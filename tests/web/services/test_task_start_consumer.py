@@ -60,7 +60,7 @@ async def wait_for_handoff(committed, execution):
 
 
 @pytest.fixture
-async def accepted(tmp_path, monkeypatch):
+async def accepted(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setattr(task_coordinator_runtime, "get_runner_id", lambda: "worker-1")
     init_db(db_url=f"sqlite:///{tmp_path / 'consumer.db'}")
@@ -71,7 +71,7 @@ async def accepted(tmp_path, monkeypatch):
         task = Task(
             user_id=user.id,
             title="Shared",
-            source="sdk",
+            source=getattr(request, "param", "sdk"),
             status=TaskStatus.PENDING,
             run_id=None,
             state_version=1,
@@ -100,6 +100,27 @@ async def accepted(tmp_path, monkeypatch):
     yield command
     await task_coordinator_runtime.close_task_coordinators()
     Base.metadata.drop_all(bind=get_engine())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "accepted,interactive", [("internal", True), ("sdk", False)], indirect=["accepted"]
+)
+async def test_start_handoff_keeps_claimed_inference_priority(
+    accepted, interactive, monkeypatch
+):
+    from xagent.core.model.chat.routing_context import xinference_interactive
+
+    observed = []
+
+    async def schedule(**kwargs):
+        observed.append(xinference_interactive.get())
+
+    monkeypatch.setattr(consumer, "_schedule_committed_turn", schedule)
+    assert accepted.dispatch_class == ("interactive" if interactive else "batch")
+    await execute_durable_task_command(accepted)
+    assert observed == [interactive]
+    assert not xinference_interactive.get()
 
 
 def test_handoff_commits_lease_and_completion_together(accepted):
@@ -202,7 +223,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
 
     from xagent.web.models.chat_message import TaskChatMessage
     from xagent.web.services import task_event_bridge
-    from xagent.web.services.task_existing_command import enqueue_existing_execution
+    from xagent.web.services.task_existing_command import stage_existing_execution
 
     monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
     with get_session_local()() as db:
@@ -215,7 +236,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         previous_owner = (task.runner_id, task.lease_attempt_id)
         owner_id = task.user_id
         before = db.query(TaskChatMessage).filter_by(task_id=task.id).count()
-    run_id = enqueue_existing_execution(
+    command_db_id = stage_existing_execution(
         task_id=accepted.task_id,
         task_owner_user_id=owner_id,
         actor_user_id=owner_id,
@@ -223,6 +244,7 @@ def test_existing_execution_accepts_without_another_transcript_row(
         context={"execution_mode": "react"},
     )
     with get_session_local()() as db:
+        run_id = db.get(TaskExecutionCommand, command_db_id).target_run_id
         task = db.get(Task, accepted.task_id)
         assert task.run_id != run_id
         assert task.output == "previous answer"

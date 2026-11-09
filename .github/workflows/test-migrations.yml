@@ -116,6 +116,14 @@ on:
       - 'src/xagent/web/services/task_lease_service.py'
       - 'tests/web/services/test_task_lease_heartbeat_batch.py'
       - 'tests/web/services/test_task_settlement_locking.py'
+      - 'tests/web/services/test_structured_output_settlement.py'
+      - 'tests/web/services/test_structured_output_wiring.py'
+      - 'tests/web/services/test_task_execution_event_writer.py'
+      - 'src/xagent/core/agent/structured_output.py'
+      - 'src/xagent/core/agent/structured_schema.py'
+      - 'src/xagent/web/services/structured_output_projection.py'
+      - 'src/xagent/web/services/task_event_context_service.py'
+      - 'src/xagent/web/models/task_execution_event.py'
       - 'src/xagent/web/services/task_auto_recovery.py'
       - 'tests/web/services/test_task_lease_expiry_interruption.py'
       - 'tests/web/services/test_persistence_failure_pause.py'
@@ -166,6 +174,7 @@ on:
       - 'tests/alembic/test_20260922_task_last_activity_at.py'
       - 'src/xagent/web/services/task_retention_purge.py'
       - 'src/xagent/web/models/task.py'
+      - 'src/xagent/web/models/expired_task.py'
       - 'tests/web/services/test_task_retention_purge.py'
       - 'src/xagent/web/services/task_deletion.py'
       - 'src/xagent/web/models/task_command.py'
@@ -342,6 +351,14 @@ jobs:
             src/xagent/web/services/task_lease_service.py
             tests/web/services/test_task_lease_heartbeat_batch.py
             tests/web/services/test_task_settlement_locking.py
+            tests/web/services/test_structured_output_settlement.py
+            tests/web/services/test_structured_output_wiring.py
+            tests/web/services/test_task_execution_event_writer.py
+            src/xagent/core/agent/structured_output.py
+            src/xagent/core/agent/structured_schema.py
+            src/xagent/web/services/structured_output_projection.py
+            src/xagent/web/services/task_event_context_service.py
+            src/xagent/web/models/task_execution_event.py
             src/xagent/web/services/task_auto_recovery.py
             tests/web/services/test_task_lease_expiry_interruption.py
             tests/web/services/test_persistence_failure_pause.py
@@ -392,6 +409,7 @@ jobs:
             tests/alembic/test_20260922_task_last_activity_at.py
             src/xagent/web/services/task_retention_purge.py
             src/xagent/web/models/task.py
+            src/xagent/web/models/expired_task.py
             tests/web/services/test_task_retention_purge.py
             src/xagent/web/services/task_deletion.py
             src/xagent/web/models/task_command.py
@@ -748,6 +766,58 @@ jobs:
         shell: bash
         run: |
           pytest tests/alembic/test_20261031_task_checkpoint_pointer_index.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task SDK credential kind migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261031_task_sdk_credential_kind.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task structured output record migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261105_task_structured_output_record.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test MCP OAuth flow access path migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261105_add_mcp_oauth_flow_access_path.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test structured output settlement (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/web/services/test_structured_output_settlement.py -m postgresql 2>&1 | tee pg.log
           if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
             echo "::error::Postgres-only cells were skipped; skipped is not passed"
             exit 1

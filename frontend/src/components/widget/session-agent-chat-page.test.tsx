@@ -331,6 +331,7 @@ describe("SessionAgentChatPage", () => {
       title: "Support Agent",
       description: "Answers schedules",
       prompts: ["Show my schedule"],
+      sendPromptOnClick: true,
       filesDisabled: true,
       voiceInputEnabled: false,
     }))

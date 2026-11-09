@@ -7,14 +7,7 @@ from typing import Any
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 try:
-    # This module is transitively imported by mcp_adapter.py, which
-    # sandboxed tool execution (tool_runner.py's _load_tool_class) also
-    # imports just to reach an unrelated class in the same module tree.
-    # The sandbox's Python environment never installs pypinyin (nothing
-    # it runs calls _semantic_slug), so a hard import here raised
-    # ModuleNotFoundError for every sandboxed tool call, not just this
-    # module's own users -- fall back to None instead, and skip
-    # romanization on the (never exercised in a sandbox) non-ASCII path.
+    # Standalone installations may omit optional name transliteration.
     from pypinyin import lazy_pinyin  # type: ignore[import-not-found]
 except ImportError:
     lazy_pinyin = None

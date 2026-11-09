@@ -54,7 +54,7 @@ class ZhipuWebSearchResult(BaseModel):
 class ZhipuWebSearchTool(AbstractBaseTool):
     """Framework wrapper for the Zhipu web search tool."""
 
-    category = ToolCategory.WEB_SEARCH
+    category = ToolCategory.WEB_TOOLS
     read_only = True  # read-only HTTP search ⇒ concurrency-safe
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:

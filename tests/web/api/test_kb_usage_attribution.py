@@ -145,3 +145,284 @@ def test_web_ingest_carries_the_scope_into_the_executor_loop(client, hook):
 
     assert threads, "the crawl never ran"
     _assert_billed_to_actor(hook, "kb_ingest_web")
+
+
+@pytest.fixture
+def refusing_gate():
+    calls: list = []
+
+    def gate(user_id: int, source: str) -> str:
+        calls.append((user_id, source))
+        return "Out of AI credits"
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    yield calls
+    quota_hooks.set_standalone_gate_hook(None)
+
+
+def _assert_refused(response: Any, gate_calls: list, source: str) -> None:
+    assert response.status_code == 402
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["source"]) == ("standalone_usage_refused", source)
+    # The member is checked, as the member is billed.
+    assert gate_calls[0] == (ACTOR_ID, source)
+
+
+def test_search_refused_by_the_gate_never_searches(client, hook, refusing_gate):
+    with patch.object(kb_module, "run_document_search") as search:
+        response = client.post(
+            "/api/kb/search",
+            data={"collection": "team-kb", "query_text": "q"},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_search")
+    search.assert_not_called()
+    assert hook == []
+
+
+def test_upload_ingest_refused_by_the_gate_writes_nothing(
+    client, hook, refusing_gate, tmp_path
+):
+    target = tmp_path / "f.txt"
+    with (
+        patch.object(kb_module, "run_document_ingestion_with_outcome") as ingest,
+        patch.object(kb_module, "get_upload_path", return_value=str(target)),
+        patch.object(kb_module, "_upsert_uploaded_file_record") as upsert,
+    ):
+        response = client.post(
+            "/api/kb/ingest",
+            data={"collection": "team-kb"},
+            files={"file": ("notes.txt", b"abc", "text/plain")},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_ingest")
+    assert refusing_gate == [(ACTOR_ID, "kb_ingest")]
+    ingest.assert_not_called()
+    upsert.assert_not_called()
+    assert not target.exists()
+
+
+def test_ingest_job_refused_by_the_gate_is_never_queued(
+    client, refusing_gate, tmp_path
+):
+    with (
+        patch.object(
+            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+        ),
+        patch.object(
+            kb_module, "_ensure_background_job_queue_available_async", new=AsyncMock()
+        ),
+        patch.object(kb_module, "_enqueue_background_job_or_503_async") as enqueue,
+    ):
+        response = client.post(
+            "/api/kb/ingest/jobs",
+            data={"collection": "team-kb"},
+            files={"file": ("notes.txt", b"abc", "text/plain")},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_ingest_job")
+    enqueue.assert_not_called()
+
+
+def test_web_ingest_refused_by_the_gate_never_crawls(client, hook, refusing_gate):
+    with patch.object(kb_module, "run_web_ingestion_with_outcome") as crawl:
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={"collection": "team-kb", "start_url": "https://example.com"},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_ingest_web")
+    crawl.assert_not_called()
+    assert hook == []
+
+
+@pytest.fixture
+def model_gate():
+    calls: list = []
+
+    def gate(user_id: int, source: str, model_ids: tuple[str, ...]) -> None:
+        calls.append((user_id, source, model_ids))
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    yield calls
+    quota_hooks.set_standalone_gate_hook(None)
+
+
+def _active_pin() -> Any:
+    from xagent.core.tools.core.RAG_tools.utils import model_resolution_pin
+
+    return model_resolution_pin._active_pin.get()
+
+
+@pytest.mark.parametrize(
+    "path,data,files,resolver,work,source,gates",
+    [
+        (
+            "/api/kb/search",
+            {"collection": "team-kb", "query_text": "q"},
+            None,
+            "resolve_search_model_ids",
+            "run_document_search",
+            "kb_search",
+            1,
+        ),
+        (
+            "/api/kb/ingest",
+            {"collection": "team-kb"},
+            {"file": ("notes.txt", b"abc", "text/plain")},
+            "resolve_ingestion_model_ids",
+            "run_document_ingestion_with_outcome",
+            "kb_ingest",
+            2,  # before the upload is written, and by the scope
+        ),
+        (
+            "/api/kb/ingest-web",
+            {"collection": "team-kb", "start_url": "https://example.com"},
+            None,
+            "resolve_ingestion_model_ids",
+            "run_web_ingestion_with_outcome",
+            "kb_ingest_web",
+            1,
+        ),
+    ],
+    ids=["search", "ingest", "ingest-web"],
+)
+def test_kb_work_runs_under_the_resolution_it_was_gated_on(
+    client, model_gate, tmp_path, path, data, files, resolver, work, source, gates
+):
+    pins: list = []
+    model_ids = ("platform/text-embedding-v4",)
+
+    def resolve(*_args: Any, **kwargs: Any) -> tuple[str, ...]:
+        # The tenant's view of the collection, as the pipeline resolves it.
+        assert kwargs["user_id"] == STORAGE_ID
+        pins.append(_active_pin())
+        return model_ids
+
+    def run(*_args: Any, **_kwargs: Any) -> Any:
+        pins.append(_active_pin())
+        raise RuntimeError("stop")
+
+    async def run_async(**kwargs: Any) -> Any:
+        return run(**kwargs)
+
+    with (
+        patch.object(kb_module, resolver, side_effect=resolve),
+        patch.object(
+            kb_module,
+            work,
+            side_effect=run_async if work.startswith("run_web") else run,
+        ),
+        patch.object(
+            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+        ),
+        patch.object(
+            kb_module,
+            "_upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="file-1"),
+        ),
+    ):
+        client.post(path, data=data, files=files)
+
+    assert model_gate == [(ACTOR_ID, source, model_ids)] * gates
+    [resolved_under, ran_under] = pins
+    assert resolved_under is not None and ran_under is resolved_under
+
+
+@pytest.mark.parametrize(
+    "path,data,files,source",
+    [
+        (
+            "/api/kb/ingest/jobs",
+            {"collection": "team-kb"},
+            {"file": ("notes.txt", b"abc", "text/plain")},
+            "kb_ingest_job",
+        ),
+        (
+            "/api/kb/ingest-web/jobs",
+            {"collection": "team-kb", "start_url": "https://example.com"},
+            None,
+            "kb_ingest_web_job",
+        ),
+    ],
+    ids=["ingest-job", "ingest-web-job"],
+)
+def test_a_job_is_gated_on_the_resolved_model_when_queued(
+    client, model_gate, tmp_path, path, data, files, source
+):
+    with (
+        patch.object(
+            kb_module,
+            "resolve_ingestion_model_ids",
+            return_value=("platform/text-embedding-v4",),
+        ),
+        patch.object(
+            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+        ),
+        patch.object(
+            kb_module, "_ensure_background_job_queue_available_async", new=AsyncMock()
+        ),
+        patch.object(
+            kb_module,
+            "_enqueue_background_job_or_503_async",
+            side_effect=RuntimeError("stop"),
+        ),
+    ):
+        client.post(path, data=data, files=files)
+
+    assert model_gate == [(ACTOR_ID, source, ("platform/text-embedding-v4",))]
+
+
+@pytest.mark.parametrize(
+    "path,data,files,resolver",
+    [
+        (
+            "/api/kb/search",
+            {"collection": "team-kb", "query_text": "q"},
+            None,
+            "resolve_search_model_ids",
+        ),
+        (
+            "/api/kb/ingest/jobs",
+            {"collection": "team-kb"},
+            {"file": ("notes.txt", b"abc", "text/plain")},
+            "resolve_ingestion_model_ids",
+        ),
+        (
+            "/api/kb/ingest-web/jobs",
+            {"collection": "team-kb", "start_url": "https://example.com"},
+            None,
+            "resolve_ingestion_model_ids",
+        ),
+    ],
+    ids=["search", "ingest-job", "ingest-web-job"],
+)
+def test_without_a_gate_nothing_is_resolved_for_it(
+    client, tmp_path, path, data, files, resolver
+):
+    pins: list = []
+
+    def search(**_kwargs: Any) -> Any:
+        pins.append(_active_pin())
+        raise RuntimeError("stop")
+
+    with (
+        patch.object(kb_module, resolver) as resolve,
+        patch.object(kb_module, "run_document_search", side_effect=search),
+        patch.object(
+            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+        ),
+        patch.object(
+            kb_module, "_ensure_background_job_queue_available_async", new=AsyncMock()
+        ),
+        patch.object(
+            kb_module,
+            "_enqueue_background_job_or_503_async",
+            side_effect=RuntimeError("stop"),
+        ),
+    ):
+        client.post(path, data=data, files=files)
+
+    resolve.assert_not_called()
+    # And nothing is pinned: the work resolves as it did before gating.
+    assert pins == ([None] if path == "/api/kb/search" else [])

@@ -540,6 +540,41 @@ def test_auto_resume_command_gets_the_upstream_dispatch_class(
     assert [c.dispatch_class for c in resume] == [expected]
 
 
+@pytest.mark.asyncio
+async def test_auto_resume_uses_normal_xinference_priority(
+    factory, notified, monkeypatch
+):
+    from xagent.core.model.chat.routing_context import xinference_interactive
+    from xagent.web.services import task_command_execution
+    from xagent.web.services.task_command_transport import (
+        TaskCommandKind,
+        claim_task_command,
+    )
+
+    now = utc_now()
+    with factory() as db:
+        _seed(db, now, source="internal")
+        db.commit()
+    assert run_auto_resume_tick(now=now).staged_commands == 1
+
+    with factory() as db:
+        command = claim_task_command(db, runner_id="worker")
+    assert command is not None
+    assert command.kind == TaskCommandKind.RESUME
+    assert command.command_id == auto_resume_command_id(PV, 1, RUN)
+    assert command.dispatch_class == "interactive"
+
+    async def observe_priority(_command):
+        return {"interactive": xinference_interactive.get()}
+
+    monkeypatch.setattr(
+        task_command_execution, "_execute_durable_task_command", observe_priority
+    )
+    assert await task_command_execution.execute_durable_task_command(command) == {
+        "interactive": False
+    }
+
+
 def test_dispatch_does_not_require_an_empty_runner(factory, notified):
     # A PAUSED task may hold an idle shared coordinator's owner lease.
     now = utc_now()

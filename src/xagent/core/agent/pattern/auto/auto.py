@@ -208,6 +208,9 @@ class _AutoChildRuntime:
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 
+    async def finish_cache_session(self) -> None:
+        await self.parent.finish_cache_session()
+
     def clear_interrupt(self) -> None:
         self.parent.clear_interrupt()
 
@@ -236,6 +239,9 @@ class _AutoChildRuntime:
 
     async def prepare_final_answer(self, content: str) -> str:
         return await self.parent.prepare_final_answer(content)
+
+    async def approve_waiting_result(self, result: dict[str, Any]) -> bool:
+        return await self.parent.approve_waiting_result(result)
 
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         await self.parent.fail_final_answer_stream(message_id, error)
@@ -490,6 +496,7 @@ class AutoPattern(AgentPattern):
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),
                 memory_store=kwargs.get("memory_store"),
+                memory_tools_factory=kwargs.get("memory_tools_factory"),
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
                 compact_llm=kwargs.get("compact_llm"),
             )
@@ -519,6 +526,7 @@ class AutoPattern(AgentPattern):
         llm: Any,
         runtime: PatternRuntime,
         memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
@@ -638,6 +646,7 @@ class AutoPattern(AgentPattern):
             llm=llm,
             runtime=child_runtime,
             memory_store=memory_store,
+            memory_tools_factory=memory_tools_factory,
             memory_similarity_threshold=memory_similarity_threshold,
             skill_manager=skill_manager,
             allowed_skills=allowed_skills,

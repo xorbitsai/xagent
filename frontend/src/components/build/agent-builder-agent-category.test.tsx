@@ -11,6 +11,11 @@ import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const useBuilderSettingsMock = vi.hoisted(() => vi.fn())
+
+vi.mock("@/lib/agent-builder-settings-extension", () => ({
+  useAgentBuilderSettingsExtension: useBuilderSettingsMock,
+}))
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -114,7 +119,7 @@ vi.mock("@/hooks/use-file-mention", () => ({
 // tool-category selector actually offers.
 vi.mock("@/components/ui/multi-select", () => ({
   MultiSelect: (props: any) => (
-    <div data-testid="multi-select" data-placeholder={props.placeholder}>
+    <div data-testid="multi-select" data-placeholder={props.placeholder} data-option-labels={(props.options || []).map((option: any) => option.label).join("|")}>
       {(props.options || []).map((o: any) => o.value).join("|")}
     </div>
   ),
@@ -129,8 +134,8 @@ import { AgentBuilder } from "./agent-builder"
 const AGENT_ID = "5"
 
 const AVAILABLE_TOOLS = [
-  { name: "calculator", description: "", category: "basic", enabled: true },
-  { name: "web_search", description: "", category: "web_search", enabled: true },
+  { name: "calculator", description: "", category: "basic_tools", enabled: true },
+  { name: "web_search", description: "", category: "web_tools", enabled: true },
   { name: "agent_7", description: "", category: "agent", enabled: true },
   { name: "misc_tool", description: "", category: "other", enabled: true },
 ]
@@ -163,7 +168,7 @@ function agentResponse(toolCategories: string[]) {
 
 function installApi(
   toolCategories: string[],
-  putResponse: () => Response = () =>
+  putResponse: () => Response | Promise<Response> = () =>
     new Response(JSON.stringify(agentResponse(toolCategories)), { status: 200 }),
   toolsBody: unknown = { tools: AVAILABLE_TOOLS },
   skills: unknown[] = []
@@ -201,20 +206,71 @@ const toolCategorySelector = () =>
 beforeEach(() => {
   apiRequestMock.mockReset()
   toastErrorMock.mockReset()
+  useBuilderSettingsMock.mockReset().mockReturnValue({})
   ;(globalThis as any).WebSocket = vi.fn()
 })
 
 afterEach(() => cleanup())
 
+describe("AgentBuilder host settings", () => {
+  it("renders the extension, gates publishing, and acknowledges only the submitted settings", async () => {
+    let finishSave!: (response: Response) => void
+    const response = new Promise<Response>(resolve => { finishSave = resolve })
+    installApi(["basic_tools"], () => response)
+    const markSaved = vi.fn()
+    const panel = <div>Host settings panel</div>
+    useBuilderSettingsMock.mockReturnValue({ panel, changes: {}, markSaved })
+    const { rerender } = render(<AgentBuilder agentId={AGENT_ID} />)
+
+    expect(await screen.findByText("Host settings panel")).toBeInTheDocument()
+    const update = screen.getByRole("button", { name: "builds.editor.header.update" })
+    const publish = screen.getByRole("button", { name: "builds.editor.header.publish" })
+    await waitFor(() => expect(publish).toBeEnabled())
+    expect(update).toBeDisabled()
+
+    const submitted = { policy: "strict" }
+    useBuilderSettingsMock.mockReturnValue({ panel, changes: submitted, markSaved })
+    rerender(<AgentBuilder agentId={AGENT_ID} />)
+    expect(update).toBeEnabled()
+    expect(publish).toBeDisabled()
+    fireEvent.click(update)
+    const put = apiRequestMock.mock.calls.find(([, options]) => options?.method === "PUT")
+    expect(JSON.parse(put?.[1].body)).toMatchObject({ host_settings: submitted })
+    expect(markSaved).not.toHaveBeenCalled()
+
+    useBuilderSettingsMock.mockReturnValue({ panel, changes: { policy: "new draft" }, markSaved })
+    rerender(<AgentBuilder agentId={AGENT_ID} />)
+    finishSave(Response.json(agentResponse(["basic_tools"])))
+    await waitFor(() => {
+      expect(markSaved).toHaveBeenCalledExactlyOnceWith(submitted)
+      expect(update).toBeEnabled()
+    })
+    expect(publish).toBeDisabled()
+  })
+
+  it("keeps the settings dirty when the save is rejected", async () => {
+    installApi(["basic_tools"], () => Response.json({ detail: "Invalid policy" }, { status: 422 }))
+    const markSaved = vi.fn()
+    useBuilderSettingsMock.mockReturnValue({ changes: { policy: "invalid" }, markSaved })
+    render(<AgentBuilder agentId={AGENT_ID} />)
+    const update = screen.getByRole("button", { name: "builds.editor.header.update" })
+    await waitFor(() => expect(update).toBeEnabled())
+    fireEvent.click(update)
+    await waitFor(() => expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe("Invalid policy"))
+    expect(markSaved).not.toHaveBeenCalled()
+    expect(update).toBeEnabled()
+  })
+})
+
 describe("AgentBuilder agent tool category (issue #802)", () => {
   it("does not offer unassignable categories even when such tools exist", async () => {
-    installApi(["basic"])
+    installApi(["basic_tools"])
     render(<AgentBuilder agentId={AGENT_ID} />)
 
     await waitFor(() => {
       const selector = toolCategorySelector()
       expect(selector).toBeTruthy()
-      expect(selector!.textContent).toContain("basic")
+      expect(selector!.textContent).toContain("basic_tools")
     })
     const offered = toolCategorySelector()!.textContent!.split("|")
     expect(offered).not.toContain("agent")
@@ -222,7 +278,7 @@ describe("AgentBuilder agent tool category (issue #802)", () => {
   })
 
   it("saves a legacy agent without writing the agent category back", async () => {
-    installApi(["basic", "agent"])
+    installApi(["basic_tools", "agent"])
     render(<AgentBuilder agentId={AGENT_ID} />)
 
     // Wait for the agent to load (name lands in the header input).
@@ -240,7 +296,7 @@ describe("AgentBuilder agent tool category (issue #802)", () => {
       )
       expect(putCall).toBeTruthy()
       const body = JSON.parse((putCall![1] as any).body)
-      expect(body.tool_categories).toEqual(["basic"])
+      expect(body.tool_categories).toEqual(["basic_tools"])
     })
   })
 })
@@ -271,7 +327,7 @@ describe("AgentBuilder update error handling (issue #956)", () => {
     },
   ])("handles $name without unmounting the builder", async ({ payload, expected }) => {
     installApi(
-      ["basic"],
+      ["basic_tools"],
       () =>
         new Response(JSON.stringify(payload), {
           status: 422,
@@ -295,7 +351,7 @@ describe("AgentBuilder update error handling (issue #956)", () => {
 
   it("renders a structured detail message without unmounting the builder", async () => {
     installApi(
-      ["basic"],
+      ["basic_tools"],
       () =>
         new Response(
           JSON.stringify({
@@ -323,7 +379,7 @@ describe("AgentBuilder update error handling (issue #956)", () => {
   })
 
   it("uses the localized fallback for an empty response without unmounting the builder", async () => {
-    installApi(["basic"], () => new Response(null, { status: 500 }))
+    installApi(["basic_tools"], () => new Response(null, { status: 500 }))
     render(<AgentBuilder agentId={AGENT_ID} />)
 
     const nameInput = await screen.findByPlaceholderText(
@@ -343,7 +399,7 @@ describe("AgentBuilder update error handling (issue #956)", () => {
 
   it("renders FastAPI validation detail messages without unmounting the builder", async () => {
     installApi(
-      ["basic"],
+      ["basic_tools"],
       () =>
         new Response(
           JSON.stringify({
@@ -380,7 +436,7 @@ describe("AgentBuilder extra built-in tools (issue #306)", () => {
   const block = () => screen.queryByText((text) => text.startsWith(PREFIX))
   const toolsBody = (tools: Record<string, unknown>[]) => ({
     tools: [
-      { name: "calculator", description: "", category: "basic", enabled: true, always_available: false },
+      { name: "calculator", description: "", category: "basic_tools", enabled: true, always_available: false },
       ...tools,
     ],
     skill_loader_tool: "skill_loader_x",
@@ -388,7 +444,7 @@ describe("AgentBuilder extra built-in tools (issue #306)", () => {
 
   it("lists backend-flagged tools and adds the skill loader only once a skill is selected", async () => {
     installApi(
-      ["basic"],
+      ["basic_tools"],
       undefined,
       toolsBody([{ name: "clock_a", description: "", category: "other", enabled: true, always_available: true }]),
       [{ name: "writer" }]
@@ -404,7 +460,7 @@ describe("AgentBuilder extra built-in tools (issue #306)", () => {
 
   it("lists an always-available tool even when an admin disabled it", async () => {
     installApi(
-      ["basic"],
+      ["basic_tools"],
       undefined,
       toolsBody([{ name: "clock_off", description: "", category: "other", enabled: false, always_available: true }])
     )
@@ -423,7 +479,7 @@ describe("AgentBuilder extra built-in tools (issue #306)", () => {
 
     await waitFor(() => {
       expect(screen.getByPlaceholderText("builds.configForm.name.placeholder")).toHaveValue("Legacy Agent")
-      expect(toolCategorySelector()?.textContent).toContain("basic")
+      expect(toolCategorySelector()?.textContent).toContain("basic_tools")
     })
     expect(block()).toBeNull()
 
@@ -463,11 +519,38 @@ describe("AgentBuilder extra built-in tools (issue #306)", () => {
 
     await waitFor(() => {
       expect(screen.getByPlaceholderText("builds.configForm.name.placeholder")).toHaveValue("Legacy Agent")
-      expect(toolCategorySelector()?.textContent).toContain("basic")
+      expect(toolCategorySelector()?.textContent).toContain("basic_tools")
     })
 
     fireEvent.click(document.getElementById("selectAllSkills")!)
 
     await waitFor(() => expect(block()?.textContent).toBe(`${PREFIX}skill_loader_x`))
+  })
+})
+
+it("renders and saves migrated categories using only the canonical groups", async () => {
+  installApi(["basic_tools", "code_execution", "web_tools"], undefined, {
+    tools: [
+      { name: "ask_user_question", description: "Ask", category: "basic_tools", enabled: true },
+      { name: "execute_python_code", description: "Python", category: "code_execution", enabled: true },
+      { name: "api_call", description: "HTTP", category: "web_tools", enabled: true },
+      { name: "fetch_web_content", description: "Fetch", category: "web_tools", enabled: true },
+    ],
+    categories: [
+      { id: "basic_tools", label: "Basic Tools" },
+      { id: "code_execution", label: "Code Execution" },
+      { id: "web_tools", label: "Web Tools" },
+    ],
+  })
+  render(<AgentBuilder agentId={AGENT_ID} />)
+  await waitFor(() => expect(screen.getByDisplayValue("Legacy Agent")).toBeInTheDocument())
+  expect(toolCategorySelector()?.textContent).toBe("basic_tools|code_execution|web_tools")
+  expect(toolCategorySelector()?.getAttribute("data-option-labels")).not.toContain("existingPermissions")
+  fireEvent.change(screen.getByDisplayValue("Legacy Agent"), { target: { value: "Renamed Legacy Agent" } })
+  fireEvent.click(screen.getByText("builds.editor.header.update"))
+  await waitFor(() => {
+    const put = apiRequestMock.mock.calls.find(([, options]) => (options as any)?.method === "PUT")
+    expect(put).toBeTruthy()
+    expect(JSON.parse((put![1] as any).body).tool_categories).toEqual(["basic_tools", "code_execution", "web_tools"])
   })
 })

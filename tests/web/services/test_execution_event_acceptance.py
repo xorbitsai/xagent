@@ -325,10 +325,9 @@ def test_existing_execution_accepts_input_with_its_command(canonical, monkeypatc
         "get_task_event_bridge",
         lambda: SimpleNamespace(require_ready=lambda: None),
     )
-    monkeypatch.setattr(existing, "notify_task_command_dispatcher", lambda: None)
     with factory() as db:
         owner = db.get(Task, tid).user_id
-    existing.enqueue_existing_execution(
+    existing.stage_existing_execution(
         task_id=tid,
         task_owner_user_id=owner,
         task_description="existing description",
@@ -543,7 +542,7 @@ def test_existing_execution_rolls_back_input_if_command_staging_fails(
         owner = db.get(Task, tid).user_id
         previous = (db.get(Task, tid).status, db.get(Task, tid).state_version)
     with pytest.raises(RuntimeError, match="command staging failed"):
-        task_existing_command.enqueue_existing_execution(
+        task_existing_command.stage_existing_execution(
             task_id=tid,
             task_owner_user_id=owner,
             task_description="existing",

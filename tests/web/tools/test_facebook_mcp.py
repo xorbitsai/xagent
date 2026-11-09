@@ -655,3 +655,166 @@ def test_publish_image_post_rejects_non_public_url(monkeypatch):
         "message": "image_url must be a public http or https URL",
     }
     mock_request.assert_not_called()
+
+
+# Composio-backed grants (#3531): every Graph call goes through Composio's
+# Proxy Execute endpoint, and the env carries no Meta token.
+COMPOSIO_PROXY_URL = "https://backend.composio.dev/api/v3.1/tools/execute/proxy"
+
+
+@pytest.fixture()
+def composio_env(monkeypatch):
+    monkeypatch.delenv("META_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    monkeypatch.setenv("COMPOSIO_CONNECTED_ACCOUNT_ID", "ca_123")
+    monkeypatch.setenv("COMPOSIO_USER_ID", "actor-hmac")
+    monkeypatch.setattr(
+        facebook.meta_graph, "_proxy_response_secrets", set(), raising=False
+    )
+
+
+def _proxied(data=None, *, status=200):
+    body = {"data": data, "status": status, "headers": {}}
+    return MockResponse(body, text=json.dumps(body))
+
+
+def _graph_call(kwargs):
+    """The Graph endpoint, method and query of one proxied request."""
+    assert kwargs["url"] == COMPOSIO_PROXY_URL
+    payload = kwargs["json"]
+    query = {
+        item["name"]: item["value"]
+        for item in payload.get("parameters", [])
+        if item["type"] == "query"
+    }
+    return payload["endpoint"], payload["method"], query, payload.get("body")
+
+
+_ACCOUNTS = {"data": [{"id": "page-1", "access_token": "page-token"}]}
+
+
+def test_proxied_list_page_posts_still_falls_back_on_a_permission_error(
+    monkeypatch, composio_env
+):
+    feed_fields = []
+
+    def request(**kwargs):
+        endpoint, _, query, _ = _graph_call(kwargs)
+        if endpoint.endswith("/me/accounts"):
+            return _proxied(_ACCOUNTS)
+        assert query["access_token"] == "page-token"
+        feed_fields.append(query["fields"])
+        if "comments" in query["fields"]:
+            return _proxied(
+                {"error": {"message": "permission denied", "code": 10}}, status=400
+            )
+        return _proxied({"data": [{"id": "post-1", "message": "hello"}]})
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(facebook.facebook_list_page_posts("page-1", limit=5))
+
+    assert result == {
+        "status": "success",
+        "posts": [{"id": "post-1", "message": "hello"}],
+        "next_link": None,
+        "engagement_available": False,
+    }
+    assert len(feed_fields) == 2
+
+
+def test_composio_permission_failure_does_not_trigger_the_engagement_fallback(
+    monkeypatch, composio_env
+):
+    feed_calls = []
+
+    def request(**kwargs):
+        endpoint, _, _, _ = _graph_call(kwargs)
+        if endpoint.endswith("/me/accounts"):
+            return _proxied(_ACCOUNTS)
+        feed_calls.append(endpoint)
+        body = {"error": {"message": "forbidden", "code": 10, "status": 403}}
+        return MockResponse(body, text=json.dumps(body), status_code=403)
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(facebook.facebook_list_page_posts("page-1", limit=5))
+
+    assert result["status"] == "error"
+    assert "Composio" in result["message"]
+    assert len(feed_calls) == 1
+
+
+def test_proxied_image_post_from_a_public_url(monkeypatch, composio_env):
+    def request(**kwargs):
+        endpoint, method, query, body = _graph_call(kwargs)
+        if endpoint.endswith("/me/accounts"):
+            return _proxied(_ACCOUNTS)
+        assert method == "POST"
+        assert endpoint == "https://graph.facebook.com/v25.0/page-1/photos"
+        assert query == {"access_token": "page-token"}
+        assert body == {"published": "true", "url": "https://example.com/a.png"}
+        return _proxied({"id": "photo-1", "post_id": "page-1_post-1"})
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        facebook.facebook_publish_image_post("page-1", "https://example.com/a.png")
+    )
+
+    assert result == {
+        "status": "success",
+        "photo_id": "photo-1",
+        "post_id": "page-1_post-1",
+    }
+
+
+def test_proxied_image_post_from_a_file_is_refused_before_anything_runs(
+    monkeypatch, composio_env, tmp_path: Path
+):
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(tmp_path))
+    image_path = tmp_path / "launch.png"
+    image_path.write_bytes(b"png")
+    mock_request = Mock()
+    monkeypatch.setattr(facebook.requests, "request", mock_request)
+
+    result = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(image_path))
+    )
+
+    assert result["status"] == "error"
+    assert "not supported" in result["message"]
+    assert "image_url" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_composio_failures_are_redacted_in_output_and_logs(
+    monkeypatch, composio_env, caplog
+):
+    """The tool logs the error it returns; neither may carry the API key, the
+    connected account id, the Composio user id or the Page token, even when
+    Composio echoes them back."""
+
+    def request(**kwargs):
+        endpoint, _, _, _ = _graph_call(kwargs)
+        if endpoint.endswith("/me/accounts"):
+            return _proxied(_ACCOUNTS)
+        body = {
+            "error": {
+                "message": 'Connected account "ca_123" (actor-hmac) not found; '
+                "key composio-key, token page-token",
+                "status": 404,
+            }
+        }
+        return MockResponse(body, text=json.dumps(body), status_code=404)
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    with caplog.at_level("DEBUG"):
+        result = facebook.facebook_publish_text_post("page-1", "Launch update")
+
+    assert "Composio" in _payload(result)["message"]
+    assert "Error publishing Facebook Page text post" in caplog.text
+    for secret in ("composio-key", "ca_123", "actor-hmac", "page-token"):
+        assert secret not in result
+        assert secret not in caplog.text

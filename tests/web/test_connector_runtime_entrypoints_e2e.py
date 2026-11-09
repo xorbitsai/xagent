@@ -372,6 +372,66 @@ async def test_telegram_voice_errors_are_reported_to_user(
 
 
 @pytest.mark.asyncio
+async def test_telegram_voice_refused_by_the_gate_tells_the_user_why(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services import quota_hooks
+
+    _setup_admin_headers()
+    db = _db_session()
+    gate_calls: list[tuple[int, str, tuple[str, ...]]] = []
+
+    def gate(user_id: int, source: str, model_ids: tuple[str, ...]) -> str:
+        gate_calls.append((user_id, source, model_ids))
+        return "Your team is out of AI credits."
+
+    class _FakeASR:
+        # Stamped by get_asr_model_instance from the channel's model row.
+        model_id = "owner-asr"
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def transcribe(self, *_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("a refused transcription reached the provider")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    try:
+        asr_model = _FakeASR()
+        bot, message = _telegram_voice_error_bot(
+            db,
+            monkeypatch,
+            channel_name="Telegram voice refused",
+            asr_model=asr_model,
+        )
+
+        async def _downloaded(**_kwargs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    "telegram_file_id": "telegram-voice-id",
+                    "path": "/nonexistent/voice.ogg",
+                    "name": "voice.ogg",
+                    "type": "audio/ogg",
+                }
+            ]
+
+        bot._download_and_register_files = _downloaded
+
+        await bot._process_user_messages_batch(123, [message])
+
+        assert message.answers == ["Your team is out of AI credits. (Task ID: 1)"]
+        assert [call[1:] for call in gate_calls] == [("telegram_voice", ("owner-asr",))]
+        assert asr_model.closed is True
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+        db.close()
+
+
+@pytest.mark.asyncio
 async def test_telegram_cancellation_during_voice_cleanup_closes_managed_lease(
     e2e_db: None,
     monkeypatch: pytest.MonkeyPatch,

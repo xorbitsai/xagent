@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect as std_inspect
+import os
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -56,6 +57,21 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def configured_unit_network_name():
+    """Keep fake-client services explicit without changing the full suite."""
+    key = "XAGENT_SANDBOX_NETWORK"
+    previous = os.environ.get(key)
+    os.environ[key] = "xagent-test-sandbox-egress"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 requires_docker = pytest.mark.skipif(
     not is_docker_available(), reason="Requires reachable Docker daemon"
 )
@@ -64,7 +80,25 @@ requires_docker = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def docker_service():
     """Provide a shared Docker sandbox service for integration-style tests."""
-    return DockerSandboxService(MemDockerStore(), namespace="test")
+    client = docker_sandbox_module._create_docker_client()
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+        options={"com.docker.network.bridge.enable_icc": "false"},
+    )
+    try:
+        yield DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            network=network_name,
+            client=client,
+        )
+    finally:
+        network.remove()
 
 
 def _unique_name(prefix: str) -> str:
@@ -243,6 +277,61 @@ class TestSupportsRuntimeSpec:
         # the probe itself needs no runtime access, so we bypass __init__.
         service = object.__new__(BoxliteSandboxService)
         assert await service.supports_runtime_spec() is False
+
+
+class TestRuntimeNetworkPolicy:
+    @pytest.fixture
+    def drifted_service(self, monkeypatch):
+        container = _FakeCreatedContainer()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeDockerClient([container]),
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module,
+            "_build_inspection",
+            lambda _container: _observed_inspection(
+                runtime_networks=("unexpected-network",)
+            ),
+        )
+        return service
+
+    @pytest.mark.asyncio
+    async def test_inspect_reports_network_policy_drift(self, drifted_service):
+        inspection = await drifted_service.inspect("box")
+
+        assert inspection is not None
+        assert inspection.runtime_policy_matches is False
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_rejects_network_policy_drift(self, drifted_service):
+        with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
+            await drifted_service.get_or_create("box")
+
+    @pytest.mark.asyncio
+    async def test_start_existing_rejects_network_policy_drift(self, drifted_service):
+        with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
+            await drifted_service.start_existing("box")
+
+    @pytest.mark.asyncio
+    async def test_configured_network_plus_extra_network_is_rejected(self, monkeypatch):
+        container = _FakeCreatedContainer()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeDockerClient([container]),
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module,
+            "_build_inspection",
+            lambda _container: _observed_inspection(
+                runtime_networks=(service._network, "bridge")
+            ),
+        )
+
+        with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
+            await service.start_existing("box")
 
 
 # --- create(): mock-layer tests for paths that are impractical against a
@@ -501,10 +590,18 @@ class TestCreatePersistsCanonicalDesiredState:
         captured: dict = {}
 
         async def fake_create_container(
-            client, name, namespace, image, template, config, extra_labels=None
+            client,
+            name,
+            namespace,
+            image,
+            template,
+            config,
+            network,
+            extra_labels=None,
         ):
             captured["template"] = template
             captured["config"] = config
+            captured["network"] = network
             captured["extra_labels"] = dict(extra_labels or {})
             return created
 
@@ -550,6 +647,7 @@ class TestCreatePersistsCanonicalDesiredState:
         # Same objects the container itself was built from.
         assert row.template == captured["template"]
         assert row.config == captured["config"]
+        assert captured["network"] == "xagent-test-sandbox-egress"
 
         # And the row reproduces the fingerprint that was stamped on the
         # container, so a reader comparing the row against the label needs no
@@ -625,7 +723,7 @@ def _observed_facts(**overrides):
         volumes=(),
         ports=(),
         network_isolated=False,
-        runtime_networks=("bridge",),
+        runtime_networks=("xagent-test-sandbox-egress",),
         labels={},
         created_at="2026-01-01T00:00:00Z",
         working_dir="/home",
@@ -665,7 +763,10 @@ class TestFindPublishMismatchesEveryBranch:
     def test_agreeing_observation_reports_no_mismatch(self):
         assert (
             docker_sandbox_module._find_publish_mismatches(
-                self._desired(), DEFAULT_SANDBOX_IMAGE, _observed_inspection()
+                self._desired(),
+                DEFAULT_SANDBOX_IMAGE,
+                _observed_inspection(),
+                "xagent-test-sandbox-egress",
             )
             == []
         )
@@ -678,6 +779,16 @@ class TestFindPublishMismatchesEveryBranch:
             ("ports", {"ports": ((18080, 80),)}),
             ("working_dir", {"working_dir": "/somewhere/else"}),
             ("network_isolated", {"network_isolated": True}),
+            ("runtime_networks", {"runtime_networks": ("other-network",)}),
+            (
+                "runtime_networks",
+                {
+                    "runtime_networks": (
+                        "xagent-test-sandbox-egress",
+                        "bridge",
+                    )
+                },
+            ),
             ("cpus", {"raw_nano_cpus": 2_000_000_000}),
             ("memory", {"raw_memory_bytes": 1024 * 1024 * 1024}),
             ("pids_limit", {"raw_pids_limit": 2048}),
@@ -685,7 +796,10 @@ class TestFindPublishMismatchesEveryBranch:
     )
     def test_each_field_is_reported_when_it_disagrees(self, field, overrides):
         mismatches = docker_sandbox_module._find_publish_mismatches(
-            self._desired(), DEFAULT_SANDBOX_IMAGE, _observed_inspection(**overrides)
+            self._desired(),
+            DEFAULT_SANDBOX_IMAGE,
+            _observed_inspection(**overrides),
+            "xagent-test-sandbox-egress",
         )
         assert mismatches == [field]
 
@@ -698,6 +812,7 @@ class TestFindPublishMismatchesEveryBranch:
                 network_isolated=True,
                 raw_memory_bytes=1024 * 1024 * 1024,
             ),
+            "xagent-test-sandbox-egress",
         )
         assert mismatches == ["image", "working_dir", "network_isolated", "memory"]
 
@@ -707,8 +822,40 @@ class TestFindPublishMismatchesEveryBranch:
             self._desired(),
             DEFAULT_SANDBOX_IMAGE,
             _observed_inspection(raw_nano_cpus=None, raw_memory_bytes=None),
+            "xagent-test-sandbox-egress",
         )
         assert mismatches == ["cpus", "memory"]
+
+    def test_isolated_sandbox_requires_no_network_attachments(self):
+        desired = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image",
+            image=DEFAULT_SANDBOX_IMAGE,
+            working_dir="/home",
+            network_isolated=True,
+            pids_limit=1024,
+        )
+        inspection = _observed_inspection(
+            network_isolated=True,
+            runtime_networks=("none",),
+        )
+        assert (
+            docker_sandbox_module._find_publish_mismatches(
+                desired,
+                DEFAULT_SANDBOX_IMAGE,
+                inspection,
+                "xagent-test-sandbox-egress",
+            )
+            == []
+        )
+
+    def test_network_enabled_sandbox_cannot_be_detached(self):
+        mismatches = docker_sandbox_module._find_publish_mismatches(
+            self._desired(),
+            DEFAULT_SANDBOX_IMAGE,
+            _observed_inspection(runtime_networks=()),
+            "xagent-test-sandbox-egress",
+        )
+        assert mismatches == ["runtime_networks"]
 
     @pytest.mark.parametrize("raw_value", [None, 0, -1])
     def test_unlimited_backend_pids_values_are_normalized(self, raw_value):
@@ -725,7 +872,10 @@ class TestFindPublishMismatchesEveryBranch:
         )
         assert (
             docker_sandbox_module._find_publish_mismatches(
-                desired, DEFAULT_SANDBOX_IMAGE, inspection
+                desired,
+                DEFAULT_SANDBOX_IMAGE,
+                inspection,
+                "xagent-test-sandbox-egress",
             )
             == []
         )
@@ -745,7 +895,10 @@ class TestFindPublishMismatchesEveryBranch:
         )
         assert (
             docker_sandbox_module._find_publish_mismatches(
-                desired, DEFAULT_SANDBOX_IMAGE, inspection
+                desired,
+                DEFAULT_SANDBOX_IMAGE,
+                inspection,
+                "xagent-test-sandbox-egress",
             )
             == []
         )
@@ -1607,6 +1760,19 @@ class TestBuildInspectionFacts:
         )
         assert inspection.facts.network_isolated is True
 
+    def test_network_isolated_comes_from_host_network_mode_none(self):
+        attrs = _attrs()
+        attrs["Config"]["NetworkDisabled"] = False
+        attrs["HostConfig"]["NetworkMode"] = "none"
+        attrs["NetworkSettings"]["Networks"] = {"none": {}}
+
+        inspection = docker_sandbox_module._build_inspection(
+            _FakeInspectableContainer(attrs)
+        )
+
+        assert inspection.facts.network_isolated is True
+        assert inspection.facts.runtime_networks == ("none",)
+
     def test_network_isolated_is_false_when_network_disabled_is_absent(self):
         attrs = _attrs()
         del attrs["Config"]["NetworkDisabled"]
@@ -1761,6 +1927,7 @@ class TestCreateContainerOwnsAttestationLabels:
             "img:tag",
             SandboxTemplate(type="image", image="img:tag"),
             SandboxConfig(),
+            "xagent-test-sandbox-egress",
             extra_labels=extra_labels,
         )
         return captured["labels"]

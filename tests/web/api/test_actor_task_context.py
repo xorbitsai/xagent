@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.tools.adapters.vibe.factory import ToolRegistry
+from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
 from xagent.core.tools.adapters.vibe.selection_spec import (
     ToolSelectionSpec,
     without_published_agent_tools,
@@ -14,6 +16,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import (
 from xagent.web.models.task import TaskStatus
 from xagent.web.services.agent_service_manager import (
     AgentServiceManager,
+    _build_tool_selection_spec_for_task,
     _spec_wants_mcp,
 )
 from xagent.web.services.channel_runtime import ChannelTaskMode
@@ -27,9 +30,11 @@ from xagent.web.services.task_runtime import (
 )
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
+    TaskModelOverride,
     TaskReconstructionSnapshot,
     TaskSetupSnapshot,
     _TaskFields,
+    apply_task_model_override,
 )
 
 
@@ -407,6 +412,314 @@ async def test_actor_interaction_reconstruction_preserves_tool_context(
     assert kwargs["force_mcp_tools"] is True
     assert _spec_wants_mcp(kwargs["tool_selection_spec"])
     assert not kwargs["tool_selection_spec"].includes_published_agent()
+
+
+def _explicit_mcp_exclusion_snapshot(
+    *,
+    status: TaskStatus = TaskStatus.PENDING,
+    tool_categories: list[str] | None = None,
+    **kwargs: Any,
+) -> TaskSetupSnapshot:
+    """An override-applied snapshot that explicitly excludes the mcp category."""
+    snapshot = _snapshot(
+        status=status,
+        agent_config={
+            "knowledge_bases": [],
+            "skills": [],
+            # Neither the list nor the actor marker changes: an old agent may
+            # never have listed "mcp", yet the override's exclusion still binds.
+            "tool_categories": tool_categories
+            if tool_categories is not None
+            else ["web_search", "file"],
+        },
+        **kwargs,
+    )
+    return apply_task_model_override(
+        snapshot,
+        TaskModelOverride(
+            llm=MagicMock(spec=BaseLLM),
+            excluded_tool_categories=frozenset({"mcp"}),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_marked_task_with_explicit_mcp_exclusion_loads_no_mcp_tools(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    manager = AgentServiceManager()
+    tool_config = MagicMock()
+    tool_config.set_execution_scope.return_value = False
+    create_tools = AsyncMock(return_value=([], tool_config))
+    agent = _Agent(tool_config)
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService", return_value=agent
+        ),
+    ):
+        built = await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_explicit_mcp_exclusion_snapshot(),
+            task_owner_user_id=1,
+            mcp_runtime_authorization_policy=actor_policy,
+            resolved_execution_scope=None,
+        )
+
+    assert built is agent
+    kwargs = create_tools.await_args.kwargs
+    # The actor policy itself is untouched: the task stays actor-marked and
+    # authorized, it merely gets fewer tools.
+    assert kwargs["mcp_runtime_authorization_policy"] is actor_policy
+    assert kwargs["force_mcp_tools"] is False
+    assert not _spec_wants_mcp(kwargs["tool_selection_spec"])
+    assert not kwargs["tool_selection_spec"].includes_mcp()
+    assert not kwargs["tool_selection_spec"].includes_published_agent()
+
+
+@pytest.mark.asyncio
+async def test_actor_interaction_reconstruction_with_explicit_mcp_exclusion_loads_no_mcp_tools(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    manager = AgentServiceManager()
+    tool_config = MagicMock()
+    tool_config.set_execution_scope.return_value = False
+    create_tools = AsyncMock(return_value=([], tool_config))
+    reconstructed = _Agent(tool_config)
+    snapshot = _explicit_mcp_exclusion_snapshot(
+        status=TaskStatus.RUNNING,
+        has_reconstructable_history=True,
+        task_llm=MagicMock(),
+    )
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService",
+            return_value=reconstructed,
+        ),
+    ):
+        result = await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=snapshot,
+            task_owner_user_id=1,
+            connector_runtime_turn_id="approval-turn",
+            mcp_runtime_authorization_policy=actor_policy,
+            task_mode=ChannelTaskMode.ACTOR_INTERACTION,
+            resolved_execution_scope=None,
+        )
+
+    assert result is reconstructed
+    kwargs = create_tools.await_args.kwargs
+    assert kwargs["connector_runtime_turn_id"] == "approval-turn"
+    assert kwargs["mcp_runtime_authorization_policy"] is actor_policy
+    assert kwargs["force_mcp_tools"] is False
+    assert not _spec_wants_mcp(kwargs["tool_selection_spec"])
+    assert not kwargs["tool_selection_spec"].includes_published_agent()
+
+
+@pytest.mark.asyncio
+async def test_actor_mcp_exclusion_keeps_a_scoped_mcp_server_loading(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    """A plain mcp exclusion leaves an explicit mcp:<server> selection alone.
+
+    The add-back and the forced load are off, but the scoped server stays in
+    the spec, so ``create_default_tools`` still loads it through
+    ``_spec_wants_mcp`` (its own spec signal, not ``force_mcp_tools``).
+    """
+    manager = AgentServiceManager()
+    tool_config = MagicMock()
+    tool_config.set_execution_scope.return_value = False
+    create_tools = AsyncMock(return_value=([], tool_config))
+    agent = _Agent(tool_config)
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService", return_value=agent
+        ),
+    ):
+        built = await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_explicit_mcp_exclusion_snapshot(
+                tool_categories=["web_search", "mcp:foo"]
+            ),
+            task_owner_user_id=1,
+            mcp_runtime_authorization_policy=actor_policy,
+            resolved_execution_scope=None,
+        )
+
+    assert built is agent
+    kwargs = create_tools.await_args.kwargs
+    assert kwargs["mcp_runtime_authorization_policy"] is actor_policy
+    assert kwargs["force_mcp_tools"] is False
+    spec = kwargs["tool_selection_spec"]
+    assert "mcp" not in spec.categories
+    assert spec.mcp_servers == frozenset({"foo"})
+    assert spec.includes_mcp() is True
+    assert _spec_wants_mcp(spec) is True
+
+
+@pytest.mark.asyncio
+async def test_actor_mcp_exclusion_of_the_only_selection_yields_no_tools(
+    actor_policy: MCPBuiltinOAuthActorPolicy,
+) -> None:
+    """["mcp"] plus an mcp exclusion stays an empty spec.
+
+    ``with_mcp_tools`` used to re-add "mcp" to the now-empty selection, which
+    is exactly what the exclusion must prevent.
+    """
+    manager = AgentServiceManager()
+    tool_config = MagicMock()
+    tool_config.set_execution_scope.return_value = False
+    create_tools = AsyncMock(return_value=([], tool_config))
+    agent = _Agent(tool_config)
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.create_default_tools",
+            new=create_tools,
+        ),
+        patch(
+            "xagent.web.services.agent_service_manager.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch(
+            "xagent.web.services.agent_service_manager.AgentService", return_value=agent
+        ),
+    ):
+        built = await manager.get_agent_for_task(
+            42,
+            task_setup_snapshot=_explicit_mcp_exclusion_snapshot(
+                tool_categories=["mcp"]
+            ),
+            task_owner_user_id=1,
+            mcp_runtime_authorization_policy=actor_policy,
+            resolved_execution_scope=None,
+        )
+
+    assert built is agent
+    kwargs = create_tools.await_args.kwargs
+    assert kwargs["mcp_runtime_authorization_policy"] is actor_policy
+    assert kwargs["force_mcp_tools"] is False
+    spec = kwargs["tool_selection_spec"]
+    assert spec.is_none()
+    assert not _spec_wants_mcp(spec)
+
+
+def test_explicit_mcp_exclusion_suppresses_the_actor_add_back() -> None:
+    excluded = _build_tool_selection_spec_for_task(
+        {"tool_categories": ["web_search", "file"]},
+        None,
+        task_id=42,
+        omit_published_agent_tools=True,
+        include_mcp_tools=True,
+        excluded_tool_categories=frozenset({"mcp"}),
+    )
+    assert not _spec_wants_mcp(excluded)
+    assert not excluded.includes_mcp()
+    assert not excluded.includes_published_agent()
+
+    # Without the exclusion nothing changes: the actor-marked add-back still
+    # puts "mcp" in the spec even though the persisted list never held it.
+    unexcluded = _build_tool_selection_spec_for_task(
+        {"tool_categories": ["web_search", "file"]},
+        None,
+        task_id=42,
+        omit_published_agent_tools=True,
+        include_mcp_tools=True,
+    )
+    assert _spec_wants_mcp(unexcluded)
+    assert unexcluded.includes_mcp()
+
+
+@pytest.mark.asyncio
+async def test_explicit_mcp_exclusion_skips_the_mcp_creator_dispatch() -> None:
+    mcp_factory = AsyncMock(return_value=[])
+    config = MagicMock()
+
+    with (
+        patch.object(ToolRegistry, "_import_tool_modules"),
+        patch.object(
+            ToolRegistry,
+            "_tool_creators",
+            [(mcp_factory, frozenset({"mcp"}), "mcp")],
+        ),
+    ):
+        config.get_tool_selection_spec.return_value = (
+            _build_tool_selection_spec_for_task(
+                {"tool_categories": ["web_search", "file"]},
+                None,
+                task_id=42,
+                include_mcp_tools=True,
+            )
+        )
+        await ToolRegistry.create_registered_tools(config)
+        mcp_factory.assert_awaited_once_with(config)
+        mcp_factory.reset_mock()
+
+        config.get_tool_selection_spec.return_value = (
+            _build_tool_selection_spec_for_task(
+                {"tool_categories": ["web_search", "file"]},
+                None,
+                task_id=42,
+                include_mcp_tools=True,
+                excluded_tool_categories=frozenset({"mcp"}),
+            )
+        )
+        assert await ToolRegistry.create_registered_tools(config) == []
+
+    mcp_factory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mcp_creator_does_not_scan_servers_when_mcp_is_excluded() -> None:
+    """The exclusion reaches the creator's internal short-circuit as well.
+
+    ``create_mcp_tools`` returns before ``get_mcp_server_configs()`` -- the DB
+    scan + credential resolution that precedes the per-server session
+    initialize (network I/O) -- so no server is contacted.
+    """
+    config = MagicMock()
+    config.get_tool_selection_spec.return_value = _build_tool_selection_spec_for_task(
+        {"tool_categories": ["web_search", "file"]},
+        None,
+        task_id=42,
+        include_mcp_tools=True,
+        excluded_tool_categories=frozenset({"mcp"}),
+    )
+    config.get_mcp_server_configs = AsyncMock(return_value=[])
+
+    assert await create_mcp_tools(config) == []
+
+    config.get_mcp_server_configs.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -796,6 +796,7 @@ def test_speech_voice_listing_uses_accessible_model_and_closes_client(
     provider = SimpleNamespace(
         api_key="synthetic-secret",
         supports_voice_listing=True,
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
         list_available_voices=AsyncMock(
             return_value=[
                 {"voice_id": "voice-one", "name": "Rachel", "extra": "private metadata"}
@@ -873,6 +874,7 @@ def test_speech_voice_listing_capability_and_output_boundaries(
             db.commit()
     provider = SimpleNamespace(
         supports_voice_listing=case != "unsupported",
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
         list_available_voices=AsyncMock(
             return_value=[
                 {"voice_id": "safe-voice", "name": "Rachel"},
@@ -3295,6 +3297,45 @@ class TestModelAPI:
             )
 
         assert response.status_code == 500
+        assert standalone_hook.calls == []
+
+    def test_transcribe_speech_refused_by_the_gate_is_a_402_without_a_call(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+        standalone_hook,
+    ):
+        from xagent.core.model.asr.xinference import XinferenceASR
+        from xagent.web.services import quota_hooks
+
+        self._create_asr_model(regular_headers, sample_speech_model_data)
+        handle = AsyncMock()
+        gate_calls: list = []
+
+        def gate(user_id, source, model_ids):
+            gate_calls.append((user_id, source, model_ids))
+            return {"code": "ai_credits_exhausted", "message": "Out of AI credits"}
+
+        quota_hooks.set_standalone_gate_hook(gate)
+        try:
+            with patch.object(XinferenceASR, "_ensure_model_handle", handle):
+                response = client.post(
+                    "/api/models/speech/transcribe",
+                    files={"file": ("voice.wav", b"RIFF", "audio/wav")},
+                    headers=regular_headers,
+                )
+        finally:
+            quota_hooks.set_standalone_gate_hook(None)
+
+        assert response.status_code == 402
+        detail = response.json()["detail"]
+        assert detail["code"] == "standalone_usage_refused"
+        assert detail["reason"]["code"] == "ai_credits_exhausted"
+        # The request names no model: the gate gets the user's default.
+        assert gate_calls == [(regular_user["id"], "speech_transcribe", ("test-asr",))]
+        handle.assert_not_called()
         assert standalone_hook.calls == []
 
     @pytest.mark.parametrize("category", ["embedding", "rerank"])

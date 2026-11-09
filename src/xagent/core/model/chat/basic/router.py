@@ -454,6 +454,24 @@ class RouterLLM(BaseLLM):
         return self._candidate_models is not None
 
     @property
+    def accepts_image_input(self) -> bool:
+        """Whether every candidate of a configured Auto reads images.
+
+        ``abilities`` never lists ``vision`` for a router, because which model
+        answers is decided per call. A configured Auto whose candidates all
+        accept images can nevertheless take an image whichever one is chosen,
+        so an image-only tool may use it. One text-only candidate, or an Auto
+        without configured candidates, makes this False.
+        """
+
+        if not self._candidate_models:
+            return False
+        return all(
+            "image" in self._input_modalities(candidate)
+            for candidate in self._candidate_models
+        )
+
+    @property
     def uses_sequential_failover(self) -> bool:
         return self._mode == "sequential_failover"
 

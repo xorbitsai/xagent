@@ -15,6 +15,7 @@ import {
   type ConnectionPhaseFacts,
   type WebSocketConnection,
   deriveConnectionPhase,
+  resolveReportedTimezone,
   useWebSocket,
 } from "./use-websocket"
 import { refreshStoredAccessToken } from "@/lib/api-wrapper"
@@ -3435,6 +3436,106 @@ describe("useWebSocket normalized connections", () => {
       expect(secondFrame.file_ids).toEqual([FILE_A, FILE_B])
       act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-8" }))
       await second
+    })
+  })
+
+  describe("chat frames with a conversation source", () => {
+    const SOURCE_REFUSALS = {
+      connection: "A conversation source is not supported for this connection.",
+      request: "A conversation source cannot accompany an answer to a request.",
+      value: "Message not sent: the conversation source is not valid.",
+    } as const
+    const SOURCES = [undefined, 1, 2147483647, 0, -1, 2147483648, 1.5, Number.NaN] as const
+    const CONNECTIONS = ["omit", "required"] as const
+    const REQUEST_IDS = [undefined, "request-1"] as const
+    const CASES = SOURCES.flatMap((source) => CONNECTIONS.flatMap((mode) => (
+      REQUEST_IDS.map((requestId) => [source, mode, requestId] as const)
+    )))
+
+    const openSocket = async (mode: "omit" | "required") => {
+      const hook = mode === "omit"
+        ? renderHook(() => useWebSocket({ connection: sessionConnection() }))
+        : renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 7 }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      if (mode === "omit") socket.protocol = "xagent-session-v1"
+      act(() => socket.open())
+      return { ...hook, socket }
+    }
+
+    // The refusal a frame shape meets first, in the order the checks run.
+    const expectedRefusal = (
+      source: number | undefined,
+      mode: "omit" | "required",
+      requestId: string | undefined,
+    ): string | null => {
+      if (source === undefined) return null
+      if (mode !== "omit") return SOURCE_REFUSALS.connection
+      if (requestId) return SOURCE_REFUSALS.request
+      if (!Number.isInteger(source) || source < 1 || source > 2147483647) return SOURCE_REFUSALS.value
+      return null
+    }
+
+    it.each(CASES)(
+      "handles source %s on a %s connection with request id %s",
+      async (source, mode, requestId) => {
+        const { result, socket } = await openSocket(mode)
+        const clientMessageId = "msg-source"
+        const refusal = expectedRefusal(source, mode, requestId)
+
+        const delivery = source === undefined
+          ? result.current.sendChatMessage("continue", undefined, false, clientMessageId, requestId)
+          : result.current.sendChatMessage(
+            "continue", undefined, false, clientMessageId, requestId, undefined, source,
+          )
+
+        if (refusal) {
+          const outcome = delivery.then(() => "delivered", (error: unknown) => error)
+          // Checked before awaiting: a frame that went out would wait for an ack.
+          await act(async () => {})
+          expect(socket.send).not.toHaveBeenCalled()
+          expect(await outcome).toMatchObject({ message: refusal, disposition: "not_sent" })
+          return
+        }
+
+        expect(socket.send).toHaveBeenCalledTimes(1)
+        const raw = socket.send.mock.calls[0][0] as string
+        const timezone = resolveReportedTimezone()
+        // The frame a send without a source has always produced, key order included.
+        const unchanged: Record<string, unknown> = {
+          type: "chat",
+          message: "continue",
+          client_message_id: clientMessageId,
+          ...(requestId ? { request_id: requestId } : {}),
+          ...(timezone ? { context: { timezone } } : {}),
+          ...(mode === "required" ? { task_id: 7 } : {}),
+        }
+        if (source === undefined) {
+          expect(raw).toBe(JSON.stringify(unchanged))
+        } else {
+          const frame = JSON.parse(raw) as Record<string, unknown>
+          expect(frame.source_task_id).toBe(source)
+          const rest = { ...frame }
+          delete rest.source_task_id
+          expect(rest).toStrictEqual(unchanged)
+        }
+        act(() => socket.receive({ type: "message_accepted", client_message_id: clientMessageId }))
+        await delivery
+      },
+    )
+
+    it("sends file ids and a conversation source in the same frame", async () => {
+      const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
+      const { result, socket } = await openSocket("omit")
+
+      const delivery = result.current.sendChatMessage(
+        "with both", undefined, false, "msg-both", undefined, { fileIds: [fileId], maxFileIds: 5 }, 101,
+      )
+
+      const frame = JSON.parse(socket.send.mock.calls[0][0] as string) as Record<string, unknown>
+      expect(frame).toMatchObject({ file_ids: [fileId], source_task_id: 101 })
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-both" }))
+      await delivery
     })
   })
 

@@ -47,7 +47,25 @@ def event_loop():
 
 @pytest.fixture(scope="module")
 def docker_service():
-    return DockerSandboxService(MemDockerStore(), namespace="test")
+    client = docker_sandbox_module._create_docker_client()
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+        options={"com.docker.network.bridge.enable_icc": "false"},
+    )
+    try:
+        yield DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            network=network_name,
+            client=client,
+        )
+    finally:
+        network.remove()
 
 
 def _unique_name(prefix: str) -> str:

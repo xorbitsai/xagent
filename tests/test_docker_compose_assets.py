@@ -31,6 +31,15 @@ def test_overlay_requires_a_resolved_compose_project_name():
         assert _service_environment(service)["XAGENT_SANDBOX_NAMESPACE"] == expected
 
 
+def test_overlay_requires_one_dedicated_sandbox_network():
+    expected = (
+        "${XAGENT_SANDBOX_NETWORK:?set XAGENT_SANDBOX_NETWORK to the dedicated "
+        "sandbox bridge}"
+    )
+    for service in ("backend", "worker", "scheduler"):
+        assert _service_environment(service)["XAGENT_SANDBOX_NETWORK"] == expected
+
+
 MILVUS_ADDON = REPO_ROOT / "docker" / "docker-compose.milvus.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 

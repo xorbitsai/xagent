@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
@@ -22,6 +23,7 @@ from ...core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.structured_output import StructuredOutputFormat
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
@@ -98,6 +100,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyMismatchError,
     MCPBuiltinOAuthActorPolicyRequiredError,
+    team_member_mcp_grants_allowed_for_task,
 )
 from .memory_availability import (
     GENERIC_MEMORY_AVAILABILITY_REASON as GENERIC_MEMORY_AVAILABILITY_REASON,
@@ -115,7 +118,16 @@ from .memory_availability import (
 from .memory_availability import (
     public_memory_availability_reason,
 )
+from .memory_binding import (
+    MemoryBindingResolutionError,
+    MemoryStoreBinding,
+    MemoryTaskBindingRequest,
+    MemoryToolAssemblyRequest,
+    MemoryToolFactory,
+    resolve_trusted_memory_binding,
+)
 from .memory_policy import (
+    MEMORY_BINDING_RESOLUTION_FAILURE_REASON,
     MEMORY_POLICY_BINDING_FAILURE_REASON,
     MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON,
     MEMORY_POLICY_TASK_MISSING_REASON,
@@ -164,6 +176,7 @@ from .task_workspace_cleanup import (
     capture_workspace_cleanup_target,
     remove_task_workspace,
 )
+from .turn_settlement import TurnUsage
 from .workforce_runtime import (
     WorkforceTaskRuntime,
     release_task_lease_with_workforce_sync,
@@ -248,6 +261,9 @@ class AgentServiceMemoryPolicy:
     memory_available: bool = True
     memory_availability_reason: str | None = None
     memory_access_scope: MemoryAccessScope | None = None
+    backend_identity: str | None = None
+    route_generation: str | None = None
+    memory_tools_factory: Callable[..., list[Any]] | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
@@ -287,6 +303,8 @@ class AgentServiceMemoryPolicy:
                         ExecutionScope | None,
                         ambient_execution_scope,
                     ),
+                    backend_identity=self.backend_identity,
+                    route_generation=self.route_generation,
                 )
             )
         if not self.memory_available:
@@ -304,6 +322,93 @@ class AgentServiceMemoryPolicy:
 def _optional_task_int(task: Any, field: str) -> int | None:
     value = getattr(task, field, None)
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _adapt_memory_tools_factory(
+    factory: MemoryToolFactory | None,
+) -> Callable[..., list[Any]] | None:
+    """Adapt the public frozen request contract to the core runtime callback."""
+
+    if factory is None:
+        return None
+
+    def build_tools(
+        *,
+        memory_store: MemoryStore,
+        task: str,
+        runtime: Any | None,
+        context: Any | None,
+    ) -> list[Any]:
+        tools = factory(
+            MemoryToolAssemblyRequest(
+                memory_store=memory_store,
+                task=task,
+                runtime=runtime,
+                context=context,
+            )
+        )
+        if isinstance(tools, (str, bytes)) or not isinstance(tools, Sequence):
+            raise TypeError("memory tools factory must return a sequence")
+        return list(tools)
+
+    return build_tools
+
+
+def _inert_memory_policy(reason: str) -> AgentServiceMemoryPolicy:
+    return AgentServiceMemoryPolicy(
+        memory=InMemoryMemoryStore(),
+        memory_enabled=False,
+        memory_available=False,
+        memory_availability_reason=reason,
+    )
+
+
+def _compose_memory_binding(
+    *,
+    binding: MemoryStoreBinding,
+    policy_scope: MemoryAccessScope | None,
+    enabled: bool,
+    availability_reason: str | None,
+) -> AgentServiceMemoryPolicy:
+    """Combine backend selection with the legacy eligibility authority.
+
+    A host may keep its existing policy resolver as the scope authority while
+    the new binding resolver selects only a backend. If both resolvers provide
+    scopes they must agree exactly; two different identity authorities are
+    rejected instead of being nested or silently preferred.
+    """
+
+    binding_scope = binding.access_scope
+    if (
+        binding_scope is not None
+        and policy_scope is not None
+        and binding_scope != policy_scope
+    ):
+        return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+    if binding_scope is not None:
+        selected_scope = binding_scope
+        memory = binding.store
+    elif policy_scope is not None:
+        selected_scope = policy_scope
+        try:
+            memory = bind_memory_access_scope(binding.store, policy_scope)
+        except Exception:
+            logger.warning("Trusted memory access-scope binding failed")
+            return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+    else:
+        selected_scope = None
+        memory = binding.store
+
+    return AgentServiceMemoryPolicy(
+        memory=memory,
+        memory_enabled=enabled,
+        memory_available=True,
+        memory_availability_reason=availability_reason,
+        memory_access_scope=selected_scope,
+        backend_identity=binding.backend_identity,
+        route_generation=binding.route_generation,
+        memory_tools_factory=_adapt_memory_tools_factory(binding.memory_tools_factory),
+    )
 
 
 def resolve_agent_service_memory_policy(
@@ -348,6 +453,27 @@ def resolve_agent_service_memory_policy(
             memory_availability_reason=None if override is None else override.reason,
         )
 
+    binding_request = MemoryTaskBindingRequest(
+        task_id=_optional_task_int(task, "id"),
+        user_id=_optional_task_int(task, "user_id"),
+        agent_id=_optional_task_int(task, "agent_id"),
+        source=source if isinstance(source, str) else None,
+        is_preview=is_preview,
+    )
+    try:
+        binding = resolve_trusted_memory_binding(binding_request)
+    except MemoryBindingResolutionError:
+        return _inert_memory_policy(MEMORY_BINDING_RESOLUTION_FAILURE_REASON)
+
+    policy_scope = override.memory_access_scope if override is not None else None
+    if binding is not None:
+        return _compose_memory_binding(
+            binding=binding,
+            policy_scope=policy_scope,
+            enabled=enabled,
+            availability_reason=None if override is None else override.reason,
+        )
+
     try:
         memory: MemoryStore = get_memory_store()
     except MemoryUnavailableError as error:
@@ -366,7 +492,7 @@ def resolve_agent_service_memory_policy(
             memory_availability_reason=error.status.state.value,
         )
 
-    access_scope = override.memory_access_scope if override is not None else None
+    access_scope = policy_scope
     if access_scope is not None:
         try:
             memory = bind_memory_access_scope(memory, access_scope)
@@ -526,6 +652,37 @@ def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
     return should_load_mcp_server_configs(tool_selection_spec)
 
 
+def _task_model_override_excluded_categories(
+    snapshot: Optional[TaskSetupSnapshot],
+) -> frozenset[str]:
+    """Tool categories this run's task model override explicitly excluded.
+
+    The one reader of the requested exclusion set, shared by both tool-build
+    readers. It comes from the snapshot's ``model_override`` because
+    ``tool_categories`` alone cannot tell "an agent created before it had an
+    ``mcp`` category" (an actor-marked task re-adds it) from "this run
+    explicitly excluded ``mcp``" (it must not). A snapshot without an
+    override means "nothing excluded", so the legacy behaviour is unchanged.
+
+    An exclusion only ever *removes* tools: it turns off the actor-marked
+    plain-``mcp`` add-back and the forced MCP config load. It is not a scoped
+    selection -- an explicit ``mcp:<server>`` entry is left alone and still
+    loads that server (see ``TaskModelOverride.excluded_tool_categories``).
+    """
+    if snapshot is None or snapshot.model_override is None:
+        return frozenset()
+    return snapshot.model_override.excluded_tool_categories
+
+
+def _task_model_override_excluded_model_ids(
+    snapshot: Optional[TaskSetupSnapshot],
+) -> frozenset[str]:
+    """Media model ids this run's task model override excludes; empty without one."""
+    if snapshot is None or snapshot.model_override is None:
+        return frozenset()
+    return snapshot.model_override.excluded_model_ids
+
+
 def _build_tool_selection_spec_for_task(
     agent_config: Optional[dict],
     workforce_runtime: Optional[WorkforceTaskRuntime],
@@ -533,6 +690,7 @@ def _build_tool_selection_spec_for_task(
     task_id: int,
     omit_published_agent_tools: bool = False,
     include_mcp_tools: bool = False,
+    excluded_tool_categories: frozenset[str] = frozenset(),
 ) -> Any:
     """Single SSOT normalizer for chat reconstruct + snapshot paths.
 
@@ -542,6 +700,10 @@ def _build_tool_selection_spec_for_task(
     tool names) into a :class:`ToolSelectionSpec`. Centralising the
     call here keeps the two paths in lockstep and avoids the 30-line
     copy / paste that used to live in each.
+
+    ``excluded_tool_categories`` is the task model override's requested
+    exclusion set (see ``_task_model_override_excluded_categories``); a plain
+    ``mcp`` entry in it suppresses the actor-marked MCP add-back below.
     """
     from ...core.tools.adapters.vibe.selection_spec import (
         ToolSelectionSpec,
@@ -565,7 +727,10 @@ def _build_tool_selection_spec_for_task(
         ),
         extras_only_when_unconfigured=workforce_runtime is not None,
     )
-    if include_mcp_tools:
+    if include_mcp_tools and "mcp" not in excluded_tool_categories:
+        # An explicit "mcp" exclusion from the task model override wins over
+        # the actor-marked add-back (see
+        # ``_task_model_override_excluded_categories``).
         spec = with_mcp_tools(spec)
     if omit_published_agent_tools:
         spec = without_published_agent_tools(spec)
@@ -688,6 +853,8 @@ async def create_default_tools(
     file_operation_access_version: Any = None,
     agent_creator_user_id: Optional[int] = None,
     declared_knowledge_bases: Optional[List[str]] = None,
+    excluded_model_ids: frozenset[str] = frozenset(),
+    mcp_team_member_grants_allowed: bool = False,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -700,7 +867,11 @@ async def create_default_tools(
     ``connector_team_id`` is the *governing agent's* owning team, never the
     calling user's own team membership. It threads into ``WebToolConfig`` so
     the connector-visibility team-scope hook (when installed) resolves that
-    team's connectors instead of the run owner's personal set only.
+    team's connectors instead of the run owner's personal set only. On this
+    path the same team also governs knowledge-base resolution, so it is
+    forwarded as ``WebToolConfig``'s separate ``knowledge_base_team_id`` as
+    well; delegated sub-agents build their own config and set the two
+    independently.
 
     ``db_task_id`` and ``file_operation_access_version`` are appended to the
     historical positional signature. Runtime callers pass them by keyword so
@@ -709,7 +880,7 @@ async def create_default_tools(
 
     ``agent_creator_user_id`` and ``declared_knowledge_bases`` thread the same
     governing agent's creator and its *stored* ``knowledge_bases`` list
-    alongside ``connector_team_id`` into ``WebToolConfig``, so the
+    alongside that team into ``WebToolConfig``, so the
     knowledge-base search path can resolve a declared name against the
     governing team, fall back to the creator's own collection, and report a
     name the team never received rather than reaching for the runner's own
@@ -717,6 +888,10 @@ async def create_default_tools(
     place ``allowed_collections`` already is (the agent's own configuration)
     and is never the model-supplied value on a search request -- the two stay
     distinct all the way to the resolution point.
+
+    ``mcp_team_member_grants_allowed`` is the task-source gate's verdict (see
+    :func:`team_member_mcp_grants_allowed_for_task`). It defaults to ``False``;
+    only the two task builders pass it, so every other caller is closed.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -796,8 +971,11 @@ async def create_default_tools(
         mcp_load_summary_tracer=mcp_load_summary_tracer,
         mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
         connector_team_id=connector_team_id,
+        knowledge_base_team_id=connector_team_id,
         agent_creator_user_id=agent_creator_user_id,
         declared_knowledge_bases=declared_knowledge_bases,
+        excluded_model_ids=excluded_model_ids,
+        mcp_team_member_grants_allowed=mcp_team_member_grants_allowed,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -2044,6 +2222,12 @@ class AgentServiceManager:
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
+        excluded_tool_categories = _task_model_override_excluded_categories(
+            task_setup_snapshot
+        )
+        excluded_model_ids = _task_model_override_excluded_model_ids(
+            task_setup_snapshot
+        )
         if task_setup_snapshot is not None:
             workforce_runtime = task_setup_snapshot.workforce_runtime
             excluded_agent_id = task_setup_snapshot.excluded_agent_id
@@ -2117,6 +2301,7 @@ class AgentServiceManager:
             task_id=task_id,
             omit_published_agent_tools=actor_execution,
             include_mcp_tools=actor_execution,
+            excluded_tool_categories=excluded_tool_categories,
         )
         workspace_owner_id = int(task.user_id)
         # Actor-logical access policy + CA mount intent, built by
@@ -2182,7 +2367,10 @@ class AgentServiceManager:
             connector_runtime_turn_id=connector_runtime_turn_id,
             mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
             mcp_actor_execution_identity=mcp_actor_execution_identity,
-            force_mcp_tools=actor_execution,
+            # Same override exclusion as the selection-spec add-back above;
+            # only removes tools (see
+            # ``_task_model_override_excluded_categories``).
+            force_mcp_tools=actor_execution and "mcp" not in excluded_tool_categories,
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
@@ -2191,6 +2379,10 @@ class AgentServiceManager:
             declared_knowledge_bases=agent_config["knowledge_bases"]
             if agent_config
             else None,
+            excluded_model_ids=excluded_model_ids,
+            mcp_team_member_grants_allowed=team_member_mcp_grants_allowed_for_task(
+                task
+            ),
         )
 
     @agent_setup.measure()
@@ -2946,12 +3138,17 @@ class AgentServiceManager:
                     prepare_root=workspace_binding.prepare_root,
                 )
 
+                excluded_tool_categories = _task_model_override_excluded_categories(
+                    snapshot
+                )
+                excluded_model_ids = _task_model_override_excluded_model_ids(snapshot)
                 tool_selection_spec = _build_tool_selection_spec_for_task(
                     agent_config,
                     workforce_runtime,
                     task_id=task_id,
                     omit_published_agent_tools=actor_marked,
                     include_mcp_tools=actor_marked,
+                    excluded_tool_categories=excluded_tool_categories,
                 )
 
                 tools = await create_default_tools(
@@ -3011,7 +3208,11 @@ class AgentServiceManager:
                     connector_runtime_turn_id=connector_runtime_turn_id,
                     mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                     mcp_actor_execution_identity=mcp_actor_execution_identity,
-                    force_mcp_tools=actor_marked,
+                    # Same override exclusion as the selection-spec add-back
+                    # above; only removes tools (see
+                    # ``_task_model_override_excluded_categories``).
+                    force_mcp_tools=actor_marked
+                    and "mcp" not in excluded_tool_categories,
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(
                         task.source if task is not None else None
                     ),
@@ -3037,6 +3238,10 @@ class AgentServiceManager:
                     declared_knowledge_bases=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
+                    excluded_model_ids=excluded_model_ids,
+                    mcp_team_member_grants_allowed=(
+                        team_member_mcp_grants_allowed_for_task(task)
+                    ),
                 )
 
                 with UserContext(runtime_user_id):
@@ -3116,6 +3321,7 @@ class AgentServiceManager:
                         memory_enabled=memory_policy.memory_enabled,
                         memory_available=memory_policy.memory_available,
                         memory_availability_reason=memory_policy.public_availability_reason,
+                        memory_tools_factory=memory_policy.memory_tools_factory,
                         execution_metadata=memory_policy.execution_metadata(
                             ambient_owner_user_id=runtime_user_id,
                             ambient_execution_scope=scope,
@@ -3348,6 +3554,7 @@ class AgentServiceManager:
                 enabled=policy.memory_enabled,
                 available=True,
                 availability_reason=policy.public_availability_reason,
+                memory_tools_factory=policy.memory_tools_factory,
                 execution_metadata=execution_metadata,
             )
         if not policy.memory_available:
@@ -3879,6 +4086,8 @@ class AgentServiceManager:
         task_lease_heartbeat_task: (
             asyncio.Task[TaskLeaseHeartbeatOutcome] | None
         ) = None,
+        turn_usage_sink: Callable[[TurnUsage], None] | None = None,
+        structured_output_format: StructuredOutputFormat | None = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
@@ -3911,6 +4120,16 @@ class AgentServiceManager:
             task_lease_heartbeat_task: Heartbeat owned by an inline transport
                 for ``task_lease``. When provided, definitive ownership loss
                 cancels and drains agent execution before this method returns.
+            turn_usage_sink: Handed to the run's tracker, which passes it this
+                run's usage whenever tracking completion returns, including
+                when the final write was not persisted because the database
+                ownership check failed. Not called when tracking is off, when
+                completion raises (a pool timeout), or when this method has
+                already seen lease ownership lost and only stops the tracker.
+                Its own failure is logged and never changes the run's result.
+            structured_output_format: The result shape to extract from the
+                final answer. It is handed to ``agent_service.execute_task``
+                only when it is not None.
 
         Returns:
             Execution result dictionary
@@ -4152,6 +4371,9 @@ class AgentServiceManager:
                             else None
                         ),
                     )
+                    # The tracker hands this run's usage to the sink each
+                    # time its completion returns.
+                    tracker.turn_usage_sink = turn_usage_sink
                     await tracker.start_tracking()
                     # Enforce quota mid-run: the pattern loop polls this every step
                     # (each LLM reply / tool call) and stops the run once its live
@@ -4196,18 +4418,26 @@ class AgentServiceManager:
             # reused service observes the exact current run.
             execution_lease = lease or task_lease
 
+            format_kwargs: Dict[str, Any] = (
+                {}
+                if structured_output_format is None
+                else {"structured_output_format": structured_output_format}
+            )
+
             async def execute_agent_task() -> Dict[str, Any]:
                 if execution_lease is None:
                     return await agent_service.execute_task(
                         task=task,
                         context=context,
                         task_id=task_id,
+                        **format_kwargs,
                     )
                 with bind_task_lease_context(execution_lease):
                     return await agent_service.execute_task(
                         task=task,
                         context=context,
                         task_id=task_id,
+                        **format_kwargs,
                     )
 
             async def execute_owned_turn() -> Dict[str, Any]:
@@ -4565,6 +4795,7 @@ class AgentServiceManager:
                     memory_enabled=memory_policy.memory_enabled,
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
+                    memory_tools_factory=memory_policy.memory_tools_factory,
                     execution_metadata=memory_policy.execution_metadata(
                         ambient_owner_user_id=user_id,
                         ambient_execution_scope=scope,

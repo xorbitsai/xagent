@@ -4,12 +4,13 @@ services:
       - SANDBOX_ENABLED=true
       - SANDBOX_IMPLEMENTATION=docker
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.8.5
+      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.8.6
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - XAGENT_SANDBOX_HOST_PROJECT_ROOT=${XAGENT_SANDBOX_HOST_PROJECT_ROOT:-${PWD}}
       - XAGENT_SANDBOX_HOST_STORAGE_ROOT=${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
       - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
+      - XAGENT_SANDBOX_NETWORK=${XAGENT_SANDBOX_NETWORK:?set XAGENT_SANDBOX_NETWORK to the dedicated sandbox bridge}
       - XAGENT_SANDBOX_WORKER_ID=backend
     volumes:
       - type: bind
@@ -70,6 +71,7 @@ services:
   worker:
     environment:
       - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
+      - XAGENT_SANDBOX_NETWORK=${XAGENT_SANDBOX_NETWORK:?set XAGENT_SANDBOX_NETWORK to the dedicated sandbox bridge}
       - XAGENT_SANDBOX_WORKER_ID=celery-worker
     volumes:
       - type: bind
@@ -79,6 +81,7 @@ services:
   scheduler:
     environment:
       - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
+      - XAGENT_SANDBOX_NETWORK=${XAGENT_SANDBOX_NETWORK:?set XAGENT_SANDBOX_NETWORK to the dedicated sandbox bridge}
       - XAGENT_SANDBOX_WORKER_ID=scheduler
     volumes:
       - type: bind

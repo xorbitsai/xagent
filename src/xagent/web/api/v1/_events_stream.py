@@ -118,16 +118,18 @@ values it deliberately leaves unbounded, in one place:
     ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
     attach, before any sink exists.
   - Deliberately uncapped: ``task.completed``'s ``output`` and
-    ``task.input_required``'s ``prompt`` (full argument in the comment
-    above ``completed_frame``). Both are the payload of a conclusion
-    frame, both are sent once per stream as that frame, and neither has
-    an equivalent on ``GET .../steps`` -- their recovery channel is
-    ``GET /v1/chat/tasks/{task_id}``. Neither ever meets the queue's
-    byte budget: on the live path (the watchdog closing an already-open
-    stream) they reach the client only as a budget-exempt close frame
-    via ``enqueue_close``; on the two attach-time fast paths (terminal,
-    waiting-for-user) they are ``yield``ed straight from the generator
-    before any sink or queue exists for this connection at all.
+    ``structured_output`` and ``task.input_required``'s ``prompt`` (full
+    argument in the comment above ``completed_frame``). Each is the
+    payload of a conclusion frame, each is sent once per stream as that
+    frame, and none has an equivalent on ``GET .../steps`` -- their
+    recovery channel is ``GET /v1/chat/tasks/{task_id}``. Bounding the
+    size of ``structured_output`` is the job of the step that produces it,
+    not of this module. None ever meets the queue's byte budget: on the
+    live path (the watchdog closing an already-open stream) they reach
+    the client only as a budget-exempt close frame via ``enqueue_close``;
+    on the two attach-time fast paths (terminal, waiting-for-user) they
+    are ``yield``ed straight from the generator before any sink or queue
+    exists for this connection at all.
   - Uncapped and bounded only by the frame they arrive in: a step's
     ``id`` and a ``message.*`` frame's ``message_id``. Neither has a
     cap of its own -- ``PublicStep.id`` is a plain ``str`` -- and an id
@@ -150,6 +152,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from datetime import datetime, timezone
 from time import monotonic
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
 
@@ -159,6 +162,8 @@ from fastapi.responses import StreamingResponse
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_session_local
 from ...models.task import TaskStatus
+from ...models.user import User
+from ...models.user_api_key import UserApiKey
 from ...schemas.v1 import PublicStep
 from ...services.db_runtime import run_db_io_cancellation_safe
 from ...services.public_trace_events import (
@@ -166,11 +171,17 @@ from ...services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
 )
+from ...services.structured_output_projection import project_structured_output
 from ...services.task_event_trace_handler import serialize_trace_data
 from ...services.task_execution_controller import TaskControlState
 from ..websocket import _is_versioned_task_event, manager
 from ._step_mapping import PublicStepProjector
-from .deps import ApiKeyPrincipal, active_runtime_key_filters
+from .deps import (
+    ApiKeyPrincipal,
+    PersonalApiKeySnapshot,
+    active_runtime_key_filters,
+    personal_key_usable,
+)
 from .errors import V1ApiError, V1ErrorCode
 
 if TYPE_CHECKING:
@@ -365,18 +376,24 @@ def status_frame(status: str) -> str:
     return _sse_frame("task.status", {"status": status})
 
 
-# ``completed_frame``'s ``output`` and ``input_required_frame``'s
-# ``prompt`` are the two content-bearing fields on this stream with no
-# size cap. Both are the payload of a conclusion frame, taken from the
-# caller's own authoritative task-row read, and neither has an
-# equivalent on ``GET .../steps``: that endpoint returns projected
-# steps, not the task row's ``output`` column and not its pending
-# question. Truncating either one would leave a client with no way to
-# recover the full value from this stream or from ``steps()``.
+# ``completed_frame``'s ``output`` and ``structured_output`` and
+# ``input_required_frame``'s ``prompt`` are the content-bearing fields on
+# this stream with no size cap. Each is the payload of a conclusion
+# frame, taken from the caller's own authoritative task-row read, and
+# none has an equivalent on ``GET .../steps``: that endpoint returns
+# projected steps, not the task row's ``output`` column, not its
+# structured result and not its pending question. Truncating any of them
+# would leave a client with no way to recover the full value from this
+# stream or from ``steps()``. ``structured_output`` is not capped here:
+# bounding a structured result is the job of the step that produces it.
+# The frame writes it with ``ensure_ascii``, so a non-ASCII character
+# takes six bytes on the wire, or twelve when it lies outside the Basic
+# Multilingual Plane.
 # ``step.*``/``message.*`` content is capped precisely because it does
 # have that channel -- ``steps()`` always returns a step's full,
-# untruncated ``data``. The recovery channel for these two is
-# ``GET /v1/chat/tasks/{task_id}``: ``TaskInfoResponse.output`` and
+# untruncated ``data``. The recovery channel for these fields is
+# ``GET /v1/chat/tasks/{task_id}``: ``TaskInfoResponse.output``,
+# ``TaskInfoResponse.structured_output`` and
 # ``TaskInfoResponse.pending_interaction.question``. Cost of the
 # exemption is bounded by construction: each is sent exactly once per
 # stream, as that stream's conclusion frame -- ``enqueue_close`` on the
@@ -396,6 +413,9 @@ def completed_frame(
     status: str,
     output: str | None,
     error: str | None,
+    structured_output: dict[str, Any] | None = None,
+    structured_output_status: str | None = None,
+    structured_output_reason: dict[str, Any] | None = None,
     snapshot_total_steps: int | None = None,
 ) -> str:
     return _sse_frame(
@@ -404,16 +424,31 @@ def completed_frame(
             "status": status,
             "output": output,
             "error": error,
+            "structured_output": structured_output,
+            "structured_output_status": structured_output_status,
+            "structured_output_reason": structured_output_reason,
             **_snapshot_marker_fields(snapshot_total_steps),
         },
     )
+
+
+def _structured_output_fields(snapshot: "_TaskInfoSnapshot") -> dict[str, Any]:
+    """The structured output fields of a conclusion frame, from the same
+    effective snapshot that supplies its status, and by the same projection
+    as ``GET /v1/chat/tasks/{task_id}``."""
+    return project_structured_output(
+        status=snapshot.status,
+        run_id=snapshot.run_id,
+        record=snapshot.structured_output_record,
+        format_configured=snapshot.format_configured,
+    ).as_dict()
 
 
 def input_required_frame(
     task_id: int, prompt: str | None, *, snapshot_total_steps: int | None = None
 ) -> str:
     # ``prompt`` is uncapped for the reason stated above
-    # ``completed_frame``, which covers both conclusion-frame fields.
+    # ``completed_frame``, which covers the uncapped conclusion-frame fields.
     # ``prompt`` comes straight from ``_TaskInfoSnapshot.pending_question``
     # (``tasks.py``'s ``_load_task_info_snapshot``, itself backed by
     # ``task_interaction_read.get_pending_interaction_question`` -- see the
@@ -816,13 +851,8 @@ def _feed_trace_event(
          otherwise fall through to the catch-all "not a known step
          family" drop below.
       3. ``is_audit_only_trace_data``: server-only RCA payloads that must
-         never reach a client.
-         ``steps()`` applies no equivalent filter on its own read. No
-         audit-only row reaches a public step there today because the
-         event types that carry audit-only data are not in the
-         projector's exposed set, but that equivalence is a coincidence
-         of the current producer rather than something either surface
-         enforces (#1405).
+         never reach a client. The shared projector also applies this
+         filter when replaying persisted events for ``steps()``.
 
     An ``ai_message`` event carrying ``data["stream_message_id"]`` --
     the trace-event mirror of a final answer already delivered
@@ -988,11 +1018,13 @@ class V1EventStreamSink:
     """One SSE consumer's broadcast-frame filter and outbound queue.
 
     Bound to exactly one ``task_id`` and one ``principal`` for the life
-    of the connection. The principal is used only for quota accounting
-    and the watchdog's key-validity check -- it is **not** an
-    authorization gate for who may act on the task; that check already
-    happened once, at attach time, via ``get_principal_from_api_key`` +
-    ``_resolve_task_or_404``.
+    of the connection. ``principal_key_prefix`` is the principal's
+    ``stream_principal_id`` -- the bare prefix for a runtime key,
+    ``personal:<prefix>`` for a personal key -- and is used only for slot
+    accounting; the watchdog checks the key through the principal itself.
+    Neither is an authorization gate for who may act on the task; that
+    check already happened once, at attach time, via
+    ``get_principal_from_api_key`` + ``_resolve_task_or_404``.
     """
 
     # This sink only consumes the broadcast fan-out; it must never be
@@ -1109,8 +1141,9 @@ class V1EventStreamSink:
         self._queued_bytes = 0
         # Deliberately not routed through the byte budget: this is the one
         # frame that must always fit. ``task.completed``'s ``output`` and
-        # ``task.input_required``'s ``prompt`` are uncapped by design (see
-        # the comment above ``completed_frame``); on the live path they
+        # ``structured_output`` and ``task.input_required``'s ``prompt`` are
+        # uncapped by design (see the comment above ``completed_frame``); on
+        # the live path they
         # only ever reach the client as a budget-exempt close frame via
         # this method, and on the attach-time fast paths there is no sink
         # and no queue at all -- refusing one here on a budget while the
@@ -1335,6 +1368,9 @@ class V1EventStreamSink:
 
 
 # -- Per-principal concurrency accounting --------------------------------
+# Counted per ``ApiKeyPrincipal.stream_principal_id``: a runtime key under its
+# bare prefix, a personal key under ``personal:<prefix>``, so the two kinds
+# never share slots even when their prefixes are equal.
 
 _principal_stream_counts: dict[str, int] = {}
 
@@ -1384,10 +1420,11 @@ def count_task_sinks(task_id: int) -> int:
 
 
 def _is_runtime_key_active(key_prefix: str) -> bool:
-    """One indexed lookup without secret verification.
+    """One indexed lookup without secret verification, for a runtime key.
 
     The handshake already verified the secret; this only re-checks
-    revoked/paused state.
+    revoked/paused state. A personal key is checked by
+    :func:`_is_personal_key_active` instead.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -1397,6 +1434,33 @@ def _is_runtime_key_active(key_prefix: str) -> bool:
             .first()
             is not None
         )
+
+
+def _is_personal_key_active(key_prefix: str) -> bool:
+    """One indexed lookup without secret verification, for a personal key.
+
+    Usable means the key row and its holder's user row still exist and
+    ``personal_key_usable`` holds (not revoked, not expired). The
+    application principal policy is not re-run: an open stream only
+    carries the holder's own task, and the next request re-authenticates.
+    """
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        row = (
+            db.query(UserApiKey.revoked_at, UserApiKey.expires_at)
+            .join(User, User.id == UserApiKey.user_id)
+            .filter(UserApiKey.key_prefix == key_prefix)
+            .first()
+        )
+    return row is not None and personal_key_usable(
+        row.revoked_at, row.expires_at, datetime.now(timezone.utc)
+    )
+
+
+def _is_principal_key_active(principal: ApiKeyPrincipal) -> bool:
+    if isinstance(principal.key, PersonalApiKeySnapshot):
+        return _is_personal_key_active(principal.key.key_prefix)
+    return _is_runtime_key_active(principal.key.key_prefix)
 
 
 async def watchdog_check_once(
@@ -1415,7 +1479,7 @@ async def watchdog_check_once(
     database.
     """
     key_active = await run_db_io_cancellation_safe(
-        lambda: _is_runtime_key_active(sink.principal_key_prefix)
+        lambda: _is_principal_key_active(principal)
     )
     if not key_active:
         return sink.enqueue_close(error_frame("unauthorized"))
@@ -1438,6 +1502,7 @@ async def watchdog_check_once(
                 status=status.value,
                 output=snapshot.output,
                 error=snapshot.error,
+                **_structured_output_fields(snapshot),
             )
         )
     if close_reason == "input_required":
@@ -2079,6 +2144,7 @@ def _terminal_snapshot_stream(
             status=snapshot.status.value,
             output=snapshot.output,
             error=snapshot.error,
+            **_structured_output_fields(snapshot),
             snapshot_total_steps=snapshot_total_steps,
         )
 
@@ -2170,6 +2236,10 @@ async def _generate(
     ``build_event_stream_response`` (read-only, no mutation) -- so a
     rejected attach still fails before any stream bytes are sent; only
     the actual counter mutation and registration move here.
+
+    ``key_prefix`` is the principal's ``stream_principal_id``, the key the
+    per-principal slot is counted under: the bare prefix for a runtime
+    key, ``personal:<prefix>`` for a personal key.
     """
     deadline = monotonic() + stream_max_duration_seconds
     sink = V1EventStreamSink(
@@ -2349,7 +2419,7 @@ async def build_event_stream_response(
     if count_task_sinks(task_id) >= PER_TASK_STREAM_CAP:
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
 
-    key_prefix = principal.key.key_prefix
+    key_prefix = principal.stream_principal_id
     if not principal_slot_available(key_prefix):
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
 

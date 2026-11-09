@@ -615,8 +615,9 @@ async def _search_knowledge_base_impl(
             ``tool_args.allowed_collections`` and never
             ``tool_args.collections``, both of which are model-authored on
             every path (a declared schema field the model can overwrite).
-            Both chat call sites derive this and the tool's allowed
-            collections from that one stored field, so in production the
+            Every caller that supplies a declaration (the two chat call
+            sites and sub-agent delegation) derives this and the tool's allowed collections
+            from that one stored field, so in production the
             two are equal by construction; a test that pairs a declaration
             with different allowed collections is isolating forwarding, and
             this function's behaviour is defined for that pairing too.
@@ -661,8 +662,9 @@ async def _search_knowledge_base_impl(
         #   returns before any team resolution when the runner id is absent,
         #   so the visible set it produced is the plain listing. Running the
         #   rule on top of that would classify every declared name through a
-        #   creator probe made on nobody's behalf. Both chat call sites carry
-        #   a real runner id today; this conjunct keeps it that way;
+        #   creator probe made on nobody's behalf. Every caller (the two
+        #   chat call sites and sub-agent delegation) carries a real runner
+        #   id today; this conjunct keeps it that way;
         # - an empty declaration (the case where agent_config carried no
         #   agent at all) has nothing to authorise or verdict-derive against,
         #   so the declared-name rule does not apply and the search falls
@@ -676,13 +678,14 @@ async def _search_knowledge_base_impl(
         #   only which team the team layer resolves against changes. This
         #   conjunct is defensive rather than a live production case:
         #   knowledge_tools.py builds no knowledge tool at all when the
-        #   agent's allowed collections are an empty list, and the two chat
-        #   call sites derive that list and this declaration from the same
-        #   expression, so a declaring-nothing agent never reaches a search;
-        #   the remaining way in is an absent declaration, which on those
-        #   call sites also means an absent governing team. Kept so a future
-        #   caller that does supply a governing team without a declaration
-        #   inherits today's behaviour instead of an empty search set;
+        #   agent's allowed collections are an empty list, and every caller
+        #   that supplies a declaration (the two chat call sites and
+        #   sub-agent delegation) derives that list and this declaration
+        #   from the same expression, so a declaring-nothing agent never
+        #   reaches a search; the remaining way in is an absent declaration,
+        #   which on those callers also means an absent governing team. Kept
+        #   so a future caller that does supply a governing team without a
+        #   declaration inherits today's behaviour instead of an empty search set;
         # - a deployment that has not installed the team-keyed hook must
         #   stay on today's behaviour byte for byte, the same way the team
         #   layer itself falls back in ``_list_visible_collections``. An

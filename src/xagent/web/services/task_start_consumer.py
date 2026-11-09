@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session
 
+from ...config import get_shared_task_execution_enabled
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
@@ -47,7 +48,7 @@ from .task_coordinator_service import (
     lock_task_lease_no_commit,
 )
 from .task_execution_controller import task_control_snapshot
-from .task_lease_service import TaskLease
+from .task_lease_service import TaskLease, acquire_task_lease_no_commit, get_runner_id
 from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
@@ -245,12 +246,20 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
 
 
 def _commit_handoff(
-    command: ClaimedTaskCommand, owner_lease: TaskOwnerLease
+    command: ClaimedTaskCommand, owner_lease: TaskOwnerLease | None
 ) -> _StartHandoff | SettledTaskCommand:
+    """Fence, admit and complete one START in a single transaction.
+
+    Shared execution passes its coordinator's ``owner_lease`` and the run is
+    begun under it. Combined mode has no coordinator (``None``): the same fence
+    then opens the run by acquiring a fresh local lease for ``start.run_id``,
+    and only an ``existing`` START (``execute_task``) is consumed.
+    """
     db = get_session_local()()
-    runner = owner_lease.runner_id
+    local = owner_lease is None
+    runner = get_runner_id() if owner_lease is None else owner_lease.runner_id
     try:
-        if not lock_task_lease_no_commit(db, owner_lease):
+        if owner_lease is not None and not lock_task_lease_no_commit(db, owner_lease):
             raise TaskCommandRejected("Task owner changed", reason="stale_owner")
         # Same lock order as acceptance. On SQLite the CAS and subsequent
         # command completion are covered by the writer transaction instead.
@@ -280,6 +289,8 @@ def _commit_handoff(
             start = read_task_start_command(command)
         except (ValidationError, ValueError):
             return _reject_start(db, row, "invalid_start")
+        if local and start.kind != "existing":
+            return _reject_start(db, row, "unsupported_start")
         if not command_identity_matches_task(db, task, row):
             return _reject_start(db, row, "start_identity_changed")
         if row.target_state_version != start.state_version:
@@ -290,6 +301,10 @@ def _commit_handoff(
             or task.status == TaskStatus.RUNNING
             or (start.kind == "create" and task.status != TaskStatus.PENDING)
         ):
+            return _reject_start(db, row, "start_state_changed")
+        if local and _local_run_in_flight(int(task.id)):
+            # This process still registers a runner whose terminal status has
+            # already committed; starting beside it would race its cleanup.
             return _reject_start(db, row, "start_state_changed")
         if start.channel is not None:
             from .channel_runtime import (
@@ -330,26 +345,46 @@ def _commit_handoff(
             # Never expose decryption details or permit missing optional
             # secrets to silently change the accepted execution input.
             return _reject_start(db, row, "runtime_values_unavailable")
-        execution = begin_task_execution_no_commit(
-            db,
-            owner_lease,
-            expected=task_control_snapshot(task),
-            new_run=True,
-            run_id=start.run_id,
-        )
-        if execution is None:
-            return _reject_start(db, row, "start_state_changed")
+        if owner_lease is not None:
+            execution = begin_task_execution_no_commit(
+                db,
+                owner_lease,
+                expected=task_control_snapshot(task),
+                new_run=True,
+                run_id=start.run_id,
+            )
+            if execution is None:
+                return _reject_start(db, row, "start_state_changed")
+            lease = TaskLease(
+                task_id=owner_lease.task_id,
+                runner_id=owner_lease.runner_id,
+                attempt_id=owner_lease.attempt_id,
+                run_id=execution.run_id,
+            )
+        else:
+            snapshot = task_control_snapshot(task)
+            acquired = acquire_task_lease_no_commit(
+                db,
+                int(task.id),
+                runner_id=runner,
+                new_run=True,
+                new_run_id=start.run_id,
+                claim_predicates=(
+                    Task.run_id == snapshot.run_id
+                    if snapshot.run_id is not None
+                    else Task.run_id.is_(None),
+                    Task.state_version == snapshot.state_version,
+                    Task.control_state == snapshot.control_state.value,
+                ),
+            )
+            if acquired is None:
+                return _reject_start(db, row, "start_state_changed")
+            lease = acquired
         db.refresh(task)
         setattr(task, "input", start.message)
         from .workforce_runtime import sync_workforce_run_status
 
         sync_workforce_run_status(db, task, TaskStatus.RUNNING)
-        lease = TaskLease(
-            task_id=owner_lease.task_id,
-            runner_id=owner_lease.runner_id,
-            attempt_id=owner_lease.attempt_id,
-            run_id=execution.run_id,
-        )
         result = {"run_id": start.run_id, "lease_attempt_id": lease.attempt_id}
         if not finish_task_command_no_commit(
             db,
@@ -393,6 +428,13 @@ def _commit_handoff(
         _retire_turn_session_best_effort(db, task_id=command.task_id)
 
 
+def _local_run_in_flight(task_id: int) -> bool:
+    from .task_execution import background_task_manager
+
+    running = background_task_manager.running_tasks.get(task_id)
+    return running is not None and not running.done()
+
+
 def _handoff_was_committed(command_id: int, lease: TaskLease) -> bool:
     with get_session_local()() as db:
         row = db.get(TaskExecutionCommand, command_id)
@@ -423,11 +465,13 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
     # Command completion releases the durable queue before registration.
     # Keep the local handoff barrier until the exact execution is registered.
     async with task_execution_controller.command(command.task_id):
-        from .task_coordinator_runtime import current_task_coordinator
+        owner_lease: TaskOwnerLease | None = None
+        if get_shared_task_execution_enabled():
+            from .task_coordinator_runtime import current_task_coordinator
 
-        coordinator = current_task_coordinator(command.task_id)
-        assert coordinator is not None and coordinator.lease is not None
-        owner_lease = coordinator.lease
+            coordinator = current_task_coordinator(command.task_id)
+            assert coordinator is not None and coordinator.lease is not None
+            owner_lease = coordinator.lease
         handoff = await run_db_io_cancellation_safe(
             lambda: _commit_handoff(command, owner_lease)
         )

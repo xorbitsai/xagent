@@ -207,3 +207,35 @@ def list_accessible_published_agents(
             include_private_workforce_manager_agents=include_private_workforce_manager_agents,
         )
     ]
+
+
+def can_user_run_agent_now(db: Session, user_id: int, agent: Agent) -> bool:
+    """Whether ``user_id`` may run ``agent`` directly, checked against live state.
+
+    The same two branches the direct-run task path accepts an agent through:
+    the caller's own or team-visible agent (``owns_agent``, the in-memory
+    mirror of ``owned_agent_clause``), or a published agent the caller can
+    see through the canonical accessible-agent query. The workforce-manager
+    exemption that path also has is deliberately not included: callers use
+    this to re-check access that was granted earlier and not re-verified
+    since, which is exactly what that exemption skips.
+
+    Hook failures (team scope, visibility policy) propagate; they are never
+    read as access. Workforce-generated manager agents are not excluded here
+    (the direct-run loader rejects them outside their own workforce); the
+    caller's agent query is expected to have filtered them out already, as
+    the delegation query does.
+    """
+    if owns_agent(agent, int(user_id), get_agent_team_scope(db, int(user_id))):
+        return True
+    if not _is_published(agent):
+        return False
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if user is None:
+        return False
+    return (
+        query_accessible_agents(db, user, purpose="agent_list")
+        .filter(Agent.id == int(agent.id))
+        .first()
+        is not None
+    )

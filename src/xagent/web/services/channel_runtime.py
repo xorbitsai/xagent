@@ -43,7 +43,7 @@ from .db_runtime import (
 )
 from .managed_task_lease import (
     ManagedTaskLease,
-    finalize_managed_task_lease_result,
+    finalize_managed_task_lease_result_sync,
     start_managed_task_lease,
 )
 from .mcp_runtime import MCPBuiltinOAuthActorPolicyRequiredError
@@ -1253,13 +1253,10 @@ def _compensate_channel_task_claim_sync(
     (websocket, A2A, V1) does on the same cancellation.
     """
 
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        return finalize_managed_task_lease_result(
-            db,
-            snapshot.lease,
-            status=snapshot.resumed_from_status or TaskStatus.FAILED,
-        )
+    return finalize_managed_task_lease_result_sync(
+        snapshot.lease,
+        status=snapshot.resumed_from_status or TaskStatus.FAILED,
+    )
 
 
 def _register_channel_uploaded_files_sync(

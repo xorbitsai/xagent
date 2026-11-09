@@ -46,6 +46,14 @@ export type ComposerAttachmentStatus = "uploading" | "uploaded" | "failed";
 const DEFAULT_FILE_ACCEPT =
   ".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp";
 
+// A requested message is typed in at most this many steps, so a long one
+// still takes under a second, and is sent a moment after it is complete.
+const AUTO_SEND_TYPING_STEP_MS = 20;
+const AUTO_SEND_MAX_TYPING_STEPS = 40;
+const AUTO_SEND_PAUSE_MS = 200;
+
+export type ComposerAutoSendRequest = { id: number; text: string };
+
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
   placeholder?: string;
@@ -107,6 +115,21 @@ interface ChatInputProps {
    * starts beside work that is already in flight.
    */
   attachmentsBusy?: boolean;
+  /**
+   * A message to type into the composer and then send as if the visitor had
+   * typed it and pressed send, with the same checks, retry identity and
+   * failure toast. Each new `id` is one request. A request that arrives while
+   * another is being typed or sent is dropped. Sending is held while the text
+   * is being typed, so Enter or the send button never sends part of it. The
+   * text is typed without its leading whitespace, which the send trims off
+   * anyway, so the draft is never blank while it is being typed. It is sent
+   * only if the composer still holds exactly the typed text once it is in, so
+   * a controlled caller must pass that back as `inputValue`. When the
+   * composer cannot send at that moment, the text stays in it for the visitor
+   * to send. An edit by the visitor while it is being typed stops it without
+   * sending.
+   */
+  autoSendRequest?: ComposerAutoSendRequest | null;
 }
 
 type ExecutionMode = "auto" | "flash" | "balanced" | "think";
@@ -172,6 +195,7 @@ export function ChatInput({
   attachmentStatuses,
   onRetryAttachment,
   attachmentsBusy = false,
+  autoSendRequest,
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -281,9 +305,32 @@ export function ChatInput({
       .replace(/\n$/, "");
   };
 
+  // A requested message being typed in (see autoSendRequest). It turns
+  // "ready" once the whole text is in and the pause has passed, and the effect
+  // after handleSubmit sends it from a render that already holds that text.
+  const [autoTyping, setAutoTyping] = useState<
+    { text: string; phase: "typing" | "ready" } | null
+  >(null);
+  const autoTypingTimerRef = useRef<number | null>(null);
+  const handledAutoSendIdRef = useRef<number | null>(null);
+  const stopAutoTyping = () => {
+    if (autoTypingTimerRef.current !== null) {
+      window.clearTimeout(autoTypingTimerRef.current);
+      autoTypingTimerRef.current = null;
+    }
+    setAutoTyping(null);
+  };
+  useEffect(() => () => {
+    if (autoTypingTimerRef.current !== null) {
+      window.clearTimeout(autoTypingTimerRef.current);
+    }
+  }, []);
+
   const handleInput = () => {
     const editor = editorRef.current;
     if (!editor) return;
+    // The visitor took over the composer: keep what is there, send nothing.
+    if (autoTyping) stopAutoTyping();
 
     const text = serializeEditorContent(editor);
 
@@ -329,6 +376,54 @@ export function ChatInput({
   useEffect(() => {
     messageRef.current = message;
   }, [message]);
+
+  // Typing steps run after later renders, so they write through the latest
+  // draft setter.
+  const setDraftRef = useRef<(value: string) => void>(setInternalMessage);
+  useEffect(() => {
+    setDraftRef.current = isControlled
+      ? (value: string) => onInputChange?.(value)
+      : setInternalMessage;
+  }, [isControlled, onInputChange]);
+
+  useEffect(() => {
+    if (!autoSendRequest || handledAutoSendIdRef.current === autoSendRequest.id) return;
+    handledAutoSendIdRef.current = autoSendRequest.id;
+    // Typed without its leading whitespace, so every step leaves a draft that
+    // is not blank. A blank draft counts as the visitor clearing the composer,
+    // which forgets the message id kept for retrying a failed send, so a retry
+    // of the same prompt would get a new id. The send trims it off anyway.
+    const text = autoSendRequest.text.trimStart();
+    if (autoTyping || isSubmittingRef.current || !text.trim()) return;
+
+    // Whole characters as a reader sees them, so an emoji or an accented
+    // letter is never shown half typed. Without Intl.Segmenter, whole code
+    // points, so a surrogate pair is never split.
+    const characters = typeof Intl.Segmenter === "function"
+      ? Array.from(new Intl.Segmenter().segment(text), ({ segment }) => segment)
+      : Array.from(text);
+    const reduceMotion = typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const charactersPerStep = reduceMotion
+      ? characters.length
+      : Math.ceil(characters.length / AUTO_SEND_MAX_TYPING_STEPS);
+    let typed = 0;
+    const typeNextStep = () => {
+      typed = Math.min(characters.length, typed + charactersPerStep);
+      setDraftRef.current(characters.slice(0, typed).join(""));
+      autoTypingTimerRef.current = typed < characters.length
+        ? window.setTimeout(typeNextStep, AUTO_SEND_TYPING_STEP_MS)
+        : window.setTimeout(() => {
+          autoTypingTimerRef.current = null;
+          setAutoTyping({ text, phase: "ready" });
+        }, AUTO_SEND_PAUSE_MS);
+    };
+    setAutoTyping({ text, phase: "typing" });
+    typeNextStep();
+    // Runs once per request. Whether another one is in progress is read from
+    // the render that delivered this request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSendRequest]);
 
 
   // Handle click on delete button and file chip preview
@@ -792,7 +887,10 @@ export function ChatInput({
     // a composer that offers the stop control accepts nothing new until it
     // resolves: the send control stays in its slot, dimmed and inert, instead
     // of delivering a message into the run the visitor has just asked to end.
-    return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight;
+    //
+    // A requested message is sent only once it is fully typed.
+    return hasDraft && !isInputBusy && !isUploadingFiles && !isStopInFlight
+      && autoTyping?.phase !== "typing";
   };
   const canPauseTask =
     !!isLoading &&
@@ -978,8 +1076,8 @@ export function ChatInput({
       }} />
   ) : null;
 
-  const handleSubmit = async (e: React.SyntheticEvent) => {
-    e.preventDefault();
+  const handleSubmit = async (e?: React.SyntheticEvent) => {
+    e?.preventDefault();
 
     if (!canSubmit() || isSubmittingRef.current) return;
 
@@ -1132,14 +1230,37 @@ export function ChatInput({
   };
 
   useEffect(() => {
+    if (autoTyping?.phase !== "ready") return;
+    setAutoTyping(null);
+    // handleSubmit applies every check a send press does, so a composer that
+    // cannot send now keeps the typed text for the visitor.
+    if (message === autoTyping.text) void handleSubmit();
+    // Runs when typing turns ready, and sends the draft of that render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoTyping]);
+
+  useEffect(() => {
     const editor = editorRef.current;
     if (!editor) return;
+    // A requested message is typed into a focused editor too, with the caret
+    // kept after the typed text.
+    const typingIntoFocusedEditor =
+      autoTyping !== null && document.activeElement === editor;
+    const moveCaretToEnd = () => {
+      if (!typingIntoFocusedEditor) return;
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    };
 
     if (!message) {
       if (editor.innerHTML !== "") {
         editor.innerHTML = "";
       }
-    } else if (document.activeElement !== editor) {
+    } else if (document.activeElement !== editor || typingIntoFocusedEditor) {
       if (filesDisabled) {
         let html = applyPromptHighlights(
           escapeHtml(sanitizeFilesDisabledPresentationText(message)),
@@ -1148,6 +1269,7 @@ export function ChatInput({
         html = html.replace(/\n/g, "<br>");
         if (editor.innerHTML !== html) {
           editor.innerHTML = html;
+          moveCaretToEnd();
         }
         return;
       }
@@ -1160,9 +1282,10 @@ export function ChatInput({
         html = html.replace(/\n/g, "<br>");
 
         editor.innerHTML = html;
+        moveCaretToEnd();
       }
     }
-  }, [filesDisabled, message, promptHighlightTerms]);
+  }, [autoTyping, filesDisabled, message, promptHighlightTerms]);
 
   return (
     // No space-y here: the hint region below is mounted while it is empty, so
@@ -1281,8 +1404,8 @@ export function ChatInput({
               contentEditable
               data-voice-input="false"
               className={cn(
-                "w-full rounded-md border-0 bg-transparent text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
-                compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[400px]"),
+                "w-full rounded-md border-0 bg-transparent text-base sm:text-[15px] outline-none placeholder:text-muted-foreground/60 overflow-y-auto resize-none focus-visible:ring-0 focus-visible:ring-offset-0 whitespace-pre-wrap break-words text-left",
+                compact ? "min-h-[44px] px-3 py-3 pr-12 max-h-[150px]" : cn(minHeightClass, "px-4 py-3 pb-16 max-h-[min(400px,40dvh)] sm:max-h-[400px]"),
                 isInputBusy ? "opacity-50 pointer-events-none" : ""
               )}
               onInput={handleInput}
@@ -1300,7 +1423,7 @@ export function ChatInput({
               aria-multiline="true"
             />
             {!message && (
-              <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
+              <div className="pointer-events-none absolute left-4 top-3 text-base sm:text-[14px] text-muted-foreground/60">
                 {placeholder ?? t("chatPage.input.placeholder")}
               </div>
             )}
@@ -1370,8 +1493,8 @@ export function ChatInput({
               )}
             </div>
           ) : (
-            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">
-              <div className="flex items-center gap-2">
+            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-1 bg-card px-2 py-2 sm:px-4 sm:py-3">
+              <div className="flex min-w-0 items-center gap-1 sm:gap-2">
                 {/* Settings button - left of upload */}
                 {!hideConfig && (
                   <>
@@ -1486,7 +1609,7 @@ export function ChatInput({
                 ) : null}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-1 sm:gap-2">
                 {shouldShowPauseButton && (
                   <Button
                     type="button"
@@ -1498,7 +1621,7 @@ export function ChatInput({
                     <Pause className="h-4 w-4" />
                   </Button>
                 )}
-                <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
+                <span className="hidden sm:inline text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
                 {voiceInputButton}
@@ -1507,6 +1630,8 @@ export function ChatInput({
                   type="submit"
                   size="icon"
                   disabled={!canSubmit()}
+                  aria-label={sendButtonLabel}
+                  title={sendButtonLabel}
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
                     !canSubmit() && "bg-muted text-muted-foreground/50"

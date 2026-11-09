@@ -16,6 +16,8 @@ const chatInputProps = vi.hoisted(() => ({
     onRetryAttachment?: (file: File) => void
     selectedAgents?: Array<{ id: number | string; name: string }>
     onSend: (message: string, config?: unknown) => void
+    inputValue?: string
+    autoSendRequest?: { id: number; text: string } | null
   },
 }))
 
@@ -440,5 +442,65 @@ describe("ChatStartScreen starting prompts", () => {
     chatInputProps.current?.onSend("hello", { model: "m" } as never)
 
     expect(onSend).toHaveBeenCalledWith("hello", [], { model: "m" })
+  })
+})
+
+describe("ChatStartScreen suggested prompts", () => {
+  it("hands a clicked prompt to the composer to type and send when sendPromptOnClick is set", () => {
+    const onInputChange = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        prompts={["Show my schedule", "Cancel my shift"]}
+        sendPromptOnClick
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+      />
+    )
+    expect(chatInputProps.current?.autoSendRequest).toBeNull()
+
+    fireEvent.click(screen.getByText("Show my schedule"))
+    const first = chatInputProps.current?.autoSendRequest
+    expect(first).toEqual({ id: expect.any(Number), text: "Show my schedule" })
+
+    // The same prompt clicked again is a new request, so a retry can start.
+    fireEvent.click(screen.getByText("Show my schedule"))
+    const second = chatInputProps.current?.autoSendRequest
+    expect(second).toEqual({ id: expect.any(Number), text: "Show my schedule" })
+    expect(second?.id).not.toBe(first?.id)
+    expect(onInputChange).not.toHaveBeenCalled()
+  })
+
+  it("keeps onPromptSelect ahead of sendPromptOnClick", () => {
+    const onPromptSelect = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        prompts={["Show my schedule"]}
+        sendPromptOnClick
+        onPromptSelect={onPromptSelect}
+        onSend={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("Show my schedule"))
+    expect(onPromptSelect).toHaveBeenCalledWith("Show my schedule", undefined)
+    expect(chatInputProps.current?.autoSendRequest).toBeFalsy()
+  })
+
+  it("only fills the composer on a click when sendPromptOnClick is not set", () => {
+    const onInputChange = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        prompts={["Show my schedule"]}
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("Show my schedule"))
+    expect(onInputChange).toHaveBeenCalledWith("Show my schedule")
+    expect(chatInputProps.current?.autoSendRequest).toBeFalsy()
   })
 })

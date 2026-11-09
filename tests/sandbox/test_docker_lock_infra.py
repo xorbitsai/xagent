@@ -42,7 +42,10 @@ class _FakeDockerClient:
 
 def _make_service() -> DockerSandboxService:
     return DockerSandboxService(
-        MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        MemDockerStore(),
+        namespace="test",
+        network="xagent-test-sandbox-egress",
+        client=_FakeDockerClient(),
     )
 
 
@@ -61,7 +64,7 @@ class _StoppableContainer:
             "Config": {"Image": "busybox:latest", "WorkingDir": "/home"},
             "HostConfig": {},
             "State": {"Status": "running"},
-            "NetworkSettings": {"Networks": {"bridge": {}}},
+            "NetworkSettings": {"Networks": {"xagent-test-sandbox-egress": {}}},
             "Created": "2026-01-01T00:00:00Z",
         }
         self.stop_calls = 0
@@ -135,6 +138,7 @@ class TestHandleStopSharesTheServiceLifecycleLock:
         service = DockerSandboxService(
             MemDockerStore(),
             namespace="test",
+            network="xagent-test-sandbox-egress",
             client=_FakeClientWithContainer(container),
         )
 
@@ -153,6 +157,7 @@ class TestHandleStopSharesTheServiceLifecycleLock:
         service = DockerSandboxService(
             MemDockerStore(),
             namespace="test",
+            network="xagent-test-sandbox-egress",
             client=_FakeClientWithContainer(container),
         )
         handle = await service.start_existing(name)
@@ -201,6 +206,7 @@ class TestHandleStopSharesTheServiceLifecycleLock:
         service = DockerSandboxService(
             MemDockerStore(),
             namespace="test",
+            network="xagent-test-sandbox-egress",
             client=_FakeClientWithContainer(container),
         )
 

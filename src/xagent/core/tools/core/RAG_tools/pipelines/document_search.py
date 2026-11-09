@@ -43,7 +43,7 @@ from ..retrieval.search_sparse import search_sparse
 from ..utils.config_utils import coerce_search_config
 from ..utils.embedding_utils import normalize_single_embedding
 from ..utils.model_resolver import resolve_embedding_adapter, resolve_rerank_adapter
-from ..utils.user_scope import resolve_user_scope
+from ..utils.user_scope import resolve_user_scope, user_scope_context
 
 if TYPE_CHECKING:
     from ..kb import KBPipelineCompatibilityFacade
@@ -697,12 +697,14 @@ def _search_documents_impl(
     )
 
     try:
-        embedding_config, embedding_adapter = resolve_embedding_adapter(
-            cfg.embedding_model_id,
-            api_key=None,
-            base_url=None,
-            timeout_sec=None,
-        )
+        # A bare model name resolves only among models this user may use.
+        with user_scope_context(user_id, is_admin):
+            embedding_config, embedding_adapter = resolve_embedding_adapter(
+                cfg.embedding_model_id,
+                api_key=None,
+                base_url=None,
+                timeout_sec=None,
+            )
         # IMPORTANT: We use the Hub model ID as the single source of truth.
         # It is used for embedding table naming and persisted collection binding.
         embedding_model_id = (cfg.embedding_model_id or "").strip()
@@ -825,9 +827,10 @@ def _search_documents_impl(
 
         # Apply optional rerank
         current_step = "apply_rerank"
-        results, used_rerank, rerank_warnings = _apply_rerank_if_needed(
-            results, query_text, cfg
-        )
+        with user_scope_context(user_id, is_admin):
+            results, used_rerank, rerank_warnings = _apply_rerank_if_needed(
+                results, query_text, cfg
+            )
         warnings.extend(rerank_warnings)
 
         return _build_pipeline_result(
@@ -847,6 +850,57 @@ def _search_documents_impl(
             search_type=cfg.search_type,
             warnings=warnings,
         )
+
+
+def resolve_search_model_ids(
+    collection: str,
+    *,
+    config: Optional[SearchConfigInput] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+) -> Tuple[str, ...]:
+    """The configured models a search will call, resolved as the search does.
+
+    For the standalone usage gate: run it, and then the search, under one
+    :class:`~..utils.model_resolution_pin.ModelResolutionPin`, and the search
+    calls exactly the models listed. The embedding model is the one the
+    collection is bound to, listed unless the search is sparse; the rerank
+    model is listed when one is requested and resolves. A model configured
+    from the environment carries no id and is left out.
+
+    Never raises. An embedding resolution that fails here fails the search
+    the same way, before it calls any model, and nothing is listed. A rerank
+    resolution that fails leaves the rerank out: the search still embeds,
+    and never calls a rerank model.
+    """
+    from ..management.collection_manager import resolve_effective_embedding_model_sync
+
+    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    cfg = coerce_search_config(config if config is not None else {})
+    model_ids: List[str] = []
+    try:
+        embedding_model_id = resolve_effective_embedding_model_sync(
+            collection, cfg.embedding_model_id
+        )
+        with user_scope_context(scope.user_id, scope.is_admin):
+            embedding_config, _ = resolve_embedding_adapter(
+                embedding_model_id,
+                api_key=None,
+                base_url=None,
+                timeout_sec=None,
+            )
+    except Exception:  # noqa: BLE001 - the search reports it
+        return ()
+    if cfg.search_type != SearchType.SPARSE:
+        model_ids.append(embedding_config.usage_model_id)
+    try:
+        with user_scope_context(scope.user_id, scope.is_admin):
+            rerank_model = _resolve_unified_rerank(cfg)
+    except Exception:  # noqa: BLE001 - the search calls no rerank either
+        rerank_model = None
+    if rerank_model is not None:
+        model_ids.append(getattr(rerank_model, "model_id", "") or "")
+    return tuple(model_id for model_id in model_ids if model_id)
 
 
 def run_document_search(

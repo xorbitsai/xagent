@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
+    Callable,
     Iterator,
     Literal,
     Optional,
@@ -26,6 +28,7 @@ from sqlalchemy import null as sql_null
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ...config import get_default_task_execution_mode, get_shared_task_execution_enabled
 from ...core.agent.checkpoint import CheckpointReadError, CheckpointUnavailableError
@@ -619,9 +622,13 @@ class ResumeCommandOutcome(str, enum.Enum):
     ALREADY_IN_PROGRESS = "already_in_progress"
     DEFERRED = "deferred"
     REJECTED = "rejected"
-    # An automatic resume that no longer applies (the task moved on, or
-    # automatic resume was switched off). A success: the command completes
-    # without an error reply.
+    # An automatic resume that does not go ahead this time: the task moved
+    # on, automatic resume was switched off, the task has an unanswered
+    # question that waits for its user, or its active interaction row could
+    # not be read while the task still rests at the fence, in which case
+    # housekeeping schedules it again until the run's automatic resume
+    # limits stop it. A success: the command completes without an error
+    # reply.
     AUTO_SKIPPED = "auto_skipped"
 
 
@@ -3311,21 +3318,20 @@ async def _pause_cap_held_commands_without_agent(
     ``TypeError``, which ``pause_task`` classifies. A database error raises.
     """
 
-    if not get_shared_task_execution_enabled():
-        return False
     from .task_dispatch_cap import build_dispatch_cap_snapshot
 
     if command.task_id in build_dispatch_cap_snapshot().active_ids:
         return False
     user = message_data["user"]
-    started_run = (
-        ()
-        if held_start_run_id is None
-        else (
+    # Without shared execution the only command a pause may pass is a START.
+    started_run: tuple[ColumnElement[bool], ...] = ()
+    if held_start_run_id is not None:
+        started_run = (
             TaskExecutionCommand.kind == "start",
             TaskExecutionCommand.target_run_id == held_start_run_id,
         )
-    )
+    elif not get_shared_task_execution_enabled():
+        started_run = (TaskExecutionCommand.kind == "start",)
 
     def read() -> Any | None:
         from .task_execution_admission import cap_held_command_predicates
@@ -3699,11 +3705,14 @@ async def resume_task(
         # append to or replan around an unanswered question. This runs
         # before agent_service is built (below) so a refused request never
         # pays for constructing one. Gated on tasks.interaction_protocol_
-        # version first, though: under a NULL marker the read below reports
-        # ActiveInteractionAbsent regardless of whether an active row
-        # exists, so this refusal never fires for that state -- deliberately,
-        # matching what the read surface would show for the same task (see
-        # active_interaction_id_sync's own docstring).
+        # version first, though: under a successfully read NULL marker the
+        # read below reports ActiveInteractionAbsent regardless of whether
+        # an active row exists, so this refusal never fires for that state
+        # -- deliberately, matching what the read surface would show for the
+        # same task (see active_interaction_id_sync's own docstring). A
+        # marker query that fails is ActiveInteractionUnavailable instead,
+        # and that branch below holds the resume back where native rows can
+        # be published, whatever the marker holds.
         #
         # Residual window, named here rather than closed here: this lookup
         # opens and closes its own session, and no lock spans it and either
@@ -3742,10 +3751,11 @@ async def resume_task(
                     # sees the unchanged fence and reschedules it, so a run
                     # that keeps waiting is eventually stopped as
                     # ``exhausted`` rather than as waiting on its user.
-                    # Unreachable until a task records
-                    # ``interaction_protocol_version``; the change that makes
-                    # it reachable should stop the row here instead
-                    # (``manual``, ``interaction_pending``).
+                    # Reached only for a task whose
+                    # ``interaction_protocol_version`` is set. This must stop
+                    # the row here instead (``manual``,
+                    # ``interaction_pending``) before native publication is
+                    # enabled on any deployment.
                     logger.info(
                         "auto resume skipped task_id=%s run_id=%s "
                         "why=interaction_pending component=auto-resume",
@@ -3792,30 +3802,115 @@ async def resume_task(
                     reason_code="interaction_pending",
                 )
         elif isinstance(active_interaction_read, ActiveInteractionUnavailable):
-            # Same action as the ActiveInteractionAbsent branch below -- the
-            # resume proceeds -- but deliberately its own branch rather than
-            # a shared one. This is the arm that turns into a refusal, and
-            # refusing here is wired by the change that first writes
-            # tasks.interaction_protocol_version = 1. Until that marker can
-            # be 1, nothing in src/ having written it to anything but NULL,
-            # a read that could not be made cannot be hiding a live native
-            # interaction row: refusing today would cost a refused resume on
-            # every waiting task, including the ones that provably carry no
-            # question at all. Keeping the branch separate is what lets that
-            # later change edit one branch's action and touch neither of the
-            # other two.
+            # Its own branch, not folded into ActiveInteractionAbsent's: a
+            # read that could not be made may be hiding a live native row.
+            # Whether one exists is exactly what this read could not tell (it
+            # may have failed on the marker itself), so what to do keys on
+            # whether this process can publish native rows. Only a process
+            # whose frozen rollout mode is native and that runs shared task
+            # execution can, so only there is the resume held back; anywhere
+            # else it proceeds, as it does on ActiveInteractionAbsent.
             #
-            # Logged at info, not warning: the read itself already logs one
-            # warning for this same incident (see
-            # active_interaction_id_sync), and a second warning-level line
-            # would double-count one read failure.
-            logger.info(
-                "the active interaction read was unavailable (reason=%s) for "
-                "task_id=%s run_id=%s; the resume proceeds",
-                active_interaction_read.reason,
-                task_id,
-                task_fields.run_id,
+            # That includes a deployment rolled back from native: rows it
+            # published stay in the table with their tasks' markers set, so a
+            # failed read there lets the resume proceed past a native row
+            # that may still be live. This is an accepted trade-off. Holding
+            # the resume back in every mode would refuse resumes on
+            # deployments that never published a row, and a failed read
+            # cannot tell the two apart.
+            #
+            # This is the one place the rollout mode decides anything about
+            # an existing row (see interaction_rollout's module docstring);
+            # the ActiveInteractionFound and ActiveInteractionAbsent branches
+            # never consult it.
+            #
+            # The proceed line is logged at info: the read itself already
+            # logged a warning for this incident (see
+            # active_interaction_id_sync). A refusal is its own outcome for
+            # the user, so it logs its own warning.
+            from .interaction_rollout import (
+                native_publication_enabled_in_this_process,
             )
+
+            if not native_publication_enabled_in_this_process():
+                logger.info(
+                    "the active interaction read was unavailable (reason=%s) "
+                    "for task_id=%s run_id=%s; the resume proceeds",
+                    active_interaction_read.reason,
+                    task_id,
+                    task_fields.run_id,
+                )
+            elif (
+                auto_resume is not None
+                and control_state is TaskControlState.RESUME_REQUESTED
+            ):
+                # The claim check above admits an automatic resume in this
+                # state only as this command's own retry: an earlier attempt
+                # wrote RESUME_REQUESTED and died. The fence has moved, so
+                # housekeeping would take a completed command for a
+                # confirmation and never dispatch another one, leaving the
+                # task in resume_requested. Deferring keeps this command
+                # alive instead, and it writes nothing, so the next attempt
+                # is still its own retry and is decided again on what that
+                # read returns. A read that outlasts max_command_defers()
+                # fails the command with the budget's terminal error;
+                # housekeeping then still confirms the moved fence, so the
+                # task stays in resume_requested until someone resumes it.
+                logger.info(
+                    "Deferring resume for task %s run %s: the active "
+                    "interaction read was unavailable (reason=%s) (attempt %s)",
+                    task_id,
+                    task_fields.run_id,
+                    active_interaction_read.reason,
+                    message_data.get("_durable_attempt_count"),
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.DEFERRED,
+                    "Resume command is waiting for the active interaction read",
+                )
+            elif auto_resume is not None:
+                # The task still rests at the fence, so the read may succeed
+                # on a later dispatch: this skips rather than refuses, because
+                # a refused automatic resume stops automatic recovery for the
+                # run. Housekeeping sees the unchanged fence and schedules
+                # the run again. Every dispatch counts against the run's
+                # automatic resume limits, so a read that keeps failing is
+                # eventually stopped as ``exhausted``, or as ``expired`` once
+                # the staleness window has passed.
+                logger.info(
+                    "auto resume skipped task_id=%s run_id=%s "
+                    "why=interaction_unverifiable component=auto-resume",
+                    task_id,
+                    task_fields.run_id,
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.AUTO_SKIPPED,
+                    "Automatic resume skipped (interaction_unverifiable)",
+                    reason_code="interaction_unverifiable",
+                )
+            else:
+                logger.warning(
+                    "resume refused for task_id=%s run_id=%s: the active "
+                    "interaction read was unavailable (reason=%s)",
+                    task_id,
+                    task_fields.run_id,
+                    active_interaction_read.reason,
+                )
+                reason = (
+                    "We couldn't check this task's pending questions; please try again."
+                )
+                await reply(
+                    {
+                        "type": "error",
+                        "message": reason,
+                        "task": {"id": task_id, **resume_control_state},
+                    },
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.REJECTED,
+                    reason,
+                    reason_code="interaction_unverifiable",
+                )
         elif isinstance(active_interaction_read, ActiveInteractionAbsent):
             # Nothing to do: no native interaction row is waiting on an
             # answer, so this gate lets the resume through.
@@ -5024,10 +5119,16 @@ async def execute_durable_task_command(
     command: ClaimedTaskCommand,
 ) -> dict[str, Any] | None | SettledTaskCommand:
     from ...config import get_shared_task_execution_enabled
+    from ...core.model.chat.routing_context import xinference_interactive_requests
+    from .task_dispatch_cap import DISPATCH_CLASS_INTERACTIVE
     from .task_execution_host import claimed_command_execution
 
     async def execute() -> dict[str, Any] | None | SettledTaskCommand:
-        with claimed_command_execution():
+        interactive = (
+            command.dispatch_class == DISPATCH_CLASS_INTERACTIVE
+            and not command.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX)
+        )
+        with claimed_command_execution(), xinference_interactive_requests(interactive):
             if command.kind == TaskCommandKind.RESUME_INPUT:
                 from .task_resume_command import execute_resume_input
 
@@ -5035,6 +5136,10 @@ async def execute_durable_task_command(
             if command.kind == TaskCommandKind.START:
                 from .task_start_consumer import execute_task_start
 
+                if not get_shared_task_execution_enabled():
+                    return await _execute_and_report_local_start(
+                        command, execute_task_start
+                    )
                 return await execute_task_start(command)
             return await _execute_and_report_task_command(command)
 
@@ -5047,6 +5152,67 @@ async def execute_durable_task_command(
         if current_task_coordinator(command.task_id) is None:
             return await execute_coordinated_command(command, execute)
     return await execute()
+
+
+async def _execute_and_report_local_start(
+    command: ClaimedTaskCommand,
+    execute: Callable[[ClaimedTaskCommand], Awaitable[SettledTaskCommand]],
+) -> SettledTaskCommand:
+    """Combined-mode START: tell the client when it terminally did not run.
+
+    The WebSocket acknowledged ``execute_task`` when it staged the START, so
+    nothing else says a START that failed for good never ran. A refusal the
+    consumer settles itself (``SettledTaskCommand``) is broadcast from its
+    result; an error that escapes is broadcast once it is final. A lost claim
+    means another dispatcher owns the START and stays silent.
+    """
+    try:
+        settled = await execute(command)
+    except TaskCommandRejected as exc:
+        if exc.reason in ("stale_claim", "stale_owner"):
+            raise
+        finish_task_command_delivery(command.command_id, command.task_id)
+        bind_terminal_event_draft(
+            exc, await _terminal_command_event_draft(command, exc)
+        )
+        await _broadcast_terminal_start_error(command, exc)
+        raise
+    except Exception as exc:
+        if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
+            finish_task_command_delivery(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc, await _terminal_command_event_draft(command, exc)
+            )
+            await _broadcast_terminal_start_error(command, exc)
+        raise
+    result = settled.result
+    reason = result.get("rejection_reason") if isinstance(result, dict) else None
+    if reason is not None:
+        # The consumer settled a refusal in its own transaction, with the
+        # durable event; the live client still has to be told.
+        finish_task_command_delivery(command.command_id, command.task_id)
+        await _broadcast_terminal_start_error(
+            command, TaskCommandRejected("Task could not start.", reason=reason)
+        )
+    return settled
+
+
+async def _broadcast_terminal_start_error(
+    command: ClaimedTaskCommand, exc: BaseException
+) -> None:
+    """Notify the client without letting a failed broadcast replace ``exc``.
+
+    Exception, never BaseException: cancellation propagates.
+    """
+    try:
+        await _broadcast_terminal_command_error(command, exc)
+    except Exception:
+        logger.warning(
+            "task %s START %s is terminal but its broadcast failed",
+            command.task_id,
+            command.command_id,
+            exc_info=True,
+        )
 
 
 async def _execute_and_report_task_command(

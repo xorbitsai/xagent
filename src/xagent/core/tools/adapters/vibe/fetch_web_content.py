@@ -70,7 +70,7 @@ class FetchWebContentResult(BaseModel):
 class FetchWebContentTool(AbstractBaseTool):
     """Tool for reading a specific webpage after search discovers a URL."""
 
-    category = ToolCategory.WEB_SEARCH
+    category = ToolCategory.WEB_TOOLS
     read_only = True  # read-only HTTP GET ⇒ concurrency-safe
 
     def __init__(self) -> None:

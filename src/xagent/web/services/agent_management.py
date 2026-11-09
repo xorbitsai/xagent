@@ -34,6 +34,7 @@ from ..models.user import User
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
 from ..services.agent_store import AgentStore, invalidate_agent_cache
+from .agent_team_scope import get_agent_team_scope
 from .api_keys import (
     AgentApiKeyService,
     ApiKeyCandidate,
@@ -48,6 +49,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .skill_management import SkillManagementRuntime, is_valid_personal_skill_name
 from .workforce_access import can_edit_workforce, filter_visible_workforces
 from .workforce_lifecycle import is_workforce_manager_removal_safe
 from .workforce_names import resolve_unique_agent_name
@@ -96,6 +98,23 @@ class InvalidAgentModelConfigError(ValueError):
 
 class InvalidKnowledgeBaseError(ValueError):
     """Raised when KB selection fails the knowledge-tool or visibility rule."""
+
+
+class InvalidAgentSkillNamesError(ValueError):
+    """Raised when a skill list replacement adds names no skill can carry.
+
+    Each name is neither visible to the caller nor a valid personal skill
+    name. The message lists at most five of them, each cut to 100 characters
+    of its ``repr``: the names are caller input of up to 1000 characters.
+    """
+
+    def __init__(self, names: list[str]) -> None:
+        self.names = names
+        super().__init__(
+            "These names are neither valid personal skill names nor the names "
+            "of skills this key can see: "
+            + ", ".join(repr(name)[:100] for name in names[:5])
+        )
 
 
 def _string_list_elements(value: Any) -> list[str]:
@@ -271,6 +290,14 @@ class AgentCreateSnapshot:
 
     agent: AgentResponseSnapshot
     api_key: RuntimeKeySnapshot | None
+
+
+@dataclass(frozen=True)
+class AgentSkillsUpdateSnapshot:
+    """Detached result of replacing an agent's skill list."""
+
+    skills: tuple[str, ...]
+    unresolved_for_caller: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1086,6 +1113,115 @@ class AgentManagementRuntime:
         with SessionLocal() as db:
             payloads = AgentManagementService(db).list_agents_for_user(user_id)
             return tuple(_agent_summary_snapshot(payload) for payload in payloads)
+
+    async def get_agent_skills(
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+    ) -> tuple[str, ...] | None:
+        """The skill names of an agent the user can see, else ``None``."""
+        return await run_db_io_cancellation_safe(
+            lambda: self._get_agent_skills_sync(user_id=user_id, agent_id=agent_id)
+        )
+
+    @staticmethod
+    def _get_agent_skills_sync(
+        *, user_id: int, agent_id: int
+    ) -> tuple[str, ...] | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            agent = AgentStore(db).get_owned_agent(user_id, agent_id, team_scope)
+            return None if agent is None else tuple(agent.skills or [])
+
+    async def set_agent_skills(
+        self,
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        skills: list[str],
+    ) -> AgentSkillsUpdateSnapshot | None:
+        """Replace the skill names of an agent the user can see.
+
+        Returns ``None`` when the user cannot see the agent. That is checked
+        before any skill is read, and again under the row lock the write
+        takes, which is the check that decides. Only a name the request adds
+        is checked: it has to be one of the user's visible skills or a valid
+        personal skill name, else :class:`InvalidAgentSkillNamesError`. Names
+        already on the agent are kept as they are. A failure to read the
+        visible skills propagates and nothing is written.
+        """
+        if await self.get_agent_skills(user_id=user_id, agent_id=agent_id) is None:
+            return None
+        visible = await SkillManagementRuntime().visible_names(user_id=user_id)
+        written = await run_db_io_cancellation_safe(
+            lambda: self._set_agent_skills_sync(
+                user_id=user_id,
+                key_prefix=key_prefix,
+                agent_id=agent_id,
+                skills=skills,
+                visible=visible,
+            )
+        )
+        if written is None:
+            return None
+        requested, added = written
+        return AgentSkillsUpdateSnapshot(
+            skills=requested,
+            unresolved_for_caller=tuple(name for name in added if name not in visible),
+        )
+
+    @staticmethod
+    def _set_agent_skills_sync(
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        skills: list[str],
+        visible: frozenset[str],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        """Write the deduplicated list in one locked transaction.
+
+        Returns the stored list and the names it added, or ``None`` when the
+        user cannot see the agent.
+        """
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            store = AgentStore(db)
+            agent = store.get_owned_agent(
+                user_id, agent_id, team_scope, for_update=True
+            )
+            if agent is None:
+                return None
+            current = list(agent.skills or [])
+            requested = list(dict.fromkeys(skills))
+            added = [name for name in requested if name not in current]
+            invalid = [
+                name
+                for name in added
+                if name not in visible and not is_valid_personal_skill_name(name)
+            ]
+            if invalid:
+                raise InvalidAgentSkillNamesError(invalid)
+            store.update_agent_fields(
+                user_id,
+                agent_id,
+                {"skills": requested},
+                team_scope=team_scope,
+                agent=agent,
+            )
+        logger.info(
+            "personal key agent skills write: key_prefix=%s user_id=%d "
+            "agent_id=%d added=%d",
+            key_prefix,
+            user_id,
+            agent_id,
+            len(added),
+        )
+        return tuple(requested), tuple(added)
 
     @staticmethod
     def _run_runtime_key_session_operation(

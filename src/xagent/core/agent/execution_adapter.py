@@ -13,6 +13,7 @@ from ..task_runtime import (
 from .agent import Agent
 from .attachments import build_image_context_references
 from .budget import BudgetPolicyProvider
+from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
 from .interruption import (
     INTERRUPTION_REASON_KEY,
     classify_run_result,
@@ -59,6 +60,7 @@ class AgentExecutionConfig:
     execution_context_messages: list[dict[str, Any]] = field(default_factory=list)
     recovered_skill_context: str | None = None
     memory_store: Any | None = None
+    memory_tools_factory: Any | None = None
     memory_similarity_threshold: float | None = None
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
@@ -66,6 +68,14 @@ class AgentExecutionConfig:
     # Capability gate: False overrides an explicitly supplied manager/list.
     skills_enabled: bool = True
     user_interaction_enabled: bool = True
+    # Host opt-in for ReAct: withhold connector tool schemas until the model
+    # loads them with ``load_tools`` (see ``deferred_tools``).
+    defer_connector_schemas: bool = False
+    # Estimated tokens of connector schemas pre-loaded because a user message
+    # names the connector. The allowance applies to each newly scanned user
+    # message, not to the whole session: loaded tools are never evicted, so a
+    # long conversation can accumulate more than this in total.
+    deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET
     preferred_input_modalities: tuple[str, ...] = ()
     execution_metadata: dict[str, Any] = field(default_factory=dict)
     budget_policy_provider: BudgetPolicyProvider | None = None
@@ -199,6 +209,7 @@ class AgentExecutionAdapter:
             # or policy change. A paused runner still holds the previous list.
             handle.runner.agent.tools = self.config.tools
             handle.runner.agent.memory_store = self.config.memory_store
+            handle.runner.agent.memory_tools_factory = self.config.memory_tools_factory
             handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
@@ -305,6 +316,7 @@ class AgentExecutionAdapter:
                 "pattern": self.config.pattern,
             },
             memory_store=self.config.memory_store,
+            memory_tools_factory=self.config.memory_tools_factory,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
             allowed_skills=(
@@ -343,6 +355,10 @@ class AgentExecutionAdapter:
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
                         user_interaction_enabled=self.config.user_interaction_enabled,
+                        defer_connector_schemas=self.config.defer_connector_schemas,
+                        deferred_preload_token_budget=(
+                            self.config.deferred_preload_token_budget
+                        ),
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
@@ -375,6 +391,10 @@ class AgentExecutionAdapter:
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
                 user_interaction_enabled=self.config.user_interaction_enabled,
+                defer_connector_schemas=self.config.defer_connector_schemas,
+                deferred_preload_token_budget=(
+                    self.config.deferred_preload_token_budget
+                ),
             ),
             "agent_react",
         )
@@ -429,7 +449,7 @@ class AgentExecutionAdapter:
             output = INTERRUPTED_USER_MESSAGE
         else:
             output = result.get("output", result.get("response", result.get("error")))
-            if not output:
+            if not output and not result.get("_output_guardrail_applied"):
                 # This backfill and the raw ``agent_result`` preserved below
                 # must stay distinguishable: the delegated-child classifier
                 # in ``agent_tool.py`` reads the pre-backfill answer from
@@ -470,6 +490,11 @@ class AgentExecutionAdapter:
             "agent_result": result,
             "injection_outcome_unknown": result.get("injection_outcome_unknown", False),
         }
+        if not output:
+            # ``output`` above now holds the placeholder, which a reader cannot
+            # tell from a real answer; this key is the supported way to know
+            # the run produced none.
+            normalized["output_missing"] = True
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome
@@ -497,6 +522,19 @@ class AgentExecutionAdapter:
         failure_code = normalize_tool_failure_code(result.get("failure_code"))
         if failure_code is not None:
             normalized["failure_code"] = failure_code
+        # Run classification for whatever reports the settled run. Each value
+        # crosses this boundary only in its expected type; ``metadata`` above
+        # stays config-only because the resume path sends it to the browser.
+        finish_reason = result.get("finish_reason")
+        if type(finish_reason) is str and finish_reason.strip():
+            normalized["finish_reason"] = finish_reason
+        if result.get("empty_final_answer") is True:
+            normalized["empty_final_answer"] = True
+        raw_metadata = result.get("metadata")
+        if isinstance(raw_metadata, dict):
+            first_delta_at = raw_metadata.get("first_answer_delta_at")
+            if type(first_delta_at) is str:
+                normalized["first_answer_delta_at"] = first_delta_at
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

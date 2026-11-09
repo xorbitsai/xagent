@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Callable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,9 @@ from ..error import (
     ModelNotFoundError,
     UnsupportedModelCategoryError,
 )
+
+# (db, rows sharing the requested model_name) -> usable rows, best first.
+NameMatchScope = Callable[[Session, list[Any]], list[Any]]
 
 
 class SQLAlchemyModelHub:
@@ -173,22 +176,38 @@ class SQLAlchemyModelHub:
         self.db.add(db_model)
         self.db.commit()
 
-    def load(self, model_id: str) -> ModelConfig:
-        # Try to find by model_id first, then by model_name
+    def load(
+        self,
+        model_id: str,
+        *,
+        name_match_scope: Optional[NameMatchScope] = None,
+    ) -> ModelConfig:
+        """Load an active model by ``model_id``, falling back to ``model_name``.
+
+        ``model_id`` is unique, so an exact match wins. ``model_name`` is not:
+        several rows (possibly owned by different users) can share one. The
+        fallback therefore orders the matches by primary key, and when
+        *name_match_scope* is given it receives ``(db, matches)`` and returns
+        the matches the caller may use, best first. Multi-user callers must
+        pass a scope; without one the oldest match is used.
+        """
         db_model = (
             self.db.query(self.Model)
             .filter(self.Model.model_id == model_id)
             .filter(self.Model.is_active)
             .first()
         )
-        # If not found by model_id, try by model_name
         if not db_model:
-            db_model = (
+            matches = (
                 self.db.query(self.Model)
                 .filter(self.Model.model_name == model_id)
                 .filter(self.Model.is_active)
-                .first()
+                .order_by(self.Model.id)
+                .all()
             )
+            if matches and name_match_scope is not None:
+                matches = name_match_scope(self.db, matches)
+            db_model = matches[0] if matches else None
         if not db_model:
             raise ModelNotFoundError(model_id)
 

@@ -6,7 +6,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
+from ..cache_lifecycle import agent_cache_session
 from ..exceptions import LLMTimeoutError
+from ..routing_context import xinference_interactive, xinference_routing_key
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -15,6 +17,8 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 _MODEL_DISCOVERY_TIMEOUT_SECONDS = 30.0
+# Xinference schedules lower priority values first.
+_INTERACTIVE_PRIORITY_HINT = -1
 
 
 async def _await_with_timeout(
@@ -133,6 +137,9 @@ class XinferenceLLM(BaseLLM):
         # Initialize the Xinference client (lazy initialization)
         self._client: Optional[Any] = None
         self._model_handle: Optional[Any] = None
+        self._supports_session_affinity = False
+        self._supports_cache_lifecycle = False
+        self._supports_chat_priority = False
         self._client_lock = asyncio.Lock()
 
     @property
@@ -156,8 +163,19 @@ class XinferenceLLM(BaseLLM):
                 raise RuntimeError("Failed to initialize Xinference client")
 
             if self._model_handle is None:
-                # Get the model handle (assumes model is already launched on the server)
-                self._model_handle = await client.get_model(self._model_uid)
+                (
+                    self._model_handle,
+                    self._supports_session_affinity,
+                ) = await client.get_chat_model(self._model_uid)
+                supports = getattr(client, "supports_agent_cache_lifecycle", None)
+                self._supports_cache_lifecycle = (
+                    callable(supports) and supports(self._model_uid) is True
+                )
+                supports_priority = getattr(client, "supports_chat_priority", None)
+                self._supports_chat_priority = (
+                    callable(supports_priority)
+                    and supports_priority(self._model_uid) is True
+                )
 
             return self._model_handle
 
@@ -195,6 +213,32 @@ class XinferenceLLM(BaseLLM):
         config.update(kwargs)
 
         return config
+
+    def _apply_session_affinity(self, config: dict[str, Any]) -> None:
+        key = xinference_routing_key.get()
+        if self._supports_session_affinity and key is not None:
+            config.setdefault("routing_key", key)
+
+    def _apply_chat_priority(self, config: dict[str, Any]) -> None:
+        if (
+            self._supports_chat_priority
+            and xinference_interactive.get()
+            and "priority" not in config
+        ):
+            config.setdefault("priority_hint", _INTERACTIVE_PRIORITY_HINT)
+
+    def _apply_cache_lifecycle(self, config: dict[str, Any]) -> None:
+        session = agent_cache_session.get()
+        if self._supports_cache_lifecycle and session is not None:
+            metadata = session.register(
+                (self.base_url, self._model_uid), self._update_cache_session
+            )
+            if metadata is not None:
+                config["cache_session"] = metadata
+
+    async def _update_cache_session(self, session: dict[str, Any]) -> None:
+        if self._client is not None:
+            await self._client.update_cache_session(self._model_uid, session)
 
     async def chat(
         self,
@@ -257,6 +301,9 @@ class XinferenceLLM(BaseLLM):
 
         async def call_model() -> Any:
             model_handle = await self._ensure_client()
+            self._apply_session_affinity(generate_config)
+            self._apply_cache_lifecycle(generate_config)
+            self._apply_chat_priority(generate_config)
             return await model_handle.chat(
                 messages=sanitized_messages,
                 tools=tools,
@@ -497,6 +544,9 @@ class XinferenceLLM(BaseLLM):
                 deadline=first_deadline,
                 timeout_message=first_timeout_message,
             )
+            self._apply_session_affinity(generate_config)
+            self._apply_cache_lifecycle(generate_config)
+            self._apply_chat_priority(generate_config)
             stream = await _await_before_deadline(
                 model_handle.chat(
                     messages=sanitized_messages,

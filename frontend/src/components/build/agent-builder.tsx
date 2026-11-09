@@ -1,5 +1,7 @@
 "use client"
 
+import { formatToolCategory, describeToolCategory } from "@/lib/tool-category-labels"
+
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
 import { AgentBuilderChat } from "./agent-builder-chat"
@@ -69,6 +71,7 @@ import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
 import { AgentSshBindings } from "./agent-ssh-bindings"
+import { useAgentBuilderSettingsExtension } from "@/lib/agent-builder-settings-extension"
 import { getAgentTaskHref } from "@/lib/agent-ui-access"
 import { PromptContextFieldsEditor } from "./prompt-context-fields-editor"
 import { AgentFlowView } from "./agent-flow-view"
@@ -354,7 +357,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     models, modelsStatus, retryModels, userDefaultGeneral, modelDefaultsSettled,
     kbs, kbsStatus, reloadKbs,
     skills, skillsStatus, retrySkills,
-    tools, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
+    tools, toolCategoryDefinitions, intrinsicToolNames, skillLoaderTool, toolsStatus, retryTools,
     mcpServers, setMcpServers, mcpSettled,
   } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
@@ -783,6 +786,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }, [closeFilePreview, setTaskId])
 
   const loadedAgentId = originalData?.id
+  const builderSettings = useAgentBuilderSettingsExtension({
+    agentId: localAgentId ? Number(localAgentId) : undefined,
+    enabled: !readOnly && (!localAgentId || String(loadedAgentId) === localAgentId),
+    saving: isCreating,
+  })
   // previewConfigKey reads the model seed and the MCP list; opening a record
   // before either lands would have it invalidated straight away. This waits
   // for the mount-time MCP fetch only, not an admin's owner-scoped reload.
@@ -1059,13 +1067,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   ).sort()
 
   const toolCategoryOptions = toolCategories.map(category => {
-    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(t => t.category === category)
+    const toolsInCategory = (Array.isArray(tools) ? tools : []).filter(tool => tool.category === category)
     const categoryDesc = getCategoryDescription(category)
     return {
       value: category,
       label: getCategoryLabel(category),
       count: toolsInCategory.length,
-      description: (categoryDesc ? `**${categoryDesc}**\n\n` : '') + `${toolsInCategory.map(t => t.name).join(', ')}`
+      description: (categoryDesc ? `**${categoryDesc}**\n\n` : '') + toolsInCategory.map(tool => tool.name).join(', '),
     }
   })
 
@@ -1102,46 +1110,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     ...(skillLoaderTool && selectedSkills.length > 0 ? [skillLoaderTool] : []),
   ]
 
-  // Helper function for category descriptions
-  function getCategoryDescription(category: string): string {
-    const descriptions: Record<string, string> = {
-      'basic': t('builds.configForm.tools.categoryDescriptions.basic'),
-      'web_search': t('builds.configForm.tools.categoryDescriptions.webSearch'),
-      'file': t('builds.configForm.tools.categoryDescriptions.file'),
-      'vision': t('builds.configForm.tools.categoryDescriptions.vision'),
-      'image': t('builds.configForm.tools.categoryDescriptions.image'),
-      'video': t('builds.configForm.tools.categoryDescriptions.video'),
-      'knowledge': t('builds.configForm.tools.categoryDescriptions.knowledge'),
-      'mcp': t('builds.configForm.tools.categoryDescriptions.mcp'),
-      'browser': t('builds.configForm.tools.categoryDescriptions.browser'),
-      'ppt': t('builds.configForm.tools.categoryDescriptions.ppt'),
-      'office': t('builds.configForm.tools.categoryDescriptions.office'),
-      'special_image': t('builds.configForm.tools.categoryDescriptions.specialImage'),
-      'database': t('builds.configForm.tools.categoryDescriptions.database'),
-      'skill': t('builds.configForm.tools.categoryDescriptions.skill'),
-    }
-    return descriptions[category] || ""
+  function translateCategory(key: string) {
+    return t(key as Parameters<typeof t>[0])
   }
 
-  // Helper function for category labels
+  function getCategoryDescription(category: string): string {
+    return describeToolCategory(category, translateCategory)
+  }
+
   function getCategoryLabel(category: string): string {
-    const labels: Record<string, string> = {
-      'basic': t('builds.configForm.tools.categories.basic'),
-      'web_search': t('builds.configForm.tools.categories.webSearch'),
-      'file': t('builds.configForm.tools.categories.file'),
-      'vision': t('builds.configForm.tools.categories.vision'),
-      'image': t('builds.configForm.tools.categories.image'),
-      'video': t('builds.configForm.tools.categories.video'),
-      'knowledge': t('builds.configForm.tools.categories.knowledge'),
-      'mcp': t('builds.configForm.tools.categories.mcp'),
-      'browser': t('builds.configForm.tools.categories.browser'),
-      'ppt': t('builds.configForm.tools.categories.ppt'),
-      'office': t('builds.configForm.tools.categories.office'),
-      'special_image': t('builds.configForm.tools.categories.specialImage'),
-      'database': t('builds.configForm.tools.categories.database'),
-      'skill': t('builds.configForm.tools.categories.skill'),
-    }
-    return labels[category] || category
+    const definition = toolCategoryDefinitions.find(item => item.id === category)
+    return formatToolCategory(category, translateCategory, definition?.label)
   }
 
   const handlePreviewSendMessage = async (content: string, config?: any, files?: Array<File | PreviewAttachment>, fresh = false) => {
@@ -1431,7 +1410,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     (modelConfig.general || null) !== ((originalData?.models || {}).general || null)
   // Enables Update, so the seeded value has a way into the database: Publish
   // posts no body and never persists models.
-  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers
+  const hostSettings = builderSettings.changes
+  const hasHostSettingsChanges = Boolean(hostSettings && Object.keys(hostSettings).length > 0)
+  const isDirty = isDirtyBeyondGeneralModel || generalModelDiffers || hasHostSettingsChanges
   // ...but a slot holding the seeded value is not an edit worth blocking
   // Publish over, for the very agents the seed exists to unblock. Picking the
   // seeded model by hand is indistinguishable from the seed itself, which is
@@ -1441,6 +1422,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const seedStillUnsaved = !(originalData?.models || {}).general
   const publishBlockedByEdits =
     isDirtyBeyondGeneralModel ||
+    hasHostSettingsChanges ||
     (generalModelDiffers &&
       !(seedStillUnsaved && modelConfig.general === seededGeneralRef.current))
 
@@ -1595,6 +1577,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     const promptContextPayload = toPromptContextFieldsPayload(promptContextFields)
 
     const finalToolCategories = buildToolCategories()
+    const submittedHostSettings = hasHostSettingsChanges ? hostSettings : undefined
 
     setIsCreating(true)
 
@@ -1635,14 +1618,16 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // Ownership transitions go through promote-team/demote-personal.
           ...(ownership === "team" ? { visibility } : {}),
           logo_base64,
+          host_settings: submittedHostSettings,
         }),
       })
 
       if (response.ok) {
+        const savedAgent = await response.json()
+        if (submittedHostSettings) builderSettings.markSaved?.(submittedHostSettings)
         setPromptContextFields(draftsFromDeclarations(promptContextPayload))
         setPromptContextSaveAttempted(false)
         if (isEditMode) {
-          const updatedAgent = await response.json()
           const trimmedName = name.trim()
           const trimmedDesc = description.trim()
           const trimmedInstr = instructions.trim()
@@ -1672,7 +1657,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             knowledge_bases: selectedKbs,
             skills: selectedSkills,
             tool_categories: finalToolCategories,
-            logo_url: updatedAgent.logo_url,
+            logo_url: savedAgent.logo_url,
             ...(ownershipResult ?? {}),
           })
           // Re-seed selectedMcpServers to match: see
@@ -1682,21 +1667,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Sync the saved logo URL so the preview doesn't fall back to the
           // stale URL captured at initial load once logoFile is cleared below.
-          setLogoUrl(updatedAgent.logo_url || null)
+          setLogoUrl(savedAgent.logo_url || null)
           setLogoFile(null)
           setLogoRemoved(false)
         } else {
-          const newAgent = await response.json()
-          setCreatedAgent(newAgent)
+          setCreatedAgent(savedAgent)
           // Preview uploads must not block saving triggers or ownership.
-          void bindPreviewTask(newAgent.id)
+          void bindPreviewTask(savedAgent.id)
 
           // Staged triggers (configured before the agent existed, #928) go
           // through the regular trigger API now that a real agent id exists.
           // Failures don't roll back the agent; failed configs are kept in
           // failedStagedTriggers for retry/discard instead of being dropped.
           if (stagedTriggers.length > 0) {
-            const outcome = await createStagedTriggers(newAgent.id, stagedTriggers)
+            const outcome = await createStagedTriggers(savedAgent.id, stagedTriggers)
             outcome.failed.forEach((entry) => {
               toast.error(
                 t("triggers.messages.stagedCreateFailed", {
@@ -1709,20 +1693,20 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             setFailedStagedTriggers(outcome.failed)
             setCreatedWebhookSecrets(outcome.generatedSecrets)
             try {
-              setTriggerSummary(await listAgentTriggers(newAgent.id))
+              setTriggerSummary(await listAgentTriggers(savedAgent.id))
             } catch (error) {
               console.error("Failed to refresh trigger summary:", error)
             }
           }
 
           // Newly created agents are always personal; promote if the user chose Team.
-          const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
+          const ownershipResult = await reconcileOwnership(savedAgent.id.toString(), savedAgent.team_id)
           // tool_categories: finalToolCategories explicitly, not whatever
-          // newAgent.tool_categories echoes back -- matches the edit-mode
+          // savedAgent.tool_categories echoes back -- matches the edit-mode
           // branch above, which sources both originalData and the reseed
           // below from the same local value rather than mixing a server
           // response with a local one.
-          setOriginalData({ ...newAgent, tool_categories: finalToolCategories, prompt_context_fields: promptContextPayload, ...(ownershipResult ?? {}) })
+          setOriginalData({ ...savedAgent, tool_categories: finalToolCategories, prompt_context_fields: promptContextPayload, ...(ownershipResult ?? {}) })
           // Same re-seed as the edit-mode branch above, and for the same
           // reason: selectedMcpServers must hold the resolved selectors
           // this request submitted, not the possibly-unresolved values it
@@ -1737,13 +1721,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           } else {
             pendingCreationDialogRef.current = true
           }
-          setLocalAgentId(newAgent.id.toString())
+          setLocalAgentId(savedAgent.id.toString())
 
           // Silently update URL to include ID so refreshing works
           // We don't want to trigger a full navigation that might close the dialog or reset state if not handled carefully
           // But since we are setting state, a replace might be fine.
           // Let's use history API to be safe and avoid component remount
-          window.history.pushState({}, '', `/build/${newAgent.id}`)
+          window.history.pushState({}, '', `/build/${savedAgent.id}`)
 
           // Also update internal state so "Edit Mode" logic kicks in effectively if we were to re-render
           // Note: agentId comes from searchParams which won't update until router.push/replace
@@ -2652,7 +2636,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             <div className="text-xs text-muted-foreground">
               {t("builds.configForm.tools.selectedCount", {
                 count: selectedToolCategories.length,
-                tools: tools.filter(t => selectedToolCategories.includes(t.category)).length
+                tools: tools.filter(tool => selectedToolCategories.includes(tool.category)).length
               })}
             </div>
           )}
@@ -3013,6 +2997,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             )}
           </div>
         )}
+        {builderSettings.panel}
       </div>
     </fieldset>
 

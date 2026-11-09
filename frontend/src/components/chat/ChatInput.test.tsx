@@ -166,6 +166,16 @@ describe("ChatInput", () => {
     expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
   })
 
+  it("labels the non-compact send icon and submits through it", async () => {
+    const onSend = vi.fn()
+    render(<ChatInput onSend={onSend} inputValue="Send my draft" onInputChange={vi.fn()}
+      compact={false} hideConfig hideFileUpload voiceInputEnabled={false} taskConfig={{ model: "selected-model" }} />)
+    const send = screen.getByRole("button", { name: "common.send" })
+    expect(send).toHaveAttribute("aria-label", "common.send")
+    fireEvent.click(send)
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Send my draft", expect.objectContaining({ model: "selected-model" })))
+  })
+
   it("requires a model when submitting generic chat", async () => {
     const onSend = vi.fn()
     const { container } = render(
@@ -2646,5 +2656,241 @@ describe("ChatInput upload-only attachments", () => {
     })
 
     await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(1))
+  })
+})
+
+describe("ChatInput autoSendRequest", () => {
+  const editorOf = (container: HTMLElement) =>
+    container.querySelector("[contenteditable]") as HTMLElement
+  // Lets the timers that type the message run, then the send they trigger.
+  const advance = async (ms: number) => {
+    await act(async () => {
+      vi.advanceTimersByTime(ms)
+    })
+  }
+  const composer = (props: Partial<React.ComponentProps<typeof ChatInput>>) => (
+    <ChatInput
+      hideConfig
+      hideFileUpload
+      onSend={vi.fn()}
+      readOnlyConfig
+      {...props}
+    />
+  )
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    let generatedClientMessageId = 0
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementation(() => `client-message-${++generatedClientMessageId}`)
+    toastErrorMock.mockReset()
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it("types the requested message in step by step, then sends it once and clears the composer", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    expect(editorOf(container)).toHaveTextContent(/^S$/)
+    await advance(100)
+    expect(editorOf(container)).toHaveTextContent(/^Show m$/)
+    expect(onSend).not.toHaveBeenCalled()
+
+    // The whole text is in after 15 more steps, and it is sent after a pause.
+    await advance(200)
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    expect(onSend).not.toHaveBeenCalled()
+    await advance(200)
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend).toHaveBeenCalledWith(
+      "Show my schedule",
+      expect.objectContaining({ clientMessageId: "client-message-1" }),
+    )
+    expect(editorOf(container)).toBeEmptyDOMElement()
+  })
+
+  it("types into the editor while it has focus", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container, rerender } = render(composer({ onSend, isLoading: true }))
+    editorOf(container).focus()
+    expect(document.activeElement).toBe(editorOf(container))
+
+    rerender(composer({
+      onSend,
+      isLoading: true,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    // The caret stays after the typed text.
+    const selection = window.getSelection()
+    expect(selection?.isCollapsed).toBe(true)
+    expect(selection?.anchorNode).toBe(editorOf(container))
+    expect(selection?.anchorOffset).toBe(editorOf(container).childNodes.length)
+  })
+
+  it("sends nothing on Enter while the message is being typed, then sends the whole message", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(100)
+
+    fireEvent.keyDown(editorOf(container), { key: "Enter" })
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    expect(onSend).not.toHaveBeenCalled()
+
+    await advance(1000)
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend).toHaveBeenCalledWith("Show my schedule", expect.anything())
+  })
+
+  it("never shows part of an emoji or an accented letter while typing", async () => {
+    const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"
+    const accented = "e\u0301"
+    const { container } = render(composer({
+      isLoading: true,
+      autoSendRequest: { id: 1, text: `${family}${accented}` },
+    }))
+
+    expect(editorOf(container).textContent).toBe(family)
+    await advance(20)
+    expect(editorOf(container).textContent).toBe(`${family}${accented}`)
+  })
+
+  it("leaves the typed message in a composer whose files are still uploading", async () => {
+    const onSend = vi.fn()
+    const file = new File(["x"], "a.pdf", { type: "application/pdf" })
+    const { container } = render(composer({
+      onSend,
+      files: [file],
+      onFilesChange: vi.fn(),
+      attachmentStatuses: new Map([[file, "uploading" as const]]),
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("leaves the typed message in a composer that cannot send", async () => {
+    const onSend = vi.fn()
+    const { container } = render(composer({
+      onSend,
+      isLoading: true,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("stops typing without sending when the visitor edits the composer", async () => {
+    const onSend = vi.fn()
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(100)
+
+    fireEvent.input(editorOf(container))
+    await advance(1000)
+
+    expect(editorOf(container)).toHaveTextContent(/^Show m$/)
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("drops a request that arrives while another one is being typed", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(100)
+
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text: "Cancel my shift" } }))
+    await advance(1000)
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend).toHaveBeenCalledWith("Show my schedule", expect.anything())
+  })
+
+  it("keeps a failed message, shows the failure toast and reuses its message id on the next request", async () => {
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(new Error("Message was rejected"))
+      .mockResolvedValueOnce(undefined)
+    const { container, rerender } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+    await advance(1000)
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+
+    // As with the send button, a new send waits until 500ms after the last one settled.
+    await advance(600)
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text: "Show my schedule" } }))
+    await advance(1000)
+
+    expect(onSend).toHaveBeenCalledTimes(2)
+    expect(onSend.mock.calls[1][1].clientMessageId).toBe(
+      onSend.mock.calls[0][1].clientMessageId,
+    )
+    expect(editorOf(container)).toBeEmptyDOMElement()
+  })
+
+  it("reuses the message id when a prompt starting with whitespace is retried after an unknown outcome", async () => {
+    // One character per step, so typing the text as given would first leave
+    // only the leading space in the composer.
+    const text = " Show my schedule"
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(new Error("Message delivery was not acknowledged"))
+      .mockResolvedValueOnce(undefined)
+    const { rerender } = render(composer({ onSend, autoSendRequest: { id: 1, text } }))
+    await advance(1000)
+    expect(onSend).toHaveBeenCalledTimes(1)
+
+    await advance(600)
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text } }))
+    await advance(1000)
+
+    expect(onSend.mock.calls.map(([message, config]) => [message, config.clientMessageId])).toEqual([
+      ["Show my schedule", "client-message-1"],
+      ["Show my schedule", "client-message-1"],
+    ])
+  })
+
+  it("puts the whole message in at once when reduced motion is preferred", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)",
+    }))
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const { container } = render(composer({
+      onSend,
+      autoSendRequest: { id: 1, text: "Show my schedule" },
+    }))
+
+    expect(editorOf(container)).toHaveTextContent(/^Show my schedule$/)
+    await advance(200)
+    expect(onSend).toHaveBeenCalledWith("Show my schedule", expect.anything())
   })
 })

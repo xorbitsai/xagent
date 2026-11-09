@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ast
-import asyncio
 import json
 import logging
+from dataclasses import replace
 from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,13 +31,14 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
+from xagent.web.services import task_existing_command
 from xagent.web.services.client_error_messages import (
     ClientErrorCode,
 )
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
+from xagent.web.services.task_command_transport import ClaimedTaskCommand
 
 from .conftest import _direct_db_session
 
@@ -124,13 +125,10 @@ async def test_execute_task_redacts_an_incidental_validation_error(
     connection_manager.broadcast_to_task = AsyncMock()
     monkeypatch.setattr(websocket_api, "manager", connection_manager)
 
-    async def raise_at_schedule(**_kwargs: object) -> asyncio.Task:
-        raise raised
-
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=raise_at_schedule),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=raised),
     )
 
     await websocket_api.handle_execute_task(
@@ -281,8 +279,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # per wording, so only the "didn't go through" one asserts a code: 57.
     # The pause pre-check's not-applicable reply adds one: 58.
     # The planned-restart hold refusal's plain error frame adds one: 59.
-    assert result.error_payloads == 59, (
-        f"expected exactly 59 error payloads, matched {result.error_payloads}; "
+    # The resume seam's refusal when it cannot read the active interaction row adds one: 60.
+    # The execute_task handler's non-busy TaskTurnError arm answers the client
+    # with one coded frame instead of re-raising silently: 61.
+    assert result.error_payloads == 61, (
+        f"expected exactly 61 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -2296,9 +2297,9 @@ async def test_unexpected_execute_error_keeps_its_traceback(
     finally:
         db.close()
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=_Unexpected("boom")),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=_Unexpected("boom")),
     )
 
     with caplog.at_level(logging.ERROR):
@@ -2621,9 +2622,9 @@ async def test_execute_runtime_error_broadcast_is_redacted(
         ),
     )
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
     )
 
     await websocket_api.handle_execute_task(
@@ -2672,8 +2673,8 @@ def _clean_origins() -> Iterator[None]:
 
 def _pause_command(
     task_id: int = 7, command_id: str = "pause:origin"
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> ClaimedTaskCommand:
+    return ClaimedTaskCommand(
         id=1,
         task_id=task_id,
         actor_user_id=1,
@@ -2682,8 +2683,6 @@ def _pause_command(
         payload={"type": "pause_task"},
         target_run_id=None,
         attempt_count=1,
-        failure_count=0,
-        defer_count=0,
     )
 
 
@@ -2842,8 +2841,9 @@ async def test_origin_entry_dies_with_its_command_or_socket(
     assert origins.has(command.command_id, command.task_id), (
         "retrying deferral keeps the origin"
     )
-    exhausted = _pause_command(command_id="pause:cleanup")
-    exhausted.defer_count = command_execution_service.max_command_defers()
+    exhausted = replace(
+        command, defer_count=command_execution_service.max_command_defers()
+    )
     with pytest.raises(command_execution_service.TaskCommandDeferred):
         await command_execution_service.execute_durable_task_command(exhausted)
     assert not origins.has(command.command_id, command.task_id)
@@ -2983,9 +2983,9 @@ async def test_execute_safe_error_reaches_the_ingress_socket(
         ),
     )
     monkeypatch.setattr(
-        TaskTurnOrchestrator,
-        "schedule_existing_task_execution",
-        AsyncMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
+        task_existing_command,
+        "stage_existing_execution",
+        MagicMock(side_effect=RuntimeError(f"storage prefix {SECRET}")),
     )
 
     ingress = MagicMock(name="ingress")

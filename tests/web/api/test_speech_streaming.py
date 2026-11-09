@@ -81,6 +81,9 @@ class FakeASR:
     model_name = "scribe_v2_realtime"
     provider_name = "elevenlabs"
 
+    async def get_streaming_capabilities(self):
+        return {"streaming": self.supports_streaming}
+
     def __init__(self):
         self.sessions = []
         self.opening = threading.Event()
@@ -108,6 +111,9 @@ class FakeTTS:
     model_id = "voice"
     model_name = "eleven_flash_v2_5"
     provider_name = "elevenlabs"
+
+    async def get_streaming_capabilities(self):
+        return {"streaming": self.supports_streaming}
 
     def __init__(self):
         self.calls = []
@@ -1075,3 +1081,206 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
     )
     assert api.tts.stream_closed and api.tts.close_count == 1
     assert len(api.usage) == 1
+
+
+@pytest.fixture
+def refusing_gate(monkeypatch):
+    calls = []
+
+    def gate(user_id, source):
+        calls.append((user_id, source))
+        return "Out of AI credits"
+
+    monkeypatch.setattr(quota_hooks, "_standalone_gate_hook", gate)
+    return calls
+
+
+def test_tts_refused_by_the_gate_is_a_402_before_the_model_loads(api, refusing_gate):
+    response = api.client.post(
+        TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}
+    )
+    assert response.status_code == 402
+    assert response.json()["detail"]["code"] == "standalone_usage_refused"
+    assert response.json()["detail"]["message"] == "Out of AI credits"
+    assert refusing_gate == [(1, "speech_synthesize")]
+    api.tts_factory.assert_not_called()
+    assert not api.usage
+
+
+def test_tts_refused_when_the_stream_opens_is_still_a_402_and_closes_the_model(
+    api, monkeypatch
+):
+    # Allowed by the endpoint, refused by the metering scope a moment later.
+    answers = iter([None, "Out of AI credits"])
+    monkeypatch.setattr(
+        quota_hooks, "_standalone_gate_hook", lambda _user, _source: next(answers)
+    )
+    response = api.client.post(
+        TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}
+    )
+    assert response.status_code == 402
+    assert response.json()["detail"]["code"] == "standalone_usage_refused"
+    assert not api.tts.calls
+    assert api.tts.close_count == 1
+    assert not api.usage
+
+
+def test_asr_refused_by_the_gate_reports_the_code_and_closes_with_1008(
+    api, refusing_gate
+):
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        assert ws.receive_json() == {
+            "type": "error",
+            "code": "standalone_usage_refused",
+            "message": "Out of AI credits",
+        }
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1008
+    assert refusing_gate == [(1, "speech_transcribe")]
+    assert not api.asr.sessions
+    assert api.asr.close_count == 1
+    assert not api.usage
+
+
+def test_speech_capabilities_require_model_access_and_close_provider(api):
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == {"streaming": True}
+    assert api.tts.close_count == 1
+    other = build_access_token(sub="other", user_id=2)
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers={"Authorization": f"Bearer {other}"},
+    )
+    assert result.status_code == 404
+    assert api.tts_factory.call_count == 1
+
+
+@pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+def test_speech_capabilities_for_each_role_close_provider(api, ability, model_id):
+    result = api.client.get(
+        f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == {"streaming": True}
+    assert getattr(api, ability).close_count == 1
+
+
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (RuntimeError("synthetic-provider-secret"), 502),
+        (TimeoutError("synthetic-provider-secret"), 504),
+    ],
+)
+def test_tts_capability_probe_failures_are_gateway_errors(api, caplog, error, status):
+    api.tts.get_streaming_capabilities = AsyncMock(side_effect=error)
+    response = api.client.post(
+        TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}
+    )
+    assert response.status_code == status
+    assert "synthetic-provider-secret" not in response.text + caplog.text
+    assert "Speech stream failed" in caplog.text
+    assert api.tts.close_count == 1 and not api.tts.calls
+
+
+def test_asr_capability_probe_failure_closes_and_redacts(api, caplog):
+    api.asr.get_streaming_capabilities = AsyncMock(
+        side_effect=RuntimeError("synthetic-provider-secret")
+    )
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        result = ws.receive_json()
+        assert result["type"] == "error" and result["code"] == "stream_failed"
+    assert "synthetic-provider-secret" not in json.dumps(result) + caplog.text
+    assert api.asr.close_count == 1 and not api.asr.sessions
+
+
+def test_capability_endpoint_only_returns_browser_contract(api):
+    expected = {
+        "streaming": True,
+        "server_vad": True,
+        "formats": ["pcm"],
+        "sample_rates": [24000],
+        "voices": [{"voice_id": "voice", "name": "Voice"}],
+    }
+    api.tts.get_streaming_capabilities = AsyncMock(
+        return_value={**expected, "internal_config": {"private": "provider-detail"}}
+    )
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == expected
+
+
+@pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (RuntimeError("synthetic-provider-secret"), 502),
+        (TimeoutError("synthetic-provider-secret"), 504),
+    ],
+)
+def test_capability_endpoint_maps_and_logs_upstream_failure(
+    api, caplog, ability, model_id, error, status
+):
+    provider = getattr(api, ability)
+    provider.get_streaming_capabilities = AsyncMock(side_effect=error)
+    response = api.client.get(
+        f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
+        headers=api.headers,
+    )
+    assert response.status_code == status
+    assert "synthetic-provider-secret" not in response.text + caplog.text
+    assert "Speech stream failed" in caplog.text
+    assert provider.close_count == 1
+
+
+@pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+def test_capability_endpoint_rejects_invalid_model_configuration(
+    api, caplog, ability, model_id
+):
+    getattr(api, ability + "_factory").side_effect = ValueError(
+        "synthetic-provider-secret"
+    )
+    response = api.client.get(
+        f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
+        headers=api.headers,
+    )
+    assert response.status_code == 400
+    assert "synthetic-provider-secret" not in response.text + caplog.text
+    assert "Speech stream failed" in caplog.text
+
+
+def test_the_gate_is_told_which_speech_model_each_request_calls(api):
+    calls = []
+
+    def gate(user_id, source, model_ids):
+        calls.append((user_id, source, model_ids))
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    try:
+        response = api.client.post(
+            TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hi"}
+        )
+        assert response.status_code == 200
+        with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+            ws.send_json({"type": "start", "model_id": "live"})
+            assert ws.receive_json()["type"] == "session_started"
+            ws.send_json({"type": "close"})
+            with pytest.raises(WebSocketDisconnect):
+                ws.receive_json()
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+
+    # TTS is checked by the endpoint and again by the scope it streams in.
+    assert calls == [
+        (1, "speech_synthesize", ("voice",)),
+        (1, "speech_synthesize", ("voice",)),
+        (1, "speech_transcribe", ("live",)),
+    ]

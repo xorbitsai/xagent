@@ -92,8 +92,10 @@ from .db_runtime import (
     task_returned,
 )
 from .db_write_retry import (
+    CommitAttempt,
     bound_rerun_lock_wait_no_commit,
     retry_db_write_async,
+    run_with_commit_witness_sync,
 )
 from .execution_event_signals import report_commit_failure, report_unknown_outcome
 from .external_task_cancel import (
@@ -156,6 +158,7 @@ from .task_runtime import (
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
+from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -509,8 +512,9 @@ class TaskTurnOrchestrator:
 
         ``task_owner_user_id`` is the task OWNER's id — the runtime identity
         the turn executes as. Callers derive it from the already-authorized
-        task row (``task.user_id``) or the SDK agent's owner
-        (``agent.user_id``), NOT from the acting principal. They differ when
+        task row (``task.user_id``), the owner of an SDK agent key's agent
+        (``agent.user_id``), or the holder of an SDK personal key -- NOT from
+        the acting principal. They differ when
         an admin operates on another user's task: authorization happens at
         the entry (e.g. the WS admin bypass), and the turn must still run as
         the owner, not the admin. The claim predicate keeps ``Task.user_id ==
@@ -773,8 +777,8 @@ class _AcceptedTurn:
     control_state: str = TaskControlState.RUNNING.value
     agent_config: Optional[dict[str, Any]] = None
     # When the turn was accepted: the claimed row's update time in process,
-    # the START command's creation time when queued (the row's values are not
-    # changed, so its update time is the previous turn's).
+    # the START command's creation time when queued (the claim need not change
+    # the row, so its update time can still be the previous turn's).
     accepted_at: Optional[datetime] = None
 
 
@@ -2024,11 +2028,13 @@ def _pause_interrupted_run_no_commit(
     *,
     error: str,
     turn_id: str | None = None,
+    attempt: CommitAttempt | None = None,
 ) -> tuple[dict[str, Any], RecordedInterruption | None] | None:
     """Pause and release an interrupted run with its projections, uncommitted.
 
     Returns the paused control snapshot and what was recorded for automatic
-    recovery, or ``None`` when the fenced write missed. This path keeps its
+    recovery, or ``None`` when the fenced write missed. ``attempt`` receives
+    the witness of the result fact this transaction stages. This path keeps its
     own writer rather than the ORM transition the result paths use: like
     ``fail_and_release_task_lease_no_commit`` it settles and releases in one
     fenced UPDATE (RUNNING, exact run and attempt), which is what this
@@ -2052,7 +2058,11 @@ def _pause_interrupted_run_no_commit(
     recorded = apply_interruption_outcome_no_commit(
         db, task=task, decision=decision, error=error
     )
-    stage_result_fact_no_commit(db, task, interruption_pause_result(), turn_id=turn_id)
+    witness = stage_result_fact_no_commit(
+        db, task, interruption_pause_result(), turn_id=turn_id
+    )
+    if attempt is not None:
+        attempt.witness = witness
     logger.warning(
         "task_id=%s run_id=%s component=settlement paused interrupted run "
         "(reason=%s): %s",
@@ -2121,7 +2131,48 @@ def settle_task_lease_isolated(
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
-    ownerless RUNNING task.
+    ownerless RUNNING task. A V2 settlement whose COMMIT failed retryably is
+    first read back by its result fact's witness
+    (``run_with_commit_witness_sync``): a lost acknowledgement whose COMMIT
+    applied returns ``True`` as if it had been acknowledged, and one that
+    did not apply is rerun. The exception types are unchanged; after reruns
+    the last attempt's error is raised.
+    """
+    return run_with_commit_witness_sync(
+        lambda attempt: _settle_task_lease_attempt(
+            lease,
+            error_message=error_message,
+            client_error_message=client_error_message,
+            client_message_type=client_message_type,
+            turn_id=turn_id,
+            classify_unknown_tool_effect=classify_unknown_tool_effect,
+            interruption=interruption,
+            report=report,
+            attempt=attempt,
+        ),
+        site="settlement",
+        task_id=lease.task_id,
+        run_id=lease.run_id,
+    )
+
+
+def _settle_task_lease_attempt(
+    lease: TaskLease,
+    *,
+    error_message: str | None,
+    client_error_message: str,
+    client_message_type: str,
+    turn_id: str | None,
+    classify_unknown_tool_effect: bool,
+    interruption: InterruptionReason | None,
+    report: SettlementReport | None,
+    attempt: CommitAttempt | None = None,
+) -> bool:
+    """One transaction of ``settle_task_lease_isolated``.
+
+    With an ``attempt``, a rerun bounds its lock waits, and a settlement that
+    stages a V2 result fact leaves its witness and its post-commit step there
+    for the retry driver.
     """
     from ..models.database import get_session_local
     from .chat_history_service import persist_assistant_message_no_commit
@@ -2131,6 +2182,8 @@ def settle_task_lease_isolated(
     SessionLocal = get_session_local()
     with SessionLocal() as settle_db:
         try:
+            if attempt is not None and attempt.rerun:
+                bound_rerun_lock_wait_no_commit(settle_db)
             if error_message is not None:
                 decision = (
                     decide_owned_run_interruption(settle_db, lease, interruption)
@@ -2144,16 +2197,24 @@ def settle_task_lease_isolated(
                         decision,
                         error=error_message,
                         turn_id=turn_id,
+                        attempt=attempt,
                     )
                     if paused is not None:
                         paused_state, recorded = paused
+                        paused_for = decision.reason
+
+                        def confirm_pause() -> bool:
+                            if report is not None:
+                                report.control_state = dict(paused_state)
+                                report.paused_for = paused_for
+                                report.recovery = recorded
+                            invalidate_task_cache_best_effort(lease.task_id)
+                            return True
+
+                        if attempt is not None:
+                            attempt.confirm = confirm_pause
                         settle_db.commit()
-                        if report is not None:
-                            report.control_state = dict(paused_state)
-                            report.paused_for = decision.reason
-                            report.recovery = recorded
-                        invalidate_task_cache_best_effort(lease.task_id)
-                        return True
+                        return confirm_pause()
                     failed = False
                 else:
                     if (
@@ -2227,12 +2288,14 @@ def settle_task_lease_isolated(
                         )
                     from .task_execution_event_writer import stage_result_fact_no_commit
 
-                    stage_result_fact_no_commit(
+                    witness = stage_result_fact_no_commit(
                         settle_db,
                         task,
                         {"error": error_message},
                         turn_id=history_turn_id,
                     )
+                    if attempt is not None:
+                        attempt.witness = witness
                     if get_shared_task_execution_enabled():
                         from .task_runtime_secrets import (
                             delete_runtime_values_no_commit,
@@ -2248,15 +2311,21 @@ def settle_task_lease_isolated(
                         if task.conversation_storage_version == 2
                         else {}
                     )
+
+                    def confirm_failure() -> bool:
+                        if unknown_tool_effect:
+                            log_unknown_tool_effect_settlement(
+                                lease.task_id, lease.run_id, unknown_tool_attempt_id
+                            )
+                        if report is not None:
+                            report.control_state = dict(event_state)
+                        invalidate_task_cache_best_effort(lease.task_id)
+                        return True
+
+                    if attempt is not None:
+                        attempt.confirm = confirm_failure
                     settle_db.commit()
-                    if unknown_tool_effect:
-                        log_unknown_tool_effect_settlement(
-                            lease.task_id, lease.run_id, unknown_tool_attempt_id
-                        )
-                    if report is not None:
-                        report.control_state = dict(event_state)
-                    invalidate_task_cache_best_effort(lease.task_id)
-                    return True
+                    return confirm_failure()
 
                 # The task may already have committed a terminal/control state.
                 # Clear the failed conditional UPDATE transaction before the
@@ -2630,6 +2699,8 @@ def _schedule_bg(
         # retryable ``failed`` delivery (it would invite a double execution).
         execution_started = False
         cleanup_cancellation: asyncio.CancelledError | None = None
+        # What this run reports once its outcome is settled.
+        facts = TurnFacts(started_at=datetime.now(timezone.utc))
         try:
             # A cancellation can land after the worker commits but before the
             # await returns. Drain that worker and settle any late lease before
@@ -2789,6 +2860,7 @@ def _schedule_bg(
                             heartbeat_task=hb_task,
                             snapshot=snapshot,
                             payload=payload,
+                            turn_facts=facts,
                         )
                     else:
                         await execute_task_background(
@@ -2806,6 +2878,7 @@ def _schedule_bg(
                             mcp_runtime_authorization_policy=(
                                 mcp_runtime_authorization_policy
                             ),
+                            turn_facts=facts,
                         )
 
                 await run_while_task_lease_owned(
@@ -2964,6 +3037,12 @@ def _schedule_bg(
                     )
         finally:
             turn_id = getattr(payload, "turn_id", None)
+            # Whether this coroutine's own settlement committed, and what it
+            # reported; read by the settlement report below. Whether it
+            # committed is read from the settlement task itself, not from how
+            # the wait for it ended (see below).
+            own_settlement_committed = False
+            report = SettlementReport()
             if lease is not None:
                 try:
                     heartbeat_outcome = await stop_task_lease_heartbeat(
@@ -3031,7 +3110,6 @@ def _schedule_bg(
                     )
                 else:
                     lease_settled = False
-                    report = SettlementReport()
                     # An owned task, so the record below can follow what the
                     # settlement did even when this runner is cancelled again
                     # while it runs (that wait then ends in CancelledError
@@ -3113,6 +3191,12 @@ def _schedule_bg(
                             settle_err,
                             exc_info=True,
                         )
+                    # The settlement's own return value. A cancellation of the
+                    # wait above skips ``lease_settled`` although the settlement
+                    # still ran to completion, so the report below reads this.
+                    own_settlement_committed = task_returned(settlement) and bool(
+                        settlement.result()
+                    )
                     if not task_returned(settlement):
                         # The settlement raised (possibly under a cancel that
                         # surfaced instead). A returned ``False`` is no
@@ -3165,6 +3249,67 @@ def _schedule_bg(
                                 task_id,
                                 exc_info=True,
                             )
+            # Report the run once its outcome is settled. A run that committed
+            # its own result is reported with that status whatever the
+            # settlement here returned: a settlement carrying an error for a
+            # task already terminal releases the lease but returns False, and
+            # a settlement deferred to lease recovery leaves the committed
+            # terminal row alone. Otherwise the settlement here must have
+            # committed, as the settlement task's own return value says: a
+            # cancellation landing while this coroutine waits for the
+            # settlement ends that wait in CancelledError even when it
+            # committed. A channel run is then only reported when it failed,
+            # because a channel run that returned normally was settled by its
+            # own finalizer, which reports it. Skipped when the turn body
+            # never ran and nothing failed (a pre-execution short-circuit),
+            # and for a run already reported through the shared facts bag.
+            # A cancellation deferred above is raised after this report, at
+            # the end of this ``finally``.
+            if (
+                lease is not None
+                and not facts.notified
+                and (
+                    facts.outcome is not None
+                    or (
+                        own_settlement_committed
+                        and (channel_command is None or settlement_error is not None)
+                    )
+                )
+                and (execution_started or settlement_error is not None)
+            ):
+                try:
+                    outcome = facts.outcome
+                    if outcome is None:
+                        # This coroutine's own settlement committed the outcome.
+                        if broadcast_error_code is not None:
+                            failure_code: str | None = broadcast_error_code
+                        elif settlement_error == EXTERNAL_TURN_INTERRUPTED_MESSAGE:
+                            failure_code = (
+                                ClientErrorCode.EXTERNAL_TURN_INTERRUPTED.value
+                            )
+                        else:
+                            failure_code = None
+                        outcome = settled_outcome(
+                            TaskStatus.PAUSED.value
+                            if report.paused
+                            else TaskStatus.FAILED.value,
+                            failure_code=failure_code,
+                        )
+                    report_turn_settled(
+                        facts,
+                        task_id=task_id,
+                        run_id=lease.run_id,
+                        turn_id=turn_id,
+                        task_source=task_source,
+                        outcome=outcome,
+                        ended_at=datetime.now(timezone.utc),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "turn settlement notification failed for task %s",
+                        task_id,
+                        exc_info=True,
+                    )
             try:
                 from .connector_runtime import pop_ephemeral_runtime_values
 

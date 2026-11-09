@@ -34,6 +34,7 @@ from ...language import (
     render_structured_request_language_policy,
     serialize_pending_user_response,
 )
+from ...prompt_prefix import PROMPT_PREFIX_KEY
 from ...result import normalize_tool_failure_code, unwrap_final_answer_content
 from ...runtime import (
     ExecutionInterrupted,
@@ -184,6 +185,9 @@ class _DAGStepRuntime:
     async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
         del message_id, error
 
+    async def approve_waiting_result(self, result: dict[str, Any]) -> bool:
+        return await self.parent.approve_waiting_result(result)
+
     async def send_message(
         self,
         *,
@@ -305,17 +309,20 @@ class _DAGStepRuntime:
         tools: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        step_metadata = {
+            "task_id": self.root_context.execution_id,
+            "step_id": self.step_id,
+            "dag_step_id": self.step_id,
+            **(metadata or {}),
+        }
         await self.parent.on_llm_start(
             context=context,
             messages=messages,
             tools=tools,
-            metadata={
-                "task_id": self.root_context.execution_id,
-                "step_id": self.step_id,
-                "dag_step_id": self.step_id,
-                **(metadata or {}),
-            },
+            metadata=step_metadata,
         )
+        if metadata is not None and PROMPT_PREFIX_KEY in step_metadata:
+            metadata[PROMPT_PREFIX_KEY] = step_metadata[PROMPT_PREFIX_KEY]
 
     async def on_llm_end(
         self,
@@ -516,6 +523,7 @@ class DAGPattern(AgentPattern):
                 compact_llm=kwargs.get("compact_llm"),
                 runtime=runtime,
                 memory_store=kwargs.get("memory_store"),
+                memory_tools_factory=kwargs.get("memory_tools_factory"),
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),
@@ -550,6 +558,7 @@ class DAGPattern(AgentPattern):
         runtime: PatternRuntime,
         compact_llm: Any | None = None,
         memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
@@ -738,6 +747,7 @@ class DAGPattern(AgentPattern):
                 compact_llm=compact_llm,
                 runtime=runtime,
                 memory_store=memory_store,
+                memory_tools_factory=memory_tools_factory,
                 memory_similarity_threshold=memory_similarity_threshold,
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
@@ -755,6 +765,7 @@ class DAGPattern(AgentPattern):
         runtime: PatternRuntime,
         compact_llm: Any | None = None,
         memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
@@ -771,6 +782,7 @@ class DAGPattern(AgentPattern):
                 compact_llm=compact_llm,
                 runtime=runtime,
                 memory_store=memory_store,
+                memory_tools_factory=memory_tools_factory,
                 memory_similarity_threshold=memory_similarity_threshold,
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
@@ -812,6 +824,7 @@ class DAGPattern(AgentPattern):
                     compact_llm=compact_llm,
                     runtime=runtime,
                     memory_store=memory_store,
+                    memory_tools_factory=memory_tools_factory,
                     memory_similarity_threshold=memory_similarity_threshold,
                     skill_manager=skill_manager,
                     allowed_skills=allowed_skills,
@@ -857,6 +870,7 @@ class DAGPattern(AgentPattern):
                         compact_llm=compact_llm,
                         runtime=runtime,
                         memory_store=memory_store,
+                        memory_tools_factory=memory_tools_factory,
                         memory_similarity_threshold=memory_similarity_threshold,
                         skill_manager=skill_manager,
                         allowed_skills=allowed_skills,
@@ -1047,6 +1061,7 @@ class DAGPattern(AgentPattern):
         runtime: PatternRuntime,
         compact_llm: Any | None = None,
         memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
@@ -1149,6 +1164,7 @@ class DAGPattern(AgentPattern):
                 compact_llm=compact_llm,
                 runtime=step_runtime,
                 memory_store=memory_store,
+                memory_tools_factory=memory_tools_factory,
                 memory_similarity_threshold=memory_similarity_threshold,
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
@@ -1827,6 +1843,7 @@ class DAGPattern(AgentPattern):
     ) -> DAGCompletionAssessment:
         messages = self._completion_assessment_messages(context)
         tools = [self._completion_assessment_tool_schema()]
+        metadata = {"phase": "dag_completion_assessment"}
         await runtime.on_dag_execution(
             context=context,
             phase="completion_assessment",
@@ -1839,7 +1856,7 @@ class DAGPattern(AgentPattern):
             context=context,
             messages=messages,
             tools=tools,
-            metadata={"phase": "dag_completion_assessment"},
+            metadata=metadata,
         )
         final_answer_stream = FinalAnswerStreamSession(runtime)
         streamer = ToolCallStringFieldStreamer(
@@ -1869,13 +1886,13 @@ class DAGPattern(AgentPattern):
             await runtime.on_llm_error(
                 context=context,
                 error=exc,
-                metadata={"phase": "dag_completion_assessment"},
+                metadata=metadata,
             )
             raise
         await runtime.on_llm_end(
             context=context,
             response=response,
-            metadata={"phase": "dag_completion_assessment"},
+            metadata=metadata,
         )
         assessment = self._parse_completion_assessment(response)
         if assessment.complete:

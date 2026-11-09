@@ -104,7 +104,7 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
-from ...tracking.standalone_usage import usage_scope
+from ...tracking.standalone_usage import StandaloneUsageRefused, usage_scope
 from ..batch_control import (
     BatchChannelControl,
     selected_task_id,
@@ -144,6 +144,10 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = frozenset(
 
 class TelegramVoiceTranscriptionError(RuntimeError):
     """Raised when a Telegram voice prompt cannot be transcribed."""
+
+
+class TelegramVoiceUsageRefused(TelegramVoiceTranscriptionError):
+    """The standalone gate refused the transcription; ``str()`` says why."""
 
 
 class TelegramBotInstance(BatchChannelControl[int]):
@@ -1374,10 +1378,17 @@ class TelegramBotInstance(BatchChannelControl[int]):
         # Transcription runs before any agent run exists to track it, so the
         # provider's usage is delivered here, for the channel owner whose ASR
         # model is used.
-        async with usage_scope(owner_user_id, usage_source="telegram_voice"):
-            return await self._transcribe_voice_files_in_scope(
-                voice_file_ids, uploaded_info, asr_model
-            )
+        try:
+            async with usage_scope(
+                owner_user_id,
+                usage_source="telegram_voice",
+                model_ids=(getattr(asr_model, "model_id", ""),),
+            ):
+                return await self._transcribe_voice_files_in_scope(
+                    voice_file_ids, uploaded_info, asr_model
+                )
+        except StandaloneUsageRefused as exc:
+            raise TelegramVoiceUsageRefused(str(exc)) from exc
 
     async def _transcribe_voice_files_in_scope(
         self,
@@ -1886,7 +1897,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     if stopped():
                         return
                     await reply_to.answer(
-                        "I couldn't prepare the attachment or transcribe the voice message. "
+                        f"{error} New messages in this group were not accepted."
+                        if isinstance(error, TelegramVoiceUsageRefused)
+                        else "I couldn't prepare the attachment or transcribe the voice message. "
                         "New messages in this group were not accepted. "
                         "Please resend them together, or send the request as text."
                     )
@@ -2597,7 +2610,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
             if isinstance(e, TelegramVoiceTranscriptionError):
                 await last_message.answer(
                     with_task_reference(
-                        "I couldn't transcribe that voice message. Please try "
+                        str(e)
+                        if isinstance(e, TelegramVoiceUsageRefused)
+                        else "I couldn't transcribe that voice message. Please try "
                         "again or send the request as text.",
                         claimed_task_id,
                     )

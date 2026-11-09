@@ -129,6 +129,7 @@ MCP_UNAVAILABLE_REASONS = frozenset(
         ACTOR_STDIO_SHADOWED_REASON,
         "catalog_app_not_found",
         "config_load_failed",
+        "grant_not_allowed_for_task_source",
         "insufficient_scope",
         "invalid_configuration",
         "invalid_launch_config",
@@ -210,6 +211,9 @@ class _LegacyOAuthTokenResolution:
     # Set only for providers that return a per-org API host instead of
     # using a fixed domain (Salesforce) -- None for everyone else.
     instance_url: str | None = None
+    # The grant's UserOAuth.token_type. "composio" marks a grant held by
+    # Composio, which launches with Composio values instead of a token.
+    token_type: str | None = None
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -365,6 +369,52 @@ class _OAuthInstanceUrlRequired(Exception):
     def __init__(self, *, env_key: str) -> None:
         super().__init__(env_key)
         self.env_key = env_key
+
+
+# Apps whose MCP subprocess can run a Composio-backed grant through Proxy
+# Execute: Facebook (#3531) and Instagram in Instagram Login mode (#3533).
+# Another app's Composio grant is reported unavailable until its subprocess
+# can proxy it.
+_COMPOSIO_PROXY_APPS = frozenset({"facebook", "instagram"})
+
+
+def _composio_grant_env(
+    *, app_id: str, connected_account_id: str, composio_user_id: str | None
+) -> dict[str, str]:
+    """Env for a Composio-backed grant, which replaces the launch config's
+    env_mapping: the grant holds Composio ids, not a provider token.
+
+    A grant that cannot be proxied raises _OAuthInstanceUrlRequired, so it is
+    surfaced as unavailable/reconnect-required like a missing instance_url.
+    """
+    from .mcp.meta_graph import (
+        COMPOSIO_API_KEY_ENV,
+        COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
+        COMPOSIO_USER_ID_ENV,
+    )
+
+    if app_id not in _COMPOSIO_PROXY_APPS:
+        logger.warning(
+            "Composio-backed grant for app '%s' cannot be proxied; "
+            "reporting the connector unavailable",
+            app_id,
+        )
+        raise _OAuthInstanceUrlRequired(env_key=COMPOSIO_CONNECTED_ACCOUNT_ID_ENV)
+    api_key = os.environ.get(COMPOSIO_API_KEY_ENV)
+    if not api_key:
+        # A deployment fault, not something the user can fix by reconnecting.
+        logger.warning(
+            "%s is not configured; Composio-backed grants are unavailable",
+            COMPOSIO_API_KEY_ENV,
+        )
+        raise _OAuthInstanceUrlRequired(env_key=COMPOSIO_API_KEY_ENV)
+    if not composio_user_id:
+        raise _OAuthInstanceUrlRequired(env_key=COMPOSIO_USER_ID_ENV)
+    return {
+        COMPOSIO_API_KEY_ENV: api_key,
+        COMPOSIO_CONNECTED_ACCOUNT_ID_ENV: connected_account_id,
+        COMPOSIO_USER_ID_ENV: composio_user_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -1810,6 +1860,38 @@ def _load_tool_runtime_policy_snapshot(
 _APP_LOCALE_TO_BROWSER_LOCALE = {"en": "en-US", "zh": "zh-CN"}
 
 
+def _filter_excluded_media_models(
+    models: Mapping[str, Any],
+    default: Any | None,
+    excluded_model_ids: frozenset[str],
+    *,
+    ability: str | None = None,
+) -> tuple[Dict[str, Any], Any | None]:
+    """Drop excluded media models and re-pick an excluded default.
+
+    The re-pick uses the media dict's own order (DB row order) and checks ``ability``.
+    """
+    if not excluded_model_ids:
+        return dict(models), default
+    kept = {
+        key: model
+        for key, model in models.items()
+        if key not in excluded_model_ids
+        and getattr(model, "model_id", None) not in excluded_model_ids
+    }
+    if default is None or getattr(default, "model_id", None) not in excluded_model_ids:
+        return kept, default
+    replacement = next(
+        (
+            model
+            for model in kept.values()
+            if ability is None or ability in (getattr(model, "abilities", None) or ())
+        ),
+        None,
+    )
+    return kept, replacement
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -1861,7 +1943,15 @@ class WebToolConfig(BaseToolConfig):
         voice: Optional[str] = None,
         mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+        knowledge_base_team_id: Optional[int] = None,
+        excluded_model_ids: frozenset[str] = frozenset(),
+        # Closed by default; the task builder passes the task-source gate's
+        # verdict for the task this config serves.
+        mcp_team_member_grants_allowed: bool = False,
     ):
+        # Media model ids this task excludes; the getters drop them from the
+        # kind's dict and re-pick an excluded default (see the filter helper).
+        self._excluded_model_ids = frozenset(excluded_model_ids)
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
         # import cycle (web.tools → core.tools.adapters). The factory
@@ -1876,10 +1966,25 @@ class WebToolConfig(BaseToolConfig):
         # path ever supplies this directly, it is read off a loaded ``Agent``
         # row (or a frozen snapshot of one) by the caller.
         self._connector_team_id = connector_team_id
+        # The team the governing agent's knowledge bases resolve against.
+        # Like ``_connector_team_id`` it is read off a loaded ``Agent`` row
+        # (or a frozen snapshot of one) by the caller, never off a request,
+        # and ``None`` is the closed default. It is a separate field because
+        # the two decisions can differ: the direct-run path opens both onto
+        # the same team, while delegated sub-agents keep connectors closed
+        # and still resolve knowledge bases against the delegated agent's
+        # team -- left ``None`` there for a personal agent or an absent or
+        # empty declaration (a workforce allowlist hop whose runner can no
+        # longer run the agent fails before any config is built).
+        self._knowledge_base_team_id = knowledge_base_team_id
+        # Whether the task this config serves may use MCP OAuth grants that a
+        # team member obtained without holding an association to the shared
+        # connector. Decided once by the task builder; closed by default.
+        self._mcp_team_member_grants_allowed = mcp_team_member_grants_allowed
         # The governing agent's creator -- always the same agent as
-        # ``_connector_team_id`` above, populated by the same caller. Used by
-        # the knowledge-base resolution path to tell the agent's creator
-        # apart from any other runner of a team-governed agent.
+        # ``_knowledge_base_team_id`` above, populated by the same caller.
+        # Used by the knowledge-base resolution path to tell the agent's
+        # creator apart from any other runner of a team-governed agent.
         self._agent_creator_user_id = agent_creator_user_id
         # The governing agent's own STORED ``knowledge_bases`` declaration --
         # never the model-supplied value on a search request. Read from the
@@ -2159,7 +2264,28 @@ class WebToolConfig(BaseToolConfig):
             loader=loader,
             terminal_neutral={},
         )
-        return dict(resolved)
+        return _filter_excluded_media_models(
+            dict(resolved), None, self._excluded_model_ids
+        )[0]
+
+    def _repick_excluded_media_default(
+        self,
+        default: Any | None,
+        models: Callable[[], Mapping[str, Any]],
+        *,
+        ability: str | None = None,
+    ) -> Any | None:
+        """Keep a default unless excluded, then re-pick it from the remaining models.
+
+        Not excluded (or no exclusions) returns it without loading the kind's dict.
+        """
+        if default is None or (
+            getattr(default, "model_id", None) not in self._excluded_model_ids
+        ):
+            return default
+        return _filter_excluded_media_models(
+            models(), default, self._excluded_model_ids, ability=ability
+        )[1]
 
     def get_vision_model(self) -> Optional[Any]:
         """Get vision model, prioritizing explicitly provided model over database."""
@@ -2193,29 +2319,41 @@ class WebToolConfig(BaseToolConfig):
 
     def get_image_generate_model(self) -> Optional[Any]:
         """Get default image generation model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_image",
-            field_name="image_generate_model",
-            cache_name="_cached_image_generate_model",
-            loader=self._load_image_generate_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_image",
+                field_name="image_generate_model",
+                cache_name="_cached_image_generate_model",
+                loader=self._load_image_generate_model,
+            ),
+            self.get_image_models,
+            ability="generate",
         )
 
     def get_image_edit_model(self) -> Optional[Any]:
         """Get default image editing model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_image",
-            field_name="image_edit_model",
-            cache_name="_cached_image_edit_model",
-            loader=self._load_image_edit_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_image",
+                field_name="image_edit_model",
+                cache_name="_cached_image_edit_model",
+                loader=self._load_image_edit_model,
+            ),
+            self.get_image_models,
+            ability="edit",
         )
 
     def get_video_model(self) -> Optional[Any]:
         """Get default video generation model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_video",
-            field_name="video_model",
-            cache_name="_cached_video_model",
-            loader=self._load_video_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_video",
+                field_name="video_model",
+                cache_name="_cached_video_model",
+                loader=self._load_video_model,
+            ),
+            self.get_video_models,
+            ability="generate",
         )
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
@@ -2680,6 +2818,10 @@ class WebToolConfig(BaseToolConfig):
         """Get allowed knowledge base collections. None means all collections are allowed."""
         return self._allowed_collections
 
+    def get_knowledge_base_team_id(self) -> Optional[int]:
+        """Get the team the governing agent's knowledge bases resolve against."""
+        return self._knowledge_base_team_id
+
     def get_agent_creator_user_id(self) -> Optional[int]:
         """Get the governing agent's creator, for the knowledge-base seam."""
         return self._agent_creator_user_id
@@ -2920,7 +3062,7 @@ class WebToolConfig(BaseToolConfig):
             connector_runtime_turn_id=self._connector_runtime_turn_id,
             connector_team_id=self._connector_team_id,
             load_policy=(self._user_id is not None and has_user_tool_policy_hooks()),
-            load_basic=(wants_category("basic") or wants_category("web_search")),
+            load_basic=wants_category("web_tools"),
             load_sql=wants_category("database"),
             load_custom_api=(
                 True
@@ -3186,6 +3328,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()
 
+    def get_excluded_model_ids(self) -> frozenset[str]:
+        """Get media model ids this task excludes (inherited by sub-agents)."""
+        return self._excluded_model_ids
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""
         return getattr(self, "_excluded_agent_id", None)
@@ -3418,11 +3564,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_asr_model(self) -> Optional[Any]:
         """Get default ASR model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="asr_model",
-            cache_name="_cached_asr_model",
-            loader=self._load_asr_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="asr_model",
+                cache_name="_cached_asr_model",
+                loader=self._load_asr_model,
+            ),
+            self.get_asr_models,
+            ability="asr",
         )
 
     def _load_asr_model(self) -> Optional[Any]:
@@ -3460,11 +3610,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_tts_model(self) -> Optional[Any]:
         """Get default TTS model from database."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="tts_model",
-            cache_name="_cached_tts_model",
-            loader=self._load_tts_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="tts_model",
+                cache_name="_cached_tts_model",
+                loader=self._load_tts_model,
+            ),
+            self.get_tts_models,
+            ability="tts",
         )
 
     def get_sound_effect_models(self) -> Dict[str, Any]:
@@ -3488,11 +3642,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_sound_effect_model(self) -> Optional[Any]:
         """Get the user's default sound effect model."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="sound_effect_model",
-            cache_name="_cached_sound_effect_model",
-            loader=self._load_sound_effect_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="sound_effect_model",
+                cache_name="_cached_sound_effect_model",
+                loader=self._load_sound_effect_model,
+            ),
+            self.get_sound_effect_models,
+            ability="generate",
         )
 
     def _load_sound_effect_model(self) -> Optional[Any]:
@@ -3526,11 +3684,15 @@ class WebToolConfig(BaseToolConfig):
 
     def get_music_model(self) -> Optional[Any]:
         """Get the user's default music model."""
-        return self._get_factory_model_value(
-            load_flag="load_audio",
-            field_name="music_model",
-            cache_name="_cached_music_model",
-            loader=self._load_music_model,
+        return self._repick_excluded_media_default(
+            self._get_factory_model_value(
+                load_flag="load_audio",
+                field_name="music_model",
+                cache_name="_cached_music_model",
+                loader=self._load_music_model,
+            ),
+            self.get_music_models,
+            ability="generate",
         )
 
     def _load_music_model(self) -> Optional[Any]:
@@ -3897,7 +4059,10 @@ class WebToolConfig(BaseToolConfig):
         app_info: Mapping[str, Any],
         access_token: str,
         instance_url: str | None = None,
+        grant_token_type: str | None = None,
     ) -> Dict[str, Any]:
+        from ..models.user_oauth import COMPOSIO_TOKEN_TYPE
+
         launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
             transport_config: Dict[str, Any] = {
@@ -3907,33 +4072,41 @@ class WebToolConfig(BaseToolConfig):
             }
 
             env = {}
-            for env_key, token_type in _oauth_launch_config_env_mapping(
-                launch_config
-            ).items():
-                if token_type == "access_token":
-                    env[env_key] = access_token
-                elif token_type == "instance_url":
-                    if not instance_url:
-                        raise _OAuthInstanceUrlRequired(env_key=env_key)
-                    env[env_key] = instance_url
-                else:
-                    # A typo'd env_mapping value (e.g. "acess_token") would
-                    # otherwise silently emit neither an env var nor an
-                    # error -- the exact opaque failure mode
-                    # _OAuthInstanceUrlRequired exists to prevent for the
-                    # one token_type above it. Not developer-only: an admin
-                    # can reach this through POST /admin/mcp/apps, whose
-                    # launch_config is an unvalidated free-form dict (see
-                    # PublicMCPAppCreate in admin_mcp.py -- its validator
-                    # checks command/required_env/url/auth.type, not
-                    # env_mapping's values), so a hand-typed custom OAuth
-                    # app's env_mapping can carry this too.
-                    logger.warning(
-                        "Unrecognized launch_config.env_mapping token_type "
-                        "'%s' for env var '%s'; no value forwarded",
-                        token_type,
-                        env_key,
+            env_mapping = _oauth_launch_config_env_mapping(launch_config)
+            if grant_token_type == COMPOSIO_TOKEN_TYPE:
+                env.update(
+                    _composio_grant_env(
+                        app_id=str(app_info.get("id") or "").strip().lower(),
+                        connected_account_id=access_token,
+                        composio_user_id=instance_url,
                     )
+                )
+            else:
+                for env_key, token_type in env_mapping.items():
+                    if token_type == "access_token":
+                        env[env_key] = access_token
+                    elif token_type == "instance_url":
+                        if not instance_url:
+                            raise _OAuthInstanceUrlRequired(env_key=env_key)
+                        env[env_key] = instance_url
+                    else:
+                        # A typo'd env_mapping value (e.g. "acess_token") would
+                        # otherwise silently emit neither an env var nor an
+                        # error -- the exact opaque failure mode
+                        # _OAuthInstanceUrlRequired exists to prevent for the
+                        # one token_type above it. Not developer-only: an admin
+                        # can reach this through POST /admin/mcp/apps, whose
+                        # launch_config is an unvalidated free-form dict (see
+                        # PublicMCPAppCreate in admin_mcp.py -- its validator
+                        # checks command/required_env/url/auth.type, not
+                        # env_mapping's values), so a hand-typed custom OAuth
+                        # app's env_mapping can carry this too.
+                        logger.warning(
+                            "Unrecognized launch_config.env_mapping token_type "
+                            "'%s' for env var '%s'; no value forwarded",
+                            token_type,
+                            env_key,
+                        )
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
@@ -4321,11 +4494,13 @@ class WebToolConfig(BaseToolConfig):
 
         access_token = str(oauth_account.access_token)
         instance_url = getattr(oauth_account, "instance_url", None)
+        token_type = getattr(oauth_account, "token_type", None)
         oauth_db.commit()
         return _LegacyOAuthTokenResolution(
             access_token=access_token,
             instance_url=instance_url,
             credential_present=True,
+            token_type=token_type,
         )
 
     def _resolve_shared_google_oauth_account(
@@ -4948,6 +5123,7 @@ class WebToolConfig(BaseToolConfig):
                         app_info=app_info,
                         access_token=access_token,
                         instance_url=legacy_token.instance_url,
+                        grant_token_type=legacy_token.token_type,
                     )
                     if serialized_slack_policy is not None:
                         transport_config.setdefault("env", {})[
@@ -5240,6 +5416,7 @@ class WebToolConfig(BaseToolConfig):
                             server,
                             user_id=self._user_id,
                             mcp_auth_context=auth_context,
+                            allow_team_member_grants=self._mcp_team_member_grants_allowed,
                         )
                     except ConnectorRuntimeError:
                         raise

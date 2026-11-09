@@ -23,6 +23,7 @@ from xagent.sandbox.base import (
     SandboxConfig,
     SandboxContractError,
     SandboxInspection,
+    SandboxMount,
     SandboxReconcileUnsupportedError,
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
@@ -215,6 +216,16 @@ class TestSpecFieldSensitivity:
             {"security_profile": "different-profile"},
             {"env": {"FOO": "different", "BAZ": "qux"}},
             {"volumes": [("/host/a", "/guest/a", "rw")]},
+            {
+                "mounts": [
+                    SandboxMount(
+                        type="volume",
+                        source="xagent-workspaces",
+                        target="/guest/workspace",
+                        subpath="user_1/task_2",
+                    )
+                ]
+            },
             {"network_isolated": True},
             {"ports": [(9090, 90)]},
         ],
@@ -266,6 +277,7 @@ class TestSpecFieldSensitivity:
             "security_profile",
             "env",
             "volumes",
+            "mounts",
             "network_isolated",
             "ports",
         }
@@ -354,6 +366,67 @@ class TestSpecOrderInsensitivity:
         assert a == b
         assert a.fingerprint() == b.fingerprint()
         assert len(a.volumes) == 2
+
+    def test_structured_mount_order_and_duplicates_do_not_affect_equality(self):
+        a = SandboxMount(
+            type="volume",
+            source="xagent-workspaces",
+            target="/workspace/a",
+            subpath="user_1/a",
+        )
+        b = SandboxMount(
+            type="volume",
+            source="xagent-workspaces",
+            target="/workspace/b",
+            subpath="user_1/b",
+        )
+        left = _make_spec(mounts=[a, b])
+        right = _make_spec(mounts=[b, a, a])
+        assert left == right
+        assert left.fingerprint() == right.fingerprint()
+
+
+class TestSandboxMountValidation:
+    def test_canonical_named_volume_subpath_mount(self):
+        mount = SandboxMount(
+            type="volume",
+            source="xagent-stage-workspaces",
+            target="//root/.xagent/uploads/user_1/",
+            subpath="user_1/task_2",
+        )
+        assert mount.target == "/root/.xagent/uploads/user_1"
+        assert mount.subpath == "user_1/task_2"
+
+    @pytest.mark.parametrize(
+        "subpath", [None, "", "/user_1", "user_1/../task", "user_1//task", "."]
+    )
+    def test_rejects_unsafe_or_root_volume_subpath(self, subpath):
+        with pytest.raises(ValueError):
+            SandboxMount(
+                type="volume",
+                source="xagent-workspaces",
+                target="/workspace",
+                subpath=subpath,
+            )
+
+    def test_rejects_volume_name_that_looks_like_a_host_path(self):
+        with pytest.raises(ValueError, match="volume name"):
+            SandboxMount(
+                type="volume",
+                source="/var/lib/data",
+                target="/workspace",
+                subpath="user_1",
+            )
+
+    def test_bind_mount_cannot_smuggle_a_subpath(self):
+        with pytest.raises(ValueError, match="do not support"):
+            SandboxMount(
+                type="bind",
+                source="/opt/project",
+                target="/app",
+                mode="ro",
+                subpath="src",
+            )
 
     def test_port_order_and_duplicates_do_not_affect_equality(self):
         a = _make_spec(ports=[(8080, 80), (9090, 90)])
@@ -531,7 +604,7 @@ class TestContractVersionNotInFingerprint:
         assert "contract_version" not in field_names
 
     def test_module_constant_exists(self):
-        assert SPEC_CONTRACT_VERSION == 2
+        assert SPEC_CONTRACT_VERSION == 3
 
 
 # --- ResolvedSandboxRuntimeSpec: to_backend_config round trip ---
@@ -566,6 +639,17 @@ class TestToBackendConfig:
         assert template.type == "snapshot"
         assert template.snapshot_id == "snap-1"
         assert template.image is None
+
+    def test_round_trip_structured_mount(self):
+        mount = SandboxMount(
+            type="volume",
+            source="xagent-workspaces",
+            target="/workspace",
+            subpath="user_1/task_2",
+        )
+        spec = _make_spec(mounts=[mount])
+        _template, config = spec.to_backend_config()
+        assert config.mounts == [mount]
 
 
 # --- Exceptions: never RuntimeError ---
@@ -656,6 +740,14 @@ class TestSandboxServiceDefaults:
 
 
 class TestSpecMatchesInspection:
+    def test_backend_runtime_policy_failure_is_a_hard_mismatch(self):
+        desired = _make_spec()
+        inspection = _make_inspection(
+            fingerprint_label=None,
+            runtime_policy_matches=False,
+        )
+        assert spec_matches_inspection(desired, inspection) is SpecVerdict.MISMATCH
+
     def test_missing_fingerprint_label_is_unverified(self):
         desired = _make_spec()
         inspection = _make_inspection(fingerprint_label=None)

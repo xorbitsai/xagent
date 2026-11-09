@@ -277,6 +277,7 @@ class ClaimedTaskCommand:
     failure_count: int = 0
     defer_count: int = 0
     admission_required: bool = False
+    dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
 
 
 @dataclass(frozen=True)
@@ -1073,12 +1074,23 @@ def _claimable_query(
         db.query(TaskExecutionCommand)
         .join(Task, Task.id == TaskExecutionCommand.task_id)
         .filter(
-            # Keep START dormant until the entire shared host is enabled.
+            # Keep START dormant until the entire shared host is enabled,
+            # except the legacy ``execute_task`` START ("existing"), which
+            # combined mode consumes locally (``execute_existing_start_local``).
             (
                 true()
                 if get_shared_task_execution_enabled()
-                else TaskExecutionCommand.kind.notin_(
-                    (TaskCommandKind.START.value, TaskCommandKind.RESUME_INPUT.value)
+                else or_(
+                    TaskExecutionCommand.kind.notin_(
+                        (
+                            TaskCommandKind.START.value,
+                            TaskCommandKind.RESUME_INPUT.value,
+                        )
+                    ),
+                    and_(
+                        TaskExecutionCommand.kind == TaskCommandKind.START.value,
+                        TaskExecutionCommand.payload["kind"].as_string() == "existing",
+                    ),
                 )
             ),
             _claim_availability_predicate(now),
@@ -1265,6 +1277,7 @@ def claim_task_command(
         target_run_id=(str(fresh.target_run_id) if fresh.target_run_id else None),
         attempt_count=int(fresh.attempt_count or 0),
         admission_required=admission_required,
+        dispatch_class=cast(DispatchClass, fresh.dispatch_class),
         failure_count=int(fresh.failure_count or 0),
         defer_count=int(fresh.defer_count or 0),
     )
@@ -2616,7 +2629,8 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
     (``_dispatcher_candidate_query``), seen from ``runner_id``: claim
     availability, team admission, the earlier-unfinished-command gate and
     runner routing, plus the START/RESUME_INPUT exclusion without shared
-    execution and the owner lease-recovery filter with it. Whether shared
+    execution (except a START of kind ``existing``, which combined mode
+    consumes itself) and the owner lease-recovery filter with it. Whether shared
     execution is on, and so which variant of each predicate applies, comes
     from the calling process's ``get_shared_task_execution_enabled()``, not
     from the worker that would claim. Without shared execution the

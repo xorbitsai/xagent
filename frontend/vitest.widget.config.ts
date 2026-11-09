@@ -26,6 +26,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/ui/markdown-renderer.tsx",
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
+        "src/components/widget/use-history-continue.ts",
         "src/components/widget/use-session-attachments.ts",
         "src/components/widget/use-session-open-message.ts",
         "src/components/widget/use-widget-session.ts",
@@ -46,6 +47,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/remark-preserve-table-content.ts",
         "src/lib/send-failure-notice.ts",
         "src/lib/widget-parent-message.ts",
+        "src/lib/widget-session-history.ts",
         "src/lib/widget-session-upload.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
@@ -87,6 +89,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/use-session-attachments.ts": {
           statements: 90, branches: 85, functions: 75, lines: 90,
         },
+        "src/components/widget/use-history-continue.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
         "src/components/widget/use-session-open-message.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,
         },
@@ -94,6 +99,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 95, branches: 80, functions: 90, lines: 95,
         },
         "src/components/widget/widget-chrome-controls.tsx": {
+          statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/lib/widget-session-history.ts": {
           statements: 95, branches: 90, functions: 95, lines: 95,
         },
         "src/lib/widget-session-upload.ts": {
@@ -241,6 +249,7 @@ export default defineConfig({
       "src/components/widget/public-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.integration.test.tsx",
+      "src/components/widget/use-history-continue.test.tsx",
       "src/components/widget/use-session-attachments.test.tsx",
       "src/components/widget/use-session-open-message.test.tsx",
       "src/components/widget/use-widget-session.test.tsx",
@@ -263,6 +272,7 @@ export default defineConfig({
       "src/lib/prompt-context-fields.test.ts",
       "src/components/build/agent-builder-prompt-context-fields.test.tsx",
       "src/lib/widget-parent-message.test.ts",
+      "src/lib/widget-session-history.test.ts",
       "src/lib/widget-session-upload.test.ts",
       "src/lib/client-errors.test.ts",
       "src/lib/send-failure-notice.test.ts",

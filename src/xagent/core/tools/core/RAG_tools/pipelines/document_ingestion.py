@@ -57,7 +57,7 @@ from ..utils.embedding_utils import (
 )
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.token_utils import get_token_counter
-from ..utils.user_scope import resolve_user_scope
+from ..utils.user_scope import resolve_user_scope, user_scope_context
 from ..vector_storage.vector_manager import (
     commit_vectors_to_db,
     read_chunks_for_embedding,
@@ -355,20 +355,13 @@ def _compact_storage_if_needed(embedding_model_id: Optional[str]) -> None:
     pipeline, hence the blanket except.
     """
     try:
-        from ..LanceDB.model_tag_utils import embeddings_table_name, to_model_tag
+        from ..LanceDB.model_tag_utils import embeddings_table_candidates
         from ..storage.factory import StorageFactory
 
         tables = list(_INGEST_TABLES)
         if embedding_model_id:
-            # The write path applies to_model_tag twice (CollectionHandle, then
-            # upsert_embeddings) and it is not idempotent for vendor-prefixed
-            # ids, so probe both spellings — the same compatibility trick as
-            # CollectionHandle._embedding_table_names. Missing tables are a
-            # cheap no-op in should_compact.
-            tables += [
-                embeddings_table_name(embedding_model_id),
-                embeddings_table_name(to_model_tag(embedding_model_id)),
-            ]
+            # The write path tags the model twice, so probe every candidate spelling.
+            tables += embeddings_table_candidates(embedding_model_id)
         store = StorageFactory.get_factory().get_vector_index_store()
         compacted = store.compact_tables(list(dict.fromkeys(tables)))
         if compacted:
@@ -530,6 +523,46 @@ def _resolve_embedding_adapter(
         base_url=config.embedding_base_url,
         timeout_sec=config.embedding_timeout_sec,
     )
+
+
+def resolve_ingestion_model_ids(
+    collection: str,
+    *,
+    ingestion_config: Optional[IngestionConfigInput] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+) -> Tuple[str, ...]:
+    """The configured embedding model an ingestion will call, resolved as it does.
+
+    For the standalone usage gate: run it, and then the ingestion, under one
+    :class:`~..utils.model_resolution_pin.ModelResolutionPin`, and the
+    ingestion embeds with exactly the model listed -- the one the collection
+    is bound to, else the requested one. A model configured from the
+    environment carries no id and is left out.
+
+    Never raises: a resolution that fails here fails the ingestion the same
+    way, before anything is embedded.
+    """
+    scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    cfg = coerce_ingestion_config(ingestion_config)
+    requested_model_id = cfg.embedding_model_id
+    selected_model_id: Optional[str]
+    try:
+        selected_model_id = resolve_effective_embedding_model_sync(
+            collection, requested_model_id
+        )
+    except ValueError:
+        selected_model_id = requested_model_id
+    except Exception:  # noqa: BLE001 - the ingestion reports it
+        return ()
+    effective_cfg = cfg.model_copy(update={"embedding_model_id": selected_model_id})
+    try:
+        with user_scope_context(scope.user_id, scope.is_admin):
+            embedding_config, _ = _resolve_embedding_adapter(effective_cfg)
+    except Exception:  # noqa: BLE001 - the ingestion reports it
+        return ()
+    model_id = embedding_config.usage_model_id
+    return (model_id,) if model_id else ()
 
 
 def _handle_ingestion_error(
@@ -711,7 +744,11 @@ def _process_document_impl(
             selected_model_id = requested_model_id
 
         effective_cfg = cfg.model_copy(update={"embedding_model_id": selected_model_id})
-        embedding_config, embedding_adapter = _resolve_embedding_adapter(effective_cfg)
+        # A bare model name resolves only among models this user may use.
+        with user_scope_context(user_id, is_admin):
+            embedding_config, embedding_adapter = _resolve_embedding_adapter(
+                effective_cfg
+            )
         selected_model_id = (embedding_config.id or selected_model_id or "").strip()
         cfg = effective_cfg.model_copy(update={"embedding_model_id": selected_model_id})
 

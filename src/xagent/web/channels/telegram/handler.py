@@ -7,6 +7,7 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 
 from ....core.agent.trace import TraceAction, TraceCategory, TraceEvent, TraceHandler
+from ...services.public_trace_events import is_audit_only_trace_data
 from .utils import (
     CancelledDelivery,
     deliver_cancellation_safe,
@@ -58,7 +59,11 @@ class TelegramTraceHandler(TraceHandler):
 
     async def handle_event(self, event: TraceEvent) -> None:
         try:
-            if self.cancelled or not self._matches_task(event):
+            if (
+                self.cancelled
+                or not self._matches_task(event)
+                or is_audit_only_trace_data(event.data)
+            ):
                 return
 
             # We only care about assistant messages and coarse tool activity for Telegram.

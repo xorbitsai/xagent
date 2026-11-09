@@ -29,7 +29,9 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.model.chat.basic.router import RouterLLM
+from xagent.core.model.chat.cache_lifecycle import agent_cache_session
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
     ToolProtocolViolation,
@@ -328,6 +330,39 @@ def test_auto_child_runtime_covers_pattern_runtime_async_interface() -> None:
     ]
 
     assert missing == []
+
+
+@pytest.mark.asyncio
+async def test_auto_child_runtime_finishes_the_shared_cache_session() -> None:
+    parent = PatternRuntime()
+    child = _AutoChildRuntime(
+        parent=parent,
+        auto_pattern=AutoPattern(),
+        root_context=ExecutionContext(execution_id="auto-cache-cleanup"),
+    )
+    events: list[dict[str, Any]] = []
+
+    async def notify(payload: dict[str, Any]) -> None:
+        events.append(payload)
+
+    class CacheAwareLLM:
+        async def chat(self, **kwargs: Any) -> str:
+            session = agent_cache_session.get()
+            assert session is not None
+            assert session.register(("server", "model"), notify) is not None
+            return session.id
+
+    session_id = await child.run_llm_call(CacheAwareLLM())
+    assert events == []
+    await child.finish_cache_session()
+    await child.finish_cache_session()
+    if parent._cache_session._publisher is not None:
+        await parent._cache_session._publisher
+
+    assert events == [{"id": session_id, "revision": 1, "phase": "finished"}]
+    assert parent._cache_session.phase == "finished"
+    assert not parent._cache_session._providers
+    assert agent_cache_session.get() is None
 
 
 def decision_tool_response(
@@ -664,6 +699,88 @@ async def test_auto_loaded_skill_guidance_reaches_dag_before_planning() -> None:
     child_system = child_context.get_messages_for_llm()[0]["content"]
     assert "Selected skill guidance" in child_system
     assert "Use the Auto skill instructions." in child_system
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["react", "plan_execute"])
+async def test_auto_public_run_forwards_custom_memory_tool_factory(
+    action: str,
+) -> None:
+    child = CapturingChildPattern()
+    pattern = AutoPattern(
+        react_pattern=child,  # type: ignore[arg-type]
+        dag_pattern=child,  # type: ignore[arg-type]
+    )
+    context = ExecutionContext(execution_id=f"auto-memory-factory-{action}")
+    context.add_user_message("Use the selected memory tools")
+
+    def factory(**_kwargs: Any) -> list[Any]:
+        return []
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([decision_tool_response(action, "Needs memory tools.")]),
+        runtime=RecordingRuntime(),
+        memory_store=FakeMemoryStore(),
+        memory_tools_factory=factory,
+    )
+
+    assert result["success"] is True
+    assert child.kwargs is not None
+    assert child.kwargs["memory_tools_factory"] is factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["react", "plan_execute"])
+async def test_auto_default_children_execute_custom_memory_tools(action: str) -> None:
+    responses: list[Any] = [decision_tool_response(action, "Needs memory tools.")]
+    if action == "plan_execute":
+        responses.append(plan_tool_response([{"id": "search", "task": "Search"}]))
+    responses.extend(
+        [
+            {
+                "content": "searching",
+                "tool_calls": [
+                    {
+                        "id": "call",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"xagent"}',
+                        },
+                    }
+                ],
+            },
+            "done",
+        ]
+    )
+    tool = FakeSearchTool()
+    factory_result = [tool]
+    factory_contexts: list[ExecutionContext] = []
+
+    def factory(**kwargs: Any) -> list[Any]:
+        factory_contexts.append(kwargs["context"])
+        return factory_result
+
+    context = ExecutionContext(execution_id=f"auto-default-memory-{action}")
+    context.add_user_message("Search memory for xagent")
+    result = await AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator())).run(
+        context=context,
+        tools=[],
+        llm=FakeLLM(responses),
+        runtime=PatternRuntime(),
+        memory_store=InMemoryMemoryStore(),
+        memory_tools_factory=factory,
+    )
+
+    assert result["success"] is True
+    assert len(tool.calls) == 1
+    assert factory_result == [tool]
+    assert factory_contexts
+    assert all(
+        factory_context.metadata["memory_tools_enabled"] is True
+        for factory_context in factory_contexts
+    )
 
 
 def plan_tool_response(
@@ -2656,3 +2773,39 @@ async def test_auto_ordinary_tool(action):
     )
     assert result["success"]
     assert len(tool.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_child_hooks_emit_one_finished_for_shared_session() -> None:
+    events = []
+
+    async def notify(payload):
+        events.append(payload)
+
+    class CacheAwareLLM(FakeLLM):
+        async def chat(self, **kwargs):
+            session = agent_cache_session.get()
+            assert session is not None
+            session.register(("auto-hooks", "model"), notify)
+            return await super().chat(**kwargs)
+
+    class HookedChild(CapturingChildPattern):
+        async def run(self, **kwargs):
+            runtime, context = kwargs["runtime"], kwargs["context"]
+            await runtime.on_pattern_start(context=context, pattern=self)
+            result = await super().run(**kwargs)
+            await runtime.on_pattern_end(context=context, pattern=self, result=result)
+            assert runtime.parent._cache_session.phase == "active"
+            return result
+
+    runtime = PatternRuntime()
+    llm = CacheAwareLLM([decision_tool_response("react", "Needs a tool.")])
+    pattern = AutoPattern(react_pattern=HookedChild())  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-lifecycle-hooks")
+    context.add_user_message("Use a tool")
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+    assert result["success"]
+    if runtime._cache_session._publisher is not None:
+        await runtime._cache_session._publisher
+    assert [item["phase"] for item in events] == ["finished"]
+    assert runtime._cache_pattern_count == 0

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
+import json
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -16,18 +18,29 @@ from uuid import uuid4
 from ...config import (
     COMPACT_THRESHOLD_DEFAULT,
     get_compact_threshold_default,
+    get_session_secret,
 )
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
+from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
+from ..guardrails.output import (
+    BLOCKED_OUTPUT,
+    UNAVAILABLE_OUTPUT,
+    ProtectedInteractionError,
+    bind_output_guardrail,
+    resolve_output_guardrail,
+)
 from ..inline_file_delivery import InlineFileDelivery
-from ..model.chat.exceptions import ModelProviderError
+from ..model.chat.exceptions import MODEL_PROVIDER_FAILURE_KINDS, ModelProviderError
+from ..model.chat.routing_context import xinference_routing_key
 from ..model.chat.token_context import token_usage_observer
 from ..model.intent import enter_goal, exit_goal
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
+from ..user_context import current_user_id
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .budget import (
@@ -66,6 +79,7 @@ from .interruption import (
 )
 from .language import reset_output_language_to_request_context
 from .result import (
+    FINAL_ANSWER_KEYS,
     extract_assistant_message,
     normalize_tool_failure_code,
     set_assistant_message,
@@ -300,6 +314,22 @@ def classify_injection(
     return InjectionDisposition.DEFER
 
 
+def _session_routing_key(context: ExecutionContext, execution_id: str) -> str:
+    scope = get_execution_scope()
+    owner = current_user_id.get()
+    identity = json.dumps(
+        [
+            "xinference-session-affinity",
+            str(owner) if owner is not None else context.user_id,
+            scope.workspace_segments if scope is not None else (),
+            execution_id,
+        ]
+    )
+    return hmac.new(
+        get_session_secret().encode(), identity.encode(), "sha256"
+    ).hexdigest()
+
+
 class AgentRunner:
     """Execute an agent by materializing an execution context and invoking patterns."""
 
@@ -483,6 +513,9 @@ class AgentRunner:
                     else self.outbound_message_handler
                 ),
             )
+            reviewer = await resolve_output_guardrail(execution_id)
+            if reviewer is not None:
+                runtime.output_guardrail = reviewer
             if self.workspace_enabled and runtime.context_ref_resolver is None:
                 if workspace is None:
                     workspace_base = base_dir or self.workspace_base_dir
@@ -526,8 +559,12 @@ class AgentRunner:
         budget_token = None
         usage_token = None
         warning_token = None
+        routing_token = None
 
         try:
+            routing_token = xinference_routing_key.set(
+                _session_routing_key(context, execution_id)
+            )
             if inherited_budget is None:
                 policy = (
                     self.budget_policy_provider()
@@ -605,16 +642,21 @@ class AgentRunner:
                     )
                     teardown_status = "failed"
                     try:
-                        result = await pattern.run(
-                            **self._build_pattern_kwargs(
-                                pattern=pattern,
-                                task=task or "",
-                                context=context,
-                                tools=tools,
-                                runtime=runtime,
-                                streaming_handler=streaming_handler,
+                        with bind_output_guardrail(runtime.output_guardrail):
+                            result = await pattern.run(
+                                **self._build_pattern_kwargs(
+                                    pattern=pattern,
+                                    task=task or "",
+                                    context=context,
+                                    tools=tools,
+                                    runtime=runtime,
+                                    streaming_handler=(
+                                        streaming_handler
+                                        if runtime.output_guardrail is None
+                                        else None
+                                    ),
+                                )
                             )
-                        )
                     except ExecutionInterrupted as exc:
                         if runtime.budget_stopped:
                             teardown_status = "completed"
@@ -662,6 +704,16 @@ class AgentRunner:
                                     "a checkpoint durability abort"
                                 )
                         raise
+                    except ProtectedInteractionError as exc:
+                        result = {
+                            "success": False,
+                            "status": "failed",
+                            "error": str(exc),
+                            "execution_id": execution_id,
+                            "context": context,
+                        }
+                        await self._finish_run(context, result, runtime=runtime)
+                        return result
                     except Exception as exc:  # noqa: BLE001
                         teardown_status = "failed"
                         logger.exception(
@@ -697,14 +749,41 @@ class AgentRunner:
                         if isinstance(result, dict)
                         else result
                     )
+                    if (
+                        runtime.output_guardrail is not None
+                        and isinstance(result, dict)
+                        and result.get("status") == "waiting_for_user"
+                    ):
+                        # Questions have their own check, which also covers options.
+                        raw_answer = None
+                    elif runtime.output_guardrail is not None:
+                        if isinstance(result, dict):
+                            result = dict(result)
+                            if raw_answer is None and result.get("output") is not None:
+                                raw_answer = json.dumps(
+                                    result["output"], ensure_ascii=False, default=str
+                                )
+                        elif raw_answer is not None and not isinstance(raw_answer, str):
+                            raw_answer = json.dumps(
+                                raw_answer, ensure_ascii=False, default=str
+                            )
                     if isinstance(raw_answer, str):
                         delivered_answer = await runtime.prepare_final_answer(
                             raw_answer
                         )
+                        if runtime.output_guardrail is not None and isinstance(
+                            result, dict
+                        ):
+                            # A different alias is not a second approved answer.
+                            for key in FINAL_ANSWER_KEYS:
+                                if key in result:
+                                    result[key] = delivered_answer
+                            result["output"] = delivered_answer
                         if delivered_answer != raw_answer:
                             if isinstance(result, dict):
-                                result = dict(result)
-                                set_assistant_message(result, delivered_answer)
+                                if runtime.output_guardrail is None:
+                                    result = dict(result)
+                                    set_assistant_message(result, delivered_answer)
                             else:
                                 result = {"success": True, "output": delivered_answer}
                             for index in range(len(context.messages) - 1, -1, -1):
@@ -833,7 +912,7 @@ class AgentRunner:
             # With no run left the checkpoint is authoritative again; another
             # process may extend it before this one sees the next input.
             self._release_idle_context(execution_id, context)
-            runtime.discard_inline_file_streams()
+            runtime.discard_final_answer_streams()
             self._active_controls.pop(execution_id, None)
             exit_goal(goal_token)
             if usage_token is not None:
@@ -842,6 +921,9 @@ class AgentRunner:
                 active_execution_budget.reset(budget_token)
             if warning_token is not None:
                 budget_warning_handler.reset(warning_token)
+            if routing_token is not None:
+                xinference_routing_key.reset(routing_token)
+            await runtime.finish_cache_session()
 
     async def _finish_budget_stop(
         self,
@@ -889,6 +971,7 @@ class AgentRunner:
                 if chinese
                 else "\n\nExisting files (not a claim of validation):\n"
             ) + "\n".join(links)
+        answer = await runtime.prepare_final_answer(answer)
         context.add_assistant_message(answer)
         result = {
             "success": True,
@@ -2011,6 +2094,7 @@ class AgentRunner:
             callbacks=self.callbacks,
             streaming_handler=streaming_handler,
             memory_store=getattr(self.agent, "memory_store", None),
+            memory_tools_factory=getattr(self.agent, "memory_tools_factory", None),
             memory_similarity_threshold=getattr(
                 self.agent, "memory_similarity_threshold", None
             ),
@@ -2184,6 +2268,40 @@ class AgentRunner:
         *,
         runtime: PatternRuntime,
     ) -> None:
+        if runtime.output_guardrail is not None:
+            if result.get(
+                "status"
+            ) == "waiting_for_user" and not await runtime.approve_waiting_result(
+                result
+            ):
+                result.clear()
+                result.update(
+                    success=False,
+                    status="failed",
+                    error=BLOCKED_OUTPUT,
+                    execution_id=context.execution_id,
+                    context=context,
+                )
+            result["_output_guardrail_applied"] = True
+            if not result.get("success") and result.get("status") != "waiting_for_user":
+                error = result.get("error")
+                if error not in (BLOCKED_OUTPUT, UNAVAILABLE_OUTPUT):
+                    result["error"] = "The agent could not complete this request."
+                result.pop("diagnostic_error", None)
+                result.pop("pattern_errors", None)
+                model_error = result.pop("model_error", None)
+                if isinstance(model_error, dict):
+                    kind = model_error.get("kind")
+                    status_code = model_error.get("status_code")
+                    result["model_error"] = {
+                        "kind": kind
+                        if isinstance(kind, str)
+                        and kind in MODEL_PROVIDER_FAILURE_KINDS
+                        else "unknown",
+                        "status_code": status_code
+                        if type(status_code) is int and 100 <= status_code <= 599
+                        else None,
+                    }
         # Drain an in-flight injection before publishing a terminal result.
         # Once closed, late live input takes the existing deferred-post path;
         # callbacks and tool teardown must not reopen this acceptance window.
@@ -2217,6 +2335,15 @@ class AgentRunner:
                     context.execution_id,
                     exc_info=True,
                 )
+        # When the answer started streaming, for the caller's turn timing.
+        # An existing value is kept: the pattern's own result wins.
+        first_delta_at = runtime.first_final_answer_delta_at
+        if first_delta_at is not None:
+            metadata = result.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                result["metadata"] = metadata
+            metadata.setdefault("first_answer_delta_at", first_delta_at.isoformat())
         await self._dispatch_callback(
             "on_run_end", runner=self, context=context, result=result
         )

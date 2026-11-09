@@ -149,6 +149,55 @@ def test_registered_resolver_failure_cannot_fall_back_to_global_store(
         resolve_trusted_memory_binding(_task_request())
 
 
+def test_resolver_failure_log_omits_exception_message_and_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    credential_marker = "SYNTHETIC_CREDENTIAL_MARKER"
+    body_marker = "SYNTHETIC_PRIVATE_NOTE_BODY"
+
+    def resolver(_request: object) -> MemoryStoreBinding:
+        raise RuntimeError(f"{credential_marker}:{body_marker}")
+
+    set_trusted_memory_binding_resolver(resolver)
+    with caplog.at_level("WARNING"), pytest.raises(MemoryBindingResolutionError):
+        resolve_trusted_memory_binding(_task_request())
+
+    assert "RuntimeError" in caplog.text
+    assert "test_memory_binding.py:resolver:" in caplog.text
+    assert credential_marker not in caplog.text
+    assert body_marker not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_async_resolution_drains_worker_before_propagating_cancellation() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def resolver(_request: object) -> MemoryStoreBinding:
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+        return _binding()
+
+    set_trusted_memory_binding_resolver(resolver)
+    resolution = asyncio.create_task(
+        resolve_trusted_memory_binding_async(
+            MemoryManagementBindingRequest(authenticated_user_id=23)
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+
+    resolution.cancel()
+    await asyncio.sleep(0)
+    assert not resolution.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await resolution
+    assert finished.is_set()
+
+
 @pytest.mark.parametrize(
     ("identity", "generation"),
     [("", "route-1"), ("backend-a", ""), (1, "route-1")],

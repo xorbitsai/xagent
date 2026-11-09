@@ -18,7 +18,10 @@ from ..config import (
     SANDBOX_VOLUMES,
     get_boxlite_home_dir,
     get_external_upload_dirs,
+    get_legacy_source_uploads_dir,
+    get_platform_source_roots,
     get_sandbox_cpus,
+    get_sandbox_enabled,
     get_sandbox_env,
     get_sandbox_host_storage_root,
     get_sandbox_idle_ttl,
@@ -26,15 +29,16 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
     get_sandbox_worker_namespace,
+    get_sandbox_workspace_mount_mode,
+    get_sandbox_workspace_volume,
+    get_sandbox_workspace_volume_root,
     get_storage_root,
     get_uploads_dir,
-)
-from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    build_code_mount_volumes,
 )
 from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
@@ -47,6 +51,7 @@ from ..sandbox.base import (
     SandboxContractError,
     SandboxInfo,
     SandboxInspection,
+    SandboxMount,
     SandboxMountIntent,
     SandboxNotFoundError,
     SandboxReconcileUnsupportedError,
@@ -1195,6 +1200,7 @@ class SandboxManager:
             memory=info.config.memory,
             env=info.config.env,
             volumes=info.config.volumes,
+            mounts=info.config.mounts,
             network_isolated=bool(info.config.network_isolated),
             ports=info.config.ports,
             pids_limit=info.config.pids_limit,
@@ -1210,7 +1216,7 @@ class SandboxManager:
     ) -> ResolvedSandboxRuntimeSpec:
         """Build the single canonical desired-state spec for one sandbox name.
 
-        The sole normalizer from environment config + code mounts + intent
+        The sole normalizer from environment config + custom mounts + intent
         mounts to ``ResolvedSandboxRuntimeSpec``: both the legacy and the
         reconciliation routes compare against this same spec via the
         process-local ``_config_cache``, and the reconciliation route also
@@ -1224,6 +1230,10 @@ class SandboxManager:
         volumes += self._make_default_volumes(
             lifecycle_type, lifecycle_id, mount_intent=mount_intent
         )
+        mounts = self._make_workspace_volume_mounts(
+            lifecycle_type, lifecycle_id, mount_intent=mount_intent
+        )
+        _reject_platform_source_mounts(volumes)
         return ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image",
             image=image,
@@ -1232,6 +1242,7 @@ class SandboxManager:
             memory=config.memory,
             env=config.env,
             volumes=volumes,
+            mounts=mounts,
             network_isolated=bool(config.network_isolated),
             ports=config.ports,
             pids_limit=config.pids_limit,
@@ -1248,7 +1259,7 @@ class SandboxManager:
         """
         Build default volume mounts.
 
-        Code directories are always mounted read-only.
+        Platform source and tests are never mounted into the guest.
         User workspace is additionally mounted read-write for user lifecycle type.
 
         Args:
@@ -1256,20 +1267,80 @@ class SandboxManager:
             lifecycle_id: e.g. task_id|user_id
             mount_intent: Actual sandbox mount intent, when known
         """
-        # Code mounts are always present (at least src/)
-        volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
+        # No platform source is mounted; calls carry an execution-only runtime.
+        volumes: list[tuple[str, str, str]] = []
         path_mapper = SandboxPathMapper.from_env()
 
-        for backend_path, _should_create in self._workspace_mount_paths(
-            lifecycle_type,
-            lifecycle_id,
-            mount_intent,
-        ):
-            self._append_unique_volume(
-                volumes, path_mapper.volume_for_backend_path(backend_path, "rw")
-            )
+        if get_sandbox_workspace_mount_mode() == "bind":
+            for backend_path, _should_create in self._workspace_mount_paths(
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent,
+            ):
+                self._append_unique_volume(
+                    volumes, path_mapper.volume_for_backend_path(backend_path, "rw")
+                )
 
         return volumes
+
+    def _make_workspace_volume_mounts(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        mount_intent: SandboxMountIntent | None = None,
+    ) -> list[SandboxMount]:
+        """Build fail-closed named-volume subpath mounts for workspaces."""
+        if get_sandbox_workspace_mount_mode() != "volume_subpath":
+            return []
+        volume = get_sandbox_workspace_volume()
+        volume_root = get_sandbox_workspace_volume_root()
+        if volume is None or volume_root is None:
+            raise SandboxContractError(
+                "volume_subpath mode requires both "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME and "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
+            )
+
+        root_views = backend_mount_path_views(volume_root)
+        if root_views.physical != root_views.lexical:
+            raise SandboxContractError(
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT and its ancestors must "
+                "resolve without symlinks"
+            )
+
+        mounts: list[SandboxMount] = []
+        for backend_path, should_create in self._workspace_mount_paths(
+            lifecycle_type, lifecycle_id, mount_intent
+        ):
+            target_views = backend_mount_path_views(backend_path)
+            if not should_create and not target_views.physical.is_dir():
+                raise SandboxContractError(
+                    "Sandbox workspace extra mount does not exist or is not a "
+                    f"directory: {str(backend_path)!r}"
+                )
+            try:
+                relative = target_views.physical.relative_to(root_views.physical)
+            except ValueError as exc:
+                raise SandboxContractError(
+                    "Every workspace mount must be below "
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT in volume_subpath mode"
+                ) from exc
+            subpath = relative.as_posix()
+            if subpath in {"", "."}:
+                raise SandboxContractError(
+                    "A sandbox cannot mount the workspace volume root"
+                )
+            mounts.append(
+                SandboxMount(
+                    type="volume",
+                    source=volume,
+                    target=str(target_views.physical),
+                    mode="rw",
+                    subpath=subpath,
+                )
+            )
+        return mounts
 
     async def _resolve_backend_probe(self) -> bool:
         """Resolve and cache ``await service.supports_runtime_spec()``.
@@ -1364,7 +1435,23 @@ class SandboxManager:
         cached_spec = self._config_cache.get(sandbox_name)
         if cached_spec is not None:
             self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
-            return self._cache[sandbox_name]
+            if not await self._resolve_backend_probe():
+                return self._cache[sandbox_name]
+            inspection = await self._service.inspect(sandbox_name)
+            if inspection is None:
+                # The daemon object was removed out of band. Drop the stale
+                # process-local handle and continue through normal recovery.
+                self._cache.pop(sandbox_name, None)
+                self._config_cache.pop(sandbox_name, None)
+            elif not inspection.runtime_policy_matches:
+                # Do not leave a poisoned cache entry behind. Falling
+                # through to reconciliation lets an idle sandbox converge
+                # immediately, while _reconcile_mismatch still rejects the
+                # destructive rebuild if an existing task is attached.
+                self._cache.pop(sandbox_name, None)
+                self._config_cache.pop(sandbox_name, None)
+            else:
+                return self._cache[sandbox_name]
 
         probe = await self._resolve_backend_probe()
         if not probe:
@@ -2097,23 +2184,53 @@ class SandboxManager:
         degrades to "no cached spec, allow".
 
         ``prepare_root`` is used while initially creating or reconciling the
-        sandbox. Cached providers do not repeat mount preparation.
+        sandbox. A matching cached provider does not repeat mount preparation;
+        recovery from a missing or drifted runtime may do so before rebuild.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
             async with self._activity_guard:
                 provider = self._lease_providers.get(base_name)
-                if provider is not None:
-                    self._ensure_config_equivalent(
-                        sandbox_name,
-                        self._config_cache.get(sandbox_name),
-                        self._build_runtime_spec(
-                            lifecycle_type, lifecycle_id, mount_intent=mount_intent
-                        ),
+
+            if provider is not None:
+                cached_spec = self._config_cache.get(sandbox_name)
+                self._ensure_config_equivalent(
+                    sandbox_name,
+                    cached_spec,
+                    self._build_runtime_spec(
+                        lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                    ),
+                )
+
+                # Re-enter the common cached-sandbox path on reconciliation
+                # backends so the hottest provider reuse path also
+                # re-inspects the live network attachment. Legacy backends
+                # have no inspection contract and keep their cache-only path.
+                # This intentionally does not depend on cached_spec being
+                # present: after an active mismatch rejects a rebuild the
+                # instance caches are empty, but every later acquire must
+                # continue to fail closed until the drift is repaired.
+                if await self._resolve_backend_probe():
+                    primary = await self._get_or_create_sandbox_locked(
+                        lifecycle_type,
+                        lifecycle_id,
+                        mount_intent=mount_intent,
+                        prepare_root=prepare_root,
                     )
+                    if primary is not provider.primary_sandbox:
+                        provider = await self._create_lease_provider_locked(
+                            lifecycle_type,
+                            lifecycle_id,
+                            mount_intent=mount_intent,
+                            prepare_root=prepare_root,
+                        )
+                        async with self._activity_guard:
+                            self._lease_providers[base_name] = provider
+
+                async with self._activity_guard:
                     self._touch_locked(base_name)
-                    return provider
+                return provider
 
             provider = await self._create_lease_provider_locked(
                 lifecycle_type,
@@ -2450,9 +2567,20 @@ class SandboxManager:
             template = SandboxTemplate(type="image", image=image)
             # Use empty config for warmup - no need for volumes/env
             warmup_config = SandboxConfig()
-            async with await self._service.get_or_create(
-                warmup_name, template=template, config=warmup_config
-            ):
+            try:
+                sandbox = await self._service.get_or_create(
+                    warmup_name, template=template, config=warmup_config
+                )
+            except SandboxRuntimeConflictError:
+                logger.warning(
+                    "Deleting stale sandbox warmup container after runtime "
+                    "policy mismatch"
+                )
+                await self._service.delete(warmup_name)
+                sandbox = await self._service.get_or_create(
+                    warmup_name, template=template, config=warmup_config
+                )
+            async with sandbox:
                 pass
             await self._service.delete(warmup_name)
             logger.info(f"Sandbox image warmup completed: {image}")
@@ -2721,6 +2849,55 @@ class SandboxManager:
             )
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Compare lexical paths and existing filesystem aliases (including case)."""
+    if path.is_relative_to(root):
+        return True
+    for ancestor in (path, *path.parents):
+        try:
+            if ancestor.samefile(root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _reject_platform_source_mounts(volumes: list[tuple[str, str, str]]) -> None:
+    """Reject custom mounts that would put backend code back into the guest.
+
+    Check ancestors and descendants, including locally resolvable aliases. The
+    managed uploads subtree is data, even in legacy installations that put it
+    below web/. Sibling Docker's configured host checkout is checked in its own
+    path domain; its source directories are no longer mounted automatically.
+    """
+    roots = get_platform_source_roots()
+    data = Path(get_uploads_dir()).resolve()
+    legacy_data = get_legacy_source_uploads_dir()
+    # A configured uploads root must never exempt web/, core/, or a symlink
+    # pointing back to source. Only the fixed legacy data subtree is exempt.
+    allowed_data = (
+        [data]
+        if legacy_data.resolve() == legacy_data and data.is_relative_to(legacy_data)
+        else []
+    )
+    roots = [root.resolve() for root in roots]
+    for host, _guest, _mode in volumes:
+        candidate = Path(host).resolve()
+        for root in roots:
+            covers_code = _path_is_within(root, candidate)
+            contains_code = _path_is_within(candidate, root)
+            managed_data = any(
+                data != root
+                and data.is_relative_to(root)
+                and candidate.is_relative_to(data)
+                for data in allowed_data
+            )
+            if covers_code or (contains_code and not managed_data):
+                raise SandboxRuntimeConflictError(
+                    "Platform source and test directories cannot be mounted into a task sandbox."
+                )
+
+
 def _check_no_conflicting_readiness_volumes(
     volumes: list[tuple[str, str, str]],
 ) -> None:
@@ -2925,28 +3102,17 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
 
     Only meaningful for backends that support spec reconciliation (Docker
     today): the legacy Boxlite route never reconciles a desired spec against
-    a live container, so there is nothing here for it to protect. Skipped
-    entirely when neither ``SANDBOX_VOLUMES`` nor
-    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
-    conflict with themselves, and they never land under the uploads guest
-    root either (``build_code_mount_volumes`` mounts fixed ``/app/src`` and
-    ``/app/tests`` paths), so with nothing operator-configured the per-user
-    reserved-subtree check below has nothing to reject; that is also why the
-    reserved-subtree check runs after this early return rather than before
-    it. When the check does run, code mounts are still part of the scanned
-    volume list along with everything else — they are not specially
-    exempted, they simply do not match the reserved shape.
+    a live container, so there is nothing here for it to protect. In
+    ``volume_subpath`` mode, the named-volume configuration and its physical
+    root are validated before serving traffic. The later bind-mount conflict
+    scan is skipped when neither ``SANDBOX_VOLUMES`` nor
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured. Platform source and tests
+    are never default mounts; configured volumes are checked for source exposure
+    before any sandbox is created.
 
-    Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
-    using the same ``host_side_sources`` flag the runtime build path uses)
-    and code mounts (``build_code_mount_volumes``) are already host-domain
-    triples and are compared as-is. External upload dirs are backend-domain
-    paths: they are normalized and deduplicated by backend physical identity
-    through ``dedupe_backend_mount_paths`` before being converted to host
-    domain through the same ``SandboxPathMapper`` the runtime mount-building
-    path uses. One stable lexical spelling is retained for sibling-Docker host
-    translation. Conflict detection itself always runs in the post-mapper host
-    domain, over the combined triple set from all three sources.
+    ``SANDBOX_VOLUMES`` already uses host-domain sources. External upload paths
+    are normalized and converted through ``SandboxPathMapper`` before conflict
+    detection over the combined set of mount triples.
 
     Beyond mutual conflicts among the configured mounts, one configured
     mount can also collide with a mount that does not exist yet: every
@@ -2960,10 +3126,54 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     Raises:
         SandboxRuntimeConflictError: Two configured mounts disagree at a
             shared host or guest path, or a configured mount lands inside
-            the reserved per-user uploads subtree.
+            the reserved per-user uploads subtree, or ``volume_subpath``
+            configuration cannot be enforced safely.
     """
-    if not await sandbox_mgr._resolve_backend_probe():
+    supports_runtime_spec = await sandbox_mgr._resolve_backend_probe()
+    workspace_mount_mode = get_sandbox_workspace_mount_mode()
+    if workspace_mount_mode == "volume_subpath" and not supports_runtime_spec:
+        raise SandboxRuntimeConflictError(
+            "volume_subpath workspace mounts require a Docker/spec-reconciliation "
+            "sandbox backend"
+        )
+    if not supports_runtime_spec:
         return
+
+    if workspace_mount_mode == "volume_subpath":
+        try:
+            volume = get_sandbox_workspace_volume()
+            volume_root = get_sandbox_workspace_volume_root()
+        except ValueError as exc:
+            raise SandboxRuntimeConflictError(
+                f"Invalid volume_subpath workspace configuration: {exc}"
+            ) from exc
+        if volume is None or volume_root is None:
+            raise SandboxRuntimeConflictError(
+                "volume_subpath mode requires both "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME and "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
+            )
+        root_views = backend_mount_path_views(volume_root)
+        if root_views.physical != root_views.lexical:
+            raise SandboxRuntimeConflictError(
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT and its ancestors must "
+                "resolve without symlinks"
+            )
+        if not root_views.physical.is_dir():
+            raise SandboxRuntimeConflictError(
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT does not exist or is not "
+                f"a directory: {str(volume_root)!r}"
+            )
+        for external_dir in get_external_upload_dirs():
+            external_views = backend_mount_path_views(external_dir)
+            try:
+                external_views.physical.relative_to(root_views.physical)
+            except ValueError as exc:
+                raise SandboxRuntimeConflictError(
+                    "Every external upload directory must be below "
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT in volume_subpath mode: "
+                    f"{str(external_dir)!r}"
+                ) from exc
 
     if sandbox_mgr.requires_host_workspace_access():
         sandbox_mgr.validate_host_workspace_access()
@@ -2981,12 +3191,12 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
         path_mapper,
     )
     volumes = list(custom_volumes)
-    volumes.extend(build_code_mount_volumes())
 
     folded_external = dedupe_backend_mount_paths(external_dirs)
     for backend_dir in folded_external:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
 
+    _reject_platform_source_mounts(volumes)
     _check_no_conflicting_readiness_volumes(volumes)
     _check_no_reserved_uploads_conflict(volumes, guest_uploads_root, reserved_prefix)
 
@@ -3012,7 +3222,7 @@ def _create_sandbox_service() -> Optional[SandboxService]:
         SandboxService instance or None if disabled
     """
     # Check if sandbox is enabled
-    sandbox_enabled = os.getenv("SANDBOX_ENABLED", "false").lower() == "true"
+    sandbox_enabled = get_sandbox_enabled()
     if not sandbox_enabled:
         logger.info("Sandbox is disabled via SANDBOX_ENABLED environment variable")
         return None
@@ -3075,6 +3285,13 @@ def _create_docker_service() -> Optional[SandboxService]:
             "(pip/systemd) must pick their own stable value (see "
             "docker/README.md 'Sandbox Runtime Overlays' and example.env)"
         )
+    network = get_sandbox_network()
+    if network is None:
+        raise RuntimeError(
+            "XAGENT_SANDBOX_NETWORK is required when the Docker sandbox "
+            "implementation is enabled; set it to the dedicated, firewalled "
+            "Docker network created for untrusted sandboxes"
+        )
     try:
         from ..sandbox import DockerSandboxService
     except ImportError as exc:
@@ -3087,11 +3304,17 @@ def _create_docker_service() -> Optional[SandboxService]:
     store = DBDockerStore(namespace=namespace if get_sandbox_worker_id() else None)
 
     try:
-        service = DockerSandboxService(store=store, namespace=namespace)
+        service = DockerSandboxService(
+            store=store, namespace=namespace, network=network
+        )
     except Exception as exc:
         raise RuntimeError("Failed to initialize the Docker sandbox runtime") from exc
 
-    logger.info("Created Docker sandbox service (namespace=%s)", namespace)
+    logger.info(
+        "Created Docker sandbox service (namespace=%s, network=%s)",
+        namespace,
+        network,
+    )
     try:
         running_legacy_count, inactive_legacy_count = service.count_legacy_containers()
     except Exception as exc:

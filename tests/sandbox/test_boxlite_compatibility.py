@@ -15,7 +15,12 @@ try:
 except ImportError:
     pytest.skip("BoxLite SDK unavailable on this platform", allow_module_level=True)
 
-from xagent.sandbox.base import SandboxConfig, SandboxInfo, SandboxTemplate
+from xagent.sandbox.base import (
+    SandboxConfig,
+    SandboxInfo,
+    SandboxMount,
+    SandboxTemplate,
+)
 from xagent.sandbox.boxlite_sandbox import (
     PUBLIC_EGRESS_NETWORKS,
     BoxliteSandboxService,
@@ -108,6 +113,36 @@ def service_and_runtime():
     service._locks = {}
     service._locks_lock = asyncio.Lock()
     return service, runtime, raw_box, metadata
+
+
+@pytest.mark.asyncio
+async def test_structured_mount_rejection_preserves_existing_box_and_store(
+    service_and_runtime,
+):
+    service, runtime, raw_box, metadata = service_and_runtime
+    runtime.get.return_value = raw_box
+    stored = SandboxInfo(
+        name=metadata.name,
+        state="running",
+        template=SandboxTemplate(type="image", image=metadata.image),
+        config=SandboxConfig(
+            mounts=[
+                SandboxMount(
+                    type="volume",
+                    source="workspaces",
+                    target="/home/sandbox/workspace",
+                    subpath="user_1/task_2",
+                )
+            ]
+        ),
+    )
+    service._store.add_info(metadata.name, stored)
+
+    with pytest.raises(ValueError, match="require the Docker sandbox backend"):
+        await service.get_or_create(metadata.name)
+
+    runtime.remove.assert_not_awaited()
+    assert service._store.get_info(metadata.name) is stored
 
 
 @pytest.mark.asyncio

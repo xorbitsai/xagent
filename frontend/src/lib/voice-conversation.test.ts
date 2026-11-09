@@ -75,6 +75,23 @@ describe("voice turn ownership", () => {
     turns.stop()
   })
 
+  it.each([false, true])("submits committed speech after a false-start partial clears (queued=%s)", async queued => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.updateBusy(queued)
+    turns.transcript("final", "Open settings", 0)
+    if (queued) await vi.advanceTimersByTimeAsync(300)
+    turns.transcript("partial", "uh", 1)
+    turns.updateBusy(false)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(actions.send).not.toHaveBeenCalled()
+    turns.transcript("partial", "", 1)
+    expect(actions.caption).toHaveBeenLastCalledWith("Open settings")
+    await vi.advanceTimersByTimeAsync(300)
+    expect(actions.send).toHaveBeenCalledExactlyOnceWith("Open settings")
+    turns.stop()
+  })
+
   it("continues after a consumed markdown prefix changes without replaying it", async () => {
     vi.useFakeTimers()
     const { turns, actions } = coordinator()
@@ -85,6 +102,52 @@ describe("voice turn ownership", () => {
     turns.reply({ id: "answer", text: "Read this. More words. Tail", complete: false })
     await vi.advanceTimersByTimeAsync(0)
     expect(actions.speak.mock.calls.map(([text]) => text)).toEqual(["Read this. ", "More words. "])
+    turns.stop()
+  })
+
+  it.each(["plain", "bold", "quote"])("speaks streamed %s list items without synthesizing their numbers separately", async style => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.transcript("final", "How do I add a vehicle?", 0)
+    await vi.advanceTimersByTimeAsync(300)
+    const marker = (number: number) => style === "bold" ? `**${number}.** ` : style === "quote" ? `> ${number}. ` : `${number}. `
+    const prefixes = [
+      `To add a vehicle in Detrack:\n\n${marker(1)}`,
+      `In your admin dashboard, open the **Vehicles** tab.\n${marker(2)}`,
+      `Choose the option to add a vehicle and fill in the vehicle details.\n${marker(3)}`,
+      "Click **Save** to add it to your account.",
+    ]
+    let text = ""
+    for (const [index, prefix] of prefixes.entries()) {
+      text += prefix
+      turns.reply({ id: "answer", text, complete: index === prefixes.length - 1 })
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    expect(actions.speak.mock.calls.map(([value]) => value.trim())).toEqual([
+      "To add a vehicle in Detrack: In your admin dashboard, open the Vehicles tab.",
+      "Choose the option to add a vehicle and fill in the vehicle details.",
+      "Click Save to add it to your account.",
+    ])
+    turns.stop()
+  })
+
+  it.each(["plain", "bold", "quote"])("streams unpunctuated %s list items before completion", async style => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.transcript("final", "What are the steps?", 0)
+    await vi.advanceTimersByTimeAsync(300)
+    const marker = (number: number) => style === "bold" ? `**${number}.** ` : style === "quote" ? `> ${number}. ` : `${number}. `
+    let text = `Steps:\n${marker(1)}Open settings\n${marker(2)}Click Save`
+    turns.reply({ id: "answer", text, complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak.mock.calls.map(([value]) => value.trim())).toEqual(["Steps: Open settings."])
+    text += `\n${marker(3)}Done`
+    turns.reply({ id: "answer", text, complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak.mock.calls.map(([value]) => value.trim())).toEqual(["Steps: Open settings.", "Click Save."])
+    turns.reply({ id: "answer", text, complete: true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak.mock.calls.map(([value]) => value.trim())).toEqual(["Steps: Open settings.", "Click Save.", "Done"])
     turns.stop()
   })
 

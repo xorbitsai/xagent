@@ -3,9 +3,11 @@ import importlib
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, List, Optional
 
+from ...tools.core.media_errors import MediaParameterError, redact_provider_detail
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from .base import BaseVideoModel, BilledVideoTaskError, BilledVideoTaskTimeout
@@ -21,7 +23,54 @@ _STANDARD_RATIOS = (
     ("3:4", 3 / 4),
 )
 _RATIO_TOLERANCE = 0.02
+
+# Whole seconds each Seedance family accepts, keyed by the version its provider
+# model name carries: ``doubao-seedance-2-0-fast-260128`` is (2, 0),
+# ``doubao-seedance-1-5-pro-250528`` is (1, 5). The bounds come from the two
+# places that state them: the ``generate_video`` provider notes (xagent
+# ``tools/core/video_tool.py``, "Seedance 1.5 Pro supports 4-12 seconds or -1
+# for intelligent duration; Seedance 2.0 supports 4-15 seconds or -1") and the
+# Ark video-generation documentation those notes follow, whose ``duration``
+# field lists the same two ranges:
+#   https://api.volcengine.com/api-docs/view?action=CreateContentsGenerationsTasks&serviceCode=ark&version=2024-01-01
+#   https://docs.volcengine.com/docs/ark/video-generation-tutorial
+# Matched on the version numbers instead of on a substring of the name: a bare
+# ``seedance-2`` is also a prefix of ``doubao-seedance-2-5-...``, and 2.5 takes
+# 4-30 seconds (1.0 takes 2-12), so the 2.0 bound would refuse clips the model
+# accepts. A family that is not in this table has no known range here, which is
+# what ``seedance_duration_limits`` reports.
+SEEDANCE_DURATION_LIMITS: dict[tuple[int, int], tuple[int, int]] = {
+    (1, 5): (4, 12),
+    (2, 0): (4, 15),
+}
+
+_SEEDANCE_VERSION_PATTERN = re.compile(r"seedance-(\d+)-(\d+)(?!\d)")
+
+# Terminal task states that end without a video. Ark bills only a video it
+# generated successfully, and a generation that fails, for example on
+# moderation, is not charged (model pricing page, video generation section):
+#   https://www.volcengine.com/docs/82379/1544106
+# A cancelled task (only a queued one can be cancelled) and an expired one
+# (stopped by Ark) produced no video either, so none of these is charged.
+_ARK_TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled", "expired"})
+
 logger = logging.getLogger(__name__)
+
+
+def seedance_duration_limits(model_name: str) -> Optional[tuple[int, int]]:
+    """``(shortest, longest)`` whole seconds ``model_name`` accepts, or ``None``.
+
+    Ark answers anything outside the range with a bare ``InvalidParameter``,
+    so the caller clamps up to the shortest length and reports the range
+    instead of letting the provider reject the request. A model whose family
+    is not known here returns ``None``: the caller then leaves the length to
+    the provider and reports no range, rather than a range that was guessed.
+    """
+    lowered = str(model_name or "").lower().replace("_", "-").replace(".", "-")
+    match = _SEEDANCE_VERSION_PATTERN.search(lowered)
+    if match is None:
+        return None
+    return SEEDANCE_DURATION_LIMITS.get((int(match.group(1)), int(match.group(2))))
 
 
 def _to_plain_data(value: Any) -> Any:
@@ -304,15 +353,34 @@ class ArkVideoModel(BaseVideoModel):
         """Write the one usage row of a created task, at its last observation.
 
         Every task that was created ends here exactly once, whichever way the
-        wait ends. Only a succeeded task bills its seconds; a task that failed,
-        was cancelled or was still running at the deadline records 0 seconds --
-        a call that happened with no produced duration -- plus whatever tokens
-        Ark reported, which is what Seedance actually charges by.
+        wait ends. Only a succeeded task bills its seconds; any other records
+        0 seconds -- a call that happened with no produced duration.
+
+        Tokens, which are what Seedance actually charges by, are taken from
+        ``task_result`` unless its status is in
+        ``_ARK_TERMINAL_FAILURE_STATUSES``: Ark does not charge such a task,
+        so it records 0 tokens whatever it reported. A task still running
+        when the wait ended (the deadline, or the caller cancelled) keeps
+        running and is charged if it succeeds, so its row keeps the tokens of
+        the observation passed here, or none when polling failed until the
+        deadline.
         """
         try:
             result = task_result if isinstance(task_result, dict) else {}
             usage = _get_nested(result.get("raw_response"), "usage")
             output_tokens = _get_nested(usage, "completion_tokens")
+            status = result.get("status")
+            if isinstance(status, str) and status in _ARK_TERMINAL_FAILURE_STATUSES:
+                if output_tokens:
+                    logger.warning(
+                        "Ark video task %s ended with status %s but reported "
+                        "%s completion tokens; recording 0, since Ark does "
+                        "not bill a task that produced no video",
+                        result.get("task_id"),
+                        status,
+                        output_tokens,
+                    )
+                output_tokens = 0
             resolution = result.get("resolution")
             record_provider_usage(
                 self,
@@ -350,7 +418,11 @@ class ArkVideoModel(BaseVideoModel):
             logger.debug("Ark video generation does not support negative_prompt")
         n = kwargs.pop("n", 1)
         if n not in (None, 1, "1"):
-            raise ValueError("Seedance video generation supports one video per request")
+            raise MediaParameterError(
+                "Seedance video generation supports one video per request",
+                field="n",
+                allowed_values={"n": [1]},
+            )
         if duration is not None:
             kwargs["duration"] = duration
         elif seconds is not None:
@@ -427,8 +499,14 @@ class ArkVideoModel(BaseVideoModel):
             try:
                 task_result = await self.get_video_task(str(task_id))
             except Exception as exc:
+                # The tool layer redacts what it reports, but this line is
+                # written before the tool ever sees the exception: the SDK
+                # error carries the account id and both request ids, so it
+                # goes through the same redactor.
                 logger.warning(
-                    "Transient error polling video task %s: %s", task_id, exc
+                    "Transient error polling video task %s: %s",
+                    task_id,
+                    redact_provider_detail(exc),
                 )
                 if time.monotonic() >= deadline:
                     self._record_task_usage(None)
@@ -443,7 +521,7 @@ class ArkVideoModel(BaseVideoModel):
             if status == "succeeded":
                 self._record_task_usage(task_result, succeeded=True)
                 return task_result
-            if status in {"failed", "cancelled", "expired"}:
+            if status in _ARK_TERMINAL_FAILURE_STATUSES:
                 self._record_task_usage(task_result)
                 raise BilledVideoTaskError(
                     f"Video generation task {task_id} ended with status {status}: "

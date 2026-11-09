@@ -285,6 +285,14 @@ KVM access.
 Docker sibling sandbox:
 
 ```bash
+export COMPOSE_PROJECT_NAME=xagent
+export XAGENT_SANDBOX_NETWORK="${COMPOSE_PROJECT_NAME}_sandbox-egress"
+docker network inspect "$XAGENT_SANDBOX_NETWORK" >/dev/null 2>&1 || \
+  docker network create --driver bridge \
+    --label xagent.sandbox.network=v1 \
+    -o com.docker.network.bridge.enable_icc=false \
+    "$XAGENT_SANDBOX_NETWORK"
+
 docker compose \
   -f docker-compose.yml \
   -f docker/docker-compose.sandbox.docker.yml \
@@ -297,9 +305,10 @@ a privileged deployment mode: Docker socket access is effectively host-level
 container control.
 
 When `DOCKER_HOST` points at a restricted Docker socket proxy instead, the
-proxy must permit daemon inspection through `GET /info`. For
-Tecnativa/docker-socket-proxy, set `INFO=1`; readiness fails closed if Xagent
-cannot verify the daemon's security mode.
+proxy must permit daemon inspection through both `GET /info` and
+`GET /networks/{name}`. For Tecnativa/docker-socket-proxy, set `INFO=1` and
+`NETWORKS=1`; readiness fails closed if Xagent cannot verify the daemon's
+security mode and the dedicated sandbox bridge configuration.
 
 The backend process itself must run as effective uid 0, and the Docker daemon
 must be rootful with user-namespace remapping disabled. Xagent uses that host
@@ -332,6 +341,16 @@ docker compose \
   -f docker/docker-compose.sandbox.docker.yml \
   up -d
 ```
+
+The source-mount guard rejects the installed platform package, detected local
+build checkouts (including the backend image's retained source), and the host
+checkout configured by `XAGENT_SANDBOX_HOST_PROJECT_ROOT`. The checks include
+their `.git` metadata and locally readable Git object stores, including linked
+worktree/common directories and alternates. It resolves aliases
+visible in the backend's filesystem. For a sibling Docker daemon, operators must
+also check host-only symlinks, Git storage paths and alternate host paths: the
+backend cannot resolve aliases that exist only on the daemon host. Custom sandbox images must not contain
+the platform package or a separate copy of its source.
 
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
@@ -387,23 +406,50 @@ deliverables are repaired individually.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
-> `XAGENT_SANDBOX_NAMESPACE` before upgrading. The Compose overlay below sets
-> it automatically; pip/systemd deployments must set their own stable, unique
-> deployment identifier (see `example.env`). The backend must also run with
+> `XAGENT_SANDBOX_NAMESPACE` and `XAGENT_SANDBOX_NETWORK` before upgrading.
+> The network must already exist, use the bridge driver, and have the
+> deployment's egress firewall policy applied. The Compose overlay below sets
+> the namespace automatically and requires the network name from the deployment
+> environment; pip/systemd deployments must set both values explicitly (see
+> `example.env`). The backend must also run with
 > effective uid 0 against a rootful Docker daemon with user-namespace
-> remapping disabled; a Docker socket proxy must permit `GET /info`
-> (`INFO=1` for Tecnativa/docker-socket-proxy). Missing or incompatible
+> remapping disabled; a Docker socket proxy must permit `GET /info` and
+> `GET /networks/*` (`INFO=1` and `NETWORKS=1` for
+> Tecnativa/docker-socket-proxy). Missing or incompatible
 > settings stop backend startup rather than falling back to unsafe ownership
 > or an unverifiable daemon mode.
 
+Create the network before starting Xagent. The label is a readiness contract
+that prevents accidentally reusing the application bridge, and ICC is disabled
+so sandboxes on the same bridge cannot address one another directly:
+
+```bash
+docker network create --driver bridge \
+  --label xagent.sandbox.network=v1 \
+  -o com.docker.network.bridge.enable_icc=false \
+  "$XAGENT_SANDBOX_NETWORK"
+```
+
 The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
-`scheduler` from the resolved `${COMPOSE_PROJECT_NAME}`. Docker sibling mode
+`scheduler` from the resolved `${COMPOSE_PROJECT_NAME}` and requires an exact
+`XAGENT_SANDBOX_NETWORK` name. Docker sibling mode
 treats that Compose project name as authoritative and overrides any namespace
 from `example.env`; a missing value fails during Compose interpolation. Every
 sandbox container a deployment creates is scoped to that namespace (physical
 name and owner labels), so multiple deployments sharing one Docker daemon
 never discover or manage each other's sandboxes. Co-located stacks must use
 distinct Compose project names and distinct `XAGENT_HOST_STORAGE_ROOT` paths.
+Every network-enabled sandbox is attached only to the configured network;
+network-isolated sandboxes use Docker's `none` network mode. Xagent verifies
+the live attachment before publishing or reusing a container and rejects the
+built-in `bridge`, `host`, `none`, and `default` network names. Creating the
+bridge and applying/persisting its firewall rules remain deployment duties.
+
+The dedicated-network runtime security profile changes the sandbox
+attestation version. Existing v2 containers created with the previous profile
+will not be adopted; drain and remove them during the coordinated maintenance
+window below so first use recreates them under the new network policy. Bind
+mounted workspace data is preserved.
 
 `XAGENT_SANDBOX_MAX_CONTAINERS` applies independently to each deployment
 namespace, not globally to the shared daemon. Size the daemon for up to the
@@ -918,6 +964,19 @@ fi
 After v17 accepts writes the copy is stale, and copying it back discards everything written since the cutover; recovery from that point means a fresh v17 backup plus reconciliation. Keep the copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm "${PGVOL}_pg16_backup"`.
 
 ## Troubleshooting
+
+### Reset the administrator password
+
+Run this command from the directory containing `docker-compose.yml`. Replace
+`admin` with your administrator's username and enter the new password when prompted.
+
+```bash
+docker compose exec backend python -m xagent.web.reset_admin_password --username admin
+```
+
+The reset revokes the administrator's existing sign-in sessions, file-stream
+tickets, and password-reset links. Sign in again with the new password. After a
+compromise, revoke independent API keys and provider grants separately.
 
 ### Container Won't Start
 

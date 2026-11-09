@@ -32,9 +32,9 @@ from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
 )
-from .context.memory_retrieval import (
-    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
-)
+from .context.memory_retrieval import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+from .deferred_tools import DEFAULT_PRELOAD_TOKEN_BUDGET
+from .structured_output import StructuredOutputFormat, _attach_structured_output
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
 
@@ -81,6 +81,7 @@ class AgentService:
         memory_enabled: bool = True,
         memory_available: bool = True,
         memory_availability_reason: str | None = None,
+        memory_tools_factory: Callable[..., list[Any]] | None = None,
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
@@ -90,6 +91,8 @@ class AgentService:
         enable_default_tools: bool = True,
         skills_enabled: bool = True,
         user_interaction_enabled: bool = True,
+        defer_connector_schemas: bool = False,
+        deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET,
         execution_metadata: dict[str, Any] | None = None,
         budget_policy_provider: BudgetPolicyProvider | None = None,
         **agent_kwargs: Any,
@@ -118,10 +121,15 @@ class AgentService:
         # to publish (see the web layer's memory availability policy).
         self.memory_available = memory_available
         self.memory_availability_reason = memory_availability_reason
+        self.memory_tools_factory = memory_tools_factory
         self.react_max_iterations = max(1, int(react_max_iterations))
         self.enable_default_tools = enable_default_tools
         self.skills_enabled = skills_enabled
         self.user_interaction_enabled = user_interaction_enabled
+        self.defer_connector_schemas = defer_connector_schemas
+        # Per newly scanned user message, not a session cap; see
+        # ``AgentExecutionConfig.deferred_preload_token_budget``.
+        self.deferred_preload_token_budget = deferred_preload_token_budget
         self.execution_metadata = dict(execution_metadata or {})
         self.budget_policy_provider = budget_policy_provider
         if tools is not None and tool_config is not None:
@@ -242,6 +250,7 @@ class AgentService:
             patterns=self.patterns,
             llm=self.llm,
             memory_store=self.memory,
+            memory_tools_factory=self.memory_tools_factory,
         )
 
         logger.info(
@@ -289,6 +298,8 @@ class AgentService:
         task: str,
         context: dict[str, Any] | None = None,
         task_id: str | None = None,
+        *,
+        structured_output_format: StructuredOutputFormat | None = None,
     ) -> dict[str, Any]:
         has_files = bool(
             context and (context.get("uploaded_files") or context.get("file_info"))
@@ -298,9 +309,19 @@ class AgentService:
                 raise ValueError("Task cannot be empty or whitespace-only")
         await self._ensure_tools_initialized()
         result = await self._execute_agent_task(task, context, task_id)
+        # Hosts control publication of these workspace files separately from
+        # text output review.
         file_outputs = self.get_output_files()
         if file_outputs:
             result["file_outputs"] = file_outputs
+        await _attach_structured_output(
+            result,
+            structured_output_format,
+            llm=self.llm,
+            task_id=task_id or self._current_task_id,
+            run_id=(context or {}).get("run_id"),
+            tracer=self.tracer,
+        )
         return result
 
     async def pause_execution(self) -> bool:
@@ -391,6 +412,8 @@ class AgentService:
     async def resume_execution_by_id(
         self,
         execution_id: str,
+        *,
+        structured_output_format: StructuredOutputFormat | None = None,
         **kwargs: Any,
     ) -> dict[str, Any] | None:
         await self._ensure_tools_initialized()
@@ -398,9 +421,27 @@ class AgentService:
             self._execution_adapter = self._build_execution_adapter()
         else:
             self._execution_adapter.config.tools = self.tools
-        return cast(
+        adapter = self._execution_adapter
+        llm = None
+        if structured_output_format is not None:
+            # A run that finishes in the resume is unregistered before it
+            # returns, so the model of the live handle is taken first.
+            handle = adapter.registry.get(execution_id)
+            runner = getattr(handle, "runner", None)
+            llm = getattr(getattr(runner, "agent", None), "llm", None)
+            if llm is None:
+                llm = adapter.config.llm
+        result = cast(
             dict[str, Any] | None,
-            await self._execution_adapter.resume(execution_id, **kwargs),
+            await adapter.resume(execution_id, **kwargs),
+        )
+        return await _attach_structured_output(
+            result,
+            structured_output_format,
+            llm=llm,
+            task_id=execution_id,
+            run_id=(kwargs.get("metadata") or {}).get("run_id"),
+            tracer=self.tracer,
         )
 
     def pause_execution_by_id(
@@ -455,6 +496,7 @@ class AgentService:
         enabled: bool,
         available: bool,
         availability_reason: str | None,
+        memory_tools_factory: Callable[..., list[Any]] | None = None,
         execution_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Atomically publish the current trusted memory policy to the runtime."""
@@ -464,6 +506,8 @@ class AgentService:
         self.memory_enabled = enabled
         self.memory_available = available
         self.memory_availability_reason = availability_reason
+        self.memory_tools_factory = memory_tools_factory
+        self.agent.memory_tools_factory = memory_tools_factory
         for key in (
             "memory_available",
             "memory_availability_reason",
@@ -474,6 +518,9 @@ class AgentService:
             self.execution_metadata.update(execution_metadata)
         if self._execution_adapter is not None:
             self._execution_adapter.config.memory_store = memory if enabled else None
+            self._execution_adapter.config.memory_tools_factory = (
+                memory_tools_factory if enabled else None
+            )
             self._execution_adapter.config.execution_metadata = dict(
                 self.execution_metadata
             )
@@ -642,6 +689,12 @@ class AgentService:
             self._execution_adapter.config.user_interaction_enabled = (
                 self.user_interaction_enabled
             )
+            self._execution_adapter.config.defer_connector_schemas = (
+                self.defer_connector_schemas
+            )
+            self._execution_adapter.config.deferred_preload_token_budget = (
+                self.deferred_preload_token_budget
+            )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
@@ -701,11 +754,16 @@ class AgentService:
                 execution_context_messages=self._execution_context_messages,
                 recovered_skill_context=self._recovered_skill_context,
                 memory_store=self.memory if self.memory_enabled else None,
+                memory_tools_factory=(
+                    self.memory_tools_factory if self.memory_enabled else None
+                ),
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
                 skills_enabled=self.skills_enabled,
                 user_interaction_enabled=self.user_interaction_enabled,
+                defer_connector_schemas=self.defer_connector_schemas,
+                deferred_preload_token_budget=self.deferred_preload_token_budget,
                 preferred_input_modalities=self.preferred_input_modalities,
                 execution_metadata=dict(self.execution_metadata),
             )
@@ -818,9 +876,10 @@ class AgentService:
                 def get_allowed_collections(self) -> list[Any] | None:
                     return None
 
-                # get_agent_creator_user_id / get_declared_knowledge_bases are
-                # not overridden here: ToolConfig already gives both a
-                # fail-closed ``None`` default (see config.py), which is
+                # get_knowledge_base_team_id / get_agent_creator_user_id /
+                # get_declared_knowledge_bases are not overridden here:
+                # ToolConfig already gives all three a fail-closed ``None``
+                # default (see config.py), which is
                 # exactly what this default, non-team-governed tool config
                 # needs.
 

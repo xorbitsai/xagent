@@ -4,6 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -14,7 +15,11 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
+from ...config import (
+    get_agent_pattern_for_execution_mode,
+    get_sandbox_enabled,
+    get_uploads_dir,
+)
 from ...core.agent.language import (
     detect_prose_script_mismatch,
     render_structured_request_language_policy,
@@ -45,6 +50,7 @@ from ..services.agent_access import (
     list_accessible_agents,
     query_accessible_agents,
 )
+from ..services.agent_host_settings import stage_agent_host_settings
 from ..services.agent_management import (
     AgentManagementRuntime,
     AgentManagementService,
@@ -108,12 +114,18 @@ class AgentCreateRequest(BaseModel):
     )
     prompt_context_fields: PromptContextFieldList = Field(
         default_factory=list,
-        description="Fields the unsigned widget entry may pass to prompt context",
+        description=(
+            "Fields unsigned callers (the widget entry and personal keys) "
+            "may pass to prompt context"
+        ),
     )
     logo_base64: Optional[str] = Field(
         None, description="Logo image as base64 data URL"
     )
     visibility: Optional[Literal["team", "admins"]] = None
+    host_settings: dict[str, Any] | None = Field(
+        None, description="Non-empty settings require a registered host writer."
+    )
 
 
 class AgentUpdateRequest(BaseModel):
@@ -140,6 +152,9 @@ class AgentUpdateRequest(BaseModel):
     allowed_domains: Optional[List[WidgetAllowedDomain]] = None
     visibility: Optional[Literal["team", "admins"]] = Field(
         None, description="Team visibility: 'team' or 'admins' (team admins only)"
+    )
+    host_settings: dict[str, Any] | None = Field(
+        None, description="Non-empty settings require a registered host writer."
     )
 
 
@@ -759,6 +774,8 @@ async def create_agent(
         # truth: uq_agents_user_id_name_active is what actually prevents a
         # concurrent-request race, so the insert itself can still raise
         # IntegrityError here.
+        host_settings = agent_data.host_settings
+
         try:
             agent = store.create_agent(
                 user_id=user_id,
@@ -776,6 +793,16 @@ async def create_agent(
                     for declaration in agent_data.prompt_context_fields
                 ],
                 visibility=agent_data.visibility,
+                before_commit=(
+                    partial(
+                        stage_agent_host_settings,
+                        db,
+                        user=current_user,
+                        settings=host_settings,
+                    )
+                    if host_settings
+                    else None
+                ),
             )
         except IntegrityError as exc:
             db.rollback()
@@ -800,6 +827,7 @@ async def create_agent(
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
+        db.rollback()
         raise
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -1191,6 +1219,9 @@ async def update_agent(
         if agent_data.visibility is not None:
             updates["visibility"] = agent_data.visibility
 
+        if agent_data.host_settings:
+            stage_agent_host_settings(db, agent, current_user, agent_data.host_settings)
+
         # Handle logo
         if agent_data.logo_base64 is not None:
             # Delete old logo
@@ -1201,7 +1232,7 @@ async def update_agent(
             logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
             updates["logo_url"] = logo_url
 
-        if updates:
+        if updates or agent_data.host_settings:
             # agent_name_exists above is a fast-path pre-check, not the source
             # of truth: uq_agents_user_id_name_active is what actually
             # prevents a concurrent-rename race, so the write itself can
@@ -1230,6 +1261,7 @@ async def update_agent(
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
+        db.rollback()
         raise
     except (UnsharedConnectorsError, UnsharedKnowledgeBasesError) as e:
         db.rollback()
@@ -1887,6 +1919,8 @@ async def preview_agent(
     db: Session = Depends(get_db),
 ) -> AgentPreviewResponse:
     """Preview agent response without saving to database."""
+    preview_sandbox_manager = None
+    preview_task_id = None
     try:
         # Resolve LLMs from model IDs
         default_llm = None
@@ -2000,6 +2034,28 @@ async def preview_agent(
             voice=current_user_voice,
         )
 
+        if get_sandbox_enabled() and (
+            tool_selection_spec.includes_category("basic")
+            or tool_selection_spec.includes_category("code_execution")
+            or tool_selection_spec.includes_category("browser")
+            or tool_selection_spec.includes_published_agent()
+            or tool_selection_spec.includes_mcp()
+        ):
+            from ...sandbox.base import SandboxMountIntent
+            from ..sandbox_manager import get_sandbox_manager
+
+            release_db_connection_if_clean(db)
+            preview_sandbox_manager = get_sandbox_manager()
+            if preview_sandbox_manager is not None:
+                provider = await preview_sandbox_manager.get_or_create_lease_provider(
+                    "task",
+                    preview_task_id,
+                    mount_intent=SandboxMountIntent(
+                        mount_root=str(get_uploads_dir() / "preview" / preview_task_id)
+                    ),
+                )
+                tool_config.set_sandbox(provider)
+
         # Determine execution mode (default to "think")
         execution_mode = request.execution_mode or "think"
 
@@ -2072,3 +2128,9 @@ async def preview_agent(
     except Exception as e:
         logger.error(f"Failed to preview agent: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if preview_sandbox_manager is not None and preview_task_id is not None:
+            try:
+                await preview_sandbox_manager.delete_sandbox("task", preview_task_id)
+            except Exception:
+                logger.warning("Could not remove preview sandbox", exc_info=True)

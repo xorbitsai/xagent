@@ -258,11 +258,13 @@ def test_upgrade_raises_when_launch_config_column_is_missing(tmp_path):
         assert APP_ID not in _app_ids(connection)
 
 
-def test_seed_row_matches_registry_apart_from_the_later_scope_fields():
+def test_seed_row_matches_registry_apart_from_later_scope_and_copy_fields():
     """The migration is a frozen copy of the registry row. The registry has
     since pinned launch_config.auth.scope and auth.required_scope
-    (20261013_atlassian_mcp_scope), so everything except those two auth
-    fields must still match; this catches other drift."""
+    (20261013_atlassian_mcp_scope) and changed name and description
+    (20261105_update_atlassian_name_and_description, whose own test pins
+    them), so everything except those fields must still match; this catches
+    other drift."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration()
@@ -273,9 +275,15 @@ def test_seed_row_matches_registry_apart_from_the_later_scope_fields():
     registry_launch = dict(registry_row["launch_config"])
     seed_auth = seed_launch.pop("auth")
     registry_auth = dict(registry_launch.pop("auth"))
-    assert {**migration.ROW, "launch_config": seed_launch} == {
-        **registry_row,
-        "launch_config": registry_launch,
+    later_copy_fields = {"name", "description"}
+    assert {
+        key: value
+        for key, value in {**migration.ROW, "launch_config": seed_launch}.items()
+        if key not in later_copy_fields
+    } == {
+        key: value
+        for key, value in {**registry_row, "launch_config": registry_launch}.items()
+        if key not in later_copy_fields
     }
     assert registry_auth.pop("scope")
     assert registry_auth.pop("required_scope")

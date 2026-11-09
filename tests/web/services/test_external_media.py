@@ -1,4 +1,6 @@
-from unittest.mock import Mock
+import os
+from pathlib import Path
+from unittest.mock import MagicMock, Mock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -555,3 +557,389 @@ def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="normalized"):
         external_media.instagram_jpeg_bytes(source)
+
+
+def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / name
+    source.parent.mkdir(parents=True)
+    if write is None:
+        Image.new("RGB", (3000, 400), "blue").save(source)
+    else:
+        write(source)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    record = _record(
+        file_id,
+        filename=name,
+        storage_path=str(source),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    db = _DB(record)
+    issued = lambda: external_media.issue_external_media_url(  # noqa: E731
+        db,
+        file_id=file_id,
+        user_id=7,
+        task_id=11,
+        purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+    )
+    return db, file_id, issued
+
+
+def test_issue_facebook_ticket_names_its_purpose(monkeypatch, tmp_path):
+    # Why: the delivery route decides whether to normalize by the ticket's
+    # purpose, so a Facebook ticket must carry the Facebook purpose.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db, file_id, issue = _facebook_issue(monkeypatch, tmp_path)
+
+    ticket = parse_qs(urlsplit(issue().url).query)["ticket"][0]
+    redeemed = external_media.redeem_external_media_ticket(
+        db, file_id=file_id, ticket=ticket
+    )
+
+    assert redeemed.purpose is external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH
+    assert redeemed.media_type == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("name", "write", "message"),
+    [
+        ("post.png", lambda path: path.write_bytes(b"not-an-image"), "PNG or JPEG"),
+        (
+            "post.gif",
+            lambda path: Image.new("RGB", (8, 8)).save(path, "GIF"),
+            "PNG or JPEG",
+        ),
+        ("post.png", lambda path: path.write_bytes(b"x" * 64), "10 MB"),
+    ],
+)
+def test_issue_facebook_rejects_what_the_page_cannot_take(
+    monkeypatch, tmp_path, name, write, message
+):
+    # Why: an image the URL path cannot deliver must fail at issue, before a
+    # ticket exists, as its own error so native grants can fall back to the
+    # connector's upload; the size cap matches the connector's.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    if message == "10 MB":
+        monkeypatch.setattr(external_media, "FACEBOOK_MAX_IMAGE_BYTES", 32)
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, name=name, write=write)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match=message):
+        issue()
+
+
+@pytest.mark.parametrize("base", [None, "http://api.example.test"])
+def test_issue_without_a_public_https_base_is_not_configured(monkeypatch, base):
+    # Why: the adapter falls back to a native upload only for this case, so it
+    # must be its own error, distinct from an image that cannot be delivered.
+    monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+    if base:
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", base)
+    file_id = str(uuid4())
+
+    with pytest.raises(external_media.ExternalMediaNotConfigured):
+        external_media.issue_external_media_url(
+            _DB(_record(file_id)),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        )
+
+
+def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path):
+    # Why: a header that parses is not enough; Meta would fail to fetch a
+    # truncated body, and it must fall back while the native upload still can.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+
+    def truncated_png(path):
+        Image.new("RGB", (640, 640), "blue").save(path)
+        path.write_bytes(path.read_bytes()[:-40])
+
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, write=truncated_png)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
+        issue()
+
+
+def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tmp_path):
+    # Why: an IO failure is a storage problem, not the image's fault; it must
+    # stay base ExternalMediaUnavailable so the adapter does not fall back.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path)
+
+    reader = MagicMock()
+    reader.__enter__.return_value.read.side_effect = OSError("Input/output error")
+    monkeypatch.setattr(external_media, "open_delivery_file", Mock(return_value=reader))
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="read") as raised:
+        issue()
+    assert not isinstance(raised.value, external_media.ExternalMediaUnsupportedImage)
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("swapped", ["file", "directory", "fifo"])
+def test_issue_facebook_refuses_a_path_swapped_after_materialization(
+    monkeypatch, tmp_path, swapped
+):
+    # The sandbox can replace an output after materialization. Signing must
+    # neither follow the new link nor block on a FIFO, before any ticket exists.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    source = Path(db.record.storage_path)
+    other = tmp_path / "other" / source.name
+    other.parent.mkdir()
+    Image.new("RGB", (64, 64), "red").save(other)
+    materialize = external_media._materialize_record
+    tickets = _count_encode_calls(monkeypatch)
+
+    def materialize_then_swap(record):
+        path = materialize(record)
+        assert path == source
+        if swapped == "directory":
+            source.parent.rename(tmp_path / "original-output")
+            source.parent.symlink_to(other.parent)
+        else:
+            source.unlink()
+            if swapped == "fifo":
+                os.mkfifo(source)
+            else:
+                source.symlink_to(other)
+        return path
+
+    monkeypatch.setattr(external_media, "_materialize_record", materialize_then_swap)
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="read") as raised:
+        issue()
+
+    assert type(raised.value) is external_media.ExternalMediaUnavailable
+    assert tickets == []
+
+
+def test_open_delivery_file_closes_the_descriptor_when_wrapping_fails(
+    monkeypatch, tmp_path
+):
+    # Each issuance or GET opens a descriptor; a failure after the open must
+    # not leak it.
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / "launch.png"
+    _png(source)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    record = _record(str(uuid4()), storage_path=str(source))
+    opened = []
+    real_open = os.open
+
+    def tracking_open(name, flags, *args, **kwargs):
+        fd = real_open(name, flags, *args, **kwargs)
+        if name == source.name:
+            opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(external_media.os, "open", tracking_open)
+    monkeypatch.setattr(
+        external_media.os, "fdopen", Mock(side_effect=OSError("fdopen failed"))
+    )
+
+    with pytest.raises(OSError, match="fdopen failed"):
+        external_media.open_delivery_file(record, source)
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("swapped", ["file", "directory", "fifo"])
+def test_issue_instagram_refuses_a_path_swapped_after_materialization(
+    monkeypatch, tmp_path, swapped
+):
+    # Instagram issuance reads the header the same way, and must not block on a
+    # FIFO or follow a link swapped in after materialization either.
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / "launch.png"
+    source.parent.mkdir(parents=True)
+    Image.new("RGB", (640, 640), "blue").save(source)
+    other = tmp_path / "other" / source.name
+    other.parent.mkdir()
+    Image.new("RGB", (640, 640), "red").save(other)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    materialize = external_media._materialize_record
+    tickets = _count_encode_calls(monkeypatch)
+
+    def materialize_then_swap(record):
+        path = materialize(record)
+        assert path == source
+        if swapped == "directory":
+            source.parent.rename(tmp_path / "original-output")
+            source.parent.symlink_to(other.parent)
+        else:
+            source.unlink()
+            if swapped == "fifo":
+                os.mkfifo(source)
+            else:
+                source.symlink_to(other)
+        return path
+
+    monkeypatch.setattr(external_media, "_materialize_record", materialize_then_swap)
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="read"):
+        external_media.issue_external_media_url(
+            _DB(
+                _record(
+                    file_id,
+                    storage_path=str(source),
+                    storage_status="legacy",
+                    storage_key=None,
+                )
+            ),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        )
+    assert tickets == []
+
+
+def test_issue_facebook_bounds_read_when_file_grows(monkeypatch, tmp_path):
+    # Grow a real, initially valid image immediately before reading. Count the
+    # bytes actually returned: checking len() after an unbounded read is too late.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db, _, issue = _facebook_issue(monkeypatch, tmp_path)
+    source = Path(db.record.storage_path)
+    source_inode = source.stat().st_ino
+    limit = source.stat().st_size
+    monkeypatch.setattr(external_media, "FACEBOOK_MAX_IMAGE_BYTES", limit)
+    tickets = _count_encode_calls(monkeypatch)
+    reads = []
+    opened = []
+    path_open = Path.open
+    fdopen = os.fdopen
+
+    def track_read(stream):
+        opened.append(stream)
+        reader = MagicMock(wraps=stream)
+        reader.__enter__.return_value = reader
+        reader.__exit__.side_effect = stream.__exit__
+
+        def read(*args, **kwargs):
+            with path_open(source, "ab") as writer:
+                writer.write(b"x" * (limit * 2))
+            content = stream.read(*args, **kwargs)
+            reads.append(len(content))
+            return content
+
+        reader.read.side_effect = read
+        return reader
+
+    def open_path(path, *args, **kwargs):
+        stream = path_open(path, *args, **kwargs)
+        mode = kwargs.get("mode", args[0] if args else "r")
+        if path == source and mode == "rb":
+            return track_read(stream)
+        return stream
+
+    def open_fd(fd, *args, **kwargs):
+        stream = fdopen(fd, *args, **kwargs)
+        if os.fstat(stream.fileno()).st_ino == source_inode:
+            return track_read(stream)
+        return stream
+
+    # Observe both the old pathname reader and the descriptor reader, so this
+    # regression fails on the old implementation without allocating a large file.
+    monkeypatch.setattr(Path, "open", open_path)
+    monkeypatch.setattr(os, "fdopen", open_fd)
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="10 MB"):
+        issue()
+
+    assert reads == [limit + 1]
+    assert opened and all(stream.closed for stream in opened)
+    assert tickets == []
+
+
+def _png(path, color="blue"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 64), color).save(path)
+
+
+def test_trust_refuses_a_symlink_below_the_user_root(monkeypatch, tmp_path):
+    # Why: a registered file replaced by a link to another task's image must
+    # not be delivered from the local copy (#3588 scope review, P1).
+    uploads = tmp_path / "uploads"
+    other = uploads / "user_7" / "web_task_99" / "private.png"
+    _png(other, "red")
+    registered = uploads / "user_7" / "web_task_11" / "post.png"
+    registered.parent.mkdir(parents=True)
+    registered.symlink_to(other)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads)
+    record = _record(str(uuid4()), storage_path=str(registered))
+
+    assert external_media.local_record_path_is_trusted(record, registered) is False
+    _png(registered.with_name("plain.png"))
+    plain = registered.with_name("plain.png")
+    assert external_media.local_record_path_is_trusted(record, plain) is True
+
+
+def test_trust_accepts_an_upload_root_that_is_itself_a_link(monkeypatch, tmp_path):
+    # Why: a mounted volume may make the upload root a link; only links below
+    # the user root are refused, so ordinary deployments keep local delivery.
+    real = tmp_path / "volume"
+    _png(real / "user_7" / "web_task_11" / "post.png")
+    uploads = tmp_path / "uploads"
+    uploads.symlink_to(real)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads)
+    path = uploads / "user_7" / "web_task_11" / "post.png"
+
+    assert (
+        external_media.local_record_path_is_trusted(_record(str(uuid4())), path) is True
+    )
+
+
+def test_issue_facebook_does_not_deliver_a_symlinked_local_copy(monkeypatch, tmp_path):
+    # Why: with the local copy refused and no durable object, issuing must
+    # fail as out of scope (staging then applies its own rules), never sign
+    # a URL for the link's target.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    uploads = tmp_path / "uploads"
+    other = uploads / "user_7" / "web_task_99" / "private.png"
+    _png(other, "red")
+
+    def link(path):
+        path.symlink_to(other)
+
+    _, _, issue = _facebook_issue(monkeypatch, tmp_path, write=link)
+
+    with pytest.raises(external_media.ExternalMediaOutOfScope):
+        issue()
+
+
+def test_issue_local_only_copy_outside_uploads_is_out_of_scope(monkeypatch, tmp_path):
+    # Why: a workspace may keep a local-only file outside the upload root that
+    # its own staging can read; issuing cannot, and must say so as its own
+    # error so native grants fall back instead of failing (scope review, P2).
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: tmp_path / "uploads")
+    elsewhere = tmp_path / "custom-workspace" / "post.png"
+    _png(elsewhere)
+    file_id = str(uuid4())
+    db = _DB(
+        _record(
+            file_id,
+            filename="post.png",
+            storage_path=str(elsewhere),
+            storage_status="legacy",
+            storage_key=None,
+        )
+    )
+
+    with pytest.raises(external_media.ExternalMediaOutOfScope):
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        )

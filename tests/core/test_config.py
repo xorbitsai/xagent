@@ -86,9 +86,13 @@ from xagent.config import (
     SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
     SANDBOX_NAMESPACE,
+    SANDBOX_NETWORK,
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
+    SANDBOX_WORKSPACE_MOUNT_MODE,
+    SANDBOX_WORKSPACE_VOLUME,
+    SANDBOX_WORKSPACE_VOLUME_ROOT,
     SLACK_APP_TOKEN,
     SLACK_CLIENT_ID,
     SLACK_CLIENT_SECRET,
@@ -199,8 +203,12 @@ from xagent.config import (
     get_sandbox_max_containers,
     get_sandbox_memory,
     get_sandbox_namespace,
+    get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_sandbox_workspace_mount_mode,
+    get_sandbox_workspace_volume,
+    get_sandbox_workspace_volume_root,
     get_slack_app_token,
     get_slack_client_id,
     get_slack_client_secret,
@@ -234,6 +242,7 @@ from xagent.config import (
     get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
+    validate_sandbox_network,
 )
 
 
@@ -367,6 +376,9 @@ class TestEnvironmentVariableConstants:
 
     def test_sandbox_namespace_constant(self):
         assert SANDBOX_NAMESPACE == "XAGENT_SANDBOX_NAMESPACE"
+
+    def test_sandbox_network_constant(self):
+        assert SANDBOX_NETWORK == "XAGENT_SANDBOX_NETWORK"
 
     def test_sandbox_host_storage_root_constant(self):
         assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
@@ -2149,6 +2161,65 @@ class TestGetSandboxNamespace:
         assert get_sandbox_namespace() == "a" * 100
 
 
+class TestGetSandboxNetwork:
+    def test_missing_or_blank_returns_none(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_NETWORK, raising=False)
+        assert get_sandbox_network() is None
+        monkeypatch.setenv(SANDBOX_NETWORK, "  ")
+        assert get_sandbox_network() is None
+
+    def test_dedicated_network_name_is_accepted(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_NETWORK, "stage_sandbox-egress.v1")
+        assert get_sandbox_network() == "stage_sandbox-egress.v1"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["bridge", "host", "none", "default", "has space", "/bad", "a" * 256],
+    )
+    def test_builtin_or_malformed_network_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv(SANDBOX_NETWORK, value)
+        with pytest.raises(ValueError, match="Invalid sandbox network"):
+            get_sandbox_network()
+
+    def test_direct_validation_is_fail_closed(self):
+        with pytest.raises(ValueError, match="Invalid sandbox network"):
+            validate_sandbox_network("")
+
+
+class TestSandboxWorkspaceMountConfig:
+    def test_mount_mode_defaults_to_bind(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_WORKSPACE_MOUNT_MODE, raising=False)
+        assert get_sandbox_workspace_mount_mode() == "bind"
+
+    def test_volume_subpath_mode_and_settings(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_MOUNT_MODE, "volume_subpath")
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME, "xagent-stage-workspaces")
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME_ROOT, "/root/.xagent/uploads")
+        assert get_sandbox_workspace_mount_mode() == "volume_subpath"
+        assert get_sandbox_workspace_volume() == "xagent-stage-workspaces"
+        assert get_sandbox_workspace_volume_root() == Path("/root/.xagent/uploads")
+
+    @pytest.mark.parametrize("value", ["", "volume", "host", "named-volume"])
+    def test_invalid_mount_mode_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_MOUNT_MODE, value)
+        if value == "":
+            assert get_sandbox_workspace_mount_mode() == "bind"
+        else:
+            with pytest.raises(ValueError, match=SANDBOX_WORKSPACE_MOUNT_MODE):
+                get_sandbox_workspace_mount_mode()
+
+    @pytest.mark.parametrize("value", ["/host/path", "bad volume", "a"])
+    def test_invalid_volume_name_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME, value)
+        with pytest.raises(ValueError, match="Docker volume name"):
+            get_sandbox_workspace_volume()
+
+    def test_relative_volume_root_is_rejected(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_WORKSPACE_VOLUME_ROOT, "uploads")
+        with pytest.raises(ValueError, match="absolute path"):
+            get_sandbox_workspace_volume_root()
+
+
 class TestGetBoxliteHomeDir:
     """Test get_boxlite_home_dir() function."""
 
@@ -2565,6 +2636,27 @@ class TestOrphanUploadGcConfig:
 
         monkeypatch.setenv("XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS", "900")
         assert get_orphan_upload_sweep_interval_seconds() == 900
+
+
+class TestComposioReconcileConfig:
+    """How often unbound Composio accounts are cleaned up (#3548)."""
+
+    def test_off_unless_set(self, monkeypatch):
+        from xagent.config import get_composio_reconcile_interval_seconds
+
+        monkeypatch.delenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", raising=False)
+        assert get_composio_reconcile_interval_seconds() is None
+        monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", " ")
+        assert get_composio_reconcile_interval_seconds() is None
+
+    def test_a_set_interval_has_a_floor(self, monkeypatch):
+        from xagent.config import get_composio_reconcile_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", "900")
+        assert get_composio_reconcile_interval_seconds() == 900
+        for invalid in ("5", "hourly"):
+            monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", invalid)
+            assert get_composio_reconcile_interval_seconds() is None
 
 
 class TestTaskCleanupRetryConfig:
@@ -4703,3 +4795,64 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+def test_public_site_configuration_is_opt_in(monkeypatch):
+    from xagent.config import (
+        get_dual_entry_oauth_enabled,
+        get_primary_public_site_url,
+        get_public_entries,
+    )
+
+    monkeypatch.delenv("XAGENT_PUBLIC_ENTRIES_JSON", raising=False)
+    monkeypatch.delenv("XAGENT_PRIMARY_PUBLIC_SITE_URL", raising=False)
+    monkeypatch.delenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://legacy.example")
+    monkeypatch.setenv("XAGENT_REGION_COOKIE_DOMAIN", ".legacy.example")
+    assert get_primary_public_site_url() == "https://legacy.example"
+    # The unconfigured legacy entry never carries a hosting cookie domain.
+    assert get_public_entries()[0].region_cookie_domain is None
+    assert not get_dual_entry_oauth_enabled()
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, False), ("true", True), ("false", False)]
+)
+def test_get_sandbox_enabled(monkeypatch, value, expected):
+    from xagent.config import get_sandbox_enabled
+
+    if value is None:
+        monkeypatch.delenv("SANDBOX_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("SANDBOX_ENABLED", value)
+    assert get_sandbox_enabled() is expected
+
+
+def test_legacy_source_uploads_boundary_ignores_operator_overrides(monkeypatch):
+    from xagent.config import get_legacy_source_uploads_dir
+
+    expected = get_legacy_source_uploads_dir()
+    monkeypatch.setenv("XAGENT_WEB_DIR", "/unrelated")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", "/")
+    assert get_legacy_source_uploads_dir() == expected
+
+
+def test_platform_git_roots_follow_relative_alternates_without_looping(
+    tmp_path, monkeypatch
+):
+    from xagent.config import get_platform_source_roots
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "xagent").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text('[project]\nname = "xagent-ai"\n')
+    objects = checkout / ".git" / "objects"
+    pool = tmp_path / "pool"
+    for path in (objects, pool):
+        (path / "info").mkdir(parents=True)
+    (objects / "info" / "alternates").write_text(os.path.relpath(pool, objects) + "\n")
+    (pool / "info" / "alternates").write_text(os.path.relpath(objects, pool) + "\n")
+    monkeypatch.chdir(checkout)
+    roots = get_platform_source_roots()
+    assert (checkout / ".git").resolve() in roots
+    assert objects.resolve() in roots
+    assert pool.resolve() in roots

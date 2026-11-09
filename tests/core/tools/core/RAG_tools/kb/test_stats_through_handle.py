@@ -124,6 +124,34 @@ def _seed_embedding(
     )
 
 
+def _write_embeddings_through_the_ingest_path(
+    collection: str, doc_id: str, chunk_ids: list[str], model: str
+) -> None:
+    """Write via the handle path ingestion uses (tags the id once, upsert tags again)."""
+    from xagent.core.tools.core.RAG_tools.core.schemas import ChunkEmbeddingData
+    from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
+        write_vectors_to_db,
+    )
+
+    write_vectors_to_db(
+        collection=collection,
+        embeddings=[
+            ChunkEmbeddingData(
+                doc_id=doc_id,
+                chunk_id=chunk_id,
+                parse_hash="ph",
+                model=model,
+                vector=[0.1, 0.2],
+                text=chunk_id,
+                chunk_hash=f"h-{chunk_id}",
+            )
+            for chunk_id in chunk_ids
+        ],
+        create_index=False,
+        user_id=1,
+    )
+
+
 def _seed_two_documents() -> None:
     """d1 (user 1): 2 chunks, 2 vectors in model A, 1 in model B; d2 (user 2): 1 chunk."""
     _seed_document(KB, "d1", 1)
@@ -241,6 +269,29 @@ def test_document_stats_see_rows_another_process_wrote() -> None:
     assert (after.data.document_exists, after.data.parse_count) == (True, 1)
 
 
+def test_document_stats_count_rows_in_the_twice_tagged_table() -> None:
+    model_id = "platform/text-embedding-v4"
+    _seed_document(KB, "d1", 1)
+    _seed_chunk(KB, "d1", "c1", 1)
+    _seed_chunk(KB, "d1", "c2", 1)
+    _write_embeddings_through_the_ingest_path(KB, "d1", ["c1", "c2"], model_id)
+    assert "embeddings_platform_text_embedding_v4" in (
+        get_vector_index_store().list_table_names()
+    )
+
+    stats = collections.get_document_stats(
+        KB, "d1", model_tag=model_id, user_id=1, is_admin=False
+    )
+
+    assert stats.status == "success"
+    assert stats.data is not None
+    assert stats.data.embedding_count == 2
+    assert stats.data.embedding_breakdown == {
+        "embeddings_PLATFORM_text_embedding_v4": 0,
+        "embeddings_platform_text_embedding_v4": 2,
+    }
+
+
 def test_list_documents_reports_a_handle_that_cannot_open() -> None:
     _seed_two_documents()
     asyncio.run(
@@ -342,6 +393,69 @@ def test_rebuild_still_clears_the_model_of_a_kb_without_vectors(monkeypatch) -> 
     rebuilt = _rebuild_with_stored_model(monkeypatch, reported_vectors=0)
 
     assert (rebuilt.embedding_model_id, rebuilt.embedding_dimension) == (None, None)
+
+
+def test_rebuild_attributes_the_twice_tagged_table_to_the_model_id(monkeypatch) -> None:
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+    model_id = "platform/text-embedding-v4"
+    _seed_document(KB, "d1", 1)
+    _seed_chunk(KB, "d1", "c1", 1)
+    _write_embeddings_through_the_ingest_path(KB, "d1", ["c1"], model_id)
+    asyncio.run(get_metadata_store().save_collection(CollectionInfo(name=KB)))
+    monkeypatch.setattr(
+        model_resolver,
+        "_list_model_hub_configs",
+        lambda: {
+            model_id: EmbeddingModelConfig(
+                id=model_id,
+                model_name="text-embedding-v4",
+                model_provider="dashscope",
+                dimension=2,
+            )
+        },
+    )
+
+    asyncio.run(rebuild_collection_metadata())
+
+    rebuilt = asyncio.run(get_metadata_store().get_collection(KB))
+    assert rebuilt.embedding_model_id == model_id
+    assert rebuilt.embedding_dimension == 2
+
+
+def test_rebuild_prefers_an_id_over_another_configs_model_name_alias(
+    monkeypatch,
+) -> None:
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+    alias_config = EmbeddingModelConfig(
+        id="sf-bge",
+        model_name="BAAI/bge-m3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    id_config = EmbeddingModelConfig(
+        id="BAAI/bge-m3",
+        model_name="bge-m3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    _seed_document(KB, "d1", 1)
+    _seed_chunk(KB, "d1", "c1", 1)
+    _write_embeddings_through_the_ingest_path(KB, "d1", ["c1"], "BAAI/bge-m3")
+    asyncio.run(get_metadata_store().save_collection(CollectionInfo(name=KB)))
+    monkeypatch.setattr(
+        model_resolver,
+        "_list_model_hub_configs",
+        lambda: {"sf-bge": alias_config, "BAAI/bge-m3": id_config},
+    )
+
+    asyncio.run(rebuild_collection_metadata())
+
+    rebuilt = asyncio.run(get_metadata_store().get_collection(KB))
+    assert rebuilt.embedding_model_id == "BAAI/bge-m3"
 
 
 def test_rebuild_leaves_a_kb_the_engine_did_not_report_unchanged(monkeypatch) -> None:

@@ -404,7 +404,10 @@ class TestImageGenerationTool:
         result = await tool.generate_image("A test prompt")
 
         assert result["success"] is False
-        assert result["error"] == "Model error"
+        # The exception's own words stay in the log. The result carries a
+        # category and a sentence that names nothing internal.
+        assert result["error_category"] == "unknown"
+        assert "Model error" not in result["error"]
         assert result["image_path"] is None
         assert result["model_used"] == "model1"
 

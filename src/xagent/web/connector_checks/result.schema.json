@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xagent:connector-smoke:result:1",
+  "title": "Connector smoke V2 run result",
+  "description": "One run of the connector smoke V2 engine under one identity. Built by xagent.web.connector_checks.results.RunResult.to_document; carries codes, ids, tool names and timing only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "declaration_format_version", "identity",
+    "environment", "started_at", "finished_at", "complete", "failure", "rows"
+  ],
+  "properties": {
+    "schema": { "const": "xagent.connector_smoke.result" },
+    "schema_version": { "const": 1 },
+    "declaration_format_version": { "type": "integer", "minimum": 1 },
+    "identity": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+    "environment": {
+      "type": ["string", "null"],
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "started_at": { "$ref": "#/$defs/timestamp" },
+    "finished_at": { "$ref": "#/$defs/timestamp" },
+    "complete": { "type": "boolean" },
+    "failure": { "oneOf": [{ "$ref": "#/$defs/code" }, { "type": "null" }] },
+    "rows": { "type": "array", "items": { "$ref": "#/$defs/row" } }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "failure": { "type": "string" } }, "required": ["failure"] },
+      "then": { "properties": { "complete": { "const": false }, "rows": { "maxItems": 0 } } }
+    }
+  ],
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "code": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,79}$" },
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row", "connector", "check", "kind", "tool",
+        "outcome", "failure_class", "reason", "duration_ms"
+      ],
+      "properties": {
+        "row": { "enum": ["session", "check"] },
+        "connector": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "check": {
+          "type": ["string", "null"],
+          "pattern": "^[a-z0-9][a-z0-9_.:-]{0,79}$"
+        },
+        "kind": { "enum": ["read", "write", null] },
+        "tool": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
+        },
+        "outcome": { "enum": ["pass", "fail", "skip", "unprobeable"] },
+        "failure_class": {
+          "enum": [
+            "not_found", "not_connected", "client_rejected", "unsupported",
+            "failed_to_start", "no_tools", "timed_out", "not_reached",
+            "tool_missing", "call_failed", "assertion_failed",
+            "tenant_mismatch", "verdict_mismatch", "cleanup_failed",
+            "skipped_by_identity", "session_unavailable", "not_declared",
+            "fixture_missing", "read_only_hint_missing", "writes_disabled",
+            null
+          ]
+        },
+        "reason": { "oneOf": [{ "$ref": "#/$defs/code" }, { "type": "null" }] },
+        "duration_ms": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "row": { "const": "session" } } },
+          "then": {
+            "properties": {
+              "check": { "type": "null" },
+              "kind": { "type": "null" },
+              "tool": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "check": { "type": "string" },
+              "kind": { "enum": ["read", "write"] }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "pass" } } },
+          "then": { "properties": { "failure_class": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "fail" } } },
+          "then": {
+            "properties": {
+              "failure_class": {
+                "enum": [
+                  "not_found", "not_connected", "client_rejected", "unsupported",
+                  "failed_to_start", "no_tools", "timed_out", "not_reached",
+                  "tool_missing", "call_failed", "assertion_failed",
+                  "tenant_mismatch", "verdict_mismatch", "cleanup_failed"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "skip" } } },
+          "then": {
+            "properties": {
+              "failure_class": {
+                "enum": [
+                  "skipped_by_identity", "session_unavailable", "not_declared",
+                  "fixture_missing", "read_only_hint_missing", "writes_disabled"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "outcome": { "const": "unprobeable" } } },
+          "then": {
+            "properties": {
+              "row": { "const": "check" },
+              "failure_class": { "type": "null" },
+              "reason": {
+                "enum": ["covered_by_l2", "sandboxed", "execution_scoped", "needs_fixture"]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

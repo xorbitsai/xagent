@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from xagent.web.tools.mcp import jira
+from xagent.web.tools.mcp import jira, jira_delete
 from xagent.web.tools.mcp import utils as jira_mcp_utils
 
 
@@ -4510,3 +4510,223 @@ def test_jira_app_registry_includes_offline_access_scope():
         row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "jira"
     )
     assert "offline_access" in jira_app["oauth_scopes"]
+
+
+# ---------------------------------------------------------------------------
+# jira_delete_issue
+# ---------------------------------------------------------------------------
+
+
+def test_delete_issue_sends_delete_without_subtasks_by_default(monkeypatch):
+    mock_request = Mock(
+        side_effect=[MockResponse(json_data=[_SITE_A]), MockResponse(status_code=204)]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_delete_issue("ENG-1"))
+
+    assert result == {"status": "success", "issue_key": "ENG-1", "deleted": True}
+    delete_call = mock_request.call_args_list[1]
+    assert delete_call.kwargs["method"] == "DELETE"
+    assert delete_call.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/issue/ENG-1"
+    )
+    # Jira reads the literal "true"/"false"; requests would send a Python
+    # bool as "True"/"False".
+    assert delete_call.kwargs["params"] == {"deleteSubtasks": "false"}
+
+
+def test_delete_issue_deletes_subtasks_when_asked(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_delete_issue("ENG-1", delete_subtasks=True, cloud_id="site-a")
+    )
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
+    assert mock_request.call_args.kwargs["params"] == {"deleteSubtasks": "true"}
+
+
+def test_delete_issue_percent_encodes_the_issue_key(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    jira.jira_delete_issue("ENG-1/../x", cloud_id="site-a")
+
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/rest/api/2/issue/ENG-1%2F..%2Fx"
+    )
+
+
+@pytest.mark.parametrize("issue_key", ["", " ENG-1", ".", "..", None])
+def test_delete_issue_rejects_an_invalid_key_without_a_request(monkeypatch, issue_key):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_delete_issue(issue_key, cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert "path segment" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_delete_issue_with_subtasks_asks_the_agent_to_check_with_the_user(
+    monkeypatch,
+):
+    jira_message = "The issue has subtasks; set deleteSubtasks to delete them."
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400, json_data={"errorMessages": [jira_message]}
+            )
+        ),
+    )
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith(jira_delete.DELETE_HAS_SUBTASKS_HINT)
+    assert "ask the user" in result["message"]
+    assert jira_message in result["message"]
+
+
+def test_delete_issue_400_with_subtasks_requested_gets_no_subtask_hint(monkeypatch):
+    # The subtask hint would tell the agent to retry with the flag it already
+    # sent, so a 400 then is reported as Jira's own message only.
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400, json_data={"errorMessages": ["Something else"]}
+            )
+        ),
+    )
+
+    result = json.loads(
+        jira.jira_delete_issue("ENG-1", delete_subtasks=True, cloud_id="site-a")
+    )
+
+    assert result["status"] == "error"
+    assert jira_delete.DELETE_HAS_SUBTASKS_HINT not in result["message"]
+    assert "Something else" in result["message"]
+
+
+def test_delete_issue_403_names_the_jira_permission(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests, "request", Mock(return_value=MockResponse(status_code=403))
+    )
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith(jira_delete.DELETE_STATUS_HINTS[403])
+    assert "Delete issues" in message
+    assert "not a broken connection" in message
+
+
+def test_delete_issue_404_forbids_guessing_another_key(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests, "request", Mock(return_value=MockResponse(status_code=404))
+    )
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    message = result["message"]
+    assert message.startswith(jira_delete.DELETE_STATUS_HINTS[404])
+    assert "confirm the exact issue key with the user" in message
+    assert "guessed" in message
+
+
+def _non_json_success_response():
+    # A 2xx whose body is not JSON (e.g. a proxy's HTML page): the request
+    # reached Jira, so the deletion may have happened.
+    response = MockResponse(status_code=200, text="<html>proxy</html>")
+    response.json = Mock(
+        side_effect=requests.exceptions.JSONDecodeError(
+            "Expecting value", "<html>proxy</html>", 0
+        )
+    )
+    return response
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(requests.ReadTimeout("read timed out"), id="read-timeout"),
+        pytest.param(
+            requests.ConnectionError("connection reset"), id="connection-dropped"
+        ),
+        pytest.param(
+            requests.exceptions.ChunkedEncodingError("body cut off"),
+            id="chunked-encoding",
+        ),
+        pytest.param(MockResponse(status_code=502), id="bad-gateway"),
+        pytest.param(MockResponse(status_code=503), id="unavailable"),
+        pytest.param(MockResponse(status_code=504), id="gateway-timeout"),
+        pytest.param(_non_json_success_response(), id="non-json-body"),
+    ],
+)
+def test_delete_issue_unknown_outcome_says_to_check_before_retrying(
+    monkeypatch, failure
+):
+    # A Mock side_effect iterable raises exception items and returns the rest.
+    monkeypatch.setattr(jira.requests, "request", Mock(side_effect=[failure]))
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith(jira_delete.DELETE_MAY_HAVE_COMPLETED)
+
+
+@pytest.mark.parametrize("status_code", [401, 500])
+def test_delete_issue_unmapped_status_returns_jira_message_without_hint(
+    monkeypatch, status_code
+):
+    # Only the mapped statuses and the unknown-outcome set get a hint.
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=status_code)),
+    )
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith(f"{status_code} Client Error")
+
+
+def test_delete_issue_connect_timeout_gets_no_outcome_hint(monkeypatch):
+    # A ConnectTimeout is a ConnectionError too, but it is the one failure
+    # known to have sent nothing.
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(side_effect=requests.ConnectTimeout("connect timed out")),
+    )
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert jira_delete.DELETE_MAY_HAVE_COMPLETED not in result["message"]
+
+
+def test_delete_issue_site_lookup_failure_gets_no_delete_hint(monkeypatch):
+    # A ReadTimeout on the DELETE gets the outcome-unknown hint, so the same
+    # timeout on the site lookup would get it too if the lookup were inside the
+    # DELETE's try. It must not, since nothing was sent to the issue.
+    mock_request = Mock(side_effect=requests.ReadTimeout("read timed out"))
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_delete_issue("ENG-1"))
+
+    assert result["status"] == "error"
+    assert jira_delete.DELETE_MAY_HAVE_COMPLETED not in result["message"]
+    assert mock_request.call_count == 1
+    assert mock_request.call_args.kwargs["method"] == "GET"

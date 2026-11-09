@@ -45,13 +45,9 @@ from xagent.web.services.workspace_binding import build_chat_workspace_binding
 
 @pytest.fixture
 def _env(tmp_path):
-    """Isolate sandbox env config and neutralize code mounts."""
+    """Isolate sandbox environment configuration."""
     with (
         patch.dict("os.environ", {}, clear=True),
-        patch(
-            "xagent.web.sandbox_manager.build_code_mount_volumes",
-            return_value=[("/repo/src", "/app/src", "ro")],
-        ),
         patch("xagent.web.sandbox_manager.grant_sandbox_runtime_access"),
     ):
         yield
@@ -783,6 +779,7 @@ class TestGateCallSiteStructuralPin:
         "_get_or_create_sandbox_locked": {
             "get_or_create_sandbox",
             "_create_lease_provider_locked",
+            "get_or_create_lease_provider",
         },
         "_create_lease_provider_locked": {
             "create_lease_provider",
@@ -1315,10 +1312,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1342,10 +1335,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1366,10 +1355,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1385,10 +1370,6 @@ class TestReadinessReservedUploadsSubtree:
                     "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:/shared:rw",
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
         ):
             manager, _service = _make_manager()
@@ -1411,10 +1392,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             with pytest.raises(SandboxRuntimeConflictError):
@@ -1436,10 +1413,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
@@ -1460,10 +1433,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
@@ -1479,10 +1448,6 @@ class TestReadinessReservedUploadsSubtree:
                     "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:rw",
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
         ):
             manager, _service = _make_manager()
@@ -1533,10 +1498,6 @@ class TestReadinessReservedUploadsSubtree:
                 },
                 clear=True,
             ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
@@ -1556,10 +1517,6 @@ class TestReadinessReservedUploadsSubtree:
                     "SANDBOX_VOLUMES": (f"{unrelated_source}:{tmp_path}:rw"),
                 },
                 clear=True,
-            ),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
             ),
         ):
             manager, _service = _make_manager()
@@ -1593,10 +1550,6 @@ class TestReadinessReservedUploadsSubtree:
                 clear=True,
             ),
             patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[],
-            ),
-            patch(
                 "xagent.web.sandbox_manager.scoped_user_root",
                 side_effect=_fake_scoped_user_root,
             ),
@@ -1604,3 +1557,46 @@ class TestReadinessReservedUploadsSubtree:
             manager, _service = _make_manager()
             with pytest.raises(SandboxContractError):
                 await check_sandbox_static_readiness(manager)
+
+
+@pytest.mark.asyncio
+async def test_removing_legacy_source_mount_rebuilds_guest_and_preserves_workspace(
+    tmp_path,
+):
+    """A pre-fix Docker spec converges before any task gets its sandbox."""
+    from dataclasses import replace
+
+    with patch.dict("os.environ", {}, clear=True):
+        manager, service = _make_manager()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        document = workspace / "keep.txt"
+        document.write_text("user data")
+        intent = SandboxMountIntent(mount_root=str(workspace))
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        old = replace(
+            desired,
+            volumes=tuple(
+                sorted(
+                    (*desired.volumes, ("/legacy/backend/src", "/app/src", "ro")),
+                )
+            ),
+        )
+        template, config = old.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=old,
+            fingerprint_label=old.fingerprint(),
+            version_label=str(SPEC_CONTRACT_VERSION),
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1",
+            state="stopped",
+            template=template,
+            config=config,
+        )
+        await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+        assert service._containers["user::1"].spec == desired
+        assert document.read_text() == "user data"

@@ -82,7 +82,11 @@ from ..services.llm_utils import (
 )
 from ..services.model_service import _passes_model_visibility_hook
 from ..services.model_store import ModelSharingConflictError, ModelStore
-from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
+from ..tracking.standalone_usage import (
+    StandaloneUsageRefused,
+    run_in_usage_scope,
+    usage_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -999,6 +1003,7 @@ async def test_model_connection(
                     run_in_usage_scope,
                     int(user.id),
                     "model_probe",
+                    (),
                     embedding_model.encode,
                     "hello",
                 ),
@@ -1181,7 +1186,7 @@ async def test_model_connection(
 
             await asyncio.wait_for(
                 asyncio.to_thread(
-                    run_in_usage_scope, int(user.id), "model_probe", _probe_rerank
+                    run_in_usage_scope, int(user.id), "model_probe", (), _probe_rerank
                 ),
                 timeout=timeout_seconds,
             )
@@ -1249,6 +1254,7 @@ async def list_speech_voices(
         ) from None
     try:
         release_db_connection_if_clean(db)
+        await model.get_streaming_capabilities()
         if not model.supports_voice_listing:
             raise HTTPException(
                 status_code=400, detail="Voice listing is not supported"
@@ -1308,7 +1314,11 @@ async def transcribe_speech_input(
     try:
         # The provider records the transcription; this delivers it for the
         # requesting user, since no agent run is tracking it.
-        async with usage_scope(int(user.id), usage_source="speech_transcribe"):
+        async with usage_scope(
+            int(user.id),
+            usage_source="speech_transcribe",
+            model_ids=(str(db_model.model_id),),
+        ):
             result = await asyncio.wait_for(
                 asr_model.transcribe(
                     audio_bytes,
@@ -1317,6 +1327,8 @@ async def transcribe_speech_input(
                 ),
                 timeout=180.0,
             )
+    except StandaloneUsageRefused:
+        raise
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc
     except Exception as exc:

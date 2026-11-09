@@ -48,13 +48,17 @@ from xagent.core.agent.language import (
 from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.execution_scope import ExecutionScope, ExecutionScopeContext
+from xagent.core.model.chat.basic.xinference import XinferenceLLM
 from xagent.core.model.chat.exceptions import (
     LLMEmptyContentError,
     LLMTimeoutError,
     ModelProviderError,
     ModelProviderRetryableError,
 )
+from xagent.core.model.chat.routing_context import xinference_routing_key
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
+from xagent.core.user_context import current_user_id
 
 
 @pytest.fixture(autouse=True)
@@ -841,9 +845,11 @@ class CheckpointFailingPattern:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.routing_key: str | None = None
 
     async def run(self, **_: Any) -> dict[str, Any]:
         self.calls += 1
+        self.routing_key = xinference_routing_key.get()
         raise CheckpointPersistenceError("checkpoint writer unavailable")
 
 
@@ -882,6 +888,8 @@ async def test_runner_aborts_the_run_on_a_checkpoint_durability_failure(
 
     assert first.calls == 1
     assert second.calls == []
+    assert first.routing_key is not None
+    assert xinference_routing_key.get() is None
 
 
 @pytest.mark.asyncio
@@ -1563,6 +1571,92 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
     ]
     assert len(workspace_manager.thread_ids) == 1
     assert workspace_manager.thread_ids[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_xinference_routing_key_survives_checkpoint_resume(
+    tmp_path: Path,
+) -> None:
+    keys: list[str | None] = []
+    messages = [{"role": "user", "content": "Continue the task"}]
+
+    class ModelHandle:
+        async def chat(self, *, generate_config: dict[str, Any], **kwargs: Any) -> Any:
+            keys.append(generate_config.get("routing_key"))
+            if generate_config["stream"]:
+
+                async def chunks():
+                    yield {
+                        "choices": [
+                            {"delta": {"content": "ok"}, "finish_reason": "stop"}
+                        ]
+                    }
+
+                return chunks()
+            return {"content": "ok"}
+
+    class ModelPattern(FakePattern):
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            llm = kwargs["llm"]
+            await llm.chat(messages=messages)
+            async for _ in llm.stream_chat(messages=messages):
+                pass
+            return await super().run(**kwargs)
+
+    llm = XinferenceLLM()
+    llm._client = MagicMock()
+    llm._model_handle = ModelHandle()
+    llm._supports_session_affinity = True
+    runner = AgentRunner(
+        agent=Agent(name="writer", llm=llm, patterns=[ModelPattern({"success": True})]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    scope_a = ExecutionScope(workspace_segments=("workspace-a",))
+    scope_b = ExecutionScope(workspace_segments=("workspace-b",))
+
+    def recorded_key() -> str:
+        nonstream_key, stream_key = keys
+        keys.clear()
+        assert nonstream_key is not None and nonstream_key == stream_key
+        return nonstream_key
+
+    token = current_user_id.set(42)
+    try:
+        with ExecutionScopeContext(scope_a):
+            first = await runner.run(task="Initial task", execution_id="task-1")
+            assert first["success"]
+            first_key = recorded_key()
+            restored = await runner.run(
+                task=None,
+                checkpoint={"context": first["context"].to_dict()},
+                resume=True,
+            )
+            assert restored["success"] and recorded_key() == first_key
+            other = await runner.run(task="Another task", execution_id="task-2")
+            assert other["success"]
+            other_task_key = recorded_key()
+        with ExecutionScopeContext(scope_b):
+            other_scope = await runner.run(
+                task="Different scope", execution_id="task-1"
+            )
+            assert other_scope["success"]
+            other_scope_key = recorded_key()
+    finally:
+        current_user_id.reset(token)
+
+    token = current_user_id.set(43)
+    try:
+        with ExecutionScopeContext(scope_a):
+            other_owner = await runner.run(
+                task="Different owner", execution_id="task-1"
+            )
+            assert other_owner["success"]
+            other_owner_key = recorded_key()
+    finally:
+        current_user_id.reset(token)
+    await llm.chat(messages=messages)
+    assert len({first_key, other_task_key, other_scope_key, other_owner_key}) == 4
+    assert keys == [None]
 
 
 @pytest.mark.asyncio
@@ -3269,3 +3363,37 @@ def test_the_marker_is_stamped_before_any_client_metadata_is_merged(
     runner._apply_request_context = record  # type: ignore[method-assign]
     runner._merge_context_metadata(context, {"request_context": {"a": 1}})
     assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_runner_finishes_cache_when_pattern_exits_without_error_hook(
+    tmp_path: Path,
+) -> None:
+    from xagent.core.agent.runtime import ExecutionInterrupted
+
+    events = []
+    runtimes = []
+
+    async def notify(payload):
+        events.append(payload)
+
+    class InterruptedPattern:
+        async def run(self, **kwargs):
+            runtime = kwargs["runtime"]
+            runtimes.append(runtime)
+            await runtime.on_pattern_start(context=kwargs["context"], pattern=self)
+            runtime._cache_session.register(("runner-interrupt", "model"), notify)
+            raise ExecutionInterrupted("stopped without pattern error hook")
+
+    runner = AgentRunner(
+        agent=Agent(name="interrupted", patterns=[InterruptedPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    result = await runner.run(task="work", execution_id="cache-interrupted")
+    assert result["status"] == "interrupted"
+    runtime = runtimes[0]
+    if runtime._cache_session._publisher is not None:
+        await runtime._cache_session._publisher
+    assert not runtime.pattern_error_reported
+    assert runtime._cache_pattern_count == 0
+    assert [item["phase"] for item in events] == ["finished"]

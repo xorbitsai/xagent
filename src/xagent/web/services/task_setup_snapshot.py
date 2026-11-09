@@ -29,6 +29,7 @@ Out of scope:
 
 from __future__ import annotations
 
+import enum
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -53,6 +54,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _NotLoaded(enum.Enum):
+    """Type of the marker for a task column the constructor never filled in.
+
+    An enum member stays the same object through copying and pickling, so the
+    identity comparison callers rely on survives a copied ``_TaskFields``.
+    """
+
+    TASK_FIELD_NOT_LOADED = 0
+
+
+# Compared by identity only. A field holding this marker was not read from the
+# task row, which is different from a column that was read and is NULL.
+TASK_FIELD_NOT_LOADED = _NotLoaded.TASK_FIELD_NOT_LOADED
+
+
 @dataclass(frozen=True)
 class _TaskFields:
     """Primitive subset of the ``Task`` row needed past the snapshot."""
@@ -71,6 +87,14 @@ class _TaskFields:
     state_version: int = 0
     control_state: str | None = None
     conversation_storage_version: int = 1
+    # The defaults below are the not-loaded marker, never None: for
+    # ``channel_id`` None means "web chat task", which is the permissive
+    # reading, so a construction site that forgets to fill these in must fail
+    # closed instead of looking like a web chat task.
+    channel_id: int | None | _NotLoaded = TASK_FIELD_NOT_LOADED
+    channel_name: str | None | _NotLoaded = TASK_FIELD_NOT_LOADED
+    telegram_user_id: str | None | _NotLoaded = TASK_FIELD_NOT_LOADED
+    sdk_credential_kind: str | None | _NotLoaded = TASK_FIELD_NOT_LOADED
 
 
 @dataclass(frozen=True)
@@ -200,7 +224,16 @@ class TaskModelOverride:
     are built on the stand-in and refuse.) ``excluded_tool_categories``
     removes tool categories from this run's selection; it requires an
     explicit category list, since an unrestricted selection has no list to
-    remove from.
+    remove from. Exclusions match *exact category names* only: excluding the
+    plain ``mcp`` category does not remove ``mcp:<server>`` entries from the
+    selection, and such an entry still loads that server. A caller that wants
+    no MCP tools at all must therefore list every ``mcp:<server>`` it selects,
+    not just ``mcp``. The applied override remains on the snapshot
+    (``model_override``), where the tool build reads this set to decide
+    whether an actor-marked task may re-add ``mcp``.
+
+    ``excluded_model_ids`` removes the named media models and re-picks an excluded
+    kind's default; LLM, vision, embedding and rerank slots are untouched.
 
     Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
     applied to rebuilds a cached service for the task unless that service
@@ -213,6 +246,7 @@ class TaskModelOverride:
     llm: BaseLLM
     vision_llm: BaseLLM | None = None
     excluded_tool_categories: frozenset[str] = frozenset()
+    excluded_model_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if not isinstance(self.llm, BaseLLM):
@@ -231,6 +265,18 @@ class TaskModelOverride:
         if not all(isinstance(category, str) for category in normalized):
             raise TypeError("excluded_tool_categories must hold category names")
         object.__setattr__(self, "excluded_tool_categories", normalized)
+        model_ids: Any = self.excluded_model_ids
+        # Same reasoning as the categories above: a bare string would be read
+        # character by character instead of naming one model id.
+        if isinstance(model_ids, (str, bytes)):
+            raise TypeError(
+                "excluded_model_ids must be a collection of model ids, "
+                "not a single string"
+            )
+        normalized_model_ids = frozenset(model_ids)
+        if not all(isinstance(model_id, str) for model_id in normalized_model_ids):
+            raise TypeError("excluded_model_ids must hold model ids")
+        object.__setattr__(self, "excluded_model_ids", normalized_model_ids)
 
 
 def apply_task_model_override(
@@ -240,6 +286,16 @@ def apply_task_model_override(
 
     Raises :class:`TaskModelOverrideError` when categories are to be excluded
     from a selection that is not an explicit list.
+
+    The returned snapshot also carries ``override`` as ``model_override``: the
+    requested exclusion sets stay reachable there for the tool build, which
+    needs the intent (an old agent's list may never have listed ``mcp``, yet
+    this run still excludes it) to decide whether an actor-marked task may
+    re-add ``mcp``, and filters the media model dicts by the excluded model
+    ids. See :class:`TaskModelOverride` for the exact-name /
+    scoped-``mcp:<server>`` semantics. The vision-category removal is
+    deliberately not part of that set: it already has its own stand-in
+    mechanism.
     """
     from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
 
@@ -496,6 +552,24 @@ def load_task_setup_snapshot_sync(
             user_id=int(task_row.user_id),
             status=task_row.status,
             source=str(task_row.source) if task_row.source is not None else None,
+            channel_id=(
+                int(task_row.channel_id) if task_row.channel_id is not None else None
+            ),
+            channel_name=(
+                str(task_row.channel_name)
+                if task_row.channel_name is not None
+                else None
+            ),
+            telegram_user_id=(
+                str(task_row.telegram_user_id)
+                if task_row.telegram_user_id is not None
+                else None
+            ),
+            sdk_credential_kind=(
+                str(task_row.sdk_credential_kind)
+                if task_row.sdk_credential_kind is not None
+                else None
+            ),
             agent_id=int(task_row.agent_id) if task_row.agent_id is not None else None,
             agent_config=(
                 dict(task_row.agent_config)

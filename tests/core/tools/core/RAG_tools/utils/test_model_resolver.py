@@ -37,7 +37,7 @@ class _StubHub:
     def list(self) -> Dict[str, object]:
         return self._models
 
-    def load(self, model_id: str) -> object:
+    def load(self, model_id: str, **_kwargs: object) -> object:
         if model_id in self._models:
             return self._models[model_id]
 
@@ -57,7 +57,7 @@ class _FailingLoadHub:
     def __init__(self) -> None:
         self.close_calls = 0
 
-    def load(self, model_id: str) -> object:
+    def load(self, model_id: str, **_kwargs: object) -> object:
         raise SAOperationalError(
             "SELECT models",
             {},
@@ -74,7 +74,7 @@ class _BuggyLoadHub:
     def __init__(self) -> None:
         self.close_calls = 0
 
-    def load(self, model_id: str) -> object:
+    def load(self, model_id: str, **_kwargs: object) -> object:
         raise InvalidRequestError("invalid model hub row")
 
     def close(self) -> None:
@@ -87,7 +87,7 @@ class _UnsupportedCategoryHub:
     def __init__(self) -> None:
         self.close_calls = 0
 
-    def load(self, model_id: str) -> object:
+    def load(self, model_id: str, **_kwargs: object) -> object:
         raise UnsupportedModelCategoryError(model_id, "audio")
 
     def close(self) -> None:

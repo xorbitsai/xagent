@@ -2142,6 +2142,83 @@ def test_a_committing_rename_hook_carries_the_routes_own_field_writes_with_it(
 
 
 # ---------------------------------------------------------------------------
+# team_member_oauth_scope: one visibility-hook call, two sets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        pytest.param(None, ({"visible": set(), "open": set()}), id="no_hook"),
+        pytest.param(
+            {"mcp": {1, 2}, "custom_api": set()},
+            {"visible": {1, 2}, "open": set()},
+            id="key_missing",
+        ),
+        pytest.param(
+            {"mcp": {1, 2}, "custom_api": set(), "member_oauth_mcp": {2}},
+            {"visible": {1, 2}, "open": {2}},
+            id="key_subset",
+        ),
+        pytest.param(
+            {"mcp": {1}, "custom_api": set(), "member_oauth_mcp": {1, 3}},
+            ValueError,
+            id="key_not_subset",
+        ),
+        pytest.param(
+            {"mcp": {1}, "custom_api": set(), "member_oauth_mcp": [1]},
+            ValueError,
+            id="key_not_set",
+        ),
+        pytest.param(
+            {"mcp": {1, 2}, "custom_api": set(), "member_oauth_mcp": {True}},
+            ValueError,
+            id="bool_member",
+        ),
+        pytest.param({"custom_api": set()}, ValueError, id="mcp_missing"),
+    ],
+)
+def test_team_member_oauth_scope_answer_shapes(answer, expected):
+    calls: list[int] = []
+    if answer is not None:
+
+        def hook(_db, user_id):
+            calls.append(user_id)
+            return answer
+
+        connector_team_scope.set_connector_team_hooks(visibility=hook)
+
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            connector_team_scope.team_member_oauth_scope(object(), 7)
+        assert calls == [7]
+        return
+    scope = connector_team_scope.team_member_oauth_scope(object(), 7)
+    assert scope.visible_mcp_ids == frozenset(expected["visible"])
+    assert scope.member_oauth_mcp_ids == frozenset(expected["open"])
+    assert calls == ([7] if answer is not None else [])
+
+
+def test_member_oauth_scope_boundary_check_refuses_transaction_ending_hook(
+    db_session,
+):
+    def hook(db, _user_id):
+        db.commit()
+        return {"mcp": {1}, "custom_api": set(), "member_oauth_mcp": {1}}
+
+    connector_team_scope.set_connector_team_hooks(visibility=hook)
+    _open_transaction(db_session)
+    with pytest.raises(ConnectorHookSessionBoundaryError):
+        connector_team_scope.team_member_oauth_scope(
+            db_session, 7, caller_holds_lock=True
+        )
+    # Without the declaration the same hook is not checked.
+    _open_transaction(db_session)
+    scope = connector_team_scope.team_member_oauth_scope(db_session, 7)
+    assert scope.member_oauth_mcp_ids == frozenset({1})
+
+
+# ---------------------------------------------------------------------------
 # T-15: the call site table in the module docstring and the actual call
 # sites in the two route modules must agree, in both directions.
 # ---------------------------------------------------------------------------
@@ -2151,6 +2228,7 @@ _HOOK_ENTRY_POINTS = {
     "rename_team_connector",
     "resolve_one_connector_access_or_raise",
     "resolve_connector_access_or_raise",
+    "team_member_oauth_scope",
 }
 
 

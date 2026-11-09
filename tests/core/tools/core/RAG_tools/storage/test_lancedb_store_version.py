@@ -183,6 +183,45 @@ class TestListVersionCandidateRowsStore:
         assert row["stats"]["upsert_count"] == 1
         assert row["stats"]["vector_dim"] == 3
 
+    def test_embed_candidate_rows_come_from_the_twice_tagged_table(
+        self, isolated_store
+    ):
+        """Rows the ingest path writes under the twice-tagged table are candidates."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import ChunkEmbeddingData
+        from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
+            write_vectors_to_db,
+        )
+
+        store = isolated_store
+        model_id = "platform/text-embedding-v4"
+        parse_hash = "eeff1234abcd5678"
+        write_vectors_to_db(
+            collection="coll",
+            embeddings=[
+                ChunkEmbeddingData(
+                    doc_id="doc",
+                    chunk_id="chunk1",
+                    parse_hash=parse_hash,
+                    model=model_id,
+                    vector=[0.1, 0.2, 0.3],
+                    text="prefixed",
+                    chunk_hash="h-chunk1",
+                )
+            ],
+            create_index=False,
+            user_id=None,
+        )
+        assert "embeddings_platform_text_embedding_v4" in store.list_table_names()
+
+        rows = store.list_version_candidate_rows(
+            "coll", "doc", "embed", model_tag=model_id
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["technical_id"] == parse_hash
+        assert rows[0]["stats"]["upsert_count"] == 1
+        assert rows[0]["stats"]["vector_dim"] == 3
+
     def test_model_tag_required_for_embed(self, isolated_store):
         """Calling with step_type='embed' and no model_tag raises VersionManagementError."""
         from xagent.core.tools.core.RAG_tools.core.exceptions import (

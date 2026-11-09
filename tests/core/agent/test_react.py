@@ -14522,6 +14522,72 @@ def _react_mcp_tool_adapter(tool_name: str):
     )
 
 
+@pytest.mark.asyncio
+async def test_react_mixed_basic_helpers_do_not_request_a_repeat_decision() -> None:
+    from xagent.core.tools.adapters.vibe.current_time_tool import (
+        CurrentTimeTool,
+        ValidateLocalTimeTool,
+    )
+
+    tools = [CurrentTimeTool(), ValidateLocalTimeTool()]
+    calls = [
+        ("get_current_time", {"timezone": "Asia/Singapore"}),
+        (
+            "validate_local_time",
+            {"local_time": "2026-11-07 09:00:00", "timezone": "Asia/Singapore"},
+        ),
+        ("get_current_time", {"timezone": "Asia/Shanghai"}),
+        (
+            "validate_local_time",
+            {"local_time": "2026-11-07 10:00:00", "timezone": "Asia/Shanghai"},
+        ),
+    ]
+    llm = FakeLLM(
+        [
+            *[
+                _tool_call_response(f"helper_{index}", name, json.dumps(args))
+                for index, (name, args) in enumerate(calls)
+            ],
+            final_answer_response("The time checks are complete."),
+        ]
+    )
+    pattern = ReActPattern(max_iterations=8)
+    context = ExecutionContext()
+    context.add_user_message("Check the current and specified times in both cities.")
+
+    result = await pattern.run(context=context, tools=tools, llm=llm)
+
+    assert result["success"] is True
+    assert len(llm.calls) == 5
+    assert all(_schema_names(call) != ["react_decision"] for call in llm.calls)
+    helper_records = [
+        record
+        for record in pattern.tool_ledger.values()
+        if record.tool_name in {tool.name for tool in tools}
+    ]
+    assert [record.tool_name for record in helper_records] == [
+        name for name, _ in calls
+    ]
+    assert all(tool_result_succeeded(record.result) for record in helper_records)
+
+
+def test_react_repeated_basic_helper_still_requests_a_repeat_decision() -> None:
+    from xagent.core.tools.adapters.vibe.current_time_tool import CurrentTimeTool
+
+    pattern = ReActPattern()
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        [CurrentTimeTool()]
+    )
+    _record_completed_calls(pattern, [("get_current_time", {}) for _ in range(4)])
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "get_current_time"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "same_tool_successes"
+    assert metadata["tool_name"] == "get_current_time"
+    assert metadata["consecutive_tool_calls"] == 4
+
+
 def test_react_repeated_guard_counts_each_decision_group_separately() -> None:
     pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
     tools = [

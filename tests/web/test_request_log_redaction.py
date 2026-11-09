@@ -79,6 +79,18 @@ def restore_logging_state() -> Iterator[None]:
             f"/cb?code={SECRET}&state={SECRET}&access_token={SECRET}",
             f"/cb?code={REDACTED}&state={REDACTED}&access_token={REDACTED}",
         ),
+        # Composio's verification trip and its denial redirect (#3532).
+        (
+            "/api/auth/meta/callback?session_uri=https%3A%2F%2Fbackend.composio.dev"
+            "%2Fverify%2Fsess_1",
+            f"/api/auth/meta/callback?session_uri={REDACTED}",
+        ),
+        (
+            "/api/auth/meta/callback?status=failed&error=access_denied"
+            "&connected_account_id=ca_1",
+            "/api/auth/meta/callback?status=failed&error=access_denied"
+            f"&connected_account_id={REDACTED}",
+        ),
         (
             f"https://host.example/a?api_key={SECRET}&page=2",
             f"https://host.example/a?api_key={REDACTED}&page=2",
@@ -107,6 +119,31 @@ def test_access_log_record_args_are_redacted():
     assert RequestTargetRedactionFilter().filter(record) is True
     assert SECRET not in record.getMessage()
     assert f"?token={REDACTED}" in record.getMessage()
+
+
+def test_access_log_record_redacts_an_encoded_composio_session_uri():
+    # The verifier URI arrives percent-encoded in the callback's query.
+    session_uri = "https%3A%2F%2Fbackend.composio.dev%2Fverify%2Fsess_SECRET"
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        (
+            "127.0.0.1:1",
+            "GET",
+            f"/api/auth/meta/callback?session_uri={session_uri}",
+            "1.1",
+            200,
+        ),
+        None,
+    )
+    assert RequestTargetRedactionFilter().filter(record) is True
+    message = record.getMessage()
+    assert "sess_SECRET" not in message
+    assert "backend.composio.dev" not in message
+    assert f"?session_uri={REDACTED}" in message
 
 
 @pytest.mark.usefixtures("restore_logging_state")

@@ -261,9 +261,7 @@ def test_hubspot_is_listed_as_unverifiable_and_sent_nothing(monkeypatch):
 
     sent = _vendor(monkeypatch, 400, {"error": "invalid_client"})
 
-    result = asyncio.run(
-        verification.verify_mcp_client(get_builtin_public_mcp_app("hubspot"))
-    )
+    result = verification.verify_mcp_client(get_builtin_public_mcp_app("hubspot"))
 
     assert (result.kind, result.name, result.verdict) == (
         "mcp-client",
@@ -277,12 +275,7 @@ def test_hubspot_is_listed_as_unverifiable_and_sent_nothing(monkeypatch):
 def test_a_connector_without_a_preregistered_client_is_not_listed():
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
-    assert (
-        asyncio.run(
-            verification.verify_mcp_client(get_builtin_public_mcp_app("notion"))
-        )
-        is None
-    )
+    assert verification.verify_mcp_client(get_builtin_public_mcp_app("notion")) is None
 
 
 def _run_main(
@@ -378,3 +371,140 @@ def test_an_unknown_exclusion_is_a_usage_error(monkeypatch):
         verification.main(["--exclude", "not-a-provider"], out=io.StringIO())
 
     assert exited.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("provider", "status", "payload"),
+    [
+        # Intercom: only the measured "Client not found" answer rejects.
+        (
+            "intercom",
+            400,
+            {
+                "type": "error.list",
+                "errors": [
+                    {
+                        "code": "parameter_invalid",
+                        "message": "Grant type not allowed for this client",
+                    }
+                ],
+            },
+        ),
+        # Meta's code 1 is also its generic unknown error.
+        (
+            "meta",
+            400,
+            {
+                "error": {
+                    "type": "OAuthException",
+                    "code": 1,
+                    "message": "An unknown error occurred",
+                }
+            },
+        ),
+    ],
+)
+def test_an_answer_merely_mentioning_the_client_is_not_a_rejection(
+    provider, status, payload
+):
+    assert _verdict(provider, status, payload) == "inconclusive"
+
+
+def test_meta_code_1_about_the_client_secret_is_a_rejection():
+    payload = {
+        "error": {
+            "type": "OAuthException",
+            "code": 1,
+            "message": "Error validating client secret.",
+        }
+    }
+
+    assert _verdict("meta", 400, payload) == "client_rejected"
+
+
+def test_a_failure_before_the_request_is_sent_is_that_credentials_result(monkeypatch):
+    def refuse_proxy():
+        raise ValueError("proxy must be trusted")
+
+    monkeypatch.setattr(tool_config, "_oauth_refresh_http_client", refuse_proxy)
+
+    result = asyncio.run(verification.verify_builtin_provider("xero", _row("xero")))
+
+    assert result.verdict == "inconclusive"
+    assert "no answer (ValueError)" in result.detail
+
+
+def test_a_provider_name_is_matched_case_insensitively(monkeypatch):
+    _vendor(monkeypatch, 400, {"error": "invalid_client"})
+    row = _row("zoom")
+    row.provider_name = "Zoom"
+
+    result = asyncio.run(verification.verify_builtin_provider("Zoom", row))
+
+    assert result.verdict == "client_rejected"
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (502, b"<html>bad gateway</html>"),
+        (400, b"not json"),
+        (200, b'{"access_token": "x"}'),
+    ],
+)
+def test_an_answer_without_a_rejection_or_an_invalid_token_is_inconclusive(
+    monkeypatch, status, body
+):
+    monkeypatch.setattr(
+        tool_config,
+        "_oauth_refresh_http_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status, content=body)
+            )
+        ),
+    )
+
+    result = asyncio.run(verification.verify_builtin_provider("linear", _row("linear")))
+
+    assert result.verdict == "inconclusive"
+
+
+def test_a_database_only_provider_has_no_rule(monkeypatch):
+    sent = _vendor(monkeypatch, 400, {"error": "invalid_client"})
+    row = SimpleNamespace(**{**vars(_row("xero")), "provider_name": "acme"})
+
+    result = asyncio.run(verification.verify_builtin_provider("acme", row))
+
+    assert (result.verdict, result.detail) == ("unverifiable", "no verification rule")
+    assert sent == []
+
+
+def test_an_excluded_provider_is_not_checked(monkeypatch):
+    _run_main(
+        monkeypatch,
+        {
+            "xero": (400, {"error": "invalid_client"}),
+            "linear": (400, {"error": "invalid_grant"}),
+        },
+    )
+    out = io.StringIO()
+
+    code = verification.main(["--exclude", "xero"], out=out)
+
+    assert code == 0
+    assert "oauth-client:xero" not in out.getvalue()
+    assert "CLIENT_OK oauth-client:linear:" in out.getvalue()
+
+
+def test_none_is_not_a_name_to_exclude(monkeypatch):
+    _run_main(monkeypatch, {"xero": (400, {"error": "invalid_grant"})})
+    monkeypatch.setattr(
+        "xagent.web.builtin_mcp_registry.get_builtin_public_mcp_app_rows",
+        lambda: [
+            {"app_id": "notion", "launch_config": {"auth": {"type": "mcp_oauth"}}}
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        verification.main(["--exclude", "None"], out=io.StringIO())

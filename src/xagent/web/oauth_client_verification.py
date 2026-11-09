@@ -43,7 +43,6 @@ Verdict = Literal["client_ok", "client_rejected", "inconclusive", "unverifiable"
 
 # Sent where the refresh sends the user's token. Never a real token.
 INVALID_TOKEN = "xagent-client-verification-invalid-token"
-_REQUEST_TIMEOUT_SECONDS = 10.0
 _CODE_PATTERN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 
 
@@ -79,11 +78,30 @@ def _by_code(*, rejected: Iterable[str], ok: Iterable[str]) -> Rule:
 
 
 def _intercom(answer: VendorAnswer) -> Verdict:
-    # A made-up client gets 404 {"errors": [{"code": "not_found",
-    # "message": "Client not found"}]} (measured 2026-11-09). How it answers
-    # a known client with an invalid token is not known yet.
-    if answer.status < 500 and "client" in answer.description:
+    # Only the answer measured for a made-up client on 2026-11-09:
+    # 404 {"errors": [{"code": "not_found", "message": "Client not found"}]}.
+    # How it answers a known client with an invalid token is not known yet.
+    if (
+        answer.status == 404
+        and answer.error == "not_found"
+        and "client not found" in answer.description
+    ):
         return "client_rejected"
+    return "inconclusive"
+
+
+def _meta(answer: VendorAnswer) -> Verdict:
+    # OAuthException 101 "Invalid Client ID"; 1 is "Error validating client
+    # secret" but also Meta's generic "An unknown error occurred", so it needs
+    # the message too. 190 is an invalid access token.
+    if answer.status >= 500:
+        return "inconclusive"
+    if answer.error == "meta:101" or (
+        answer.error == "meta:1" and "client secret" in answer.description
+    ):
+        return "client_rejected"
+    if answer.error == "meta:190":
+        return "client_ok"
     return "inconclusive"
 
 
@@ -96,9 +114,7 @@ RULES: dict[str, Rule] = {
     "google": _by_code(
         rejected={"invalid_client", "unauthorized_client"}, ok={"invalid_grant"}
     ),
-    # OAuthException 101 "Invalid Client ID", 1 "Error validating client
-    # secret"; 190 is an invalid access token.
-    "meta": _by_code(rejected={"meta:101", "meta:1"}, ok={"meta:190"}),
+    "meta": _meta,
     "zoom": _STANDARD,
     "salesforce": _by_code(
         rejected={"invalid_client_id", "invalid_client"}, ok={"invalid_grant"}
@@ -184,9 +200,10 @@ def _answer_detail(answer: VendorAnswer) -> str:
 async def _ask_vendor(send: Callable[[], Any]) -> VendorAnswer | str:
     """One request; a string is why there is no answer.
 
-    Any failure to get an answer (a timeout, a refused egress policy) is
-    reported for this credential only, so one unreachable vendor never hides
-    the other results.
+    ``send`` resolves the credential, builds the request, creates the client
+    and sends it. Any failure on the way (a timeout, a refused egress policy,
+    a proxy setting the client refuses) is reported for this credential only,
+    so one failing credential never hides the other results.
     """
     try:
         response = await send()
@@ -205,11 +222,13 @@ async def verify_builtin_provider(provider: str, row: Any | None) -> Verificatio
 
     readiness = check_provider(provider, row)
     sources = f"client_id={readiness.client_id} client_secret={readiness.client_secret}"
-    if provider in UNVERIFIABLE:
+    # Rules are keyed like the refresh's own provider checks: lowercased.
+    name = provider.lower()
+    if name in UNVERIFIABLE:
         return VerificationResult(
-            "oauth-client", provider, "unverifiable", UNVERIFIABLE[provider]
+            "oauth-client", provider, "unverifiable", UNVERIFIABLE[name]
         )
-    rule = RULES.get(provider)
+    rule = RULES.get(name)
     if rule is None:
         return VerificationResult(
             "oauth-client", provider, "unverifiable", "no verification rule"
@@ -229,19 +248,22 @@ async def verify_builtin_provider(provider: str, row: Any | None) -> Verificatio
         send_oauth_refresh_request,
     )
 
-    client_id, client_secret = _resolve_oauth_client_per_field(provider, row)
-    request = await build_oauth_refresh_request(
-        provider,
-        row,
-        client_id=client_id,
-        client_secret=client_secret,
-        access_token=INVALID_TOKEN,
-        refresh_token=INVALID_TOKEN,
-        instance_url=None,
-        user_id="client-verification",
-    )
-    async with _oauth_refresh_http_client() as client:
-        answer = await _ask_vendor(lambda: send_oauth_refresh_request(client, request))
+    async def ask() -> Any:
+        client_id, client_secret = _resolve_oauth_client_per_field(provider, row)
+        request = await build_oauth_refresh_request(
+            provider,
+            row,
+            client_id=client_id,
+            client_secret=client_secret,
+            access_token=INVALID_TOKEN,
+            refresh_token=INVALID_TOKEN,
+            instance_url=None,
+            user_id="client-verification",
+        )
+        async with _oauth_refresh_http_client() as client:
+            return await send_oauth_refresh_request(client, request)
+
+    answer = await _ask_vendor(ask)
     if isinstance(answer, str):
         return VerificationResult(
             "oauth-client", provider, "inconclusive", f"{sources}; {answer}"
@@ -251,15 +273,23 @@ async def verify_builtin_provider(provider: str, row: Any | None) -> Verificatio
     )
 
 
-async def verify_mcp_client(app: Mapping[str, Any]) -> VerificationResult | None:
+def _mcp_credential_provider(app: Mapping[str, Any]) -> str | None:
+    """The credential provider of an ``mcp_oauth`` catalog app, if it has one."""
+    auth = (app.get("launch_config") or {}).get("auth") or {}
+    credential_provider = auth.get("credential_provider")
+    if auth.get("type") != "mcp_oauth" or not isinstance(credential_provider, str):
+        return None
+    return credential_provider
+
+
+def verify_mcp_client(app: Mapping[str, Any]) -> VerificationResult | None:
     """One catalog MCP connector's pre-registered client, if it has one.
 
     No pre-registered client can be checked with an invalid token today, so
     each one is reported with the reason and nothing is sent.
     """
-    auth = (app.get("launch_config") or {}).get("auth") or {}
-    credential_provider = auth.get("credential_provider")
-    if auth.get("type") != "mcp_oauth" or not isinstance(credential_provider, str):
+    credential_provider = _mcp_credential_provider(app)
+    if credential_provider is None:
         return None
     reason = MCP_UNVERIFIABLE.get(credential_provider, "no verification rule")
     return VerificationResult("mcp-client", credential_provider, "unverifiable", reason)
@@ -278,14 +308,9 @@ async def verify_all(
 ) -> list[VerificationResult]:
     rows_by_provider = {str(row.provider_name): row for row in rows}
     providers = list(dict.fromkeys([*builtin_providers, *sorted(rows_by_provider)]))
-    mcp_list = [app for app in mcp_apps]
+    mcp_list = list(mcp_apps)
     known = set(providers) | {
-        str(
-            ((app.get("launch_config") or {}).get("auth") or {}).get(
-                "credential_provider"
-            )
-        )
-        for app in mcp_list
+        name for app in mcp_list if (name := _mcp_credential_provider(app))
     }
     unknown = sorted(exclude - known)
     if unknown:
@@ -296,7 +321,7 @@ async def verify_all(
         if provider not in exclude
     ]
     for app in mcp_list:
-        result = await verify_mcp_client(app)
+        result = verify_mcp_client(app)
         if result is not None and result.name not in exclude:
             results.append(result)
     return results

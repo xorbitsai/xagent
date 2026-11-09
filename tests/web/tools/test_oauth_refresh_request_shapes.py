@@ -374,3 +374,51 @@ def test_refresh_sends_the_pinned_request(db, monkeypatch, provider):
         _shape(_captured_refresh(db, monkeypatch, provider))
         == EXPECTED_SHAPES[provider]
     )
+
+
+@pytest.mark.parametrize("provider", sorted(EXPECTED_SHAPES))
+def test_refresh_sends_with_a_ten_second_timeout(db, monkeypatch, provider):
+    request = _captured_refresh(db, monkeypatch, provider)
+
+    assert request.extensions["timeout"] == {
+        "connect": 10.0,
+        "read": 10.0,
+        "write": 10.0,
+        "pool": 10.0,
+    }
+
+
+def test_an_account_host_refresh_does_not_follow_a_redirect(db, monkeypatch):
+    """A redirect would skip the account host's private-network check."""
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(302, headers={"Location": "http://169.254.169.254/"})
+
+    monkeypatch.setattr(
+        tool_config,
+        "_oauth_refresh_http_client",
+        lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=True
+        ),
+    )
+    user = db.query(User).one()
+    grant = UserOAuth(
+        user_id=user.id,
+        provider="zendesk",
+        access_token=ACCESS_TOKEN,
+        refresh_token=REFRESH_TOKEN,
+        instance_url=INSTANCE_URLS["zendesk"],
+        provider_user_id="1",
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    db.add(grant)
+    db.commit()
+
+    refreshed = asyncio.run(
+        tool_config.refresh_oauth_token_if_needed(db, grant, "zendesk")
+    )
+
+    assert refreshed is False
+    assert len(sent) == 1

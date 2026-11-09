@@ -35,7 +35,7 @@ ConnectorChecks(
 
 - **Check id.** Every check has a declared id, `<app_id>.<snake_case_name>`, at most 80 characters and unique within the connector. The result and the result diff key on it, so an id is never derived from a position and never reused for a different check.
 - **Read check.** One tool, its arguments and assertions on the result. `require_read_only_hint=True` skips the check unless the server advertises the tool with `readOnlyHint: true`, for servers whose tools are vendor-owned (#3566).
-- **Unprobeable check.** A slot that cannot run, with an L3 reason (`covered_by_l2`, `sandboxed`, `execution_scoped`, `needs_fixture`). Its row is always `unprobeable`.
+- **Unprobeable check.** A slot that cannot run, with an L3 reason (`covered_by_l2`, `sandboxed`, `execution_scoped`, `needs_fixture`, `write_only`). Its row is always `unprobeable`.
 - **Write check.** `create`, `verify` and `cleanup` steps, an optional `cleanup_guard`, a `tenant_pin` and `expected_verdicts`; see [Write checks and the sweep](#write-checks-and-the-sweep). A write check runs only for a connector whose app id is listed in `XAGENT_CONNECTOR_SMOKE_WRITE_APPS` (see [Running write checks](#running-write-checks)); otherwise it reports `skip` with `writes_disabled`.
 - **Exemption.** A tool that has no check carries an exemption and a reason, keyed by its wire name. A tool cannot be both checked and exempted.
 
@@ -291,7 +291,7 @@ The `user` adapter (`user_identity.py`):
 ```json
 {
   "schema": "xagent.connector_smoke.result",
-  "schema_version": 1,
+  "schema_version": 2,
   "declaration_format_version": 1,
   "identity": "toby",
   "environment": "production-au",
@@ -352,4 +352,4 @@ The `user` adapter (`user_identity.py`):
 
 - `DECLARATION_FORMAT_VERSION` (`declarations.py`) changes when a declared check or a consumer of declarations must adapt. Version 2 added `CreatedRef`, `ItemRef`, the cleanup guard, the sweep and the rules on write areas, fixture keys in cleanup, read steps, run-scoped suffixes and `@` in arguments (#3564). It also refuses a path that is not a tuple: version 1 took a list, or a string as a path of one-letter keys.
 - `RESULT_SCHEMA_VERSION` (`results.py`) and the schema's `schema_version` const change together when a consumer of results must adapt: a field removed or renamed, a class removed, a meaning changed. A test pins the schema's enums to the Python enums.
-- A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change.
+- A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change. Version 2 added the unprobeable reason `write_only` (#3655).

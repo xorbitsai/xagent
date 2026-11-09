@@ -32,6 +32,7 @@ UnprobeableReason = Literal[
     "sandboxed",
     "execution_scoped",
     "needs_fixture",
+    "write_only",
 ]
 
 # Why a connector declares no probe:
@@ -44,6 +45,8 @@ UnprobeableReason = Literal[
 # - execution_scoped: needs a task's execution identity (chrome-devtools).
 # - needs_fixture: every read-only tool takes a vendor object id (a document,
 #   a spreadsheet, a file path) the monitor account would have to own.
+# - write_only: the connector has no read-only tool at all (jira-ticket only
+#   creates tickets), so any probe call would write vendor data.
 UNPROBEABLE_REASONS: frozenset[str] = frozenset(get_args(UnprobeableReason))
 
 
@@ -126,6 +129,7 @@ UNPROBEABLE_CONNECTORS: Mapping[str, UnprobeableReason] = {
     "fireflies": "covered_by_l2",
     "rocketlane": "covered_by_l2",
     "google-maps": "sandboxed",
+    "jira-ticket": "write_only",
     "chrome-devtools": "execution_scoped",
     "google-docs": "needs_fixture",
     "google-sheets": "needs_fixture",

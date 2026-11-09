@@ -288,6 +288,7 @@ probe is reported as `SKIP` and is not a check:
 | `unprobeable (sandboxed)` | `google-maps` | An `npx` connector; the call would run on the backend host after the listing released its sandbox. |
 | `unprobeable (execution_scoped)` | `chrome-devtools` | It can only run inside a task. |
 | `unprobeable (needs_fixture)` | Google Docs, Sheets, Slides; Word, Excel, PowerPoint | Every read-only tool needs a document the monitor account would have to own. |
+| `unprobeable (write_only)` | `jira-ticket` | It has no read-only tool at all, so any probe call would write vendor data. |
 | `no probe declared` | A custom catalog app | Only builtin apps declare probes. The route must name the app itself; see `not the catalog's row` below. |
 
 A run that probes nothing, because every connected app was skipped or none is

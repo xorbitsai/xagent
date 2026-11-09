@@ -119,6 +119,17 @@ async def _wait_for_status(task_id: int, status: str) -> None:
     raise AssertionError(_commands(task_id))
 
 
+async def _wait_for_call(mock: Mock) -> None:
+    # The handoff commits the command as completed on a database thread and
+    # only then, back on the loop, hands the run to the scheduler. A reader
+    # that saw "completed" may therefore run just before the scheduler call.
+    for _ in range(100):
+        if mock.called:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("the committed run was never scheduled")
+
+
 @pytest.mark.asyncio
 async def test_combined_execute_task_is_staged_and_run_by_the_dispatcher(
     task_and_user, hold, frames, schedule
@@ -127,6 +138,7 @@ async def test_combined_execute_task_is_staged_and_run_by_the_dispatcher(
     websocket = MagicMock(name="origin")
     await websocket_api.handle_execute_task(websocket, task_id, {"user": user})
     await _wait_for_status(task_id, "completed")
+    await _wait_for_call(schedule)
 
     assert _commands(task_id) == [("start", "completed", "existing")]
     schedule.assert_called_once()

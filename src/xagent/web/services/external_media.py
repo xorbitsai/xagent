@@ -144,10 +144,10 @@ def _image_media_type(record: Any) -> str:
 def delivered_image_media_type(content: bytes, registered_type: str) -> str:
     """The type of the image bytes being delivered, read from their signature.
 
-    Issuance accepts PNG or JPEG bytes whatever the file's extension, and
+    Issuance accepts PNG or JPEG bytes under any of .png, .jpg or .jpeg, and
     image_tool saves every edited image as .png, so the extension can name the
-    wrong type; delivery sends nosniff, so the declared type is final. Bytes
-    with neither signature keep the registered type.
+    wrong one of the two; delivery sends nosniff, so the declared type is
+    final. Bytes with neither signature keep the registered type.
     """
     if content.startswith(_PNG_SIGNATURE):
         return "image/png"

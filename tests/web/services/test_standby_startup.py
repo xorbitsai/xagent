@@ -20,10 +20,8 @@ import pytest
 import sqlalchemy as sa
 
 from tests.integration.test_auto_migration_startup import (  # noqa: F401
-    unregister_startup_task_extensions,
-)
-from tests.integration.test_auto_migration_startup import (
     _patch_channel_modules_disabled,
+    unregister_startup_task_extensions,
 )
 from xagent.config import STANDBY as STANDBY_ENV
 from xagent.web.models import database as database_module

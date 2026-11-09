@@ -11,10 +11,10 @@ Pass an instance as ``http=`` to ``googleapiclient.discovery.build`` and pass
 googleapiclient's bundled copy and is never fetched through the proxy.
 
 A batch request is one ``multipart/mixed`` body, which the proxy does not
-carry. ``execute_batch`` sends the batch's requests one at a time instead,
-with bounded concurrency, a cap on the requests one batch may hold, and an
-overall deadline, and hands the results to the batch's own callbacks in the
-order the requests were added.
+carry. ``execute_batch`` sends the batch's requests individually instead, with
+bounded concurrency, a cap on the requests one batch may hold, and an overall
+deadline, and hands the results to the batch's own callbacks in the order the
+requests were added.
 
 A binary answer (``ProxyResponse.binary_data``) is not in ``data``: Composio
 stores the file and returns a signed URL. The transport downloads that URL and
@@ -43,8 +43,9 @@ from .composio_proxy import (
 )
 
 # How many batch requests may be in flight at once. A Gmail message search
-# asks for 10 messages by default, so 8 keeps the common case to two waves
-# without opening a connection per request when a caller asks for many more.
+# asks for 10 messages by default, so 8 keeps the common case to two waves and
+# caps how many sessions are open at once when a caller asks for many more;
+# each proxied call opens its own session.
 DEFAULT_BATCH_CONCURRENCY = 8
 # The whole batch must finish inside this budget. It matches the per-call
 # proxy timeout: without it a batch of N requests against an unresponsive
@@ -279,7 +280,7 @@ class GoogleApiProxyHttp:
         """httplib2 closes its connection pool here; this transport has none."""
 
 
-def check_request(request: Any) -> None:
+def precheck_body_size(request: Any) -> None:
     """Refuse one googleapiclient request the proxy would reject for its body
     size, before it is sent.
 
@@ -373,10 +374,10 @@ def execute_batch(
             f"{MAX_BATCH_REQUESTS} request limit for one proxied batch; "
             "ask for fewer at a time"
         )
-    requests = batch._requests
+    batch_requests = batch._requests
 
     def run(request_id: str) -> tuple[Any, bytes] | BaseException:
-        request = requests[request_id]
+        request = batch_requests[request_id]
         http = request.http
         if http is None:
             return ValueError("Missing a valid http object.")
@@ -419,7 +420,7 @@ def execute_batch(
         executor.shutdown(wait=False, cancel_futures=True)
 
     for request_id in order:
-        request = requests[request_id]
+        request = batch_requests[request_id]
         outcome = outcomes[request_id]
         response: Any = None
         exception: BaseException | None = None

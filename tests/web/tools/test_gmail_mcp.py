@@ -805,7 +805,7 @@ def test_a_native_send_does_not_run_the_proxy_pre_send_check(monkeypatch):
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: service)
     monkeypatch.setattr(
         gmail.google_api_proxy,
-        "check_request",
+        "precheck_body_size",
         lambda request: checked.append(request),
     )
 

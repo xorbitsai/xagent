@@ -445,7 +445,7 @@ def _send_through_proxy(
     # Every request is checked against the proxy's body limit before the
     # first one is sent.
     for request, _attached_summary in requests_per_message:
-        google_api_proxy.check_request(request)
+        google_api_proxy.precheck_body_size(request)
 
     results: list[dict[str, Any]] = []
     try:

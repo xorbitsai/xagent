@@ -748,16 +748,102 @@ def test_an_error_that_echoes_the_decoded_message_hides_its_content(proxy):
     assert "DECODED-BODY-MARKER" not in text
 
 
+def test_a_decoded_fragment_across_the_cut_is_redacted_whole(proxy):
+    """A decoded body line can cross the cut. Cutting the text before the
+    per-line pass used to keep the line's visible prefix."""
+    line = "BODY-MARKER-" + "x" * 1188
+    raw = base64.urlsafe_b64encode(b"Subject: x\r\n\r\n" + line.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": f"invalid body {line}"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert line[:80] not in text
+    assert "x" * 100 not in text
+
+
+def test_a_decoded_fragment_that_contains_a_token_is_redacted_whole(proxy):
+    """Redacting the token first rewrites the fragment, so the decoded line
+    used to survive with only the token masked. The line must be gone in the
+    form redaction leaves it too."""
+    line = "please read the Bearer sk-secret-token-value section in this mail"
+    raw = base64.urlsafe_b64encode(b"Subject: x\r\n\r\n" + line.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": f"invalid body {line}"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "please read the" not in text
+    assert "section in this mail" not in text
+    assert "[redacted]" in text
+
+
+def test_a_short_decoded_fragment_near_the_cut_leaves_one_marker(proxy):
+    """Cutting the text once in the body pass and again in the error made the
+    tail read ``...[truncated...[truncated]`` when a short fragment near the
+    cut shortened the kept text."""
+    prefix = "Composio proxy request failed with HTTP 400: "
+    fragment = "DECODED-FRAGMENT-1234"
+    message = prefix + "z" * (979 - len(prefix)) + fragment + "y" * 500
+    raw = base64.urlsafe_b64encode(
+        b"Subject: x\r\n\r\n" + f"{fragment}\r\n{'p' * 100}".encode()
+    ).decode()
+    proxy.response = _Response(400, {"error": {"message": message[len(prefix) :]}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert fragment not in text
+    assert text.endswith("...[truncated]")
+    assert text.count("truncat") == 1
+
+
 def test_a_large_decoded_body_is_redacted_from_a_truncated_error_text(proxy):
-    """The error text is cut to ``MAX_ERROR_TEXT_CHARS`` before the per-line
-    pass. A 4.5 MB message decodes to tens of thousands of lines, and each
-    one used to run a ``replace`` over the whole untruncated text."""
+    """Only the part of the decoded content that can reach the kept text is
+    scanned. A 4.5 MB message decodes to tens of thousands of lines, and each
+    one used to run a ``replace`` over the whole untruncated text. The lines
+    that do show must still be gone, including one across the cut and one
+    whose token redaction rewrote."""
+    cross_cut = "CROSS-CUT-MARKER-" + "x" * 1188
+    token_line = "please read the Bearer sk-secret-token-value section in this mail"
     lines = [f"attachment-line-{number:05d}-{'x' * 40}" for number in range(20000)]
     raw = base64.urlsafe_b64encode(
-        b"Subject: long body\r\n\r\n" + "\r\n".join(lines).encode()
+        b"Subject: long body\r\n\r\n"
+        + f"{cross_cut}\r\n{token_line}\r\n".encode()
+        + "\r\n".join(lines).encode()
     ).decode()
+    # The error text repeats some of the decoded content, not the whole
+    # message, so the body fragment itself is not what redacts it.
     proxy.response = _Response(
-        400, {"error": {"message": "invalid body " + "y" * 1_000_000}}
+        400,
+        {
+            "error": {
+                "message": "invalid body "
+                + token_line
+                + " "
+                + cross_cut
+                + " "
+                + "y" * 1_000_000
+            }
+        },
     )
 
     started = time.monotonic()
@@ -771,6 +857,8 @@ def test_a_large_decoded_body_is_redacted_from_a_truncated_error_text(proxy):
     elapsed = time.monotonic() - started
 
     text = str(raised.value)
-    assert lines[0] not in text
+    assert "please read the" not in text
+    assert "section in this mail" not in text
+    assert cross_cut[:80] not in text
     assert len(text) == composio_proxy.MAX_ERROR_TEXT_CHARS + len("...[truncated]")
-    assert elapsed < 1.0, "the per-line pass must run on the truncated text"
+    assert elapsed < 1.0, "the decoded pass must not scan the whole message per line"

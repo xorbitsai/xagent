@@ -201,15 +201,58 @@ def _redact_echoed_body(message: str, body: Any) -> str:
         return message
     # A launch secret or provider token can straddle the cut, so redact them
     # while the text is still whole. ``ComposioProxyError`` redacts again
-    # before its own cut; this one only bounds the pass below.
+    # before its own cut; this one keeps the fragments below matching the text
+    # the error will show.
     message = redact(message)
-    # The error text is cut to this length anyway; doing it before the
-    # per-line pass keeps that pass bounded (a 4.5 MB message decodes to tens
-    # of thousands of lines).
-    message = _truncated(message)
-    for value in _decoded_mime_fragments(body):
-        message = message.replace(value, _REDACTED)
-    return message
+    # The decoded content is replaced before the error text is cut: a fragment
+    # that crosses the cut would otherwise keep its visible prefix, and one
+    # whose token ``redact`` rewrote would no longer match at all. Only the
+    # part that can still reach the kept text is scanned, so the pass over a
+    # 4.5 MB message (tens of thousands of decoded lines) stays bounded.
+    return _redacted_decoded_fragments(message, _decoded_mime_fragments(body))
+
+
+def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
+    """``message`` with every decoded fragment that reaches its kept text
+    removed.
+
+    ``ComposioProxyError`` cuts the text to ``MAX_ERROR_TEXT_CHARS`` after
+    this, so only an occurrence that starts before that cut can show. Such a
+    fragment can still cross the cut, so the search runs to the cut plus the
+    fragment's own length. Each fragment is also matched in the form
+    ``redact`` leaves it in, because the text has already been redacted.
+    """
+    spans: list[tuple[int, int]] = []
+    for fragment in fragments:
+        if not fragment:
+            continue
+        variants = {fragment, str(redact(fragment))}
+        for value in variants:
+            start = 0
+            limit = MAX_ERROR_TEXT_CHARS + len(value)
+            while True:
+                found = message.find(value, start, limit)
+                if found < 0:
+                    break
+                spans.append((found, found + len(value)))
+                start = found + len(value)
+    if not spans:
+        return message
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    pieces: list[str] = []
+    position = 0
+    for start, end in merged:
+        pieces.append(message[position:start])
+        pieces.append(_REDACTED)
+        position = end
+    pieces.append(message[position:])
+    return "".join(pieces)
 
 
 def _long_strings(value: Any) -> list[str]:

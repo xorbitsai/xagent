@@ -75,8 +75,25 @@ async def run_with_tool_runtime_cleanup(
                 raise
 
 
+# The vendor rejected the platform's OAuth client (#3580). The connector
+# checks read it as its own class; a builtin provider's refresh names the
+# provider after a colon (``client_rejected:<provider>``).
+CLIENT_REJECTED_REASON = "client_rejected"
+_CLIENT_REJECTED_PROVIDER_REASON = re.compile(
+    r"client_rejected:[a-z0-9][a-z0-9-]{0,63}"
+)
+
+
+def is_client_rejected_reason(reason: object) -> bool:
+    return type(reason) is str and (
+        reason == CLIENT_REJECTED_REASON
+        or _CLIENT_REJECTED_PROVIDER_REASON.fullmatch(reason) is not None
+    )
+
+
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
+        CLIENT_REJECTED_REASON,
         ACTOR_STDIO_SESSION_RUNTIME_UNAVAILABLE_REASON,
         ACTOR_STDIO_SHADOWED_REASON,
         NESTED_DELEGATION_NOT_APPROVABLE_REASON,
@@ -149,7 +166,11 @@ class MCPUnavailableSummary:
         )
         safe_reason = (
             reason
-            if type(reason) is str and reason in _PUBLIC_MCP_UNAVAILABLE_REASONS
+            if type(reason) is str
+            and (
+                reason in _PUBLIC_MCP_UNAVAILABLE_REASONS
+                or is_client_rejected_reason(reason)
+            )
             else _DEFAULT_MCP_UNAVAILABLE_REASON
         )
         safe_cause_type = (

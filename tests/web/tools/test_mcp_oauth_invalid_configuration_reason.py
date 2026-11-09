@@ -134,3 +134,16 @@ def test_every_web_runtime_reason_survives_the_public_summary():
     """The web runtime allowlist is the narrower one: a reason it keeps must
     not be rewritten again when the load summary is built."""
     assert MCP_UNAVAILABLE_REASONS <= _PUBLIC_MCP_UNAVAILABLE_REASONS
+
+
+@pytest.mark.parametrize(
+    ("reason", "kept"),
+    [
+        ("client_rejected", "client_rejected"),
+        ("client_rejected:slack", "client_rejected:slack"),
+        ("client_rejected:Not A Provider", "mcp_server_unavailable"),
+    ],
+)
+def test_a_client_rejected_reason_survives_the_public_summary(reason, kept):
+    """#3580: the builtin refresh names the provider after a colon."""
+    assert MCPUnavailableSummary.from_values("slack", reason).reason == kept

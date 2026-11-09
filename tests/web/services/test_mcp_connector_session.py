@@ -351,6 +351,44 @@ async def test_builtin_oauth_token_is_refreshed_before_the_start(db_users, monke
 
 
 @pytest.mark.asyncio
+async def test_a_rejected_platform_client_is_not_connected_with_its_reason(
+    db_users, monkeypatch
+):
+    """#3580: like the refresh failure it replaces, a rejected platform client
+    leaves the connection not connected, so the tools route keeps answering
+    400, now with the client_rejected reason."""
+    from xagent.web.tools import config as tool_config
+
+    db, user, _ = db_users
+    server = _connect_github(db, user)
+    db.query(UserOAuth).update(
+        {"expires_at": datetime.now(timezone.utc) + timedelta(minutes=1)}
+    )
+    db.commit()
+
+    async def rejected(oauth_db, oauth_account, provider_name):
+        raise tool_config._OAuthRefreshClientRejected("client_rejected:github")
+
+    monkeypatch.setattr(
+        "xagent.web.tools.config.refresh_oauth_token_if_needed", rejected
+    )
+    loader = _Loader()
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await list_connector_tools(
+        db, user=user, server_id=server.id, name_prefix="mcp_"
+    )
+
+    assert result.outcome is ConnectorToolsOutcome.NOT_CONNECTED
+    assert result.reason == "client_rejected:github"
+    assert loader.calls == []
+    with pytest.raises(HTTPException) as exc_info:
+        await get_mcp_server_tools(server.id, user, db)
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["code"] == "client_rejected:github"
+
+
+@pytest.mark.asyncio
 async def test_remote_mcp_oauth_connector_gets_its_grant(db_users, monkeypatch):
     db, user, _ = db_users
     server = _connect_remote_oauth(db, user)

@@ -2483,6 +2483,52 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       expect(sentTypes(socket)).toEqual(["chat"])
     })
 
+    it("does not ask for a new session when the check before a hand-over is rejected after the view closed", async () => {
+      historySurfaces.real = true
+      const postMessage = vi.spyOn(window, "postMessage").mockImplementation(() => {})
+      let answerCheck: ((response: Response) => void) | null = null
+      let checkSignal: AbortSignal | undefined
+      fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (String(url).includes("/conversations/40/messages") && String(url).includes("limit=1")) {
+          checkSignal = init?.signal ?? undefined
+          return new Promise<Response>((resolve) => { answerCheck = resolve })
+        }
+        if (String(url).includes("/conversations/40/messages")) {
+          return json({
+            messages: [{ id: 1, role: "user", content: "An old question", created_at: "2026-01-01T00:00:00Z", attachments: [] }],
+            next_cursor: null,
+          })
+        }
+        return json({ conversations: [{ task_id: 40, title: "Older chat", created_at: "2026-01-01T00:00:00Z" }], next_cursor: null })
+      })
+      const reconnects = () => postMessage.mock.calls
+        .filter(([message]) => (message as { type?: string })?.type === "reconnect_request")
+      const socket = await mountWithHistory()
+      replayEarlierConversation(socket)
+      receive(socket, ATTACHED)
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+      fireEvent.click(await screen.findByRole("button", { name: /Older chat/ }))
+      await screen.findByText("An old question")
+      const editor = screen.getByRole("textbox")
+      act(() => { editor.textContent = "go on"; fireEvent.input(editor) })
+      act(() => { fireEvent.submit(editor.closest("form")!) })
+      await waitFor(() => expect(answerCheck).not.toBeNull())
+
+      // The host page opens a new conversation while the check is on its way.
+      deliverOpenMessage("Book a shift")
+      await waitFor(() => expect(sentTypes(socket)).toEqual(["new_conversation"]))
+      receive(socket, { type: "conversation_reset" })
+      await waitFor(() => expect(chats(socket)).toHaveLength(1))
+      expect(checkSignal?.aborted).toBe(true)
+      await act(async () => { answerCheck?.(new Response("{}", { status: 401 })) })
+      await letItRun()
+
+      expect(reconnects()).toEqual([])
+      expect(socket.close).not.toHaveBeenCalled()
+      expect(screen.queryByText("widgetSession.reloadRequired")).not.toBeInTheDocument()
+    })
+
     it("keeps the draft in the same composer node across a visit to history", async () => {
       surfaces.real = true
       const socket = await mountWithHistory()

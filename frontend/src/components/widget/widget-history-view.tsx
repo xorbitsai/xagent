@@ -9,31 +9,23 @@ import type { SessionConversationAttachment, useApp } from "@/contexts/app-conte
 import { useI18n } from "@/contexts/i18n-context"
 import {
   readWidgetConversation,
-  WidgetSessionHistoryError,
   type WidgetConversationMessage,
   type WidgetSessionHistoryAuth,
   type WidgetSessionHistoryErrorKind,
 } from "@/lib/widget-session-history"
 import { PHASE_ROUTE } from "./use-session-open-message"
+import { readErrorKind, usePagedHistory } from "./use-paged-history"
 
 type SessionConversationPhase = ReturnType<typeof useApp>["sessionConversationState"]
 
-export type HistoryPreflightErrorKind =
-  | "source_not_found"
-  | "history_disabled"
-  | "unauthorized"
-  | "preflight_failed"
-
-// Why the check before a hand-over failed. The view shows its own line for it,
-// so the composer must not raise a second notice.
+// The check before a hand-over failed. The view shows its own line for it, so
+// the composer must not raise a second notice.
 export class HistoryPreflightError extends Error {
-  readonly kind: HistoryPreflightErrorKind
   readonly notificationHandled = true
 
-  constructor(kind: HistoryPreflightErrorKind) {
+  constructor(kind: WidgetSessionHistoryErrorKind) {
     super(kind)
     this.name = "HistoryPreflightError"
-    this.kind = kind
   }
 }
 
@@ -47,31 +39,19 @@ export interface WidgetHistoryViewProps {
   unauthorizedNotice: "refreshToLoad" | "tryLater"
   taskId: number
   title: string
+  // The page closes this view while a hand-over is in flight, so neither of
+  // these needs to account for one.
   sessionPhase: SessionConversationPhase
   sessionAttachment: SessionConversationAttachment
-  // True while a message from an earlier hand-over is still being sent.
-  continueBusy: boolean
   onBack: () => void
   // Called once the source has been checked, with the visitor's message. The
   // page takes it from here and this view goes away.
   onContinue: (message: string, sourceTaskId: number) => void
 }
 
-type FailureLine = "notFound" | "disabled" | "refreshToLoad" | "tryLater" | "loadFailed"
-
-const PREFLIGHT_KIND: Record<WidgetSessionHistoryErrorKind, HistoryPreflightErrorKind> = {
-  not_found: "source_not_found",
-  disabled: "history_disabled",
-  unauthorized: "unauthorized",
-  load_failed: "preflight_failed",
-}
-
-const readErrorKind = (error: unknown): WidgetSessionHistoryErrorKind =>
-  error instanceof WidgetSessionHistoryError ? error.kind : "load_failed"
-
 // A source that is gone or switched off cannot be continued, whatever the
 // visitor types, so its composer is taken away.
-const endsTheView = (line: FailureLine | "startMessageFailed" | null): boolean => line === "notFound" || line === "disabled"
+const endsTheView = (kind: WidgetSessionHistoryErrorKind | null): boolean => kind === "not_found" || kind === "disabled"
 
 const messageContent = (message: WidgetConversationMessage): React.ReactNode => {
   if (message.role !== "user" || message.attachments.length === 0) return message.content
@@ -100,97 +80,86 @@ export function WidgetHistoryView({
   title,
   sessionPhase,
   sessionAttachment,
-  continueBusy,
   onBack,
   onContinue,
 }: WidgetHistoryViewProps) {
   const { t } = useI18n()
-  const [messages, setMessages] = useState<WidgetConversationMessage[]>([])
-  const [nextCursor, setNextCursor] = useState<string | null>(null)
-  const [firstPage, setFirstPage] = useState<"loading" | "ready" | "failed">("loading")
-  const [morePages, setMorePages] = useState<"idle" | "loading" | "failed">("idle")
-  const [readFailure, setReadFailure] = useState<FailureLine>("loadFailed")
-  const [sendFailure, setSendFailure] = useState<FailureLine | "startMessageFailed" | null>(null)
+  const [sendFailure, setSendFailure] = useState<WidgetSessionHistoryErrorKind | null>(null)
   const [checking, setChecking] = useState(false)
   const backRef = useRef<HTMLButtonElement>(null)
   const mountedRef = useRef(false)
-  const latestRequestRef = useRef(0)
-  const controllerRef = useRef<AbortController | null>(null)
-  const sourceRef = useRef({ origin, getAuth, taskId, unauthorizedNotice })
+  // The check before a hand-over is cancelled when the view closes, so a
+  // late rejection cannot go on to refresh the token with the auth of the
+  // phase the check started in.
+  const checkControllerRef = useRef<AbortController | null>(null)
+  const sourceRef = useRef({ origin, getAuth, taskId })
 
   useEffect(() => {
-    sourceRef.current = { origin, getAuth, taskId, unauthorizedNotice }
-  }, [origin, getAuth, taskId, unauthorizedNotice])
+    sourceRef.current = { origin, getAuth, taskId }
+  }, [origin, getAuth, taskId])
 
-  const failureFor = useCallback((kind: WidgetSessionHistoryErrorKind): FailureLine => {
-    if (kind === "not_found") return "notFound"
-    if (kind === "disabled") return "disabled"
-    if (kind === "unauthorized") return sourceRef.current.unauthorizedNotice
-    return "loadFailed"
-  }, [])
-
-  const load = useCallback((cursor: string | null) => {
-    controllerRef.current?.abort()
-    const controller = new AbortController()
-    controllerRef.current = controller
-    latestRequestRef.current += 1
-    const request = latestRequestRef.current
-    if (cursor === null) setFirstPage("loading")
-    else setMorePages("loading")
+  const fetchPage = useCallback((cursor: string | null, signal: AbortSignal) => {
     const source = sourceRef.current
-    readWidgetConversation(
-      source.origin,
-      source.getAuth(),
-      source.taskId,
-      { cursor },
-      controller.signal,
-    ).then(
-      (page) => {
-        if (request !== latestRequestRef.current) return
-        setMessages((current) => (cursor === null ? page.messages : [...current, ...page.messages]))
-        setNextCursor(page.nextCursor)
-        setFirstPage("ready")
-        setMorePages("idle")
-      },
-      (error: unknown) => {
-        if (request !== latestRequestRef.current) return
-        setReadFailure(failureFor(readErrorKind(error)))
-        if (cursor === null) setFirstPage("failed")
-        else setMorePages("failed")
-      },
+    return readWidgetConversation(source.origin, source.getAuth(), source.taskId, { cursor }, signal).then(
+      (page) => ({ items: page.messages, nextCursor: page.nextCursor }),
     )
-  }, [failureFor])
+  }, [])
+  const {
+    items: messages,
+    nextCursor,
+    firstPage,
+    morePages,
+    errorKind: readFailure,
+    load,
+  } = usePagedHistory(fetchPage)
 
   useEffect(() => {
     mountedRef.current = true
     backRef.current?.focus()
-    load(null)
     return () => {
       mountedRef.current = false
-      latestRequestRef.current += 1
-      controllerRef.current?.abort()
+      checkControllerRef.current?.abort()
     }
-  }, [load])
+  }, [])
+
+  const failureLine = (kind: WidgetSessionHistoryErrorKind): string => (
+    kind === "not_found"
+      ? t("widgetSession.history.notFound")
+      : kind === "disabled"
+        ? t("widgetSession.history.disabled")
+        : kind === "unauthorized"
+          ? t(`widgetSession.history.${unauthorizedNotice}`)
+          : t("widgetSession.history.loadFailed")
+  )
+  // A reload is the only way past "refreshToLoad": a retry or a check before a
+  // hand-over would only be rejected again.
+  const reloadOnly = (kind: WidgetSessionHistoryErrorKind | null): boolean => (
+    kind === "unauthorized" && unauthorizedNotice === "refreshToLoad"
+  )
 
   const route = PHASE_ROUTE[sessionPhase]
   const blockedNotice = sessionAttachment === "unsupported"
     ? "sendUnavailable"
-    : sessionAttachment !== "attached" || continueBusy || (route !== "send" && route !== "reset")
+    : sessionAttachment !== "attached" || (route !== "send" && route !== "reset")
       ? "waitForCurrent"
       : null
+  const readFailed = firstPage === "failed" || morePages === "failed"
+  const sendLocked = reloadOnly(sendFailure) || (readFailed && reloadOnly(readFailure))
 
   const submit = async (message: string) => {
     setSendFailure(null)
     setChecking(true)
+    const controller = new AbortController()
+    checkControllerRef.current = controller
     try {
       const source = sourceRef.current
-      await readWidgetConversation(source.origin, source.getAuth(), source.taskId, { limit: 1 })
+      await readWidgetConversation(source.origin, source.getAuth(), source.taskId, { limit: 1 }, controller.signal)
     } catch (error) {
       if (!mountedRef.current) return
       const kind = readErrorKind(error)
-      setSendFailure(kind === "load_failed" ? "startMessageFailed" : failureFor(kind))
+      setSendFailure(kind)
       setChecking(false)
-      throw new HistoryPreflightError(PREFLIGHT_KIND[kind])
+      throw new HistoryPreflightError(kind)
     }
     if (!mountedRef.current) return
     setChecking(false)
@@ -198,8 +167,7 @@ export function WidgetHistoryView({
   }
 
   const composerGone = endsTheView(sendFailure) || (firstPage === "failed" && endsTheView(readFailure))
-  // A reload is the only way past "refreshToLoad", so a retry would only fail again.
-  const retry = readFailure === "refreshToLoad" ? null : (
+  const retry = reloadOnly(readFailure) ? null : (
     <button
       type="button"
       onClick={() => load(firstPage === "failed" ? null : nextCursor)}
@@ -227,10 +195,11 @@ export function WidgetHistoryView({
         {firstPage === "loading" ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+            <span className="sr-only">{t("common.loading")}</span>
           </div>
         ) : firstPage === "failed" ? (
           <div className="text-sm">
-            <p className="text-destructive" role="alert">{t(`widgetSession.history.${readFailure}`)}</p>
+            <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
             {endsTheView(readFailure) ? null : retry}
           </div>
         ) : messages.length === 0 ? (
@@ -251,7 +220,7 @@ export function WidgetHistoryView({
             </div>
             {morePages === "failed" ? (
               <div className="mt-3 text-sm">
-                <p className="text-destructive" role="alert">{t(`widgetSession.history.${readFailure}`)}</p>
+                <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
                 {retry}
               </div>
             ) : nextCursor !== null ? (
@@ -270,15 +239,15 @@ export function WidgetHistoryView({
       <div className="flex-none border-t p-3">
         {sendFailure ? (
           <p className="mb-2 text-xs text-destructive" role="alert">
-            {sendFailure === "startMessageFailed"
+            {sendFailure === "load_failed"
               ? t("widgetSession.startMessageFailed")
-              : t(`widgetSession.history.${sendFailure}`)}
+              : failureLine(sendFailure)}
           </p>
         ) : null}
         {composerGone ? null : (
           <ChatInput
             onSend={(message) => submit(message)}
-            isLoading={blockedNotice !== null || checking}
+            isLoading={blockedNotice !== null || checking || sendLocked}
             hideFileUpload={true}
             filesDisabled={true}
             hideConfig={true}

@@ -362,6 +362,7 @@ function SessionConversationContent({
   if (view.kind !== "chat" && (isSessionInteractionLocked || historyBlocked || historyWithdrawn)) {
     setView({ kind: "chat" })
   }
+  const unauthorizedHistoryNotice = sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"
 
   if (status === "waiting" || (status === "refreshing" && !agent)) {
     return (
@@ -558,10 +559,9 @@ function SessionConversationContent({
               <WidgetHistoryList
                 origin={window.location.origin}
                 getAuth={getHistoryAuth}
-                unauthorizedNotice={sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"}
+                unauthorizedNotice={unauthorizedHistoryNotice}
                 currentTaskId={state.taskId}
                 onBack={() => setView({ kind: "chat" })}
-                onOpenCurrent={() => setView({ kind: "chat" })}
                 onOpen={(taskId, title) => setView({ kind: "history_view", taskId, title })}
               />
             ) : (
@@ -569,12 +569,11 @@ function SessionConversationContent({
                 key={view.taskId}
                 origin={window.location.origin}
                 getAuth={getHistoryAuth}
-                unauthorizedNotice={sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"}
+                unauthorizedNotice={unauthorizedHistoryNotice}
                 taskId={view.taskId}
                 title={view.title}
                 sessionPhase={sessionConversationState}
                 sessionAttachment={sessionConversationAttachment}
-                continueBusy={continueBusy}
                 onBack={() => setView({ kind: "history_list" })}
                 onContinue={handleContinue}
               />

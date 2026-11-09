@@ -97,7 +97,6 @@ const defaults = (): WidgetHistoryViewProps => ({
   title: "Order question",
   sessionPhase: "unbound",
   sessionAttachment: "attached",
-  continueBusy: false,
   onBack: vi.fn(),
   onContinue: vi.fn(),
 })
@@ -193,7 +192,7 @@ describe("WidgetHistoryView", () => {
       history.read.mockReturnValue(first.promise)
       renderView()
 
-      expect(screen.getByRole("status")).toBeInTheDocument()
+      expect(screen.getByRole("status")).toHaveTextContent("common.loading")
       await act(async () => first.resolve(messagePage()))
       expect(screen.queryByRole("status", { name: "" })).not.toBeInTheDocument()
     })
@@ -229,6 +228,22 @@ describe("WidgetHistoryView", () => {
 
       expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.refreshToLoad")
       expect(screen.queryByRole("button", { name: "widgetSession.history.retry" })).not.toBeInTheDocument()
+      // A check before a hand-over would be rejected the same way.
+      expect(screen.getByTestId("composer").dataset.loading).toBe("true")
+    })
+
+    it("asks for a reload and locks the composer when a later page meets a rejected token", async () => {
+      history.read
+        .mockResolvedValueOnce(messagePage([message(1, "user", "Where is my order?")], "c2"))
+        .mockRejectedValueOnce(new WidgetSessionHistoryError("unauthorized"))
+      renderView({ unauthorizedNotice: "refreshToLoad" })
+      await screen.findByText("Where is my order?")
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetSession.history.loadMore" }))
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.refreshToLoad")
+      expect(screen.queryByRole("button", { name: "widgetSession.history.retry" })).not.toBeInTheDocument()
+      expect(screen.getByTestId("composer").dataset.loading).toBe("true")
     })
 
     it("shows the try-later notice for a rejected token and retries", async () => {
@@ -238,6 +253,7 @@ describe("WidgetHistoryView", () => {
       renderView({ unauthorizedNotice: "tryLater" })
 
       expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.tryLater")
+      expect(screen.getByTestId("composer").dataset.loading).toBe("false")
       fireEvent.click(screen.getByRole("button", { name: "widgetSession.history.retry" }))
 
       expect(await screen.findByText("Where is my order?")).toBeInTheDocument()
@@ -359,19 +375,17 @@ describe("WidgetHistoryView", () => {
   describe("whether the visitor can send from here", () => {
     const phases = Object.keys(PHASE_ROUTE) as Array<keyof typeof PHASE_ROUTE>
     const attachments = ["pending", "attached", "unsupported"] as const
-    const cases = phases.flatMap((phase) => attachments.flatMap((attachment) => [false, true].map(
-      (continueBusy) => [phase, attachment, continueBusy] as const,
-    )))
+    const cases = phases.flatMap((phase) => attachments.map((attachment) => [phase, attachment] as const))
 
-    it.each(cases)("phase %s, replay %s, continuing %s", async (phase, attachment, continueBusy) => {
+    it.each(cases)("phase %s, replay %s", async (phase, attachment) => {
       history.read.mockResolvedValue(messagePage())
-      renderView({ sessionPhase: phase, sessionAttachment: attachment, continueBusy })
+      renderView({ sessionPhase: phase, sessionAttachment: attachment })
       await screen.findByText("Where is my order?")
 
       const sendable = PHASE_ROUTE[phase] === "send" || PHASE_ROUTE[phase] === "reset"
       const expectedHint = attachment === "unsupported"
         ? "widgetSession.history.sendUnavailable"
-        : attachment === "pending" || !sendable || continueBusy
+        : attachment === "pending" || !sendable
           ? "widgetSession.history.waitForCurrent"
           : null
 
@@ -389,6 +403,7 @@ describe("WidgetHistoryView", () => {
       await screen.findByText("Where is my order?")
 
       expect(surfaces.input).toMatchObject({
+        filesDisabled: true,
         hideFileUpload: true,
         hideConfig: true,
         readOnlyConfig: true,
@@ -457,16 +472,16 @@ describe("WidgetHistoryView", () => {
 
     it.each([
       ["a conversation that is gone", new WidgetSessionHistoryError("not_found"),
-        "source_not_found", "widgetSession.history.notFound", false],
+        "widgetSession.history.notFound", false],
       ["history turned off", new WidgetSessionHistoryError("disabled"),
-        "history_disabled", "widgetSession.history.disabled", false],
+        "widgetSession.history.disabled", false],
       ["a token that may not be refreshed", new WidgetSessionHistoryError("unauthorized"),
-        "unauthorized", "widgetSession.history.tryLater", true],
+        "widgetSession.history.tryLater", true],
       ["a failed read", new WidgetSessionHistoryError("load_failed"),
-        "preflight_failed", "widgetSession.startMessageFailed", true],
+        "widgetSession.startMessageFailed", true],
       ["an error of another kind", new Error("boom"),
-        "preflight_failed", "widgetSession.startMessageFailed", true],
-    ])("stays here and says so for %s", async (_label, failure, kind, text, keepsComposer) => {
+        "widgetSession.startMessageFailed", true],
+    ])("stays here and says so for %s", async (_label, failure, text, keepsComposer) => {
       history.read.mockResolvedValueOnce(messagePage())
       const { props } = renderView()
       await screen.findByText("Where is my order?")
@@ -481,7 +496,7 @@ describe("WidgetHistoryView", () => {
       })
 
       expect(rejection).toBeInstanceOf(HistoryPreflightError)
-      expect(rejection).toMatchObject({ kind, notificationHandled: true })
+      expect(rejection).toMatchObject({ notificationHandled: true })
       expect(props.onContinue).not.toHaveBeenCalled()
       expect(screen.getByRole("alert")).toHaveTextContent(text)
       expect(Boolean(screen.queryByTestId("composer"))).toBe(keepsComposer)
@@ -496,7 +511,9 @@ describe("WidgetHistoryView", () => {
       await send()
 
       expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.history.refreshToLoad")
-      expect(screen.getByTestId("composer").dataset.loading).toBe("false")
+      // A reload is the only way past it, so the composer stays locked and
+      // keeps the visitor's text.
+      expect(screen.getByTestId("composer").dataset.loading).toBe("true")
     })
 
     it("clears the failure line and sends on the next try", async () => {
@@ -528,6 +545,21 @@ describe("WidgetHistoryView", () => {
 
       expect(props.onContinue).not.toHaveBeenCalled()
       expect(consoleError).not.toHaveBeenCalled()
+    })
+
+    it("cancels the check when the view closes", async () => {
+      history.read.mockResolvedValueOnce(messagePage())
+      const check = deferred<ReturnType<typeof messagePage>>()
+      history.read.mockReturnValueOnce(check.promise)
+      const { unmount } = renderView()
+      await screen.findByText("Where is my order?")
+
+      await send()
+      const signal = history.read.mock.calls[1][4] as AbortSignal
+      expect(signal.aborted).toBe(false)
+      unmount()
+
+      expect(signal.aborted).toBe(true)
     })
 
     it("drops a failed check that finishes after the view closed", async () => {

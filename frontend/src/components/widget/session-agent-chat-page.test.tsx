@@ -133,7 +133,8 @@ vi.mock("./widget-history-list", () => ({
         <button type="button" onClick={() => (props.onOpen as (id: number, title: string) => void)(7, "Earlier chat")}>
           list-open-other
         </button>
-        <button type="button" onClick={() => (props.onOpenCurrent as () => void)()}>list-open-current</button>
+        {/* The real list answers a click on the current conversation with onBack. */}
+        <button type="button" onClick={() => (props.onBack as () => void)()}>list-open-current</button>
         <button type="button" onClick={() => (props.onBack as () => void)()}>list-back</button>
       </div>
     )
@@ -1341,7 +1342,6 @@ describe("SessionAgentChatPage", () => {
           title: "Earlier chat",
           sessionPhase: "unbound",
           sessionAttachment: "attached",
-          continueBusy: false,
         })
 
         fireEvent.click(screen.getByRole("button", { name: "view-back" }))
@@ -1599,7 +1599,6 @@ describe("SessionAgentChatPage", () => {
         expect(app.viewProps).toMatchObject({
           sessionPhase: "replacement_ready",
           sessionAttachment: "unsupported",
-          continueBusy: false,
           unauthorizedNotice: "refreshToLoad",
         })
       })

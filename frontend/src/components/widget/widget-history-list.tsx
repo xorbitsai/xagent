@@ -1,16 +1,14 @@
 "use client"
 
-import React, { useCallback, useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useRef } from "react"
 import { ArrowLeft, Loader2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import {
   listWidgetConversations,
-  WidgetSessionHistoryError,
-  type WidgetConversationSummary,
   type WidgetSessionHistoryAuth,
-  type WidgetSessionHistoryErrorKind,
 } from "@/lib/widget-session-history"
+import { usePagedHistory } from "./use-paged-history"
 
 export interface WidgetHistoryListProps {
   origin: string
@@ -20,15 +18,12 @@ export interface WidgetHistoryListProps {
   // What to say when a request is rejected as unauthorized and may not be
   // refreshed in the current phase.
   unauthorizedNotice: "refreshToLoad" | "tryLater"
-  // The conversation the visitor is in; choosing it goes back to the chat.
+  // The conversation the visitor is in; choosing it goes back to the chat,
+  // the same way as the back button.
   currentTaskId: number | null
   onBack: () => void
-  onOpenCurrent: () => void
   onOpen: (taskId: number, title: string) => void
 }
-
-const readErrorKind = (error: unknown): WidgetSessionHistoryErrorKind =>
-  error instanceof WidgetSessionHistoryError ? error.kind : "load_failed"
 
 const formatCreatedAt = (createdAt: string): string =>
   new Date(normalizeTimestampMs(createdAt)).toLocaleString([], {
@@ -46,62 +41,27 @@ export function WidgetHistoryList({
   unauthorizedNotice,
   currentTaskId,
   onBack,
-  onOpenCurrent,
   onOpen,
 }: WidgetHistoryListProps) {
   const { t } = useI18n()
-  const [items, setItems] = useState<WidgetConversationSummary[]>([])
-  const [nextCursor, setNextCursor] = useState<string | null>(null)
-  // The first page, and the pages after it, fail and retry separately: a
-  // failed later page leaves the loaded conversations on screen.
-  const [firstPage, setFirstPage] = useState<"loading" | "ready" | "failed">("loading")
-  const [morePages, setMorePages] = useState<"idle" | "loading" | "failed">("idle")
-  const [errorKind, setErrorKind] = useState<WidgetSessionHistoryErrorKind>("load_failed")
   const backRef = useRef<HTMLButtonElement>(null)
-  // A response is written only while it belongs to the newest request; a
-  // closing list also takes a number, so nothing lands after it.
-  const latestRequestRef = useRef(0)
-  const controllerRef = useRef<AbortController | null>(null)
   const sourceRef = useRef({ origin, getAuth })
 
   useEffect(() => {
     sourceRef.current = { origin, getAuth }
   }, [origin, getAuth])
 
-  const load = useCallback((cursor: string | null) => {
-    controllerRef.current?.abort()
-    const controller = new AbortController()
-    controllerRef.current = controller
-    latestRequestRef.current += 1
-    const request = latestRequestRef.current
-    if (cursor === null) setFirstPage("loading")
-    else setMorePages("loading")
+  const fetchPage = useCallback((cursor: string | null, signal: AbortSignal) => {
     const source = sourceRef.current
-    listWidgetConversations(source.origin, source.getAuth(), { cursor }, controller.signal).then(
-      (page) => {
-        if (request !== latestRequestRef.current) return
-        setItems((current) => (cursor === null ? page.conversations : [...current, ...page.conversations]))
-        setNextCursor(page.nextCursor)
-        setFirstPage("ready")
-        setMorePages("idle")
-      },
-      (error: unknown) => {
-        if (request !== latestRequestRef.current) return
-        setErrorKind(readErrorKind(error))
-        if (cursor === null) setFirstPage("failed")
-        else setMorePages("failed")
-      },
+    return listWidgetConversations(source.origin, source.getAuth(), { cursor }, signal).then(
+      (page) => ({ items: page.conversations, nextCursor: page.nextCursor }),
     )
   }, [])
+  const { items, nextCursor, firstPage, morePages, errorKind, load } = usePagedHistory(fetchPage)
 
   useEffect(() => {
     backRef.current?.focus()
-    load(null)
-    return () => {
-      latestRequestRef.current += 1
-      controllerRef.current?.abort()
-    }
-  }, [load])
+  }, [])
 
   const failureText = errorKind === "unauthorized"
     ? t(`widgetSession.history.${unauthorizedNotice}`)
@@ -145,6 +105,7 @@ export function WidgetHistoryList({
         {firstPage === "loading" ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+            <span className="sr-only">{t("common.loading")}</span>
           </div>
         ) : firstPage === "failed" ? (
           failure(() => load(null))
@@ -158,7 +119,7 @@ export function WidgetHistoryList({
                   <button
                     type="button"
                     onClick={() => (
-                      item.taskId === currentTaskId ? onOpenCurrent() : onOpen(item.taskId, item.title)
+                      item.taskId === currentTaskId ? onBack() : onOpen(item.taskId, item.title)
                     )}
                     className="flex w-full flex-col items-start gap-0.5 rounded-md border px-3 py-2 text-left hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >

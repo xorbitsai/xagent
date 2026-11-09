@@ -42,7 +42,6 @@ const deferred = <T,>() => {
 
 const handlers = () => ({
   onBack: vi.fn(),
-  onOpenCurrent: vi.fn(),
   onOpen: vi.fn(),
 })
 
@@ -106,7 +105,7 @@ describe("WidgetHistoryList", () => {
     history.list.mockReturnValue(first.promise)
     renderList()
 
-    expect(screen.getByRole("status")).toBeInTheDocument()
+    expect(screen.getByRole("status")).toHaveTextContent("common.loading")
     await act(async () => first.resolve(page([1])))
     expect(screen.queryByRole("status")).not.toBeInTheDocument()
   })
@@ -119,7 +118,7 @@ describe("WidgetHistoryList", () => {
     expect(screen.getAllByText("widgetSession.history.currentConversation")).toHaveLength(1)
     fireEvent.click(screen.getByRole("button", { name: /Conversation 20/ }))
 
-    expect(props.onOpenCurrent).toHaveBeenCalledTimes(1)
+    expect(props.onBack).toHaveBeenCalledTimes(1)
     expect(props.onOpen).not.toHaveBeenCalled()
     expect(history.list).toHaveBeenCalledTimes(1)
   })
@@ -132,7 +131,7 @@ describe("WidgetHistoryList", () => {
     fireEvent.click(screen.getByRole("button", { name: /Conversation 30/ }))
 
     expect(props.onOpen).toHaveBeenCalledWith(30, "Conversation 30")
-    expect(props.onOpenCurrent).not.toHaveBeenCalled()
+    expect(props.onBack).not.toHaveBeenCalled()
   })
 
   it("goes back", async () => {

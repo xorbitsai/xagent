@@ -27,6 +27,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
         "src/components/widget/use-history-continue.ts",
+        "src/components/widget/use-paged-history.ts",
         "src/components/widget/use-session-attachments.ts",
         "src/components/widget/use-session-open-message.ts",
         "src/components/widget/use-widget-session.ts",
@@ -102,6 +103,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/widget/widget-chrome-controls.tsx": {
           statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/components/widget/use-paged-history.ts": {
+          statements: 90, branches: 85, functions: 85, lines: 90,
         },
         "src/components/widget/widget-history-list.tsx": {
           statements: 90, branches: 85, functions: 85, lines: 90,

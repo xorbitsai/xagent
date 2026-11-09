@@ -2231,6 +2231,51 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       expect(chats(socket)).toHaveLength(1)
     })
 
+    // The page promises that no message reaches the wrong conversation, not
+    // that every message is delivered. When the host page's reply lands in the
+    // very render in which the hand-over is placed, both frames go out in
+    // order; the second carries a source while the first has already opened a
+    // conversation, so the session server refuses it as invalid and the
+    // visitor's follow-up is lost without a notice.
+    it("loses the hand-over, quietly, when the host page's reply lands in the render that places it", async () => {
+      let answer: (() => void) | null = null
+      vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation((...args) => {
+        const [data] = args as [Record<string, unknown>]
+        if (data?.type !== "initial_message_request") return
+        answer = () => window.dispatchEvent(new MessageEvent("message", {
+          data: { xagent: true, v: 1, type: "initial_message", value: "Hello from the host page" },
+          source: EMBEDDED_PARENT as unknown as MessageEventSource,
+        }))
+      })
+      const socket = await mountWithHistory()
+      receive(socket, ATTACHED)
+      await waitFor(() => expect(answer).not.toBeNull())
+      openEarlierConversation()
+
+      act(() => {
+        handOver()
+        answer?.()
+      })
+
+      await waitFor(() => expect(chats(socket)).toHaveLength(2))
+      expect(chats(socket)[0]).toMatchObject({ message: "Hello from the host page" })
+      expect(chats(socket)[0]).not.toHaveProperty("source_task_id")
+      expect(chats(socket)[1]).toMatchObject({ message: CONTINUE, source_task_id: 41 })
+      receive(socket, taskInfo(42))
+      receive(socket, { type: "message_accepted", client_message_id: chats(socket)[0].client_message_id })
+      receive(socket, {
+        type: "message_rejected",
+        client_message_id: chats(socket)[1].client_message_id,
+        rejection_outcome: "not_accepted",
+        error_code: "invalid_message",
+      })
+      await letItRun()
+
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+      expect(chats(socket)).toHaveLength(2)
+      expect(sentTypes(socket)).toEqual(["chat", "chat"])
+    })
+
     it("takes the visitor back to the chat when it arrives", async () => {
       asParent()
       const socket = await mountWithHistory()

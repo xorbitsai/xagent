@@ -234,7 +234,11 @@ function SessionConversationContent({
   // a hand-over (it is given `continueBusy`), the hand-over never waits for it,
   // and the host page's initial message is spent by a hand-over; all three
   // read `continueBusy` during render, so which effect runs first decides
-  // nothing.
+  // nothing. What this guarantees is that no message enters the wrong
+  // conversation, not that none is lost: if the host page's initial message
+  // arrives in the very render that places a hand-over, both frames go out,
+  // the second one is refused by the session server, and the visitor's
+  // follow-up is dropped without a notice.
   const openMessage = useWidgetOpenMessage({ enabled: true })
   const { busy: continueBusy } = useHistoryContinue({
     request: continueRequest,

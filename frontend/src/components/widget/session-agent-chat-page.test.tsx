@@ -1693,6 +1693,11 @@ describe("SessionAgentChatPage", () => {
           rerender(<SessionAgentChatPage />)
 
           expect(await screen.findByText(noticeText)).toBeInTheDocument()
+          // The dropped message leaves nothing in hand: the start screen sends
+          // again and the history entry is back.
+          expect(app.startProps?.isSending).toBe(false)
+          openMenu()
+          expect(historyItem()).toBeInTheDocument()
         })
 
         it("clears the line on the next hand-over and when the conversation changes", async () => {

@@ -7607,6 +7607,15 @@ export function AppProvider({
     const requestId = typeof config?.metadata?.request_id === 'string'
       ? config.metadata.request_id
       : undefined
+    // The earlier conversation a new one continues from. Only the Session
+    // window's taskless chat can carry it; the frame check validates its range.
+    const sourceTaskId: unknown = config?.sourceTaskId
+    if (sourceTaskId !== undefined && typeof sourceTaskId !== "number") {
+      throw new MessageDeliveryError("Message not sent: the conversation source is not valid.", "not_sent")
+    }
+    if (sourceTaskId !== undefined && !sessionTransport?.allowTasklessChat) {
+      throw new MessageDeliveryError("Message not sent: the conversation source is not valid.", "not_sent")
+    }
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current
         ? {
@@ -7743,8 +7752,10 @@ export function AppProvider({
         })
       }
       const fileIds = uploadedFiles.map(file => file.fileId)
-      const chatArgs: Parameters<typeof sendChatMessage> =
-        [message, files, config?.force, clientMessageId, requestId]
+      // A send without a source passes the same five arguments as always.
+      const chatArgs: Parameters<typeof sendChatMessage> = sourceTaskId === undefined
+        ? [message, files, config?.force, clientMessageId, requestId]
+        : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
       beginSessionMessageDelivery()
       try {
         await sendChatWithResend(

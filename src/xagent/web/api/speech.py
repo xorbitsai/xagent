@@ -34,6 +34,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.user import User
 from ..schemas.speech import ASRStreamStart, TTSStreamRequest
+from ..services.release_hold import release_hold
 from ..services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -247,6 +248,11 @@ async def stream_asr(
         return
     if user is None:
         await _close_asr_socket(websocket, 4001, "Authentication required")
+        return
+    if release_hold.writers_retired:
+        # Transcription meters usage when it ends; the old process may no
+        # longer write, so the client reconnects to the new one.
+        await _close_asr_socket(websocket, 1012, "Service restart")
         return
     await accept_authenticated_websocket(websocket)
     model: BaseASR | None = None

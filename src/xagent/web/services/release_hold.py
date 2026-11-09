@@ -119,6 +119,10 @@ class ReleaseHold:
         # Refusals since the hold last closed, by entry kind; diagnostics only.
         self._refused: Counter[str] = Counter()
         self._sealed = False
+        # One-way for the life of the lifespan: set once the host retired this
+        # process's writers (``app.retire_writers``). Entries that would write
+        # while the old process only waits to be replaced refuse on it.
+        self._writers_retired = False
         # Sticky for the life of the process: the blocking evidence.
         self._unsettled_total = 0
         self._unsettled: deque[dict[str, str]] = deque(
@@ -132,6 +136,18 @@ class ReleaseHold:
     @property
     def sealed(self) -> bool:
         return self._sealed
+
+    @property
+    def writers_retired(self) -> bool:
+        return self._writers_retired
+
+    def mark_writers_retired(self) -> None:
+        """The host stopped this process's writers; refuse writes that remain."""
+        self._writers_retired = True
+
+    def reset_writers_retired(self) -> None:
+        """A new lifespan starts new writers."""
+        self._writers_retired = False
 
     @property
     def unsettled_total(self) -> int:

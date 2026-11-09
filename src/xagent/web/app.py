@@ -111,6 +111,7 @@ from .runtime_telemetry import (
     start_process_runtime_telemetry,
     stop_process_runtime_telemetry,
 )
+from .services.release_hold import release_hold
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
 from .services.connector_team_scope import (
     ConnectorHookSessionBoundaryError,
@@ -1946,6 +1947,7 @@ async def startup_event() -> None:
     global _migration_task, _writers_retired
     # A new lifespan starts new writers; the next retire must stop them.
     _writers_retired = False
+    release_hold.reset_writers_retired()
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
     validate_auth_config()
@@ -2595,6 +2597,7 @@ async def retire_writers() -> None:
         except Exception as e:
             logger.error("Failed to stop chat channels: %s", e, exc_info=True)
         _writers_retired = True
+        release_hold.mark_writers_retired()
 
 
 def writers_retired() -> bool:

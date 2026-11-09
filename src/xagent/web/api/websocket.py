@@ -2238,6 +2238,20 @@ def _enqueue_websocket_task_command_sync(
         return result
 
 
+def _refuse_write_after_retire() -> None:
+    """Refuse a socket write once the host retired this process's writers.
+
+    The old process then only waits to be replaced, so a command it enqueued
+    would write while the successor's migrations run. The client gets the
+    retryable "execution paused" error and lands on the new process.
+    """
+    if release_hold.writers_retired:
+        raise ClientVisibleValidationError(
+            client_error_message(ClientErrorCode.EXECUTION_PAUSED),
+            error_code=ClientErrorCode.EXECUTION_PAUSED,
+        )
+
+
 async def _enqueue_websocket_task_command(
     *,
     websocket: WebSocket | None = None,
@@ -2253,6 +2267,7 @@ async def _enqueue_websocket_task_command(
             "User authentication required for task command",
             error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
         )
+    _refuse_write_after_retire()
     resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
     # User ORM instances and server-only authentication fields are never put
     # into the JSON inbox. The consumer re-resolves the actor by id.
@@ -2475,6 +2490,7 @@ async def handle_execute_task(
                 "User authentication required for task execution",
                 error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
+        _refuse_write_after_retire()
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
 
@@ -4000,6 +4016,12 @@ async def websocket_builder_chat_endpoint(
             logger.info(f"📨 Received builder chat message: {data[:200]}")
 
             message_data = json.loads(data)
+
+            if release_hold.writers_retired:
+                # A builder turn creates agents and knowledge bases; the old
+                # process may no longer write.
+                await send_execution_paused(websocket)
+                continue
 
             # Run in background to not block receiving
             if active_chat_task is not None:

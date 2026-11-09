@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from email import policy
 from email.parser import BytesParser
 from typing import Any
@@ -474,3 +475,231 @@ def test_a_composio_gmail_grant_gets_the_composio_launch_variables(monkeypatch):
         composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV: ACCOUNT_ID,
         composio_proxy.COMPOSIO_USER_ID_ENV: COMPOSIO_USER,
     }
+
+
+def test_an_oversized_second_message_refuses_the_whole_batch_before_sending(
+    proxy, monkeypatch, tmp_path
+):
+    """#3647 regression guard: the proxy refuses an oversized JSON body
+    locally, so a batch whose second message is too large must fail entirely
+    up front instead of sending the first one and then erroring."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    attachment = tmp_path / "big.bin"
+    attachment.write_bytes(b"\x00" * 4096)
+    monkeypatch.setattr(composio_proxy, "MAX_JSON_BODY_BYTES", 3000)
+    proxy.answer("/messages/send", 200, {"id": "sent-1"})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {"to": "a@example.com", "subject": "Small", "body": "hi"},
+                {
+                    "to": "b@example.com",
+                    "subject": "Big",
+                    "body": "B",
+                    "attachments": [str(attachment)],
+                },
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "too large to send through Composio" in result["message"]
+    assert "3000 byte limit" in result["message"]
+    assert proxy.calls == [], "no message may be sent before the whole batch is checked"
+
+
+def test_sending_more_messages_than_the_cap_is_refused_before_sending(
+    proxy, monkeypatch
+):
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+    messages = [
+        {"to": "a@example.com", "subject": str(number), "body": "B"}
+        for number in range(google_api_proxy.MAX_BATCH_REQUESTS + 1)
+    ]
+
+    result = json.loads(gmail.gmail_send_messages(messages, action="send"))
+
+    assert result["status"] == "error"
+    assert "request limit for one tool call" in result["message"]
+    assert proxy.calls == []
+
+
+def test_a_send_that_fails_midway_returns_the_messages_already_sent(proxy, monkeypatch):
+    """Messages already sent cannot be taken back; the error must report
+    them instead of dropping the partial result."""
+    calls: list[dict[str, Any]] = []
+
+    def request(**kwargs: Any) -> _Response:
+        calls.append(kwargs["json"])
+        if len(calls) == 1:
+            return _Response(200, {"status": 200, "data": {"id": "sent-1"}})
+        return _Response(500, {"error": {"message": "upstream is down"}})
+
+    monkeypatch.setattr(composio_proxy.requests, "request", request)
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {"to": "a@example.com", "subject": "One", "body": "1"},
+                {"to": "b@example.com", "subject": "Two", "body": "2"},
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["results"] == [{"status": "sent", "id": "sent-1", "attachments": []}]
+    assert "1 of 2 messages were sent" in result["message"]
+    assert "upstream is down" in result["message"]
+
+
+def test_a_search_above_the_request_cap_is_refused_before_the_list_call(
+    proxy, monkeypatch
+):
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_search_messages(
+            "q", max_results=google_api_proxy.MAX_BATCH_REQUESTS + 1
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "request limit for one tool call" in result["message"]
+    assert proxy.calls == []
+
+
+def test_reading_more_threads_than_the_request_cap_is_refused_before_sending(
+    proxy, monkeypatch
+):
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+    thread_ids = [
+        f"t{number}" for number in range(google_api_proxy.MAX_BATCH_REQUESTS + 1)
+    ]
+
+    result = json.loads(gmail.gmail_read_threads(thread_ids))
+
+    assert result["status"] == "error"
+    assert "request limit for one tool call" in result["message"]
+    assert proxy.calls == []
+
+
+def test_deleting_a_label_sends_a_delete_through_the_proxy(proxy, monkeypatch):
+    proxy.default = _Response(200, {"status": 204, "data": None})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(gmail.gmail_manage_labels("delete", label_id="L1"))
+
+    assert result == {"status": "success", "message": "Label L1 deleted"}
+    (call,) = proxy.calls
+    assert call["method"] == "DELETE"
+    assert (
+        call["endpoint"] == "https://gmail.googleapis.com/gmail/v1/users/me/labels/L1"
+    )
+
+
+def test_updating_a_label_patches_through_the_proxy(proxy, monkeypatch):
+    proxy.answer("/labels/L1", 200, {"id": "L1", "name": "New"})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(gmail.gmail_manage_labels("update", label_id="L1", name="New"))
+
+    assert result["label"] == {"id": "L1", "name": "New"}
+    (call,) = proxy.calls
+    assert call["method"] == "PATCH"
+    assert (
+        call["endpoint"] == "https://gmail.googleapis.com/gmail/v1/users/me/labels/L1"
+    )
+    assert call["body"] == {"name": "New"}
+
+
+def test_modifying_a_message_posts_its_label_changes(proxy, monkeypatch):
+    proxy.answer("/messages/m1/modify", 200, {"id": "m1"})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_manage_labels(
+            "modify_message",
+            message_id="m1",
+            add_label_ids=["STARRED"],
+            remove_label_ids=["UNREAD"],
+        )
+    )
+
+    assert result["message"] == {"id": "m1"}
+    (call,) = proxy.calls
+    assert call["method"] == "POST"
+    assert call["endpoint"] == (
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/modify"
+    )
+    assert call["body"] == {"addLabelIds": ["STARRED"], "removeLabelIds": ["UNREAD"]}
+
+
+def test_drafting_a_message_through_the_proxy(proxy, monkeypatch):
+    proxy.answer("/drafts", 200, {"id": "draft-1"})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [{"to": "a@example.com", "subject": "Draft", "body": "later"}],
+            action="draft",
+        )
+    )
+
+    assert result["results"] == [
+        {"status": "drafted", "id": "draft-1", "attachments": []}
+    ]
+    (call,) = proxy.calls
+    assert call["endpoint"] == "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
+    assert "raw" in call["body"]["message"]
+
+
+def test_an_error_that_echoes_the_message_hides_its_body_and_attachment(
+    proxy, monkeypatch, tmp_path, caplog
+):
+    """The vendor can echo the refused request body; the base64 ``raw`` in it
+    carries the mail body and attachment, and must not reach the tool result
+    or the server log."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    attachment = tmp_path / "secret.txt"
+    attachment.write_text("ATTACHMENT-SECRET", encoding="utf-8")
+    leaked: dict[str, str] = {}
+
+    def request(**kwargs: Any) -> _Response:
+        raw = kwargs["json"]["body"]["raw"]
+        leaked["raw"] = raw
+        return _Response(
+            400, {"error": {"message": f"invalid body {json.dumps({'raw': raw})}"}}
+        )
+
+    monkeypatch.setattr(composio_proxy.requests, "request", request)
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    with caplog.at_level(logging.ERROR, logger="gmail-mcp"):
+        result = json.loads(
+            gmail.gmail_send_messages(
+                [
+                    {
+                        "to": "a@example.com",
+                        "subject": "Secret",
+                        "body": "BODY-SECRET",
+                        "attachments": [str(attachment)],
+                    }
+                ],
+                action="send",
+            )
+        )
+
+    assert result["status"] == "error"
+    assert leaked["raw"] not in result["message"]
+    assert leaked["raw"] not in "\n".join(
+        record.getMessage() for record in caplog.records
+    )
+    decoded = base64.urlsafe_b64decode(leaked["raw"])
+    assert b"BODY-SECRET" in decoded
+    # The attachment body is base64 inside the MIME message.
+    assert base64.b64encode(b"ATTACHMENT-SECRET") in decoded

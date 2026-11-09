@@ -470,3 +470,210 @@ def test_a_batch_with_no_requests_sends_nothing(proxy):
     google_api_proxy.execute_batch(service.new_batch_http_request())
 
     assert proxy.calls == []
+
+
+class _Download:
+    """The public_requests response shape a binary download returns."""
+
+    def __init__(self, status_code: int, content: bytes) -> None:
+        self.status_code = status_code
+        self.content = content
+
+
+def test_a_binary_answer_is_downloaded_from_its_signed_url(proxy, monkeypatch):
+    """Composio does not relay the bytes: it stores the file and answers
+    ``data=None`` plus ``binary_data``. The transport must return the bytes,
+    not an empty body that a downloader would treat as a finished 0-byte
+    file."""
+    seen: dict[str, Any] = {}
+
+    def download(url: str, timeout: float) -> _Download:
+        seen["url"] = url
+        seen["timeout"] = timeout
+        return _Download(200, b"%PDF-1.4 real bytes")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", download)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed",
+                "content_type": "application/pdf",
+                "size": 18,
+            },
+            "headers": {"x-goog-generation": "7"},
+        },
+    )
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
+    )
+
+    assert seen["url"] == "https://files.composio.dev/signed"
+    assert content == b"%PDF-1.4 real bytes"
+    assert response["content-type"] == "application/pdf"
+    assert response["content-length"] == str(len(content))
+    # The provider's own response headers survive too.
+    assert response["x-goog-generation"] == "7"
+
+
+def test_a_binary_answer_without_a_usable_url_is_refused(proxy, monkeypatch):
+    def download(url: str, timeout: float) -> _Download:
+        raise AssertionError("no download without a usable URL")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", download)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {"content_type": "application/pdf", "size": 3},
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    assert "download URL" in str(raised.value)
+
+
+def test_a_failed_binary_download_names_no_signed_url(proxy, monkeypatch):
+    def download(url: str, timeout: float) -> _Download:
+        return _Download(403, b"denied")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", download)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed-secret",
+                "content_type": "application/pdf",
+                "size": 3,
+            },
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    assert "HTTP 403" in str(raised.value)
+    assert "files.composio.dev" not in str(raised.value)
+    assert "signed-secret" not in str(raised.value)
+
+
+def test_a_redirect_keeps_its_location_header(proxy):
+    """A 3xx is handed back with the provider's Location so a caller can
+    follow it; the transport does not silently follow or drop it."""
+    proxy.answer_with(
+        200,
+        {
+            "status": 302,
+            "data": None,
+            "headers": {
+                "Location": "https://drive.usercontent.google.com/download/x",
+                "X-Goog-Request-Id": "r1",
+            },
+        },
+    )
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
+    )
+
+    assert response.status == 302
+    assert response["location"] == "https://drive.usercontent.google.com/download/x"
+    assert response["x-goog-request-id"] == "r1"
+    assert content == b""
+
+
+def test_a_batch_above_the_request_cap_is_refused_before_sending(proxy):
+    ids = [str(number) for number in range(google_api_proxy.MAX_BATCH_REQUESTS + 1)]
+
+    with pytest.raises(ValueError, match="request limit"):
+        google_api_proxy.execute_batch(
+            _added_batch(_gmail_service(), ids, lambda *_args: None)
+        )
+
+    assert proxy.calls == []
+
+
+def test_a_request_that_finishes_after_the_deadline_snapshot_keeps_its_result(
+    proxy, monkeypatch
+):
+    """``wait`` returns a snapshot of pending futures; a request can finish
+    between that snapshot and the classification, and its result must not be
+    replaced by a made-up TimeoutError."""
+    real_wait = google_api_proxy.wait
+
+    def delayed_wait(futures, timeout=None):
+        done, pending = real_wait(futures, timeout=timeout)
+        # Let a request in the pending snapshot finish before classifying.
+        time.sleep(0.3)
+        return done, pending
+
+    def slow(**kwargs: Any) -> _Response:
+        time.sleep(0.1)
+        return _Response(200, {"status": 200, "data": {"id": "m1"}})
+
+    monkeypatch.setattr(google_api_proxy, "wait", delayed_wait)
+    monkeypatch.setattr(composio_proxy.requests, "request", slow)
+    seen: list[tuple[str, Any, Any]] = []
+
+    def callback(request_id, response, exception):
+        seen.append((request_id, response, exception))
+
+    batch = _added_batch(_gmail_service(), ["m1"], callback)
+    google_api_proxy.execute_batch(batch, deadline=0.02)
+
+    assert seen[0][1] == {"id": "m1"}
+    assert seen[0][2] is None
+
+
+def test_a_redirect_reaches_the_caller_with_its_location(proxy):
+    """A caller (for example a media download in #3648) can read the
+    Location off the HttpError's response."""
+    proxy.answer_with(
+        200,
+        {
+            "status": 302,
+            "data": None,
+            "headers": {"Location": "https://drive.usercontent.google.com/download/x"},
+        },
+    )
+
+    with pytest.raises(HttpError) as raised:
+        _gmail_service().users().labels().get(userId="me", id="x").execute()
+
+    assert raised.value.resp.status == 302
+    assert (
+        raised.value.resp["location"]
+        == "https://drive.usercontent.google.com/download/x"
+    )
+
+
+def test_a_late_answer_after_the_deadline_is_not_delivered_twice(monkeypatch):
+    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
+    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
+    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
+    seen: list[tuple[str, Any, Any]] = []
+
+    def slow(**kwargs: Any) -> _Response:
+        time.sleep(0.3)
+        return _Response(200, {"status": 200, "data": {"id": "m1"}})
+
+    monkeypatch.setattr(composio_proxy.requests, "request", slow)
+
+    def callback(request_id, response, exception):
+        seen.append((request_id, response, exception))
+
+    batch = _added_batch(_gmail_service(), ["m1"], callback)
+    google_api_proxy.execute_batch(batch, deadline=0.02)
+    time.sleep(0.4)
+
+    assert len(seen) == 1
+    assert seen[0][1] is None
+    assert isinstance(seen[0][2], TimeoutError)

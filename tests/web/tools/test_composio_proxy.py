@@ -7,6 +7,7 @@ no request leaves the process.
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -368,3 +369,153 @@ def test_the_body_limit_counts_the_whole_proxy_payload(proxy, monkeypatch):
         )
 
     assert len(proxy.calls) == 2
+
+
+def test_a_response_keeps_the_provider_headers_and_binary_data(proxy):
+    """#3648 needs the provider's headers (a 3xx's Location) and Composio's
+    binary envelope; both are part of the answer and must not be dropped."""
+    headers = {
+        "location": "https://files.example/signed",
+        "x-goog-request-id": "r1",
+    }
+    binary_data = {
+        "url": "https://files.example/signed",
+        "content_type": "application/pdf",
+        "size": 3,
+    }
+    proxy.response = _Response(
+        200,
+        {
+            "status": 302,
+            "data": None,
+            "headers": headers,
+            "binary_data": binary_data,
+        },
+    )
+
+    response = composio_proxy.proxy_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a",
+        allowed_hosts=GMAIL_HOSTS,
+    )
+
+    assert response.status == 302
+    assert response.headers == headers
+    assert response.binary_data == binary_data
+
+
+def test_a_successful_answer_without_data_is_a_composio_error(proxy):
+    """A truncated 2xx used to reach a callback and fail opaquely there."""
+    proxy.response = _Response(200, {"status": 200})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+            allowed_hosts=GMAIL_HOSTS,
+        )
+
+    assert "without the provider's data" in str(raised.value)
+
+
+def test_a_no_content_answer_may_omit_data(proxy):
+    proxy.response = _Response(200, {"status": 204})
+
+    response = composio_proxy.proxy_request(
+        "DELETE",
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels/x",
+        allowed_hosts=GMAIL_HOSTS,
+    )
+
+    assert (response.status, response.data) == (204, None)
+
+
+def test_an_error_that_echoes_the_request_body_hides_the_message(proxy):
+    """A Gmail message's body and attachments travel base64 in ``raw``; a
+    vendor error echoing the body must not put them in the tool result."""
+    raw = base64.urlsafe_b64encode(b"Subject: private\n\nLEAK-ME body").decode()
+    proxy.response = _Response(
+        400,
+        {"error": {"message": f"invalid body {json.dumps({'raw': raw})}"}},
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert raw not in text
+    assert "[redacted]" in text
+
+
+def test_an_error_that_echoes_a_provider_token_is_redacted(proxy):
+    """Composio can echo an upstream Authorization header; its value is not
+    one of our launch variables, so it is redacted by shape."""
+    token = "ya29.PROVIDER-SECRET-TOKEN-123"
+    proxy.response = _Response(
+        401,
+        {"error": {"message": f"upstream said authorization: Bearer {token}"}},
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "GET", "/services/data/v62.0/sobjects", allowed_hosts=()
+        )
+
+    text = str(raised.value)
+    assert token not in text
+    assert "Bearer [redacted]" in text
+
+
+@pytest.mark.parametrize(
+    "query, headers",
+    [
+        ([("q", "a\r\nX-Injected: 1")], None),
+        (None, {"accept": "application/json\nX-Injected: 1"}),
+        (None, {"accept": "application/json\rX-Injected: 1"}),
+    ],
+    ids=["query-crlf", "header-lf", "header-cr"],
+)
+def test_a_control_character_in_a_parameter_is_refused_before_sending(
+    proxy, query, headers
+):
+    with pytest.raises(ValueError, match="control character"):
+        composio_proxy.proxy_request(
+            "GET",
+            "/services/data/v62.0/query",
+            allowed_hosts=(),
+            query=query or (),
+            headers=headers,
+        )
+
+    assert proxy.calls == []
+
+
+def test_an_absolute_endpoint_with_a_control_character_is_refused(proxy):
+    with pytest.raises(ValueError, match="control character"):
+        composio_proxy.proxy_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels\nX: 1",
+            allowed_hosts=GMAIL_HOSTS,
+        )
+
+    assert proxy.calls == []
+
+
+def test_a_per_call_body_limit_overrides_the_shared_default(proxy):
+    """#3669's Salesforce may have a different real limit; the shared default
+    stays, but a connector can pass its own."""
+    with pytest.raises(ValueError, match="200 byte limit"):
+        composio_proxy.proxy_request(
+            "POST",
+            "/services/data/v62.0/sobjects/Account",
+            allowed_hosts=(),
+            body={"Name": "x" * 500},
+            max_body_bytes=200,
+        )
+
+    assert proxy.calls == []

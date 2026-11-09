@@ -164,6 +164,9 @@ def test_an_error_that_is_not_an_array_is_shown_bounded(proxy):
     assert result["status"] == "error"
     assert result["message"].startswith("Salesforce API error (status 502): ")
     assert result["message"].endswith("... [truncated]")
+    assert len(result["message"]) == len(
+        "Salesforce API error (status 502): "
+    ) + salesforce.MAX_ERROR_RESPONSE_TEXT_CHARS + len("... [truncated]")
 
 
 def test_a_composio_refusal_is_an_error_without_secrets(proxy):
@@ -244,8 +247,9 @@ def test_a_composio_id_echoed_in_an_error_is_redacted(proxy):
     assert _secrets_in(result["message"]) == []
 
 
-def test_a_redirect_status_is_returned_as_data_like_the_direct_path(proxy):
-    """The direct path only treats 400 and above as an error."""
+def test_multiple_choices_is_returned_as_data(proxy):
+    """Salesforce answers 300 when an external id matches several records,
+    and the body lists them; the direct path returns it as data too."""
     proxy.answer(300, [{"id": "001xx", "url": "/services/data/v59.0/x"}])
 
     result = salesforce._request("GET", f"{API}/sobjects/Account/ExtId__c/x")
@@ -257,3 +261,29 @@ def test_an_empty_answer_reads_as_an_empty_object(proxy):
     proxy.answer(200, None)
 
     assert salesforce._request("GET", f"{API}/sobjects") == {}
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_composio_did_not_follow_is_an_error(proxy, status):
+    """The direct path follows redirects; an unfollowed one through Composio
+    must not read as an empty, successful result."""
+    proxy.answer(status, None)
+
+    result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith(f"Salesforce API error (status {status}): ")
+
+
+def test_an_echoed_id_cut_by_the_bound_is_redacted_whole(proxy):
+    """The id straddles the cut: cutting before redacting would leave a prefix
+    of it in the message."""
+    kept = 8
+    padding = "x" * (salesforce.MAX_ERROR_RESPONSE_TEXT_CHARS - kept)
+    proxy.answer(403, [{"errorCode": "DENIED", "message": padding + ACCOUNT_ID}])
+
+    result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
+
+    assert result["status"] == "error"
+    assert result["message"].endswith("... [truncated]")
+    assert ACCOUNT_ID[:kept] not in result["message"]

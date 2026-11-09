@@ -343,12 +343,6 @@ def _raise_api_error(status: int, detail: str) -> NoReturn:
     raise RuntimeError(f"Salesforce API error (status {status}): {detail}")
 
 
-def _uses_composio() -> bool:
-    """Whether this process serves a Composio-backed grant (#3646): it is
-    launched with Composio's ids instead of a token and an instance URL."""
-    return bool(os.environ.get(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
-
-
 def _request_via_composio(
     method: str,
     path: str,
@@ -368,6 +362,14 @@ def _request_via_composio(
         body=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
+    # The direct path never sees a redirect: requests follows it. One that
+    # comes back through Composio was not followed, and its empty body would
+    # read as an empty result. 300 is Salesforce's answer when an external id
+    # matches several records and carries the candidates, so it stays data.
+    if 300 < response.status < 400:
+        _raise_api_error(
+            response.status, "the request was redirected and the redirect not followed"
+        )
     if response.status >= 400:
         detail = _error_detail_from_payload(response.data)
         if detail is None:
@@ -389,7 +391,7 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
-    if _uses_composio():
+    if composio_proxy.serves_composio_grant():
         return _request_via_composio(method, path, params=params, json_data=json_data)
     return _request_absolute(
         method, f"{_instance_url()}{path}", params=params, json_data=json_data
@@ -407,7 +409,7 @@ def salesforce_get_current_user() -> str:
     try:
         result = (
             _request_via_composio("GET", ORG_USERINFO_PATH)
-            if _uses_composio()
+            if composio_proxy.serves_composio_grant()
             else _request_absolute("GET", USERINFO_URL)
         )
         return _success(

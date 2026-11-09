@@ -455,7 +455,7 @@ describe("WidgetHistoryView", () => {
       expect(history.read.mock.calls[1][1]).toBe(refreshed)
     })
 
-    it("keeps the composer locked while the source is being checked, and waits for a refreshed token", async () => {
+    it("keeps the composer locked while the source is being checked, and hands over once the check returns", async () => {
       history.read.mockResolvedValueOnce(messagePage())
       const check = deferred<ReturnType<typeof messagePage>>()
       history.read.mockReturnValueOnce(check.promise)

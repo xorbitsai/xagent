@@ -1,15 +1,18 @@
-"""Connect Facebook and Instagram through Composio-hosted auth (#3532, #3533).
+"""Connect apps through Composio-hosted auth (#3532, #3533, #3645).
 
-While our Meta App Review is pending, Toby's Facebook and Instagram connectors
-can use Composio's own Meta App. Each app has its own switch
-(``XAGENT_FACEBOOK_AUTH_BACKEND``, ``XAGENT_INSTAGRAM_AUTH_BACKEND``; set to
-``composio``) and selects this flow for its new connects only; Meta Ads and
-WhatsApp share the ``meta`` provider and stay native. Composio's Instagram
+While our own app approvals are pending, a connector can use Composio's app
+instead: Facebook and Instagram (``meta`` provider) today. Each app in
+``COMPOSIO_APPS`` names its own provider and has its own switch (for example
+``XAGENT_FACEBOOK_AUTH_BACKEND``; set to ``composio``) and selects this flow
+for its new connects only; Meta Ads and WhatsApp share the ``meta`` provider
+and stay native. Each app reads its identity its own way; Composio's Instagram
 toolkit uses Instagram Login, so its identity comes from ``graph.instagram.com``.
 
-The browser makes three trips, all on the Meta callback path, because that is
-the only path xagent-saas routes per region and the only path the actor proof
-cookie is sent to:
+The browser makes three trips, all on one shared callback path
+(``CALLBACK_PROVIDER``'s, the Meta one) whatever the app's provider: Composio's
+OAuth user verification is a single URL per project, and the flow and actor
+proof cookies are scoped to the path they come back to. A state is still
+minted for, and only accepted under, its app's own provider:
 
 1. **Start** (server side, called by xagent-saas): the usual signed ``state``,
    single-use flow row and actor proof cookie, but ``Location`` points back to
@@ -108,34 +111,53 @@ INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v25.0/me"
 INSTAGRAM_APP_ID = "instagram"
 INSTAGRAM_TOOLKIT_SLUG = "instagram"
 META_PROVIDER = "meta"
+# Every Composio app's trips (begin, verification, denial) land on this one
+# provider's callback path, whatever the app's own provider: Composio's OAuth
+# user verification is a single URL per project, and the flow and actor proof
+# cookies are scoped to the path they come back to.
+CALLBACK_PROVIDER = META_PROVIDER
 
 
 class ComposioApp(NamedTuple):
     """What differs between the apps that can connect through Composio."""
 
     app_id: str
+    # The OAuth provider the app's connector is started under; its state is
+    # minted for this provider and is refused under any other.
+    provider: str
     label: str
     backend_env: str
     auth_config_env: str
     toolkit_slug: str
-    # GET this through the proxy; ``identity_field`` of the reply is stored as
-    # the grant's provider_user_id.
+    # GET this through the proxy with ``identity_params`` as its query;
+    # ``identity_field`` of the reply, which must fully match
+    # ``identity_id_pattern``, is stored as the grant's provider_user_id.
     identity_url: str
     identity_field: str
+    identity_params: tuple[tuple[str, str], ...]
+    identity_id_pattern: re.Pattern[str]
+
+
+# Graph ids, Facebook user ids and Instagram professional account ids alike.
+_GRAPH_ID_RE = re.compile(r"[0-9]{1,32}")
 
 
 COMPOSIO_APPS: dict[str, ComposioApp] = {
     FACEBOOK_APP_ID: ComposioApp(
         app_id=FACEBOOK_APP_ID,
+        provider=META_PROVIDER,
         label="Facebook",
         backend_env=FACEBOOK_AUTH_BACKEND_ENV,
         auth_config_env=COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV,
         toolkit_slug=FACEBOOK_TOOLKIT_SLUG,
         identity_url=GRAPH_ME_URL,
         identity_field="id",
+        identity_params=(("fields", "id"),),
+        identity_id_pattern=_GRAPH_ID_RE,
     ),
     INSTAGRAM_APP_ID: ComposioApp(
         app_id=INSTAGRAM_APP_ID,
+        provider=META_PROVIDER,
         label="Instagram",
         backend_env=INSTAGRAM_AUTH_BACKEND_ENV,
         auth_config_env=COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID_ENV,
@@ -143,6 +165,8 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_url=INSTAGRAM_GRAPH_ME_URL,
         # The professional account id the Instagram tools address.
         identity_field="user_id",
+        identity_params=(("fields", "user_id"),),
+        identity_id_pattern=_GRAPH_ID_RE,
     ),
 }
 
@@ -163,7 +187,6 @@ _REQUEST_TIMEOUT_SECONDS = 10
 # Composio ids are short nanoid-style strings. Anything else is refused before
 # it is put in a URL path or stored.
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
-_PROVIDER_USER_ID_RE = re.compile(r"[0-9]{1,32}")
 _MAX_SESSION_URI_LENGTH = 4096
 
 Step = Literal["begin", "verify", "denied"]
@@ -196,14 +219,15 @@ def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
     """The app whose new connects go through Composio, if this one does.
 
     Each app follows only its own switch, so turning Facebook over never
-    moves Instagram, and Meta Ads and WhatsApp have no switch at all.
+    moves Instagram, and Meta Ads and WhatsApp have no switch at all. An app
+    is only ever started under its own provider.
     """
-    if provider.lower() != META_PROVIDER or not app_id:
+    if not app_id:
         return None
     from .mcp_apps import _normalize_oauth_grant_key
 
     app = COMPOSIO_APPS.get(_normalize_oauth_grant_key(app_id) or "")
-    if app is None or not _uses_composio(app):
+    if app is None or app.provider != provider.lower() or not _uses_composio(app):
         return None
     return app
 
@@ -293,12 +317,11 @@ def _page(title: str, *paragraphs: str, status_code: int) -> HTMLResponse:
 
 def _unavailable_page(*app_ids: str) -> HTMLResponse:
     """``app_ids`` are the apps the browser's flows were for, when known."""
-    label = " or ".join(
-        COMPOSIO_APPS[app_id].label for app_id in (app_ids or tuple(COMPOSIO_APPS))
-    )
+    label = " or ".join(COMPOSIO_APPS[app_id].label for app_id in app_ids)
     return _page(
-        f"{label} can't be connected right now",
-        f"The {label} connection service could not complete the request.",
+        f"{label or 'This app'} can't be connected right now",
+        f"The {label + ' ' if label else ''}connection service could not "
+        "complete the request.",
         "Close this window and select Connect again in a few minutes.",
         status_code=503,
     )
@@ -335,6 +358,25 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
     return None
 
 
+def shared_callback_url(db: Session, provider: str, db_provider: Any) -> str:
+    """The shared callback URL, for a start under any app's provider.
+
+    ``db_provider`` is the started provider's row; it is the shared path's own
+    row only when that provider is the callback provider.
+    """
+    from .api.auth import _resolve_oauth_redirect_uri
+
+    if provider.lower() != CALLBACK_PROVIDER:
+        from .models.oauth_provider import OAuthProvider
+
+        db_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == CALLBACK_PROVIDER)
+            .first()
+        )
+    return _resolve_oauth_redirect_uri(CALLBACK_PROVIDER, db_provider)
+
+
 def begin_location(redirect_uri: str, state: str) -> str:
     """Where the start sends the browser: our callback path with ``state``."""
     separator = "&" if "?" in redirect_uri else "?"
@@ -342,14 +384,14 @@ def begin_location(redirect_uri: str, state: str) -> str:
 
 
 def callback_step(provider: str, query: Mapping[str, Any]) -> Step | None:
-    """Which Composio trip a Meta callback request is, if any.
+    """Which Composio trip a request on the shared callback path is, if any.
 
-    Native Meta callbacks keep their own handling: a begin needs a state that
-    carries the Composio marker, and a denial is only taken while an app
-    connects through Composio. A ``session_uri`` is never part of a native
-    callback.
+    Native callbacks on that path keep their own handling: a begin needs a
+    state that carries the Composio marker, and a denial is only taken while
+    an app connects through Composio. A ``session_uri`` is never part of a
+    native callback.
     """
-    if provider.lower() != META_PROVIDER:
+    if provider.lower() != CALLBACK_PROVIDER:
         return None
 
     def has(name: str) -> bool:
@@ -551,7 +593,8 @@ def fetch_provider_user_id(
             "connected_account_id": account_id,
             "user_id": user_id,
             "parameters": [
-                {"name": "fields", "value": app.identity_field, "type": "query"}
+                {"name": name, "value": value, "type": "query"}
+                for name, value in app.identity_params
             ],
         },
     )
@@ -563,7 +606,7 @@ def fetch_provider_user_id(
         or type(upstream_status) is not int
         or not 200 <= upstream_status < 300
         or not isinstance(provider_user_id, str)
-        or not _PROVIDER_USER_ID_RE.fullmatch(provider_user_id)
+        or not app.identity_id_pattern.fullmatch(provider_user_id)
     ):
         logger.warning(
             "Composio proxy did not return a %s identity "
@@ -948,11 +991,32 @@ def _reject(reason: str) -> _Rejected:
     return _Rejected(reason, _actor_oauth_flow_rejected_response(reason))
 
 
+def _provider_of(app_id: str | None) -> str:
+    """The app's own provider; the callback's while the app is unknown."""
+    app = COMPOSIO_APPS.get(app_id) if isinstance(app_id, str) else None
+    return app.provider if app is not None else CALLBACK_PROVIDER
+
+
 def _log_rejection(reason: str, app_id: str | None = None) -> None:
     """``app_id`` is unknown until the signed state has been read."""
     from .api.auth import _log_oauth_callback_rejection
 
-    _log_oauth_callback_rejection(META_PROVIDER, reason, app_id=app_id, actor_flow=True)
+    _log_oauth_callback_rejection(
+        _provider_of(app_id), reason, app_id=app_id, actor_flow=True
+    )
+
+
+def _is_expired_composio_state(state: str) -> bool:
+    """Whether a genuinely signed, expired state was minted for a Composio app."""
+    from .api.auth import _expired_actor_oauth_state
+
+    return any(
+        expired is not None and expired.get(AUTH_BACKEND_CLAIM) == AUTH_BACKEND
+        for expired in (
+            _expired_actor_oauth_state(state, provider)
+            for provider in {app.provider for app in COMPOSIO_APPS.values()}
+        )
+    )
 
 
 def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
@@ -960,15 +1024,13 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
     from .api.auth import (
         _MAX_USER_ID,
         ActorOAuthFlowRejected,
-        _expired_actor_oauth_state,
         check_actor_oauth_flow,
         verify_token,
     )
 
     payload = verify_token(state)
     if payload is None:
-        expired = _expired_actor_oauth_state(state, META_PROVIDER)
-        if expired is not None and expired.get(AUTH_BACKEND_CLAIM) == AUTH_BACKEND:
+        if _is_expired_composio_state(state):
             raise _reject("state_expired")
         raise _reject("state_invalid")
     nonce = payload.get("actor_flow_nonce")
@@ -978,10 +1040,11 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
     # The Composio-specific claims; the shared actor checks follow.
     if (
         payload.get("type") != "oauth_state"
-        or payload.get("provider") != META_PROVIDER
         or payload.get(AUTH_BACKEND_CLAIM) != AUTH_BACKEND
         or not isinstance(app_id, str)
         or app_id not in COMPOSIO_APPS
+        # A state is spent only on a flow of the provider it was minted for.
+        or payload.get("provider") != COMPOSIO_APPS[app_id].provider
         or type(user_id) is not int
         or not 0 < user_id <= _MAX_USER_ID
         or not isinstance(expires_at, (int, float))
@@ -991,7 +1054,7 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
         owner_key = check_actor_oauth_flow(
             db,
             request,
-            provider=META_PROVIDER,
+            provider=COMPOSIO_APPS[app_id].provider,
             user_id=user_id,
             app_id=app_id,
             nonce=nonce,
@@ -1023,7 +1086,7 @@ def _flow_row_query(db: Session, nonce: str) -> Any:
 def _cookie_scope(db_provider: Any) -> tuple[bool, str]:
     from .api.auth import _actor_oauth_cookie_scope
 
-    return _actor_oauth_cookie_scope(META_PROVIDER, db_provider)
+    return _actor_oauth_cookie_scope(CALLBACK_PROVIDER, db_provider)
 
 
 def _flow_cookie_name(nonce: str) -> str:
@@ -1131,13 +1194,13 @@ def handle_callback(
 
 
 def _too_many_flows_page(app_id: str) -> HTMLResponse:
-    # The limit counts the actor's Facebook and Instagram windows together.
+    # The limit counts all of the actor's Composio windows, whatever the app.
     label = COMPOSIO_APPS[app_id].label
     return _page(
         "Too many sign-in windows are open",
         f"{label} was not connected.",
-        "Close the other Facebook or Instagram sign-in windows, or wait ten "
-        "minutes, and then select Connect again.",
+        "Close the other sign-in windows, or wait ten minutes, and then "
+        "select Connect again.",
         status_code=400,
     )
 
@@ -1185,7 +1248,7 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
             user_id=composio_user_id(
                 config, user_id=flow.user_id, owner_key=flow.owner_key
             ),
-            callback_url=_resolve_oauth_redirect_uri(META_PROVIDER, db_provider),
+            callback_url=_resolve_oauth_redirect_uri(CALLBACK_PROVIDER, db_provider),
         )
     except ComposioError as exc:
         _log_rejection(exc.reason, flow.app_id)
@@ -1246,19 +1309,20 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
         )
         _log_rejection("verification_not_configured", log_app)
         return _clear_flow_cookies(_unavailable_page(*app_ids), db_provider, dead)
+    provider = _provider_of(log_app)
     provider_error = _oauth_callback_provider_error(
-        META_PROVIDER, query.get("error") or "access_denied", None
+        provider, query.get("error") or "access_denied", None
     )
     assert provider_error is not None  # a non-empty error is passed in
     _log_oauth_callback_rejection(
-        META_PROVIDER,
+        provider,
         "provider_error",
         app_id=log_app,
         actor_flow=True,
         provider_error=provider_error,
     )
     return _clear_flow_cookies(
-        _actor_oauth_provider_error_response(META_PROVIDER, provider_error),
+        _actor_oauth_provider_error_response(provider, provider_error),
         db_provider,
         dead,
     )
@@ -1306,8 +1370,9 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             _reject("claims_invalid").response, db_provider, dead
         )
 
-    # A browser can hold Facebook and Instagram flows of the same actor at
-    # once. They share the API key and the Composio user id, so the session
+    # A browser can hold flows of several apps for the same actor at once
+    # (Facebook and Instagram, say). They share the project's API key and the
+    # Composio user id, so the session
     # is completed with any configured app before knowing which app it was;
     # the matched flow's own app then decides the auth config, toolkit and
     # identity checked. One app's missing config never blocks the other's.
@@ -1435,7 +1500,10 @@ def _store_grant(
     try:
         # Composio I/O can overlap a personal disconnect.
         _lock_actor_link(
-            db, user_id=flow.user_id, provider=META_PROVIDER, app_id=flow.app_id
+            db,
+            user_id=flow.user_id,
+            provider=COMPOSIO_APPS[flow.app_id].provider,
+            app_id=flow.app_id,
         )
     except ValueError:
         db.rollback()

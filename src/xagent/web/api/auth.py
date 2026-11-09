@@ -3103,10 +3103,15 @@ def is_actor_oauth_cookie_header(value: str) -> bool:
 
 def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
     """Match the browser cookie to the configured callback URL."""
+    return _oauth_cookie_scope_for(_resolve_oauth_redirect_uri(provider, db_provider))
+
+
+def _oauth_cookie_scope_for(callback_url: str) -> tuple[bool, str]:
+    """``(secure, path)`` of a cookie the browser sends back to ``callback_url``."""
     from urllib.parse import urlparse
 
-    redirect_uri = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
-    return redirect_uri.scheme.lower() == "https", redirect_uri.path or "/"
+    parsed = urlparse(callback_url)
+    return parsed.scheme.lower() == "https", parsed.path or "/"
 
 
 def _encrypt_actor_owner_claim(owner_key: str) -> str:
@@ -3586,18 +3591,18 @@ def start_builtin_oauth_for_resource_owner(
     if not isinstance(response, RedirectResponse):
         return response
     if via_composio:
-        # Same state, flow row and proof cookie; the browser comes back to our
-        # callback path first, which sends it on to Composio (composio_auth).
+        # Same state, flow row and proof cookie; the browser comes back to the
+        # shared Composio callback path first, which sends it on to Composio
+        # (composio_auth). The proof cookie is scoped to that path.
         from urllib.parse import parse_qs, urlsplit
 
         state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
-        response = RedirectResponse(
-            composio_auth.begin_location(
-                _resolve_oauth_redirect_uri(provider, db_provider), state
-            )
-        )
+        callback_url = composio_auth.shared_callback_url(db, provider, db_provider)
+        response = RedirectResponse(composio_auth.begin_location(callback_url, state))
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
+    else:
+        cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
     db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
-    cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
     response.set_cookie(
         _actor_oauth_cookie_name(nonce_digest),
         browser_nonce,

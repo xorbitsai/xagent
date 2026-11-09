@@ -338,6 +338,10 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
             return validate_builtin_public_mcp_apps(connection)
 
 
+# The URL ``init_db_standby`` bound, so activation rebinds the same database writable.
+_standby_db_url: str | None = None
+
+
 def init_db_standby(db_url: str | None = None) -> None:
     """Bind the database for a standby process without writing anything.
 
@@ -350,8 +354,13 @@ def init_db_standby(db_url: str | None = None) -> None:
     from ...db.migration import check_standby_schema
     from .task import check_task_status_enum_drift
 
+    global _standby_db_url
     validate_encryption_config()
-    configure_db(db_url)
+    _standby_db_url = db_url
+    # Enforced by the database (SQLite ``mode=ro``, PostgreSQL READ ONLY
+    # transactions): nothing a standby serves or warms can write the shared
+    # database. ``complete_standby_db_init`` swaps in a writable engine.
+    configure_db(db_url, read_only=True)
     engine = get_engine()
     try:
         check_standby_schema(engine)
@@ -383,7 +392,10 @@ def complete_standby_db_init() -> None:
     """
     from ..services.encryption_key_rotation import validate_stored_encryption_keys
 
+    readonly_engine = get_engine()
     try:
+        configure_db(_standby_db_url)
+        readonly_engine.dispose()
         validate_stored_encryption_keys()
         mismatches = _initialize_database_schema(get_engine())
     except BaseException:
@@ -407,7 +419,6 @@ def _log_builtin_mcp_mismatches(mismatches: list[dict[str, Any]]) -> None:
 
 def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
-    global _engine, _SessionLocal
     # Import all models to ensure they are registered with Base.metadata
     from ..services.encryption_key_rotation import validate_stored_encryption_keys
     from . import (  # noqa: F401
@@ -458,14 +469,7 @@ def init_db(db_url: str | None = None) -> None:
     except BaseException:
         # Lazy workers use an unbound factory to detect that init_db must retry.
         # A failed admission/schema upgrade must not leave a usable factory.
-        failed_engine = _engine
-        _engine = None
-        _SessionLocal = None
-        if failed_engine is not None:
-            try:
-                failed_engine.dispose()
-            except Exception:
-                logger.warning("Failed to dispose rejected database engine")
+        reset_failed_engine()
         raise
 
     _log_builtin_mcp_mismatches(builtin_mcp_mismatches)

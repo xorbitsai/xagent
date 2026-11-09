@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from ..config import (
     get_shared_task_execution_enabled,
+    get_standby_enabled,
     get_task_auto_resume_poll_seconds,
     get_task_execution_role,
     get_task_lease_recovery_batch_size,
@@ -67,18 +68,9 @@ from .services.turn_settlement import drain_turn_settlement_hooks
 logger = logging.getLogger(__name__)
 
 
-def validate_worker_schema(*, allow_older: bool = False) -> None:
-    """Inspect the deployed revision; worker replicas never execute migrations.
-
-    ``allow_older`` is for a standby worker, which starts against the schema
-    the serving release runs: any revision this release knows is accepted.
-    """
+def validate_worker_schema() -> None:
+    """Inspect the deployed revision; worker replicas never execute migrations."""
     engine = get_engine()
-    if allow_older:
-        from ..db.migration import check_standby_schema
-
-        check_standby_schema(engine)
-        return
     expected = set(
         ScriptDirectory.from_config(create_alembic_config(engine)).get_heads()
     )
@@ -95,6 +87,12 @@ async def run_worker(
     initialize_host: Callable[[], Awaitable[None]] | None = None,
     stop: asyncio.Event | None = None,
 ) -> None:
+    if get_standby_enabled():
+        # Without a host that activates it, a standby worker would never claim.
+        # A host with its own control channel (the SaaS pool) wraps this loop.
+        raise ValueError(
+            "XAGENT_STANDBY is not supported by the core worker entry point"
+        )
     validate_encryption_config()
     from ..core.model.network_policy import ModelNetworkPolicy
     from ..core.tools.core.mcp.http import MCPNetworkPolicy

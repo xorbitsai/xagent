@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import subprocess
 import sys
@@ -11,42 +12,14 @@ import pytest
 import sqlalchemy as sa
 from alembic.script import ScriptDirectory
 
+from xagent.config import STANDBY as STANDBY_ENV
 from xagent.db.migration import check_standby_schema, create_alembic_config
 from xagent.web.models import database as database_module
 from xagent.web.services.standby import (
-    STANDBY_ENV,
     StandbyActivationError,
     StandbyController,
     StandbyPhase,
-    standby_requested,
 )
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        (None, False),
-        ("", False),
-        ("0", False),
-        ("off", False),
-        ("1", True),
-        ("True", True),
-    ],
-)
-def test_standby_requested_parses_boolean(
-    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: bool
-) -> None:
-    if raw is None:
-        monkeypatch.delenv(STANDBY_ENV, raising=False)
-    else:
-        monkeypatch.setenv(STANDBY_ENV, raw)
-    assert standby_requested() is expected
-
-
-def test_standby_requested_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STANDBY_ENV, "maybe")
-    with pytest.raises(ValueError):
-        standby_requested()
 
 
 @pytest.mark.parametrize(("raw", "closed"), [("1", True), ("", False)])
@@ -108,10 +81,10 @@ async def test_failed_activation_stays_failed_and_is_not_retried() -> None:
     controller.begin()
     controller.defer("ok", ok)
     controller.defer("boom", boom)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="migration check failed"):
         await controller.activate()
     assert controller.phase is StandbyPhase.FAILED and controller.standby
-    with pytest.raises(StandbyActivationError):
+    with pytest.raises(StandbyActivationError, match="phase is failed"):
         await controller.activate()
     assert ran == ["ok"]
 
@@ -122,7 +95,7 @@ def test_defer_outside_standby_is_refused() -> None:
     async def noop() -> None:
         return None
 
-    with pytest.raises(StandbyActivationError):
+    with pytest.raises(StandbyActivationError, match="cannot defer"):
         controller.defer("x", noop)
 
 
@@ -159,11 +132,17 @@ def test_schema_admission_accepts_older_and_head_revisions(tmp_path: Path) -> No
         check_standby_schema(engine)
 
 
-@pytest.mark.parametrize("revision", ["from_a_newer_release", None])
+@pytest.mark.parametrize(
+    ("revision", "match"),
+    [
+        ("from_a_newer_release", "unknown to this release"),
+        (None, "no Alembic revision"),
+    ],
+)
 def test_schema_admission_refuses_unknown_or_missing_revision(
-    tmp_path: Path, revision: str | None
+    tmp_path: Path, revision: str | None, match: str
 ) -> None:
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match=match):
         check_standby_schema(_sqlite_with_revision(tmp_path, revision))
 
 
@@ -291,10 +270,63 @@ def test_enum_drift_tolerates_missing_labels_only_for_standby(
     expected = list(task_module.Task.__table__.c.status.type.enums)
 
     older = _FakePgBind(expected[:-1])
-    with pytest.raises(task_module.TaskStatusEnumDriftError):
+    with pytest.raises(task_module.TaskStatusEnumDriftError, match="missing labels"):
         task_module.check_task_status_enum_drift(older)
     task_module.check_task_status_enum_drift(older, allow_missing_labels=True)
 
     newer = _FakePgBind([*expected, "LABEL_FROM_A_NEWER_RELEASE"])
-    with pytest.raises(task_module.TaskStatusEnumDriftError):
+    with pytest.raises(
+        task_module.TaskStatusEnumDriftError, match="LABEL_FROM_A_NEWER"
+    ):
         task_module.check_task_status_enum_drift(newer, allow_missing_labels=True)
+
+
+@pytest.mark.asyncio
+async def test_failure_hooks_run_after_a_step_fails_late() -> None:
+    controller = StandbyController()
+    events: list[str] = []
+
+    async def opened() -> None:
+        events.append("opened")
+
+    async def late_failure() -> None:
+        raise RuntimeError("sandbox warmup failed")
+
+    async def undo() -> None:
+        events.append(f"undo phase={controller.phase.value}")
+
+    controller.begin()
+    controller.on_failure(undo)
+    controller.defer("opened", opened)
+    controller.defer("late", late_failure)
+    with pytest.raises(RuntimeError, match="sandbox warmup failed"):
+        await controller.activate()
+    assert events == ["opened", "undo phase=failed"]
+
+
+@pytest.mark.asyncio
+async def test_reset_during_activation_is_not_overwritten_by_it() -> None:
+    controller = StandbyController()
+    reached = asyncio.Event()
+    proceed = asyncio.Event()
+    ran: list[str] = []
+
+    async def first() -> None:
+        reached.set()
+        await proceed.wait()
+        ran.append("first")
+
+    async def second() -> None:
+        ran.append("second")
+
+    controller.begin()
+    controller.defer("first", first)
+    controller.defer("second", second)
+    task = asyncio.create_task(controller.activate())
+    await reached.wait()
+    controller.reset()
+    proceed.set()
+    await task
+    # The steps already snapshotted still finish, but the reset owns the phase.
+    assert ran == ["first", "second"]
+    assert controller.phase is StandbyPhase.NORMAL

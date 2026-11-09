@@ -14,32 +14,26 @@ Two pieces live here and nowhere else, so every host asks the same questions:
   instead of running it; :meth:`StandbyController.activate` runs them in
   registration order, so activation reproduces the order of a normal start.
 
-The module is stdlib-only because ``release_hold`` imports it at import time.
+The module imports only ``config`` (itself a leaf) because ``release_hold``
+imports it at import time.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import time
 from collections.abc import Awaitable, Callable
 from enum import Enum
 
-logger = logging.getLogger(__name__)
+from ...config import get_standby_enabled
 
-STANDBY_ENV = "XAGENT_STANDBY"
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"", "0", "false", "no", "off"}
+logger = logging.getLogger(__name__)
 
 
 def standby_requested() -> bool:
     """True when ``XAGENT_STANDBY`` asks for standby; a bad value is a startup error."""
-    raw = os.environ.get(STANDBY_ENV, "").strip().lower()
-    if raw in _TRUE:
-        return True
-    if raw in _FALSE:
-        return False
-    raise ValueError(f"{STANDBY_ENV} must be a boolean, got {raw!r}")
+    return get_standby_enabled()
 
 
 class StandbyPhase(str, Enum):
@@ -55,6 +49,7 @@ class StandbyActivationError(RuntimeError):
 
 
 DeferredStep = Callable[[], Awaitable[None]]
+FailureHook = Callable[[], Awaitable[None]]
 
 
 class StandbyController:
@@ -63,6 +58,7 @@ class StandbyController:
     def __init__(self) -> None:
         self._phase = StandbyPhase.NORMAL
         self._steps: list[tuple[str, DeferredStep]] = []
+        self._failure_hooks: list[FailureHook] = []
         self._activated_at: float | None = None
         self._lock: asyncio.Lock | None = None
 
@@ -89,6 +85,7 @@ class StandbyController:
         if self._phase is StandbyPhase.NORMAL:
             self._phase = StandbyPhase.STANDBY
             self._steps.clear()
+            self._failure_hooks = []
 
     def defer(self, name: str, step: DeferredStep) -> None:
         """Postpone ``step`` to activation. Only valid while in standby."""
@@ -102,16 +99,23 @@ class StandbyController:
     def deferred(self) -> list[str]:
         return [name for name, _ in self._steps]
 
+    def on_failure(self, callback: FailureHook) -> None:
+        """Register what must run when activation fails after steps already ran.
+
+        A step such as "open admission" has side effects the failure leaves in
+        place (an open hold, started loops); the host undoes them here. Hooks
+        run in registration order, each guarded, after the phase is ``FAILED``.
+        """
+        self._failure_hooks.append(callback)
+
     async def activate(self) -> None:
         """Run every deferred step in order; idempotent once active.
 
-        A failure leaves the phase ``FAILED`` and the caller's release hold
-        closed: a half-activated process never serves. A later call after a
-        failure is refused rather than retried, because steps that already
-        ran (a migration check, a started loop) are not safe to run twice.
+        A failure leaves the phase ``FAILED`` and runs the failure hooks, so a
+        half-activated process never serves. A later call after a failure is
+        refused rather than retried, because steps that already ran (a
+        migration check, a started loop) are not safe to run twice.
         """
-        import time
-
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
@@ -126,18 +130,28 @@ class StandbyController:
             # (schedule cutoffs, "process started at" bounds) must see the
             # activation instant, never the earlier import time.
             self._activated_at = time.time()
+            steps = list(self._steps)
+            hooks = self._failure_hooks
             try:
-                for name, step in self._steps:
+                for name, step in steps:
                     logger.info("Standby activation: %s", name)
                     await step()
             except BaseException:
-                self._activated_at = None
-                self._phase = StandbyPhase.FAILED
+                if self._phase is StandbyPhase.ACTIVATING:
+                    self._activated_at = None
+                    self._phase = StandbyPhase.FAILED
                 logger.exception("Standby activation failed; staying closed")
+                for hook in list(hooks):
+                    try:
+                        await hook()
+                    except Exception:
+                        logger.exception("Standby failure hook failed")
                 raise
-            self._steps.clear()
-            self._phase = StandbyPhase.ACTIVE
-            logger.info("Standby activation complete")
+            # A shutdown that reset the ledger mid-activation owns the phase.
+            if self._phase is StandbyPhase.ACTIVATING:
+                self._steps.clear()
+                self._phase = StandbyPhase.ACTIVE
+                logger.info("Standby activation complete")
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -150,6 +164,7 @@ class StandbyController:
         """Back to a normal process; for tests and a fresh ASGI lifespan."""
         self._phase = StandbyPhase.NORMAL
         self._steps.clear()
+        self._failure_hooks = []
         self._activated_at = None
         self._lock = None
 

@@ -133,18 +133,18 @@ from .services.ops_signals import (
     register_degradation,
 )
 from .services.orphan_upload_gc import run_orphan_upload_gc_loop
+from .services.release_hold import release_hold
 from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
 )
+from .services.standby import standby, standby_requested
 from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
-from .services.release_hold import release_hold
-from .services.standby import standby, standby_requested
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
@@ -2439,14 +2439,108 @@ async def _start_late_tasks() -> None:
     start_composio_reconcile_task(app)
 
 
+async def _stop_runtime_loops() -> None:
+    """Stop the background loops and dispatchers startup (or activation) started.
+
+    Shared by shutdown and by a failed standby activation, which must not leave
+    the claim paths it already started running.
+    """
+    global \
+        _file_storage_startup_sync_task, \
+        _migration_task, \
+        _task_command_dispatcher_task, \
+        _trigger_dispatcher_task, \
+        _sandbox_idle_sweep_task
+
+    if _task_command_dispatcher_task is not None:
+        from .services.task_command_transport import stop_task_command_dispatcher
+
+        await stop_task_command_dispatcher()
+    _task_command_dispatcher_task = None
+
+    await stop_orphan_upload_gc_task(app)
+    await stop_composio_reconcile_task(app)
+    await stop_retention_purge_task(app)
+    await stop_task_cleanup_retry_task(app)
+    await stop_uploaded_file_recovery_task(app)
+    await stop_task_auto_resume_task(app)
+    await stop_task_lease_recovery_task(app)
+
+    if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
+        logger.info("Cancelling sandbox idle sweep task...")
+        _sandbox_idle_sweep_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sandbox_idle_sweep_task
+    _sandbox_idle_sweep_task = None
+
+    if _file_storage_startup_sync_task and not _file_storage_startup_sync_task.done():
+        logger.info("Cancelling background startup file storage sync task...")
+        _file_storage_startup_sync_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _file_storage_startup_sync_task
+    _file_storage_startup_sync_task = None
+
+    if _trigger_dispatcher_task and not _trigger_dispatcher_task.done():
+        logger.info("Cancelling trigger dispatcher task...")
+        _trigger_dispatcher_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _trigger_dispatcher_task
+    _trigger_dispatcher_task = None
+
+    if _migration_task and not _migration_task.done():
+        logger.info("Cancelling background LanceDB migration task...")
+        _migration_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _migration_task
+    _migration_task = None
+
+    # Cancel metadata rebuild background task
+    if hasattr(app.state, "metadata_rebuild_task"):
+        task = app.state.metadata_rebuild_task
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def _abort_standby_activation() -> None:
+    """A failed activation must not leave an open hold or running claim paths.
+
+    Stops what the already-run activation steps started: the loops and
+    dispatchers, any chat channel, and (shared execution) the event bridge.
+    The process is then stopped by its host; a failed standby is never retried.
+    """
+    release_hold.seal("standby activation failed")
+    await _stop_runtime_loops()
+    channel_tasks = [
+        task
+        for name in ("telegram_task", "feishu_task", "slack_task")
+        if (task := getattr(app.state, name, None)) is not None
+    ]
+    for task in channel_tasks:
+        task.cancel()
+    await asyncio.gather(*channel_tasks, return_exceptions=True)
+    if get_shared_task_execution_enabled():
+        from .api.websocket import manager
+        from .services.task_event_bridge import stop_task_event_bridge
+
+        try:
+            await manager.stop_stream_reconciliation()
+            await stop_task_event_bridge()
+        except Exception:
+            logger.exception(
+                "Failed to stop the task event bridge after a failed activation"
+            )
+
+
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _migration_task
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
     if standby_requested():
         standby.begin()
+        standby.on_failure(_abort_standby_activation)
         release_hold.seal("standby")
     validate_auth_config()
     from ..core.model.network_policy import ModelNetworkPolicy
@@ -2567,13 +2661,9 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global \
-        _file_storage_startup_sync_task, \
-        _migration_task, \
-        _task_command_dispatcher_task, \
-        _trigger_dispatcher_task, \
-        _sandbox_idle_sweep_task
-
+    # A standby that never activated owns nothing shared: it must not clean up
+    # sandboxes (or anything else) the serving process still runs.
+    was_standby = standby.standby
     # A next lifespan in this process starts from a clean standby ledger, and
     # steps a never-activated standby postponed are dropped with it.
     standby.reset()
@@ -2600,55 +2690,7 @@ async def shutdown_event() -> None:
 
     flush_langfuse()
 
-    if _task_command_dispatcher_task is not None:
-        from .services.task_command_transport import stop_task_command_dispatcher
-
-        await stop_task_command_dispatcher()
-    _task_command_dispatcher_task = None
-
-    await stop_orphan_upload_gc_task(app)
-    await stop_composio_reconcile_task(app)
-    await stop_retention_purge_task(app)
-    await stop_task_cleanup_retry_task(app)
-    await stop_uploaded_file_recovery_task(app)
-    await stop_task_auto_resume_task(app)
-    await stop_task_lease_recovery_task(app)
-
-    if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
-        logger.info("Cancelling sandbox idle sweep task...")
-        _sandbox_idle_sweep_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _sandbox_idle_sweep_task
-    _sandbox_idle_sweep_task = None
-
-    if _file_storage_startup_sync_task and not _file_storage_startup_sync_task.done():
-        logger.info("Cancelling background startup file storage sync task...")
-        _file_storage_startup_sync_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _file_storage_startup_sync_task
-    _file_storage_startup_sync_task = None
-
-    if _trigger_dispatcher_task and not _trigger_dispatcher_task.done():
-        logger.info("Cancelling trigger dispatcher task...")
-        _trigger_dispatcher_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _trigger_dispatcher_task
-    _trigger_dispatcher_task = None
-
-    if _migration_task and not _migration_task.done():
-        logger.info("Cancelling background LanceDB migration task...")
-        _migration_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _migration_task
-    _migration_task = None
-
-    # Cancel metadata rebuild background task
-    if hasattr(app.state, "metadata_rebuild_task"):
-        task = app.state.metadata_rebuild_task
-        if task and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+    await _stop_runtime_loops()
 
     # Shutdown chat channels before draining task finalizers.
     try:
@@ -2731,7 +2773,7 @@ async def shutdown_event() -> None:
     from .sandbox_manager import get_sandbox_manager
 
     sandbox_mgr = get_sandbox_manager()
-    if sandbox_mgr:
+    if sandbox_mgr and not was_standby:
         await sandbox_mgr.cleanup()
 
     # Wait briefly for the background orphaned temp-file cleanup to unwind (its

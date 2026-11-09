@@ -52,6 +52,7 @@ AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+STANDBY = "XAGENT_STANDBY"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
 WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
@@ -1196,6 +1197,21 @@ def get_shared_task_execution_enabled() -> bool:
     if configured is not None and configured.strip():
         return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
     return get_worker_count() is not None or get_task_execution_role() != "combined"
+
+
+def get_standby_enabled() -> bool:
+    """Whether this process starts as a warmed standby (``XAGENT_STANDBY``).
+
+    A standby binds the database read-only, writes nothing and starts no claim
+    path or singleton until it is activated. Strict on purpose: a typo must not
+    silently fall back to a normal start that writes beside the serving process.
+    """
+    raw = os.getenv(STANDBY, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{STANDBY} must be a boolean, got {raw!r}")
 
 
 def get_task_execution_role() -> Literal["combined", "web", "worker"]:

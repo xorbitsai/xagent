@@ -111,6 +111,10 @@ def test_a_verification_routed_to_another_region_binds_nothing(
 
     response = browser.get(au_db, _verify_url(composio, sg_account))
 
+    # With the same Composio user id, Composio does activate SG's account for
+    # AU's completion; with a different one it refuses. Either way AU binds
+    # nothing it did not create.
+    assert (sg_account in composio.completed) == (au_owner == OWNER)
     assert response.status_code == 400
     assert _grants(au_db) == []
     assert _grants(sg_db) == []
@@ -123,18 +127,25 @@ def test_a_verification_routed_to_another_region_binds_nothing(
     assert _grants(sg_db) == []
 
 
+@pytest.mark.parametrize(
+    "au_owner",
+    [OWNER, OTHER_REGION_OWNER],
+    ids=["same-actor-key", "other-actor-key"],
+)
 def test_a_begin_in_another_region_ends_this_regions_flow_in_the_browser(
-    regions, composio_env, composio
+    regions, composio_env, composio, au_owner
 ):
-    """A flow whose row lives in another region's database is not one this
-    region can verify, so the second region's begin clears its cookie: the
-    first connect fails closed rather than waiting to be misrouted."""
+    """The second region's begin clears the first region's flow cookie: the
+    first connect fails closed rather than waiting to be misrouted. With the
+    same actor key it is cleared because its row is not in this region's
+    database; with another actor key, because only one actor's flows stay
+    open in a browser."""
     (sg_db, sg_user), (au_db, au_user) = regions
     browser = Browser()
     _begin(sg_db, sg_user, browser, OWNER)
     (sg_cookie,) = _flow_cookies(browser)
 
-    _begin(au_db, au_user, browser, OTHER_REGION_OWNER)
+    _begin(au_db, au_user, browser, au_owner)
 
     assert sg_cookie not in _flow_cookies(browser)
     assert len(_flow_cookies(browser)) == 1

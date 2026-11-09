@@ -332,11 +332,12 @@ def _unavailable_page(*app_ids: str) -> HTMLResponse:
 def start_preflight(app_id: str) -> HTMLResponse | None:
     """Refuse a Composio start this deployment cannot finish."""
     label = COMPOSIO_APPS[app_id].label
-    # xagent-saas's per-connection region routing
-    # (XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED) routes the verification and
-    # denial trips, which carry no ``state``, by a fixed-name route cookie
-    # (xorbitsai/xagent-saas#2461). A trip that still reaches another region
-    # binds nothing there: see tests/web/test_composio_cross_region.py.
+    # With xagent-saas's per-connection region routing on
+    # (XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED), the verification and denial
+    # trips, which carry no ``state``, are meant to be routed by a fixed-name
+    # route cookie that xagent-saas mints and the edge reads
+    # (xorbitsai/xagent-saas#2461). A trip that reaches another region binds
+    # nothing there: see tests/web/test_composio_cross_region.py.
     try:
         _configured_callback_url()
     except _CallbackUrlInvalid as problem:

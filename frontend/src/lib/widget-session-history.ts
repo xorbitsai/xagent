@@ -12,7 +12,8 @@ export const HISTORY_REQUEST_TIMEOUT_MS = 20_000
 
 // "disabled" is the server's 403 and "not_found" its 404; the response body is
 // never read to tell them apart. "unauthorized" is a 401 that was not
-// refreshed. Everything else is "load_failed".
+// refreshed. Everything else is "load_failed", except a caller abort, which
+// fails as an AbortError like the session upload's.
 export type WidgetSessionHistoryErrorKind = "not_found" | "disabled" | "unauthorized" | "load_failed"
 
 export class WidgetSessionHistoryError extends Error {
@@ -39,15 +40,15 @@ export interface WidgetConversationSummary {
 
 export interface WidgetConversationAttachment {
   filename: string
-  file_size: number | null
-  mime_type: string | null
+  fileSize: number | null
+  mimeType: string | null
 }
 
 export interface WidgetConversationMessage {
   id: number
   role: "user" | "assistant"
   content: string
-  created_at: string
+  createdAt: string
   attachments: WidgetConversationAttachment[]
 }
 
@@ -57,6 +58,27 @@ export interface WidgetSessionHistoryPage {
 }
 
 const loadFailed = () => new WidgetSessionHistoryError("load_failed")
+
+const abortError = (): DOMException => new DOMException("The read was aborted.", "AbortError")
+
+// Waits for `promise` unless `signal` aborts first. The abort settles only
+// this caller's wait; the promise itself, which may be shared, keeps running.
+const raceAbort = <T,>(promise: Promise<T>, signal?: AbortSignal): Promise<T> => {
+  if (!signal) return promise
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(abortError())
+    signal.addEventListener("abort", onAbort, { once: true })
+    // Attached before the check below, so a promise that rejects after this
+    // wait was aborted is still handled.
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value) },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error) },
+    )
+    // The source may have aborted the signal while it was being called, which
+    // is before this listener existed.
+    if (signal.aborted) onAbort()
+  })
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -96,7 +118,7 @@ const parseAttachment = (entry: unknown): WidgetConversationAttachment | null =>
   ) {
     return null
   }
-  return { filename: entry.filename, file_size: entry.file_size, mime_type: entry.mime_type }
+  return { filename: entry.filename, fileSize: entry.file_size, mimeType: entry.mime_type }
 }
 
 const parseMessagePage = (
@@ -125,7 +147,7 @@ const parseMessagePage = (
       id: entry.id,
       role: entry.role,
       content: entry.content,
-      created_at: entry.created_at,
+      createdAt: entry.created_at,
       attachments,
     })
   }
@@ -204,12 +226,15 @@ const request = async <T,>(
   // Checked after every wait, so an aborted read neither sends a request nor
   // asks for a refreshed token.
   const ensureActive = () => {
-    if (signal?.aborted) throw loadFailed()
+    if (signal?.aborted) throw abortError()
   }
+  // A token wait is not covered by the request deadline, so it is raced
+  // against the caller's signal: an abort ends the read even while a token is
+  // still pending.
   const obtain = async (source: () => Promise<string>): Promise<string> => {
     let token: string
     try {
-      token = await source()
+      token = await raceAbort(source(), signal)
     } catch {
       throw loadFailed()
     }
@@ -217,18 +242,25 @@ const request = async <T,>(
     return token
   }
 
-  ensureActive()
-  const token = await obtain(auth.getToken)
-  const first = await attempt(url, token, parse, signal)
-  ensureActive()
-  if (first.kind === "ok") return first.value
-  const refreshToken = auth.refreshToken
-  if (!refreshToken) throw new WidgetSessionHistoryError("unauthorized")
-  const refreshed = await obtain(() => refreshToken(token))
-  const retry = await attempt(url, refreshed, parse, signal)
-  ensureActive()
-  if (retry.kind === "ok") return retry.value
-  throw loadFailed()
+  try {
+    ensureActive()
+    const token = await obtain(auth.getToken)
+    const first = await attempt(url, token, parse, signal)
+    ensureActive()
+    if (first.kind === "ok") return first.value
+    const refreshToken = auth.refreshToken
+    if (!refreshToken) throw new WidgetSessionHistoryError("unauthorized")
+    const refreshed = await obtain(() => refreshToken(token))
+    const retry = await attempt(url, refreshed, parse, signal)
+    ensureActive()
+    if (retry.kind === "ok") return retry.value
+    throw loadFailed()
+  } catch (error) {
+    // Whatever the request ran into, a read the caller aborted fails as
+    // aborted.
+    ensureActive()
+    throw error
+  }
 }
 
 export function listWidgetConversations(

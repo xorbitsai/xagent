@@ -65,13 +65,13 @@ const MESSAGES_RESULT = {
       id: 1,
       role: "user",
       content: "Where is my order?",
-      created_at: "2026-01-02T03:04:05Z",
+      createdAt: "2026-01-02T03:04:05Z",
       attachments: [
-        { filename: "receipt.pdf", file_size: 11, mime_type: "application/pdf" },
-        { filename: "note.txt", file_size: null, mime_type: null },
+        { filename: "receipt.pdf", fileSize: 11, mimeType: "application/pdf" },
+        { filename: "note.txt", fileSize: null, mimeType: null },
       ],
     },
-    { id: 2, role: "assistant", content: "It ships today.", created_at: "2026-01-02T03:04:06Z", attachments: [] },
+    { id: 2, role: "assistant", content: "It ships today.", createdAt: "2026-01-02T03:04:06Z", attachments: [] },
   ],
   nextCursor: null,
 }
@@ -117,6 +117,12 @@ const expectKind = (outcome: unknown, kind: WidgetSessionHistoryErrorKind) => {
   const error = (outcome as { error?: unknown }).error
   expect(error).toBeInstanceOf(WidgetSessionHistoryError)
   expect((error as WidgetSessionHistoryError).kind).toBe(kind)
+}
+
+const expectAborted = (outcome: unknown) => {
+  const error = (outcome as { error?: unknown }).error
+  expect(error).toBeInstanceOf(DOMException)
+  expect((error as DOMException).name).toBe("AbortError")
 }
 
 const expectEveryRequestIsTokenSafe = (path: string) => {
@@ -333,15 +339,46 @@ describe.each(Object.keys(ENDPOINTS) as Array<keyof typeof ENDPOINTS>)("the %s r
   })
 
   describe("a caller that aborts", () => {
-    it("fails as load_failed without a request when aborted before it starts", async () => {
+    it("fails as aborted without a request when aborted before it starts", async () => {
       const controller = new AbortController()
       controller.abort()
 
-      expectKind(await outcomeOf(endpoint.call(makeAuth(), controller.signal)), "load_failed")
+      expectAborted(await outcomeOf(endpoint.call(makeAuth(), controller.signal)))
       expect(fetchMock).not.toHaveBeenCalled()
     })
 
-    it("fails as load_failed when aborted while the request is in flight", async () => {
+    it("fails as aborted while the token is still pending, without a request", async () => {
+      const controller = new AbortController()
+      const auth = makeAuth({ getToken: vi.fn(() => new Promise<string>(() => {})) })
+      const pending = outcomeOf(endpoint.call(auth, controller.signal))
+      await vi.waitFor(() => expect(auth.getToken).toHaveBeenCalledTimes(1))
+
+      controller.abort()
+      expectAborted(await pending)
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    it("fails as aborted while the refreshed token is still pending, without a retry", async () => {
+      const controller = new AbortController()
+      const auth = makeAuth({ refreshToken: vi.fn(() => new Promise<string>(() => {})) })
+      fetchMock.mockResolvedValueOnce(jsonResponse(401, {}))
+      const pending = outcomeOf(endpoint.call(auth, controller.signal))
+      await vi.waitFor(() => expect(auth.refreshToken).toHaveBeenCalledTimes(1))
+
+      controller.abort()
+      expectAborted(await pending)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    })
+
+    it("still fails as load_failed when the token cannot be obtained and nothing aborts", async () => {
+      const controller = new AbortController()
+      const auth = makeAuth({ getToken: vi.fn(async () => { throw new Error("no token") }) })
+
+      expectKind(await outcomeOf(endpoint.call(auth, controller.signal)), "load_failed")
+      expect(fetchMock).not.toHaveBeenCalled()
+    })
+
+    it("fails as aborted when aborted while the request is in flight", async () => {
       const controller = new AbortController()
       fetchMock.mockImplementationOnce((_input, init) => new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
@@ -350,7 +387,7 @@ describe.each(Object.keys(ENDPOINTS) as Array<keyof typeof ENDPOINTS>)("the %s r
       await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
 
       controller.abort()
-      expectKind(await pending, "load_failed")
+      expectAborted(await pending)
     })
 
     it("does not refresh the token after an abort", async () => {
@@ -361,12 +398,12 @@ describe.each(Object.keys(ENDPOINTS) as Array<keyof typeof ENDPOINTS>)("the %s r
         return jsonResponse(401, {})
       })
 
-      expectKind(await outcomeOf(endpoint.call(auth, controller.signal)), "load_failed")
+      expectAborted(await outcomeOf(endpoint.call(auth, controller.signal)))
       expect(auth.refreshToken).not.toHaveBeenCalled()
       expect(fetchMock).toHaveBeenCalledTimes(1)
     })
 
-    it("fails as load_failed when aborted before the retry after a refresh answers", async () => {
+    it("fails as aborted when aborted before the retry after a refresh answers", async () => {
       const controller = new AbortController()
       const auth = makeAuth()
       fetchMock.mockResolvedValueOnce(jsonResponse(401, {}))
@@ -375,7 +412,7 @@ describe.each(Object.keys(ENDPOINTS) as Array<keyof typeof ENDPOINTS>)("the %s r
         return jsonResponse(200, endpoint.okBody)
       })
 
-      expectKind(await outcomeOf(endpoint.call(auth, controller.signal)), "load_failed")
+      expectAborted(await outcomeOf(endpoint.call(auth, controller.signal)))
       expect(auth.refreshToken).toHaveBeenCalledTimes(1)
       expect(fetchMock).toHaveBeenCalledTimes(2)
     })
@@ -389,7 +426,7 @@ describe.each(Object.keys(ENDPOINTS) as Array<keyof typeof ENDPOINTS>)("the %s r
         }),
       })
 
-      expectKind(await outcomeOf(endpoint.call(auth, controller.signal)), "load_failed")
+      expectAborted(await outcomeOf(endpoint.call(auth, controller.signal)))
       expect(fetchMock).not.toHaveBeenCalled()
     })
   })

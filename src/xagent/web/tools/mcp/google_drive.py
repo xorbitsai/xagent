@@ -22,6 +22,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
+from . import composio_proxy, composio_tools, google_api_proxy
 from .utils import (
     allowed_dirs_from_env,
     clamp_limit,
@@ -112,6 +113,16 @@ _DRIVE_PATH_SHAPE_PATTERN = re.compile(rf"/(?:{_DRIVE_PATH_ALTERNATION})/")
 _DRIVE_URL_HOSTS = frozenset(
     {"drive.google.com", "docs.google.com", "drive.usercontent.google.com"}
 )
+
+# The only host a proxied Drive call goes to. Media downloads and exports,
+# metadata reads and permission calls all live under it; uploads on a
+# Composio grant do not use the transport at all.
+_DRIVE_API_HOSTS = frozenset({"www.googleapis.com"})
+# A Drive resource key travels as a request header, so the proxy transport
+# must forward it for a pre-2021 link-shared file to resolve.
+_DRIVE_RESOURCE_KEY_HEADER = "X-Goog-Drive-Resource-Keys"
+# The file fields both create paths return, matching the native requests.
+_CREATED_FILE_FIELDS = "id, name, webViewLink, mimeType"
 
 # "owner" is deliberately excluded: ownership transfer needs
 # transferOwnership=True, is not reversible the way a role change is, and is
@@ -844,6 +855,13 @@ def _safe_output_filename(name: str) -> str:
 
 
 def _download_media(request: Any) -> bytes:
+    """The media request's whole content.
+
+    On a Composio grant the proxy transport turns a binary answer
+    (``binary_data``) back into bytes and reports their full length, so the
+    downloader's first chunk is the whole file. Nothing here knows which
+    backend the request goes through.
+    """
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
@@ -1015,6 +1033,21 @@ def _name_looks_binary(name: str) -> bool:
 
 
 def get_drive_service() -> Any:
+    if composio_proxy.serves_composio_grant():
+        # A Composio-backed grant holds no Google token: Composio injects it
+        # into each proxied call. The discovery document comes from
+        # googleapiclient's bundled copy and is never fetched through the
+        # proxy.
+        return build(
+            "drive",
+            "v3",
+            http=google_api_proxy.GoogleApiProxyHttp(
+                allowed_hosts=_DRIVE_API_HOSTS,
+                extra_headers=(_DRIVE_RESOURCE_KEY_HEADER,),
+            ),
+            static_discovery=True,
+        )
+
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
@@ -1039,15 +1072,25 @@ def get_drive_service() -> Any:
 
 
 # What a Drive connection can see depends on its OAuth scope, which this
-# process does not know. With the per-file drive.file scope, files.list and
-# files.get only see files created through this app or explicitly granted to
-# it, so the user's other files look missing. Both texts below are worded to
-# stay true under either scope.
+# process does not know. A native connection may use the per-file drive.file
+# scope, where files.list and files.get only see files created through this
+# app or explicitly granted to it, so the user's other files look missing. A
+# Composio-backed grant holds the full drive scope instead, so that caveat is
+# left out of every message below for it.
 _PER_FILE_ACCESS_NOTE = (
     "If this connection uses per-file Drive access, it can only see files "
     "created through this app or explicitly granted to it, so a file the "
     "user can open in Google Drive may still not be visible here."
 )
+
+
+def _per_file_access_note() -> str:
+    """The drive.file caveat, unless the grant has full Drive access."""
+    if composio_proxy.serves_composio_grant():
+        return ""
+    return _PER_FILE_ACCESS_NOTE
+
+
 # The Google Docs, Sheets and Slides connectors open their own files by link
 # without this connection, but cannot open an Office file stored in Drive.
 # This process does not know which of them are connected, so the hint for
@@ -1069,11 +1112,17 @@ _OFFICE_FILE_HINT = (
     "as a Google file (for example File > Save as Google Sheets) and paste "
     "the new file's link."
 )
-_EMPTY_SEARCH_NOTE = (
-    "No files matched. This connection only sees files it can access. "
-    f"{_PER_FILE_ACCESS_NOTE} An empty result does not mean the file does "
-    f"not exist. {_OPEN_BY_LINK_HINT} {_OFFICE_FILE_HINT}"
-)
+
+
+def _empty_search_note() -> str:
+    note = _per_file_access_note()
+    return (
+        "No files matched. This connection only sees files it can access. "
+        f"{note + ' ' if note else ''}An empty result does not mean the file "
+        f"does not exist. {_OPEN_BY_LINK_HINT} {_OFFICE_FILE_HINT}"
+    )
+
+
 # files.list can return an empty page together with a nextPageToken, so an
 # empty page only means "nothing matched" when no token comes with it.
 _EMPTY_PAGE_NOTE = (
@@ -1084,9 +1133,10 @@ _EMPTY_PAGE_NOTE = (
 
 
 def _unavailable_file_message(exc: Exception) -> str:
+    note = _per_file_access_note()
     return (
         "Google Drive could not open this file: it does not exist, or this "
-        f"Drive connection cannot access it. {_PER_FILE_ACCESS_NOTE} "
+        f"Drive connection cannot access it. {note + ' ' if note else ''}"
         f"{_OPEN_BY_LINK_HINT} {_OFFICE_FILE_HINT} Google API response: "
         f"{google_api_error_summary(exc)}"
     )
@@ -1114,12 +1164,10 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
     some matching files were cut to fit -- treat the "files" list as
     possibly incomplete in that case rather than the full result set.
 
-    Results only include files this connection can access. With per-file
-    Drive access (drive.file), that is only files created through this app
-    or explicitly granted to it, so a file missing from the results may
-    still exist. An empty result carries a "note" field explaining this; when
-    Google reports that more results may exist beyond an empty page, the note
-    says so instead.
+    Results only include files this connection can access, so a file missing
+    from the results may still exist. An empty result carries a "note" field
+    explaining why it is empty; when Google reports that more results may
+    exist beyond an empty page, the note says so instead.
     """
     try:
         page_size = clamp_limit(max_results, max_limit=1000)
@@ -1145,7 +1193,7 @@ def google_drive_search(query: str = "", max_results: int = 10) -> str:
                     "note": (
                         _EMPTY_PAGE_NOTE
                         if results.get("nextPageToken")
-                        else _EMPTY_SEARCH_NOTE
+                        else _empty_search_note()
                     ),
                 },
                 ensure_ascii=False,
@@ -1479,6 +1527,15 @@ def google_drive_upload_file(
             file_metadata, parent_id
         )
 
+        if composio_proxy.serves_composio_grant():
+            return _upload_file_via_composio(
+                file_path=file_path,
+                local_path=local_path,
+                name=resolved_name,
+                mime_type=resolved_mime_type,
+                parent_id=resolved_parent_id,
+            )
+
         service = get_drive_service()
 
         # local_path.open() here is a fresh by-path open, not the same
@@ -1541,6 +1598,9 @@ def google_drive_upload_file(
 # one extra round trip on the resumable path. Read at call time so tests can
 # lower them.
 _SIMPLE_UPLOAD_MAX_BYTES = 5_000_000
+# A staged Composio upload keeps a file at most this large in memory, so a
+# small upload reads it once and a larger one streams it with block checks.
+_STAGED_UPLOAD_IN_MEMORY_BYTES = 5_000_000
 # A resumable upload's chunks must be a multiple of 256 KiB.
 _RESUMABLE_CHUNK_BYTES = 16 * 1024 * 1024
 # A product guard-rail, not a Drive limit (Drive accepts far larger files),
@@ -1926,11 +1986,16 @@ def _unavailable_content_update_message(exc: Exception, lead: str | None = None)
         )
     # Not _OPEN_BY_LINK_HINT: opening the file with the Docs, Sheets or Slides
     # tools does not help for a stored .pptx, .xlsx or PDF.
+    per_file = ""
+    if not composio_proxy.serves_composio_grant():
+        per_file = (
+            " If this connection uses per-file Drive access, it can only "
+            "change files created through this app or explicitly granted to "
+            "it, so a file the user uploaded to Google Drive themselves may "
+            "not be reachable here."
+        )
     return (
-        f"{lead} If this connection uses per-file Drive access, it can only "
-        "change files created through this app or explicitly granted to it, "
-        "so a file the user uploaded to Google Drive themselves may not be "
-        "reachable here. "
+        f"{lead}{per_file} "
         "Options to offer the user: (1) if Google Drive's file picker is "
         "available for this connection, select the file there and ask again; "
         "(2) replace the file themselves in Google Drive (Manage versions > "
@@ -2033,6 +2098,21 @@ def _is_content_rejection(exc: Exception) -> bool:
     return status is not None and 400 <= status < 500 and status != 408
 
 
+def _same_content(current: dict[str, Any], previous: dict[str, Any]) -> bool:
+    """Whether ``current`` still has the content and head revision of
+    ``previous``."""
+    old_md5 = previous.get("md5Checksum")
+    new_md5 = current.get("md5Checksum")
+    if not (
+        isinstance(old_md5, str)
+        and old_md5
+        and isinstance(new_md5, str)
+        and new_md5.lower() == old_md5.lower()
+    ):
+        return False
+    return current.get("headRevisionId") == previous.get("headRevisionId")
+
+
 def _reread_unchanged_file(
     service: Any, file_id: str, resource_key: str | None, previous: dict[str, Any]
 ) -> tuple[dict[str, Any] | None, Exception | None]:
@@ -2042,6 +2122,23 @@ def _reread_unchanged_file(
     the content read before the update (the same checksum and head
     revision), and ``None`` otherwise. The second is the error when the
     file cannot be read, and ``None`` otherwise."""
+    now, error = _read_content_update_file(service, file_id, resource_key)
+    if error is not None or now is None:
+        return None, error
+    if not _same_content(now, previous):
+        return None, None
+    return now, None
+
+
+def _read_content_update_file(
+    service: Any, file_id: str, resource_key: str | None
+) -> tuple[dict[str, Any] | None, Exception | None]:
+    """The file's content metadata now, or the error that stopped the read.
+
+    Used to settle an update whose answer is missing: Drive's checksum is
+    the evidence, so a read that fails leaves the outcome unknown rather
+    than assumed either way.
+    """
     request = service.files().get(
         fileId=file_id,
         supportsAllDrives=True,
@@ -2051,24 +2148,542 @@ def _reread_unchanged_file(
     try:
         now = request.execute(num_retries=_CONTENT_UPDATE_NUM_RETRIES)
     except Exception as exc:
-        logger.warning(
-            "Could not read file %s again after the update: %s", file_id, exc
-        )
+        logger.warning("Could not read file %s after the update: %s", file_id, exc)
         return None, exc
     if not isinstance(now, dict):
-        return None, None
-    old_md5 = previous.get("md5Checksum")
-    new_md5 = now.get("md5Checksum")
-    if not (
-        isinstance(old_md5, str)
-        and old_md5
-        and isinstance(new_md5, str)
-        and new_md5.lower() == old_md5.lower()
-    ):
-        return None, None
-    if now.get("headRevisionId") != previous.get("headRevisionId"):
-        return None, None
+        return None, RuntimeError("Drive returned an invalid file response")
     return now, None
+
+
+def _holds_content(file: dict[str, Any], *, md5: str, size: int) -> bool:
+    """Whether ``file`` is Drive's record of exactly the bytes uploaded."""
+    stored_md5 = file.get("md5Checksum")
+    if not isinstance(stored_md5, str) or not stored_md5:
+        return False
+    if stored_md5.lower() != md5.lower():
+        return False
+    stored_size = _as_int(file.get("size"))
+    return stored_size is None or stored_size == size
+
+
+class _VerifiedStagedReader:
+    """The hashed bytes of ``fh``, checked block by block while they upload.
+
+    A staged upload reads the replacement file again after the hash pass.
+    Each read is aligned to the hash pass's blocks and compared with its
+    digest, so bytes that changed since then are never sent: the read raises
+    and the staging upload stops. Only a temporary object is being written,
+    so Drive is never touched by a stopped upload.
+    """
+
+    def __init__(self, fh: BinaryIO, *, size: int, block_digests: list[bytes]) -> None:
+        self._fh = fh
+        self._size = size
+        self._block_digests = block_digests
+        self._offset = 0
+
+    def __len__(self) -> int:
+        # What requests uses for Content-Length, so the body is not chunked.
+        return self._size
+
+    def read(self, amount: int = -1) -> bytes:
+        end = (
+            self._size
+            if amount is None or amount < 0
+            else min(self._offset + amount, self._size)
+        )
+        if self._offset >= end:
+            return b""
+        first_block = self._offset // _HASH_BLOCK_BYTES
+        start = first_block * _HASH_BLOCK_BYTES
+        stop = min(-(-end // _HASH_BLOCK_BYTES) * _HASH_BLOCK_BYTES, self._size)
+        self._fh.seek(start)
+        data = _read_exactly(self._fh, stop - start)
+        for index, offset in enumerate(
+            range(0, len(data), _HASH_BLOCK_BYTES), first_block
+        ):
+            block = data[offset : offset + _HASH_BLOCK_BYTES]
+            if _block_digest(block) != self._block_digests[index]:
+                raise _ReplacementChangedError(_LOCAL_FILE_CHANGED)
+        beginning = self._offset
+        self._offset = end
+        return data[beginning - start : end - start]
+
+
+def _tool_file_object(data: Any) -> dict[str, Any]:
+    """The file object in a Drive tool's answer, or an empty mapping.
+
+    Composio does not document the create tool's output shape. Only the id
+    is needed; a tool answer has been seen to carry it at the top level, and
+    an SDK-style answer wraps it in ``file`` or ``data``.
+    """
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    for candidate in (data, data.get("file"), data.get("data")):
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("id"), str)
+            and candidate["id"]
+        ):
+            return candidate
+    return {}
+
+
+def _created_file_metadata(file_id: str, tool_data: Any) -> dict[str, Any]:
+    """The new file's metadata, matching what the native create path returns.
+
+    Read back through the proxy so the output shape does not depend on the
+    Composio tool's answer. If that read fails, the tool's answer (which at
+    least names the new id) is used instead of reporting a failure: the file
+    exists, and a retry would create a second one.
+    """
+    try:
+        service = get_drive_service()
+        file = (
+            service.files()
+            .get(
+                fileId=file_id,
+                supportsAllDrives=True,
+                fields=_CREATED_FILE_FIELDS,
+            )
+            .execute()
+        )
+        if isinstance(file, dict):
+            return file
+    except Exception as exc:
+        logger.warning("Could not read the created file %s: %s", file_id, exc)
+    fallback = {
+        key: value
+        for key, value in _tool_file_object(tool_data).items()
+        if key in ("id", "name", "webViewLink", "mimeType") and isinstance(value, str)
+    }
+    fallback.setdefault("id", file_id)
+    return fallback
+
+
+def _composio_drive_error(message: str, **extra: Any) -> str:
+    return json.dumps(
+        {"status": "error", "message": message, **extra}, ensure_ascii=False
+    )
+
+
+def _upload_file_via_composio(
+    *,
+    file_path: str,
+    local_path: Path,
+    name: str,
+    mime_type: str,
+    parent_id: str | None,
+) -> str:
+    """Upload a local file with Composio's create tool and the Files API.
+
+    The proxy cannot carry a create's metadata and content in one request,
+    so the bytes are staged and the tool names the staged object. Its answer
+    is not trusted for the output shape; the file is read back through the
+    proxy instead.
+    """
+    try:
+        fh_ctx = local_path.open("rb")
+    except OSError as exc:
+        logger.warning("Failed to open upload file %s: %s", local_path, exc)
+        return _composio_drive_error("Could not read the file at the given path")
+    with fh_ctx as fh:
+        size = os.fstat(fh.fileno()).st_size
+        if size == 0:
+            return _composio_drive_error(f"File is empty: {file_path}")
+        try:
+            local_md5, local_bytes, block_digests = _hash_replacement_file(
+                fh, size, keep_bytes=size <= _STAGED_UPLOAD_IN_MEMORY_BYTES
+            )
+        except ValueError as exc:
+            return _composio_drive_error(_then_nothing_changed(exc))
+        except OSError as exc:
+            logger.warning("Failed to read upload file %s: %s", local_path, exc)
+            return _composio_drive_error("Could not read the file at the given path")
+        body: bytes | _VerifiedStagedReader = (
+            local_bytes
+            if local_bytes is not None
+            else _VerifiedStagedReader(fh, size=size, block_digests=block_digests)
+        )
+        try:
+            staged = composio_tools.stage_file(
+                tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+                filename=name,
+                mimetype=mime_type,
+                md5=local_md5,
+                data=body,
+                length=size,
+            )
+            arguments: dict[str, Any] = {
+                "name": name,
+                "mimeType": mime_type,
+                "file_to_upload": staged,
+            }
+            if parent_id is not None:
+                arguments["parents"] = [parent_id]
+            result = composio_tools.execute_tool(
+                composio_tools.GOOGLEDRIVE_CREATE_FILE, arguments
+            )
+        except Exception as exc:
+            logger.error(f"Error uploading file: {exc}")
+            return _composio_drive_error(
+                "The file was not uploaded to Google Drive: Composio could "
+                f"not complete the upload. {exc}"
+            )
+        if not result.successful:
+            detail = f": {result.error}" if result.error else "."
+            return _composio_drive_error(
+                f"Google Drive did not accept the upload{detail}"
+            )
+        file_id = _tool_file_object(result.data).get("id")
+        if not isinstance(file_id, str) or not file_id:
+            return _composio_drive_error(
+                "Composio reported that the upload succeeded but did not "
+                "return the new file's id, so it could not be confirmed. "
+                "Check Google Drive before uploading the file again."
+            )
+        return json.dumps(
+            {
+                "status": "success",
+                "file": _created_file_metadata(file_id, result.data),
+            },
+            ensure_ascii=False,
+        )
+
+
+def _create_file_via_composio(
+    *,
+    name: str,
+    content: str,
+    mime_type: str,
+    upload_mime_type: str,
+    parent_id: str | None,
+) -> str:
+    """Create a text-backed file with Composio's create tool.
+
+    Google's conversion from text to a Google Doc happens inside the
+    create's multipart request, so the staged upload's type is the source
+    type (``upload_mime_type``) while the tool's ``mimeType`` is the target.
+    """
+    data = content.encode("utf-8")
+    md5 = hashlib.md5(data, usedforsecurity=False).hexdigest()
+    try:
+        staged = composio_tools.stage_file(
+            tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+            filename=name,
+            mimetype=upload_mime_type,
+            md5=md5,
+            data=data,
+            length=len(data),
+        )
+        arguments: dict[str, Any] = {
+            "name": name,
+            "mimeType": mime_type,
+            "file_to_upload": staged,
+        }
+        if parent_id is not None:
+            arguments["parents"] = [parent_id]
+        result = composio_tools.execute_tool(
+            composio_tools.GOOGLEDRIVE_CREATE_FILE, arguments
+        )
+    except Exception as exc:
+        logger.error(f"Error creating file: {exc}")
+        return _composio_drive_error(
+            "The file was not created in Google Drive: Composio could not "
+            f"complete the create. {exc}"
+        )
+    if not result.successful:
+        detail = f": {result.error}" if result.error else "."
+        return _composio_drive_error(f"Google Drive did not create the file{detail}")
+    file_id = _tool_file_object(result.data).get("id")
+    if not isinstance(file_id, str) or not file_id:
+        return _composio_drive_error(
+            "Composio reported that the file was created but did not return "
+            "its id, so it could not be confirmed. Check Google Drive before "
+            "creating the file again."
+        )
+    return json.dumps(
+        {
+            "status": "success",
+            "file": _created_file_metadata(file_id, result.data),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _content_update_success(
+    *,
+    updated: dict[str, Any],
+    current: dict[str, Any],
+    current_summary: dict[str, Any],
+    name: str,
+    stored_mime_type: str,
+    note: str = "",
+) -> str:
+    """The result for an update whose new content Drive has confirmed."""
+    message = (
+        f"Replaced the content of '{name}' in Google Drive. Its id, link "
+        "and sharing are unchanged. Google Drive keeps the previous version "
+        "in the file's version history only for a limited time (about 30 "
+        "days unless it is kept forever)."
+    )
+    # Drive does not set "shared" for a file in a shared drive, whose
+    # members all see it.
+    if current.get("driveId"):
+        message += (
+            " It is in a shared drive, so everyone with access to it, "
+            "including the drive's members, now sees the new content."
+        )
+    elif current.get("shared"):
+        message += " It is shared, so everyone with access now sees the new content."
+    updated_mime_type = _normalize_mime_type(str(updated.get("mimeType") or ""))
+    if stored_mime_type and updated_mime_type and updated_mime_type != stored_mime_type:
+        message += (
+            f" Its type changed from '{stored_mime_type}' to '{updated_mime_type}'."
+        )
+    return json.dumps(
+        {
+            "status": "success",
+            "changed": True,
+            "message": message + note,
+            "file": _content_summary(updated),
+            "previous": current_summary,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _unreadable_content_update_message(
+    name: str, read_error: Exception | None, *, lead: str
+) -> str:
+    """Guidance for an update whose file cannot be read to settle its result.
+
+    ``lead`` says what happened; this adds why the outcome is unknown and
+    what the user should check. A read refused for a missing or inaccessible
+    file gets the matching guidance instead of a plain transport message.
+    """
+    unknown = (
+        f"so it is not known whether '{name}' changed. Do not report it as "
+        "updated or as unchanged; ask the user to check the file's version "
+        "history in Google Drive before trying again."
+    )
+    if read_error is not None and is_google_file_unavailable_error(read_error):
+        return _unavailable_content_update_message(
+            read_error,
+            lead=(
+                f"{lead}: the file no longer exists, or this Drive connection "
+                f"can no longer access it, {unknown}"
+            ),
+        )
+    if read_error is not None and is_google_file_access_error(read_error):
+        return _content_permission_message(
+            name,
+            read_error,
+            lead=(
+                f"{lead}: the connected Google account was refused permission "
+                f"to read '{name}' again to check it, {unknown}"
+            ),
+        )
+    detail = f" {_content_error_detail(read_error)}" if read_error is not None else ""
+    return f"{lead}, {unknown}{detail}"
+
+
+def _composio_update_failure(
+    *,
+    service: Any,
+    file_id: str,
+    resource_key: str | None,
+    name: str,
+    current: dict[str, Any],
+    current_summary: dict[str, Any],
+    local_md5: str,
+    local_size: int,
+    stored_mime_type: str,
+    reason: str,
+) -> str:
+    """The result for an upload Composio reported as failed.
+
+    A failed tool answer does not by itself say whether Drive stored the
+    content: a timeout can arrive after it did. The file is read again
+    through the proxy. Its checksum being the uploaded one means the upload
+    landed; the previous checksum and head revision means it did not;
+    anything else leaves the outcome unknown.
+    """
+    now, read_error = _read_content_update_file(service, file_id, resource_key)
+    if now is None:
+        return _content_update_error(
+            _unreadable_content_update_message(
+                name,
+                read_error,
+                lead=(
+                    "The upload to Google Drive did not finish normally, and "
+                    "the file could not be read again to check it"
+                ),
+            ),
+            previous=current_summary,
+        )
+    if _holds_content(now, md5=local_md5, size=local_size):
+        return _content_update_success(
+            updated=now,
+            current=current,
+            current_summary=current_summary,
+            name=name,
+            stored_mime_type=stored_mime_type,
+            note=(
+                " Composio reported an error for the upload, but Google "
+                "Drive's own checksum shows exactly the new content."
+            ),
+        )
+    if not _same_content(now, current):
+        return _content_update_error(
+            f"Google Drive did not accept the new content for '{name}', and "
+            "the file has changed since it was read before this call, so it "
+            "is not known whether this call changed it. Do not report it as "
+            f"updated; ask the user to check the file's version history. {reason}",
+            previous=current_summary,
+        )
+    return _content_update_error(
+        f"Google Drive did not accept the new content for '{name}'. Do not "
+        f"report the file as updated. {_NOTHING_CHANGED} {reason}",
+        file=current_summary,
+    )
+
+
+def _replace_content_via_composio(
+    *,
+    service: Any,
+    file_id: str,
+    resource_key: str | None,
+    name: str,
+    current: dict[str, Any],
+    current_summary: dict[str, Any],
+    fh: BinaryIO,
+    local_size: int,
+    local_md5: str,
+    local_bytes: bytes | None,
+    block_digests: list[bytes],
+    upload_mime_type: str,
+    stored_mime_type: str,
+) -> str:
+    """Replace a file's content with Composio's media-only update tool.
+
+    The pre-read, the identical-content short circuit and the head revision
+    check have already run in the caller; this stages the bytes, runs the
+    tool, and then reads the file back through the proxy to decide the
+    result. A single media upload is what Composio's tool carries, so this
+    path is not limited by Proxy Execute's JSON body size.
+    """
+    body: bytes | _VerifiedStagedReader = (
+        local_bytes
+        if local_bytes is not None
+        else _VerifiedStagedReader(fh, size=local_size, block_digests=block_digests)
+    )
+    try:
+        staged = composio_tools.stage_file(
+            tool_slug=composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+            filename=name,
+            mimetype=upload_mime_type,
+            md5=local_md5,
+            data=body,
+            length=local_size,
+        )
+    except _ReplacementChangedError:
+        return _content_update_error(
+            "The local file changed while it was being uploaded, so the "
+            "upload was stopped before it completed and Google Drive kept "
+            "the file as it was. Finish writing the replacement file before "
+            f"calling this tool. {_NOTHING_CHANGED}",
+            file=current_summary,
+        )
+    except Exception as exc:
+        logger.error(f"Error staging replacement content: {exc}")
+        return _content_update_error(
+            "The replacement content could not be uploaded to Composio's "
+            f"file storage, so Google Drive was not changed. {exc}",
+            file=current_summary,
+        )
+    try:
+        result = composio_tools.execute_tool(
+            composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+            {
+                "fileId": file_id,
+                "file_to_upload": staged,
+                "uploadType": "media",
+                "supportsAllDrives": True,
+            },
+        )
+    except Exception as exc:
+        logger.error(f"Error updating file content: {exc}")
+        return _composio_update_failure(
+            service=service,
+            file_id=file_id,
+            resource_key=resource_key,
+            name=name,
+            current=current,
+            current_summary=current_summary,
+            local_md5=local_md5,
+            local_size=local_size,
+            stored_mime_type=stored_mime_type,
+            reason=f"Composio reported: {exc}",
+        )
+    if not result.successful:
+        reason = (
+            f"Composio reported: {result.error}"
+            if result.error
+            else "Composio reported that the upload failed without a reason."
+        )
+        return _composio_update_failure(
+            service=service,
+            file_id=file_id,
+            resource_key=resource_key,
+            name=name,
+            current=current,
+            current_summary=current_summary,
+            local_md5=local_md5,
+            local_size=local_size,
+            stored_mime_type=stored_mime_type,
+            reason=reason,
+        )
+    updated, read_error = _read_content_update_file(service, file_id, resource_key)
+    if updated is None:
+        return _content_update_error(
+            _unreadable_content_update_message(
+                name,
+                read_error,
+                lead=(
+                    "Google Drive accepted the upload, but the file could not "
+                    "be read again to confirm the new content"
+                ),
+            ),
+            previous=current_summary,
+        )
+    mismatch = _content_update_mismatch(
+        updated,
+        current,
+        file_id=file_id,
+        local_md5=local_md5,
+    )
+    if mismatch is not None:
+        return _content_update_error(
+            f"Google Drive accepted the upload for '{name}', but the file it "
+            f"returned does not confirm the new content ({mismatch}). Do "
+            "not report this as done; ask the user to check the file's "
+            "version history in Google Drive.",
+            file=_content_summary(updated),
+            previous=current_summary,
+        )
+    return _content_update_success(
+        updated=updated,
+        current=current,
+        current_summary=current_summary,
+        name=name,
+        stored_mime_type=stored_mime_type,
+    )
 
 
 def _content_update_request_error(
@@ -2562,6 +3177,27 @@ def google_drive_update_file_content(
             # multipart upload. Leaving it out keeps the name, parents and
             # description exactly as they are.
             upload_mime_type = requested_mime_type or stored_mime_type or _OCTET_STREAM
+
+            if composio_proxy.serves_composio_grant():
+                # The proxy cannot carry a multipart or resumable update. The
+                # same guarantees are kept by staging the bytes and reading
+                # the file back through the proxy before and after.
+                return _replace_content_via_composio(
+                    service=service,
+                    file_id=resolved_file_id,
+                    resource_key=resource_key,
+                    name=name,
+                    current=current,
+                    current_summary=current_summary,
+                    fh=fh,
+                    local_size=local_size,
+                    local_md5=local_md5,
+                    local_bytes=local_bytes,
+                    block_digests=block_digests,
+                    upload_mime_type=upload_mime_type,
+                    stored_mime_type=stored_mime_type,
+                )
+
             media: _ChunkBytesUpload
             if local_bytes is not None:
                 media = _ChunkBytesUpload(
@@ -2634,41 +3270,12 @@ def google_drive_update_file_content(
                 previous=current_summary,
             )
 
-        message = (
-            f"Replaced the content of '{name}' in Google Drive. Its id, link "
-            "and sharing are unchanged. Google Drive keeps the previous version "
-            "in the file's version history only for a limited time (about 30 "
-            "days unless it is kept forever)."
-        )
-        # Drive does not set "shared" for a file in a shared drive, whose
-        # members all see it.
-        if current.get("driveId"):
-            message += (
-                " It is in a shared drive, so everyone with access to it, "
-                "including the drive's members, now sees the new content."
-            )
-        elif current.get("shared"):
-            message += (
-                " It is shared, so everyone with access now sees the new content."
-            )
-        updated_mime_type = _normalize_mime_type(str(updated.get("mimeType") or ""))
-        if (
-            stored_mime_type
-            and updated_mime_type
-            and updated_mime_type != stored_mime_type
-        ):
-            message += (
-                f" Its type changed from '{stored_mime_type}' to '{updated_mime_type}'."
-            )
-        return json.dumps(
-            {
-                "status": "success",
-                "changed": True,
-                "message": message,
-                "file": _content_summary(updated),
-                "previous": current_summary,
-            },
-            ensure_ascii=False,
+        return _content_update_success(
+            updated=updated,
+            current=current,
+            current_summary=current_summary,
+            name=name,
+            stored_mime_type=stored_mime_type,
         )
     except Exception as e:
         logger.error(f"Error updating file content: {e}")
@@ -2808,11 +3415,21 @@ def google_drive_create_file(
             file_metadata, parent_id
         )
 
+        # When creating a Google Doc, the upload mime type needs to be the original content's mime type (like text/plain)
+        upload_mime_type = "text/plain" if is_google_doc_conversion else mime_type
+
+        if composio_proxy.serves_composio_grant():
+            return _create_file_via_composio(
+                name=name,
+                content=content,
+                mime_type=mime_type,
+                upload_mime_type=upload_mime_type,
+                parent_id=resolved_parent_id,
+            )
+
         service = get_drive_service()
         fh = io.BytesIO(content.encode("utf-8"))
 
-        # When creating a Google Doc, the upload mime type needs to be the original content's mime type (like text/plain)
-        upload_mime_type = "text/plain" if is_google_doc_conversion else mime_type
         media = MediaIoBaseUpload(fh, mimetype=upload_mime_type, resumable=True)
 
         create_request = service.files().create(
@@ -2906,36 +3523,49 @@ def _move_error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-_NO_VISIBLE_PARENT_MESSAGE = (
-    "Drive did not return the parent folder that holds file_id, so nothing "
-    "was moved. This connection may not be able to see that folder: for "
-    "example, the file is shared with the user but is not in their My Drive, "
-    "or, if this connection uses per-file Drive access, the file sits in a "
-    "folder that was not created through this app. Ask the user to move the "
-    "file in Google Drive."
-)
+def _no_visible_parent_message() -> str:
+    message = (
+        "Drive did not return the parent folder that holds file_id, so nothing "
+        "was moved. This connection may not be able to see that folder: for "
+        "example, the file is shared with the user but is not in their My Drive"
+    )
+    if not composio_proxy.serves_composio_grant():
+        message += (
+            ", or, if this connection uses per-file Drive access, the file "
+            "sits in a folder that was not created through this app"
+        )
+    return f"{message}. Ask the user to move the file in Google Drive."
 
 
 def _unavailable_move_source_message(exc: Exception) -> str:
+    per_file = ""
+    if not composio_proxy.serves_composio_grant():
+        per_file = (
+            " If this connection uses per-file Drive access, it can only use "
+            "files created through this app or explicitly granted to it;"
+        )
     return (
         "Google Drive could not open file_id: the file does not exist, or this "
-        "Drive connection cannot access it, so nothing was moved. If this "
-        "connection uses per-file Drive access, it can only use files created "
-        "through this app or explicitly granted to it; ask the user to move "
-        "the file in Google Drive instead. Google API response: "
-        f"{google_api_error_summary(exc)}"
+        f"Drive connection cannot access it, so nothing was moved.{per_file} "
+        "Ask the user to move the file in Google Drive instead. Google API "
+        f"response: {google_api_error_summary(exc)}"
     )
 
 
 def _unavailable_move_destination_message(exc: Exception) -> str:
+    per_file = ""
+    if not composio_proxy.serves_composio_grant():
+        per_file = (
+            " If this connection uses per-file Drive access, it can only use "
+            "folders created through this app, so a folder the user created "
+            "directly in Google Drive cannot be a destination."
+        )
     return (
         "Google Drive could not open destination_folder_id: the folder does "
         "not exist, or this Drive connection cannot access it, so nothing was "
-        "moved. If this connection uses per-file Drive access, it can only use "
-        "folders created through this app, so a folder the user created "
-        "directly in Google Drive cannot be a destination. Ask the user to "
-        f"move the file in Google Drive, or {_CREATE_FOLDER_OFFER}. Google "
-        f"API response: {google_api_error_summary(exc)}"
+        f"moved.{per_file} Ask the user to move the file in Google Drive, or "
+        f"{_CREATE_FOLDER_OFFER}. Google API response: "
+        f"{google_api_error_summary(exc)}"
     )
 
 
@@ -2950,21 +3580,31 @@ def _move_update_error_message(exc: Exception, *, moving: bool) -> str | None:
     summary = google_api_error_summary(exc, with_reasons=True)
     if is_google_file_unavailable_error(exc):
         if not moving:
+            per_file = ""
+            if not composio_proxy.serves_composio_grant():
+                per_file = (
+                    " If this connection uses per-file Drive access, it can "
+                    "only use files created through this app or explicitly "
+                    "granted to it."
+                )
             return (
                 "Google Drive could not open the file while renaming it, or "
                 "this Drive connection cannot access it, so nothing was "
-                "renamed. If this connection uses per-file Drive access, it "
-                "can only use files created through this app or explicitly "
-                "granted to it. Ask the user to rename the file in Google "
-                f"Drive. Google API response: {summary}"
+                f"renamed.{per_file} Ask the user to rename the file in "
+                f"Google Drive. Google API response: {summary}"
+            )
+        per_file = ""
+        if not composio_proxy.serves_composio_grant():
+            per_file = (
+                " If this connection uses per-file Drive access, it can only "
+                "use files and folders created through this app."
             )
         return (
             "Google Drive could not open the file or the destination folder "
             "while updating it, or this Drive connection cannot access one of "
-            "them, so nothing was moved or renamed. If this connection uses "
-            "per-file Drive access, it can only use files and folders created "
-            "through this app. Ask the user to move the file in Google Drive, "
-            f"or {_CREATE_FOLDER_OFFER}. Google API response: {summary}"
+            f"them, so nothing was moved or renamed.{per_file} Ask the user to "
+            f"move the file in Google Drive, or {_CREATE_FOLDER_OFFER}. Google "
+            f"API response: {summary}"
         )
     if not is_google_file_access_error(exc):
         return None
@@ -3015,14 +3655,8 @@ def google_drive_move_file(
     access change with the user before calling this tool. This also requires the
     connected account to have permission to move the item.
 
-    If this connection uses per-file Drive access (drive.file), the item and
-    the destination folder must both be visible to this app: files and
-    folders created through this app (for example with
-    google_drive_create_folder), or files explicitly granted to it. A folder
-    the user created directly in Google Drive is not visible, so it cannot be
-    a destination; ask the user to move the item in Google Drive, or offer to
-    create a new folder with google_drive_create_folder (it would be a
-    separate folder from the user's, so ask first).
+    If this connection cannot see the item or the destination folder, the move
+    is refused with a message that says what to do.
     """
     try:
         if not isinstance(new_name, str):
@@ -3103,7 +3737,7 @@ def google_drive_move_file(
         ):
             raise ValueError("Drive returned an invalid parents list for file_id")
         if not current_parents:
-            raise ValueError(_NO_VISIBLE_PARENT_MESSAGE)
+            raise ValueError(_no_visible_parent_message())
         update_body: dict[str, Any] = {}
         if requested_name and requested_name != source.get("name"):
             update_body["name"] = requested_name

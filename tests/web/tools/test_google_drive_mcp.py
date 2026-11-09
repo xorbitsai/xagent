@@ -2258,8 +2258,7 @@ async def test_move_file_is_registered_with_an_optional_new_name():
     assert sorted(schema["required"]) == ["destination_folder_id", "file_id"]
     assert schema["properties"]["new_name"]["default"] == ""
     description = " ".join(tool.description.split())
-    assert "cannot be a destination" in description
-    assert "offer to create a new folder" in description
+    assert "cannot see the item or the destination folder" in description
     assert "changes its parent folder and, optionally, its name" in description
     assert "only changes its parent folder" not in description
 

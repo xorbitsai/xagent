@@ -385,11 +385,11 @@ class _OAuthInstanceUrlRequired(Exception):
 
 
 # Apps whose MCP subprocess can run a Composio-backed grant through Proxy
-# Execute: Facebook (#3531), Instagram in Instagram Login mode (#3533) and
-# Gmail (#3647), whose googleapiclient calls go through a proxy transport.
-# Another app's Composio grant is reported unavailable until its subprocess
-# can proxy it.
-_COMPOSIO_PROXY_APPS = frozenset({"facebook", "instagram", "gmail"})
+# Execute: Facebook (#3531), Instagram in Instagram Login mode (#3533),
+# Gmail (#3647) and Google Drive, whose googleapiclient calls go through a
+# proxy transport. Another app's Composio grant is reported unavailable until
+# its subprocess can proxy it.
+_COMPOSIO_PROXY_APPS = frozenset({"facebook", "instagram", "gmail", "google-drive"})
 
 
 def _composio_grant_env(

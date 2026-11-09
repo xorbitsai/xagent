@@ -987,6 +987,231 @@ def _log_and_classify_failed_refresh(
         raise _OAuthRefreshPermanentlyInvalid()
 
 
+@dataclass(frozen=True)
+class OAuthRefreshRequest:
+    """The token request a builtin provider's refresh sends (#3580).
+
+    ``kwargs`` are what the refresh passes to ``client.get``/``client.post``
+    besides the URL and timeout. The client verification command sends the
+    same request with an invalid token, so it checks what a refresh sends.
+    """
+
+    method: Literal["GET", "POST"]
+    url: str
+    kwargs: dict[str, Any]
+    # The grant is bound to its account host (oauth_account_hosts).
+    account_hosted: bool = False
+
+
+async def build_oauth_refresh_request(
+    provider_name: str,
+    provider_config: Any,
+    *,
+    client_id: str,
+    client_secret: str,
+    access_token: str | None,
+    refresh_token: str | None,
+    instance_url: str | None,
+    user_id: Any,
+) -> OAuthRefreshRequest:
+    """Build the token request a refresh of this provider sends.
+
+    Raises _OAuthRefreshPermanentlyInvalid when the grant lacks what the
+    request needs (a refresh token, its account or its Deputy instance).
+    ``user_id`` is only used in log messages.
+    """
+    from ..api.auth import _resolve_oauth_redirect_uri
+    from ..oauth_provider_quirks import requires_json_accept_header
+
+    normalized_provider = provider_name.lower()
+    if normalized_provider == "meta":
+        return OAuthRefreshRequest(
+            "GET",
+            provider_config.token_url,
+            {
+                "params": {
+                    "grant_type": "fb_exchange_token",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "fb_exchange_token": access_token,
+                }
+            },
+        )
+
+    if not refresh_token:
+        # Unlike the provider-config checks above (which can self-heal
+        # once an admin fixes the OAuthProvider row, so are left as a
+        # transient False), a missing refresh_token is a property of
+        # this specific account row -- no retry will ever produce one,
+        # so this is permanent.
+        logger.warning(
+            f"Token expired for {provider_name} but no refresh_token available."
+        )
+        raise _OAuthRefreshPermanentlyInvalid()
+
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    post_kwargs: dict[str, Any] = {}
+    # Matches the code-exchange branch in api/auth.py: an admin-created
+    # provider named "Zoom" would otherwise connect fine but silently
+    # fail every refresh an hour later.
+    if normalized_provider == "zoom":
+        # Zoom's token endpoint requires HTTP Basic Auth for client
+        # credentials (client_id:client_secret, base64) on every refresh,
+        # same as the initial code exchange.
+        post_kwargs["auth"] = httpx.BasicAuth(client_id, client_secret)
+    else:
+        data["client_id"] = client_id
+        data["client_secret"] = client_secret
+
+    refresh_token_url = provider_config.token_url
+    from ..oauth_account_hosts import (
+        OAuthAccountError,
+        get_oauth_account_host,
+        normalize_oauth_account,
+        resolve_oauth_account_endpoints,
+    )
+
+    account_host = get_oauth_account_host(normalized_provider)
+    if account_host is not None:
+        # Refresh on the account the grant was issued for (stored in
+        # instance_url at connect, see oauth_account_hosts). A missing or
+        # malformed stored label never heals on retry, so it is
+        # permanent; a resolution failure below stays transient.
+        try:
+            stored_account = normalize_oauth_account(instance_url)
+        except OAuthAccountError:
+            logger.warning(
+                "Cannot refresh %s token for user %s: no valid account "
+                "stored on this connection.",
+                provider_name,
+                user_id,
+            )
+            raise _OAuthRefreshPermanentlyInvalid() from None
+        account_endpoints = await asyncio.to_thread(
+            resolve_oauth_account_endpoints, account_host, stored_account
+        )
+        refresh_token_url = account_endpoints.token_url
+        data.update(account_host.token_params)
+        # A redirect would skip the account host's private-network check.
+        post_kwargs["follow_redirects"] = False
+    if normalized_provider == "deputy":
+        # Deputy's docs (both the code-exchange and refresh legs) list
+        # `redirect_uri` and `scope` as required body params here too,
+        # matching the code-exchange branch in api/auth.py. scope is
+        # read from provider_config.default_scopes -- same source, and
+        # same "no app-level oauth_scopes override" caveat, as that
+        # code-exchange leg (see its comment) -- rather than a
+        # hardcoded literal, so an admin who edits this provider row's
+        # scopes doesn't leave refresh silently still sending the old
+        # value.
+        # Resolved from the CURRENT provider row/env var, not whatever
+        # redirect_uri was actually used for this grant's original
+        # authorization -- UserOAuth has no per-grant redirect_uri
+        # column to read instead (no provider in this codebase needs
+        # one; Deputy is the only one requiring redirect_uri on
+        # refresh at all). If an admin changes the Deputy provider's
+        # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
+        # already connected, Deputy may reject those users' next
+        # refresh with a redirect_uri mismatch until they reconnect --
+        # a known limitation, not something this function can resolve
+        # without a schema change.
+        data["redirect_uri"] = _resolve_oauth_redirect_uri(
+            provider_name, provider_config
+        )
+        data["scope"] = (
+            " ".join(
+                stripped
+                for scope in provider_config.default_scopes or []
+                if isinstance(scope, str) and (stripped := scope.strip())
+            )
+            or "longlife_refresh_token"
+        )
+        # Deputy's generic once.deputy.com host only serves the initial
+        # code exchange -- token renewal must go to the same per-install
+        # host returned as `endpoint` in that exchange (and persisted as
+        # UserOAuth.instance_url), not the static token_url on the
+        # provider row. See deputy.py's _instance_url() for the matching
+        # use-time validation of that same stored value.
+        stored_instance_url = instance_url
+        if not stored_instance_url:
+            # A per-account data problem (like the missing refresh_token
+            # check above), not a provider-config one -- retrying will
+            # never produce an instance_url, so this is permanent.
+            logger.warning(
+                f"Cannot refresh Deputy token for user "
+                f"{user_id}: no instance_url stored on "
+                "this connection."
+            )
+            raise _OAuthRefreshPermanentlyInvalid()
+        refresh_token_url = f"{stored_instance_url}/oauth/access_token"
+
+    headers = {}
+    if normalized_provider == "linkedin":
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if requires_json_accept_header(normalized_provider):
+        headers["Accept"] = "application/json"
+    if account_host is not None:
+        headers.update(account_host.request_headers())
+
+    from ..api.auth import _is_employment_hero_token_url
+    from ..oauth_provider_quirks import matches_provider_family
+
+    if matches_provider_family(
+        normalized_provider, "employment-hero"
+    ) and _is_employment_hero_token_url(refresh_token_url):
+        # Matches the code-exchange branch in api/auth.py: Employment
+        # Hero's partner guide requires grant_type and refresh_token as
+        # query parameters on the refresh request too, with only the
+        # credential fields in the form body. Gated on
+        # _is_employment_hero_token_url too, not just the family match
+        # -- same reasoning as the code-exchange branch: an admin-
+        # created "employment-hero"-family row's token_url isn't
+        # guaranteed to actually be Employment Hero's, and this
+        # EH-specific wire quirk would break a genuinely different
+        # token endpoint's refresh instead of using the standard RFC
+        # 6749 body-only shape it likely expects. Putting a long-lived
+        # credential (refresh_token) in a query string is a generic
+        # secret-exposure anti-pattern (it can end up in proxy/server
+        # access logs a form body wouldn't) -- accepted here as a
+        # residual risk forced by Employment Hero's documented contract,
+        # not a choice this codebase would otherwise make. No httpx/
+        # httpcore request-logging middleware exists in this codebase
+        # today (those loggers are pinned to WARNING) and the
+        # explicitly trusted (XAGENT_TRUSTED_EGRESS_PROXY) proxy sees a
+        # CONNECT tunnel for HTTPS, never this URL's query string --
+        # reassess this note if either changes.
+        post_kwargs["params"] = {
+            "grant_type": data.pop("grant_type"),
+            "refresh_token": data.pop("refresh_token"),
+        }
+
+    # Matches the code-exchange branch in api/auth.py: Atlassian's token
+    # endpoint requires a JSON body on refresh too, not form-urlencoded.
+    body_kwarg: dict[str, Any] = {"data": data}
+    if normalized_provider == "jira":
+        headers["Content-Type"] = "application/json"
+        body_kwarg = {"json": data}
+
+    return OAuthRefreshRequest(
+        "POST",
+        refresh_token_url,
+        {"headers": headers, **body_kwarg, **post_kwargs},
+        account_hosted=account_host is not None,
+    )
+
+
+def send_oauth_refresh_request(
+    client: httpx.AsyncClient, request: OAuthRefreshRequest
+) -> Awaitable[httpx.Response]:
+    """Send a built refresh request the way the refresh always has."""
+    if request.method == "GET":
+        return client.get(request.url, timeout=10.0, **request.kwargs)
+    return client.post(request.url, timeout=10.0, **request.kwargs)
+
+
 async def refresh_oauth_token_if_needed(
     db: Any,
     oauth_account: Any,
@@ -1027,12 +1252,8 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ..api.auth import (
-            _resolve_oauth_client_per_field,
-            _resolve_oauth_redirect_uri,
-        )
+        from ..api.auth import _resolve_oauth_client_per_field
         from ..models.oauth_provider import OAuthProvider
-        from ..oauth_provider_quirks import requires_json_accept_header
 
         provider_config = (
             db.query(OAuthProvider)
@@ -1063,22 +1284,23 @@ async def refresh_oauth_token_if_needed(
         # so an admin-created provider's display casing is unaffected.
         normalized_provider = provider_name.lower()
 
-        if normalized_provider == "meta":
-            async with _oauth_refresh_http_client() as client:
-                response = await _request_oauth_refresh_with_retries(
-                    lambda: client.get(
-                        provider_config.token_url,
-                        params={
-                            "grant_type": "fb_exchange_token",
-                            "client_id": client_id,
-                            "client_secret": client_secret,
-                            "fb_exchange_token": oauth_account.access_token,
-                        },
-                        timeout=10.0,
-                    ),
-                    provider_name=provider_name,
-                )
+        request = await build_oauth_refresh_request(
+            provider_name,
+            provider_config,
+            client_id=client_id,
+            client_secret=client_secret,
+            access_token=oauth_account.access_token,
+            refresh_token=oauth_account.refresh_token,
+            instance_url=getattr(oauth_account, "instance_url", None),
+            user_id=oauth_account.user_id,
+        )
+        async with _oauth_refresh_http_client() as client:
+            response = await _request_oauth_refresh_with_retries(
+                lambda: send_oauth_refresh_request(client, request),
+                provider_name=provider_name,
+            )
 
+        if normalized_provider == "meta":
             if response.status_code == 200:
                 data = response.json()
                 if "access_token" in data:
@@ -1101,175 +1323,6 @@ async def refresh_oauth_token_if_needed(
             )
             return False
 
-        if not oauth_account.refresh_token:
-            # Unlike the provider-config checks above (which can self-heal
-            # once an admin fixes the OAuthProvider row, so are left as a
-            # transient False), a missing refresh_token is a property of
-            # this specific account row -- no retry will ever produce one,
-            # so this is permanent.
-            logger.warning(
-                f"Token expired for {provider_name} but no refresh_token available."
-            )
-            raise _OAuthRefreshPermanentlyInvalid()
-
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": oauth_account.refresh_token,
-        }
-        post_kwargs: dict[str, Any] = {}
-        # Matches the code-exchange branch in api/auth.py: an admin-created
-        # provider named "Zoom" would otherwise connect fine but silently
-        # fail every refresh an hour later.
-        if normalized_provider == "zoom":
-            # Zoom's token endpoint requires HTTP Basic Auth for client
-            # credentials (client_id:client_secret, base64) on every refresh,
-            # same as the initial code exchange.
-            post_kwargs["auth"] = httpx.BasicAuth(client_id, client_secret)
-        else:
-            data["client_id"] = client_id
-            data["client_secret"] = client_secret
-
-        refresh_token_url = provider_config.token_url
-        from ..oauth_account_hosts import (
-            OAuthAccountError,
-            get_oauth_account_host,
-            normalize_oauth_account,
-            resolve_oauth_account_endpoints,
-        )
-
-        account_host = get_oauth_account_host(normalized_provider)
-        if account_host is not None:
-            # Refresh on the account the grant was issued for (stored in
-            # instance_url at connect, see oauth_account_hosts). A missing or
-            # malformed stored label never heals on retry, so it is
-            # permanent; a resolution failure below stays transient.
-            try:
-                stored_account = normalize_oauth_account(oauth_account.instance_url)
-            except OAuthAccountError:
-                logger.warning(
-                    "Cannot refresh %s token for user %s: no valid account "
-                    "stored on this connection.",
-                    provider_name,
-                    oauth_account.user_id,
-                )
-                raise _OAuthRefreshPermanentlyInvalid() from None
-            account_endpoints = await asyncio.to_thread(
-                resolve_oauth_account_endpoints, account_host, stored_account
-            )
-            refresh_token_url = account_endpoints.token_url
-            data.update(account_host.token_params)
-            # A redirect would skip the account host's private-network check.
-            post_kwargs["follow_redirects"] = False
-        if normalized_provider == "deputy":
-            # Deputy's docs (both the code-exchange and refresh legs) list
-            # `redirect_uri` and `scope` as required body params here too,
-            # matching the code-exchange branch in api/auth.py. scope is
-            # read from provider_config.default_scopes -- same source, and
-            # same "no app-level oauth_scopes override" caveat, as that
-            # code-exchange leg (see its comment) -- rather than a
-            # hardcoded literal, so an admin who edits this provider row's
-            # scopes doesn't leave refresh silently still sending the old
-            # value.
-            # Resolved from the CURRENT provider row/env var, not whatever
-            # redirect_uri was actually used for this grant's original
-            # authorization -- UserOAuth has no per-grant redirect_uri
-            # column to read instead (no provider in this codebase needs
-            # one; Deputy is the only one requiring redirect_uri on
-            # refresh at all). If an admin changes the Deputy provider's
-            # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
-            # already connected, Deputy may reject those users' next
-            # refresh with a redirect_uri mismatch until they reconnect --
-            # a known limitation, not something this function can resolve
-            # without a schema change.
-            data["redirect_uri"] = _resolve_oauth_redirect_uri(
-                provider_name, provider_config
-            )
-            data["scope"] = (
-                " ".join(
-                    stripped
-                    for scope in provider_config.default_scopes or []
-                    if isinstance(scope, str) and (stripped := scope.strip())
-                )
-                or "longlife_refresh_token"
-            )
-            # Deputy's generic once.deputy.com host only serves the initial
-            # code exchange -- token renewal must go to the same per-install
-            # host returned as `endpoint` in that exchange (and persisted as
-            # UserOAuth.instance_url), not the static token_url on the
-            # provider row. See deputy.py's _instance_url() for the matching
-            # use-time validation of that same stored value.
-            stored_instance_url = getattr(oauth_account, "instance_url", None)
-            if not stored_instance_url:
-                # A per-account data problem (like the missing refresh_token
-                # check above), not a provider-config one -- retrying will
-                # never produce an instance_url, so this is permanent.
-                logger.warning(
-                    f"Cannot refresh Deputy token for user "
-                    f"{oauth_account.user_id}: no instance_url stored on "
-                    "this connection."
-                )
-                raise _OAuthRefreshPermanentlyInvalid()
-            refresh_token_url = f"{stored_instance_url}/oauth/access_token"
-
-        headers = {}
-        if normalized_provider == "linkedin":
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-        if requires_json_accept_header(normalized_provider):
-            headers["Accept"] = "application/json"
-        if account_host is not None:
-            headers.update(account_host.request_headers())
-
-        from ..api.auth import _is_employment_hero_token_url
-        from ..oauth_provider_quirks import matches_provider_family
-
-        if matches_provider_family(
-            normalized_provider, "employment-hero"
-        ) and _is_employment_hero_token_url(refresh_token_url):
-            # Matches the code-exchange branch in api/auth.py: Employment
-            # Hero's partner guide requires grant_type and refresh_token as
-            # query parameters on the refresh request too, with only the
-            # credential fields in the form body. Gated on
-            # _is_employment_hero_token_url too, not just the family match
-            # -- same reasoning as the code-exchange branch: an admin-
-            # created "employment-hero"-family row's token_url isn't
-            # guaranteed to actually be Employment Hero's, and this
-            # EH-specific wire quirk would break a genuinely different
-            # token endpoint's refresh instead of using the standard RFC
-            # 6749 body-only shape it likely expects. Putting a long-lived
-            # credential (refresh_token) in a query string is a generic
-            # secret-exposure anti-pattern (it can end up in proxy/server
-            # access logs a form body wouldn't) -- accepted here as a
-            # residual risk forced by Employment Hero's documented contract,
-            # not a choice this codebase would otherwise make. No httpx/
-            # httpcore request-logging middleware exists in this codebase
-            # today (those loggers are pinned to WARNING) and the
-            # explicitly trusted (XAGENT_TRUSTED_EGRESS_PROXY) proxy sees a
-            # CONNECT tunnel for HTTPS, never this URL's query string --
-            # reassess this note if either changes.
-            post_kwargs["params"] = {
-                "grant_type": data.pop("grant_type"),
-                "refresh_token": data.pop("refresh_token"),
-            }
-
-        # Matches the code-exchange branch in api/auth.py: Atlassian's token
-        # endpoint requires a JSON body on refresh too, not form-urlencoded.
-        body_kwarg: dict[str, Any] = {"data": data}
-        if normalized_provider == "jira":
-            headers["Content-Type"] = "application/json"
-            body_kwarg = {"json": data}
-
-        async with _oauth_refresh_http_client() as client:
-            response = await _request_oauth_refresh_with_retries(
-                lambda: client.post(
-                    refresh_token_url,
-                    headers=headers,
-                    timeout=10.0,
-                    **body_kwarg,
-                    **post_kwargs,
-                ),
-                provider_name=provider_name,
-            )
-
         if response.status_code == 200:
             data = response.json()
             if "access_token" in data:
@@ -1277,7 +1330,7 @@ async def refresh_oauth_token_if_needed(
                 if "refresh_token" in data:
                     oauth_account.refresh_token = data["refresh_token"]
                 # An account-hosted grant stays bound to its account.
-                if "instance_url" in data and account_host is None:
+                if "instance_url" in data and not request.account_hosted:
                     # Matches the code-exchange branch in api/auth.py:
                     # Salesforce can return a different instance_url on
                     # refresh (e.g. after an org migration), so this is

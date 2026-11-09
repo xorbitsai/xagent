@@ -60,6 +60,17 @@ usable key fails once as `encryption-key`. It proves a value is present, not
 that the vendor accepts it. Its `--exclude` takes OAuth provider names
 (`google`), not the catalog app IDs this script's `--exclude` takes.
 
+Whether the vendor still accepts each client is checked by
+`python -m xagent.web.oauth_client_verification`
+([#3580](https://github.com/xorbitsai/xagent/issues/3580)), run the same way.
+For every builtin OAuth provider it sends the provider's refresh request once,
+with the deployment's real client credential and a deliberately invalid token,
+and prints `CLIENT_OK`, `CLIENT_REJECTED`, `INCONCLUSIVE` or `UNVERIFIABLE`
+(with the reason) per credential, plus the vendor's error code and where each
+field resolved from, never a value. It exits 1 when any client is rejected;
+`INCONCLUSIVE` lines do not fail it. A pre-registered remote MCP client is
+listed as `UNVERIFIABLE`. `--exclude` takes the same provider names.
+
 ### Side effects
 
 - Starting a launch writes nothing.

@@ -6374,10 +6374,49 @@ describe("AppProvider websocket message routing", () => {
       }
       expect(outcome).toBeInstanceOf(MessageDeliveryError)
       expect(outcome).toMatchObject({
-        message: "Message not sent: the conversation source is not valid.",
+        message: typeof source === "number"
+          ? "A conversation source is not supported for this connection."
+          : "Message not sent: the conversation source is not valid.",
         disposition: "not_sent",
       })
       expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("refuses a source while a conversation is bound and sends nothing", async () => {
+      mount("session")
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(150)))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+
+      const outcome = await act(async () => getSessionControls()
+        .sendMessage("continue", { clientMessageId: "bound-source", sourceTaskId: 101 })
+        .then(() => "ok", (error: unknown) => error))
+
+      expect(outcome).toBeInstanceOf(MessageDeliveryError)
+      expect(outcome).toMatchObject({
+        message: "Message not sent: a conversation source can only start a new conversation.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+    })
+
+    it("carries a source on the message that starts the replacement conversation", async () => {
+      mount("session")
+      const onMessage = webSocketOptions.current?.onMessage
+      act(() => onMessage?.(taskInfoMessage(150)))
+      const reset = getSessionControls().startNewConversation()
+      await act(async () => {
+        onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+        await reset
+      })
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_ready")
+
+      void getSessionControls().sendMessage("continue", { clientMessageId: "replacement-source", sourceTaskId: 101 })
+      await act(async () => {})
+
+      expect(sendChatMessageMock.mock.calls).toEqual([
+        ["continue", undefined, undefined, "replacement-source", undefined, undefined, 101],
+      ])
     })
 
     it("passes the uploaded file ids and the source together", async () => {

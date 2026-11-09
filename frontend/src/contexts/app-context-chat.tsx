@@ -7608,13 +7608,14 @@ export function AppProvider({
       ? config.metadata.request_id
       : undefined
     // The earlier conversation a new one continues from. Only the Session
-    // window's taskless chat can carry it; the frame check validates its range.
+    // window's taskless chat can carry it, and only on the message that starts
+    // a new conversation; the frame check validates its range.
     const sourceTaskId: unknown = config?.sourceTaskId
     if (sourceTaskId !== undefined && typeof sourceTaskId !== "number") {
       throw new MessageDeliveryError("Message not sent: the conversation source is not valid.", "not_sent")
     }
     if (sourceTaskId !== undefined && !sessionTransport?.allowTasklessChat) {
-      throw new MessageDeliveryError("Message not sent: the conversation source is not valid.", "not_sent")
+      throw new MessageDeliveryError("A conversation source is not supported for this connection.", "not_sent")
     }
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current
@@ -7717,6 +7718,19 @@ export function AppProvider({
         || sessionConversationRef.current.phase === "replacement_awaiting_task"
       ) {
         throw new Error("The replacement conversation is already starting.")
+      }
+      // Every Session frame omits the task id, so a source sent while a
+      // conversation is bound would ride on a follow-up into that conversation,
+      // which the session server refuses.
+      if (
+        sourceTaskId !== undefined
+        && sessionConversationRef.current.phase !== "unbound"
+        && sessionConversationRef.current.phase !== "replacement_ready"
+      ) {
+        throw new MessageDeliveryError(
+          "Message not sent: a conversation source can only start a new conversation.",
+          "not_sent",
+        )
       }
 
       const startsReplacementConversation =

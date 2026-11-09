@@ -39,7 +39,10 @@ export interface UseHistoryContinueInput {
   // True while the provider is delivering any message, including a host page
   // open message already being sent; this driver waits for it. An open
   // message still in its own slot does not count: this driver never waits
-  // for one.
+  // for one. The order runs the other way only through the page: a page that
+  // also runs the open message driver passes this hook's `busy` into that
+  // driver's `isMessageDeliveryPending`, so an open message waits until the
+  // continuation has ended.
   isMessageDeliveryPending: boolean
   isConversationResetPending: boolean
   isAttachmentBusy: boolean
@@ -56,7 +59,8 @@ export interface UseHistoryContinueInput {
 // the slot and replaces any older one still there, nothing is sent until the
 // current socket has attached, a conversation that is still bound is reset
 // first, a message is reset at most once, and a failure is never retried.
-// Every way a message ends is reported through onOutcome.
+// Every way a message ends is reported through onOutcome, except a reset or
+// send that settles after unmount, which reports nothing.
 //
 // `busy` is true from the render a request reaches the slot until its
 // message has ended, whether it was sent, failed or dropped.
@@ -193,7 +197,8 @@ export function useHistoryContinue({
     isAttachmentBusy,
     startNewConversation,
     sendContinueMessage,
-    onOutcome,
+    // onOutcome is read through onOutcomeRef, so a new callback alone does not
+    // run this effect again.
     settled,
   ])
 

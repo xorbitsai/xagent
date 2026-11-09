@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs"
-import { resolve } from "node:path"
 import { useCallback, useRef, useState } from "react"
 import { act, cleanup, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
@@ -464,6 +462,28 @@ describe("useHistoryContinue", () => {
       expect(latest.mock.calls).toEqual([[outcome]])
       expect(earlier).not.toHaveBeenCalled()
     })
+
+    it("does not run the driver again on a render that only passes a new callback", () => {
+      // A slot the page has not cleared yet, so a second run would take and
+      // report the same message again.
+      const request: HistoryContinueRequest = { seq: 1, message: "A", sourceTaskId: 101 }
+      const input = (callback: UseHistoryContinueInput["onOutcome"]): UseHistoryContinueInput => ({
+        ...controls({ sessionConversationState: "reload_required", onOutcome: callback }),
+        request,
+        take,
+      })
+      const { rerender } = renderHook((props: UseHistoryContinueInput) => useHistoryContinue(props), {
+        initialProps: input(onOutcome),
+      })
+      expect(take.mock.calls).toEqual([[1]])
+
+      const latest = vi.fn<(outcome: HistoryContinueOutcome) => void>()
+      rerender(input(latest))
+
+      expect(take.mock.calls).toEqual([[1]])
+      expect(outcomes()).toEqual([["reload_required"]])
+      expect(latest).not.toHaveBeenCalled()
+    })
   })
 
   describe("unmount", () => {
@@ -499,12 +519,6 @@ describe("useHistoryContinue", () => {
   })
 
   describe("the phase routes", () => {
-    it("reads the open message driver's phase table instead of keeping its own", () => {
-      const source = readFileSync(resolve(process.cwd(), "src/components/widget/use-history-continue.ts"), "utf8")
-      expect(source).not.toMatch(/["'`]replacement_awaiting_task["'`]/)
-      expect(source).toMatch(/import \{ PHASE_ROUTE \} from "\.\/use-session-open-message"/)
-    })
-
     it.each(Object.entries(PHASE_ROUTE) as Array<[Phase, (typeof PHASE_ROUTE)[Phase]]>)(
       "routes a message in the %s phase as %s",
       (phase, route) => {

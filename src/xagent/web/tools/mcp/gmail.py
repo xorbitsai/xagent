@@ -11,6 +11,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
+from . import google_api_proxy
 from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,9 @@ mcp = FastMCP("gmail-mcp")
 # a batch of many medium attachments is capped the same as one big one.
 _MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GMAIL_FILE_ALLOWED_DIRS"
+# The Gmail API's own host. The proxy transport refuses any other, so
+# Composio's injected token cannot be sent anywhere else.
+_GMAIL_API_HOSTS = frozenset({"gmail.googleapis.com"})
 
 
 def _allowed_file_dirs() -> list[Path]:
@@ -128,6 +132,17 @@ def _resolve_message_attachments(
 
 
 def get_gmail_service() -> Any:
+    if google_api_proxy.uses_composio_proxy():
+        # No Google token to build credentials from: every request goes
+        # through Composio, which adds the grant's token itself. The
+        # discovery document stays local to the library.
+        return build(
+            "gmail",
+            "v1",
+            http=google_api_proxy.GoogleApiProxyHttp(allowed_hosts=_GMAIL_API_HOSTS),
+            static_discovery=True,
+        )
+
     token = os.environ.get("GOOGLE_ACCESS_TOKEN")
     refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN")
     client_id = os.environ.get("GOOGLE_CLIENT_ID")
@@ -149,6 +164,20 @@ def get_gmail_service() -> Any:
 
     credentials = Credentials(**creds_kwargs)
     return build("gmail", "v1", credentials=credentials)
+
+
+def _execute_batch(batch: Any) -> None:
+    """Run a batch natively, or request by request through the proxy.
+
+    A proxied grant cannot send the batch's ``multipart/mixed`` body, so its
+    requests are sent individually with bounded concurrency. Both paths call
+    the batch's callbacks with the same ``(request_id, response, exception)``
+    triples in the same order.
+    """
+    if google_api_proxy.uses_composio_proxy():
+        google_api_proxy.execute_batch(batch)
+    else:
+        batch.execute()
 
 
 @mcp.tool()
@@ -213,7 +242,7 @@ def gmail_search_messages(
                 )
             )
 
-        batch.execute()
+        _execute_batch(batch)
 
         if errors:
             logger.error(f"Batch errors: {errors}")
@@ -251,7 +280,7 @@ def gmail_read_threads(thread_ids: list[str]) -> str:
         for t_id in thread_ids:
             batch.add(service.users().threads().get(userId="me", id=t_id))
 
-        batch.execute()
+        _execute_batch(batch)
 
         return json.dumps(
             {

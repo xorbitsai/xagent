@@ -3538,7 +3538,8 @@ def _finalize_resumed_task(
         # The lease is released in this transaction, so a lost acknowledgement
         # can only be proven applied by a row it inserted: the result fact
         # (V2) or the legacy transcript row. Without one (a legacy wait or
-        # pause with no answer, an ownerless legacy task, a replayed fact)
+        # pause with no answer, a legacy completion with an empty answer, an
+        # ownerless legacy task, a replayed fact)
         # the commit error is re-raised, reported as unresolved when the
         # connection dropped.
         # Read before COMMIT: the row's attributes expire on a failed one.

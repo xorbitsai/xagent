@@ -543,6 +543,47 @@ async def test_a_raised_resume_asks_settlement_to_classify(explicit_cancel):
     assert settle_mock.call_args.kwargs["classify_unknown_tool_effect"] is True
 
 
+@pytest.fixture
+def _automatic_resume_on(monkeypatch):
+    monkeypatch.setenv(PAUSE_SWITCH, "true")
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classify", [False, True], ids=["unclassified", "classified"])
+async def test_a_resume_settled_without_an_interruption_is_classified(
+    canonical, _automatic_resume_on, caplog, classify
+):
+    """An explicit cancel, or an error with no interruption reason, settles
+    with no interruption to resume from, so even with automatic resume on
+    the flag decides whether a started tool with no committed outcome fails
+    the run as an unknown tool effect."""
+    factory, tid = canonical
+    lease = await _run_with_unknown_tool(factory, tid)
+
+    settled = _settle_resumed_task_lease(
+        lease,
+        error_message="Task was cancelled",
+        interruption=None,
+        classify_unknown_tool_effect=classify,
+    )
+
+    assert settled
+    task, row, events = _state(factory, tid)
+    assert task.status == TaskStatus.FAILED
+    assert task.runner_id is None
+    outcomes = [fields(r.getMessage()) for r in records(caplog)]
+    if classify:
+        assert task.error_message == TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+        assert [(o["kind"], o["ref"]) for o in outcomes] == [("tool_effect", ATTEMPT)]
+    else:
+        assert task.error_message == "Task was cancelled"
+        assert outcomes == []
+    # No interruption decided: nothing to pause or resume from.
+    assert row is None
+    assert events == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["finalize", "resume_finalize"])
 async def test_a_resumed_result_settles_like_a_new_run_result(

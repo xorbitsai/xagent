@@ -15,9 +15,16 @@ delete tool, and no argument selects a project, site or URL.
 Configuration (per-user encrypted env, like the other key-based connectors):
 ``JIRA_TICKET_SITE``, ``JIRA_TICKET_EMAIL``, ``JIRA_TICKET_API_TOKEN`` and
 ``JIRA_TICKET_PROJECT_KEY``. Requests use HTTP Basic auth with the email and
-the API token.
+a classic (unscoped) Atlassian API token: only that kind of token works against
+``https://<site>.atlassian.net``; scoped tokens and service accounts must go
+through ``api.atlassian.com/ex/jira/{cloudId}``, which this connector does not
+use.
 
-Scope note: written against the published Jira Cloud REST v2 contract and
+The description is sent as Atlassian Document Format (REST v3), built from the
+plain text, so Jira shows it literally: the wiki markup that REST v2 would
+render (links, external images, macros) is never interpreted.
+
+Scope note: written against the published Jira Cloud REST v3 contract and
 covered by mocked tests; it has not been exercised against a live site.
 """
 
@@ -28,35 +35,26 @@ import re
 import socket
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
 
-from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils import public_requests as requests
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
     reject_private_network_host,
 )
 from ...utils.graphql_errors import truncate_error_text
-from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-ticket-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
-
 mcp = FastMCP("jira-ticket-mcp")
 
-# Same session posture as freshdesk.py/zendesk.py: trust_env=False so an
-# ambient proxy cannot bypass the address check in _base_url(), and no .netrc
-# credential can follow a redirect; the CA bundle is re-applied explicitly
-# because trust_env=False also turns off requests' own lookup of it.
+# The public_requests facade's Session pins every connection to the address it
+# validated as public, honours only the operator-trusted egress proxy, ignores
+# ambient proxies and .netrc, and keeps the CA-bundle environment variables.
 _session = requests.Session()
-_session.trust_env = False
-_ca_bundle = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("CURL_CA_BUNDLE")
-if _ca_bundle:
-    _session.verify = _ca_bundle
 
 ATLASSIAN_DOMAIN = "atlassian.net"
 
@@ -123,10 +121,11 @@ def _base_url() -> str:
     """Return the site URL, refusing one whose name resolves privately.
 
     ``<label>.atlassian.net`` is a name in a zone only Atlassian controls, so
-    a user cannot point it at an internal address. The resolve-and-check is
-    kept anyway, as in freshdesk.py/zendesk.py: it is cheap, it costs no
-    extra moving parts, and it keeps this connector's SSRF posture identical
-    to its siblings instead of a one-off argument about why it differs.
+    a user cannot point it at an internal address. This check only turns a
+    misconfiguration into an early, clear error before anything is sent; it
+    does not pin the connection. The public_requests session does that: it
+    resolves again, rejects non-public addresses and connects to the address
+    it validated.
     """
     site = _site()
     hostname = site.removeprefix("https://")
@@ -212,8 +211,9 @@ def _status_message(response: requests.Response) -> str:
         return f"{base}: {detail}" if detail else base
     if status == 401:
         return (
-            "Jira rejected the credentials (HTTP 401) -- check "
-            "JIRA_TICKET_EMAIL and JIRA_TICKET_API_TOKEN"
+            "Jira rejected the credentials (HTTP 401) -- JIRA_TICKET_API_TOKEN "
+            "must be a classic (unscoped) Atlassian API token created by the "
+            "JIRA_TICKET_EMAIL account"
         )
     if status == 403:
         return (
@@ -238,6 +238,43 @@ def _status_message(response: requests.Response) -> str:
     return f"Jira returned an unexpected response (HTTP {status})"
 
 
+class _NothingSentError(RuntimeError):
+    """A transport failure that certainly happened before Jira got the request."""
+
+
+# NameResolutionError subclasses NewConnectionError in urllib3 2.x.
+_CONNECT_STAGE_ERRORS = (NewConnectionError, ConnectTimeoutError)
+
+
+def _certainly_not_sent(exc: requests.RequestException) -> bool:
+    """True if the request provably never reached Jira.
+
+    Only failures that occur before a connection carries the request qualify:
+    a connect timeout, a rejected URL, a proxy that could not be reached, a
+    urllib3 connect-stage failure (including a DNS failure), and the
+    public_requests facade's own pre-send "host could not be resolved" error.
+    TLS, read and decoding failures can follow a committed create and are not
+    included.
+    """
+    if isinstance(
+        exc,
+        (requests.ConnectTimeout, requests.exceptions.InvalidURL),
+    ):
+        return True
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return True
+    if not isinstance(exc, requests.ConnectionError):
+        return False
+    # public_requests raises ConnectionError(...) from the OSError that the
+    # DNS lookup failed with; urllib3 failures are passed as args[0] instead.
+    if isinstance(exc.__cause__, OSError):
+        return True
+    reason = exc.args[0] if exc.args else None
+    if isinstance(reason, MaxRetryError):
+        reason = reason.reason
+    return isinstance(reason, _CONNECT_STAGE_ERRORS)
+
+
 def _send(
     site: str,
     method: str,
@@ -246,33 +283,29 @@ def _send(
     json_data: dict[str, Any] | None = None,
     timeout: int = CREATE_TIMEOUT_SECONDS,
 ) -> requests.Response:
-    """Issue one request; raise a token-free error for any failure."""
+    """Issue one request to the full API ``path``; raise a token-free error."""
     email, token = _credentials()
-    url = f"{site}/rest/api/2{path}"
-    try:
-        proxy_url = get_trusted_proxy_url()
-    except PrivateNetworkHostError as exc:
-        raise type(exc)(_safe_text(exc)) from None
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
-
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    url = f"{site}{path}"
 
     try:
         response = _session.request(
             method=method,
             url=url,
-            proxies=proxies,
             # Never follow a redirect with the Basic credential attached.
             allow_redirects=False,
             auth=(email, token),
-            headers=headers,
+            headers={"Accept": "application/json"},
             json=json_data,
             timeout=timeout,
         )
     except requests.RequestException as exc:
-        # Keep the exception class (the create path distinguishes timeouts)
-        # but rebuild its text: it can embed a proxy URL with credentials.
-        raise type(exc)(f"Jira request failed: {_safe_text(exc)}") from None
+        # Rebuild the text (it can embed a proxy URL with credentials). Keep
+        # the class unless the request certainly never left, which the create
+        # path must tell apart from a failure after Jira may have committed.
+        message = f"Jira request failed: {_safe_text(exc)}"
+        if _certainly_not_sent(exc):
+            raise _NothingSentError(message) from None
+        raise type(exc)(message) from None
 
     if 300 <= response.status_code < 400:
         raise RuntimeError(
@@ -317,18 +350,42 @@ def _validated_text(name: str, value: str, limit: int) -> str:
 
 
 _OUTCOME_UNKNOWN_ADVICE = (
-    "The ticket may have been created -- check the project before retrying"
+    "The ticket may already have been created; do not call jira_ticket_create "
+    "again, and tell the user it may already have been filed"
 )
+
+
+def _adf_document(text: str) -> dict[str, Any]:
+    """Plain text as an Atlassian Document Format document.
+
+    Blank-line-separated blocks become paragraphs and single newlines become
+    hard breaks. Every line is one literal text node, so nothing in it is
+    interpreted as markup. Empty lines and paragraphs are skipped because ADF
+    rejects empty text nodes.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    content: list[dict[str, Any]] = []
+    for block in re.split(r"\n\s*\n", normalized):
+        nodes: list[dict[str, Any]] = []
+        for line in block.split("\n"):
+            if not line.strip():
+                continue
+            if nodes:
+                nodes.append({"type": "hardBreak"})
+            nodes.append({"type": "text", "text": line})
+        if nodes:
+            content.append({"type": "paragraph", "content": nodes})
+    return {"type": "doc", "version": 1, "content": content}
 
 
 def _outcome_unknown(exc: Exception) -> bool:
     """True if a failed create may nevertheless have created the ticket."""
-    if isinstance(exc, requests.ConnectTimeout):
-        return False  # the connection was never established: nothing was sent
+    if isinstance(exc, _NothingSentError):
+        return False  # classified in _send: the request never reached Jira
     if isinstance(exc, requests.RequestException):
         # Anything else raised while sending or reading the response may come
-        # after Jira committed the issue (timeouts, resets, a body that cannot
-        # be decoded, ...).
+        # after Jira committed the issue (timeouts, resets, TLS or decoding
+        # failures, ...).
         return True
     response = getattr(exc.__cause__, "response", None)
     status = getattr(response, "status_code", None)
@@ -349,17 +406,25 @@ def jira_ticket_create(
     connection -- it cannot be chosen here.
 
     summary: one-line title (max 255 characters).
-    description: plain-text body (max 32000 characters).
+    description: plain text, max 32000 characters; sent as Atlassian Document
+        Format so Jira shows it literally -- no markup, links or images are
+        interpreted.
     issue_type: Jira issue type name, e.g. "Bug" or "Task"; empty means "Task".
     labels: optional labels; each is one word without spaces (max 10).
 
-    Calling this again creates another ticket, so do not repeat a call whose
-    outcome is unknown without first checking the project.
+    Calling this again creates another ticket, so if a call fails with the
+    ticket possibly already created, do not call this tool again; tell the
+    user it may already have been filed.
 
     Returns the issue key and its browse URL.
     """
     try:
-        text_summary = _validated_text("summary", summary, MAX_SUMMARY_CHARS)
+        # Jira Cloud rejects a summary containing newline characters.
+        text_summary = _validated_text(
+            "summary",
+            " ".join(summary.split()) if isinstance(summary, str) else summary,
+            MAX_SUMMARY_CHARS,
+        )
         text_description = _validated_text(
             "description", description, MAX_DESCRIPTION_CHARS
         )
@@ -370,14 +435,16 @@ def jira_ticket_create(
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "summary": text_summary,
-            "description": text_description,
+            "description": _adf_document(text_description),
             "issuetype": {"name": (issue_type or "").strip() or DEFAULT_ISSUE_TYPE},
         }
         if clean_labels:
             fields["labels"] = clean_labels
 
         try:
-            response = _send(site, "POST", "/issue", json_data={"fields": fields})
+            response = _send(
+                site, "POST", "/rest/api/3/issue", json_data={"fields": fields}
+            )
         except Exception as exc:
             if not _outcome_unknown(exc):
                 raise
@@ -390,14 +457,13 @@ def jira_ticket_create(
             created = response.json()
         except ValueError:
             raise RuntimeError(
-                "Jira returned a non-JSON response to the create request; the "
-                "ticket may have been created -- check the project before retrying"
+                f"Jira returned a non-JSON response to the create request. "
+                f"{_OUTCOME_UNKNOWN_ADVICE}"
             ) from None
         key = created.get("key") if isinstance(created, dict) else None
         if not isinstance(key, str) or not _ISSUE_KEY_PATTERN.match(key):
             raise RuntimeError(
-                "Jira did not return a usable issue key; the ticket may have "
-                "been created -- check the project before retrying"
+                f"Jira did not return a usable issue key. {_OUTCOME_UNKNOWN_ADVICE}"
             )
     except Exception as exc:
         safe_message = _safe_text(exc)

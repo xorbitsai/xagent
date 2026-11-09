@@ -207,13 +207,16 @@ def test_existing_row_with_matching_provenance_is_left_alone(tmp_path):
     with engine.begin() as connection:
         _create_table(connection)
         _upgrade(migration, connection)
-        connection.execute(text("UPDATE public_mcp_apps SET is_visible_in_connector=0"))
+        connection.execute(text("UPDATE public_mcp_apps SET is_visible_in_connector=1"))
         _upgrade(migration, connection)
-        visible = connection.execute(
-            text("SELECT is_visible_in_connector FROM public_mcp_apps")
-        ).scalar()
-    # An operator who hid the seeded row keeps it hidden.
-    assert visible == 0
+        rows = connection.execute(
+            text(
+                "SELECT is_visible_in_connector FROM public_mcp_apps "
+                "WHERE app_id = 'jira-ticket'"
+            )
+        ).all()
+    # The seed ships hidden; an operator who showed the row keeps it shown.
+    assert [row[0] for row in rows] == [1]
 
 
 def test_collision_with_a_custom_app_id_row_is_preserved_and_logged(tmp_path, caplog):

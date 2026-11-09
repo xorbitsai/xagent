@@ -50,9 +50,9 @@ ROW = {
     "app_id": APP_ID,
     "name": "Jira Ticket",
     "description": (
-        "Connect a Jira Cloud site with an API token to create tickets in one "
-        "fixed project. This connector can only create tickets: it cannot "
-        "read, search or change existing ones."
+        "Connect a Jira Cloud site with a classic (unscoped) API token to "
+        "create tickets in one fixed project. This connector can only create "
+        "tickets: it cannot read, search or change existing ones."
     ),
     "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
     "transport": "stdio",

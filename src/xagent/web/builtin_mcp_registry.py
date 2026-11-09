@@ -1725,7 +1725,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # canonicalize_builtin_identity(server name) == "jira-ticket".
             "app_id": "jira-ticket",
             "name": "Jira Ticket",
-            "description": "Connect a Jira Cloud site with an API token to create tickets in one fixed project. This connector can only create tickets: it cannot read, search or change existing ones.",
+            "description": "Connect a Jira Cloud site with a classic (unscoped) API token to create tickets in one fixed project. This connector can only create tickets: it cannot read, search or change existing ones.",
             "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
             "transport": "stdio",
             "provider_name": None,

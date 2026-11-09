@@ -1,6 +1,6 @@
 """Tests for the create-only Jira ticket connector.
 
-Mocked against the Jira Cloud REST v2 contract (create issue).
+Mocked against the Jira Cloud REST v3 contract (create issue).
 They pin the requests this module builds and how it translates responses; they
 cannot show the documented shapes match a live site.
 """
@@ -11,6 +11,14 @@ from typing import Any
 
 import pytest
 import requests
+from urllib3.exceptions import (
+    ConnectTimeoutError,
+    NameResolutionError,
+    MaxRetryError,
+    NewConnectionError,
+    ProtocolError,
+    ReadTimeoutError,
+)
 
 from xagent.web.tools.mcp import jira_ticket
 
@@ -96,6 +104,13 @@ def _call(**kwargs: Any) -> dict[str, Any]:
 def test_exposes_only_the_create_tool() -> None:
     tools = asyncio.run(jira_ticket.mcp.list_tools())
     assert [tool.name for tool in tools] == ["jira_ticket_create"]
+
+
+def test_module_uses_the_public_requests_facade() -> None:
+    from xagent.core.utils import public_requests
+
+    assert jira_ticket.requests is public_requests
+    assert isinstance(jira_ticket._session, public_requests.Session)
 
 
 def test_tool_has_no_argument_that_selects_project_site_or_url() -> None:
@@ -243,7 +258,8 @@ def test_create_request_shape_and_result(session: _FakeSession) -> None:
     }
     (call,) = session.calls
     assert call["method"] == "POST"
-    assert call["url"] == f"{SITE}/rest/api/2/issue"
+    assert call["url"] == f"{SITE}/rest/api/3/issue"
+    assert call["headers"] == {"Accept": "application/json"}
     assert call["auth"] == (EMAIL, TOKEN)
     assert call["allow_redirects"] is False
     assert call["timeout"] == jira_ticket.CREATE_TIMEOUT_SECONDS
@@ -251,7 +267,16 @@ def test_create_request_shape_and_result(session: _FakeSession) -> None:
         "fields": {
             "project": {"key": "SUP"},
             "summary": "Login broken",
-            "description": "Cannot sign in.",
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Cannot sign in."}],
+                    }
+                ],
+            },
             "issuetype": {"name": "Task"},
         }
     }
@@ -317,7 +342,7 @@ def test_create_response_with_a_path_like_key_is_refused(
 @pytest.mark.parametrize(
     "status, fragment",
     [
-        (401, "JIRA_TICKET_EMAIL"),
+        (401, "classic (unscoped)"),
         (403, "Create Issues"),
         (404, "project or site"),
         (429, "rate limit"),
@@ -350,33 +375,192 @@ def test_gateway_error_on_create_says_the_ticket_may_exist(
 ) -> None:
     session.queue = [_FakeResponse(status_code=status, text="gw")]
     message = _call()["message"]
-    assert "may have been created" in message
-    assert "check the project" in message
+    assert "may already have been created" in message
+    assert "do not call jira_ticket_create again" in message
     assert "try again" not in message.lower()
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [
-        requests.exceptions.ReadTimeout("slow"),
-        requests.exceptions.ChunkedEncodingError("cut"),
-        requests.exceptions.ConnectionError("reset"),
-        requests.exceptions.ContentDecodingError("bad gzip"),
-    ],
-)
+_URL = f"{SITE}/rest/api/3/issue"
+
+
+def _maxretry(reason: Exception) -> requests.ConnectionError:
+    return requests.ConnectionError(MaxRetryError(None, _URL, reason=reason))  # type: ignore[arg-type]
+
+
+def _facade_dns_error() -> requests.ConnectionError:
+    try:
+        raise OSError("Name or service not known")
+    except OSError as cause:
+        try:
+            raise requests.ConnectionError(
+                "Public API host could not be resolved"
+            ) from cause
+        except requests.ConnectionError as exc:
+            return exc
+
+
+_NOTHING_SENT = [
+    requests.exceptions.ConnectTimeout("no route"),
+    requests.exceptions.InvalidURL("private address"),
+    requests.exceptions.ProxyError("proxy refused"),
+    _maxretry(NewConnectionError(None, "refused")),  # type: ignore[arg-type]
+    _maxretry(ConnectTimeoutError(None, "connect timed out")),  # type: ignore[arg-type]
+    _maxretry(NameResolutionError("acme.atlassian.net", None, OSError("dns"))),  # type: ignore[arg-type]
+    _facade_dns_error(),
+]
+
+_OUTCOME_UNKNOWN = [
+    requests.exceptions.ReadTimeout("slow"),
+    requests.exceptions.ChunkedEncodingError("cut"),
+    requests.exceptions.ConnectionError("reset"),
+    requests.exceptions.ContentDecodingError("bad gzip"),
+    requests.exceptions.SSLError("handshake"),
+    _maxretry(ProtocolError("connection aborted")),
+    _maxretry(ReadTimeoutError(None, _URL, "read timed out")),  # type: ignore[arg-type]
+    _maxretry(None),  # type: ignore[arg-type]
+]
+
+
+@pytest.mark.parametrize("exc", _OUTCOME_UNKNOWN)
 def test_post_send_failure_on_create_says_the_ticket_may_exist(
     session: _FakeSession, exc: Exception
 ) -> None:
     session.queue = [exc]
     message = _call()["message"]
-    assert "may have been created" in message
+    assert "may already have been created" in message
     assert "try again" not in message.lower()
 
 
-def test_connect_timeout_on_create_is_safe_to_retry(session: _FakeSession) -> None:
-    session.queue = [requests.exceptions.ConnectTimeout("no route")]
-    message = _call()["message"]
-    assert "may have been created" not in message
+@pytest.mark.parametrize("exc", _NOTHING_SENT)
+def test_failure_before_anything_was_sent_is_not_outcome_unknown(
+    session: _FakeSession, exc: Exception
+) -> None:
+    session.queue = [exc]
+    result = _call()
+    assert result["status"] == "error"
+    assert result["message"].startswith("Jira request failed")
+    assert "may already have been created" not in result["message"]
+    assert TOKEN not in result["message"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("Name or service not known"), ValueError("private address")],
+    ids=["unresolvable-host", "private-address"],
+)
+def test_real_facade_refusals_before_sending_are_not_outcome_unknown(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    """Through the real public_requests session: its adapter refuses before
+    connecting, and the connector must not call that a possibly-created
+    ticket."""
+    from xagent.core.utils import public_requests
+
+    def refuse(url: str) -> list[str]:
+        raise failure
+
+    monkeypatch.setattr(public_requests, "validate_public_http_url_sync", refuse)
+    result = _call()
+    assert result["status"] == "error"
+    assert result["message"].startswith("Jira request failed")
+    assert "may already have been created" not in result["message"]
+    assert TOKEN not in result["message"]
+
+
+@pytest.mark.parametrize("exc", _NOTHING_SENT)
+def test_nothing_sent_failures_raise_the_dedicated_error(
+    session: _FakeSession, exc: Exception
+) -> None:
+    session.queue = [exc]
+    with pytest.raises(jira_ticket._NothingSentError):
+        jira_ticket._send(SITE, "POST", "/rest/api/3/issue", json_data={})
+    assert jira_ticket._outcome_unknown(jira_ticket._NothingSentError("x")) is False
+
+
+@pytest.mark.parametrize("exc", _OUTCOME_UNKNOWN)
+def test_other_transport_failures_stay_request_exceptions(
+    session: _FakeSession, exc: Exception
+) -> None:
+    session.queue = [exc]
+    with pytest.raises(requests.RequestException) as caught:
+        jira_ticket._send(SITE, "POST", "/rest/api/3/issue", json_data={})
+    assert not isinstance(caught.value, jira_ticket._NothingSentError)
+    assert jira_ticket._outcome_unknown(caught.value) is True
+
+
+def test_summary_newlines_and_whitespace_runs_are_collapsed(
+    session: _FakeSession,
+) -> None:
+    session.queue = [_created()]
+    _call(summary="  Login\r\nbroken\n\n on \t mobile \r")
+    assert session.calls[0]["json"]["fields"]["summary"] == "Login broken on mobile"
+
+
+def test_description_keeps_its_newlines_in_the_adf_body(
+    session: _FakeSession,
+) -> None:
+    session.queue = [_created()]
+    _call(description="one\ntwo")
+    content = session.calls[0]["json"]["fields"]["description"]["content"]
+    assert content == [
+        {
+            "type": "paragraph",
+            "content": [
+                {"type": "text", "text": "one"},
+                {"type": "hardBreak"},
+                {"type": "text", "text": "two"},
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[x|https://e.test]",
+        "!https://e.test/p.png!",
+        "{noformat}",
+        "*bold* _it_ {code}x{code} [~user]",
+    ],
+)
+def test_markup_looking_description_arrives_verbatim(text: str) -> None:
+    assert jira_ticket._adf_document(text) == {
+        "type": "doc",
+        "version": 1,
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+    }
+
+
+def test_adf_paragraphs_and_hard_breaks() -> None:
+    doc = jira_ticket._adf_document("a\r\nb\r\r\nc\n \n\n\nd\ne")
+    paragraphs = doc["content"]
+    assert [p["type"] for p in paragraphs] == ["paragraph"] * 3
+    assert paragraphs[0]["content"] == [
+        {"type": "text", "text": "a"},
+        {"type": "hardBreak"},
+        {"type": "text", "text": "b"},
+    ]
+    assert paragraphs[1]["content"] == [{"type": "text", "text": "c"}]
+    assert paragraphs[2]["content"] == [
+        {"type": "text", "text": "d"},
+        {"type": "hardBreak"},
+        {"type": "text", "text": "e"},
+    ]
+
+
+def test_adf_never_emits_an_empty_text_node() -> None:
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "text":
+                assert node["text"] != ""
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    for text in ["x\n\n\n\ny", "\nx\n", "a\n   \nb", "  \n x"]:
+        walk(jira_ticket._adf_document(text))
 
 
 def test_create_advice_survives_a_very_long_underlying_message(
@@ -384,14 +568,14 @@ def test_create_advice_survives_a_very_long_underlying_message(
 ) -> None:
     session.queue = [requests.exceptions.ReadTimeout("x" * 5000)]
     message = _call()["message"]
-    assert message.startswith("The ticket may have been created")
-    assert "check the project" in message
+    assert message.startswith("The ticket may already have been created")
+    assert "do not call jira_ticket_create again" in message
     assert len(message) < 1500
 
 
 def test_rate_limit_on_create_is_not_outcome_unknown(session: _FakeSession) -> None:
     session.queue = [_FakeResponse(status_code=429, text="slow")]
-    assert "may have been created" not in _call()["message"]
+    assert "may already have been created" not in _call()["message"]
 
 
 def test_one_dns_check_per_call(

@@ -30,7 +30,7 @@ ConnectorChecks(
 
 - **Check id.** Every check has a declared id, `<app_id>.<snake_case_name>`, at most 80 characters and unique within the connector. The result and the result diff key on it, so an id is never derived from a position and never reused for a different check.
 - **Read check.** One tool, its arguments and assertions on the result. `require_read_only_hint=True` skips the check unless the server advertises the tool with `readOnlyHint: true`, for servers whose tools are vendor-owned (#3566).
-- **Unprobeable check.** A slot that cannot run, with an L3 reason (`covered_by_l2`, `sandboxed`, `execution_scoped`, `needs_fixture`). Its row is always `unprobeable`.
+- **Unprobeable check.** A slot that cannot run, with an L3 reason (`covered_by_l2`, `sandboxed`, `execution_scoped`, `needs_fixture`, `write_only`). Its row is always `unprobeable`.
 - **Write check.** `create`, `verify` and `cleanup` steps, an optional `cleanup_guard`, a `tenant_pin` and `expected_verdicts`; see [Write checks and the sweep](#write-checks-and-the-sweep). The write switch is per connector, keyed by its app id. **No write check runs until #3564 lands**: each one reports `skip` with `writes_disabled`.
 - **Exemption.** A tool that has no check carries an exemption and a reason, keyed by its wire name. A tool cannot be both checked and exempted.
 

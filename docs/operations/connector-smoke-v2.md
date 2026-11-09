@@ -36,6 +36,12 @@ ConnectorChecks(
 
 - **Sweep.** A connector with a write check declares one `Sweep`, which removes the objects aborted runs left behind; a connector without write checks declares none.
 
+**Coverage (#3565).** A builtin connector is either in `CONNECTOR_CHECKS` or on `LEGACY_CONNECTORS` (`registry.py`), the connectors that have not adopted V2 yet. `tests/web/connector_checks/test_tool_coverage.py` holds these rules:
+
+- Every tool an in-repo (`python -m`) connector's server registers has a check or an exemption, and every tool a declaration names is registered. A remote (`url`) or `npx` connector is not held to per-tool coverage (see Today's L3 probes).
+- The legacy list only shrinks. A connector leaves it in the PR that adds its declaration; a new builtin connector ships with its declaration and cannot join it.
+- An exemption's reason says why the tool has no check yet, in one of the shared reasons in `registry.py`: a read whose check is not declared yet, a write waiting for #3564, or a write that creates an object no tool of the server deletes.
+
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`. A write check's steps can also use a `RunScopedName`, its `verify`, `cleanup` and `cleanup_guard` a `CreatedRef`, and a sweep's `delete` an `ItemRef`. None of them ever comes from the caller of the engine.
 
 ### Write checks and the sweep

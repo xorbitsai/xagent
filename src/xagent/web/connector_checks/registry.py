@@ -20,9 +20,35 @@ from .declarations import (
     L3Envelope,
     ReadCheck,
     StatusSuccess,
+    ToolExemption,
     UnprobeableCheck,
 )
 from .fixtures import FixtureRef
+
+# Why a tool of an in-repo connector has no check yet (#3565).
+_READ_PENDING = "read; no read check is declared for it yet"
+_WRITE_PENDING = "write; write checks wait for the safety rails of #3564"
+_WRITE_WITHOUT_CLEANUP = (
+    "write that creates an object no tool of this server deletes, so a write "
+    "check has nothing to clean up with"
+)
+
+
+def _exemptions(
+    *,
+    reads: tuple[str, ...] = (),
+    writes: tuple[str, ...] = (),
+    writes_without_cleanup: tuple[str, ...] = (),
+) -> tuple[ToolExemption, ...]:
+    return (
+        *(ToolExemption(tool, _READ_PENDING) for tool in reads),
+        *(ToolExemption(tool, _WRITE_PENDING) for tool in writes),
+        *(
+            ToolExemption(tool, _WRITE_WITHOUT_CLEANUP)
+            for tool in writes_without_cleanup
+        ),
+    )
+
 
 # Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
 # connector has a check or an exemption (#3565, tests/web/connector_checks/
@@ -53,6 +79,27 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            reads=(
+                "excel_get_range",
+                "excel_get_used_range",
+                "excel_count_values",
+                "excel_find_rows",
+                "excel_list_tables",
+                "excel_list_table_rows",
+            ),
+            writes=(
+                "excel_add_worksheet",
+                "excel_delete_worksheet",
+                "excel_update_range",
+                "excel_delete_columns",
+                "excel_delete_rows",
+                "excel_clear_range",
+                "excel_add_table_rows",
+                "excel_delete_table_row",
+            ),
+            writes_without_cleanup=("excel_add_table",),
+        ),
     ),
     "google-docs": ConnectorChecks(
         "google-docs",
@@ -66,6 +113,15 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                     HasKeys((), ("document_id", "title")),
                 ),
             ),
+        ),
+        exemptions=_exemptions(
+            reads=(),
+            writes=(
+                "google_docs_append_text",
+                "google_docs_replace_text",
+                "google_docs_batch_update",
+            ),
+            writes_without_cleanup=("google_docs_create_document",),
         ),
     ),
     "google-sheets": ConnectorChecks(
@@ -81,6 +137,17 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            reads=("google_sheets_read_range",),
+            writes=(
+                "google_sheets_update_range",
+                "google_sheets_append_rows",
+                "google_sheets_clear_range",
+                "google_sheets_add_sheet",
+                "google_sheets_delete_sheet",
+            ),
+            writes_without_cleanup=("google_sheets_create_spreadsheet",),
+        ),
     ),
     "google-slides": ConnectorChecks(
         "google-slides",
@@ -93,6 +160,19 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                     StatusSuccess(),
                     HasKeys((), ("presentation_id", "title", "slides")),
                 ),
+            ),
+        ),
+        exemptions=_exemptions(
+            reads=("google_slides_get_slide_thumbnail",),
+            writes=(
+                "google_slides_add_slide",
+                "google_slides_update_slide",
+                "google_slides_delete_slide",
+                "google_slides_batch_update",
+            ),
+            writes_without_cleanup=(
+                "google_slides_create_presentation",
+                "google_slides_import_pptx",
             ),
         ),
     ),
@@ -136,6 +216,19 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            reads=(
+                "powerpoint_get_presentation_text",
+                "powerpoint_get_slide_text",
+                "powerpoint_list_slide_layouts",
+            ),
+            writes=(
+                "powerpoint_set_shape_text",
+                "powerpoint_add_slide",
+                "powerpoint_delete_slide",
+            ),
+            writes_without_cleanup=("powerpoint_create_presentation",),
+        ),
     ),
     "word": ConnectorChecks(
         "word",
@@ -149,6 +242,17 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                     HasKeys((), ("text", "generation")),
                 ),
             ),
+        ),
+        exemptions=_exemptions(
+            reads=("word_list_paragraphs",),
+            writes=(
+                "word_set_paragraph_text",
+                "word_append_paragraph",
+                "word_add_heading",
+                "word_insert_page_break",
+                "word_replace_text",
+            ),
+            writes_without_cleanup=("word_create_document",),
         ),
     ),
 }

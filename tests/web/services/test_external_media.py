@@ -456,7 +456,7 @@ def test_instagram_conversion_applies_exif_orientation(tmp_path):
         assert image.getexif().get(274, 1) == 1
 
 
-def _jpeg(size, orientation=1):
+def _sized_jpeg(size, orientation=1):
     exif = Image.Exif()
     exif[274] = orientation
     buffer = BytesIO()
@@ -485,7 +485,7 @@ def test_instagram_conversion_decodes_a_narrow_jpeg_at_reduced_size(
 
     monkeypatch.setattr(external_media.ImageOps, "exif_transpose", record_decoded_size)
 
-    external_media.instagram_jpeg_bytes(_jpeg(stored, orientation))
+    external_media.instagram_jpeg_bytes(_sized_jpeg(stored, orientation))
 
     [(width, height)] = decoded
     assert stored[0] // width > 1 and stored[1] // height > 1
@@ -533,7 +533,7 @@ def test_instagram_conversion_sends_the_same_size_whatever_it_decodes_at(
     # instead would send 1440x859. Orientations 2-4 keep the stored 3000x1200
     # image's width and height; 5-8 (mirrored or not) turn it upright as
     # 1200x3000.
-    converted = external_media.instagram_jpeg_bytes(_jpeg(stored, orientation))
+    converted = external_media.instagram_jpeg_bytes(_sized_jpeg(stored, orientation))
 
     with Image.open(BytesIO(converted)) as image:
         assert image.size == sent

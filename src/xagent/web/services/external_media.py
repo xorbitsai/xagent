@@ -15,7 +15,14 @@ from typing import IO, Any, BinaryIO
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
-from PIL import ExifTags, Image, ImageFile, ImageOps, JpegImagePlugin, UnidentifiedImageError
+from PIL import (
+    ExifTags,
+    Image,
+    ImageFile,
+    ImageOps,
+    JpegImagePlugin,
+    UnidentifiedImageError,
+)
 from sqlalchemy.orm import Session
 
 from ...config import (

@@ -13,8 +13,8 @@ import pytest
 import requests
 from urllib3.exceptions import (
     ConnectTimeoutError,
-    NameResolutionError,
     MaxRetryError,
+    NameResolutionError,
     NewConnectionError,
     ProtocolError,
     ReadTimeoutError,

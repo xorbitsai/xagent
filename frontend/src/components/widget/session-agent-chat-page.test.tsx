@@ -1809,6 +1809,9 @@ describe("SessionAgentChatPage", () => {
         await sendFrom(config, coded(code))
 
         expect(screen.getByRole("alert")).toHaveTextContent(expected)
+        if (expected !== "widgetSession.history.continueUnavailable") {
+          expect(screen.queryByText("widgetSession.history.continueUnavailable")).not.toBeInTheDocument()
+        }
       })
 
       it.each([

@@ -120,8 +120,8 @@ class ProxyResponse:
     ``binary_data`` (``url``, ``content_type``, ``size``) and ``data`` is
     null or absent: Composio stores the file and returns a signed URL, it
     never relays the bytes in ``data``. ``data`` is optional and nullable in
-    Composio's schema, so ``None`` means no body; a 2xx other than 204 with
-    neither a body nor a file is refused as an incomplete answer.
+    Composio's schema, so ``None`` means no body; whether an empty 2xx is a
+    complete answer is the provider's own API's rule, not this client's.
     """
 
     status: int
@@ -471,10 +471,9 @@ def proxy_request(
         )
     provider_status = answer["status"]
     # Composio's 200 schema only requires ``status``: ``data`` is optional and
-    # nullable, and a file answer carries ``binary_data`` instead. So only a
-    # real 2xx that has neither is an incomplete answer; a 3xx, 304, an
-    # upstream 4xx/5xx and a binary answer all go back to the caller with the
-    # provider's own status and headers.
+    # nullable, and a file answer carries ``binary_data`` instead. All of them
+    # go back to the caller with the provider's own status and headers; each
+    # connector decides what an empty 2xx means for the API it speaks.
     answer_headers = answer.get("headers")
     binary_data = answer.get("binary_data")
     if answer_headers is not None and not isinstance(answer_headers, Mapping):
@@ -488,19 +487,6 @@ def proxy_request(
         # answer into a successful 0-byte download.
         raise ComposioProxyError(
             "Composio proxy returned a binary answer in an unexpected shape",
-            status=status,
-        )
-    if (
-        200 <= provider_status < 300
-        and provider_status != 204
-        and answer.get("data") is None
-        and not isinstance(binary_data, Mapping)
-    ):
-        # A 2xx without a body is not a successful provider answer: a
-        # truncated answer would otherwise reach a callback and fail opaquely
-        # there. An explicit null counts as no body, like an absent key.
-        raise ComposioProxyError(
-            "Composio proxy returned an answer without the provider's data",
             status=status,
         )
     return ProxyResponse(

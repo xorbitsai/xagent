@@ -557,22 +557,21 @@ def test_a_per_call_body_limit_overrides_the_shared_default(proxy):
     [{"status": 200}, {"status": 200, "data": None}],
     ids=["absent", "null"],
 )
-def test_a_successful_answer_without_data_or_binary_data_is_a_composio_error(
-    proxy, answer
-):
-    """A truncated 2xx used to reach a callback and fail opaquely there; with
-    neither a body nor a file there is nothing to return. An explicit null is
-    no body either, not a 0-byte JSON document."""
+def test_a_successful_answer_without_data_is_returned_as_no_body(proxy, answer):
+    """Composio's schema makes ``data`` optional and nullable. Whether an
+    empty 2xx is a complete answer is the connector's own API's rule:
+    Salesforce (#3669) reads it as ``{}``, while Gmail refuses it in its
+    transport. The shared client only reports that there is no body."""
     proxy.response = _Response(200, answer)
 
-    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
-        composio_proxy.proxy_request(
-            "GET",
-            "https://gmail.googleapis.com/gmail/v1/users/me/labels",
-            allowed_hosts=GMAIL_HOSTS,
-        )
+    response = composio_proxy.proxy_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+        allowed_hosts=GMAIL_HOSTS,
+    )
 
-    assert "without the provider's data" in str(raised.value)
+    assert response.status == 200
+    assert response.data is None
 
 
 def test_a_redirect_without_data_is_still_a_provider_answer(proxy):

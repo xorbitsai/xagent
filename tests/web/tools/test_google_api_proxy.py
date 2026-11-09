@@ -173,6 +173,24 @@ def test_a_no_content_answer_has_an_empty_body(proxy):
     assert response["content-type"] == "application/json; charset=UTF-8"
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [{"status": 200}, {"status": 200, "data": None}],
+    ids=["absent", "null"],
+)
+def test_a_200_without_a_body_is_refused(proxy, answer):
+    """Gmail answers an empty success with 204, so a 200 with neither a body
+    nor a file is an incomplete answer and fails this request here. The
+    shared client leaves that rule to each API: Salesforce (#3669) reads the
+    same answer as ``{}``."""
+    proxy.answer_with(200, answer)
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/labels")
+
+    assert "without the provider's data" in str(raised.value)
+
+
 def test_a_text_answer_is_returned_as_bytes(proxy):
     """A later media download reuses this transport; its answer may not be
     JSON."""

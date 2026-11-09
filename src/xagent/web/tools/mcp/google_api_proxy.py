@@ -126,8 +126,21 @@ def _binary_content(
 
 
 def _body_and_type(answer: ProxyResponse, *, timeout: float) -> tuple[bytes, str]:
+    """The body and content type of one provider answer.
+
+    Gmail answers an empty success with 204, so a 2xx other than 204 that
+    carries neither a body nor a file is an incomplete answer for this
+    transport. Failing that one request is better than handing an empty body
+    to a caller that reads it as a JSON document. The shared client leaves
+    that judgment to each API: Salesforce, for one, reads an empty answer as
+    an empty object.
+    """
     if answer.binary_data is not None:
         return _binary_content(answer.binary_data, timeout=timeout)
+    if answer.ok and answer.status != 204 and answer.data is None:
+        raise ComposioProxyError(
+            "Composio proxy returned an answer without the provider's data"
+        )
     return _content(answer.data)
 
 
@@ -427,9 +440,9 @@ def execute_batch(
                     raise HttpError(raw_response, content, uri=request.uri)
                 response = request.postproc(raw_response, content)
             except Exception as exc:
-                # A response that cannot be turned into a result (an empty
-                # body is not JSON, for one) fails that request alone; the
-                # other callbacks have not run yet and must still run.
+                # A response that cannot be turned into a result fails that
+                # request alone; the other callbacks have not run yet and must
+                # still run.
                 exception = exc
         callback = batch._callbacks[request_id]
         if callback is not None:

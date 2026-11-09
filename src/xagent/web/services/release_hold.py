@@ -67,6 +67,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from .standby import standby_requested
+
 logger = logging.getLogger(__name__)
 
 # How many unsettled entries are kept for diagnostics. ``unsettled_total`` keeps
@@ -285,6 +287,10 @@ class ReleaseHold:
 
 
 release_hold = ReleaseHold()
+# A standby process starts closed and sealed, from import on: no ingress exists
+# yet, so nothing can be admitted in between. Activation reopens it.
+if standby_requested():
+    release_hold.seal("standby")
 
 
 def execution_status() -> dict[str, Any]:

@@ -338,6 +338,73 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
             return validate_builtin_public_mcp_apps(connection)
 
 
+def init_db_standby(db_url: str | None = None) -> None:
+    """Bind the database for a standby process without writing anything.
+
+    Checks only what a process can check against a schema that is older than
+    its code (or equal): the revisions must be known to this release and the
+    ``taskstatus`` enum may lack labels this code adds. Migrations, seeding,
+    policy syncs and the stored-key admission wait for
+    :func:`complete_standby_db_init`.
+    """
+    from ...db.migration import check_standby_schema
+    from .task import check_task_status_enum_drift
+
+    validate_encryption_config()
+    configure_db(db_url)
+    engine = get_engine()
+    try:
+        check_standby_schema(engine)
+        with engine.connect() as connection:
+            check_task_status_enum_drift(connection, allow_missing_labels=True)
+    except BaseException:
+        reset_failed_engine()
+        raise
+
+
+def reset_failed_engine() -> None:
+    """Drop a rejected engine so no usable factory outlives a failed admission."""
+    global _engine, _SessionLocal
+    failed_engine = _engine
+    _engine = None
+    _SessionLocal = None
+    if failed_engine is not None:
+        try:
+            failed_engine.dispose()
+        except Exception:
+            logger.warning("Failed to dispose rejected database engine")
+
+
+def complete_standby_db_init() -> None:
+    """Run the deferred half of :func:`init_db` on the standby's bound engine.
+
+    Strict from here on: the migration has run, so the schema must now be this
+    release's. Reuses the engine standby already bound instead of replacing it.
+    """
+    from ..services.encryption_key_rotation import validate_stored_encryption_keys
+
+    try:
+        validate_stored_encryption_keys()
+        mismatches = _initialize_database_schema(get_engine())
+    except BaseException:
+        reset_failed_engine()
+        raise
+    _log_builtin_mcp_mismatches(mismatches)
+    logger.info("Database initialized. Waiting for first admin setup.")
+
+
+def _log_builtin_mcp_mismatches(mismatches: list[dict[str, Any]]) -> None:
+    for mismatch in mismatches:
+        logger.warning(
+            "Built-in MCP catalog drift detected: app_id=%s "
+            "mismatched_fields=%s canonical_hash=%s persisted_hash=%s",
+            mismatch["app_id"],
+            ",".join(mismatch["mismatched_fields"]),
+            mismatch["canonical_hash"],
+            mismatch["persisted_hash"],
+        )
+
+
 def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
     global _engine, _SessionLocal
@@ -401,14 +468,6 @@ def init_db(db_url: str | None = None) -> None:
                 logger.warning("Failed to dispose rejected database engine")
         raise
 
-    for mismatch in builtin_mcp_mismatches:
-        logger.warning(
-            "Built-in MCP catalog drift detected: app_id=%s "
-            "mismatched_fields=%s canonical_hash=%s persisted_hash=%s",
-            mismatch["app_id"],
-            ",".join(mismatch["mismatched_fields"]),
-            mismatch["canonical_hash"],
-            mismatch["persisted_hash"],
-        )
+    _log_builtin_mcp_mismatches(builtin_mcp_mismatches)
 
     logger.info("Database initialized. Waiting for first admin setup.")

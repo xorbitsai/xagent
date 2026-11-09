@@ -67,9 +67,18 @@ from .services.turn_settlement import drain_turn_settlement_hooks
 logger = logging.getLogger(__name__)
 
 
-def validate_worker_schema() -> None:
-    """Inspect the deployed revision; worker replicas never execute migrations."""
+def validate_worker_schema(*, allow_older: bool = False) -> None:
+    """Inspect the deployed revision; worker replicas never execute migrations.
+
+    ``allow_older`` is for a standby worker, which starts against the schema
+    the serving release runs: any revision this release knows is accepted.
+    """
     engine = get_engine()
+    if allow_older:
+        from ..db.migration import check_standby_schema
+
+        check_standby_schema(engine)
+        return
     expected = set(
         ScriptDirectory.from_config(create_alembic_config(engine)).get_heads()
     )

@@ -85,7 +85,9 @@ _MISSING_LABEL_REMEDY = (
 )
 
 
-def check_task_status_enum_drift(bind: Connection) -> None:
+def check_task_status_enum_drift(
+    bind: Connection, *, allow_missing_labels: bool = False
+) -> None:
     """Refuse to serve when the live ``taskstatus`` enum's labels disagree
     with the labels ``Task.status`` is declared with.
 
@@ -140,6 +142,9 @@ def check_task_status_enum_drift(bind: Connection) -> None:
     from the type the column uses, and an extra label on that copy would
     reject a correct deployment.
 
+    ``allow_missing_labels`` is for standby start only: it tolerates labels
+    this code declares but the live type lacks, and nothing else.
+
     Expected labels come from ``Task.__table__.c.status.type.enums`` --
     the ``Enum`` column's own declared labels -- rather than from
     ``{member.name for member in TaskStatus}``. Today the two sets are
@@ -174,6 +179,12 @@ def check_task_status_enum_drift(bind: Connection) -> None:
 
     missing = sorted(expected_labels - live_labels)
     extra = sorted(live_labels - expected_labels)
+    if allow_missing_labels and not extra:
+        # A standby process runs ahead of the deployed schema: labels this code
+        # adds are created by the migration that precedes activation, which
+        # re-runs this check strictly. Unexpected labels still refuse, because
+        # they mean the database is newer than this code.
+        return
     if missing and extra:
         remedy = (
             f"{_MISSING_LABEL_REMEDY} The unexpected label(s) indicate this "

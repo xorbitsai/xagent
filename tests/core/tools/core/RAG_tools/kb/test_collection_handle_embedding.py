@@ -32,7 +32,10 @@ from xagent.core.tools.core.RAG_tools.kb.models import (
     KBStorageBackend,
     KBUserScope,
 )
-from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
+from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+    embeddings_table_candidates,
+    to_model_tag,
+)
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_ingestion_status_store,
     get_main_pointer_store,
@@ -170,6 +173,24 @@ class TestHandleReadChunksNeedingEmbedding:
         assert result.total_count == 2
         assert result.pending_count == 1
         assert [c.chunk_id for c in result.chunks] == ["c1"]
+
+    def test_sees_rows_the_write_path_stored_under_a_twice_tagged_table(self) -> None:
+        handle = make_handle("coll")
+        _seed_chunk("coll", "d1", "h1", "c0", index=0)
+        handle.write_embeddings(
+            [
+                _embedding(
+                    "d1", "c0", "h1", "platform/text-embedding-v4", vector=[0.1, 0.2]
+                )
+            ],
+            create_index=False,
+        )
+
+        result = handle.read_chunks_needing_embedding(
+            "d1", "h1", "platform/text-embedding-v4", is_admin=True
+        )
+        assert result.total_count == 1
+        assert result.pending_count == 0
 
     def test_empty_when_no_chunks(self) -> None:
         handle = make_handle("coll")
@@ -329,12 +350,16 @@ def _embedding(
 def _embedding_rows(model: str, collection: str, doc_id: str) -> list[dict]:
     store = get_vector_index_store()
     rows: list[dict] = []
-    for batch in store.iter_batches(
-        table_name=f"embeddings_{to_model_tag(model)}",
-        filters={"collection": collection, "doc_id": doc_id},
-        is_admin=True,
-    ):
-        rows.extend(batch.to_pylist())
+    existing = set(store.list_table_names())
+    for table_name in embeddings_table_candidates(model):
+        if table_name not in existing:
+            continue
+        for batch in store.iter_batches(
+            table_name=table_name,
+            filters={"collection": collection, "doc_id": doc_id},
+            is_admin=True,
+        ):
+            rows.extend(batch.to_pylist())
     return rows
 
 
@@ -480,6 +505,69 @@ class TestHandleDeleteEmbeddingRecords:
             store.count_rows("embeddings_m1", {"collection": "other"}, is_admin=True)
             == 1
         )
+
+
+class TestHandleSearchAcrossEmbeddingsTables:
+    @staticmethod
+    def _vector(dimension: int = 1024) -> list[float]:
+        return [1.0, *([0.0] * (dimension - 1))]
+
+    def test_prefixed_model_is_written_and_found_by_dense_and_sparse_search(
+        self,
+    ) -> None:
+        handle = make_handle("coll")
+        model = "platform/text-embedding-v4"
+        vector = self._vector()
+        handle.write_embeddings(
+            [
+                _embedding(
+                    "d1", "c0", "h1", model, vector=vector, text="quokka retrieval"
+                )
+            ],
+            create_index=True,
+        )
+        store = get_vector_index_store()
+        assert [n for n in store.list_table_names() if n.startswith("embeddings_")] == [
+            "embeddings_platform_text_embedding_v4"
+        ]
+
+        dense = handle.search_dense(model, vector, top_k=5, is_admin=True)
+        assert dense.status == "success"
+        assert [result.chunk_id for result in dense.results] == ["c0"]
+
+        sparse = handle.search_sparse(model, "quokka", top_k=5, is_admin=True)
+        assert sparse.status == "success"
+        assert sparse.fts_enabled is True
+        assert [result.chunk_id for result in sparse.results] == ["c0"]
+        assert not any(
+            warning.code in {"FTS_FALLBACK", "FTS_INDEX_MISSING"}
+            for warning in sparse.warnings
+        )
+
+    def test_id_without_slash_keeps_its_single_table(self) -> None:
+        handle = make_handle("coll")
+        model = "text-embedding-v4"
+        vector = self._vector()
+        handle.write_embeddings(
+            [
+                _embedding(
+                    "d1", "c0", "h1", model, vector=vector, text="quokka retrieval"
+                )
+            ],
+            create_index=True,
+        )
+        store = get_vector_index_store()
+        assert [n for n in store.list_table_names() if n.startswith("embeddings_")] == [
+            "embeddings_text_embedding_v4"
+        ]
+
+        dense = handle.search_dense(model, vector, top_k=5, is_admin=True)
+        assert dense.status == "success"
+        assert [result.chunk_id for result in dense.results] == ["c0"]
+
+        sparse = handle.search_sparse(model, "quokka", top_k=5, is_admin=True)
+        assert sparse.fts_enabled is True
+        assert [result.chunk_id for result in sparse.results] == ["c0"]
 
 
 class TestHandleEmbeddingRollback:

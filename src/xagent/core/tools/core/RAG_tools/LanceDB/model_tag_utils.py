@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Final
 
-__all__ = ["to_model_tag", "embeddings_table_name"]
+__all__ = ["to_model_tag", "embeddings_table_name", "embeddings_table_candidates"]
 
 _INVALID_CHARS: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
 
@@ -27,3 +27,10 @@ def to_model_tag(model_name: str) -> str:
 
 def embeddings_table_name(model_name: str) -> str:
     return f"embeddings_{to_model_tag(model_name)}"
+
+
+def embeddings_table_candidates(model_name: str) -> list[str]:
+    """Tables for a model: the tag applied once, then the twice-tagged writer name."""
+    single = embeddings_table_name(model_name)
+    double = embeddings_table_name(to_model_tag(model_name))
+    return list(dict.fromkeys([single, double]))

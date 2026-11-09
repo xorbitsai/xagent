@@ -1061,8 +1061,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
     def open_embeddings_table(self, model_tag: str) -> Tuple[Any, str]:
         """Open embeddings table with legacy fallback support.
 
-        Tries the primary Hub ID-based table name first, then falls back
-        to legacy provider-based naming if the primary doesn't exist.
+        Tries the candidate Hub ID-based table names in order, then falls back
+        to legacy provider-based naming if none exists.
 
         Args:
             model_tag: Model tag for the embeddings table.
@@ -1074,18 +1074,23 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             DatabaseOperationError: If neither primary nor legacy table exists.
         """
         from ..core.exceptions import DatabaseOperationError
-        from ..LanceDB.model_tag_utils import to_model_tag
+        from ..LanceDB.model_tag_utils import (
+            embeddings_table_candidates,
+            to_model_tag,
+        )
         from ..utils.model_resolver import resolve_embedding_adapter
 
         conn = self._get_connection()
-        primary_table_name = f"embeddings_{to_model_tag(model_tag)}"
+        candidate_table_names = embeddings_table_candidates(model_tag)
 
-        # Try primary table first
-        try:
-            table = conn.open_table(primary_table_name)
-            return table, primary_table_name
-        except Exception as primary_exc:
-            last_error = primary_exc
+        tried_table_names: List[str] = []
+        for candidate_table_name in candidate_table_names:
+            tried_table_names.append(candidate_table_name)
+            try:
+                table = conn.open_table(candidate_table_name)
+                return table, candidate_table_name
+            except Exception as candidate_exc:
+                last_error = candidate_exc
 
         # Try legacy fallback
         legacy_table_name: Optional[str] = None
@@ -1095,7 +1100,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         except Exception:
             legacy_table_name = None
 
-        if legacy_table_name and legacy_table_name != primary_table_name:
+        if legacy_table_name and legacy_table_name not in tried_table_names:
+            tried_table_names.append(legacy_table_name)
             try:
                 table = conn.open_table(legacy_table_name)
                 logger.info(
@@ -1103,19 +1109,16 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     "Consider migrating to '%s' for consistency.",
                     legacy_table_name,
                     model_tag,
-                    primary_table_name,
+                    candidate_table_names[0],
                 )
                 return table, legacy_table_name
             except Exception as legacy_exc:
                 last_error = legacy_exc
 
-        # Neither table exists
+        # No candidate table exists
         error_msg = f"Embeddings table not found for model_tag='{model_tag}'"
-        if primary_table_name:
-            error_msg += f" (tried: '{primary_table_name}'"
-            if legacy_table_name:
-                error_msg += f", '{legacy_table_name}'"
-            error_msg += ")"
+        error_msg += " (tried: " + ", ".join(f"'{name}'" for name in tried_table_names)
+        error_msg += ")"
         raise DatabaseOperationError(error_msg) from last_error
 
     # Deprecated: use KBCollectionHandle.delete_collection_data instead. Remove in #514.
@@ -1483,7 +1486,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         """
         from ..core.config import IndexPolicy
         from ..core.schemas import IndexResult
-        from ..LanceDB.model_tag_utils import to_model_tag
+        from ..LanceDB.model_tag_utils import embeddings_table_candidates
 
         # Import LanceDB index types
         try:
@@ -1495,22 +1498,29 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..LanceDB.schema_manager import _safe_close_table
 
         conn = self._get_connection()
-        table_name = f"embeddings_{to_model_tag(model_tag)}"
+        candidate_table_names = embeddings_table_candidates(model_tag)
+        table_name = candidate_table_names[0]
 
         if readonly:
             # In readonly mode, check if FTS index exists without creating any indexes
             fts_enabled = False
             table = None
-            try:
-                table = conn.open_table(table_name)
-                indexes = table.list_indices()
-                fts_enabled = any(
-                    idx.index_type == "FTS" and "text" in idx.columns for idx in indexes
-                )
-            except Exception as e:
-                logger.debug("Unable to check FTS index status in readonly mode: %s", e)
-            finally:
-                _safe_close_table(table)
+            for candidate_table_name in candidate_table_names:
+                try:
+                    table = conn.open_table(candidate_table_name)
+                    table_name = candidate_table_name
+                    indexes = table.list_indices()
+                    fts_enabled = any(
+                        idx.index_type == "FTS" and "text" in idx.columns
+                        for idx in indexes
+                    )
+                    break
+                except Exception as e:
+                    logger.debug(
+                        "Unable to check FTS index status in readonly mode: %s", e
+                    )
+                finally:
+                    _safe_close_table(table)
 
             return IndexResult(
                 status="readonly",
@@ -1518,10 +1528,17 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 fts_enabled=fts_enabled,
             )
 
-        try:
-            table = conn.open_table(table_name)
-        except Exception as exc:
-            logger.debug("Unable to open table '%s': %s", table_name, exc)
+        table = None
+        last_open_error: Optional[Exception] = None
+        for candidate_table_name in candidate_table_names:
+            try:
+                table = conn.open_table(candidate_table_name)
+                table_name = candidate_table_name
+                break
+            except Exception as exc:
+                last_open_error = exc
+        if table is None:
+            logger.debug("Unable to open table '%s': %s", table_name, last_open_error)
             return IndexResult(status="failed", advice=None, fts_enabled=False)
 
         # Use default index policy
@@ -2902,15 +2919,15 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         self, connection: Any, filters: Dict[str, Any], model_tag: str
     ) -> List[Dict[str, Any]]:
         """Get embedding candidates from the database."""
+        from ..LanceDB.model_tag_utils import embeddings_table_candidates
+
+        candidate_table_names = set(embeddings_table_candidates(model_tag))
         table_names = list_table_names(connection)
-        embed_tables = [name for name in table_names if name.startswith("embeddings_")]
+        embed_tables = [name for name in table_names if name in candidate_table_names]
         if not embed_tables:
             return []
         embed_candidates: List[Dict[str, Any]] = []
         for table_name in embed_tables:
-            table_model_tag = table_name.replace("embeddings_", "")
-            if model_tag != table_model_tag:
-                continue
             result = self._vis_query_table(connection, table_name, filters)
             if not result:
                 continue

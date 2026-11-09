@@ -1463,26 +1463,24 @@ async def _rebuild_collection_metadata_impl() -> None:
     try:
         from xagent.core.model.model import EmbeddingModelConfig
 
-        from ..LanceDB.model_tag_utils import to_model_tag
+        from ..LanceDB.model_tag_utils import embeddings_table_candidates
         from ..utils.model_resolver import _list_model_hub_configs
 
         for cfg in _list_model_hub_configs().values():
             if not isinstance(cfg, EmbeddingModelConfig):
                 continue
-            register_tag_mapping(
-                hub_tag_to_id,
-                to_model_tag(cfg.id),
-                (cfg.id, cfg.dimension),
-                get_identity=lambda item: item[0],
-                logger=logger,
-            )
-            register_tag_mapping(
-                hub_tag_to_id,
-                to_model_tag(cfg.model_name),
-                (cfg.id, cfg.dimension),
-                get_identity=lambda item: item[0],
-                logger=logger,
-            )
+            # The write path tags twice, so register every spelling a table can carry.
+            for table_name in (
+                *embeddings_table_candidates(cfg.id),
+                *embeddings_table_candidates(cfg.model_name),
+            ):
+                register_tag_mapping(
+                    hub_tag_to_id,
+                    table_name.removeprefix("embeddings_"),
+                    (cfg.id, cfg.dimension),
+                    get_identity=lambda item: item[0],
+                    logger=logger,
+                )
     except Exception as e:
         logger.warning(
             "Model hub initialization failed during collection metadata rebuild: "

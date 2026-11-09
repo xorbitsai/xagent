@@ -291,26 +291,25 @@ def _infer_embedding_config_from_collection(
         try:
             from xagent.core.model.model import EmbeddingModelConfig
 
+            from ..LanceDB.model_tag_utils import embeddings_table_candidates
             from .model_resolver import _list_model_hub_configs
 
             hub_tag_to_id: Dict[str, str] = {}
             for cfg in _list_model_hub_configs().values():
                 if not isinstance(cfg, EmbeddingModelConfig):
                     continue
-                register_tag_mapping(
-                    hub_tag_to_id,
-                    to_model_tag(cfg.id),
-                    cfg.id,
-                    get_identity=lambda item: item,
-                    logger=logger,
-                )
-                register_tag_mapping(
-                    hub_tag_to_id,
-                    to_model_tag(cfg.model_name),
-                    cfg.id,
-                    get_identity=lambda item: item,
-                    logger=logger,
-                )
+                # The write path tags twice, so register every spelling a table can carry.
+                for table_name in (
+                    *embeddings_table_candidates(cfg.id),
+                    *embeddings_table_candidates(cfg.model_name),
+                ):
+                    register_tag_mapping(
+                        hub_tag_to_id,
+                        table_name.removeprefix("embeddings_"),
+                        cfg.id,
+                        get_identity=lambda item: item,
+                        logger=logger,
+                    )
             embedding_model_id = hub_tag_to_id.get(model_tag)
         except Exception as e:
             logger.warning(

@@ -78,7 +78,7 @@ from ..core.schemas import (
     SparseSearchResponse,
     StepType,
 )
-from ..LanceDB.model_tag_utils import embeddings_table_name, to_model_tag
+from ..LanceDB.model_tag_utils import embeddings_table_candidates, to_model_tag
 from ..LanceDB.schema_manager import (
     _safe_close_table,
     ensure_chunks_table,
@@ -2431,21 +2431,21 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             # Chunks already embedded for this model tag are excluded by
             # chunk_id presence in the per-model embeddings table.
             embedded_chunk_ids: set[str] = set()
-            model_tag = to_model_tag(model)
-            embeddings_table_name = f"embeddings_{model_tag}"
             try:
                 embedding_filters: dict[str, Any] = {
                     "collection": collection,
                     "doc_id": doc_id,
                     "parse_hash": parse_hash,
                 }
-                embedding_count = vector_store.count_rows_or_zero(
-                    table_name=embeddings_table_name,
-                    filters=embedding_filters,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-                if embedding_count > 0:
+                for embeddings_table_name in embeddings_table_candidates(model):
+                    embedding_count = vector_store.count_rows_or_zero(
+                        table_name=embeddings_table_name,
+                        filters=embedding_filters,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                    if embedding_count <= 0:
+                        continue
                     for batch in vector_store.iter_batches(
                         table_name=embeddings_table_name,
                         columns=["chunk_id"],
@@ -2752,10 +2752,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         ]
         if model_tag is None:
             return tables
-        candidates = {
-            f"embeddings_{model_tag}",
-            f"embeddings_{to_model_tag(model_tag)}",
-        }
+        candidates = set(embeddings_table_candidates(model_tag))
         return [name for name in tables if name in candidates]
 
     def snapshot_embeddings(
@@ -5725,8 +5722,8 @@ def _recorded_model(name: str, description: dict[str, Any]) -> str:
 def _embeddings_key(client: Any, name: str) -> str:
     """Return the per-document count key of Milvus collection ``name``."""
     model = _recorded_model(name, client.describe_collection(name))
-    # LanceDB tags a model id twice on write, so its tables carry the second pass.
-    return embeddings_table_name(to_model_tag(model))
+    # LanceDB's write path tags twice, so its tables carry the second candidate.
+    return embeddings_table_candidates(model)[-1]
 
 
 def _document_rows(

@@ -133,6 +133,49 @@ class TestInferEmbeddingConfigFromCollection:
 
         assert result == ("text-embedding-ada-002", 1536)
 
+    def test_infer_attributes_the_twice_tagged_table(self, monkeypatch):
+        from xagent.core.model.model import EmbeddingModelConfig
+        from xagent.core.tools.core.RAG_tools.core.schemas import ChunkEmbeddingData
+        from xagent.core.tools.core.RAG_tools.utils import model_resolver
+        from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
+            write_vectors_to_db,
+        )
+
+        model_id = "platform/text-embedding-v4"
+        write_vectors_to_db(
+            collection="mig_collection",
+            embeddings=[
+                ChunkEmbeddingData(
+                    doc_id="d1",
+                    chunk_id="c1",
+                    parse_hash="ph",
+                    model=model_id,
+                    vector=[0.1, 0.2],
+                    text="prefixed",
+                    chunk_hash="h-c1",
+                )
+            ],
+            create_index=False,
+            user_id=1,
+        )
+        monkeypatch.setattr(
+            model_resolver,
+            "_list_model_hub_configs",
+            lambda: {
+                model_id: EmbeddingModelConfig(
+                    id=model_id,
+                    model_name="text-embedding-v4",
+                    model_provider="dashscope",
+                    dimension=2,
+                )
+            },
+        )
+
+        assert _infer_embedding_config_from_collection("mig_collection") == (
+            model_id,
+            2,
+        )
+
     @patch(
         "xagent.core.tools.core.RAG_tools.utils.migration_utils.get_vector_store_raw_connection"
     )

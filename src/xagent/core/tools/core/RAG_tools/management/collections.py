@@ -38,7 +38,7 @@ from ..core.schemas import (
     IngestionConfig,
     ListCollectionsResult,
 )
-from ..LanceDB.model_tag_utils import embeddings_table_name
+from ..LanceDB.model_tag_utils import embeddings_table_candidates
 from ..LanceDB.schema_manager import _safe_close_table
 from ..management.status import (
     _clear_ingestion_status_impl,
@@ -998,9 +998,14 @@ def _get_document_stats_impl(
             if name.startswith("embeddings_")
         }
         if model_tag:
-            table_name = embeddings_table_name(model_tag)
-            embedding_count = embedding_breakdown.get(table_name, 0)
-            embedding_breakdown = {table_name: embedding_count}
+            table_names = embeddings_table_candidates(model_tag)
+            embedding_count = sum(
+                embedding_breakdown.get(table_name, 0) for table_name in table_names
+            )
+            embedding_breakdown = {
+                table_name: embedding_breakdown.get(table_name, 0)
+                for table_name in table_names
+            }
         else:
             embedding_count = sum(
                 count

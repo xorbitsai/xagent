@@ -13,7 +13,10 @@ fixture in ``tests/conftest.py``.
 
 from datetime import datetime, timezone
 
-from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
+from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+    embeddings_table_candidates,
+    to_model_tag,
+)
 from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 
 
@@ -96,8 +99,11 @@ def _embedding_row(
 
 def _count_embeddings(model: str, collection: str) -> int:
     store = get_vector_index_store()
-    return store.count_rows(
-        f"embeddings_{to_model_tag(model)}", {"collection": collection}, is_admin=True
+    existing = set(store.list_table_names())
+    return sum(
+        store.count_rows(table_name, {"collection": collection}, is_admin=True)
+        for table_name in embeddings_table_candidates(model)
+        if table_name in existing
     )
 
 
@@ -122,6 +128,23 @@ class TestDeleteEmbeddingRecords:
         assert store.count_rows("documents", {"collection": "coll"}, is_admin=True) == 1
         assert store.count_rows("parses", {"collection": "coll"}, is_admin=True) == 1
         assert store.count_rows("chunks", {"collection": "coll"}, is_admin=True) == 1
+
+    def test_deletes_rows_from_the_twice_tagged_table(self) -> None:
+        store = get_vector_index_store()
+        model = "platform/text-embedding-v4"
+        # Ingestion hands to_model_tag(model) to upsert_embeddings, which tags again.
+        store.upsert_embeddings(
+            to_model_tag(model),
+            [_embedding_row("coll", "d1", "h1", "c0", model, vector=[0.1, 0.2])],
+        )
+        assert "embeddings_platform_text_embedding_v4" in store.list_table_names()
+
+        deleted = store.delete_embedding_records(
+            "coll", "d1", model_tag=model, user_id=None, is_admin=True
+        )
+
+        assert deleted == 1
+        assert _count_embeddings(model, "coll") == 0
 
     def test_model_tag_none_spans_all_embedding_tables(self) -> None:
         store = get_vector_index_store()

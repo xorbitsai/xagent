@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from ..LanceDB.model_tag_utils import to_model_tag
+from ..LanceDB.model_tag_utils import embeddings_table_candidates
 from ..LanceDB.schema_manager import _safe_close_table
 from ..utils.lancedb_query_utils import list_embeddings_table_names
 from ..utils.string_utils import (
@@ -24,8 +24,7 @@ def select_embedding_tables(conn: Any, model_tag: Optional[str] = None) -> list[
     if model_tag is None:
         return table_names
 
-    candidate_tags = {model_tag, to_model_tag(model_tag)}
-    candidate_tables = {f"embeddings_{tag}" for tag in candidate_tags}
+    candidate_tables = set(embeddings_table_candidates(model_tag))
     return [table_name for table_name in table_names if table_name in candidate_tables]
 
 

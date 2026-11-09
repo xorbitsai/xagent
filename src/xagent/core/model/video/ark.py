@@ -46,6 +46,14 @@ SEEDANCE_DURATION_LIMITS: dict[tuple[int, int], tuple[int, int]] = {
 
 _SEEDANCE_VERSION_PATTERN = re.compile(r"seedance-(\d+)-(\d+)(?!\d)")
 
+# Terminal task states that end without a video. Ark bills only a video it
+# generated successfully, and a generation that fails, for example on
+# moderation, is not charged (model pricing page, video generation section):
+#   https://www.volcengine.com/docs/82379/1544106
+# A cancelled task (only a queued one can be cancelled) and an expired one
+# (stopped by Ark) produced no video either, so none of these is charged.
+_ARK_TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled", "expired"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -362,10 +370,17 @@ class ArkVideoModel(BaseVideoModel):
         """Write the one usage row of a created task, at its last observation.
 
         Every task that was created ends here exactly once, whichever way the
-        wait ends. Only a succeeded task bills its seconds; a task that failed,
-        was cancelled or was still running at the deadline records 0 seconds --
-        a call that happened with no produced duration -- plus whatever tokens
-        Ark reported, which is what Seedance actually charges by.
+        wait ends. Only a succeeded task bills its seconds; any other records
+        0 seconds -- a call that happened with no produced duration.
+
+        Tokens, which are what Seedance actually charges by, are taken from
+        ``task_result`` unless its status is in
+        ``_ARK_TERMINAL_FAILURE_STATUSES``: Ark does not charge such a task,
+        so it records 0 tokens whatever it reported. A task still running
+        when the wait ended (the deadline, or the caller cancelled) keeps
+        running and is charged if it succeeds, so its row keeps the tokens of
+        the observation passed here, or none when polling failed until the
+        deadline.
 
         ``input_has_video`` says whether the submitted content contained a
         video. Ark's token count already includes an input video, but Ark
@@ -378,6 +393,18 @@ class ArkVideoModel(BaseVideoModel):
             result = task_result if isinstance(task_result, dict) else {}
             usage = _get_nested(result.get("raw_response"), "usage")
             output_tokens = _get_nested(usage, "completion_tokens")
+            status = result.get("status")
+            if isinstance(status, str) and status in _ARK_TERMINAL_FAILURE_STATUSES:
+                if output_tokens:
+                    logger.warning(
+                        "Ark video task %s ended with status %s but reported "
+                        "%s completion tokens; recording 0, since Ark does "
+                        "not bill a task that produced no video",
+                        result.get("task_id"),
+                        status,
+                        output_tokens,
+                    )
+                output_tokens = 0
             resolution = result.get("resolution")
             record_provider_usage(
                 self,
@@ -533,7 +560,7 @@ class ArkVideoModel(BaseVideoModel):
                     task_result, input_has_video=input_has_video, succeeded=True
                 )
                 return task_result
-            if status in {"failed", "cancelled", "expired"}:
+            if status in _ARK_TERMINAL_FAILURE_STATUSES:
                 self._record_task_usage(task_result, input_has_video=input_has_video)
                 raise BilledVideoTaskError(
                     f"Video generation task {task_id} ended with status {status}: "

@@ -1436,7 +1436,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/51/0b/c0f53a14317b304e2
 
 [[package]]
 name = "deepdoc-lib"
-version = "0.2.4"
+version = "0.2.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -1445,7 +1445,6 @@ dependencies = [
     { name = "chardet" },
     { name = "datrie" },
     { name = "demjson3" },
-    { name = "google-generativeai" },
     { name = "hanziconv" },
     { name = "html5lib" },
     { name = "huggingface-hub" },
@@ -1481,9 +1480,9 @@ dependencies = [
     { name = "xpinyin" },
     { name = "zai-sdk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/91/70624f1805527d94a48dc31ac9df9c262ca30685a6e228116bd835ef2e40/deepdoc_lib-0.2.4.tar.gz", hash = "sha256:a30465d7eb1060510067c4c2ab68000383b7104be05b1540d1e561ea5bcf1b8d", size = 4598946, upload-time = "2026-10-17T14:46:11.584Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/36/2e/e3593e2f61071d22190370b4323c722acf2d1e792c9d32bda7656cade156/deepdoc_lib-0.2.5.tar.gz", hash = "sha256:1f7ba788ff0566fbd9cdbe14945589fa72424cf82398fb5797beb7acb852376a", size = 4659036, upload-time = "2026-11-09T07:12:43.693Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e1/6b/e6031d83ba99468be9a9894e4ee945eb5a417e0c8cb5810c5ecc1ec08d87/deepdoc_lib-0.2.4-py3-none-any.whl", hash = "sha256:58160b65cd4c9e235854e15c919e1047bb39767256e3c99d4fbc74dfe6afffb7", size = 4675647, upload-time = "2026-10-17T14:46:09.456Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/cf/e6e8ed72d1e4cec4f22e59ad03295d07d96089d1506962888a8fca89c2ae/deepdoc_lib-0.2.5-py3-none-any.whl", hash = "sha256:ccb6587dab899a229017939a070fbb7b2334781bd7b52fefc3843a0252351e16", size = 4676027, upload-time = "2026-11-09T07:12:41.696Z" },
 ]
 
 [[package]]
@@ -2098,21 +2097,6 @@ wheels = [
 ]
 
 [[package]]
-name = "google-ai-generativelanguage"
-version = "0.6.15"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "google-api-core", extra = ["grpc"] },
-    { name = "google-auth" },
-    { name = "proto-plus" },
-    { name = "protobuf" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/11/d1/48fe5d7a43d278e9f6b5ada810b0a3530bbeac7ed7fcbcd366f932f05316/google_ai_generativelanguage-0.6.15.tar.gz", hash = "sha256:8f6d9dc4c12b065fe2d0289026171acea5183ebf2d0b11cefe12f3821e159ec3", size = 1375443, upload-time = "2025-01-13T21:50:47.459Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7c/a3/67b8a6ff5001a1d8864922f2d6488dc2a14367ceb651bc3f09a947f2f306/google_ai_generativelanguage-0.6.15-py3-none-any.whl", hash = "sha256:5a03ef86377aa184ffef3662ca28f19eeee158733e45d7947982eb953c6ebb6c", size = 1327356, upload-time = "2025-01-13T21:50:44.174Z" },
-]
-
-[[package]]
 name = "google-api-core"
 version = "2.25.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2234,24 +2218,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9b/ba/0b343b0770d4710ad2979fd9301d7caa56c940174d5361ed4a7cc4979241/google_genai-1.66.0.tar.gz", hash = "sha256:ffc01647b65046bca6387320057aa51db0ad64bcc72c8e3e914062acfa5f7c49", size = 504386, upload-time = "2026-03-04T22:15:28.156Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/dd/403949d922d4e261b08b64aaa132af4e456c3b15c8e2a2d9e6ef693f66e2/google_genai-1.66.0-py3-none-any.whl", hash = "sha256:7f127a39cf695277104ce4091bb26e417c59bb46e952ff3699c3a982d9c474ee", size = 732174, upload-time = "2026-03-04T22:15:26.63Z" },
-]
-
-[[package]]
-name = "google-generativeai"
-version = "0.8.6"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "google-ai-generativelanguage" },
-    { name = "google-api-core" },
-    { name = "google-api-python-client" },
-    { name = "google-auth" },
-    { name = "protobuf" },
-    { name = "pydantic" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/0f/ef33b5bb71437966590c6297104c81051feae95d54b11ece08533ef937d3/google_generativeai-0.8.6-py3-none-any.whl", hash = "sha256:37a0eaaa95e5bbf888828e20a4a1b2c196cc9527d194706e58a68ff388aeb0fa", size = 155098, upload-time = "2025-12-16T17:53:58.61Z" },
 ]
 
 [[package]]
@@ -7473,13 +7439,13 @@ resolution-markers = [
     "python_full_version < '3.11.5' and platform_machine == 'arm64' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "fsspec", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "jinja2", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "networkx", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "setuptools", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "sympy", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:10802fd383bbfed646212e765a72c37d2185205d4f26eb197a254e8ac7ddcb25", upload-time = "2026-05-12T16:20:07Z" },
@@ -7519,13 +7485,13 @@ resolution-markers = [
     "(python_full_version < '3.11.5' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.11.5' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
 dependencies = [
-    { name = "filelock", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "fsspec", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "jinja2", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "networkx", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "setuptools", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "sympy", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "typing-extensions", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
+    { name = "filelock" },
+    { name = "fsspec" },
+    { name = "jinja2" },
+    { name = "networkx" },
+    { name = "setuptools" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.12.0%2Bcpu-cp311-cp311-linux_s390x.whl", hash = "sha256:aaa9c1f5e8c518d7be1e3c3e1b090ca7d63b6e353a1abd6cfdaf902405093467", upload-time = "2026-05-12T23:16:01Z" },
@@ -7569,9 +7535,9 @@ resolution-markers = [
     "python_full_version < '3.11.5' and platform_machine == 'arm64' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "pillow", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" } },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.0-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:df0c166b6bdf7c47f88e81e8b43bc085451d5c50d0c5d1691bc474c1227d6fed", upload-time = "2026-05-12T16:20:37Z" },
@@ -7611,9 +7577,9 @@ resolution-markers = [
     "(python_full_version < '3.11.5' and platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux') or (python_full_version < '3.11.5' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
 dependencies = [
-    { name = "numpy", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "pillow", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
-    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" } },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torchvision-0.27.0%2Bcpu-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:99d05d071ff34305334ee1854f5edf7c2767b96ba59fe92e76d84a1fa72c8e06", upload-time = "2026-05-12T16:20:36Z" },
@@ -8703,7 +8669,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=50.0.2" },
     { name = "curl-cffi", marker = "extra == 'all'", specifier = ">=0.14.0" },
     { name = "curl-cffi", marker = "extra == 'waf-crawl'", specifier = ">=0.14.0" },
-    { name = "deepdoc-lib", specifier = "==0.2.4" },
+    { name = "deepdoc-lib", specifier = "==0.2.5" },
     { name = "defusedxml", specifier = ">=0.7.1" },
     { name = "docker", specifier = ">=7.2.0" },
     { name = "docling", marker = "extra == 'ai-document'", specifier = ">=2.140.0" },

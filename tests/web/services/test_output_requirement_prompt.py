@@ -14,7 +14,9 @@ from xagent.core.agent import structured_output
 from xagent.web.services import file_turn
 from xagent.web.services.file_turn import (
     append_prompt_context_block,
+    append_uploaded_files_context,
     build_prompt_context_block,
+    build_uploaded_files_context,
 )
 from xagent.web.services.response_format import RESPONSE_FORMAT_CONFIG_KEY
 
@@ -212,3 +214,30 @@ async def test_the_message_shown_to_users_does_not_carry_the_block(
 
     assert seen["context"]["display_message"] == "first turn"
     assert MARKER not in repr(seen["context"])
+
+
+@pytest.mark.parametrize("context", [None, SIGNED], ids=["no-context", "context"])
+async def test_a_turn_with_uploaded_files_gets_the_block_after_the_files(
+    db_session, monkeypatch, context
+) -> None:
+    files = build_uploaded_files_context(
+        [{"file_id": "f-1", "original_name": "rota.csv"}]
+    )
+    # The model text a caller builds for a turn with an uploaded file: the
+    # files block, then the prompt context block when the task has one.
+    model_text = append_prompt_context_block(
+        append_uploaded_files_context("first turn", files), context
+    )
+
+    _, seen = await wiring._run_new_turn(
+        db_session,
+        monkeypatch,
+        _config(_stored(), context),
+        wiring._good_model(),
+        llm_user_message=model_text,
+    )
+
+    tail = "" if context is None else f"\n\n{build_prompt_context_block(context)}"
+    assert seen["task"] == f"first turn\n\n{files}\n\n{SNAPSHOT}{tail}"
+    assert seen["task"].count(MARKER) == 1
+    assert seen["context"]["display_message"] == "first turn"

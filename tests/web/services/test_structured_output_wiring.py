@@ -179,7 +179,12 @@ class _NoopBroadcastManager:
 
 
 async def _run_new_turn(
-    db, monkeypatch: pytest.MonkeyPatch, agent_config: Any, llm: ScriptedModel
+    db,
+    monkeypatch: pytest.MonkeyPatch,
+    agent_config: Any,
+    llm: ScriptedModel,
+    *,
+    llm_user_message: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Run one real new turn; the agent manager is a stand-in that runs the real
     structured-output step on its result."""
@@ -187,7 +192,9 @@ async def _run_new_turn(
     with get_db_session() as lease_db:
         lease = acquire_task_lease(lease_db, task_id, new_run=True)
     assert lease is not None
-    return task_id, await run_turn(monkeypatch, task_id, owner_id, lease, llm)
+    return task_id, await run_turn(
+        monkeypatch, task_id, owner_id, lease, llm, llm_user_message=llm_user_message
+    )
 
 
 async def run_turn(
@@ -197,9 +204,11 @@ async def run_turn(
     lease: TaskLease,
     llm: ScriptedModel,
     message: str = "first turn",
+    llm_user_message: str | None = None,
 ) -> dict[str, Any]:
     """Run ``execute_task_background`` for a task that holds ``lease`` and
-    return the keywords the agent manager received."""
+    return the keywords the agent manager received. ``llm_user_message`` is
+    the model text a caller built, for example with uploaded files added."""
     snapshot = load_task_setup_snapshot_sync(task_id, owner_id)
     assert snapshot is not None
     seen: dict[str, Any] = {}
@@ -238,7 +247,7 @@ async def run_turn(
             context={},
             agent_manager=AgentManager(),
             task_owner_user_id=owner_id,
-            llm_user_message=None,
+            llm_user_message=llm_user_message,
             task_setup_snapshot=snapshot,
             expected_run_id=lease.run_id,
             task_lease=lease,

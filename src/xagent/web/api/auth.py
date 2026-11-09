@@ -3101,11 +3101,6 @@ def is_actor_oauth_cookie_header(value: str) -> bool:
     )
 
 
-def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
-    """Match the browser cookie to the configured callback URL."""
-    return _oauth_cookie_scope_for(_resolve_oauth_redirect_uri(provider, db_provider))
-
-
 def _oauth_cookie_scope_for(callback_url: str) -> tuple[bool, str]:
     """``(secure, path)`` of a cookie the browser sends back to ``callback_url``."""
     from urllib.parse import urlparse
@@ -3606,7 +3601,9 @@ def start_builtin_oauth_for_resource_owner(
         response = RedirectResponse(composio_auth.begin_location(callback_url, state))
         cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
     else:
-        cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(
+            _resolve_oauth_redirect_uri(provider, db_provider)
+        )
     db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
     response.set_cookie(
         _actor_oauth_cookie_name(nonce_digest),

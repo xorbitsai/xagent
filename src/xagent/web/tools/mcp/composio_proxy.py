@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -46,6 +47,10 @@ _LAUNCH_SECRET_ENVS = (
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_ERROR_TEXT_CHARS = 1000
 _REDACTED = "[redacted]"
+# A path Composio resolves against the account's own host: one leading "/",
+# no backslash, whitespace or control character, so no URL parser on the
+# way can read it as another host ("//evil", "/\\evil").
+_RELATIVE_ENDPOINT_RE = re.compile(r"/(?!/)[^\\\s\x00-\x1f\x7f]*")
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +115,14 @@ def _required_env(name: str) -> str:
 def _checked_endpoint(endpoint: str, allowed_hosts: Collection[str]) -> str:
     """An HTTPS URL on an allowed host, or a path Composio resolves against
     the connected account's own host (a Salesforce org's My Domain)."""
-    parts = urlsplit(endpoint)
-    if not parts.scheme and not parts.netloc and endpoint.startswith("/"):
+    if endpoint.startswith("/"):
+        if not _RELATIVE_ENDPOINT_RE.fullmatch(endpoint):
+            raise ValueError(
+                "a path endpoint must start with a single '/' and contain no "
+                "backslash, whitespace or control character"
+            )
         return endpoint
+    parts = urlsplit(endpoint)
     if parts.scheme != "https" or not parts.netloc:
         raise ValueError("endpoint must be an https URL or a path starting with '/'")
     if parts.username is not None or parts.port is not None:
@@ -127,7 +137,7 @@ def proxy_request(
     endpoint: str,
     *,
     allowed_hosts: Collection[str],
-    query: Iterable[tuple[str, str]] = (),
+    query: Mapping[str, str] | Iterable[tuple[str, str]] = (),
     headers: Mapping[str, str] | None = None,
     body: Any = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
@@ -135,19 +145,22 @@ def proxy_request(
     """Send ``method endpoint`` through Composio as the launched grant.
 
     ``allowed_hosts`` are the hostnames an absolute ``endpoint`` may name.
-    ``query`` is a sequence of pairs so a repeated parameter keeps its order;
+    ``query`` is a mapping, or a sequence of pairs when a parameter repeats;
     ``body`` is sent as JSON. Raises ``ComposioProxyError`` when Composio does
     not relay the call, and ``ValueError`` before sending anything when the
     endpoint or a launch variable is unusable.
     """
+    if isinstance(allowed_hosts, str):
+        raise TypeError("allowed_hosts must be a collection of hostnames, not a str")
     endpoint = _checked_endpoint(endpoint, allowed_hosts)
+    pairs = query.items() if isinstance(query, Mapping) else query
     api_key = _required_env(COMPOSIO_API_KEY_ENV)
     connected_account_id = _required_env(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV)
     user_id = _required_env(COMPOSIO_USER_ID_ENV)
 
     parameters = [
         {"name": str(name), "value": str(value), "type": "query"}
-        for name, value in query
+        for name, value in pairs
     ] + [
         {"name": str(name), "value": str(value), "type": "header"}
         for name, value in (headers or {}).items()

@@ -31,9 +31,10 @@ for, and only accepted under, its app's own provider:
    checks run first, then ``complete_auth`` is called with that actor's
    Composio user id, derived from *our* session. The account it activates
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
-   of its app's auth config and toolkit. ``GET /me`` through the proxy gives
-   the Facebook user id or the Instagram ``user_id``, and the grant is stored
-   for #3531 to execute. A refused completion spends nothing.
+   of its app's auth config and toolkit. The app's own identity read through
+   the proxy (``identity_url`` with ``identity_params``) gives the provider
+   user id, which must match ``identity_id_pattern``, and the grant is stored
+   for the app's runtime to execute. A refused completion spends nothing.
 
 A begin needs a state carrying the Composio marker, a verification carries a
 ``session_uri``, and a denied or failed authorization comes back to
@@ -360,14 +361,8 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
         )
     try:
         _configured_callback_url()
-    except ValueError:
-        logger.error(
-            "Composio %s connect refused: %s is not a valid callback URL; it "
-            "must end with %s or %s",
-            label,
-            COMPOSIO_CALLBACK_URL_ENV,
-            *_CALLBACK_PATHS,
-        )
+    except _CallbackUrlInvalid as problem:
+        _log_invalid_callback_url(problem, label)
         return _unavailable_page(app_id)
     missing = _missing_config_names(app_id)
     if missing:
@@ -380,22 +375,55 @@ def start_preflight(app_id: str) -> HTMLResponse | None:
     return None
 
 
+class _CallbackUrlInvalid(ValueError):
+    """``XAGENT_COMPOSIO_CALLBACK_URL`` is unusable; ``reason`` is safe to log:
+    it never contains the configured value, which may carry credentials."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 def _configured_callback_url() -> str | None:
-    """``XAGENT_COMPOSIO_CALLBACK_URL``; ``ValueError`` unless it is a usable
-    URL ending with one of the routes that accept Composio trips (a reverse
-    proxy may put a prefix before it)."""
-    configured = get_composio_callback_url()
-    if configured is not None and not urlsplit(configured).path.endswith(
-        _CALLBACK_PATHS
-    ):
-        raise ValueError(f"{COMPOSIO_CALLBACK_URL_ENV} names no Composio callback")
+    """``XAGENT_COMPOSIO_CALLBACK_URL``, or ``_CallbackUrlInvalid`` unless it is
+    a usable URL ending with one of the routes that accept Composio trips (a
+    reverse proxy may put a prefix before it)."""
+    try:
+        configured = get_composio_callback_url()
+    except ValueError:
+        # Not the config error's text: it quotes the raw value.
+        raise _CallbackUrlInvalid(
+            "it must be an absolute http(s) URL with no query, fragment or credentials"
+        ) from None
+    if configured is None:
+        return None
+    # An empty query or fragment ("...callback#") passes urlsplit unnoticed,
+    # but the state appended after it would never reach the server.
+    if "?" in configured or "#" in configured:
+        raise _CallbackUrlInvalid("it must not contain '?' or '#'")
+    if not urlsplit(configured).path.endswith(_CALLBACK_PATHS):
+        raise _CallbackUrlInvalid(
+            "its path must end with {} or {}".format(*_CALLBACK_PATHS)
+        )
     return configured
+
+
+def _log_invalid_callback_url(
+    problem: _CallbackUrlInvalid, label: str | None = None
+) -> None:
+    logger.error(
+        "%s%s is not a valid callback URL: %s",
+        f"Composio {label} connect refused: " if label else "",
+        COMPOSIO_CALLBACK_URL_ENV,
+        problem.reason,
+    )
 
 
 def shared_callback_url(db: Session, meta_row: Any = None) -> str:
     """The callback URL every Composio trip returns to.
 
-    ``XAGENT_COMPOSIO_CALLBACK_URL`` when set (``ValueError`` when invalid);
+    ``XAGENT_COMPOSIO_CALLBACK_URL`` when set (``_CallbackUrlInvalid`` when
+    invalid);
     otherwise the Meta callback URL, read from ``meta_row`` when the caller
     already holds the Meta provider row and from the database otherwise.
     """
@@ -1226,12 +1254,8 @@ def handle_callback(
     trip arrived on the Meta callback."""
     try:
         callback = shared_callback_url(db, meta_row)
-    except ValueError:
-        logger.error(
-            "%s is not a valid callback URL; it must end with %s or %s",
-            COMPOSIO_CALLBACK_URL_ENV,
-            *_CALLBACK_PATHS,
-        )
+    except _CallbackUrlInvalid as problem:
+        _log_invalid_callback_url(problem)
         _log_rejection("callback_url_invalid")
         return _unavailable_page()
     if step == "begin":
@@ -1245,8 +1269,9 @@ def handle_dedicated_callback(request: Any, db: Session) -> Response:
     """``/api/auth/composio/callback``: only Composio trips are accepted."""
     step = callback_step(request.query_params)
     if step is None:
-        _log_rejection("not_a_composio_trip")
-        return _reject("claims_invalid").response
+        rejected = _reject("not_a_composio_trip")
+        _log_rejection(rejected.reason)
+        return rejected.response
     return handle_callback(step, request, db)
 
 

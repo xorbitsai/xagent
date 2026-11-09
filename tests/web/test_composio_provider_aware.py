@@ -562,21 +562,91 @@ def test_the_dedicated_route_matches_before_the_provider_route(db_session):
         "https://app.example.com/api/auth/composio/callback?x=1",
         "https://user:pass@app.example.com/api/auth/composio/callback",
         "https://app.example.com/api/auth/linear/callback",
+        "https://app.example.com/api/auth/composio/callback#",
+        "https://app.example.com/api/auth/composio/callback?",
     ],
-    ids=["text", "ftp", "query", "credentials", "not-a-composio-route"],
+    ids=[
+        "text",
+        "ftp",
+        "query",
+        "credentials",
+        "not-a-composio-route",
+        "empty-fragment",
+        "empty-query",
+    ],
 )
-def test_an_invalid_setting_refuses_the_start_and_the_trips(linear, monkeypatch, value):
+def test_an_invalid_setting_refuses_the_start_and_the_trips(
+    linear, monkeypatch, caplog, value
+):
     db, user, composio = linear
     monkeypatch.setenv("XAGENT_COMPOSIO_CALLBACK_URL", value)
+    caplog.set_level(logging.ERROR)
 
     start = _start_linear(db, user, Browser())
 
     assert start.status_code == 503
     assert "set-cookie" not in start.headers
     assert db.query(ActorOAuthFlowState).count() == 0
+    # The log names the setting and the rule, never the value.
+    assert "XAGENT_COMPOSIO_CALLBACK_URL is not a valid callback URL" in caplog.text
+    assert "pass@" not in caplog.text and value not in caplog.text
 
-    trip = Browser().get(db, _verify_url(composio, "ca_any"))
-    assert trip.status_code == 503
+    session = _verify_url(composio, "ca_any").split("=", 1)[1]
+    for trip_url in (
+        f"{CALLBACK_URL}?session_uri={session}",
+        f"{DEDICATED_URL}?session_uri={session}",
+    ):
+        trip = RoutedBrowser().get(db, trip_url)
+        assert trip.status_code == 503, trip_url
+    assert composio.calls == []
+
+
+@pytest.mark.parametrize(
+    "value,reason",
+    [
+        ("ftp://app.example.com/api/auth/composio/callback", "absolute http(s) URL"),
+        ("https://app.example.com/api/auth/composio/callback#", "'?' or '#'"),
+        ("https://app.example.com/api/auth/linear/callback", "path must end with"),
+    ],
+    ids=["scheme", "empty-fragment", "path"],
+)
+def test_an_invalid_setting_is_logged_with_its_own_reason(
+    linear, monkeypatch, caplog, value, reason
+):
+    db, user, _composio = linear
+    monkeypatch.setenv("XAGENT_COMPOSIO_CALLBACK_URL", value)
+    caplog.set_level(logging.ERROR)
+
+    _start_linear(db, user, Browser())
+
+    assert reason in caplog.text
+    others = {
+        "absolute http(s) URL",
+        "'?' or '#'",
+        "path must end with",
+    } - {reason}
+    assert not any(other in caplog.text for other in others)
+
+
+def test_a_trip_on_the_meta_callback_still_uses_the_configured_one(dedicated):
+    """With the setting on the dedicated route, a trip arriving on the Meta
+    callback is still a Composio trip, and cookies are cleared on the
+    configured path."""
+    db, user, composio = dedicated
+    stale = f"{composio_auth.FLOW_COOKIE_PREFIX}{'0' * 24}"
+    request = SimpleNamespace(
+        query_params={"session_uri": "https://backend.composio.dev/verify/x"},
+        cookies={stale: "not-a-flow-cookie"},
+    )
+
+    response = auth_api.generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert response.status_code == 400
+    assert "Missing code or state" not in response.body.decode()
+    jar = SimpleCookie()
+    for header in response.headers.getlist("set-cookie"):
+        jar.load(header)
+    assert jar[stale]["path"] == DEDICATED_PATH
     assert composio.calls == []
 
 
@@ -654,8 +724,24 @@ def test_the_setting_may_name_the_meta_callback_behind_a_prefix(linear, monkeypa
         "https://app.example.com/x/api/auth/meta/callback",
     )
 
-    start = _start_linear(db, user, Browser())
+    browser = Browser()
+    start = _start_linear(db, user, browser)
 
-    assert start.headers["location"].startswith(
-        "https://app.example.com/x/api/auth/meta/callback?state="
+    prefixed = "https://app.example.com/x/api/auth/meta/callback"
+    assert start.headers["location"].startswith(f"{prefixed}?state=")
+    assert _cookie_path(start, "xagent_actor_oauth") == "/x/api/auth/meta/callback"
+
+    query = parse_qs(urlsplit(start.headers["location"]).query)
+    request = SimpleNamespace(
+        query_params={"state": query["state"][0]},
+        cookies={name: value for name, (value, _path) in browser.cookies.items()},
+    )
+    begin = auth_api.generic_oauth_callback("meta", request, db, _meta_provider())
+
+    assert begin.status_code == 302, begin.body
+    (link,) = [body for _, path, body in composio.calls if path.endswith("/link")]
+    assert link["callback_url"] == prefixed
+    assert (
+        _cookie_path(begin, composio_auth.FLOW_COOKIE_PREFIX)
+        == "/x/api/auth/meta/callback"
     )

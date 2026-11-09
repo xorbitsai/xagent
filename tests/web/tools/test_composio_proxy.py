@@ -114,6 +114,10 @@ def test_a_path_is_left_for_composio_to_resolve_against_the_account(proxy):
         "https://gmail.googleapis.com.attacker.example/gmail/v1",
         "https://user@gmail.googleapis.com/gmail/v1",
         "https://gmail.googleapis.com:8443/gmail/v1",
+        "/\\evil.example/gmail/v1",
+        "/gmail/v1/users/me labels",
+        "/gmail/v1/users/me\nlabels",
+        "/gmail/v1/users/me\x7f",
     ],
     ids=[
         "http",
@@ -124,6 +128,10 @@ def test_a_path_is_left_for_composio_to_resolve_against_the_account(proxy):
         "lookalike-host",
         "credentials",
         "port",
+        "backslash-path",
+        "space-in-path",
+        "control-in-path",
+        "delete-in-path",
     ],
 )
 def test_an_endpoint_off_the_allowed_hosts_is_refused_before_sending(proxy, endpoint):
@@ -265,3 +273,51 @@ def test_a_long_composio_message_is_cut_after_redaction(proxy):
     assert text.endswith("...[truncated]")
     assert len(text) == composio_proxy.MAX_ERROR_TEXT_CHARS + len("...[truncated]")
     assert API_KEY[:kept] not in text
+
+
+def test_a_query_mapping_sends_each_name_and_value(proxy):
+    composio_proxy.proxy_request(
+        "GET",
+        "/services/data/v62.0/query",
+        allowed_hosts=(),
+        query={"q": "SELECT Id FROM Account", "id": "x"},
+    )
+
+    (call,) = proxy.calls
+    assert call["json"]["parameters"] == [
+        {"name": "q", "value": "SELECT Id FROM Account", "type": "query"},
+        {"name": "id", "value": "x", "type": "query"},
+    ]
+
+
+def test_allowed_hosts_given_as_one_string_is_refused(proxy):
+    with pytest.raises(TypeError):
+        composio_proxy.proxy_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            allowed_hosts="gmail.googleapis.com",
+        )
+
+    assert proxy.calls == []
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _Response(200, {"data": {}, "status": True}),
+        _Response(502, {"error": "Bad gateway"}),
+        _Response(503, None),
+    ],
+    ids=["boolean-status", "error-not-an-object", "no-json-body"],
+)
+def test_odd_composio_answers_are_composio_errors(proxy, response):
+    proxy.response = response
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "GET", "/services/data/v62.0/sobjects", allowed_hosts=()
+        )
+
+    if response.status_code != 200:
+        assert raised.value.status == response.status_code
+        assert raised.value.slug is None

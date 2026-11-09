@@ -194,7 +194,7 @@ def _owner_grants(factory) -> list[tuple[int, str, str, str]]:
 
 
 def _refresh_returning(monkeypatch, scope: str) -> None:
-    async def fake_refresh(_client, *, refresh_token, resource, client=None):
+    async def fake_refresh(_client, *, refresh_token, resource, client=None, **_kwargs):
         return {
             "access_token": "refreshed-access-token",
             "refresh_token": "rotated-refresh-token",

@@ -1666,7 +1666,7 @@ async def test_a_rejected_client_is_reported_as_client_rejected_and_keeps_the_gr
     db_session.db.commit()
 
     async def client_rejected(_db, _account, _provider):
-        raise web_tools_config._OAuthRefreshClientRejected("slack")
+        raise web_tools_config._OAuthRefreshClientRejected("client_rejected:slack")
 
     monkeypatch.setattr(
         web_tools_config, "refresh_oauth_token_if_needed", client_rejected

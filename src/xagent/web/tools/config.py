@@ -214,8 +214,9 @@ class ResolvedToken:
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
-    # The vendor rejected the platform's client on this refresh (#3580).
-    client_rejected_provider: str | None = None
+    # The vendor rejected the platform's client on this refresh (#3580): the
+    # session reason, client_rejected[:<provider>].
+    client_rejected_reason: str | None = None
     credential_present: bool = False
     # No accepted grant, but a provider-level one the app-scoped policy
     # rejected exists: reconnecting the app fixes it.
@@ -872,9 +873,9 @@ class _OAuthRefreshClientRejected(Exception):
     user's grant itself is not shown to be dead, so it is kept.
     """
 
-    def __init__(self, provider: str) -> None:
-        super().__init__(provider)
-        self.provider = provider
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class _OAuthRefreshPermanentlyInvalid(Exception):
@@ -972,8 +973,10 @@ def _is_permanent_oauth_refresh_error(
 def _log_and_classify_failed_refresh(
     *, response: httpx.Response, provider_name: str
 ) -> None:
-    """Log a failed refresh response and raise _OAuthRefreshPermanentlyInvalid
-    when its body confirms the refresh token itself is dead. Shared by
+    """Log a failed refresh response. Raise _OAuthRefreshClientRejected when
+    the vendor rejected the platform's client (#3580), and
+    _OAuthRefreshPermanentlyInvalid when its body confirms the refresh token
+    itself is dead. Shared by
     every response shape that means "this refresh did not produce a usable
     access_token" -- a non-200 status, and a 200 status whose body still
     lacks access_token (see _is_permanent_oauth_refresh_error).
@@ -985,7 +988,7 @@ def _log_and_classify_failed_refresh(
     from ..api.auth import _OAUTH_ERROR_MESSAGE_LIMIT
 
     payload = _oauth_refresh_error_payload(response)
-    from ..oauth_client_verification import is_client_rejected
+    from ..oauth_client_verification import client_rejected_reason, is_client_rejected
 
     if is_client_rejected(provider_name, response.status_code, payload):
         provider = provider_name.lower()
@@ -997,7 +1000,7 @@ def _log_and_classify_failed_refresh(
                 "oauth_classification": CLIENT_REJECTED_REASON,
             },
         )
-        raise _OAuthRefreshClientRejected(provider)
+        raise _OAuthRefreshClientRejected(client_rejected_reason(provider))
     error_code = (
         _oauth_refresh_error_code_from_payload(payload, provider_name)
         if payload
@@ -4345,7 +4348,6 @@ class WebToolConfig(BaseToolConfig):
                 )
             }
         permanently_invalid = False
-        client_rejected_provider: str | None = None
         try:
             refresh_options = {"flush_changes": False} if shared_google_account else {}
             is_valid = await refresh_oauth_token_if_needed(
@@ -4359,16 +4361,12 @@ class WebToolConfig(BaseToolConfig):
             permanently_invalid = True
         except _OAuthRefreshClientRejected as rejected:
             # Not this user's grant: kept, like a transient failure.
-            is_valid = False
-            client_rejected_provider = rejected.provider
-
-        if client_rejected_provider is not None:
             oauth_db.rollback()
             return _LegacyOAuthTokenResolution(
                 access_token=None,
                 refresh_failed=True,
                 credential_present=True,
-                client_rejected_provider=client_rejected_provider,
+                client_rejected_reason=rejected.reason,
             )
 
         if not is_valid and not permanently_invalid:
@@ -5165,10 +5163,8 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason=(
-                            f"{CLIENT_REJECTED_REASON}:"
-                            f"{legacy_token.client_rejected_provider}"
-                            if legacy_token.client_rejected_provider
-                            else "oauth_token_refresh_failed"
+                            legacy_token.client_rejected_reason
+                            or "oauth_token_refresh_failed"
                         ),
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",

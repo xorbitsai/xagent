@@ -19,7 +19,11 @@ from xagent.web.models.database import Base
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
-from xagent.web.oauth_client_verification import is_client_rejected
+from xagent.web.mcp_apps import catalog_mcp_credential_provider_for_client_id
+from xagent.web.oauth_client_verification import (
+    client_rejected_reason,
+    is_client_rejected,
+)
 from xagent.web.services import mcp_oauth
 from xagent.web.tools import config as tool_config
 
@@ -50,6 +54,10 @@ MICROSOFT_EXPIRED_SECRET = {
         ("meta", 400, {"error": {"type": "OAuthException", "code": 190}}, False),
         ("jira", 403, {"error": "unauthorized_client"}, False),
         ("google", 503, {"error": "invalid_client"}, False),
+        # On a real refresh this means the refresh token was issued to another
+        # client (a grant from before a client switch): that grant's problem,
+        # not the current client's, unlike the verification probe.
+        ("google", 400, {"error": "unauthorized_client"}, False),
         ("xero", 400, None, False),
     ],
 )
@@ -57,8 +65,7 @@ def test_which_refresh_failures_reject_the_client(provider, status, payload, rej
     assert is_client_rejected(provider, status, payload) is rejected
 
 
-@pytest.fixture()
-def grant(tmp_path):
+def _seed(tmp_path, provider: str):
     engine = create_engine(
         f"sqlite:///{tmp_path / 'rejected.db'}",
         connect_args={"check_same_thread": False},
@@ -66,9 +73,7 @@ def grant(tmp_path):
     Base.metadata.create_all(engine)
     db = sessionmaker(bind=engine, autoflush=False)()
     row = next(
-        r
-        for r in get_builtin_oauth_provider_rows()
-        if r["provider_name"] == "microsoft"
+        r for r in get_builtin_oauth_provider_rows() if r["provider_name"] == provider
     )
     db.add(
         OAuthProvider(
@@ -84,7 +89,7 @@ def grant(tmp_path):
     db.commit()
     account = UserOAuth(
         user_id=user.id,
-        provider="microsoft",
+        provider=provider,
         access_token="old-access",
         refresh_token="good-refresh",
         provider_user_id="1",
@@ -92,6 +97,20 @@ def grant(tmp_path):
     )
     db.add(account)
     db.commit()
+    return engine, db, account
+
+
+@pytest.fixture()
+def grant(tmp_path):
+    engine, db, account = _seed(tmp_path, "microsoft")
+    yield db, account
+    db.close()
+    engine.dispose()
+
+
+@pytest.fixture()
+def github_grant(tmp_path):
+    engine, db, account = _seed(tmp_path, "github")
     yield db, account
     db.close()
     engine.dispose()
@@ -121,7 +140,7 @@ def test_a_rejected_client_raises_logs_once_and_keeps_the_grant(
                 tool_config.refresh_oauth_token_if_needed(db, account, "microsoft")
             )
 
-    assert rejected.value.provider == "microsoft"
+    assert rejected.value.reason == "client_rejected:microsoft"
     assert (account.access_token, account.refresh_token) == (
         "old-access",
         "good-refresh",
@@ -137,14 +156,29 @@ def test_a_rejected_client_raises_logs_once_and_keeps_the_grant(
     assert "expired-secret" not in caplog.text and "good-refresh" not in caplog.text
 
 
-def test_a_dead_grant_is_still_permanent(grant, monkeypatch):
-    db, account = grant
-    _vendor_answers(monkeypatch, 400, {"error": "invalid_grant"})
+def test_a_dead_grant_is_still_permanent(github_grant, monkeypatch):
+    """Dead-grant classification still runs after the client check."""
+    db, account = github_grant
+    _vendor_answers(monkeypatch, 200, {"error": "bad_refresh_token"})
 
-    assert (
-        asyncio.run(tool_config.refresh_oauth_token_if_needed(db, account, "microsoft"))
-        is False
-    )
+    with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
+        asyncio.run(tool_config.refresh_oauth_token_if_needed(db, account, "github"))
+
+
+@pytest.mark.parametrize(
+    ("provider", "reason"),
+    [
+        ("microsoft", "client_rejected:microsoft"),
+        ("Employment-Hero", "client_rejected:employment-hero"),
+        # An admin-created provider name the allowlist would refuse keeps the
+        # class rather than turning into runtime_connection_failed.
+        ("my_crm", "client_rejected"),
+        ("crm.example", "client_rejected"),
+    ],
+)
+def test_the_reason_names_the_provider_only_when_the_name_fits(provider, reason):
+    assert client_rejected_reason(provider) == reason
+    assert tool_config._is_mcp_unavailable_reason(reason)
 
 
 @pytest.mark.parametrize(
@@ -171,7 +205,9 @@ def _mcp_client() -> SimpleNamespace:
     )
 
 
-async def _refresh_mcp(status: int, payload: object, *, preregistered: bool) -> str:
+async def _refresh_mcp(
+    status: int, payload: object, *, credential_provider: str | None
+) -> str:
     async def no_url_policy(url, *, resolve_dns=False):
         return None
 
@@ -188,7 +224,7 @@ async def _refresh_mcp(status: int, payload: object, *, preregistered: bool) -> 
                 refresh_token="good-refresh",
                 resource="https://mcp.example.com",
                 client=client,
-                classify_client_rejection=preregistered,
+                credential_provider=credential_provider,
             )
     except mcp_oauth.MCPOAuthRuntimeError as exc:
         return exc.code
@@ -198,15 +234,32 @@ async def _refresh_mcp(status: int, payload: object, *, preregistered: bool) -> 
 
 
 @pytest.mark.parametrize(
-    ("payload", "preregistered", "code"),
+    ("payload", "credential_provider", "code"),
     [
-        ({"error": "invalid_client"}, True, "client_rejected"),
-        # A per-user registered client only affects that user.
-        ({"error": "invalid_client"}, False, "token_refresh_failed"),
-        ({"error": "invalid_grant"}, True, "token_refresh_failed"),
+        ({"error": "invalid_client"}, "hubspot", "client_rejected:hubspot"),
+        # Any other client, a user's own static or registered one, only
+        # affects that user.
+        ({"error": "invalid_client"}, None, "token_refresh_failed"),
+        ({"error": "invalid_grant"}, "hubspot", "token_refresh_failed"),
     ],
 )
-def test_an_mcp_refresh_rejects_only_a_preregistered_client(
-    payload, preregistered, code
+def test_an_mcp_refresh_rejects_only_the_platform_client(
+    payload, credential_provider, code
 ):
-    assert asyncio.run(_refresh_mcp(400, payload, preregistered=preregistered)) == code
+    assert (
+        asyncio.run(_refresh_mcp(400, payload, credential_provider=credential_provider))
+        == code
+    )
+
+
+def test_only_the_deployment_client_is_the_platform_client(monkeypatch):
+    """A user's custom server can carry a static client too; only the
+    deployment's own pre-registered client id names a credential provider."""
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", "platform-client")
+
+    assert catalog_mcp_credential_provider_for_client_id("platform-client") == (
+        "hubspot"
+    )
+    assert catalog_mcp_credential_provider_for_client_id("users-own-client") is None
+    monkeypatch.delenv("XAGENT_HUBSPOT_MCP_CLIENT_ID")
+    assert catalog_mcp_credential_provider_for_client_id("platform-client") is None

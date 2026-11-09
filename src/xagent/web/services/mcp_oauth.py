@@ -813,8 +813,8 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
             refresh_token=refresh_token,
             resource=refresh_resource,
             client=client,
-            classify_client_rejection=bool(
-                _runtime_config_value(None, auth_config, "client_id")
+            credential_provider=_platform_credential_provider(
+                oauth_client_snapshot.client_id
             ),
         )
 
@@ -1347,14 +1347,16 @@ async def _refresh_mcp_oauth_grant(
     refresh_token: str,
     resource: str,
     client: httpx.AsyncClient | None = None,
-    classify_client_rejection: bool = False,
+    credential_provider: str | None = None,
 ) -> dict[str, Any]:
     """Refresh one grant.
 
-    ``classify_client_rejection`` is set for a pre-registered (platform-held)
-    client: a refresh the vendor rejects for that client then raises
-    ``client_rejected`` (#3580), since it affects every user of the server. A
-    per-user registered client keeps ``token_refresh_failed``.
+    ``credential_provider`` names the catalog provider when the client is the
+    platform's own pre-registered one: a refresh the vendor rejects for that
+    client then raises ``client_rejected:<provider>`` (#3580), since it
+    affects every user of the server. Any other client, a user's custom
+    static client or a per-user registered one, keeps
+    ``token_refresh_failed``.
     """
     data = {
         "grant_type": "refresh_token",
@@ -1420,22 +1422,24 @@ async def _refresh_mcp_oauth_grant(
             "MCP OAuth refresh failed with token endpoint payload: %s",
             oauth_error_log_payload(payload),
         )
-        from ..oauth_client_verification import is_client_rejected
+        from ..oauth_client_verification import (
+            client_rejected_reason,
+            is_client_rejected,
+        )
 
-        if classify_client_rejection and is_client_rejected(
-            "mcp", response.status_code, payload
+        if credential_provider is not None and is_client_rejected(
+            credential_provider, response.status_code, payload
         ):
-            provider = urlsplit(str(oauth_client.token_endpoint)).hostname or "mcp"
             logger.error(
                 "OAuth client rejected (provider=%s classification=client_rejected)",
-                provider,
+                credential_provider,
                 extra={
-                    "oauth_provider": provider,
+                    "oauth_provider": credential_provider,
                     "oauth_classification": "client_rejected",
                 },
             )
             raise MCPOAuthRuntimeError(
-                "client_rejected",
+                client_rejected_reason(credential_provider),
                 "The OAuth provider rejected the platform's client",
             )
         raise MCPOAuthRuntimeError(
@@ -1443,6 +1447,12 @@ async def _refresh_mcp_oauth_grant(
             oauth_error_message(payload, "MCP OAuth refresh failed"),
         )
     return payload
+
+
+def _platform_credential_provider(client_id: str) -> str | None:
+    from ..mcp_apps import catalog_mcp_credential_provider_for_client_id
+
+    return catalog_mcp_credential_provider_for_client_id(client_id)
 
 
 def _runtime_config_value(

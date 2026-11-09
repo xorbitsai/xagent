@@ -198,7 +198,8 @@ export function WidgetHistoryView({
   }
 
   const composerGone = endsTheView(sendFailure) || (firstPage === "failed" && endsTheView(readFailure))
-  const retry = (
+  // A reload is the only way past "refreshToLoad", so a retry would only fail again.
+  const retry = readFailure === "refreshToLoad" ? null : (
     <button
       type="button"
       onClick={() => load(firstPage === "failed" ? null : nextCursor)}

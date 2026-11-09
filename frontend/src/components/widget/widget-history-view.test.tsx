@@ -223,22 +223,25 @@ describe("WidgetHistoryView", () => {
       expect(screen.queryByTestId("composer")).not.toBeInTheDocument()
     })
 
-    it.each(["refreshToLoad", "tryLater"] as const)(
-      "shows the %s notice for a rejected token that may not be refreshed, and retries",
-      async (unauthorizedNotice) => {
-        history.read
-          .mockRejectedValueOnce(new WidgetSessionHistoryError("unauthorized"))
-          .mockResolvedValueOnce(messagePage())
-        renderView({ unauthorizedNotice })
+    it("asks for a reload and offers no retry when a rejected token cannot be refreshed", async () => {
+      history.read.mockRejectedValueOnce(new WidgetSessionHistoryError("unauthorized"))
+      renderView({ unauthorizedNotice: "refreshToLoad" })
 
-        expect(await screen.findByRole("alert")).toHaveTextContent(
-          `widgetSession.history.${unauthorizedNotice}`,
-        )
-        fireEvent.click(screen.getByRole("button", { name: "widgetSession.history.retry" }))
+      expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.refreshToLoad")
+      expect(screen.queryByRole("button", { name: "widgetSession.history.retry" })).not.toBeInTheDocument()
+    })
 
-        expect(await screen.findByText("Where is my order?")).toBeInTheDocument()
-      },
-    )
+    it("shows the try-later notice for a rejected token and retries", async () => {
+      history.read
+        .mockRejectedValueOnce(new WidgetSessionHistoryError("unauthorized"))
+        .mockResolvedValueOnce(messagePage())
+      renderView({ unauthorizedNotice: "tryLater" })
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.tryLater")
+      fireEvent.click(screen.getByRole("button", { name: "widgetSession.history.retry" }))
+
+      expect(await screen.findByText("Where is my order?")).toBeInTheDocument()
+    })
 
     it("shows a failure line with a retry for any other failure and keeps the composer", async () => {
       history.read

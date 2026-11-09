@@ -578,9 +578,11 @@ def test_rate_limit_on_create_is_not_outcome_unknown(session: _FakeSession) -> N
     assert "may already have been created" not in _call()["message"]
 
 
-def test_one_dns_check_per_call(
+def test_base_url_resolves_the_site_once_per_call(
     session: _FakeSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Counts only _base_url's pre-check: the session fixture replaces the
+    # facade, whose own resolve on connect is outside this test.
     lookups: list[Any] = []
 
     def _resolve(*a: Any, **k: Any) -> list[Any]:
@@ -633,6 +635,21 @@ def test_redirect_is_refused(session: _FakeSession) -> None:
     message = _call()["message"]
     assert "redirect" in message
     assert "evil.example" not in message
+
+
+def test_400_field_error_never_echoes_the_token(session: _FakeSession) -> None:
+    """The bare token (no URL userinfo for redact_sensitive_text to catch) in
+    a field error Jira echoes back is removed by _safe_text's own replace."""
+    session.queue = [
+        _FakeResponse(
+            status_code=400,
+            payload={"errorMessages": [], "errors": {"summary": f"bad {TOKEN}"}},
+        )
+    ]
+    result = _call()
+    assert result["status"] == "error"
+    assert "summary" in result["message"]
+    assert TOKEN not in result["message"]
 
 
 def test_transport_error_never_echoes_the_token(session: _FakeSession) -> None:

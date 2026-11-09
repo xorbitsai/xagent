@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:xagent:connector-smoke:result:1",
+  "$id": "urn:xagent:connector-smoke:result:2",
   "title": "Connector smoke V2 run result",
   "description": "One run of the connector smoke V2 engine under one identity. Built by xagent.web.connector_checks.results.RunResult.to_document; carries codes, ids, tool names and timing only.",
   "type": "object",
@@ -11,7 +11,7 @@
   ],
   "properties": {
     "schema": { "const": "xagent.connector_smoke.result" },
-    "schema_version": { "const": 1 },
+    "schema_version": { "const": 2 },
     "declaration_format_version": { "type": "integer", "minimum": 1 },
     "identity": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
     "environment": {

@@ -250,7 +250,7 @@ The `user` adapter (`user_identity.py`):
 ```json
 {
   "schema": "xagent.connector_smoke.result",
-  "schema_version": 1,
+  "schema_version": 2,
   "declaration_format_version": 1,
   "identity": "toby",
   "environment": "production-au",
@@ -311,4 +311,4 @@ The `user` adapter (`user_identity.py`):
 
 - `DECLARATION_FORMAT_VERSION` (`declarations.py`) changes when a declared check or a consumer of declarations must adapt. Version 2 added `CreatedRef`, `ItemRef`, the cleanup guard, the sweep and the rules on write areas, fixture keys in cleanup, read steps, run-scoped suffixes and `@` in arguments (#3564). It also refuses a path that is not a tuple: version 1 took a list, or a string as a path of one-letter keys.
 - `RESULT_SCHEMA_VERSION` (`results.py`) and the schema's `schema_version` const change together when a consumer of results must adapt: a field removed or renamed, a class removed, a meaning changed. A test pins the schema's enums to the Python enums.
-- A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change.
+- A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change. Version 2 added the unprobeable reason `write_only` (#3655).

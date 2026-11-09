@@ -116,15 +116,16 @@ def upgrade() -> None:
         if existing["app_id"] == APP_ID:
             if _has_provenance(existing["launch_config"]):
                 return
-            # Not adopted: no marker is written, so the builtin overlay keeps
-            # treating this as the operator's own row.
-            logger.warning(
-                "Preserving existing public_mcp_apps row with app_id=%r because "
-                "it has no matching builtin_provenance; the builtin Jira Ticket "
-                "connector will not be seeded",
-                APP_ID,
+            # An unprovenanced row squatting on the exact app_id the builtin
+            # overlay keys off is a misidentification risk; skipping would
+            # stamp this revision without ever seeding. Fail closed, as the
+            # rocketlane and atlassian seeds do, and leave the row untouched
+            # for an operator to rename or remove before re-running.
+            raise RuntimeError(
+                "Cannot seed builtin Jira Ticket connector: an existing "
+                f"public_mcp_apps row with app_id={APP_ID!r} has no matching "
+                "builtin_provenance"
             )
-            return
         if {
             canonicalize_builtin_identity(existing["app_id"]),
             canonicalize_builtin_identity(existing["name"]),

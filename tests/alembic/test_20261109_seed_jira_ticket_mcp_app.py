@@ -219,10 +219,11 @@ def test_existing_row_with_matching_provenance_is_left_alone(tmp_path):
     assert [row[0] for row in rows] == [1]
 
 
-def test_collision_with_a_custom_app_id_row_is_preserved_and_logged(tmp_path, caplog):
-    """A hand-made row under this app_id has no provenance marker. It is not
-    overwritten, not adopted (no marker is added, so the registry overlay keeps
-    ignoring it), and the skip is logged rather than silent."""
+def test_upgrade_refuses_an_exact_app_id_row_without_provenance(tmp_path):
+    """A hand-made row under this exact app_id squats on the identity the
+    builtin overlay keys off, so the seed fails closed (as the rocketlane and
+    atlassian seeds do) instead of stamping the revision without seeding. The
+    operator's row is left untouched."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -230,7 +231,7 @@ def test_collision_with_a_custom_app_id_row_is_preserved_and_logged(tmp_path, ca
         _insert_custom(
             connection, app_id="jira-ticket", name="Operator Jira", visible=1
         )
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(RuntimeError, match="builtin_provenance"):
             _upgrade(migration, connection)
         row = (
             connection.execute(
@@ -245,10 +246,6 @@ def test_collision_with_a_custom_app_id_row_is_preserved_and_logged(tmp_path, ca
     assert row["name"] == "Operator Jira"
     assert row["is_visible_in_connector"] == 1
     assert json.loads(row["launch_config"]) == {"command": "operator-cmd"}
-    assert any(
-        "jira-ticket" in r.getMessage() and "builtin_provenance" in r.getMessage()
-        for r in caplog.records
-    )
 
 
 @pytest.mark.parametrize(

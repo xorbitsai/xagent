@@ -677,3 +677,146 @@ def test_a_late_answer_after_the_deadline_is_not_delivered_twice(monkeypatch):
     assert len(seen) == 1
     assert seen[0][1] is None
     assert isinstance(seen[0][2], TimeoutError)
+
+
+def test_a_binary_answer_without_a_data_key_is_downloaded(proxy, monkeypatch):
+    """Composio's schema makes ``data`` optional, so a file answer may carry
+    only ``binary_data``; it must still download instead of becoming an
+    empty body."""
+    seen: dict[str, Any] = {}
+
+    def download(url: str, timeout: float) -> _Download:
+        seen["url"] = url
+        return _Download(200, b"%PDF-1.4 no data key")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", download)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed",
+                "content_type": "application/pdf",
+                "size": 21,
+            },
+        },
+    )
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
+    )
+
+    assert seen["url"] == "https://files.composio.dev/signed"
+    assert content == b"%PDF-1.4 no data key"
+    assert response["content-type"] == "application/pdf"
+    assert response["content-length"] == str(len(content))
+
+
+def test_a_redirect_without_a_data_key_keeps_its_location(proxy):
+    """A bodyless 3xx is a normal provider answer; its Location must reach
+    the caller even when the answer has no ``data`` member."""
+    proxy.answer_with(
+        200,
+        {
+            "status": 302,
+            "headers": {"Location": "https://drive.usercontent.google.com/download/x"},
+        },
+    )
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
+    )
+
+    assert response.status == 302
+    assert response["location"] == "https://drive.usercontent.google.com/download/x"
+    assert content == b""
+
+
+def test_an_upstream_error_without_a_data_key_still_reaches_the_caller(proxy):
+    """A 304 or a bodyless upstream error keeps the provider's status; it is
+    googleapiclient that turns it into an ``HttpError``."""
+    proxy.answer_with(200, {"status": 304})
+
+    with pytest.raises(HttpError) as raised:
+        _gmail_service().users().labels().get(userId="me", id="x").execute()
+
+    assert raised.value.resp.status == 304
+
+
+def test_a_malformed_binary_answer_is_not_a_zero_byte_success(proxy, monkeypatch):
+    """``binary_data`` is an object in Composio's schema; a string used to be
+    dropped silently and the answer became a successful 0-byte body."""
+
+    def download(*args: Any, **kwargs: Any) -> _Download:
+        raise AssertionError("no download for a malformed envelope")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", download)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": "https://files.composio.dev/signed",
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    assert "binary" in str(raised.value)
+
+
+def test_a_download_that_raises_names_no_signed_url(proxy, monkeypatch):
+    """The signed URL is a bearer-like credential; an exception from the
+    download client can name it, so only a generic message is raised."""
+
+    def download(url: str, timeout: float) -> _Download:
+        raise RuntimeError(f"boom {url}")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", download)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed-secret",
+                "content_type": "application/pdf",
+                "size": 3,
+            },
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    text = str(raised.value)
+    assert "files.composio.dev" not in text
+    assert "signed-secret" not in text
+    assert raised.value.__cause__ is None
+
+
+def test_the_transport_can_override_the_shared_body_limit(proxy):
+    """The 4.5 MB default is an inferred bound; a stage measurement that
+    finds a different per-API limit must be usable without changing the
+    shared constant."""
+    http = google_api_proxy.GoogleApiProxyHttp(
+        allowed_hosts=GMAIL_HOSTS, max_body_bytes=200
+    )
+    body = json.dumps({"raw": "x" * 500})
+
+    with pytest.raises(ValueError, match="200 byte limit"):
+        http.request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            method="POST",
+            body=body,
+            headers={"content-type": "application/json"},
+        )
+    with pytest.raises(ValueError, match="200 byte limit"):
+        http.check_request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            method="POST",
+            body=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert proxy.calls == []

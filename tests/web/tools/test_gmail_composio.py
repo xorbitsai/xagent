@@ -570,6 +570,8 @@ def test_a_search_above_the_request_cap_is_refused_before_the_list_call(
 
     assert result["status"] == "error"
     assert "request limit for one tool call" in result["message"]
+    # The list request is one more proxy call than the message cap counts.
+    assert "101 message requests (plus the list request)" in result["message"]
     assert proxy.calls == []
 
 

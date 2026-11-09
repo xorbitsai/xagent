@@ -1,12 +1,15 @@
 import base64
 import json
+import mimetypes
 from email import policy
+from email.message import EmailMessage
 from email.parser import BytesParser
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
-from xagent.web.tools.mcp import gmail
+from xagent.web.tools.mcp import composio_proxy, gmail
 
 _parse_message = BytesParser(policy=policy.default).parsebytes
 
@@ -17,6 +20,13 @@ def _credentials(monkeypatch):
     monkeypatch.delenv("GOOGLE_REFRESH_TOKEN", raising=False)
     monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
     monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    # This file is the native path; no Composio grant is ever launched here.
+    for name in (
+        composio_proxy.COMPOSIO_API_KEY_ENV,
+        composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
+        composio_proxy.COMPOSIO_USER_ID_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _mock_gmail_service(monkeypatch, users_mock):
@@ -552,3 +562,255 @@ def test_send_messages_returns_error_payload_on_api_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "boom" in result["message"]
+
+
+def _native_send_reference(messages: list[dict], action: str) -> str:
+    """``gmail_send_messages`` as it was before the proxy transport (d5c68369).
+
+    Kept as the reference the native path is compared against: it resolves
+    the attachments, builds and sends each message in turn, and returns the
+    bare error on failure.
+    """
+    try:
+        if not isinstance(messages, list):
+            raise ValueError("'messages' must be a list of message dicts")
+
+        resolved_attachments: list[list[tuple[str, bytes]]] = []
+        budget_remaining = gmail._MAX_ATTACHMENT_BYTES
+        for msg_data in messages:
+            attachments, budget_remaining = gmail._resolve_message_attachments(
+                msg_data, budget_remaining
+            )
+            resolved_attachments.append(attachments)
+
+        service = gmail.get_gmail_service()
+        results = []
+
+        for msg_data, attachments in zip(messages, resolved_attachments):
+            message = EmailMessage()
+            message.set_content(msg_data.get("body", ""))
+            message["To"] = msg_data.get("to", "")
+            message["From"] = "me"
+            message["Subject"] = msg_data.get("subject", "")
+
+            if "cc" in msg_data:
+                message["Cc"] = msg_data["cc"]
+            if "bcc" in msg_data:
+                message["Bcc"] = msg_data["bcc"]
+
+            attached_summary: list[dict[str, Any]] = []
+            for filename, data in attachments:
+                guessed_type, _ = mimetypes.guess_type(filename)
+                maintype, _, subtype = (
+                    guessed_type or "application/octet-stream"
+                ).partition("/")
+                params = {"charset": "utf-8"} if maintype == "text" else {}
+                message.add_attachment(
+                    data,
+                    maintype=maintype,
+                    subtype=subtype or "octet-stream",
+                    filename=filename,
+                    params=params,
+                )
+                attached_summary.append({"filename": filename, "size": len(data)})
+
+            encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+            create_message = {"raw": encoded_message}
+
+            if action == "send":
+                sent_message = (
+                    service.users()
+                    .messages()
+                    .send(userId="me", body=create_message)
+                    .execute()
+                )
+                results.append(
+                    {
+                        "status": "sent",
+                        "id": sent_message["id"],
+                        "attachments": attached_summary,
+                    }
+                )
+            else:
+                draft = (
+                    service.users()
+                    .drafts()
+                    .create(userId="me", body={"message": create_message})
+                    .execute()
+                )
+                results.append(
+                    {
+                        "status": "drafted",
+                        "id": draft["id"],
+                        "attachments": attached_summary,
+                    }
+                )
+
+        return json.dumps({"status": "success", "results": results})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+def _native_users(fail_at: int | None = None) -> Mock:
+    """A native users resource whose n-th send/draft fails when asked."""
+    users = Mock()
+    calls = {"count": 0}
+
+    def execute() -> dict[str, str]:
+        calls["count"] += 1
+        if calls["count"] == fail_at:
+            raise RuntimeError("boom")
+        return {"id": f"m{calls['count']}"}
+
+    users.messages.return_value.send.return_value.execute.side_effect = execute
+    users.drafts.return_value.create.return_value.execute.side_effect = execute
+    return users
+
+
+def _send_transcript(users: Mock) -> list[dict[str, Any]]:
+    """What was actually built and sent, message by message."""
+    entries: list[dict[str, Any]] = []
+    endpoints = (
+        ("send", users.messages.return_value.send, "body", "raw"),
+        ("draft", users.drafts.return_value.create, "body", "message"),
+    )
+    for kind, endpoint, outer, inner in endpoints:
+        for call in endpoint.call_args_list:
+            payload = call.kwargs[outer]
+            raw = payload["raw"] if inner == "raw" else payload[inner]["raw"]
+            message = _parse_message(base64.urlsafe_b64decode(raw))
+            body = message.get_body(preferencelist=("plain",))
+            entries.append(
+                {
+                    "kind": kind,
+                    "to": message["To"],
+                    "subject": message["Subject"],
+                    "cc": message["Cc"],
+                    "bcc": message["Bcc"],
+                    "body": body.get_content() if body is not None else "",
+                    "attachments": [
+                        part.get_filename() for part in message.iter_attachments()
+                    ],
+                }
+            )
+    return entries
+
+
+def _run_native_send(
+    monkeypatch,
+    send,
+    messages: list[dict],
+    action: str,
+    fail_at: int | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    users = _native_users(fail_at)
+    service = Mock()
+    service.users.return_value = users
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: service)
+    return json.loads(send(messages, action)), _send_transcript(users)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["single", "two", "second-send-fails", "second-build-fails", "draft"],
+)
+def test_native_send_matches_the_original_implementation(monkeypatch, scenario):
+    """#3647 acceptance: with no Composio grant, the send tool behaves
+    exactly as it did at d5c68369, including every error path."""
+    messages: list[dict] = [
+        {"to": "a@example.com", "subject": "One", "body": "first"},
+        {
+            "to": "b@example.com",
+            "subject": "Two",
+            "body": "second",
+            "cc": "cc@example.com",
+        },
+    ]
+    action = "send"
+    fail_at: int | None = None
+    if scenario == "single":
+        messages = messages[:1]
+    elif scenario == "second-send-fails":
+        fail_at = 2
+    elif scenario == "second-build-fails":
+        messages[1]["subject"] = "bad\nsubject"
+    elif scenario == "draft":
+        action = "draft"
+
+    expected, expected_transcript = _run_native_send(
+        monkeypatch, _native_send_reference, messages, action, fail_at
+    )
+    actual, actual_transcript = _run_native_send(
+        monkeypatch, gmail.gmail_send_messages, messages, action, fail_at
+    )
+
+    assert actual == expected
+    assert actual_transcript == expected_transcript
+
+
+def test_a_native_send_that_fails_midway_keeps_the_old_bare_error(monkeypatch):
+    """The partial-results payload is Composio-only: native keeps the bare
+    error even after the first message went out."""
+    users = _native_users(fail_at=2)
+    service = Mock()
+    service.users.return_value = users
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: service)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {"to": "a@example.com", "subject": "One", "body": "1"},
+                {"to": "b@example.com", "subject": "Two", "body": "2"},
+            ],
+            action="send",
+        )
+    )
+
+    assert result == {"status": "error", "message": "boom"}
+    assert "results" not in result
+    # The second send was attempted (and failed) after the first went out.
+    assert users.messages.return_value.send.return_value.execute.call_count == 2
+
+
+def test_a_native_send_does_not_pre_build_the_batch(monkeypatch):
+    """A message that cannot be built must not hold back the one before it:
+    the native path builds and sends each message in turn, as before."""
+    users = _native_users()
+    service = Mock()
+    service.users.return_value = users
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: service)
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {"to": "a@example.com", "subject": "One", "body": "1"},
+                {"to": "b@example.com", "subject": "bad\nsubject", "body": "2"},
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "results" not in result
+    assert users.messages.return_value.send.call_count == 1
+
+
+def test_a_native_send_does_not_run_the_proxy_pre_send_check(monkeypatch):
+    """The body-size pre-check is Composio-only; a native request was never
+    checked through the proxy transport."""
+    checked: list[Any] = []
+    users = _native_users()
+    service = Mock()
+    service.users.return_value = users
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: service)
+    monkeypatch.setattr(
+        gmail.google_api_proxy,
+        "check_request",
+        lambda request: checked.append(request),
+    )
+
+    gmail.gmail_send_messages(
+        [{"to": "a@example.com", "subject": "One", "body": "1"}], action="send"
+    )
+
+    assert checked == []

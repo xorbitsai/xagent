@@ -404,20 +404,6 @@ def test_a_response_keeps_the_provider_headers_and_binary_data(proxy):
     assert response.binary_data == binary_data
 
 
-def test_a_successful_answer_without_data_is_a_composio_error(proxy):
-    """A truncated 2xx used to reach a callback and fail opaquely there."""
-    proxy.response = _Response(200, {"status": 200})
-
-    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
-        composio_proxy.proxy_request(
-            "GET",
-            "https://gmail.googleapis.com/gmail/v1/users/me/labels",
-            allowed_hosts=GMAIL_HOSTS,
-        )
-
-    assert "without the provider's data" in str(raised.value)
-
-
 def test_a_no_content_answer_may_omit_data(proxy):
     proxy.response = _Response(200, {"status": 204})
 
@@ -519,3 +505,192 @@ def test_a_per_call_body_limit_overrides_the_shared_default(proxy):
         )
 
     assert proxy.calls == []
+
+
+def test_a_successful_answer_without_data_or_binary_data_is_a_composio_error(proxy):
+    """A truncated 2xx used to reach a callback and fail opaquely there; with
+    neither a body nor a file there is nothing to return."""
+    proxy.response = _Response(200, {"status": 200})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+            allowed_hosts=GMAIL_HOSTS,
+        )
+
+    assert "without the provider's data" in str(raised.value)
+
+
+def test_a_redirect_without_data_is_still_a_provider_answer(proxy):
+    """Composio's 200 schema only requires ``status``: ``data`` is optional,
+    so a 3xx with no body must reach the caller with its Location instead of
+    being refused as an incomplete answer."""
+    location = "https://drive.usercontent.google.com/download/x"
+    proxy.response = _Response(200, {"status": 302, "headers": {"location": location}})
+
+    response = composio_proxy.proxy_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a",
+        allowed_hosts=GMAIL_HOSTS,
+    )
+
+    assert response.status == 302
+    assert response.data is None
+    assert response.headers == {"location": location}
+
+
+def test_a_binary_answer_may_omit_data(proxy):
+    binary_data = {
+        "url": "https://files.composio.dev/signed",
+        "content_type": "application/pdf",
+        "size": 3,
+    }
+    proxy.response = _Response(200, {"status": 200, "binary_data": binary_data})
+
+    response = composio_proxy.proxy_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a",
+        allowed_hosts=GMAIL_HOSTS,
+    )
+
+    assert response.status == 200
+    assert response.data is None
+    assert response.binary_data == binary_data
+
+
+def test_an_upstream_error_may_omit_data(proxy):
+    proxy.response = _Response(200, {"status": 404})
+
+    response = composio_proxy.proxy_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels/missing",
+        allowed_hosts=GMAIL_HOSTS,
+    )
+
+    assert response.status == 404
+    assert response.data is None
+    assert not response.ok
+
+
+@pytest.mark.parametrize(
+    "answer, fragment",
+    [
+        (
+            {"status": 200, "data": None, "binary_data": "https://files/signed"},
+            "binary",
+        ),
+        (
+            {"status": 200, "data": None, "binary_data": ["https://files/signed"]},
+            "binary",
+        ),
+        (
+            {"status": 302, "data": None, "headers": ["location", "https://example/x"]},
+            "headers",
+        ),
+        (
+            {"status": 302, "data": None, "headers": "location: https://example/x"},
+            "headers",
+        ),
+    ],
+    ids=["binary-str", "binary-list", "headers-list", "headers-str"],
+)
+def test_a_malformed_envelope_field_is_a_composio_error(proxy, answer, fragment):
+    """A non-object field used to be dropped silently, which turned a
+    malformed file answer into a successful 0-byte body and lost a 3xx's
+    Location."""
+    proxy.response = _Response(200, answer)
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1",
+            allowed_hosts=GMAIL_HOSTS,
+        )
+
+    assert fragment in str(raised.value)
+
+
+def test_an_error_that_echoes_a_truncated_body_hides_the_message(proxy):
+    """A vendor that cuts the echoed body off leaves the ``"raw"`` member
+    unterminated; the base64 prefix still carries the MIME headers and the
+    start of the body, so it must be redacted to the end of the echo."""
+    raw = base64.urlsafe_b64encode(
+        b"Subject: TRUNCATED-ECHO-SUBJECT\r\n\r\n" + b"BODY-MARKER-TRUNCATED" * 100
+    ).decode()
+    truncated = raw[:600]
+    proxy.response = _Response(
+        400, {"error": {"message": f'invalid body {{"raw": "{truncated}'}}
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert truncated not in text
+    assert "[redacted]" in text
+
+
+@pytest.mark.parametrize(
+    "message, secret",
+    [
+        ("bad grant refresh_token=1//0gSECRET-REFRESH", "1//0gSECRET-REFRESH"),
+        ("bad grant client_secret=GOCSPX-SECRET-CLIENT", "GOCSPX-SECRET-CLIENT"),
+        ('bad body {"refresh_token": "1//0gSECRET-JSON"}', "1//0gSECRET-JSON"),
+        ('bad body {"client_secret": "GOCSPX-SECRET-JSON"}', "GOCSPX-SECRET-JSON"),
+    ],
+    ids=["refresh-form", "client-form", "refresh-json", "client-json"],
+)
+def test_an_error_that_names_a_non_bearer_credential_is_redacted(
+    proxy, message, secret
+):
+    """A vendor can name the grant's refresh token or client secret; neither
+    is one of our launch variables, so they are matched by member name."""
+    proxy.response = _Response(401, {"error": {"message": message}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "GET", "/services/data/v62.0/sobjects", allowed_hosts=()
+        )
+
+    text = str(raised.value)
+    assert secret not in text
+    assert "[redacted]" in text
+
+
+def test_an_error_that_echoes_the_decoded_message_hides_its_content(proxy):
+    """A vendor can echo the decoded request instead of the JSON body it was
+    sent; the mail body and the caller-written headers then appear in
+    clear."""
+    raw = base64.urlsafe_b64encode(
+        b"To: a@example.com\r\nFrom: me\r\nSubject: DECODED-ECHO-SUBJECT\r\n"
+        b"\r\nDECODED-BODY-MARKER\r\n"
+    ).decode()
+    proxy.response = _Response(
+        400,
+        {
+            "error": {
+                "message": (
+                    "invalid message Subject: DECODED-ECHO-SUBJECT "
+                    "body DECODED-BODY-MARKER"
+                )
+            }
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "DECODED-ECHO-SUBJECT" not in text
+    assert "DECODED-BODY-MARKER" not in text

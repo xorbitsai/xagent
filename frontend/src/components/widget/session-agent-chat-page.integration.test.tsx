@@ -2384,6 +2384,65 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       expect(postMessage.mock.calls.filter(([message]) => (message as { type?: string })?.type === "reconnect_request")).toEqual([])
     })
 
+    it("keeps the history composer away from the file list of a login stored in the browser", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      const missingRect = !Range.prototype.getBoundingClientRect
+      if (missingRect) {
+        Range.prototype.getBoundingClientRect = () => ({
+          top: 400, bottom: 410, left: 10, right: 20, width: 10, height: 10, x: 10, y: 400, toJSON: () => ({}),
+        }) as DOMRect
+      }
+      localStorage.setItem("auth_cache", JSON.stringify({
+        schemaVersion: 2,
+        sessionId: "stored-login",
+        credentialRevision: 0,
+        profileRevision: 0,
+        token: "personal-access-token",
+        refreshToken: "personal-refresh-token",
+        user: { id: "personal-user", username: "staff" },
+        timestamp: Date.now(),
+      }))
+      historySurfaces.real = true
+      fetchMock.mockImplementation(async (url: string) => {
+        if (String(url).includes("/api/files/list")) {
+          return json({ files: [{ file_id: "f-private", filename: "payroll.pdf", file_size: 1, modified_time: 1 }] })
+        }
+        if (String(url).includes("/conversations/40/messages")) {
+          return json({
+            messages: [{ id: 1, role: "user", content: "An old question", created_at: "2026-01-01T00:00:00Z", attachments: [] }],
+            next_cursor: null,
+          })
+        }
+        return json({ conversations: [{ task_id: 40, title: "Older chat", created_at: "2026-01-01T00:00:00Z" }], next_cursor: null })
+      })
+      try {
+        const socket = await mountWithHistory()
+        receive(socket, ATTACHED)
+        fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+        fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+        fireEvent.click(await screen.findByRole("button", { name: /Older chat/ }))
+        await screen.findByText("An old question")
+
+        // An email address is enough to start a file mention.
+        const editor = screen.getByRole("textbox")
+        editor.textContent = "mail me at a@b"
+        const range = document.createRange()
+        range.setStart(editor.firstChild!, "mail me at a@b".length)
+        range.collapse(true)
+        window.getSelection()?.removeAllRanges()
+        window.getSelection()?.addRange(range)
+        fireEvent.input(editor)
+        await act(async () => { vi.advanceTimersByTime(300); await Promise.resolve() })
+        await letItRun()
+
+        expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("/api/files/"))).toEqual([])
+        expect(document.body).not.toHaveTextContent("payroll.pdf")
+      } finally {
+        if (missingRect) delete (Range.prototype as { getBoundingClientRect?: unknown }).getBoundingClientRect
+        vi.useRealTimers()
+      }
+    })
+
     it("keeps the draft in the same composer node across a visit to history", async () => {
       surfaces.real = true
       const socket = await mountWithHistory()

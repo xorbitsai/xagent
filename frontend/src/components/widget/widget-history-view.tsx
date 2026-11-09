@@ -280,6 +280,7 @@ export function WidgetHistoryView({
             onSend={(message) => submit(message)}
             isLoading={blockedNotice !== null || checking}
             hideFileUpload={true}
+            filesDisabled={true}
             hideConfig={true}
             readOnlyConfig={true}
             compact={true}

@@ -214,13 +214,15 @@ A check's row depends on the session:
 | write check, writes switched off | `skip`/`writes_disabled` | `skip`/`writes_disabled` |
 | app with no declaration | `<connector>.l3_probe` `skip`/`not_declared` | the same |
 
-Connectors run in sequence under the total timeout. The step it interrupts, a session or a call, fails as `timed_out` with the reason `run_deadline`, also when the step swallowed the cancellation and returned. A connector it keeps from starting has a `fail`/`not_reached` session row and the check rows of any session that did not pass; under a session that passed, a call it keeps from starting is `fail`/`not_reached`. The run is then not `complete`.
+Connectors run in sequence under the total timeout. The step it interrupts, a session or a call, fails as `timed_out` with the reason `run_deadline`, also when the step swallowed the cancellation and returned. A connector it keeps from starting has a `fail`/`not_reached` session row and the check rows of any session that did not pass; under a session that passed, a call it keeps from starting is `fail`/`not_reached`. The run is then not `complete`. A write check refused as `not_reached`/`time_budget` is the exception: it is refused before the deadline, and the run goes on (see [Running write checks](#running-write-checks)).
 
 A run with no rows carries a `failure`. It is the adapter's `IdentitySetupError` code, or one of the engine's codes: `enumeration:exception` (the enumeration raised something else), `enumeration:no_connectors`, `enumeration:duplicate_connector` (two targets with one label), `fixtures:exception` (the fixture resolver raised), `write_policy:exception` (the identity's write policy raised) or `selection:no_targets` (the selectors matched nothing).
 
 Today's L3 probes run as their derived `<app_id>.l3_probe` checks with the probe route's verdicts: `tests/web/connector_checks/test_l3_parity.py` feeds the same listing and tool behaviour to the route's call path and to the engine, and compares them. A probe outcome maps to a check row as `ok` → `pass`, `probe_failed` → `call_failed`, `probe_assertion_failed` → `assertion_failed`, `probe_tool_missing` → `tool_missing` and `timed_out` → `timed_out`, with the same reasons except the call's own bound (`probe_call` there, `check_call` here). A listing outcome is the session row's class.
 
 ### Running write checks
+
+**Do not switch writes on before the sweeper runs** (#3564, a later PR): a write that could not delete its object (a failed create, a failed guard or cleanup, a killed run) leaves it to the sweeper.
 
 A write check creates, verifies and deletes a real object in the connector's test tenant (`writes.py`), so it runs only for a connector whose catalog app id is listed in `XAGENT_CONNECTOR_SMOKE_WRITE_APPS` (comma-separated, empty by default, set per environment; `config.get_connector_smoke_write_apps`). The engine reads the switch once at the start of a run. It is not a CLI argument, and an identity adapter cannot set it; the V2 workflow's kill switch still turns the whole run off (xorbitsai/xagent-saas#2536).
 
@@ -305,7 +307,7 @@ The `user` adapter (`user_identity.py`):
 - **Rows.** Each connector has one `session` row (starting it and listing its tools), followed by one `check` row per declared check. The diff keys on `(identity, connector, check)`, with `check` null for the session row. When a session does not pass, none of its checks runs: each is `skip` with `session_unavailable` (`writes_disabled` for a write check whose connector's writes are off) or stays `unprobeable`, so one broken connector is one failure.
 - **`connector`** is the catalog app id. An admin-created app's id is free text, so one that is not a kebab-case id of at most 64 characters, or that starts with `custom-`, is named `custom-<16 hex digits>` from its SHA-256 (`ConnectorTarget.connector`): stable across runs, and never the text itself. Hashing ids that start with `custom-` too means a generated label never names another app.
 - **`environment`** is the deployment's label, or null when the caller gives none, so the diff can confirm it compares runs of one environment.
-- **`complete`** is false when the run's total timeout cut it, or when it failed to set up; what the timeout kept from starting fails with `not_reached` (see [Engine](#engine)).
+- **`complete`** is false when the run's total timeout cut it, or when it failed to set up; what the timeout kept from starting fails with `not_reached` (see [Engine](#engine)). A write check refused as `not_reached`/`time_budget` does not make the run incomplete: the run goes on.
 - **`failure`** is a code for a run that could not be set up (`<stage>:<reason>`, such as `enumeration:no_connectors`; the engine's codes are listed under [Engine](#engine)), and null otherwise. Such a run has no rows; the diff reads it as no data, never as every connector recovering.
 - **Outcomes.** `pass` and `unprobeable` carry no class; an `unprobeable` row's `reason` is its L3 reason. `fail` and `skip` carry a class from the tables below, and `reason` optionally refines it with a code.
 - **What a document never holds.** Tokens, secrets, response bodies, fixture values or end-user ids. Every reason is a code (`^[a-z0-9][a-z0-9_.:-]{0,79}$`): a listing's reason that is not a code is dropped, and a row refuses one. A code-shaped value can still be anything, so the callers that build rows put only codes in them.
@@ -320,7 +322,7 @@ The `user` adapter (`user_identity.py`):
 | `failed_to_start` | the server did not start; `reason` is the load phase, or `exception` when opening the session raised |
 | `no_tools` | the server listed no tools |
 | `timed_out` | starting, listing or a check's call exceeded its bound; `reason` is `check_call` for a call's own bound and `run_deadline` for the run's |
-| `not_reached` | the run's total timeout ended before this connector, or before this check's call |
+| `not_reached` | the run's total timeout ended before this connector, or before this check's call; with reason `time_budget`, too little time was left to start this write check |
 | `tool_missing` | the server does not list the check's tool |
 | `call_failed` | the call raised (`exception`), the result was flagged as an error (`tool_error`), or it was not a mapping (`invalid_result`) |
 | `assertion_failed` | an assertion did not hold; `reason` names which kind |

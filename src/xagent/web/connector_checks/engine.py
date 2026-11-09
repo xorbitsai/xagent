@@ -41,7 +41,9 @@ Connectors run in sequence under one total timeout. The step it interrupts
 A connector it keeps from starting has a ``fail``/``not_reached`` session row
 and the check rows of any session that did not pass; under a session that
 passed, a call it keeps from starting is ``fail``/``not_reached``. The run is
-then not ``complete``.
+then not ``complete``. A write check refused as ``not_reached``/``time_budget``
+(``writes.py``) is the one exception: it is refused before the deadline, and
+the run goes on.
 
 The engine is meant for a one-shot CLI process: it does not take the web
 process's probe slot (``services/connector_probe.py``), so it must not run
@@ -216,7 +218,8 @@ async def run_checks(
     names another app, or a timeout that is a bool, NaN, infinite or not above
     0; ``TypeError`` for a selector given as one string, a timeout that is not
     a number, or a fixture value that is not a JSON scalar. A resolver that
-    raises fails the run as ``fixtures:exception``.
+    raises fails the run as ``fixtures:exception``, and a write policy that
+    raises as ``write_policy:exception``.
     """
     started_at = datetime.now(timezone.utc)
     _require_finite_positive(total_timeout)
@@ -277,7 +280,8 @@ async def run_checks(
         return finish((), "selection:no_targets")
     if any(plan.writes for plan in plans):
         # The objects a run creates carry its id; the log ties them to it.
-        logger.info("Write checks run under run id %s", run_id)
+        # WARNING, so it reaches stderr under the CLI's logging setup.
+        logger.warning("Write checks run under run id %s", run_id)
 
     rows: list[SessionRow | CheckRow] = []
     for plan in plans:

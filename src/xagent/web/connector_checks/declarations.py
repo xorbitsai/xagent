@@ -15,10 +15,10 @@ create writes into the connector's write area (a fixture key
 cleanup deletes that object by the same name, or by a ``CreatedRef`` to the
 id create returned once a cleanup guard has read the object by that id and
 confirmed its name. A connector with write checks declares a ``Sweep`` for
-what aborted runs leave behind. Until the write-check safety rails land
-(#3564) the engine runs no write check and reports each as
-``writes_disabled``; the write switch is per connector and keyed by its app
-id, so a check does not carry one. A tool that has no check carries an
+what aborted runs leave behind. The engine runs a write check only for a
+connector listed in ``XAGENT_CONNECTOR_SMOKE_WRITE_APPS`` (``writes.py``) and
+reports it as ``writes_disabled`` otherwise; the switch is per connector and
+keyed by its app id, so a check does not carry one. A tool that has no check carries an
 exemption with its reason instead.
 
 Arguments, and assertions' expected values, are JSON values or fixture keys

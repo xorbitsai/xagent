@@ -25,7 +25,8 @@ and must confirm its name (``cleanup_failed``/``ownership``). The guard and
 the cleanup run under their own call timeouts, not the run's deadline, and
 finish even when the run is cancelled, which is then re-raised. A create
 that raised, timed out or returned an error, or returned no usable id,
-leaves whatever it made to the sweeper.
+leaves whatever it made to the sweeper, which a later PR of #3564 adds:
+until it runs, such an object stays in the tenant.
 
 A row reports the first of: a refusal, ``cleanup_failed``, a failed create,
 a failed verify, ``pass``. A step's failure is ``<step>:<detail>``, the
@@ -74,9 +75,6 @@ _VERIFY = "verify"
 _GUARD = "guard"
 _CLEANUP = "cleanup"
 
-# Answers a write tool's verdict for one target, or None for no policy.
-VerdictSource = Callable[[str], ExpectedVerdict | None]
-
 
 class WritePolicyFailed(Exception):
     """The identity's write policy raised; carries nothing from the error."""
@@ -94,10 +92,6 @@ def new_run_id(started_at: datetime) -> str:
     in any environment."""
     minute = started_at.astimezone(timezone.utc).strftime("%Y%m%d%H%M")
     return f"{minute}-{secrets.token_hex(3)}"
-
-
-def run_scoped_name(run_id: str, suffix: str) -> str:
-    return f"{RUN_SCOPED_PREFIX}{run_id}-{suffix}"
 
 
 @dataclass(frozen=True)
@@ -137,15 +131,9 @@ def prepare_writes(
     The verdicts come from the adapter's ``identity.WritePolicy``; an adapter
     without one prepares every check with no verdicts.
     """
-    verdict_of: VerdictSource | None = None
-    if isinstance(adapter, WritePolicy):
-        policy = adapter
-
-        def verdict_of(tool: str) -> ExpectedVerdict | None:
-            return policy.write_policy_verdict(target, tool)
-
+    policy = adapter if isinstance(adapter, WritePolicy) else None
     return {
-        check.id: prepare_write(check, resolver, verdict_of, run_id)
+        check.id: prepare_write(check, resolver, policy, target, run_id)
         for check in checks
         if isinstance(check, WriteCheck)
     }
@@ -154,7 +142,8 @@ def prepare_writes(
 def prepare_write(
     check: WriteCheck,
     resolver: FixtureResolver,
-    verdict_of: VerdictSource | None,
+    policy: WritePolicy | None,
+    target: ConnectorTarget,
     run_id: str,
 ) -> PreparedWrite:
     """``check`` with its fixtures resolved, its names filled in and its
@@ -164,11 +153,11 @@ def prepare_write(
     check; a write policy that raises is ``WritePolicyFailed``.
     """
     verdicts: dict[str, ExpectedVerdict | None] | None = None
-    if verdict_of is not None:
+    if policy is not None:
         verdicts = {}
         for tool in (check.create.tool, check.cleanup.tool):
             try:
-                verdicts[tool] = verdict_of(tool)
+                verdicts[tool] = policy.write_policy_verdict(target, tool)
             except Exception as error:
                 logger.warning(
                     "The write policy for %s raised %s", check.id, type(error).__name__
@@ -208,7 +197,7 @@ def unavailable_write_row(connector: str, check: WriteCheck) -> CheckRow:
 def _prepare_step(step: ToolStep, resolver: FixtureResolver, run_id: str) -> _Step:
     def name(value: Any) -> Any:
         if isinstance(value, RunScopedName):
-            return run_scoped_name(run_id, value.suffix)
+            return f"{RUN_SCOPED_PREFIX}{run_id}-{value.suffix}"
         return value
 
     arguments = _map_leaves(resolve_fixtures(dict(step.arguments), resolver), name)
@@ -322,6 +311,18 @@ async def run_write(
                 _clean(found, resolved, check.id, check_timeout)
             )
     if cancelled:
+        # No row will carry the outcome: the run is being cancelled. A failed
+        # cleanup, or a create whose object is left to the sweeper, is logged.
+        dropped = cleanup_fault
+        if dropped is None and create_fault is not None:
+            dropped = (create_fault[0], f"{_CREATE}:{create_fault[1]}")
+        if dropped is not None:
+            logger.warning(
+                "Write check %s was cancelled and would have reported %s/%s",
+                check.id,
+                dropped[0].value,
+                dropped[1],
+            )
         raise asyncio.CancelledError
     if cleanup_fault is not None:
         return row(Outcome.FAIL, *cleanup_fault)
@@ -362,11 +363,7 @@ def _resolve_created(steps: Mapping[str, _Step], created: Any) -> dict[str, _Ste
             nonlocal missing
             if not isinstance(value, CreatedRef):
                 return value
-            found = (
-                MISSING
-                if created is None
-                else value_at(created, create.payload, value.path)
-            )
+            found = value_at(created, create.payload, value.path)
             if found is MISSING or not _is_id(found):
                 missing = True
                 return value
@@ -443,7 +440,10 @@ async def _call(tool: Any, step: _Step, timeout: float) -> _Called:
         async with bound:
             raw = await tool.run_json_async(dict(step.arguments))
     except Exception as error:
-        return _Called(error=error, timed_out=isinstance(error, TimeoutError))
+        # A tool that turned its bound's cancellation into another error timed
+        # out all the same, as a read check's call does.
+        timed_out = isinstance(error, TimeoutError) or bound.expired()
+        return _Called(error=error, timed_out=timed_out)
     # A tool that swallowed its bound's cancellation and returned.
     return _Called(raw=raw, timed_out=bound.expired())
 

@@ -351,27 +351,45 @@ async def test_a_verdict_the_policy_does_not_give_writes_nothing(
 
 
 @pytest.mark.usefixtures("writes_on")
-async def test_a_write_area_with_no_value_refuses_the_write() -> None:
+@pytest.mark.parametrize("key", ["jira.write_project_key", "jira.tenant_id"])
+async def test_a_fixture_with_no_value_refuses_the_write(key: str) -> None:
     tenant = Tenant()
     tools = tenant.tools()
     fixtures = {**FIXTURES}
-    del fixtures["jira.write_project_key"]
+    del fixtures[key]
 
     result = await run(adapter(tools, fixtures=fixtures))
 
-    assert write_row(result) == ("fail", "tenant_mismatch", "jira.write_project_key")
+    assert write_row(result) == ("fail", "tenant_mismatch", key)
     assert all(not tool.calls for tool in tools.values())
 
 
 @pytest.mark.usefixtures("writes_on")
-async def test_a_tool_the_server_does_not_list_refuses_the_write() -> None:
+@pytest.mark.parametrize(
+    ("absent", "step"),
+    [
+        ("jira_list_accessible_sites", "pin"),
+        ("jira_create_issue", "create"),
+        ("jira_get_issue", "verify"),
+        ("jira_delete_issue", "cleanup"),
+        ("jira_issue_details", "guard"),
+    ],
+)
+async def test_a_tool_the_server_does_not_list_refuses_the_write(
+    absent: str, step: str
+) -> None:
     tenant = Tenant()
-    tools = tenant.tools()
-    del tools["jira_delete_issue"]
+    tools = tenant.tools(jira_issue_details=FakeTool("jira_issue_details"))
+    del tools[absent]
+    guard = ToolStep(
+        "jira_issue_details",
+        {"issue_key": KEY},
+        assertions=(Equals(("issue", "summary"), NAME),),
+    )
 
-    result = await run(adapter(tools))
+    result = await run(adapter(tools), jira(write(cleanup_guard=guard)))
 
-    assert write_row(result) == ("fail", "tool_missing", "cleanup")
+    assert write_row(result) == ("fail", "tool_missing", step)
     assert all(not tool.calls for tool in tools.values())
 
 
@@ -395,12 +413,13 @@ async def test_a_write_check_starts_only_with_time_for_every_step() -> None:
         ),
     )
 
-    # Five steps (pin, create, verify, guard, cleanup) of a second each.
+    # Five steps (pin, create, verify, guard, cleanup) of a second each: 4.5
+    # seconds would do for four, so the guard is counted.
     result = await run_checks(
         fake,
         declarations=declared(jira(), confluence),
         check_timeout=1.0,
-        total_timeout=3.0,
+        total_timeout=4.5,
     )
 
     assert write_row(result) == ("fail", "not_reached", "time_budget")
@@ -788,3 +807,184 @@ def test_the_run_id_is_the_start_minute_in_utc() -> None:
 
     assert re.fullmatch(r"202611090030-[0-9a-f]{6}", run_id)
     assert new_run_id(started) != run_id
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_failed_create_deletes_nothing_by_name() -> None:
+    tenant = Tenant()
+    tools = tenant.tools(
+        jira_create_issue=FakeTool("jira_create_issue", error=RuntimeError("boom")),
+        jira_delete_issue=FakeTool("jira_delete_issue", respond=tenant.delete_named),
+    )
+    check = write(
+        cleanup=ToolStep(
+            "jira_delete_issue", {"summary": NAME}, assertions=(StatusSuccess(),)
+        ),
+        cleanup_guard=None,
+    )
+
+    result = await run(adapter(tools), jira(check))
+
+    assert write_row(result) == ("fail", "call_failed", "create:exception")
+    assert tools["jira_delete_issue"].calls == []
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_guard_whose_id_is_missing_leaves_the_delete_to_the_sweeper() -> None:
+    # Verify finds its id; the guard also needs one create did not return.
+    tenant = Tenant()
+    tools = tenant.tools()
+    guard = ToolStep(
+        "jira_get_issue",
+        {"issue_key": KEY, "id": CreatedRef(("issue", "id"))},
+        assertions=(Equals(("issue", "summary"), NAME),),
+    )
+
+    result = await run(adapter(tools), jira(write(cleanup_guard=guard)))
+
+    assert write_row(result) == (
+        "fail",
+        "assertion_failed",
+        "create:created_ref_missing",
+    )
+    assert tools["jira_get_issue"].calls == [{"issue_key": "SMOKE-1"}]  # verify
+    assert tools["jira_delete_issue"].calls == []
+    assert len(tenant.issues) == 1
+
+
+class _Converting(FakeTool):
+    """Turns its bound's cancellation into an error of its own."""
+
+    async def run_json_async(self, args: Any) -> Any:
+        self.calls.append(dict(args))
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            raise RuntimeError("interrupted") from None
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_call_that_hides_its_timeout_still_timed_out() -> None:
+    tenant = Tenant()
+    tools = tenant.tools(jira_search=_Converting("jira_search"))
+    verify = ToolStep("jira_search", {"jql": NAME}, assertions=(StatusSuccess(),))
+
+    result = await run(adapter(tools), jira(write(verify=verify)), check_timeout=0.3)
+
+    assert write_row(result) == ("fail", "timed_out", "verify:check_call")
+    assert tenant.issues == {}
+
+
+@pytest.mark.usefixtures("writes_on")
+@pytest.mark.parametrize("step", ["jira_list_accessible_sites", "jira_create_issue"])
+async def test_cancelling_the_run_before_create_returns_cleans_up_nothing(
+    step: str,
+) -> None:
+    tenant = Tenant()
+    blocking = _Blocking(step)
+    tools = tenant.tools(
+        jira_delete_issue=FakeTool("jira_delete_issue", respond=tenant.delete_named),
+        **{step: blocking},
+    )
+    # By name, the delete needs nothing from create: only the create's own
+    # result can let it run.
+    check = write(
+        cleanup=ToolStep(
+            "jira_delete_issue", {"summary": NAME}, assertions=(StatusSuccess(),)
+        ),
+        cleanup_guard=None,
+    )
+    task = asyncio.create_task(
+        run(adapter(tools), jira(check), check_timeout=30.0, total_timeout=600.0)
+    )
+
+    await asyncio.wait_for(blocking.started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Nothing returned a created object: nothing is read back or deleted.
+    assert tools["jira_get_issue"].calls == []
+    assert tools["jira_delete_issue"].calls == []
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_cleanup_that_fails_on_a_cancelled_run_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tenant = Tenant()
+    blocking = _Blocking("jira_search")
+    tools = tenant.tools(
+        jira_search=blocking,
+        jira_delete_issue=FakeTool(
+            "jira_delete_issue", result=result({"status": "error"}, is_error=True)
+        ),
+    )
+    verify = ToolStep("jira_search", {"jql": NAME}, assertions=(StatusSuccess(),))
+    task = asyncio.create_task(
+        run(
+            adapter(tools),
+            jira(write(verify=verify)),
+            check_timeout=30.0,
+            total_timeout=600.0,
+        )
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.wait_for(blocking.started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert (
+        "jira.issue_round_trip was cancelled and would have reported "
+        "cleanup_failed/cleanup:tool_error"
+    ) in caplog.text
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_an_object_left_to_the_sweeper_on_a_cancelled_run_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Create returns no "id", so the cleanup by it is left to the sweeper.
+    tenant = Tenant()
+    blocking = _Blocking("jira_search")
+    tools = tenant.tools(jira_search=blocking)
+    by_id = {"issue_key": CreatedRef(("issue", "id"))}
+    check = write(
+        verify=ToolStep("jira_search", {"jql": NAME}, assertions=(StatusSuccess(),)),
+        cleanup=ToolStep("jira_delete_issue", by_id, assertions=(StatusSuccess(),)),
+        cleanup_guard=ToolStep(
+            "jira_get_issue", by_id, assertions=(Equals(("issue", "summary"), NAME),)
+        ),
+    )
+    task = asyncio.create_task(
+        run(adapter(tools), jira(check), check_timeout=30.0, total_timeout=600.0)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await asyncio.wait_for(blocking.started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert (
+        "jira.issue_round_trip was cancelled and would have reported "
+        "assertion_failed/create:created_ref_missing"
+    ) in caplog.text
+    assert tools["jira_delete_issue"].calls == []
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_the_run_id_reaches_stderr_at_the_cli_s_level(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tenant = Tenant()
+    tools = tenant.tools()
+
+    with caplog.at_level(logging.WARNING):
+        await run(adapter(tools))
+
+    created = tools["jira_create_issue"].calls[0]["summary"]
+    run_id = created.removeprefix("xagent-smoke-").removesuffix("-issue")
+    assert f"Write checks run under run id {run_id}" in caplog.text

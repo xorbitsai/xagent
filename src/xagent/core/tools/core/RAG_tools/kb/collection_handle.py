@@ -78,7 +78,11 @@ from ..core.schemas import (
     SparseSearchResponse,
     StepType,
 )
-from ..LanceDB.model_tag_utils import embeddings_table_candidates, to_model_tag
+from ..LanceDB.model_tag_utils import (
+    embeddings_table_candidates,
+    to_model_tag,
+    written_embeddings_table_name,
+)
 from ..LanceDB.schema_manager import (
     _safe_close_table,
     ensure_chunks_table,
@@ -2431,13 +2435,13 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             # Chunks already embedded for this model tag are excluded by
             # chunk_id presence in the per-model embeddings table.
             embedded_chunk_ids: set[str] = set()
-            try:
-                embedding_filters: dict[str, Any] = {
-                    "collection": collection,
-                    "doc_id": doc_id,
-                    "parse_hash": parse_hash,
-                }
-                for embeddings_table_name in embeddings_table_candidates(model):
+            embedding_filters: dict[str, Any] = {
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+            }
+            for embeddings_table_name in embeddings_table_candidates(model):
+                try:
                     embedding_count = vector_store.count_rows_or_zero(
                         table_name=embeddings_table_name,
                         filters=embedding_filters,
@@ -2457,14 +2461,14 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                             chunk_id = row.get("chunk_id")
                             if chunk_id is not None:
                                 embedded_chunk_ids.add(chunk_id)
-            except Exception as e:  # noqa: BLE001 - missing/absent table = none embedded
-                logger.warning(
-                    "Failed to query existing embeddings for model %s "
-                    "(assuming none exist): %s",
-                    model,
-                    e,
-                )
-                embedded_chunk_ids = set()
+                except Exception as e:  # noqa: BLE001 - keep ids from tables that did read
+                    logger.warning(
+                        "Failed to query existing embeddings for model %s "
+                        "in table %s (skipping it): %s",
+                        model,
+                        embeddings_table_name,
+                        e,
+                    )
 
             # Only the current content is embedded: retire deletes the rest at commit.
             current = _parse_content(self, doc_id, parse_hash, user_id, is_admin)
@@ -5722,8 +5726,7 @@ def _recorded_model(name: str, description: dict[str, Any]) -> str:
 def _embeddings_key(client: Any, name: str) -> str:
     """Return the per-document count key of Milvus collection ``name``."""
     model = _recorded_model(name, client.describe_collection(name))
-    # LanceDB's write path tags twice, so its tables carry the second candidate.
-    return embeddings_table_candidates(model)[-1]
+    return written_embeddings_table_name(model)
 
 
 def _document_rows(

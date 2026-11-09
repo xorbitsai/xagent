@@ -35,7 +35,9 @@ from xagent.core.tools.core.RAG_tools.kb.models import (
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_candidates,
     to_model_tag,
+    written_embeddings_table_name,
 )
+from xagent.core.tools.core.RAG_tools.management import collections
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_ingestion_status_store,
     get_main_pointer_store,
@@ -191,6 +193,29 @@ class TestHandleReadChunksNeedingEmbedding:
         )
         assert result.total_count == 1
         assert result.pending_count == 0
+
+    def test_a_failing_table_read_keeps_ids_from_the_other(self, monkeypatch) -> None:
+        handle = make_handle("coll")
+        model = "platform/text-embedding-v4"
+        _seed_chunk("coll", "d1", "h1", "c0", index=0)
+        _seed_chunk("coll", "d1", "h1", "c1", index=1)
+        _seed_embedding("coll", "d1", "h1", "c0", model)
+        store = get_vector_index_store()
+        failing_table = written_embeddings_table_name(model)
+        original = store.count_rows_or_zero
+
+        def _count(table_name, *args, **kwargs):
+            if table_name == failing_table:
+                raise RuntimeError("unreadable table")
+            return original(table_name, *args, **kwargs)
+
+        monkeypatch.setattr(store, "count_rows_or_zero", _count)
+
+        result = handle.read_chunks_needing_embedding("d1", "h1", model, is_admin=True)
+
+        assert result.total_count == 2
+        assert result.pending_count == 1
+        assert [c.chunk_id for c in result.chunks] == ["c1"]
 
     def test_empty_when_no_chunks(self) -> None:
         handle = make_handle("coll")
@@ -542,6 +567,67 @@ class TestHandleSearchAcrossEmbeddingsTables:
         assert not any(
             warning.code in {"FTS_FALLBACK", "FTS_INDEX_MISSING"}
             for warning in sparse.warnings
+        )
+
+    def test_both_spellings_read_the_writer_table(self) -> None:
+        handle = make_handle("coll")
+        model = "platform/text-embedding-v4"
+        writer_table = "embeddings_platform_text_embedding_v4"
+        stale_table = "embeddings_PLATFORM_text_embedding_v4"
+        stale_vector = [0.0, 1.0, *([0.0] * 1022)]
+        writer_vector = self._vector()
+        _seed_embedding("coll", "doc-a", "h1", "ca", model, vector=stale_vector)
+        handle.write_embeddings(
+            [
+                _embedding(
+                    "doc-b",
+                    "cb",
+                    "h1",
+                    model,
+                    vector=writer_vector,
+                    text="twoonlytoken",
+                )
+            ],
+            create_index=True,
+        )
+        store = get_vector_index_store()
+        assert {writer_table, stale_table} <= set(store.list_table_names())
+
+        dense = handle.search_dense(model, writer_vector, top_k=5, is_admin=True)
+        assert dense.status == "success"
+        assert [result.doc_id for result in dense.results] == ["doc-b"]
+
+        sparse = handle.search_sparse(model, "twoonlytoken", top_k=5, is_admin=True)
+        assert sparse.fts_enabled is True
+        assert [result.doc_id for result in sparse.results] == ["doc-b"]
+        assert not any(
+            warning.code in {"FTS_FALLBACK", "FTS_INDEX_MISSING"}
+            for warning in sparse.warnings
+        )
+
+        stats_a = collections.get_document_stats(
+            "coll", "doc-a", model_tag=model, is_admin=True
+        )
+        stats_b = collections.get_document_stats(
+            "coll", "doc-b", model_tag=model, is_admin=True
+        )
+        assert stats_a.data is not None and stats_b.data is not None
+        assert (stats_a.data.embedding_count, stats_b.data.embedding_count) == (1, 1)
+
+        assert (
+            handle.delete_embedding_records("doc-a", model_tag=model, is_admin=True)
+            == 1
+        )
+        assert store.count_rows(stale_table, {"collection": "coll"}, is_admin=True) == 0
+        assert (
+            store.count_rows(writer_table, {"collection": "coll"}, is_admin=True) == 1
+        )
+        assert (
+            handle.delete_embedding_records("doc-b", model_tag=model, is_admin=True)
+            == 1
+        )
+        assert (
+            store.count_rows(writer_table, {"collection": "coll"}, is_admin=True) == 0
         )
 
     def test_id_without_slash_keeps_its_single_table(self) -> None:

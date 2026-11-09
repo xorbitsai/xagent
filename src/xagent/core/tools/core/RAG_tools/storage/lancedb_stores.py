@@ -1071,21 +1071,21 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             Tuple of (table_object, actual_table_name_used).
 
         Raises:
-            DatabaseOperationError: If neither primary nor legacy table exists.
+            DatabaseOperationError: If no candidate or legacy table exists.
         """
         from ..core.exceptions import DatabaseOperationError
         from ..LanceDB.model_tag_utils import (
             embeddings_table_candidates,
             to_model_tag,
+            written_embeddings_table_name,
         )
         from ..utils.model_resolver import resolve_embedding_adapter
 
         conn = self._get_connection()
         candidate_table_names = embeddings_table_candidates(model_tag)
 
-        tried_table_names: List[str] = []
+        tried_table_names = list(candidate_table_names)
         for candidate_table_name in candidate_table_names:
-            tried_table_names.append(candidate_table_name)
             try:
                 table = conn.open_table(candidate_table_name)
                 return table, candidate_table_name
@@ -1109,17 +1109,16 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     "Consider migrating to '%s' for consistency.",
                     legacy_table_name,
                     model_tag,
-                    candidate_table_names[0],
+                    written_embeddings_table_name(model_tag),
                 )
                 return table, legacy_table_name
             except Exception as legacy_exc:
                 last_error = legacy_exc
 
-        # No candidate table exists
-        error_msg = f"Embeddings table not found for model_tag='{model_tag}'"
-        error_msg += " (tried: " + ", ".join(f"'{name}'" for name in tried_table_names)
-        error_msg += ")"
-        raise DatabaseOperationError(error_msg) from last_error
+        tried = ", ".join(f"'{name}'" for name in tried_table_names)
+        raise DatabaseOperationError(
+            f"Embeddings table not found for model_tag='{model_tag}' (tried: {tried})"
+        ) from last_error
 
     # Deprecated: use KBCollectionHandle.delete_collection_data instead. Remove in #514.
     def delete_collection_data(
@@ -1289,7 +1288,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         user_id: Optional[int] = None,
         is_admin: bool = False,
     ) -> int:
-        """Delete only ``embeddings_{model_tag}`` rows for a document.
+        """Delete only rows in the model's candidate embeddings tables for a document.
 
         Enumerates the matching per-model embedding tables (all of them when
         ``model_tag`` is ``None``) and deletes the rows for the resolved scope
@@ -1504,8 +1503,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         if readonly:
             # In readonly mode, check if FTS index exists without creating any indexes
             fts_enabled = False
-            table = None
             for candidate_table_name in candidate_table_names:
+                table = None
                 try:
                     table = conn.open_table(candidate_table_name)
                     table_name = candidate_table_name
@@ -1538,7 +1537,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             except Exception as exc:
                 last_open_error = exc
         if table is None:
-            logger.debug("Unable to open table '%s': %s", table_name, last_open_error)
+            logger.debug(
+                "Unable to open any of %s: %s", candidate_table_names, last_open_error
+            )
             return IndexResult(status="failed", advice=None, fts_enabled=False)
 
         # Use default index policy

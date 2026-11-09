@@ -424,6 +424,40 @@ def test_rebuild_attributes_the_twice_tagged_table_to_the_model_id(monkeypatch) 
     assert rebuilt.embedding_dimension == 2
 
 
+def test_rebuild_prefers_an_id_over_another_configs_model_name_alias(
+    monkeypatch,
+) -> None:
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+    alias_config = EmbeddingModelConfig(
+        id="sf-bge",
+        model_name="BAAI/bge-m3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    id_config = EmbeddingModelConfig(
+        id="BAAI/bge-m3",
+        model_name="bge-m3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    _seed_document(KB, "d1", 1)
+    _seed_chunk(KB, "d1", "c1", 1)
+    _write_embeddings_through_the_ingest_path(KB, "d1", ["c1"], "BAAI/bge-m3")
+    asyncio.run(get_metadata_store().save_collection(CollectionInfo(name=KB)))
+    monkeypatch.setattr(
+        model_resolver,
+        "_list_model_hub_configs",
+        lambda: {"sf-bge": alias_config, "BAAI/bge-m3": id_config},
+    )
+
+    asyncio.run(rebuild_collection_metadata())
+
+    rebuilt = asyncio.run(get_metadata_store().get_collection(KB))
+    assert rebuilt.embedding_model_id == "BAAI/bge-m3"
+
+
 def test_rebuild_leaves_a_kb_the_engine_did_not_report_unchanged(monkeypatch) -> None:
     asyncio.run(
         get_metadata_store().save_collection(

@@ -569,6 +569,14 @@ EXCLUDED_PUBLIC_SURFACE: dict[tuple[str, str], str] = {
     ): "module-local table naming helper; no product-code imports outside RAG_tools",
     (
         "xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils",
+        "model_tag_candidates",
+    ): "module-local table naming helper; no product-code imports outside RAG_tools",
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils",
+        "written_embeddings_table_name",
+    ): "module-local table naming helper; no product-code imports outside RAG_tools",
+    (
+        "xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils",
         "to_model_tag",
     ): "module-local table naming helper; no product-code imports outside RAG_tools",
 }

@@ -292,6 +292,65 @@ describe("WidgetChromeControls", () => {
     )
   })
 
+  describe("the history item", () => {
+    const onHistory = vi.fn()
+
+    beforeEach(() => onHistory.mockReset())
+
+    it("offers no history item unless one is given", () => {
+      render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+
+      expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+        "Start over",
+        "widgetChat.expandWindow",
+      ])
+    })
+
+    it("shows the given label between the new-conversation item and the expand toggle", () => {
+      render(
+        <WidgetChromeControls
+          newConversation={{ label: "Start over", onClick: onNewConversation }}
+          history={{ label: "Earlier chats", onClick: onHistory }}
+        />,
+      )
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+
+      expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+        "Start over",
+        "Earlier chats",
+        "widgetChat.expandWindow",
+      ])
+    })
+
+    it("offers it without a new-conversation item", () => {
+      render(<WidgetChromeControls history={{ label: "Earlier chats", onClick: onHistory }} />)
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+
+      expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+        "Earlier chats",
+        "widgetChat.expandWindow",
+      ])
+    })
+
+    it("calls the handler once and closes the menu when it is chosen", () => {
+      render(<WidgetChromeControls history={{ label: "Earlier chats", onClick: onHistory }} />)
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      fireEvent.click(screen.getByRole("menuitem", { name: "Earlier chats" }))
+
+      expect(onHistory).toHaveBeenCalledTimes(1)
+      expect(screen.queryByRole("menu")).toBeNull()
+      expect(postMessageSpy).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: "widget_expand" }),
+        "*",
+      )
+    })
+  })
+
   it("closes the menu on Escape", () => {
     render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
 

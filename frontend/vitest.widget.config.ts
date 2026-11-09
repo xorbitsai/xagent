@@ -27,10 +27,14 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
         "src/components/widget/use-history-continue.ts",
+        "src/components/widget/use-paged-history.ts",
         "src/components/widget/use-session-attachments.ts",
         "src/components/widget/use-session-open-message.ts",
         "src/components/widget/use-widget-session.ts",
         "src/components/widget/widget-chrome-controls.tsx",
+        "src/components/widget/widget-history-list.tsx",
+        "src/components/widget/widget-history-shell.tsx",
+        "src/components/widget/widget-history-view.tsx",
         "src/contexts/app-context-chat.tsx",
         "src/contexts/auth-context.tsx",
         "src/contexts/connector-runtime-dialog-context.tsx",
@@ -100,6 +104,18 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/widget/widget-chrome-controls.tsx": {
           statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/components/widget/use-paged-history.ts": {
+          statements: 90, branches: 85, functions: 85, lines: 90,
+        },
+        "src/components/widget/widget-history-list.tsx": {
+          statements: 90, branches: 85, functions: 85, lines: 90,
+        },
+        "src/components/widget/widget-history-shell.tsx": {
+          statements: 90, branches: 85, functions: 85, lines: 90,
+        },
+        "src/components/widget/widget-history-view.tsx": {
+          statements: 90, branches: 85, functions: 85, lines: 90,
         },
         "src/lib/widget-session-history.ts": {
           statements: 95, branches: 90, functions: 95, lines: 95,
@@ -245,6 +261,8 @@ export default defineConfig({
       "src/components/widget/widget-session.test.ts",
       "src/components/widget/widget-chrome.test.ts",
       "src/components/widget/widget-chrome-controls.test.tsx",
+      "src/components/widget/widget-history-list.test.tsx",
+      "src/components/widget/widget-history-view.test.tsx",
       "src/components/widget/widget-open.test.ts",
       "src/components/widget/public-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.test.tsx",

@@ -210,6 +210,7 @@ class TokenUsage:
         provider_text_input_tokens: Any = _ABSENT,
         provider_image_input_tokens: Any = _ABSENT,
         provider_billed_units: Any = _ABSENT,
+        input_has_video: Any = _ABSENT,
     ) -> None:
         """Append one media detail row. The only media write path.
 
@@ -316,6 +317,13 @@ class TokenUsage:
         billed_units = _coerce_optional_media_tokens(provider_billed_units)
         if billed_units is not None:
             detail["provider_billed_units"] = billed_units
+        # Whether the request sent to the provider contained a video. Some
+        # vendors charge a different per-token rate for such a request, and
+        # the token count alone cannot tell the two apart. Only a real bool is
+        # kept: absent or malformed stays absent, meaning "unknown", so no
+        # producer that does not report it changes shape.
+        if isinstance(input_has_video, bool):
+            detail["input_has_video"] = input_has_video
         self.details.append(detail)
 
     def increment_llm_calls(self) -> None:
@@ -1027,6 +1035,7 @@ def add_media_usage(
     provider_text_input_tokens: Any = _ABSENT,
     provider_image_input_tokens: Any = _ABSENT,
     provider_billed_units: Any = _ABSENT,
+    input_has_video: Any = _ABSENT,
 ) -> None:
     """Record non-LLM media model usage on the current context.
 
@@ -1064,6 +1073,9 @@ def add_media_usage(
             in its own billing unit (e.g. ElevenLabs credits). Recorded beside
             ``quantity``, which stays in the modality's unit. Omitted when
             unavailable; an explicit 0 is preserved.
+        input_has_video: Whether the request sent to the provider contained a
+            video. Kept only when it is a bool; omitted otherwise, which means
+            unknown.
 
     Raises:
         ValueError: If ``call_type`` is not a known :class:`MediaCallType`
@@ -1087,6 +1099,7 @@ def add_media_usage(
         provider_text_input_tokens=provider_text_input_tokens,
         provider_image_input_tokens=provider_image_input_tokens,
         provider_billed_units=provider_billed_units,
+        input_has_video=input_has_video,
         resolution=resolution,
         tokens_estimated=tokens_estimated,
     )

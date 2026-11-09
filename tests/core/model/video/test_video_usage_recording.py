@@ -195,6 +195,145 @@ async def test_ark_rejects_not_waiting_before_submitting():
     assert _rows(manager) == []
 
 
+# --- whether the request carried a video input ---------------------------------
+# Ark's token count already includes any input video, but a request whose input
+# contains a video is charged at a different per-token rate than one without,
+# so the row has to say which kind of request it was.
+
+_REFERENCE_VIDEO = "https://cdn.test/reference.mp4"
+
+
+async def test_ark_row_says_the_request_carried_a_reference_video():
+    fake = _ArkFake([_succeeded()])
+    model = _ark(fake)
+
+    with TokenContextManager() as manager:
+        await model.generate_video(
+            prompt="a fox",
+            reference_video_urls=[_REFERENCE_VIDEO],
+            poll_interval=0,
+        )
+
+    [row] = _rows(manager)
+    assert row["input_has_video"] is True
+
+
+async def test_ark_row_says_a_text_and_image_request_carried_no_video():
+    fake = _ArkFake([_succeeded()])
+    model = _ark(fake)
+
+    with TokenContextManager() as manager:
+        await model.generate_video(
+            prompt="a fox",
+            reference_image_urls=["https://cdn.test/fox.png"],
+            poll_interval=0,
+        )
+
+    [row] = _rows(manager)
+    assert row["input_has_video"] is False
+
+
+@pytest.mark.parametrize(
+    "content,reference_video_urls,expected",
+    [
+        # A caller-supplied content list is what Ark receives.
+        (
+            [
+                {"type": "text", "text": "a fox"},
+                {"type": "video_url", "video_url": {"url": _REFERENCE_VIDEO}},
+            ],
+            None,
+            True,
+        ),
+        # It also replaces the reference lists, so a reference video passed
+        # beside it is never sent and must not mark the row.
+        (
+            [{"type": "text", "text": "a fox"}],
+            [_REFERENCE_VIDEO],
+            False,
+        ),
+    ],
+)
+async def test_ark_row_follows_the_content_actually_submitted(
+    content, reference_video_urls, expected
+):
+    fake = _ArkFake([_succeeded()])
+    submitted: list[Any] = []
+
+    def create(content, **kwargs):
+        submitted.append(content)
+        return fake.create(content, **kwargs)
+
+    model = _ark(fake)
+    model._inner._client_create = create
+
+    with TokenContextManager() as manager:
+        await model.generate_video(
+            content=content,
+            reference_video_urls=reference_video_urls,
+            poll_interval=0,
+        )
+
+    assert submitted == [content]
+    [row] = _rows(manager)
+    assert row["input_has_video"] is expected
+
+
+@pytest.mark.parametrize(
+    "polls,created,error,timeout",
+    [
+        ([_succeeded(status="failed")], None, BilledVideoTaskError, None),
+        ([{"id": "task-1", "status": "running"}], None, BilledVideoTaskTimeout, 0.001),
+        ([httpx.ConnectError("reset")], None, BilledVideoTaskTimeout, 0.001),
+        ([_succeeded()], {}, BilledVideoTaskError, None),
+    ],
+    ids=["terminal-failure", "deadline", "poll-errors", "missing-task-id"],
+)
+async def test_ark_every_unfinished_exit_keeps_the_video_input_mark(
+    polls, created, error, timeout
+):
+    fake = _ArkFake(polls, created=created)
+    model = _ark(fake)
+
+    with TokenContextManager() as manager:
+        with pytest.raises(error):
+            await model.generate_video(
+                prompt="a fox",
+                reference_video_urls=[_REFERENCE_VIDEO],
+                poll_interval=0,
+                timeout=timeout,
+            )
+
+    [row] = _rows(manager)
+    assert row["input_has_video"] is True
+
+
+async def test_ark_cancelled_wait_keeps_the_video_input_mark():
+    entered = asyncio.Event()
+    fake = _ArkFake([_succeeded()])
+    model = _ark(fake)
+
+    async def hanging_get(task_id):
+        entered.set()
+        await asyncio.Event().wait()
+
+    model._inner.get_video_task = hanging_get
+
+    with TokenContextManager() as manager:
+        task = asyncio.create_task(
+            model.generate_video(
+                prompt="a fox", reference_video_urls=[_REFERENCE_VIDEO]
+            )
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    [row] = _rows(manager)
+    assert row["input_has_video"] is True
+
+
 def test_db_built_provider_carries_the_configured_id_on_the_inner_model():
     db_model = SimpleNamespace(
         model_provider="volcengine-ark",

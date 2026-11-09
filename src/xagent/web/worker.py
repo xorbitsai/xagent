@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from ..config import (
     get_shared_task_execution_enabled,
+    get_standby_enabled,
     get_task_auto_resume_poll_seconds,
     get_task_execution_role,
     get_task_lease_recovery_batch_size,
@@ -86,6 +87,12 @@ async def run_worker(
     initialize_host: Callable[[], Awaitable[None]] | None = None,
     stop: asyncio.Event | None = None,
 ) -> None:
+    if get_standby_enabled():
+        # Without a host that activates it, a standby worker would never claim.
+        # A host with its own control channel (the SaaS pool) wraps this loop.
+        raise ValueError(
+            "XAGENT_STANDBY is not supported by the core worker entry point"
+        )
     validate_encryption_config()
     from ..core.model.network_policy import ModelNetworkPolicy
     from ..core.tools.core.mcp.http import MCPNetworkPolicy

@@ -3530,6 +3530,31 @@ def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     assert config.get_toby_personal_stdio_enabled() is True
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, False),
+        ("", False),
+        ("0", False),
+        ("off", False),
+        ("1", True),
+        ("True", True),
+    ],
+)
+def test_standby_enabled_parses_boolean(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(config.STANDBY, raising=False)
+    else:
+        monkeypatch.setenv(config.STANDBY, value)
+    assert config.get_standby_enabled() is expected
+
+
+def test_standby_enabled_rejects_a_typo(monkeypatch):
+    monkeypatch.setenv(config.STANDBY, "maybe")
+    with pytest.raises(ValueError, match="XAGENT_STANDBY"):
+        config.get_standby_enabled()
+
+
 @pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
 def test_shared_task_execution_explicit_setting_wins(monkeypatch, value, expected):
     monkeypatch.delenv(config.SHARED_TASK_EXECUTION_ENABLED, raising=False)

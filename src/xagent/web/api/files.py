@@ -80,6 +80,7 @@ from ..services.external_media import (
     ExternalMediaPurpose,
     ExternalMediaTicketRejected,
     ExternalMediaUnavailable,
+    delivered_image_media_type,
     instagram_image_requires_normalization,
     instagram_jpeg_bytes,
     local_record_path_is_trusted,
@@ -1856,7 +1857,11 @@ def external_media_file(
         filename = f"{Path(filename).stem}.jpg"
     return Response(
         content=content,
-        media_type="image/jpeg" if instagram else redeemed.media_type,
+        media_type=(
+            "image/jpeg"
+            if instagram
+            else delivered_image_media_type(content, redeemed.media_type)
+        ),
         headers={
             **response_headers,
             "Content-Disposition": _content_disposition_header("inline", filename),

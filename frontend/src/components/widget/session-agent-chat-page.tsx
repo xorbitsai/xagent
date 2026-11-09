@@ -332,16 +332,18 @@ function SessionConversationContent({
     }
   }, [uploads, readCurrentToken])
 
-  // Anything under way that sends or resets, or a host page message still
-  // waiting, takes the visitor back to the chat and keeps the history entry
-  // away. A reload-required session does the same: its notice only exists on
-  // the chat. The render in which an open message has been taken and its reset
-  // confirmed, but its send has not started, is the one render in which none of
-  // these is set; the send starts in that render's effect and the next render
-  // closes whatever was opened meanwhile.
+  // Anything under way that sends or resets, including a file upload for a
+  // message, or a host page message still waiting, takes the visitor back to
+  // the chat and keeps the history entry away. A reload-required session does
+  // the same: its notice only exists on the chat. The render in which an open
+  // message has been taken and its reset confirmed, but its send has not
+  // started, is the one render in which none of these is set; the send starts
+  // in that render's effect and the next render closes whatever was opened
+  // meanwhile.
   const historyBlocked = openMessage.request !== null
     || isConversationResetPending
     || isMessageDeliveryPending
+    || isAttachmentBusy
     || continueBusy
   if (view.kind !== "chat" && (isSessionInteractionLocked || historyBlocked)) {
     setView({ kind: "chat" })

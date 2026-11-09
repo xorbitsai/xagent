@@ -2443,6 +2443,46 @@ describe("SessionAgentChatPage continues from an earlier conversation", () => {
       }
     })
 
+    it("offers no history while a file for a start-page message uploads, so the new conversation is not reset", async () => {
+      let answerUpload!: (response: Response) => void
+      fetchMock.mockImplementation(async (url: string) => {
+        if (String(url).endsWith("/v1/external/chat/sessions/files")) {
+          return new Promise<Response>((resolve) => { answerUpload = resolve })
+        }
+        return json({})
+      })
+      const socket = await mountWithHistory({
+        capabilities: {
+          ...HISTORY,
+          file_uploads: { allowed_extensions: [".pdf"], max_file_bytes: 1000, max_files_per_message: 3 },
+        },
+      })
+      receive(socket, ATTACHED)
+      let sending!: Promise<unknown>
+      act(() => {
+        sending = surfaces.start?.onSend("with a file", [new File(["abc"], "a.pdf", { type: "application/pdf" })], {})
+      })
+      await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/sessions/files"))).toBe(true))
+
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      expect(screen.queryByRole("menuitem", { name: "widgetSession.history.menuLabel" })).not.toBeInTheDocument()
+
+      answerUpload(new Response(JSON.stringify({
+        file_id: "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c",
+        filename: "a.pdf",
+        file_size: 3,
+        mime_type: "application/pdf",
+        created_at: "2026-01-01T00:00:00Z",
+      }), { status: 201, headers: { "Content-Type": "application/json" } }))
+      await waitFor(() => expect(chats(socket)).toHaveLength(1))
+      receive(socket, taskInfo(42))
+      receive(socket, { type: "message_accepted", client_message_id: chats(socket)[0].client_message_id })
+      await act(async () => { await sending })
+      await letItRun()
+
+      expect(sentTypes(socket)).toEqual(["chat"])
+    })
+
     it("keeps the draft in the same composer node across a visit to history", async () => {
       surfaces.real = true
       const socket = await mountWithHistory()

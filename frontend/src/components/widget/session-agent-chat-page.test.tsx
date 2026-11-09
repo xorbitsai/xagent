@@ -1234,6 +1234,31 @@ describe("SessionAgentChatPage", () => {
         expect(historyItem()).not.toBeInTheDocument()
       })
 
+      it("is withdrawn while a file for a start-page message uploads, and comes back once it is done", async () => {
+        setBridge("active", activeSession({ capabilities: { conversationHistory: true, fileUploads: uploads } }))
+        app.isConnected = true
+        app.sessionConversationAttachment = "attached"
+        let releaseToken!: (reason: unknown) => void
+        bridge.value.ensureFreshSession.mockReturnValueOnce(
+          new Promise((_resolve, reject) => { releaseToken = reject }),
+        )
+        render(<SessionAgentChatPage />)
+        const onSend = app.startProps?.onSend as (message: string, files: File[]) => Promise<void>
+
+        let sending!: Promise<void>
+        act(() => { sending = onSend("with a file", [new File(["x"], "a.pdf", { type: "application/pdf" })]) })
+        openMenu()
+        expect(historyItem()).not.toBeInTheDocument()
+        openMenu()
+
+        await act(async () => {
+          releaseToken(Object.assign(new Error("gone"), { errorCode: "upload_failed" }))
+          await sending.catch(() => undefined)
+        })
+        openMenu()
+        expect(historyItem()).toBeInTheDocument()
+      })
+
       it("is withdrawn while a host page message waits to be sent", () => {
         mountWithHistory({ sessionConversationAttachment: "pending" })
         deliverOpenMessage()

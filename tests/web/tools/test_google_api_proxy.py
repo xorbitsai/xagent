@@ -111,6 +111,21 @@ def test_a_request_is_mapped_to_one_proxy_call(proxy):
     }
 
 
+def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
+    """A GET whose URI is too long is sent as a POST with the query
+    form-encoded in the body. The proxy carries a query as parameters and a
+    body only as JSON, so the query goes back on the URI."""
+    long_query = "x" * 2200
+
+    _gmail_service().users().messages().list(userId="me", q=long_query).execute()
+
+    (call,) = proxy.calls
+    assert call["method"] == "GET"
+    assert "body" not in call
+    assert {"name": "q", "value": long_query, "type": "query"} in call["parameters"]
+    assert all(item["name"] != "content-type" for item in call["parameters"])
+
+
 def test_only_headers_that_change_the_answer_are_forwarded(proxy):
     """Content-Length and User-Agent describe a request we no longer make,
     Accept-Encoding would ask for a body the proxy has to relay, and the

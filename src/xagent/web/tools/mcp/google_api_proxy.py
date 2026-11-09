@@ -117,20 +117,37 @@ class GoogleApiProxyHttp:
         httplib2's callers pass them; neither applies here. Composio follows
         no redirect for us, so a 3xx reaches googleapiclient as a 3xx.
         """
+        request_headers = headers or {}
         parsed = urlsplit(uri)
         endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        query = parse_qsl(parsed.query, keep_blank_values=True)
         forwarded = {
             name: value
-            for name, value in (headers or {}).items()
+            for name, value in request_headers.items()
             if name.lower() in _FORWARDED_HEADERS
         }
+        if _replays_a_get(request_headers):
+            # googleapiclient turns a GET whose URI is too long into a POST
+            # with the query form-encoded in the body. The proxy carries a
+            # query as parameters and a body only as JSON, so restore the GET
+            # instead of sending a form body it cannot carry.
+            method = "GET"
+            query.extend(parse_qsl(_form_text(body), keep_blank_values=True))
+            forwarded = {
+                name: value
+                for name, value in forwarded.items()
+                if name.lower() != "content-type"
+            }
+            proxied_body = None
+        else:
+            proxied_body = _json_body(body)
         answer = proxy_request(
             method,
             endpoint,
             allowed_hosts=self._allowed_hosts,
-            query=parse_qsl(parsed.query, keep_blank_values=True),
+            query=query,
             headers=forwarded,
-            body=_json_body(body),
+            body=proxied_body,
             timeout=self._timeout,
         )
         content, content_type = _content(answer.data)
@@ -159,6 +176,22 @@ def _json_body(body: str | bytes | None) -> Any:
     if isinstance(body, (bytes, bytearray)):
         raise ValueError("the proxy transport only carries JSON request bodies")
     return json.loads(body)
+
+
+def _replays_a_get(headers: Mapping[str, str]) -> bool:
+    """Whether googleapiclient rewrote this request from a GET to a POST."""
+    return any(
+        name.lower() == "x-http-method-override" and value.upper() == "GET"
+        for name, value in headers.items()
+    )
+
+
+def _form_text(body: str | bytes | None) -> str:
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body
+    return body.decode("utf-8")
 
 
 def execute_batch(

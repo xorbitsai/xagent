@@ -350,6 +350,36 @@ def test_sending_with_an_attachment_sends_the_encoded_message(
     assert message["Subject"] == "Notes"
 
 
+def test_a_message_too_large_for_the_proxy_is_refused_clearly(
+    proxy, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    attachment = tmp_path / "big.bin"
+    attachment.write_bytes(b"\x00" * 4096)
+    monkeypatch.setattr(composio_proxy, "MAX_JSON_BODY_BYTES", 2000)
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_send_messages(
+            [
+                {
+                    "to": "a@example.com",
+                    "subject": "Big",
+                    "body": "B",
+                    "attachments": [str(attachment)],
+                }
+            ],
+            action="send",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "too large to send through Composio" in result["message"]
+    assert "2000 byte limit" in result["message"]
+    assert "smaller attachment" in result["message"]
+    assert proxy.calls == []
+
+
 def test_an_upstream_error_reaches_the_tool_as_googles_message(proxy, monkeypatch):
     proxy.answer("/labels/missing", 404, _NOT_FOUND)
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())

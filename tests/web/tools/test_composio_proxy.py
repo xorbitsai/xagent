@@ -7,6 +7,7 @@ no request leaves the process.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -321,3 +322,49 @@ def test_odd_composio_answers_are_composio_errors(proxy, response):
     if response.status_code != 200:
         assert raised.value.status == response.status_code
         assert raised.value.slug is None
+
+
+def test_a_body_over_the_proxy_limit_is_refused_before_sending(proxy, monkeypatch):
+    """A request bigger than the proxy accepts is refused here, with both
+    sizes, instead of failing at Composio's edge as an opaque 413."""
+    monkeypatch.setattr(composio_proxy, "MAX_JSON_BODY_BYTES", 200)
+
+    with pytest.raises(ValueError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "/services/data/v62.0/sobjects/Account",
+            allowed_hosts=(),
+            body={"Name": "x" * 500},
+        )
+
+    assert "too large to send through Composio" in str(raised.value)
+    assert "200 byte limit" in str(raised.value)
+    assert proxy.calls == []
+
+
+def test_the_body_limit_counts_the_whole_proxy_payload(proxy, monkeypatch):
+    """The limit covers the envelope too, not just the provider's body."""
+    body = {"Name": "x" * 50}
+    monkeypatch.setattr(composio_proxy, "MAX_JSON_BODY_BYTES", 10_000_000)
+
+    composio_proxy.proxy_request(
+        "POST", "/services/data/v62.0/sobjects/Account", allowed_hosts=(), body=body
+    )
+    (call,) = proxy.calls
+    payload_size = len(json.dumps(call["json"]))
+
+    monkeypatch.setattr(composio_proxy, "MAX_JSON_BODY_BYTES", payload_size)
+    composio_proxy.proxy_request(
+        "POST", "/services/data/v62.0/sobjects/Account", allowed_hosts=(), body=body
+    )
+    monkeypatch.setattr(composio_proxy, "MAX_JSON_BODY_BYTES", payload_size - 1)
+
+    with pytest.raises(ValueError):
+        composio_proxy.proxy_request(
+            "POST",
+            "/services/data/v62.0/sobjects/Account",
+            allowed_hosts=(),
+            body=body,
+        )
+
+    assert len(proxy.calls) == 2

@@ -25,6 +25,7 @@ Composio user id.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -45,6 +46,13 @@ _LAUNCH_SECRET_ENVS = (
     COMPOSIO_USER_ID_ENV,
 )
 DEFAULT_TIMEOUT_SECONDS = 30
+# The largest JSON body one Proxy Execute call may carry. Composio's API is
+# served by Vercel functions (its answers can carry ``x-vercel-id``), whose
+# documented request-body limit is 4.5 MB; the decimal value stays below that
+# however the platform rounds it. A body above this is refused here, with both
+# sizes in the message, instead of failing at Composio's edge with an opaque
+# 413. This has not been confirmed against a live project.
+MAX_JSON_BODY_BYTES = 4_500_000
 MAX_ERROR_TEXT_CHARS = 1000
 _REDACTED = "[redacted]"
 # A path Composio resolves against the account's own host: one leading "/",
@@ -148,7 +156,8 @@ def proxy_request(
     ``query`` is a mapping, or a sequence of pairs when a parameter repeats;
     ``body`` is sent as JSON. Raises ``ComposioProxyError`` when Composio does
     not relay the call, and ``ValueError`` before sending anything when the
-    endpoint or a launch variable is unusable.
+    endpoint or a launch variable is unusable, or when the JSON body would
+    exceed ``MAX_JSON_BODY_BYTES``.
     """
     if isinstance(allowed_hosts, str):
         raise TypeError("allowed_hosts must be a collection of hostnames, not a str")
@@ -176,6 +185,16 @@ def proxy_request(
         payload["parameters"] = parameters
     if body is not None:
         payload["body"] = body
+    encoded_payload = json.dumps(payload)
+    if len(encoded_payload) > MAX_JSON_BODY_BYTES:
+        # Same serialization requests would send, so the sizes match what the
+        # proxy would have received.
+        raise ValueError(
+            "the request body is too large to send through Composio: "
+            f"{len(encoded_payload)} bytes of JSON, above the "
+            f"{MAX_JSON_BODY_BYTES} byte limit; send less in one request "
+            "(for example a smaller attachment)"
+        )
 
     try:
         response = requests.request(

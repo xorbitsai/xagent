@@ -11,7 +11,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
 from mcp.server.fastmcp import FastMCP
 
-from . import google_api_proxy
+from . import composio_proxy, google_api_proxy
 from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -132,7 +132,7 @@ def _resolve_message_attachments(
 
 
 def get_gmail_service() -> Any:
-    if google_api_proxy.uses_composio_proxy():
+    if composio_proxy.serves_composio_grant():
         # No Google token to build credentials from: every request goes
         # through Composio, which adds the grant's token itself. The
         # discovery document stays local to the library.
@@ -174,10 +174,26 @@ def _execute_batch(batch: Any) -> None:
     the batch's callbacks with the same ``(request_id, response, exception)``
     triples in the same order.
     """
-    if google_api_proxy.uses_composio_proxy():
+    if composio_proxy.serves_composio_grant():
         google_api_proxy.execute_batch(batch)
     else:
         batch.execute()
+
+
+def _check_composio_batch_budget(count: int, what: str) -> None:
+    """Refuse a Composio-backed tool call that would fan out past the cap.
+
+    The batch fallback sends one proxy request per item; without this check a
+    single call could turn a list of ids into hundreds of Proxy Execute calls
+    (the concurrency limit only bounds how many are in flight at once). The
+    native path is untouched.
+    """
+    if count > google_api_proxy.MAX_BATCH_REQUESTS:
+        raise ValueError(
+            f"{what} would need {count} proxied requests, above the "
+            f"{google_api_proxy.MAX_BATCH_REQUESTS} request limit for one tool "
+            "call; ask for fewer at a time"
+        )
 
 
 @mcp.tool()
@@ -187,8 +203,13 @@ def gmail_search_messages(
     """
     Search and list Gmail messages with optional query and label filters.
     Use query parameter for Gmail search syntax (e.g. 'is:unread', 'from:example@test.com').
+    On a Composio-backed grant at most 100 messages are read in one call (the
+    batch fallback sends one proxy request per message, plus the list request);
+    ask for more in smaller calls.
     """
     try:
+        if composio_proxy.serves_composio_grant():
+            _check_composio_batch_budget(max_results, "max_results")
         service = get_gmail_service()
         kwargs = {"userId": "me", "maxResults": max_results}
         if query:
@@ -264,8 +285,12 @@ def gmail_search_messages(
 def gmail_read_threads(thread_ids: list[str]) -> str:
     """
     Read one or more Gmail threads by ID.
+    On a Composio-backed grant at most 100 thread ids are read in one call
+    (one proxy request per thread); ask for more in smaller calls.
     """
     try:
+        if composio_proxy.serves_composio_grant():
+            _check_composio_batch_budget(len(thread_ids), "thread_ids")
         service = get_gmail_service()
         threads_data = []
         errors = []
@@ -314,10 +339,18 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
     + byte size) — check that before telling the user a file was sent,
     don't assume it from the request alone. All attachments across the
     whole call share one combined size budget (see _MAX_ATTACHMENT_BYTES).
+    On a Composio-backed grant the proxy's 4.5 MB JSON body limit
+    (composio_proxy.MAX_JSON_BODY_BYTES) arrives first: the encoded message
+    inflates raw bytes by 4/3, so about 3.3 MB of attachments is the effective
+    ceiling regardless of the larger shared budget. If any message in the
+    call is too large, the whole call is refused before the first is sent.
+    At most 100 messages are sent or drafted in one call on a Composio grant.
     """
     try:
         if not isinstance(messages, list):
             raise ValueError("'messages' must be a list of message dicts")
+        if composio_proxy.serves_composio_grant():
+            _check_composio_batch_budget(len(messages), "messages")
 
         # Resolve every message's attachments before sending any message, so
         # a bad attachment path on message 2 can't leave message 1 already
@@ -330,9 +363,10 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
             )
             resolved_attachments.append(attachments)
 
-        service = get_gmail_service()
-        results = []
-
+        # Build every message before sending any too: Composio refuses a
+        # JSON body above its limit locally, and sending message 1 first
+        # would leave a batch half-delivered when message 2 was too large.
+        prepared: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
         for msg_data, attachments in zip(messages, resolved_attachments):
             message = EmailMessage()
             message.set_content(msg_data.get("body", ""))
@@ -367,36 +401,56 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
                 attached_summary.append({"filename": filename, "size": len(data)})
 
             encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-            create_message = {"raw": encoded_message}
+            prepared.append(({"raw": encoded_message}, attached_summary))
 
+        service = get_gmail_service()
+        requests_per_message: list[tuple[Any, list[dict[str, Any]]]] = []
+        for create_message, attached_summary in prepared:
             if action == "send":
-                sent_message = (
-                    service.users()
-                    .messages()
-                    .send(userId="me", body=create_message)
-                    .execute()
-                )
-                results.append(
-                    {
-                        "status": "sent",
-                        "id": sent_message["id"],
-                        "attachments": attached_summary,
-                    }
+                request = (
+                    service.users().messages().send(userId="me", body=create_message)
                 )
             else:
-                draft = (
+                request = (
                     service.users()
                     .drafts()
                     .create(userId="me", body={"message": create_message})
-                    .execute()
                 )
+            requests_per_message.append((request, attached_summary))
+
+        # Every request is checked against the proxy's body limit before the
+        # first one is sent. On the native path this is a no-op.
+        for request, _attached_summary in requests_per_message:
+            google_api_proxy.check_request(request)
+
+        results: list[dict[str, Any]] = []
+        try:
+            for request, attached_summary in requests_per_message:
+                response = request.execute()
                 results.append(
                     {
-                        "status": "drafted",
-                        "id": draft["id"],
+                        "status": "sent" if action == "send" else "drafted",
+                        "id": response["id"],
                         "attachments": attached_summary,
                     }
                 )
+        except Exception as e:
+            if not results:
+                raise
+            # Messages already sent cannot be taken back: report them rather
+            # than making the caller guess whether the batch went out.
+            completed = "sent" if action == "send" else "drafted"
+            logger.error(f"Error sending/drafting messages: {e}")
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": (
+                        f"{len(results)} of {len(requests_per_message)} messages "
+                        f"were {completed} before this error: {e}"
+                    ),
+                    "results": results,
+                }
+            )
 
         return json.dumps({"status": "success", "results": results})
     except Exception as e:

@@ -12,25 +12,33 @@ googleapiclient's bundled copy and is never fetched through the proxy.
 
 A batch request is one ``multipart/mixed`` body, which the proxy does not
 carry. ``execute_batch`` sends the batch's requests one at a time instead,
-with bounded concurrency and an overall deadline, and hands the results to
-the batch's own callbacks in the order the requests were added.
+with bounded concurrency, a cap on the requests one batch may hold, and an
+overall deadline, and hands the results to the batch's own callbacks in the
+order the requests were added.
+
+A binary answer (``ProxyResponse.binary_data``) is not in ``data``: Composio
+stores the file and returns a signed URL. The transport downloads that URL and
+returns its bytes, with the file's own content type and length.
 """
 
 from __future__ import annotations
 
 import http.client
 import json
-import os
 from collections.abc import Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from googleapiclient.errors import HttpError  # type: ignore[import-not-found]
 
+from ....core.utils import public_requests as requests
 from .composio_proxy import (
-    COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
     DEFAULT_TIMEOUT_SECONDS,
+    ComposioProxyError,
+    ProxyResponse,
+    check_json_body_size,
     proxy_request,
 )
 
@@ -42,6 +50,11 @@ DEFAULT_BATCH_CONCURRENCY = 8
 # proxy timeout: without it a batch of N requests against an unresponsive
 # proxy could hold the tool open for N/workers times the timeout.
 DEFAULT_BATCH_DEADLINE_SECONDS = float(DEFAULT_TIMEOUT_SECONDS)
+# One tool call must not fan out into an unbounded number of proxy calls:
+# the concurrency above limits only how many are in flight, not how many are
+# made. 100 is Google's own per-batch request limit, so the fallback stays on
+# the same scale as the native batch it replaces.
+MAX_BATCH_REQUESTS = 100
 
 # The only request headers forwarded to the API. Both change what Google
 # returns or how it reads the body. Content-Length and User-Agent describe
@@ -53,17 +66,15 @@ _FORWARDED_HEADERS = ("accept", "content-type")
 _JSON_CONTENT_TYPE = "application/json; charset=UTF-8"
 
 
-def uses_composio_proxy() -> bool:
-    """Whether this process serves a Composio-backed grant: it is launched
-    with Composio's ids instead of a Google token."""
-    return bool(os.environ.get(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
-
-
 class Response(dict[str, str]):
     """The part of ``httplib2.Response`` that googleapiclient reads."""
 
-    def __init__(self, status: int, headers: Mapping[str, str]) -> None:
-        super().__init__({"status": str(status), **headers})
+    def __init__(self, status: int, headers: Mapping[str, str] | None = None) -> None:
+        normalized = {
+            str(name).lower(): str(value) for name, value in (headers or {}).items()
+        }
+        normalized["status"] = str(status)
+        super().__init__(normalized)
         self.status = status
         self.reason = http.client.responses.get(status, "")
         self.version = 11
@@ -71,7 +82,7 @@ class Response(dict[str, str]):
 
 
 def _content(response_data: Any) -> tuple[bytes, str]:
-    """The response body and content type for one proxied answer."""
+    """The response body and content type for one proxied JSON answer."""
     if response_data is None:
         return b"", _JSON_CONTENT_TYPE
     if isinstance(response_data, bytes):
@@ -79,6 +90,57 @@ def _content(response_data: Any) -> tuple[bytes, str]:
     if isinstance(response_data, str):
         return response_data.encode("utf-8"), "text/plain; charset=UTF-8"
     return json.dumps(response_data).encode("utf-8"), _JSON_CONTENT_TYPE
+
+
+def _binary_content(
+    binary_data: Mapping[str, Any], *, timeout: float
+) -> tuple[bytes, str]:
+    """The bytes behind a binary answer's signed URL, and their content type.
+
+    Composio uploads a binary upstream body to its own storage and returns
+    that signed URL in ``binary_data``; the URL expires, so it must not be
+    kept, and it must not appear in an error either (it is a bearer-like
+    credential for the file). ``public_requests`` keeps the download off a
+    non-public destination.
+    """
+    url = binary_data.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise ComposioProxyError(
+            "the proxied binary response has no usable download URL"
+        )
+    try:
+        response = requests.get(url, timeout=timeout)
+    except Exception:
+        # Type only: the exception's text can name the signed URL.
+        raise ComposioProxyError(
+            "the proxied binary response could not be downloaded"
+        ) from None
+    if not 200 <= response.status_code < 300:
+        raise ComposioProxyError(
+            "the proxied binary response could not be downloaded "
+            f"(HTTP {response.status_code})"
+        )
+    content_type = binary_data.get("content_type")
+    if not isinstance(content_type, str) or not content_type:
+        content_type = "application/octet-stream"
+    return response.content, content_type
+
+
+def _body_and_type(answer: ProxyResponse, *, timeout: float) -> tuple[bytes, str]:
+    if answer.binary_data is not None:
+        return _binary_content(answer.binary_data, timeout=timeout)
+    return _content(answer.data)
+
+
+@dataclass(frozen=True)
+class _PreparedRequest:
+    """One googleapiclient request translated into a proxy call."""
+
+    method: str
+    endpoint: str
+    query: list[tuple[str, str]]
+    headers: dict[str, str]
+    body: Any
 
 
 class GoogleApiProxyHttp:
@@ -109,21 +171,13 @@ class GoogleApiProxyHttp:
         }
         self._timeout = timeout
 
-    def request(
+    def _prepare(
         self,
         uri: str,
-        method: str = "GET",
-        body: str | bytes | None = None,
-        headers: Mapping[str, str] | None = None,
-        redirections: int = 5,
-        connection_type: Any = None,
-    ) -> tuple[Response, bytes]:
-        """Send one googleapiclient request through Composio.
-
-        ``redirections`` and ``connection_type`` are accepted because
-        httplib2's callers pass them; neither applies here. Composio follows
-        no redirect for us, so a 3xx reaches googleapiclient as a 3xx.
-        """
+        method: str,
+        body: str | bytes | None,
+        headers: Mapping[str, str] | None,
+    ) -> _PreparedRequest:
         request_headers = headers or {}
         parsed = urlsplit(uri)
         endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -148,29 +202,92 @@ class GoogleApiProxyHttp:
             proxied_body = None
         else:
             proxied_body = _json_body(body)
-        answer = proxy_request(
-            method,
-            endpoint,
-            allowed_hosts=self._allowed_hosts,
+        return _PreparedRequest(
+            method=method,
+            endpoint=endpoint,
             query=query,
             headers=forwarded,
             body=proxied_body,
+        )
+
+    def request(
+        self,
+        uri: str,
+        method: str = "GET",
+        body: str | bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        redirections: int = 5,
+        connection_type: Any = None,
+    ) -> tuple[Response, bytes]:
+        """Send one googleapiclient request through Composio.
+
+        ``redirections`` and ``connection_type`` are accepted because
+        httplib2's callers pass them; neither applies here. This transport
+        does not follow a redirect: the status and the provider's headers
+        (including ``location``) are returned, so the caller can follow it.
+        """
+        prepared = self._prepare(uri, method, body, headers)
+        answer = proxy_request(
+            prepared.method,
+            prepared.endpoint,
+            allowed_hosts=self._allowed_hosts,
+            query=prepared.query,
+            headers=prepared.headers,
+            body=prepared.body,
             timeout=self._timeout,
         )
-        content, content_type = _content(answer.data)
-        return (
-            Response(
-                answer.status,
-                {
-                    "content-type": content_type,
-                    "content-length": str(len(content)),
-                },
-            ),
-            content,
+        content, content_type = _body_and_type(answer, timeout=self._timeout)
+        response_headers = {
+            str(name).lower(): str(value)
+            for name, value in (answer.headers or {}).items()
+        }
+        response_headers["content-type"] = content_type
+        response_headers["content-length"] = str(len(content))
+        return Response(answer.status, response_headers), content
+
+    def check_request(
+        self,
+        uri: str,
+        method: str = "GET",
+        body: str | bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        """Refuse one request the proxy would reject for its JSON body size,
+        without sending it.
+
+        Sending several requests in one tool call (one message each) checks
+        every request first, so an oversized later one cannot leave the
+        earlier ones already delivered.
+        """
+        prepared = self._prepare(uri, method, body, headers)
+        check_json_body_size(
+            prepared.method,
+            prepared.endpoint,
+            query=prepared.query,
+            headers=prepared.headers,
+            body=prepared.body,
         )
 
     def close(self) -> None:
         """httplib2 closes its connection pool here; this transport has none."""
+
+
+def check_request(request: Any) -> None:
+    """Refuse one googleapiclient request the proxy would reject for its body
+    size, before it is sent.
+
+    A request on the native transport is left alone, so the native path is
+    unchanged.
+    """
+    http = getattr(request, "http", None)
+    if not isinstance(http, GoogleApiProxyHttp):
+        return
+    http.check_request(
+        request.uri,
+        method=request.method,
+        body=request.body,
+        headers=request.headers,
+    )
 
 
 def _json_body(body: str | bytes | None) -> Any:
@@ -219,6 +336,9 @@ def execute_batch(
     credentials of ours, so a 401 is the provider's answer and reaches the
     callback as an error.
 
+    A batch above ``MAX_BATCH_REQUESTS`` is refused before any of it is sent,
+    so one tool call cannot fan out into an unbounded number of proxy calls.
+
     A request still unanswered at ``deadline`` reaches its callback as a
     ``TimeoutError``; the batch's own threads are abandoned rather than
     awaited, so the caller returns inside its budget.
@@ -228,6 +348,12 @@ def execute_batch(
     order: list[str] = list(batch._order)
     if not order:
         return
+    if len(order) > MAX_BATCH_REQUESTS:
+        raise ValueError(
+            f"this batch has {len(order)} requests, above the "
+            f"{MAX_BATCH_REQUESTS} request limit for one proxied batch; "
+            "ask for fewer at a time"
+        )
     requests = batch._requests
 
     def run(request_id: str) -> tuple[Any, bytes] | BaseException:
@@ -260,7 +386,10 @@ def execute_batch(
         for future in pending:
             future.cancel()
         for request_id, future in futures.items():
-            if future in pending:
+            # ``pending`` is a snapshot taken when ``wait`` returned: a
+            # request can finish between that snapshot and this loop, and
+            # its result must not be replaced by a made-up timeout.
+            if future.cancelled() or (future in pending and not future.done()):
                 outcomes[request_id] = TimeoutError(
                     f"this request did not finish within {deadline:g}s "
                     "(the batch is bounded so the tool returns in time)"

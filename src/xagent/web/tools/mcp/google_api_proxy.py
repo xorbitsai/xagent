@@ -87,12 +87,16 @@ class GoogleApiProxyHttp:
     ``allowed_hosts`` are the API's own hostnames. They are checked before
     anything is sent, so a request can never take Composio's injected token to
     a host this connector does not call.
+
+    ``extra_headers`` names further request headers an API needs forwarded
+    (for example a Drive resource key); every other header stays behind.
     """
 
     def __init__(
         self,
         *,
         allowed_hosts: Collection[str],
+        extra_headers: Collection[str] = (),
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if isinstance(allowed_hosts, str):
@@ -100,6 +104,9 @@ class GoogleApiProxyHttp:
                 "allowed_hosts must be a collection of hostnames, not a str"
             )
         self._allowed_hosts = frozenset(host.lower() for host in allowed_hosts)
+        self._forwarded_headers = frozenset(_FORWARDED_HEADERS) | {
+            header.lower() for header in extra_headers
+        }
         self._timeout = timeout
 
     def request(
@@ -124,7 +131,7 @@ class GoogleApiProxyHttp:
         forwarded = {
             name: value
             for name, value in request_headers.items()
-            if name.lower() in _FORWARDED_HEADERS
+            if name.lower() in self._forwarded_headers
         }
         if _replays_a_get(request_headers):
             # googleapiclient turns a GET whose URI is too long into a POST

@@ -152,6 +152,31 @@ def test_only_headers_that_change_the_answer_are_forwarded(proxy):
     assert "must-not-travel" not in json.dumps(call)
 
 
+def test_a_named_extra_header_is_forwarded(proxy):
+    """A connector can name the headers its API needs; everything else,
+    including a token, still stays behind."""
+    http = google_api_proxy.GoogleApiProxyHttp(
+        allowed_hosts=GMAIL_HOSTS,
+        extra_headers=("X-Goog-Drive-Resource-Keys",),
+    )
+
+    http.request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+        headers={
+            "X-Goog-Drive-Resource-Keys": "key-1/key-2",
+            "authorization": "Bearer must-not-travel",
+        },
+    )
+
+    (call,) = proxy.calls
+    assert {
+        "name": "X-Goog-Drive-Resource-Keys",
+        "value": "key-1/key-2",
+        "type": "header",
+    } in call["parameters"]
+    assert all(item["name"] != "authorization" for item in call["parameters"])
+
+
 def test_a_response_is_mapped_back_to_status_and_content(proxy):
     proxy.answer_with(200, {"status": 200, "data": {"id": "m1"}})
 

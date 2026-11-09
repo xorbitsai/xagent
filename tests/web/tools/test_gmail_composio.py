@@ -177,6 +177,15 @@ def test_a_composio_grant_builds_the_service_on_the_proxy_transport(
         transport.request("https://www.googleapis.com/drive/v3/files")
 
 
+def test_building_the_service_fetches_no_discovery_document(proxy):
+    """The discovery document is the library's bundled copy; fetching it
+    through the proxy would spend a call and could be refused cross-domain."""
+    service = gmail.get_gmail_service()
+
+    assert service is not None
+    assert proxy.calls == []
+
+
 def test_a_native_grant_still_builds_credentials(monkeypatch):
     for name in (
         composio_proxy.COMPOSIO_API_KEY_ENV,

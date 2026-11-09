@@ -2335,7 +2335,6 @@ class _LegacyExecuteTaskRequest:
 
     task_id: int
     task_owner_user_id: int
-    task_source: str | None
     task_description: str
     task_context: dict[str, Any]
     task_info: dict[str, Any]
@@ -2392,7 +2391,6 @@ def _load_legacy_execute_task_request_sync(
         return _LegacyExecuteTaskRequest(
             task_id=int(task.id),
             task_owner_user_id=int(task.user_id),
-            task_source=str(task.source) if task.source is not None else None,
             task_description=str(task.description),
             task_context=task_context,
             task_info={

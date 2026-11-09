@@ -646,24 +646,17 @@ async def test_existing_execution_applies_current_input_once(
 
     monkeypatch.setattr(task_execution, "execute_task_background", execute)
     with forbid_legacy_content(factory.kw["bind"]):
-        if shared:
-            handle = task_orchestrator._schedule_bg(
-                task_id=tid,
-                task_owner_user_id=owner,
-                task_source=None,
-                task_lease=lease,
-                payload=payload,
-                force_fresh=False,
-                context={},
-            )
-        else:
-            handle = await task_orchestrator.TaskTurnOrchestrator.schedule_existing_task_execution(
-                task_id=tid,
-                task_owner_user_id=owner,
-                task_source=None,
-                payload=payload,
-                context={},
-            )
+        # Without a pre-acquired lease the runner acquires its own and
+        # persists the accepted input under it.
+        handle = task_orchestrator._schedule_bg(
+            task_id=tid,
+            task_owner_user_id=owner,
+            task_source=None,
+            **({"task_lease": lease} if shared else {}),
+            payload=payload,
+            force_fresh=False,
+            context={},
+        )
         await handle
     assert observed == [(["earlier"], ["current description"], payload.turn_id)]
 

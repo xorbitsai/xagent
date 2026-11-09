@@ -625,6 +625,33 @@ async def test_pause_precheck_leaves_other_cases_to_pause_task(
     reply.assert_not_awaited()
 
 
+@pytest.mark.parametrize("held_kind, handled", [("start", True), ("message", False)])
+async def test_pause_precheck_without_shared_execution_settles_only_a_held_start(
+    pause_host: CapHost,
+    monkeypatch: pytest.MonkeyPatch,
+    held_kind: str,
+    handled: bool,
+) -> None:
+    host = pause_host
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    _, task_id = await cap_held_task(host, TaskStatus.COMPLETED)
+    enqueue_at(host, task_id, held_kind, 3, run_id="run-new")
+    pause_id = stage_pause(host, task_id)
+    reply = AsyncMock()
+    message_data: dict[str, Any] = {
+        "user": SimpleNamespace(id=host.user_id, is_admin=False),
+        "_durable_pause_not_applicable": False,
+    }
+
+    result = await task_command_execution._pause_cap_held_commands_without_agent(
+        reply, SimpleNamespace(id=pause_id, task_id=task_id), message_data
+    )
+
+    assert result is handled
+    assert message_data["_durable_pause_not_applicable"] is handled
+    assert reply.await_count == int(handled)
+
+
 # Case -> (control kind, control status, whether the held row is settled).
 SELECTION_CASES = {
     "pause_version_equal_row": ("pause", "completed", True),

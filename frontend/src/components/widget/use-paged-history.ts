@@ -16,9 +16,11 @@ export interface HistoryPage<T> {
 
 // Reads a history resource page by page, from the first page on mount. The
 // first page, and the pages after it, fail and retry separately: a failed
-// later page leaves the loaded items in place. A response is written only
-// while it belongs to the newest request; unmounting also takes a number and
-// aborts the request in flight, so nothing lands after it.
+// later page leaves the loaded items in place. Every load aborts the request
+// before it, and unmounting aborts the one in flight, so a response is written
+// only while its request has not been aborted and nothing lands after unmount.
+// `fetchPage` must keep its identity across renders: a new one starts over
+// from the first page.
 export function usePagedHistory<T>(
   fetchPage: (cursor: string | null, signal: AbortSignal) => Promise<HistoryPage<T>>,
 ) {
@@ -27,43 +29,34 @@ export function usePagedHistory<T>(
   const [firstPage, setFirstPage] = useState<"loading" | "ready" | "failed">("loading")
   const [morePages, setMorePages] = useState<"idle" | "loading" | "failed">("idle")
   const [errorKind, setErrorKind] = useState<WidgetSessionHistoryErrorKind>("load_failed")
-  const latestRequestRef = useRef(0)
   const controllerRef = useRef<AbortController | null>(null)
-  const fetchPageRef = useRef(fetchPage)
-
-  useEffect(() => {
-    fetchPageRef.current = fetchPage
-  }, [fetchPage])
 
   const load = useCallback((cursor: string | null) => {
     controllerRef.current?.abort()
     const controller = new AbortController()
     controllerRef.current = controller
-    latestRequestRef.current += 1
-    const request = latestRequestRef.current
     if (cursor === null) setFirstPage("loading")
     else setMorePages("loading")
-    fetchPageRef.current(cursor, controller.signal).then(
+    fetchPage(cursor, controller.signal).then(
       (page) => {
-        if (request !== latestRequestRef.current) return
+        if (controller.signal.aborted) return
         setItems((current) => (cursor === null ? page.items : [...current, ...page.items]))
         setNextCursor(page.nextCursor)
         setFirstPage("ready")
         setMorePages("idle")
       },
       (error: unknown) => {
-        if (request !== latestRequestRef.current) return
+        if (controller.signal.aborted) return
         setErrorKind(readErrorKind(error))
         if (cursor === null) setFirstPage("failed")
         else setMorePages("failed")
       },
     )
-  }, [])
+  }, [fetchPage])
 
   useEffect(() => {
     load(null)
     return () => {
-      latestRequestRef.current += 1
       controllerRef.current?.abort()
     }
   }, [load])

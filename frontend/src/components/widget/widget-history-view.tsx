@@ -1,7 +1,6 @@
 "use client"
 
 import React, { useCallback, useEffect, useRef, useState } from "react"
-import { ArrowLeft, Loader2 } from "lucide-react"
 import { ChatInput } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { UserMessageContent } from "@/components/chat/user-message-content"
@@ -15,6 +14,7 @@ import {
 } from "@/lib/widget-session-history"
 import { PHASE_ROUTE } from "./use-session-open-message"
 import { readErrorKind, usePagedHistory } from "./use-paged-history"
+import { HistoryShell, LoadMoreButton } from "./widget-history-shell"
 
 type SessionConversationPhase = ReturnType<typeof useApp>["sessionConversationState"]
 
@@ -86,11 +86,10 @@ export function WidgetHistoryView({
   const { t } = useI18n()
   const [sendFailure, setSendFailure] = useState<WidgetSessionHistoryErrorKind | null>(null)
   const [checking, setChecking] = useState(false)
-  const backRef = useRef<HTMLButtonElement>(null)
-  const mountedRef = useRef(false)
   // The check before a hand-over is cancelled when the view closes, so a
   // late rejection cannot go on to refresh the token with the auth of the
-  // phase the check started in.
+  // phase the check started in, and a check that settles after that changes
+  // nothing.
   const checkControllerRef = useRef<AbortController | null>(null)
   const sourceRef = useRef({ origin, getAuth, taskId })
 
@@ -113,13 +112,8 @@ export function WidgetHistoryView({
     load,
   } = usePagedHistory(fetchPage)
 
-  useEffect(() => {
-    mountedRef.current = true
-    backRef.current?.focus()
-    return () => {
-      mountedRef.current = false
-      checkControllerRef.current?.abort()
-    }
+  useEffect(() => () => {
+    checkControllerRef.current?.abort()
   }, [])
 
   const failureLine = (kind: WidgetSessionHistoryErrorKind): string => (
@@ -155,13 +149,13 @@ export function WidgetHistoryView({
       const source = sourceRef.current
       await readWidgetConversation(source.origin, source.getAuth(), source.taskId, { limit: 1 }, controller.signal)
     } catch (error) {
-      if (!mountedRef.current) return
+      if (controller.signal.aborted) return
       const kind = readErrorKind(error)
       setSendFailure(kind)
       setChecking(false)
       throw new HistoryPreflightError(kind)
     }
-    if (!mountedRef.current) return
+    if (controller.signal.aborted) return
     setChecking(false)
     onContinue(message, taskId)
   }
@@ -177,91 +171,68 @@ export function WidgetHistoryView({
     </button>
   )
 
+  const footer = (
+    <div className="flex-none border-t p-3">
+      {sendFailure ? (
+        <p className="mb-2 text-xs text-destructive" role="alert">
+          {sendFailure === "load_failed"
+            ? t("widgetSession.startMessageFailed")
+            : failureLine(sendFailure)}
+        </p>
+      ) : null}
+      {composerGone ? null : (
+        <ChatInput
+          onSend={(message) => submit(message)}
+          isLoading={blockedNotice !== null || checking || sendLocked}
+          hideFileUpload={true}
+          filesDisabled={true}
+          hideConfig={true}
+          readOnlyConfig={true}
+          compact={true}
+          voiceInputEnabled={false}
+        />
+      )}
+      {blockedNotice ? (
+        <p className="mt-2 text-xs text-muted-foreground" role="status">
+          {t(`widgetSession.history.${blockedNotice}`)}
+        </p>
+      ) : null}
+    </div>
+  )
+
   return (
-    <section className="flex min-h-0 flex-1 flex-col" aria-label={title}>
-      <div className="flex flex-none items-center gap-2 border-b px-3 py-2">
-        <button
-          ref={backRef}
-          type="button"
-          onClick={onBack}
-          className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-          {t("widgetSession.history.back")}
-        </button>
-        <h2 className="truncate text-sm font-semibold">{title}</h2>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        {firstPage === "loading" ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
-            <span className="sr-only">{t("common.loading")}</span>
+    <HistoryShell title={title} onBack={onBack} loading={firstPage === "loading"} footer={footer}>
+      {firstPage === "failed" ? (
+        <div className="text-sm">
+          <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
+          {endsTheView(readFailure) ? null : retry}
+        </div>
+      ) : messages.length === 0 ? (
+        <p className="text-sm text-muted-foreground">{t("widgetSession.history.viewEmpty")}</p>
+      ) : (
+        <>
+          <div className="flex flex-col gap-4">
+            {messages.map((message) => (
+              <ChatMessage
+                key={message.id}
+                role={message.role}
+                content={messageContent(message)}
+                rawContent={message.role === "assistant" ? message.content : undefined}
+                showProcessView={false}
+                timestamp={message.createdAt}
+              />
+            ))}
           </div>
-        ) : firstPage === "failed" ? (
-          <div className="text-sm">
-            <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
-            {endsTheView(readFailure) ? null : retry}
-          </div>
-        ) : messages.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("widgetSession.history.viewEmpty")}</p>
-        ) : (
-          <>
-            <div className="flex flex-col gap-4">
-              {messages.map((message) => (
-                <ChatMessage
-                  key={message.id}
-                  role={message.role}
-                  content={messageContent(message)}
-                  rawContent={message.role === "assistant" ? message.content : undefined}
-                  showProcessView={false}
-                  timestamp={message.createdAt}
-                />
-              ))}
+          {morePages === "failed" ? (
+            <div className="mt-3 text-sm">
+              <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
+              {retry}
             </div>
-            {morePages === "failed" ? (
-              <div className="mt-3 text-sm">
-                <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
-                {retry}
-              </div>
-            ) : nextCursor !== null ? (
-              <button
-                type="button"
-                disabled={morePages === "loading"}
-                onClick={() => load(nextCursor)}
-                className="mt-3 rounded-md border px-3 py-1.5 text-sm hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {t("widgetSession.history.loadMore")}
-              </button>
-            ) : null}
-          </>
-        )}
-      </div>
-      <div className="flex-none border-t p-3">
-        {sendFailure ? (
-          <p className="mb-2 text-xs text-destructive" role="alert">
-            {sendFailure === "load_failed"
-              ? t("widgetSession.startMessageFailed")
-              : failureLine(sendFailure)}
-          </p>
-        ) : null}
-        {composerGone ? null : (
-          <ChatInput
-            onSend={(message) => submit(message)}
-            isLoading={blockedNotice !== null || checking || sendLocked}
-            hideFileUpload={true}
-            filesDisabled={true}
-            hideConfig={true}
-            readOnlyConfig={true}
-            compact={true}
-            voiceInputEnabled={false}
-          />
-        )}
-        {blockedNotice ? (
-          <p className="mt-2 text-xs text-muted-foreground" role="status">
-            {t(`widgetSession.history.${blockedNotice}`)}
-          </p>
-        ) : null}
-      </div>
-    </section>
+          ) : nextCursor !== null ? (
+            <LoadMoreButton loading={morePages === "loading"} onClick={() => load(nextCursor)} />
+          ) : null}
+        </>
+      )}
+    </HistoryShell>
   )
 }

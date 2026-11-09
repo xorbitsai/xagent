@@ -33,6 +33,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/use-widget-session.ts",
         "src/components/widget/widget-chrome-controls.tsx",
         "src/components/widget/widget-history-list.tsx",
+        "src/components/widget/widget-history-shell.tsx",
         "src/components/widget/widget-history-view.tsx",
         "src/contexts/app-context-chat.tsx",
         "src/contexts/auth-context.tsx",
@@ -108,6 +109,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 90, branches: 85, functions: 85, lines: 90,
         },
         "src/components/widget/widget-history-list.tsx": {
+          statements: 90, branches: 85, functions: 85, lines: 90,
+        },
+        "src/components/widget/widget-history-shell.tsx": {
           statements: 90, branches: 85, functions: 85, lines: 90,
         },
         "src/components/widget/widget-history-view.tsx": {

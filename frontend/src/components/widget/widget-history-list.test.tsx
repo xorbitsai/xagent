@@ -345,6 +345,31 @@ describe("WidgetHistoryList", () => {
       expect(screen.queryByText("widgetSession.history.loadFailed")).not.toBeInTheDocument()
     })
 
+    it("keeps the newer first page when the page of a cancelled request arrives after it", async () => {
+      const first = deferred<ReturnType<typeof page>>()
+      const second = deferred<ReturnType<typeof page>>()
+      history.list.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+      render(
+        <React.StrictMode>
+          <WidgetHistoryList
+            origin={ORIGIN}
+            getAuth={() => AUTH}
+            unauthorizedNotice="tryLater"
+            currentTaskId={null}
+            {...handlers()}
+          />
+        </React.StrictMode>,
+      )
+
+      await act(async () => second.resolve(page([7])))
+      await screen.findByText("Conversation 7")
+      // The first mount's request ignores its abort and answers late.
+      await act(async () => first.resolve(page([3])))
+
+      expect(screen.getByText("Conversation 7")).toBeInTheDocument()
+      expect(screen.queryByText("Conversation 3")).not.toBeInTheDocument()
+    })
+
     it("neither writes nor complains when a response arrives after it closed", async () => {
       const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined)
       const first = deferred<ReturnType<typeof page>>()

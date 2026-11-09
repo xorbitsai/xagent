@@ -578,6 +578,21 @@ describe("WidgetHistoryView", () => {
       expect(consoleError).not.toHaveBeenCalled()
     })
 
+    it("settles the send quietly when a failed check returns after the view closed", async () => {
+      history.read.mockResolvedValueOnce(messagePage())
+      const check = deferred<ReturnType<typeof messagePage>>()
+      history.read.mockReturnValueOnce(check.promise)
+      renderView()
+      await screen.findByText("Where is my order?")
+
+      let sending: Promise<void> | undefined
+      act(() => { sending = surfaces.input?.onSend("a question", {}) as Promise<void> })
+      cleanup()
+      await act(async () => check.reject(new WidgetSessionHistoryError("not_found")))
+
+      await expect(sending).resolves.toBeUndefined()
+    })
+
     it("lets the visitor go back while the source is being checked", async () => {
       history.read.mockResolvedValueOnce(messagePage())
       const check = deferred<ReturnType<typeof messagePage>>()

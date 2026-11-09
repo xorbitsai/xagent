@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
+from . import composio_proxy
 from .utils import (
     clamp_limit,
     clamp_offset,
@@ -25,6 +26,10 @@ mcp = FastMCP("salesforce-mcp")
 # per-org instance_url used by every other endpoint here -- Salesforce
 # routes the request to the correct org internally based on the token.
 USERINFO_URL = "https://login.salesforce.com/services/oauth2/userinfo"
+# On a Composio-backed grant (#3646) the same document is read from the org's
+# own host, through the proxy: login.salesforce.com does not serve sandbox
+# orgs, and the org's host is known to Composio only.
+ORG_USERINFO_PATH = "/services/oauth2/userinfo"
 
 # Pinned to a long-supported version rather than the latest release --
 # Salesforce supports past API versions for many years (not indefinitely;
@@ -338,6 +343,45 @@ def _raise_api_error(status: int, detail: str) -> NoReturn:
     raise RuntimeError(f"Salesforce API error (status {status}): {detail}")
 
 
+def _uses_composio() -> bool:
+    """Whether this process serves a Composio-backed grant (#3646): it is
+    launched with Composio's ids instead of a token and an instance URL."""
+    return bool(os.environ.get(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
+
+
+def _request_via_composio(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
+) -> Any:
+    """Send an org-relative ``path`` through Composio, which adds the token
+    and, per Composio's Proxy Execute, resolves the path against the
+    connected org's own host (to be confirmed live, #3646)."""
+    response = composio_proxy.proxy_request(
+        method,
+        path,
+        # Paths only: the org's host is Composio's to fill in.
+        allowed_hosts=(),
+        query=params or {},
+        body=json_data,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
+    if response.status >= 400:
+        detail = _error_detail_from_payload(response.data)
+        if detail is None:
+            detail = (
+                json.dumps(response.data, ensure_ascii=False)
+                if response.data is not None
+                else ""
+            )
+        # Redacted before it is cut, so a Composio id echoed in the provider's
+        # answer cannot reach the model, half or whole.
+        _raise_api_error(response.status, composio_proxy.redact(detail))
+    return response.data if response.data is not None else {}
+
+
 def _request(
     method: str,
     path: str,
@@ -345,6 +389,8 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    if _uses_composio():
+        return _request_via_composio(method, path, params=params, json_data=json_data)
     return _request_absolute(
         method, f"{_instance_url()}{path}", params=params, json_data=json_data
     )
@@ -359,7 +405,11 @@ def salesforce_get_current_user() -> str:
     user id.
     """
     try:
-        result = _request_absolute("GET", USERINFO_URL)
+        result = (
+            _request_via_composio("GET", ORG_USERINFO_PATH)
+            if _uses_composio()
+            else _request_absolute("GET", USERINFO_URL)
+        )
         return _success(
             user={
                 "user_id": result.get("user_id"),

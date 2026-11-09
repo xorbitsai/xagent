@@ -29,6 +29,11 @@ mcp = FastMCP("gmail-mcp")
 # fail the real send with an opaque API error. This is a budget shared
 # across every message in one gmail_send_messages call, not per-message —
 # a batch of many medium attachments is capped the same as one big one.
+# A Composio grant never reaches this budget: an attachment is base64-encoded
+# inside the MIME part and the whole message is base64-encoded again into
+# `raw`, so one message's JSON body is about 1.8 times the attachment and
+# composio_proxy.MAX_JSON_BODY_BYTES binds first (about 2.5 MB per message;
+# see gmail_send_messages).
 _MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GMAIL_FILE_ALLOWED_DIRS"
 # The Gmail API's own host. The proxy transport refuses any other, so
@@ -494,11 +499,14 @@ def gmail_send_messages(messages: list[dict], action: str = "draft") -> str:
     don't assume it from the request alone. All attachments across the
     whole call share one combined size budget (see _MAX_ATTACHMENT_BYTES).
     On a Composio-backed grant the proxy's 4.5 MB JSON body limit
-    (composio_proxy.MAX_JSON_BODY_BYTES) arrives first: the encoded message
-    inflates raw bytes by 4/3, so about 3.3 MB of attachments is the effective
-    ceiling regardless of the larger shared budget. If any message in the
-    call is too large, the whole call is refused before the first is sent.
-    At most 100 messages are sent or drafted in one call on a Composio grant.
+    (composio_proxy.MAX_JSON_BODY_BYTES) arrives first: an attachment is
+    base64-encoded inside the MIME message, and the whole message is
+    base64-encoded again as its 'raw', so the JSON body is about 1.8 times
+    the attachment's own bytes. About 2.5 MB of attachments per message is
+    therefore the effective ceiling, below the larger shared budget. If any
+    message in the call is too large, the whole call is refused before the
+    first is sent. At most 100 messages are sent or drafted in one call on a
+    Composio grant.
     """
     try:
         if not isinstance(messages, list):

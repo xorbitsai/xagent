@@ -24,8 +24,9 @@ from .declarations import (
 )
 from .fixtures import FixtureRef
 
-# Connectors that have adopted V2, by catalog app id. Tool coverage and
-# exemptions for the six document connectors follow with #3565.
+# Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
+# connector has a check or an exemption (#3565, tests/web/connector_checks/
+# test_tool_coverage.py); a remote one declares the checks it has.
 CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     "atlassian": ConnectorChecks(
         "atlassian",
@@ -151,6 +152,59 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
     ),
 }
+
+
+# Builtin connectors that have not adopted V2 yet (#3565). The coverage test
+# skips them; every other builtin connector is in CONNECTOR_CHECKS, and each
+# tool of an in-repo (``python -m``) one has a check or an exemption. The list
+# only shrinks: a connector leaves it in the PR that adds its declaration, and
+# a new connector ships with its declaration instead of joining it.
+LEGACY_CONNECTORS: frozenset[str] = frozenset(
+    {
+        "aws",
+        "chartmogul",
+        "chrome-devtools",
+        "deputy",
+        "employment-hero",
+        "facebook",
+        "fireflies",
+        "freshdesk",
+        "github",
+        "gmail",
+        "google-ads",
+        "google-analytics",
+        "google-calendar",
+        "google-drive",
+        "google-maps",
+        "google-search-console",
+        "granola",
+        "hubspot",
+        "instagram",
+        "intercom",
+        "jira",
+        "linear",
+        "linkedin",
+        "magento",
+        "meta-ads",
+        "mixpanel",
+        "myob",
+        "onedrive",
+        "outlook",
+        "planner",
+        "posthog",
+        "rocketlane",
+        "salesforce",
+        "sharepoint",
+        "shopify",
+        "slack",
+        "stripe",
+        "teams",
+        "whatsapp",
+        "xero",
+        "zendesk",
+        "zoom",
+    }
+)
 
 
 def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:

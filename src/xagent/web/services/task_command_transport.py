@@ -1076,7 +1076,8 @@ def _claimable_query(
         .filter(
             # Keep START dormant until the entire shared host is enabled,
             # except the legacy ``execute_task`` START ("existing"), which
-            # combined mode consumes locally (``execute_existing_start_local``).
+            # combined mode consumes through the START consumer
+            # (``execute_task_start``) without a coordinator.
             (
                 true()
                 if get_shared_task_execution_enabled()

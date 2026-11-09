@@ -63,7 +63,6 @@ def _loaded_request() -> Any:
     return SimpleNamespace(
         task_id=5,
         task_owner_user_id=7,
-        task_source=None,
         task_description="d",
         task_context={},
         task_info={},

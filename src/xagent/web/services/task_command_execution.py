@@ -3323,7 +3323,7 @@ async def _pause_cap_held_commands_without_agent(
     if command.task_id in build_dispatch_cap_snapshot().active_ids:
         return False
     user = message_data["user"]
-    # Without shared execution the only command a pause may pass is a START.
+    # Without shared execution only a held START is settled here.
     started_run: tuple[ColumnElement[bool], ...] = ()
     if held_start_run_id is not None:
         started_run = (
@@ -5166,6 +5166,8 @@ async def _execute_and_report_local_start(
     result; an error that escapes is broadcast once it is final. A lost claim
     means another dispatcher owns the START and stays silent.
     """
+    from .task_start_consumer import PostCommitStartFailure
+
     try:
         settled = await execute(command)
     except TaskCommandRejected as exc:
@@ -5176,6 +5178,19 @@ async def _execute_and_report_local_start(
             exc, await _terminal_command_event_draft(command, exc)
         )
         await _broadcast_terminal_start_error(command, exc)
+        raise
+    except PostCommitStartFailure:
+        # The consumer told the client when it failed after its commit.
+        raise
+    except TaskCommandDeferred as exc:
+        # A deferral that will retry stays silent; the one that spends the
+        # budget is terminal and is the first the client hears of it.
+        if command.defer_count + 1 >= max_command_defers():
+            finish_task_command_delivery(command.command_id, command.task_id)
+            bind_terminal_event_draft(
+                exc, await _terminal_command_event_draft(command, exc)
+            )
+            await _broadcast_terminal_start_error(command, exc)
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
@@ -5191,10 +5206,29 @@ async def _execute_and_report_local_start(
         # The consumer settled a refusal in its own transaction, with the
         # durable event; the live client still has to be told.
         finish_task_command_delivery(command.command_id, command.task_id)
-        await _broadcast_terminal_start_error(
-            command, TaskCommandRejected("Task could not start.", reason=reason)
+        refusal = TaskCommandRejected("Task could not start.", reason=reason)
+        # Same presentation the staged terminal event carries.
+        bind_terminal_event_draft(
+            refusal, await _terminal_command_event_draft(command, refusal)
         )
+        await _broadcast_terminal_start_error(command, refusal)
     return settled
+
+
+async def report_post_commit_start_failure(
+    command: ClaimedTaskCommand, error: Exception
+) -> None:
+    """Broadcast the terminal error of a START that failed after it committed.
+
+    The command row is COMPLETED, so ``fail_task_command`` is a no-op and no
+    durable event will follow: this live frame is the only notice. It is sent
+    on every attempt because a completed command is never retried.
+    """
+    finish_task_command_delivery(command.command_id, command.task_id)
+    bind_terminal_event_draft(
+        error, await _terminal_command_event_draft(command, error)
+    )
+    await _broadcast_terminal_start_error(command, error)
 
 
 async def _broadcast_terminal_start_error(

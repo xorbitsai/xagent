@@ -10,7 +10,15 @@ search and read other reporters' tickets. This server offers exactly one tool,
 configuration, so the worst a visitor can do is file a ticket in that project.
 
 There is deliberately no read, search, get, update, comment, transition or
-delete tool, and no argument selects a project, site or URL.
+delete tool, and no argument selects a project, site or URL. Attachments are
+only ever uploaded to the issue the same call just created.
+
+Attachments are read only from directories named in
+``XAGENT_JIRA_FILE_ALLOWED_DIRS``. The shared helper treats an unset or blank
+value as "allow the working directory"; this server does not, because a launch
+path that does not provide an upload allowlist would then let a relative path
+such as ``.env`` be read from the server's own directory and uploaded. Unset
+or blank therefore means attachments are unavailable in that run.
 
 Configuration (per-user encrypted env, like the other key-based connectors):
 ``JIRA_TICKET_SITE``, ``JIRA_TICKET_EMAIL``, ``JIRA_TICKET_API_TOKEN`` and
@@ -33,6 +41,7 @@ import logging
 import os
 import re
 import socket
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -45,6 +54,12 @@ from ....core.utils.security import (
     reject_private_network_host,
 )
 from ...utils.graphql_errors import truncate_error_text
+from .jira_attachment import (
+    UPLOAD_ALLOWED_DIRS_ENV_VAR,
+    UPLOAD_TIMEOUT_SECONDS,
+    confirmed_attachment,
+    read_allowed_file,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-ticket-mcp")
@@ -281,11 +296,19 @@ def _send(
     path: str,
     *,
     json_data: dict[str, Any] | None = None,
+    files: dict[str, tuple[str, bytes]] | None = None,
     timeout: int = CREATE_TIMEOUT_SECONDS,
 ) -> requests.Response:
-    """Issue one request to the full API ``path``; raise a token-free error."""
+    """Issue one request to the full API ``path``; raise a token-free error.
+
+    ``files`` makes it a multipart upload: requests sets the Content-Type (it
+    carries the boundary) and Jira blocks an upload without the XSRF opt-out.
+    """
     email, token = _credentials()
     url = f"{site}{path}"
+    headers = {"Accept": "application/json"}
+    if files is not None:
+        headers["X-Atlassian-Token"] = "no-check"
 
     try:
         response = _session.request(
@@ -294,8 +317,9 @@ def _send(
             # Never follow a redirect with the Basic credential attached.
             allow_redirects=False,
             auth=(email, token),
-            headers={"Accept": "application/json"},
+            headers=headers,
             json=json_data,
+            files=files,
             timeout=timeout,
         )
     except requests.RequestException as exc:
@@ -378,6 +402,118 @@ def _adf_document(text: str) -> dict[str, Any]:
     return {"type": "doc", "version": 1, "content": content}
 
 
+_UPLOAD_FAILURE_GUIDANCE = (
+    "The ticket exists; this connector cannot add files to it later, so "
+    "mention the file in a follow-up instead of calling jira_ticket_create again."
+)
+
+
+def _upload_failure_reason(exc: Exception) -> str:
+    """Reason for a failed upload, from this module's own wording only.
+
+    Raw exception text is never included: it can carry host paths, proxy URLs
+    or advice written for jira.py's tools (including "try again", which with
+    this connector can only mean a second create and a duplicate ticket). The
+    only text that comes from outside is Jira's own capped field/error details
+    on a 4xx, which ``_error_details`` redacts and bounds.
+
+    The failure is classified by type and cause, not by message: a failed HTTP
+    response reaches here as the RuntimeError ``_send`` raises from an
+    ``HTTPError`` that carries the response.
+    """
+    check = "check the ticket's attachments"
+    response = getattr(exc.__cause__, "response", None)
+    status = getattr(response, "status_code", None)
+    if response is not None and isinstance(status, int):
+        if status == 403:
+            return (
+                "Jira denied the upload: the connection's account needs the "
+                "Create Attachments permission in the project"
+            )
+        if status == 404:
+            return "Jira could not find the ticket just created to attach the file"
+        if status == 413:
+            return (
+                "Jira rejected the file as too large for the site's attachment "
+                "limit, or the ticket reached its attachment limit"
+            )
+        if status == 429:
+            return "Jira rate-limited the upload"
+        if status >= 500:
+            return (
+                f"Jira answered HTTP {status}; the upload may have completed -- {check}"
+            )
+        if 400 <= status < 500:
+            detail = _error_details(response)
+            base = f"Jira rejected the upload (HTTP {status})"
+            return f"{base}: {detail}" if detail else base
+    if isinstance(exc, _NothingSentError):
+        return "The upload could not be sent to Jira"
+    if isinstance(exc, requests.exceptions.JSONDecodeError) or (
+        isinstance(exc, ValueError) and not isinstance(exc, requests.RequestException)
+    ):
+        # A 2xx whose body is not JSON, or that confirmed no matching attachment.
+        return f"Jira did not confirm the attachment -- {check}"
+    if isinstance(exc, requests.RequestException):
+        return (
+            "The upload did not complete; the file may or may not be attached "
+            f"-- {check}"
+        )
+    return "The upload failed"
+
+
+def _attachment_failure(filename: str, exc: Exception) -> dict[str, str]:
+    """A failed_attachments entry for ``filename`` (a name, never a host path)."""
+    return {
+        "path": Path(filename).name or "attachment",
+        "error": f"{_upload_failure_reason(exc)}. {_UPLOAD_FAILURE_GUIDANCE}",
+    }
+
+
+def _read_attachments(paths: dict[str, str]) -> list[tuple[str, bytes]]:
+    """Read every named local file up front, before any ticket exists.
+
+    ``paths`` maps argument name to the raw path; blank ones are skipped.
+    Raises ValueError naming the argument for the first rejected file.
+    Holds up to three files of MAX_ATTACHMENT_BYTES in memory at once.
+    """
+    named = {arg: raw for arg, raw in paths.items() if raw and raw.strip()}
+    if named and not (os.environ.get(UPLOAD_ALLOWED_DIRS_ENV_VAR) or "").strip():
+        raise ValueError(
+            f"{next(iter(named))}: attachments are not available in this run "
+            "(no upload directory allowlist was provided). No ticket was "
+            "created; mention the files in the description instead"
+        )
+    files: list[tuple[str, bytes]] = []
+    for arg, raw in named.items():
+        try:
+            files.append(read_allowed_file(raw))
+        except (ValueError, OSError) as exc:
+            raise ValueError(
+                f"{arg} could not be attached: {_safe_text(exc)}. "
+                "No ticket was created."
+            ) from exc
+    return files
+
+
+def _upload(site: str, key: str, filename: str, data: bytes) -> dict[str, Any]:
+    """Upload one pre-read file to ``key``; raises on any failure."""
+    response = _send(
+        site,
+        "POST",
+        f"/rest/api/3/issue/{key}/attachments",
+        files={"file": (filename, data)},
+        timeout=UPLOAD_TIMEOUT_SECONDS,
+    )
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise requests.exceptions.JSONDecodeError(
+            "Jira returned a non-JSON response to the upload", "", 0
+        ) from exc
+    return confirmed_attachment(body, len(data))
+
+
 def _outcome_unknown(exc: Exception) -> bool:
     """True if a failed create may nevertheless have created the ticket."""
     if isinstance(exc, _NothingSentError):
@@ -398,6 +534,9 @@ def jira_ticket_create(
     description: str,
     issue_type: str = "",
     labels: list[str] | None = None,
+    attachment_path: str = "",
+    attachment_path_2: str = "",
+    attachment_path_3: str = "",
 ) -> str:
     """
     Create one Jira ticket in the project this connection is configured for.
@@ -411,12 +550,22 @@ def jira_ticket_create(
         interpreted.
     issue_type: Jira issue type name, e.g. "Bug" or "Task"; empty means "Task".
     labels: optional labels; each is one word without spaces (max 10).
+    attachment_path, attachment_path_2, attachment_path_3: optional files to
+        attach, up to three; they take files the user uploaded in this
+        conversation. They are attached only to the ticket this call creates.
+        A file that is missing, not allowed or too large is rejected before
+        anything is sent, so no ticket is created. If the ticket is created
+        but an upload then fails, the result lists it under failed_attachments;
+        this connector cannot add files to a ticket later, so mention such a
+        file in a follow-up instead of calling this tool again.
 
     Calling this again creates another ticket, so if a call fails with the
     ticket possibly already created, do not call this tool again; tell the
     user it may already have been filed.
 
-    Returns the issue key and its browse URL.
+    Returns the issue key and its browse URL, plus attachments (the files
+    uploaded to the ticket) and failed_attachments (the files that could not
+    be, each with a reason).
     """
     try:
         # Jira Cloud rejects a summary containing newline characters.
@@ -431,6 +580,15 @@ def jira_ticket_create(
         clean_labels = _validated_labels(labels)
         project_key = _project_key()
         site = _base_url()
+        # Local files are validated before the ticket exists, so a bad path
+        # cannot leave an orphan ticket that the agent then recreates.
+        files = _read_attachments(
+            {
+                "attachment_path": attachment_path,
+                "attachment_path_2": attachment_path_2,
+                "attachment_path_3": attachment_path_3,
+            }
+        )
 
         fields: dict[str, Any] = {
             "project": {"key": project_key},
@@ -470,7 +628,20 @@ def jira_ticket_create(
         logger.error("Error creating Jira ticket: %s", safe_message)
         return _error(safe_message)
 
-    return _success(key=key, url=f"{site}/browse/{key}")
+    attachments: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for filename, data in files:
+        try:
+            attachments.append(_upload(site, key, filename, data))
+        except Exception as exc:
+            failed.append(_attachment_failure(filename, exc))
+
+    return _success(
+        key=key,
+        url=f"{site}/browse/{key}",
+        attachments=attachments,
+        failed_attachments=failed,
+    )
 
 
 if __name__ == "__main__":

@@ -534,6 +534,12 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("slack", "slack_upload_file"): ("file_path",),
     ("jira", "jira_add_attachment"): ("file_path",),
     ("facebook-pages", "facebook_publish_image_post"): ("file_path",),
+    # Create-only intake connector: only the ticket this same call creates gets the files.
+    ("jira-ticket", "jira_ticket_create"): (
+        "attachment_path",
+        "attachment_path_2",
+        "attachment_path_3",
+    ),
 }
 
 # Tools above whose own ``file_id`` argument names something other than a

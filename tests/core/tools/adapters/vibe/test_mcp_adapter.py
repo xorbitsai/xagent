@@ -593,6 +593,132 @@ def test_durable_upload_mapping_covers_builtin_connectors(
     assert _durable_upload_fields("Google_Drive", "google_drive_upload_file") == ()
 
 
+def test_durable_upload_mapping_covers_all_ticket_attachment_fields():
+    assert _durable_upload_fields("jira-ticket", "jira_ticket_create") == (
+        "attachment_path",
+        "attachment_path_2",
+        "attachment_path_3",
+    )
+
+
+def _ticket_create_adapter(workspace):
+    mcp_tool = SimpleNamespace(
+        name="jira_ticket_create",
+        description="Create a ticket",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "attachment_path": {"type": "string"},
+                "attachment_path_2": {"type": "string"},
+                "attachment_path_3": {"type": "string"},
+            },
+        },
+    )
+    return _build_mcp_tool_adapter(
+        "jira-ticket",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=workspace,
+    )
+
+
+class _TicketWorkspace:
+    def __init__(self):
+        self.staged = []
+        self.discarded = []
+
+    def stage_file_for_external_upload(self, file_id):
+        self.staged.append(file_id)
+        return f"/task/temp/.xagent-internal/mcp-upload/staged/{file_id}.bin"
+
+    def discard_staged_external_upload(self, path):
+        self.discarded.append(path)
+
+
+_TICKET_REFS = {
+    "attachment_path": "file:11111111-1111-4111-8111-111111111111",
+    "attachment_path_2": "file:22222222-2222-4222-8222-222222222222",
+    "attachment_path_3": "file:33333333-3333-4333-8333-333333333333",
+}
+
+
+def _staged_path(field):
+    file_id = _TICKET_REFS[field].removeprefix("file:")
+    return f"/task/temp/.xagent-internal/mcp-upload/staged/{file_id}.bin"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        ["attachment_path", "attachment_path_2", "attachment_path_3"],
+        ["attachment_path_3"],
+    ],
+)
+async def test_ticket_create_stages_and_cleans_every_attachment_field(
+    monkeypatch, fields
+):
+    workspace = _TicketWorkspace()
+    adapter = _ticket_create_adapter(workspace)
+    captured = {}
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async(
+        {"summary": "Login broken", **{f: _TICKET_REFS[f] for f in fields}}
+    )
+
+    assert result["is_error"] is False
+    assert captured["name"] == "jira_ticket_create"
+    assert captured["arguments"]["summary"] == "Login broken"
+    for field in fields:
+        assert captured["arguments"][field] == _staged_path(field)
+    for field in set(_TICKET_REFS) - set(fields):
+        assert field not in captured["arguments"]
+    assert workspace.staged == [_TICKET_REFS[f].removeprefix("file:") for f in fields]
+    assert workspace.discarded == [_staged_path(f) for f in fields]
+
+
+@pytest.mark.asyncio
+async def test_ticket_create_discards_every_staged_file_when_connector_raises(
+    monkeypatch,
+):
+    workspace = _TicketWorkspace()
+    adapter = _ticket_create_adapter(workspace)
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            raise RuntimeError("connector failed")
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async({"summary": "Login broken", **_TICKET_REFS})
+
+    assert result["is_error"] is True
+    assert workspace.discarded == [_staged_path(f) for f in _TICKET_REFS]
+
+
 def test_external_media_mapping_is_limited_to_builtin_instagram():
     binding = _external_media_binding("Instagram", "instagram_publish_image")
 

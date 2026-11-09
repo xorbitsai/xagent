@@ -1,12 +1,13 @@
 """Tests for the create-only Jira ticket connector.
 
-Mocked against the Jira Cloud REST v3 contract (create issue).
+Mocked against the Jira Cloud REST v3 contract (create issue, add attachment).
 They pin the requests this module builds and how it translates responses; they
 cannot show the documented shapes match a live site.
 """
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,7 +21,7 @@ from urllib3.exceptions import (
     ReadTimeoutError,
 )
 
-from xagent.web.tools.mcp import jira_ticket
+from xagent.web.tools.mcp import jira_attachment, jira_ticket
 
 SITE = "https://acme.atlassian.net"
 TOKEN = "tok-SECRET-123"
@@ -76,11 +77,28 @@ def _config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JIRA_TICKET_EMAIL", EMAIL)
     monkeypatch.setenv("JIRA_TICKET_API_TOKEN", TOKEN)
     monkeypatch.setenv("JIRA_TICKET_PROJECT_KEY", "SUP")
+    monkeypatch.delenv(jira_attachment.UPLOAD_ALLOWED_DIRS_ENV_VAR, raising=False)
     # Resolve every host to a public address by default.
     monkeypatch.setattr(
         jira_ticket.socket,
         "getaddrinfo",
         lambda *a, **k: [(2, 1, 6, "", ("104.192.136.1", 443))],
+    )
+
+
+@pytest.fixture
+def allowed_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    directory = tmp_path / "workspace"
+    directory.mkdir()
+    monkeypatch.setenv(
+        jira_attachment.UPLOAD_ALLOWED_DIRS_ENV_VAR, json.dumps([str(directory)])
+    )
+    return directory
+
+
+def _attached(size: int, name: str = "a.txt") -> _FakeResponse:
+    return _FakeResponse(
+        payload=[{"id": "9", "filename": name, "size": size, "mimeType": "text/plain"}]
     )
 
 
@@ -120,6 +138,9 @@ def test_tool_has_no_argument_that_selects_project_site_or_url() -> None:
         "description",
         "issue_type",
         "labels",
+        "attachment_path",
+        "attachment_path_2",
+        "attachment_path_3",
     }
 
 
@@ -255,6 +276,8 @@ def test_create_request_shape_and_result(session: _FakeSession) -> None:
         "status": "success",
         "key": "SUP-7",
         "url": f"{SITE}/browse/SUP-7",
+        "attachments": [],
+        "failed_attachments": [],
     }
     (call,) = session.calls
     assert call["method"] == "POST"
@@ -326,12 +349,303 @@ def test_create_response_without_a_usable_key_is_an_error(
 
 
 def test_create_response_with_a_path_like_key_is_refused(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    (allowed_dir / "a.txt").write_bytes(b"hi")
+    session.queue = [_created("../../SUP-1")]
+    result = _call(attachment_path=str(allowed_dir / "a.txt"))
+    assert result["status"] == "error"
+    assert len(session.calls) == 1  # no upload to a crafted path
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+
+def _write(directory: Path, name: str, data: bytes) -> str:
+    (directory / name).write_bytes(data)
+    return str(directory / name)
+
+
+def test_attachments_upload_to_the_created_issue_in_order(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    b = _write(allowed_dir, "b.txt", b"world!!")
+    session.queue = [_created("SUP-9"), _attached(5, "a.txt"), _attached(7, "b.txt")]
+
+    result = _call(attachment_path=a, attachment_path_2="", attachment_path_3=b)
+
+    assert result["failed_attachments"] == []
+    assert [x["filename"] for x in result["attachments"]] == ["a.txt", "b.txt"]
+    assert len(session.calls) == 3
+    for call, name, data in zip(
+        session.calls[1:], ("a.txt", "b.txt"), (b"hello", b"world!!")
+    ):
+        assert call["method"] == "POST"
+        assert call["url"] == f"{SITE}/rest/api/3/issue/SUP-9/attachments"
+        assert call["headers"]["X-Atlassian-Token"] == "no-check"
+        assert "Content-Type" not in call["headers"]
+        assert call["files"] == {"file": (name, data)}
+        assert call["json"] is None
+        assert call["auth"] == (EMAIL, TOKEN)
+        assert call["allow_redirects"] is False
+        assert call["timeout"] == jira_attachment.UPLOAD_TIMEOUT_SECONDS
+
+
+def test_create_request_carries_no_files_or_xsrf_header(
     session: _FakeSession,
 ) -> None:
-    session.queue = [_created("../../SUP-1")]
-    result = _call()
+    session.queue = [_created()]
+    _call()
+    assert session.calls[0].get("files") is None
+    assert "X-Atlassian-Token" not in session.calls[0]["headers"]
+
+
+def test_attachment_outside_allowed_dirs_creates_nothing(
+    session: _FakeSession, allowed_dir: Path, tmp_path: Path
+) -> None:
+    outside = _write(tmp_path, "secret.txt", b"nope")
+    ok = _write(allowed_dir, "ok.txt", b"fine")
+
+    result = _call(attachment_path=ok, attachment_path_2=outside)
+
     assert result["status"] == "error"
+    assert "attachment_path_2" in result["message"]
+    assert "outside the allowed" in result["message"]
+    assert "No ticket was created" in result["message"]
+    assert str(tmp_path) not in json.dumps(result)
+    assert session.calls == []
+
+
+def test_missing_attachment_creates_nothing(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    result = _call(attachment_path_3=str(allowed_dir / "gone.txt"))
+    assert result["status"] == "error"
+    assert "attachment_path_3" in result["message"]
+    assert session.calls == []
+
+
+def test_attachment_over_the_size_limit_creates_nothing(
+    session: _FakeSession, allowed_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(jira_attachment, "MAX_ATTACHMENT_BYTES", 4)
+    big = _write(allowed_dir, "big.bin", b"12345")
+
+    result = _call(attachment_path=big)
+
+    assert result["status"] == "error"
+    assert "attachment_path" in result["message"]
+    assert "over the local upload limit" in result["message"]
+    assert session.calls == []
+
+
+def test_empty_json_allowlist_denies_every_attachment(
+    session: _FakeSession, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(jira_attachment.UPLOAD_ALLOWED_DIRS_ENV_VAR, "[]")
+    result = _call(attachment_path=_write(tmp_path, "a.txt", b"hi"))
+    assert result["status"] == "error"
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", "[]"])
+def test_unset_blank_or_empty_allowlist_refuses_without_opening_the_file(
+    session: _FakeSession,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+) -> None:
+    """No working-directory fallback: a launch path that gives no allowlist
+    must not let a relative path read from the server's cwd."""
+    if value is None:
+        monkeypatch.delenv(jira_attachment.UPLOAD_ALLOWED_DIRS_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(jira_attachment.UPLOAD_ALLOWED_DIRS_ENV_VAR, value)
+    (tmp_path / ".env").write_bytes(b"SECRET=1")
+    monkeypatch.chdir(tmp_path)
+
+    opened: list[Any] = []
+    real_open = Path.open
+    real_read_bytes = Path.read_bytes
+
+    def _spy_open(self: Path, *a: Any, **k: Any) -> Any:
+        opened.append(self)
+        return real_open(self, *a, **k)
+
+    def _spy_read_bytes(self: Path) -> bytes:
+        opened.append(self)
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "open", _spy_open)
+    monkeypatch.setattr(Path, "read_bytes", _spy_read_bytes)
+
+    result = _call(attachment_path=".env")
+
+    assert result["status"] == "error"
+    assert "No ticket was created" in result["message"]
+    assert not any(p.name == ".env" for p in opened)
+    assert session.calls == []
+
+
+def test_no_attachment_needs_no_allowlist(session: _FakeSession) -> None:
+    session.queue = [_created()]
+    assert _call()["status"] == "success"
+
+
+def test_blank_attachment_arguments_are_ignored(session: _FakeSession) -> None:
+    session.queue = [_created()]
+    assert _call(attachment_path="  ", attachment_path_2="")["status"] == "success"
     assert len(session.calls) == 1
+
+
+def _nothing_sent() -> BaseException:
+    return jira_ticket._NothingSentError("Jira request failed: host unreachable")
+
+
+def _http(status: int, payload: Any = None, **kwargs: Any) -> _FakeResponse:
+    return _FakeResponse(
+        status_code=status,
+        payload=payload,
+        text="x" if payload is None else "",
+        **kwargs,
+    )
+
+
+_CONFIRM = "Jira did not confirm the attachment"
+_CHECK = "check the ticket's attachments"
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        (
+            _http(403, {"errorMessages": ["nope"]}),
+            "Jira denied the upload: the connection's account needs the "
+            "Create Attachments permission in the project",
+        ),
+        (
+            _http(404),
+            "Jira could not find the ticket just created to attach the file",
+        ),
+        (
+            _http(413),
+            "Jira rejected the file as too large for the site's attachment limit, "
+            "or the ticket reached its attachment limit",
+        ),
+        (
+            _http(429, headers={"Retry-After": "12"}),
+            "Jira rate-limited the upload",
+        ),
+        (
+            _http(400, {"errorMessages": ["The file name is invalid"]}),
+            "Jira rejected the upload (HTTP 400): The file name is invalid",
+        ),
+        (_http(400), "Jira rejected the upload (HTTP 400)"),
+        (
+            _http(500),
+            f"Jira answered HTTP 500; the upload may have completed -- {_CHECK}",
+        ),
+        (
+            _http(503),
+            f"Jira answered HTTP 503; the upload may have completed -- {_CHECK}",
+        ),
+        (_nothing_sent(), "The upload could not be sent to Jira"),
+        (
+            requests.ReadTimeout("slow"),
+            "The upload did not complete; the file may or may not be attached "
+            f"-- {_CHECK}",
+        ),
+        (
+            requests.ConnectionError("reset"),
+            "The upload did not complete; the file may or may not be attached "
+            f"-- {_CHECK}",
+        ),
+        (_attached(99), f"{_CONFIRM} -- {_CHECK}"),  # size differs from the 5 sent
+        (_FakeResponse(status_code=200, text="<html>"), f"{_CONFIRM} -- {_CHECK}"),
+    ],
+)
+def test_failed_upload_reason_comes_from_the_fixed_vocabulary(
+    session: _FakeSession, allowed_dir: Path, outcome: Any, expected: str
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    session.queue = [_created(), outcome]
+    result = _call(attachment_path=a)
+    assert result["status"] == "success"
+    assert result["key"] == "SUP-7"
+    assert result["attachments"] == []
+    (failure,) = result["failed_attachments"]
+    assert failure["path"] == "a.txt"
+    error = failure["error"]
+    assert error == f"{expected}. {jira_ticket._UPLOAD_FAILURE_GUIDANCE}"
+    lowered = error.lower()
+    for phrase in ("retry", "try again", "before retrying"):
+        assert phrase not in lowered
+    assert "12s" not in error
+    assert "cloud_id" not in error and "issue_key" not in error
+
+
+def test_unclassified_upload_failure_is_a_generic_reason(
+    session: _FakeSession, allowed_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    session.queue = [_created()]
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("secret internals, try again later")
+
+    monkeypatch.setattr(jira_ticket, "_upload", boom)
+    error = _call(attachment_path=a)["failed_attachments"][0]["error"]
+    assert error == (f"The upload failed. {jira_ticket._UPLOAD_FAILURE_GUIDANCE}")
+
+
+def test_upload_400_details_never_echo_the_token(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    session.queue = [
+        _created(),
+        _FakeResponse(
+            status_code=400,
+            payload={"errorMessages": [], "errors": {"file": f"bad {TOKEN}"}},
+        ),
+    ]
+    result = _call(attachment_path=a)
+    error = result["failed_attachments"][0]["error"]
+    assert error.startswith("Jira rejected the upload (HTTP 400): file: bad")
+    assert TOKEN not in json.dumps(result)
+
+
+def test_one_failed_upload_does_not_stop_the_next(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    b = _write(allowed_dir, "b.txt", b"world")
+    session.queue = [_created(), _nothing_sent(), _attached(5, "b.txt")]
+    result = _call(attachment_path=a, attachment_path_2=b)
+    assert [x["filename"] for x in result["attachments"]] == ["b.txt"]
+    assert [x["path"] for x in result["failed_attachments"]] == ["a.txt"]
+
+
+def test_failed_attachments_never_contain_a_host_path(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    posix = "/Users/Some Body/key.pem"
+    windows = "C:\\Users\\Some Body\\key.pem"
+    session.queue = [
+        _created(),
+        requests.ConnectionError(f"failed sending {a}, {posix} and {windows}"),
+    ]
+    result = _call(attachment_path=a)
+    assert result["failed_attachments"][0]["path"] == "a.txt"
+    dumped = json.dumps(result)
+    for leaked in (str(allowed_dir), posix, windows, "Some Body", "key.pem"):
+        assert leaked not in dumped
+    # JSON escapes backslashes, so check the raw form as well.
+    assert "Users" not in dumped
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +893,7 @@ def test_rate_limit_on_create_is_not_outcome_unknown(session: _FakeSession) -> N
 
 
 def test_base_url_resolves_the_site_once_per_call(
-    session: _FakeSession, monkeypatch: pytest.MonkeyPatch
+    session: _FakeSession, allowed_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Counts only _base_url's pre-check: the session fixture replaces the
     # facade, whose own resolve on connect is outside this test.
@@ -590,8 +904,9 @@ def test_base_url_resolves_the_site_once_per_call(
         return [(2, 1, 6, "", ("104.192.136.1", 443))]
 
     monkeypatch.setattr(jira_ticket.socket, "getaddrinfo", _resolve)
-    session.queue = [_created()]
-    assert _call()["status"] == "success"
+    a = _write(allowed_dir, "a.txt", b"hello")
+    session.queue = [_created(), _attached(5)]
+    assert _call(attachment_path=a)["status"] == "success"
     assert len(lookups) == 1
 
 

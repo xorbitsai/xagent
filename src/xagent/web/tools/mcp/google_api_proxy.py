@@ -86,8 +86,6 @@ def _content(response_data: Any) -> tuple[bytes, str]:
     """The response body and content type for one proxied JSON answer."""
     if response_data is None:
         return b"", _JSON_CONTENT_TYPE
-    if isinstance(response_data, bytes):
-        return response_data, "application/octet-stream"
     if isinstance(response_data, str):
         return response_data.encode("utf-8"), "text/plain; charset=UTF-8"
     return json.dumps(response_data).encode("utf-8"), _JSON_CONTENT_TYPE
@@ -319,11 +317,7 @@ def _replays_a_get(headers: Mapping[str, str]) -> bool:
 
 
 def _form_text(body: str | bytes | None) -> str:
-    if body is None:
-        return ""
-    if isinstance(body, str):
-        return body
-    return body.decode("utf-8")
+    return (body.decode("utf-8") if isinstance(body, bytes) else body) or ""
 
 
 def execute_batch(

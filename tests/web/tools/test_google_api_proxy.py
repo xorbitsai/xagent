@@ -170,28 +170,20 @@ def test_a_no_content_answer_has_an_empty_body(proxy):
 
     assert response.status == 204
     assert content == b""
+    assert response["content-type"] == "application/json; charset=UTF-8"
 
 
-@pytest.mark.parametrize(
-    "data, expected, content_type",
-    [
-        ("%PDF-1.4 bytes", b"%PDF-1.4 bytes", "text/plain; charset=UTF-8"),
-        (b"%PDF-1.4 bytes", b"%PDF-1.4 bytes", "application/octet-stream"),
-        (None, b"", "application/json; charset=UTF-8"),
-    ],
-    ids=["text", "bytes", "empty"],
-)
-def test_a_non_json_answer_is_returned_as_bytes(proxy, data, expected, content_type):
+def test_a_text_answer_is_returned_as_bytes(proxy):
     """A later media download reuses this transport; its answer may not be
     JSON."""
-    proxy.answer_with(200, {"status": 200, "data": data})
+    proxy.answer_with(200, {"status": 200, "data": "%PDF-1.4 bytes"})
 
     response, content = _http().request(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/x"
     )
 
-    assert content == expected
-    assert response["content-type"] == content_type
+    assert content == b"%PDF-1.4 bytes"
+    assert response["content-type"] == "text/plain; charset=UTF-8"
 
 
 def test_an_upstream_error_keeps_its_status_and_body(proxy):

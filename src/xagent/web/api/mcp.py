@@ -7106,8 +7106,10 @@ async def discover_mcp_oauth(
 def _initiated_on_mcp_oauth_callback_site(request: Request) -> bool:
     """Whether ``request`` reached this deployment on the OAuth callback's site.
 
-    Only a deployment with several public entries has more than one site; with
-    a single entry every request is on the callback's site.
+    Only a deployment with configured public entries can tell sites apart.
+    Without them ``request_public_entry`` does not read the Host header, so the
+    check passes; a callback that then misses the state cookie fails before the
+    token exchange.
     """
     from ..public_entries import request_public_entry
 

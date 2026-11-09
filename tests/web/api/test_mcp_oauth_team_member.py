@@ -1025,3 +1025,25 @@ async def test_team_member_regional_request_must_start_on_the_callback_site(
     assert env.register_calls == 0
     assert env.db.query(MCPOAuthFlowState).count() == 0
     assert env.db.query(MCPOAuthClient).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_team_member_regional_request_without_public_entries_is_not_rejected(
+    env, monkeypatch
+):
+    # Without configured public entries the request's site cannot be told
+    # apart, so the site check passes even though the callback lives on the
+    # API host while the authorization entry points back at the app host.
+    monkeypatch.delenv("XAGENT_PUBLIC_ENTRIES_JSON", raising=False)
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://callback.example.com")
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv(
+        "XAGENT_OAUTH_AUTHORIZATION_ENTRY_BASE_URL", "https://callback.example.com"
+    )
+    monkeypatch.setenv("XAGENT_DUAL_ENTRY_OAUTH_ENABLED", "true")
+
+    response = await env.connect(request=_regional_request("other.example.com"))
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith(f"{ISSUER}/authorize")
+    assert env.db.query(MCPOAuthFlowState).one().access_path == "team_member"

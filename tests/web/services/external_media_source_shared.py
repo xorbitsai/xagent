@@ -93,6 +93,28 @@ def jpeg_400px(layout: str) -> bytes:
     return buffer.getvalue()
 
 
+# The scan layouts against the PNG pixel limit, lowered to 400 * 400 + slack:
+# one scan per layout keeps the higher JPEG limit, more than one gets the PNG
+# limit (#3596). Shared by the issuance and the route tests.
+MULTI_SCAN_PIXEL_LIMIT_CASES = pytest.mark.parametrize(
+    ("layout", "slack", "refused_as"),
+    [
+        ("progressive", -1, "progressive JPEG"),
+        ("progressive", 0, None),
+        ("non-interleaved", -1, "multi-scan JPEG"),
+        ("non-interleaved", 0, None),
+        ("interleaved", -1, None),
+    ],
+    ids=[
+        "progressive-over",
+        "progressive-at-limit",
+        "non-interleaved-over",
+        "non-interleaved-at-limit",
+        "interleaved-same-size",
+    ],
+)
+
+
 def write_small_image(path: Path) -> None:
     """A small valid image, in the format the file name's extension says."""
     image_format = "JPEG" if path.suffix == ".jpg" else "PNG"

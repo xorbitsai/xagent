@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from tests.web.services.external_media_source_shared import (
+    MULTI_SCAN_PIXEL_LIMIT_CASES,
     OVERSIZED,
     OVERSIZED_SOURCES,
     SOURCE_LIMIT,
@@ -425,6 +426,40 @@ def test_route_holds_a_conforming_jpeg_to_the_source_byte_limit(
         assert response.content == expected
 
 
+@pytest.mark.parametrize(
+    ("filename", "image_format"),
+    [("ready.jpg", "JPEG"), ("converted.png", "PNG")],
+    ids=["sent-as-read", "converted"],
+)
+def test_route_reads_a_delivered_source_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+    filename: str,
+    image_format: str,
+):
+    # Why: Pillow must be given the bounded copy, never the file (#3596). The
+    # refusal paths above cannot tell: a route that checked the copy but then
+    # handed the file to Pillow would still refuse those. On success the file
+    # is read once, in full, and never again.
+    image_path, url = _instagram_source_url(
+        monkeypatch,
+        tmp_path,
+        db,
+        filename=filename,
+        write=lambda path: Image.new("RGB", (1080, 1080), "blue").save(
+            path, image_format
+        ),
+    )
+    opened = count_source_reads(monkeypatch, files)
+
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert [reader.bytes_read for reader in opened] == [image_path.stat().st_size]
+
+
 def test_route_converts_a_conforming_jpeg_over_the_jpeg_byte_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -457,23 +492,7 @@ def test_route_converts_a_conforming_jpeg_over_the_jpeg_byte_limit(
     assert response.content.startswith(b"\xff\xd8")
 
 
-@pytest.mark.parametrize(
-    ("layout", "slack", "refused_as"),
-    [
-        ("progressive", -1, "progressive JPEG"),
-        ("progressive", 0, None),
-        ("non-interleaved", -1, "multi-scan JPEG"),
-        ("non-interleaved", 0, None),
-        ("interleaved", -1, None),
-    ],
-    ids=[
-        "progressive-over",
-        "progressive-at-limit",
-        "non-interleaved-over",
-        "non-interleaved-at-limit",
-        "interleaved-same-size",
-    ],
-)
+@MULTI_SCAN_PIXEL_LIMIT_CASES
 def test_route_holds_a_multi_scan_jpeg_to_the_png_pixel_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

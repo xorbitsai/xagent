@@ -490,7 +490,10 @@ def read_instagram_source(source: BinaryIO) -> BytesIO:
     limit. A file already over the limit is refused unread; reading at most one
     byte past it catches a file the sandbox grows or rewrites after that check.
 
-    Raises ``OSError`` when the file cannot be read.
+    Raises ``ExternalMediaUnavailable`` when the file is over the limit (the
+    route answers it with 422; it is not an ``OSError``, so issuance's
+    ``except OSError`` lets it through), and ``OSError`` when the file cannot
+    be read.
     """
     limit = INSTAGRAM_MAX_SOURCE_BYTES
     if os.fstat(source.fileno()).st_size <= limit:
@@ -501,15 +504,6 @@ def read_instagram_source(source: BinaryIO) -> BytesIO:
         f"Registered image exceeds the {limit // (1024 * 1024)} MB Instagram "
         "source limit; compress or downscale it and try again"
     )
-
-
-def _source_size(source: Path | BinaryIO) -> int:
-    if isinstance(source, Path):
-        return source.stat().st_size
-    if isinstance(source, BytesIO):
-        with source.getbuffer() as content:
-            return content.nbytes
-    return os.fstat(source.fileno()).st_size
 
 
 def _validate_instagram_header(source: BinaryIO) -> None:
@@ -614,11 +608,16 @@ def _jpeg_main_image_ends(content: bytes) -> bool:
     return content.find(_JPEG_END_OF_IMAGE, scan_start) != -1
 
 
-def instagram_image_requires_normalization(source: Path | BinaryIO) -> bool:
-    """Return whether a local image must be normalized before Instagram fetches it."""
+def instagram_image_requires_normalization(source: BytesIO) -> bool:
+    """Return whether a local image must be normalized before Instagram fetches it.
+
+    ``source`` is the bounded copy ``read_instagram_source`` returns, so Pillow
+    never reads the file itself.
+    """
 
     try:
-        file_size = _source_size(source)
+        with source.getbuffer() as content:
+            file_size = content.nbytes
         with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
             if image.format != "JPEG":
@@ -688,8 +687,11 @@ def _resize_for_instagram_canvas(
     return image
 
 
-def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
-    """Normalize a local image to Instagram's JPEG and aspect-ratio contract."""
+def instagram_jpeg_bytes(source: BytesIO) -> bytes:
+    """Normalize a local image to Instagram's JPEG and aspect-ratio contract.
+
+    ``source`` is the bounded copy ``read_instagram_source`` returns.
+    """
 
     try:
         with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:

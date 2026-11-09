@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from tests.web.services.external_media_source_shared import (
+    MULTI_SCAN_PIXEL_LIMIT_CASES,
     OVERSIZED,
     OVERSIZED_SOURCES,
     SOURCE_LIMIT,
@@ -366,7 +367,7 @@ def test_instagram_jpeg_conversion_flattens_alpha_and_pads_aspect_ratio(tmp_path
     source = tmp_path / "tall.png"
     Image.new("RGBA", (100, 300), (255, 0, 0, 128)).save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "converted.jpg"
     output.write_bytes(converted)
 
@@ -382,7 +383,7 @@ def test_instagram_conversion_upscales_tiny_tall_image_to_minimum_width(tmp_path
     source = tmp_path / "tiny-tall.png"
     Image.new("RGB", (3, 4), "blue").save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "tiny-tall.jpg"
     output.write_bytes(converted)
 
@@ -395,7 +396,7 @@ def test_instagram_conversion_resizes_before_padding_extreme_tall_image(tmp_path
     source = tmp_path / "extreme-tall.png"
     Image.new("RGB", (10, 50_000), "blue").save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "extreme-tall.jpg"
     output.write_bytes(converted)
 
@@ -408,7 +409,7 @@ def test_instagram_conversion_pads_wide_image_and_downscales_width(tmp_path):
     source = tmp_path / "wide.png"
     Image.new("RGB", (2000, 500), "blue").save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "wide.jpg"
     output.write_bytes(converted)
 
@@ -424,7 +425,7 @@ def test_instagram_conversion_flattens_palette_transparency(tmp_path):
     image.info["transparency"] = 0
     image.save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "palette.jpg"
     output.write_bytes(converted)
 
@@ -439,8 +440,13 @@ def test_instagram_conversion_applies_exif_orientation(tmp_path):
     exif[274] = 6
     Image.new("RGB", (400, 800), "blue").save(source, exif=exif)
 
-    assert external_media.instagram_image_requires_normalization(source) is True
-    converted = external_media.instagram_jpeg_bytes(source)
+    assert (
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
+        is True
+    )
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "oriented-normalized.jpg"
     output.write_bytes(converted)
 
@@ -536,7 +542,12 @@ def test_instagram_conforming_jpeg_does_not_require_normalization(tmp_path):
     source = tmp_path / "ready.jpg"
     Image.new("RGB", (1080, 1080), "blue").save(source)
 
-    assert external_media.instagram_image_requires_normalization(source) is False
+    assert (
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
+        is False
+    )
 
 
 def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_path):
@@ -562,7 +573,9 @@ def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_pa
     )
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="pixel limit"):
-        external_media.instagram_image_requires_normalization(source)
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
 
 
 @pytest.mark.parametrize(
@@ -574,7 +587,9 @@ def test_instagram_decoder_errors_are_mapped(monkeypatch, tmp_path, error):
     monkeypatch.setattr(external_media.Image, "open", Mock(side_effect=error))
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="decoded"):
-        external_media.instagram_image_requires_normalization(source)
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
 
 
 def test_issue_preflights_image_header(monkeypatch, tmp_path):
@@ -657,7 +672,7 @@ def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):
     )
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="normalized"):
-        external_media.instagram_jpeg_bytes(source)
+        external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
 
 
 def _instagram_issue(monkeypatch, tmp_path, *, name="launch.png", write):
@@ -771,23 +786,7 @@ def test_issue_instagram_source_byte_limit_includes_the_limit(
             issue()
 
 
-@pytest.mark.parametrize(
-    ("layout", "slack", "refused_as"),
-    [
-        ("progressive", -1, "progressive JPEG"),
-        ("progressive", 0, None),
-        ("non-interleaved", -1, "multi-scan JPEG"),
-        ("non-interleaved", 0, None),
-        ("interleaved", -1, None),
-    ],
-    ids=[
-        "progressive-over",
-        "progressive-at-limit",
-        "non-interleaved-over",
-        "non-interleaved-at-limit",
-        "interleaved-same-size",
-    ],
-)
+@MULTI_SCAN_PIXEL_LIMIT_CASES
 def test_issue_instagram_holds_a_multi_scan_jpeg_to_the_png_pixel_limit(
     monkeypatch, tmp_path, layout, slack, refused_as
 ):
@@ -848,7 +847,7 @@ def _with_zero_length_segment(jpeg: bytes) -> bytes:
         (_with_fill_bytes, "non-interleaved", True),
         (_with_fake_scan_in_a_comment, "interleaved", False),
         (_with_second_soi, "interleaved", True),
-        (_with_zero_length_segment, "non-interleaved", True),
+        (_with_zero_length_segment, "interleaved", True),
     ],
     ids=[
         "fill-bytes-interleaved",

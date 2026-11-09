@@ -20,7 +20,7 @@ ConnectorChecks(
             assertions=(
                 StatusSuccess(),
                 EachHasKeys(("sites",), ("id", "name")),
-                Equals(("sites", 0, "id"), FixtureRef("jira.site_id")),
+                Equals(("sites", 0, "id"), FixtureRef("jira.tenant_id")),
             ),
         ),
     ),
@@ -106,11 +106,12 @@ Validation enforces these:
 - **Steps.** Every step of a write check (`create`, `verify`, `cleanup`, `cleanup_guard`) and of a sweep (`find`, `delete`) needs at least one assertion. A tenant pin's read, a cleanup guard and the sweep are not checked tools: they do not count as a check of their tool.
 - **Tenant pin.** The pin's step reads the connection's tenant id at `path`; `expected` is the registry's id (a fixture key). Every tenant pin of a connector, its sweep's included, names the same fixture key. A path, here and in an assertion, is a tuple.
 - **Write area.** `create`, and the sweep's `find`, take at least one write-area fixture key, `<app_id>.write_...`: `jira.write_project_key` above, or `google-drive.write_folder_id`. It names the isolated container the tenant registry (xorbitsai/xagent-saas#2533) sets aside for the connector's write checks. Its namespace is the connector's, which can differ from the pin's (`google.tenant_id`).
-- **Run-scoped name.** `create` names its object with a `RunScopedName`, which the engine fills in as `xagent-smoke-<run_id>-<suffix>`.
-- **Cleanup.** `cleanup` deletes the object `create` named: by the same `RunScopedName`, or by a `CreatedRef` (the value at a path of the create step's payload, typically the id the vendor gave the new object). A cleanup with neither, or with another run-scoped name, is refused.
-- **Cleanup guard.** A cleanup that deletes by a `CreatedRef` needs a `cleanup_guard`, and no other cleanup has one. The guard reads the object by the same reference and asserts, with `Equals`, the `RunScopedName` that `create` gave it, so a wrongly declared path can never delete an object the run did not create. It may not call a tool any of the connector's write checks creates or cleans up with.
+- **Run-scoped name.** `create` names its object with a `RunScopedName`, which the engine fills in as `xagent-smoke-<run_id>-<suffix>`. No two write checks of a connector use the same suffix, so in one run a name matches one check's object.
+- **Cleanup.** `cleanup`'s arguments name the run's object: by the `RunScopedName` that `create` gave it, or by a `CreatedRef` (the value at a path of the create step's payload, typically the id the vendor gave the new object). They take no fixture key but the tenant pin's and write-area keys, so no seeded object outside the write area is the target. A cleanup with neither reference, with another run-scoped name or with another fixture key is refused.
+- **Cleanup guard.** A cleanup that deletes by a `CreatedRef` needs a `cleanup_guard`, and no other cleanup has one. The guard's arguments carry the same reference and no run-scoped name, and its `Equals` asserts the `RunScopedName` that `create` gave the object. Its fixture keys are limited as cleanup's are.
+- **Read steps.** Read checks, `verify`, every tenant pin's step, the cleanup guard and the sweep's `find` only read: none may call a tool that any of the connector's write checks creates or cleans up with.
 - **Approval verdict.** `expected_verdicts` gives, for exactly the `create` and `cleanup` tools, the verdict the deployment's write policy gives a restricted actor (`allow`, `require_approval`, `deny`): for Toby, `deny` when the tool is withheld from a non-installer member. A change to Toby's write classification can therefore turn a check declared here red until its declaration follows; that is intended.
-- **Sweep.** A connector with a write check declares one, and only such a connector does. `find` lists the write area, `items` is the path of the array of objects in its payload, and `name` the path of an item's name. `delete` takes one item by an `ItemRef` (a path inside the item) and uses a tool one of the connector's write checks cleans up with, so its verdict is declared.
+- **Sweep.** A connector with a write check declares one, and only such a connector does. `find` lists the write area, `items` is the path of the array of objects in its payload, and `name` the path of an item's name. `delete` takes one item by an `ItemRef` (a path inside the item), takes no fixture key but the pin's and write-area keys, and uses the cleanup tool of every write check of the connector, so its verdict is declared. A sweep lists one kind of object, so a connector's write checks all create, and clean up, that one kind.
 - **Literal addresses.** No string in the arguments of a write check's or a sweep's step contains an `@`, as a key or a value: an address comes from a fixture in the test tenant.
 
 At run time, which #3564 adds to the engine (it does none of this yet):
@@ -119,13 +120,17 @@ At run time, which #3564 adds to the engine (it does none of this yet):
 - The probe path bypasses both the approval gate and the per-user tool overrides, so the engine compares each declared verdict with the identity adapter's answer before any call.
 - Cleanup runs even when verify fails, which is why the guard belongs to cleanup and not to verify.
 - The sweeper lists only the write area, so an object created outside it would never be swept. It matches each item's name against `xagent-smoke-` and reads the object's age from it.
+- A cleanup or a guard that finds an object by its run-scoped name matches the whole name, never part of it: one suffix can begin another (`issue`, `issue-2`).
 
 Review each write flow against these, which validation cannot check:
 
-- Cleanup and sweep use the connector's own tools, so a connector without a delete tool (the HubSpot MCP server and the in-repo GitHub server today) declares no write check until its Tier 1 issue (#3572, #3568) settles how to clean up.
+- Cleanup and sweep use the connector's own tools, so a connector whose server cannot delete what its write check creates declares no write check until its Tier 1 issue settles how to clean up. Today that includes the HubSpot MCP server (#3572), the in-repo GitHub server (#3568), Slack's messages (#3571) and Gmail's drafts (#3567).
 - The sweep's `find` lists the same container `create` writes into. Jira's search takes only JQL, so its sweep reads a query fixture rather than the project key `create` takes.
-- Each step's target comes from its fixture or reference, never from a literal next to one.
-- A cleanup guard only reads.
+- Each step's target comes from its reference or a write-area fixture, never from a literal, or from the pin's key, next to one: validation sees that a reference is present, not which argument the tool treats as its target.
+- The cleanup guard finds the object by its `CreatedRef` alone, not by a query fixture or a literal that sits next to it. Only then does it catch a wrongly declared path before anything is deleted.
+- Cleanup and the sweep's `delete` never target the write-area container itself, which is a seeded object too.
+- The sweep's `ItemRef` is the id of the item whose `name` the sweeper matched, not a parent's or a sibling's.
+- Every read step only reads. Validation refuses the connector's own create and cleanup tools there, not every tool that writes.
 - A pin over a list, such as Jira's sites, asserts that the list has exactly one item.
 - Gmail creates drafts and never sends.
 - Jira sets no assignee and no watcher.
@@ -304,6 +309,6 @@ The `user` adapter (`user_identity.py`):
 
 ## Versioning
 
-- `DECLARATION_FORMAT_VERSION` (`declarations.py`) changes when a declared check or a consumer of declarations must adapt. Version 2 added `CreatedRef`, `ItemRef`, the cleanup guard, the sweep and the write-area and email rules (#3564).
+- `DECLARATION_FORMAT_VERSION` (`declarations.py`) changes when a declared check or a consumer of declarations must adapt. Version 2 added `CreatedRef`, `ItemRef`, the cleanup guard, the sweep and the rules on write areas, fixture keys in cleanup, read steps, run-scoped suffixes and `@` in arguments (#3564). It also refuses a path that is not a tuple: version 1 took a list, or a string as a path of one-letter keys.
 - `RESULT_SCHEMA_VERSION` (`results.py`) and the schema's `schema_version` const change together when a consumer of results must adapt: a field removed or renamed, a class removed, a meaning changed. A test pins the schema's enums to the Python enums.
 - A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change.

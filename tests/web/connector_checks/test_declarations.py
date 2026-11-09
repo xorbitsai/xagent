@@ -34,6 +34,7 @@ from xagent.web.connector_checks.declarations import (
 from xagent.web.connector_checks.fixtures import FixtureRef
 
 _TENANT = FixtureRef("jira.tenant_id")
+_WRITE_PROJECT = FixtureRef("jira.write_project_key")
 _ISSUE_KEY = CreatedRef(("issue", "key"))
 _ISSUE_NAME = RunScopedName("issue")
 
@@ -196,18 +197,27 @@ def _read(**changes: Any) -> ReadCheck:
             _checks(
                 reads=(_read(assertions=(Equals(("name",), RunScopedName("x")),)),)
             ),
-            "run-scoped",
+            "a read check may not use a run-scoped name",
         ),
         (_checks(reads=(_read(arguments={"q": object()}),)), "argument"),
         (_checks(reads=(_read(arguments={1: "x"}),)), "argument"),
-        (_checks(reads=(_read(arguments={"q": RunScopedName("x")}),)), "run-scoped"),
+        (
+            _checks(reads=(_read(arguments={"q": RunScopedName("x")}),)),
+            "a read check may not use a run-scoped name",
+        ),
         (_checks(reads=(_read(assertions=(Length((), min=2, max=1),)),)), "length"),
         (_checks(reads=(_read(assertions=(Length((), min=-1),)),)), "length"),
         (_checks(reads=(_read(assertions=(HasKeys((), ()),)),)), "keys"),
         (_checks(reads=(_read(assertions=(EachHasKeys(("a",), ()),)),)), "keys"),
         (_checks(reads=(_read(assertions=(IsType((), "list"),)),)), "type"),  # type: ignore[arg-type]
-        (_checks(reads=(_read(assertions=(HasKeys((-1,), ("a",)),)),)), "path"),
-        (_checks(reads=(_read(assertions=(HasKeys((1.5,), ("a",)),)),)), "path"),  # type: ignore[arg-type]
+        (
+            _checks(reads=(_read(assertions=(HasKeys((-1,), ("a",)),)),)),
+            "invalid path segment",
+        ),
+        (
+            _checks(reads=(_read(assertions=(HasKeys((1.5,), ("a",)),)),)),  # type: ignore[arg-type]
+            "invalid path segment",
+        ),
         (
             _checks(reads=(_read(assertions=(L3Envelope(), StatusSuccess())),)),
             "L3Envelope",
@@ -232,7 +242,10 @@ def _read(**changes: Any) -> ReadCheck:
             "exempted twice",
         ),
         (_checks(exemptions=(ToolExemption("a_tool", "  "),)), "reason"),
-        (_checks(writes=(_write(create=_create(summary="fixed")),)), "run-scoped name"),
+        (
+            _checks(writes=(_write(create=_create(summary="fixed")),)),
+            "create must name its object with a run-scoped name",
+        ),
         (
             _checks(writes=(_write(expected_verdicts={"jira_create_issue": "allow"}),)),
             "expected verdict",
@@ -279,7 +292,7 @@ def _read(**changes: Any) -> ReadCheck:
             "finite",
         ),
         (
-            # A cleanup cannot target a seeded object.
+            # No reference to the run's object at all.
             _checks(
                 writes=(
                     _write(
@@ -292,12 +305,12 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "cleanup",
+            "cleanup must name its object",
         ),
-        (_checks(reads=(_read(assertions=()),)), "assertion"),
+        (_checks(reads=(_read(assertions=()),)), "check needs at least one assertion"),
         (
             _checks(writes=(_write(cleanup=_by_key("jira_delete_issue")),)),
-            "assertion",
+            "cleanup needs at least one assertion",
         ),
         (_checks(reads=(_write(),), writes=()), "reads"),
         (_checks(writes=(_read(),)), "writes"),
@@ -317,21 +330,43 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "run-scoped",
+            "the tenant pin may not use a run-scoped name",
         ),
-        (_checks(writes=(_write(tenant_pin=_pin(path=("sites", -1))),)), "path"),
+        (
+            _checks(writes=(_write(tenant_pin=_pin(path=("sites", -1))),)),
+            "invalid path segment",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        expected_verdicts=["jira_create_issue", "jira_delete_issue"]
+                    ),
+                )
+            ),
+            "expected verdicts must be a mapping",
+        ),
+        (_checks(reads=(_read(id=1),)), "a check id must be a string"),
+        (
+            _checks(reads=(_read(assertions=(HasKeys("issues", ("a",)),)),)),  # type: ignore[arg-type]
+            "a path must be a tuple",
+        ),
+        (
+            _checks(writes=(_write(tenant_pin=_pin(path="id")),)),
+            "a path must be a tuple",
+        ),
         # Created-object and listed-item references
         (
             _checks(writes=(_write(create=_create(parent=_ISSUE_KEY)),)),
-            "created-object reference",
+            "create may not use a created-object reference",
         ),
         (
             _checks(reads=(_read(arguments={"issue_key": _ISSUE_KEY}),)),
-            "created-object reference",
+            "a read check may not use a created-object reference",
         ),
         (
             _checks(reads=(_read(assertions=(Equals(("key",), _ISSUE_KEY),)),)),
-            "created-object reference",
+            "a read check may not use a created-object reference",
         ),
         (
             _checks(
@@ -345,7 +380,7 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "created-object reference",
+            "the tenant pin may not use a created-object reference",
         ),
         (
             _checks(
@@ -360,31 +395,9 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "listed-item reference",
+            "cleanup may not use a listed-item reference",
         ),
-        # The cleanup guard
-        (_checks(writes=(_write(cleanup_guard=None),)), "guard"),
-        (
-            # Another write check's cleanup tool is no read either.
-            _checks(
-                writes=(
-                    _write(),
-                    _write(
-                        id="jira.archive_round_trip",
-                        cleanup=_by_key("jira_archive_issue", StatusSuccess()),
-                        cleanup_guard=_by_key(
-                            "jira_delete_issue",
-                            Equals(("issue", "summary"), _ISSUE_NAME),
-                        ),
-                        expected_verdicts={
-                            "jira_create_issue": "deny",
-                            "jira_archive_issue": "deny",
-                        },
-                    ),
-                )
-            ),
-            "create or cleanup tool",
-        ),
+        # Cleanup and the cleanup guard
         (
             _checks(
                 writes=(
@@ -398,43 +411,47 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "object create named",
+            "cleanup must name the object create named",
         ),
         (
+            # A seeded object's key is never cleanup's target.
             _checks(
                 writes=(
                     _write(
-                        expected_verdicts=["jira_create_issue", "jira_delete_issue"]
-                    ),
-                )
-            ),
-            "mapping",
-        ),
-        (_checks(reads=(_read(id=1),)), "check id"),
-        (_checks(reads=(_read(assertions=(HasKeys("issues", ("a",)),)),)), "tuple"),  # type: ignore[arg-type]
-        (_checks(writes=(_write(tenant_pin=_pin(path="id")),)), "tuple"),
-        (
-            _checks(
-                writes=(
-                    _write(
-                        create=_create(project_key=FixtureRef("slack.write_channel_id"))
-                    ),
-                )
-            ),
-            "write area",
-        ),
-        (
-            _checks(
-                writes=(
-                    _write(
-                        cleanup_guard=_by_key(
+                        cleanup=ToolStep(
                             "jira_delete_issue",
-                            Equals(("issue", "summary"), _ISSUE_NAME),
-                        )
+                            {
+                                "issue_key": FixtureRef("jira.seed.issue"),
+                                "summary": _ISSUE_NAME,
+                            },
+                            assertions=(StatusSuccess(),),
+                        ),
+                        cleanup_guard=None,
                     ),
                 )
             ),
-            "create or cleanup tool",
+            "cleanup may take only the tenant pin's or a write-area fixture key",
+        ),
+        (_checks(writes=(_write(cleanup_guard=None),)), "needs a cleanup guard"),
+        (
+            # A reference nested in an argument still deletes by id.
+            _checks(
+                writes=(
+                    _write(
+                        cleanup=ToolStep(
+                            "jira_delete_issue",
+                            {"issue": {"key": _ISSUE_KEY}},
+                            assertions=(StatusSuccess(),),
+                        ),
+                        cleanup_guard=None,
+                    ),
+                )
+            ),
+            "needs a cleanup guard",
+        ),
+        (
+            _checks(writes=(_write(cleanup_guard="jira_get_issue"),)),
+            "cleanup guard must be a ToolStep",
         ),
         (
             _checks(
@@ -448,7 +465,7 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "guard",
+            "a cleanup guard is only for a cleanup that deletes",
         ),
         (
             _checks(
@@ -462,7 +479,27 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "guard",
+            "must read the object the cleanup deletes",
+        ),
+        (
+            # Looked up by name, it would confirm the name whatever the
+            # cleanup's reference points at.
+            _checks(
+                writes=(
+                    _write(
+                        cleanup_guard=ToolStep(
+                            "jira_search_issues",
+                            {
+                                "cloud_id": _TENANT,
+                                "jql": _ISSUE_NAME,
+                                "key": _ISSUE_KEY,
+                            },
+                            assertions=(Equals(("issues", 0, "summary"), _ISSUE_NAME),),
+                        )
+                    ),
+                )
+            ),
+            "find the object by its created-object reference",
         ),
         (
             _checks(
@@ -470,7 +507,7 @@ def _read(**changes: Any) -> ReadCheck:
                     _write(cleanup_guard=_by_key("jira_get_issue", StatusSuccess())),
                 )
             ),
-            "guard",
+            "must assert the run-scoped name",
         ),
         (
             _checks(
@@ -483,27 +520,148 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "guard",
+            "must assert the run-scoped name",
         ),
-        # The tenant's write area and literal addresses
+        (
+            _checks(
+                writes=(
+                    _write(
+                        cleanup_guard=ToolStep(
+                            "jira_get_issue",
+                            {
+                                "issue_key": _ISSUE_KEY,
+                                "project": FixtureRef("jira.seed.project_key"),
+                            },
+                            assertions=(Equals(("issue", "summary"), _ISSUE_NAME),),
+                        )
+                    ),
+                )
+            ),
+            "cleanup guard may take only the tenant pin's or a write-area fixture key",
+        ),
+        # Steps that only read
+        (
+            _checks(
+                writes=(
+                    _write(
+                        cleanup_guard=_by_key(
+                            "jira_delete_issue",
+                            Equals(("issue", "summary"), _ISSUE_NAME),
+                        )
+                    ),
+                )
+            ),
+            "the cleanup guard only reads",
+        ),
+        (
+            # Another write check's create tool is no read either.
+            _checks(
+                writes=(
+                    _write(),
+                    _write(
+                        id="jira.subtask_round_trip",
+                        create=ToolStep(
+                            "jira_create_subtask",
+                            {
+                                "project_key": FixtureRef("jira.write_project_key"),
+                                "summary": RunScopedName("subtask"),
+                            },
+                            assertions=(StatusSuccess(),),
+                        ),
+                        cleanup_guard=_by_key(
+                            "jira_create_issue",
+                            Equals(("issue", "summary"), RunScopedName("subtask")),
+                        ),
+                        expected_verdicts={
+                            "jira_create_subtask": "deny",
+                            "jira_delete_issue": "deny",
+                        },
+                    ),
+                )
+            ),
+            "the cleanup guard only reads",
+        ),
+        (
+            _checks(
+                writes=(_write(verify=_by_key("jira_delete_issue", StatusSuccess())),)
+            ),
+            "verify only reads",
+        ),
+        (
+            _checks(reads=(_read(tool="jira_delete_issue"),)),
+            "a read check only reads",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        tenant_pin=_pin(
+                            step=ToolStep(
+                                "jira_create_issue", assertions=(StatusSuccess(),)
+                            )
+                        )
+                    ),
+                )
+            ),
+            "jira.issue_round_trip: the tenant pin only reads",
+        ),
+        (
+            _checks(
+                sweep=_sweep(
+                    tenant_pin=_pin(
+                        step=ToolStep(
+                            "jira_delete_issue", assertions=(StatusSuccess(),)
+                        )
+                    )
+                )
+            ),
+            "jira sweep: the tenant pin only reads",
+        ),
+        (
+            _checks(
+                sweep=_sweep(
+                    find=ToolStep(
+                        "jira_delete_issue",
+                        {"cloud_id": _TENANT, "issue_key": _WRITE_PROJECT},
+                        assertions=(StatusSuccess(),),
+                    )
+                )
+            ),
+            "find only reads",
+        ),
+        (
+            _checks(writes=(_write(), _write(id="jira.second_round_trip"))),
+            "already names its object with the run-scoped suffix 'issue'",
+        ),
+        # The connector's write area and literal addresses
+        (
+            _checks(
+                writes=(
+                    _write(
+                        create=_create(project_key=FixtureRef("slack.write_channel_id"))
+                    ),
+                )
+            ),
+            "create must target the connector's write area",
+        ),
         (
             _checks(
                 writes=(
                     _write(create=_create(project_key=FixtureRef("other.project_key"))),
                 )
             ),
-            "write area",
+            "create must target the connector's write area",
         ),
         (
             _checks(writes=(_write(create=_create(project_key="SMOKE")),)),
-            "write area",
+            "create must target the connector's write area",
         ),
         (
             # The pin's own key names the tenant, not the write area.
             _checks(
                 writes=(_write(create=_create(project_key="PROD", cloud_id=_TENANT)),)
             ),
-            "write area",
+            "create must target the connector's write area",
         ),
         (
             _checks(
@@ -513,15 +671,15 @@ def _read(**changes: Any) -> ReadCheck:
                     ),
                 )
             ),
-            "write area",
+            "create must target the connector's write area",
         ),
         (
             _checks(writes=(_write(create=_create(to={"qa@example.com": True})),)),
-            "email",
+            "create has an '@'",
         ),
         (
             _checks(writes=(_write(create=_create(assignee="qa@example.com")),)),
-            "email",
+            "create has an '@'",
         ),
         (
             _checks(
@@ -529,12 +687,60 @@ def _read(**changes: Any) -> ReadCheck:
                     _write(create=_create(watchers=["a", {"user": "qa@example.com"}])),
                 )
             ),
-            "email",
+            "create has an '@'",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        verify=_by_key("jira_get_issue", StatusSuccess()),
+                        cleanup=ToolStep(
+                            "jira_delete_issue",
+                            {"issue_key": _ISSUE_KEY, "notify": "qa@example.com"},
+                            assertions=(StatusSuccess(),),
+                        ),
+                    ),
+                )
+            ),
+            "cleanup has an '@'",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        verify=ToolStep(
+                            "jira_get_issue",
+                            {"issue_key": _ISSUE_KEY, "watcher": "qa@example.com"},
+                            assertions=(StatusSuccess(),),
+                        )
+                    ),
+                )
+            ),
+            "verify has an '@'",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(
+                        cleanup_guard=ToolStep(
+                            "jira_get_issue",
+                            {"issue_key": _ISSUE_KEY, "watcher": "qa@example.com"},
+                            assertions=(Equals(("issue", "summary"), _ISSUE_NAME),),
+                        )
+                    ),
+                )
+            ),
+            "cleanup guard has an '@'",
         ),
         # The sweep
-        (_checks(sweep=None), "sweep"),
-        (_checks(writes=()), "sweep"),
-        (_checks(sweep=_write()), "Sweep"),
+        (_checks(sweep=None), "must declare a sweep"),
+        (_checks(writes=()), "a sweep needs a write check"),
+        (_checks(sweep=_write()), "sweep must be a Sweep"),
+        (_checks(sweep=_sweep(find="jira_search_issues")), "find must be a ToolStep"),
+        (
+            _checks(sweep=_sweep(delete="jira_delete_issue")),
+            "delete must be a ToolStep",
+        ),
         (
             _checks(
                 sweep=_sweep(
@@ -545,7 +751,7 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "listed-item reference",
+            "delete must take the item by a listed-item reference",
         ),
         (
             _checks(
@@ -557,7 +763,42 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "cleanup tool",
+            "one cleanup tool",
+        ),
+        (
+            # A comment check's leftovers would never be swept.
+            _checks(
+                writes=(
+                    _write(),
+                    WriteCheck(
+                        "jira.comment_round_trip",
+                        create=ToolStep(
+                            "jira_add_comment",
+                            {
+                                "issue_key": FixtureRef("jira.write_issue_key"),
+                                "body": RunScopedName("comment"),
+                            },
+                            assertions=(StatusSuccess(),),
+                        ),
+                        verify=ToolStep(
+                            "jira_list_comments",
+                            {"issue_key": FixtureRef("jira.write_issue_key")},
+                            assertions=(StatusSuccess(),),
+                        ),
+                        cleanup=ToolStep(
+                            "jira_delete_comment",
+                            {"body": RunScopedName("comment")},
+                            assertions=(StatusSuccess(),),
+                        ),
+                        tenant_pin=_pin(),
+                        expected_verdicts={
+                            "jira_add_comment": "deny",
+                            "jira_delete_comment": "deny",
+                        },
+                    ),
+                )
+            ),
+            "one cleanup tool",
         ),
         (
             _checks(
@@ -568,7 +809,7 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "assertion",
+            "delete needs at least one assertion",
         ),
         (
             _checks(
@@ -580,7 +821,34 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "created-object reference",
+            "delete may not use a created-object reference",
+        ),
+        (
+            _checks(
+                sweep=_sweep(
+                    delete=ToolStep(
+                        "jira_delete_issue",
+                        {
+                            "issue_key": ItemRef(("key",)),
+                            "parent": FixtureRef("jira.seed.issue"),
+                        },
+                        assertions=(StatusSuccess(),),
+                    )
+                )
+            ),
+            "delete may take only the tenant pin's or a write-area fixture key",
+        ),
+        (
+            _checks(
+                sweep=_sweep(
+                    delete=ToolStep(
+                        "jira_delete_issue",
+                        {"issue_key": ItemRef(("key",)), "notify": "qa@example.com"},
+                        assertions=(StatusSuccess(),),
+                    )
+                )
+            ),
+            "delete has an '@'",
         ),
         (
             _checks(
@@ -592,7 +860,7 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "run-scoped",
+            "find may not use a run-scoped name",
         ),
         (
             _checks(
@@ -604,7 +872,7 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "listed-item reference",
+            "find may not use a listed-item reference",
         ),
         (
             _checks(
@@ -616,7 +884,7 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "write area",
+            "find must target the connector's write area",
         ),
         (
             _checks(
@@ -628,13 +896,13 @@ def _read(**changes: Any) -> ReadCheck:
                     )
                 )
             ),
-            "email",
+            "find has an '@'",
         ),
         (
             _checks(
                 sweep=_sweep(find=ToolStep("jira_search_issues", {"cloud_id": _TENANT}))
             ),
-            "assertion",
+            "find needs at least one assertion",
         ),
         (
             _checks(
@@ -642,8 +910,8 @@ def _read(**changes: Any) -> ReadCheck:
             ),
             "same fixture key",
         ),
-        (_checks(sweep=_sweep(items=("issues", -1))), "path"),
-        (_checks(sweep=_sweep(items="issues")), "path"),
+        (_checks(sweep=_sweep(items=("issues", -1))), "invalid path segment"),
+        (_checks(sweep=_sweep(items="issues")), "a path must be a tuple"),
         (_checks(sweep=_sweep(name=())), "name path"),
         (_checks(sweep=_sweep(name="summary")), "name path"),
         (_checks(sweep=_sweep(name=("summary", -1))), "name path"),
@@ -667,6 +935,20 @@ def test_a_cleanup_by_run_scoped_name_needs_no_guard() -> None:
     validate_connector_checks(
         _checks(writes=(_write(cleanup=cleanup, cleanup_guard=None),))
     )
+
+
+def test_cleanup_and_its_guard_may_take_a_write_area_key() -> None:
+    by_key = {"project_key": _WRITE_PROJECT, "issue_key": _ISSUE_KEY}
+    write = _write(
+        cleanup=ToolStep("jira_delete_issue", by_key, assertions=(StatusSuccess(),)),
+        cleanup_guard=ToolStep(
+            "jira_get_issue",
+            by_key,
+            assertions=(Equals(("issue", "summary"), _ISSUE_NAME),),
+        ),
+    )
+
+    validate_connector_checks(_checks(writes=(write,)))
 
 
 def test_checked_tools_leave_out_the_tenant_pin_the_guard_and_the_sweep() -> None:

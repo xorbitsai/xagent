@@ -258,8 +258,8 @@ class WriteCheck:
     When it deletes by a ``CreatedRef``, ``cleanup_guard`` must first read
     the object by that same reference, with a tool none of the connector's
     write checks creates or cleans up with, and assert the name create gave
-    it, so a wrongly declared path can never delete an object this run did
-    not create.
+    it. As long as the guard finds the object by that reference, which review
+    checks, a wrongly declared path is caught before anything is deleted.
     ``expected_verdicts`` names the approval verdict for exactly the write
     tools, ``create`` and ``cleanup``.
     """
@@ -355,8 +355,9 @@ def validate_connector_checks(checks: ConnectorChecks) -> None:
             )
         _validate_check_id(app_id, write.id, seen)
         _validate_write(app_id, write)
-    _refuse_writing_guards(checks)
+    _refuse_shared_names(checks)
     _validate_sweep(checks)
+    _refuse_writes_in_read_steps(checks)
 
     checked = checks.checked_tools()
     exempted: set[str] = set()
@@ -377,7 +378,11 @@ def validate_connector_checks(checks: ConnectorChecks) -> None:
 
 def _validate_check_id(app_id: str, check_id: str, seen: set[str]) -> None:
     prefix = f"{app_id}."
-    if not isinstance(check_id, str) or not check_id.startswith(prefix):
+    if not isinstance(check_id, str):
+        raise DeclarationError(
+            f"{app_id}: a check id must be a string, not {type(check_id).__name__}"
+        )
+    if not check_id.startswith(prefix):
         raise DeclarationError(f"check id {check_id!r} must start with {prefix!r}")
     # The rule a result row holds the id to: a code, at most 80 characters.
     if not is_check_id(app_id, check_id):
@@ -395,15 +400,6 @@ def _validate_read(check: ReadCheck) -> None:
     _require_assertion(check.id, "check", check.assertions)
 
 
-# The references each step of a write check may use.
-_WRITE_STEP_REFERENCES: dict[str, tuple[type, ...]] = {
-    "create": (RunScopedName,),
-    "verify": (RunScopedName, CreatedRef),
-    "cleanup": (RunScopedName, CreatedRef),
-    "cleanup guard": (RunScopedName, CreatedRef),
-}
-
-
 def _validate_write(app_id: str, check: WriteCheck) -> None:
     where = check.id
     for name in ("create", "verify", "cleanup"):
@@ -417,7 +413,11 @@ def _validate_write(app_id: str, check: WriteCheck) -> None:
     if guard is not None:
         steps["cleanup guard"] = guard
     for name, step in steps.items():
-        _validate_step(where, name, step, allowed=_WRITE_STEP_REFERENCES[name])
+        # Only create may not read what it is about to create.
+        references = (
+            (RunScopedName,) if name == "create" else (RunScopedName, CreatedRef)
+        )
+        _validate_step(where, name, step, allowed=references)
 
     suffixes = {
         ref.suffix for ref in _references(check.create.arguments, RunScopedName)
@@ -441,7 +441,11 @@ def _validate_write(app_id: str, check: WriteCheck) -> None:
             f"{where}: cleanup must name the object create named, not another "
             "run-scoped name"
         )
+    pin_key = check.tenant_pin.expected.key
+    _refuse_other_fixtures(where, "cleanup", check.cleanup, pin_key, app_id)
     _validate_guard(where, guard, deleted_by_id, suffixes)
+    if guard is not None:
+        _refuse_other_fixtures(where, "cleanup guard", guard, pin_key, app_id)
 
     write_tools = {check.create.tool, check.cleanup.tool}
     verdicts = check.expected_verdicts
@@ -480,6 +484,13 @@ def _validate_guard(
         raise DeclarationError(
             f"{where}: the cleanup guard must read the object the cleanup deletes"
         )
+    if _references(guard.arguments, RunScopedName):
+        # Looked up by name, it would confirm the name whichever object the
+        # cleanup's reference points at.
+        raise DeclarationError(
+            f"{where}: the cleanup guard must find the object by its "
+            "created-object reference, not by a run-scoped name"
+        )
     if not any(
         isinstance(item, Equals)
         and isinstance(item.value, RunScopedName)
@@ -492,21 +503,53 @@ def _validate_guard(
         )
 
 
-def _refuse_writing_guards(checks: ConnectorChecks) -> None:
-    """A cleanup guard runs before anything is deleted, so it may not call a
-    tool any of the connector's write checks creates or cleans up with (the
-    sweep's ``delete`` is one of them)."""
+def _refuse_writes_in_read_steps(checks: ConnectorChecks) -> None:
+    """A step that only reads (a read check, verify, a tenant pin, a cleanup
+    guard, the sweep's ``find``) may not call a tool any of the connector's
+    write checks creates or cleans up with; the sweep's ``delete`` is one of
+    the latter."""
     write_tools = {
         tool
         for write in checks.writes
         for tool in (write.create.tool, write.cleanup.tool)
     }
+    reads: list[tuple[str, str, ToolStep | ReadCheck]] = [
+        (read.id, "a read check", read)
+        for read in checks.reads
+        if isinstance(read, ReadCheck)
+    ]
     for write in checks.writes:
-        if write.cleanup_guard is not None and write.cleanup_guard.tool in write_tools:
+        reads.append((write.id, "verify", write.verify))
+        reads.append((write.id, "the tenant pin", write.tenant_pin.step))
+        if write.cleanup_guard is not None:
+            reads.append((write.id, "the cleanup guard", write.cleanup_guard))
+    if checks.sweep is not None:
+        where = f"{checks.app_id} sweep"
+        reads.append((where, "the tenant pin", checks.sweep.tenant_pin.step))
+        reads.append((where, "find", checks.sweep.find))
+    for where, name, step in reads:
+        if step.tool in write_tools:
             raise DeclarationError(
-                f"{write.id}: the cleanup guard may not call a create or cleanup "
-                "tool of the connector's write checks"
+                f"{where}: {name} only reads, so it may not call a create or "
+                "cleanup tool of the connector's write checks"
             )
+
+
+def _refuse_shared_names(checks: ConnectorChecks) -> None:
+    """Two write checks of a connector never give their objects the same
+    run-scoped name: in one run a cleanup by name, or a guard's name check,
+    could then match the other check's object."""
+    named: set[str] = set()
+    for write in checks.writes:
+        suffixes = {
+            ref.suffix for ref in _references(write.create.arguments, RunScopedName)
+        }
+        if shared := sorted(suffixes & named):
+            raise DeclarationError(
+                f"{write.id}: another write check of {checks.app_id} already "
+                f"names its object with the run-scoped suffix {shared[0]!r}"
+            )
+        named |= suffixes
 
 
 def _validate_sweep(checks: ConnectorChecks) -> None:
@@ -549,8 +592,17 @@ def _validate_sweep(checks: ConnectorChecks) -> None:
         raise DeclarationError(
             f"{where}: delete must take the item by a listed-item reference"
         )
-    if sweep.delete.tool not in {write.cleanup.tool for write in checks.writes}:
-        raise DeclarationError(f"{where}: delete must use a write check's cleanup tool")
+    cleanup_tools = {write.cleanup.tool for write in checks.writes}
+    if cleanup_tools != {sweep.delete.tool}:
+        # A sweep lists one kind of object, so it can only find what one
+        # cleanup tool would have deleted.
+        raise DeclarationError(
+            f"{where}: delete must use the one cleanup tool of the connector's "
+            f"write checks, not {sweep.delete.tool!r} for {sorted(cleanup_tools)}"
+        )
+    _refuse_other_fixtures(
+        where, "delete", sweep.delete, sweep.tenant_pin.expected.key, app_id
+    )
 
 
 def _validate_pin(where: str, pin: TenantPin) -> None:
@@ -575,9 +627,27 @@ def _validate_step(
     _refuse_references(where, name, step.arguments, step.assertions, allowed=allowed)
     if any(isinstance(leaf, str) and "@" in leaf for leaf in _leaves(step.arguments)):
         raise DeclarationError(
-            f"{where}: {name} has a literal email address in its arguments; "
-            "take it from a fixture in the test tenant"
+            f"{where}: {name} has an '@' in its arguments; an address comes "
+            "from a fixture in the test tenant"
         )
+
+
+def _refuse_other_fixtures(
+    where: str, name: str, step: ToolStep, pin_key: str, app_id: str
+) -> None:
+    """A step that deletes, or picks what is deleted, takes no fixture key
+    but the tenant pin's and write-area keys, so no seeded object outside the
+    write area is its target."""
+    for ref in _references(step.arguments, FixtureRef):
+        if ref.key != pin_key and not _is_write_area_key(ref.key, app_id):
+            raise DeclarationError(
+                f"{where}: {name} may take only the tenant pin's or a "
+                f"write-area fixture key, not {ref.key!r}"
+            )
+
+
+def _is_write_area_key(key: str, app_id: str) -> bool:
+    return key.startswith(f"{app_id}.{_WRITE_AREA_PREFIX}")
 
 
 def _require_write_area(where: str, name: str, step: ToolStep, app_id: str) -> None:
@@ -589,10 +659,11 @@ def _require_write_area(where: str, name: str, step: ToolStep, app_id: str) -> N
     (``google-drive.write_folder_id``), which can differ from the tenant
     pin's (``google.tenant_id``).
     """
-    prefix = f"{app_id}.{_WRITE_AREA_PREFIX}"
     if not any(
-        ref.key.startswith(prefix) for ref in _references(step.arguments, FixtureRef)
+        _is_write_area_key(ref.key, app_id)
+        for ref in _references(step.arguments, FixtureRef)
     ):
+        prefix = f"{app_id}.{_WRITE_AREA_PREFIX}"
         raise DeclarationError(
             f"{where}: {name} must target the connector's write area, a fixture "
             f"key starting with {prefix!r}"

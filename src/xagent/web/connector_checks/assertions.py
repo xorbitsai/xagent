@@ -76,8 +76,9 @@ def judge_result(
     """The failure class and reason of ``raw`` under ``assertions``, or
     ``(None, None)`` when the check passes.
 
-    Every fixture in an ``Equals`` value must already be resolved
-    (``resolve_expected``); an unresolved one raises ``TypeError``.
+    Every fixture, run-scoped name and created-object reference in an
+    ``Equals`` value must already be resolved (``resolve_expected`` resolves
+    fixtures); an unresolved one raises ``TypeError``.
     """
     for assertion in assertions:
         if isinstance(assertion, Equals) and isinstance(

@@ -105,6 +105,19 @@ def _get_nested(value: Any, *path: str) -> Any:
     return current
 
 
+def _content_has_video(content: Any) -> bool:
+    """Whether a Seedance request ``content`` list carries a video item.
+
+    Ark's content items are typed ``text``, ``image_url``, ``video_url`` or
+    ``audio_url``; only ``video_url`` is a video input, whatever its role.
+    """
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "video_url" for item in content
+    )
+
+
 def _size_to_seedance_params(
     size: Optional[str],
 ) -> tuple[Optional[str], Optional[str]]:
@@ -348,7 +361,11 @@ class ArkVideoModel(BaseVideoModel):
         return content
 
     def _record_task_usage(
-        self, task_result: Optional[dict[str, Any]], *, succeeded: bool = False
+        self,
+        task_result: Optional[dict[str, Any]],
+        *,
+        input_has_video: bool,
+        succeeded: bool = False,
     ) -> None:
         """Write the one usage row of a created task, at its last observation.
 
@@ -364,6 +381,13 @@ class ArkVideoModel(BaseVideoModel):
         running and is charged if it succeeds, so its row keeps the tokens of
         the observation passed here, or none when polling failed until the
         deadline.
+
+        ``input_has_video`` says whether the submitted content contained a
+        video. Ark's token count already includes an input video, but Ark
+        charges such a request at its own per-token rate, so the row carries
+        it. It is required, not defaulted: every exit names the request it
+        belongs to. It is passed in rather than kept on the instance, which
+        is reused across calls (it caches its client).
         """
         try:
             result = task_result if isinstance(task_result, dict) else {}
@@ -388,6 +412,7 @@ class ArkVideoModel(BaseVideoModel):
                 result.get("duration") if succeeded else 0,
                 output_tokens=0 if output_tokens is None else output_tokens,
                 resolution=resolution if isinstance(resolution, str) else "",
+                input_has_video=input_has_video,
             )
         except Exception as e:  # noqa: BLE001 - metering never breaks the call
             logger.warning("Failed to record Ark video usage: %s", e, exc_info=True)
@@ -463,20 +488,27 @@ class ArkVideoModel(BaseVideoModel):
                 "wait_for_result=False is not supported"
             )
 
+        # Read off what is actually submitted, not off reference_video_urls: a
+        # caller-supplied ``content`` replaces the reference lists entirely.
+        input_has_video = _content_has_video(request_content)
         create_result = await self.create_video_task(request_content, **kwargs)
         task_id = create_result.get("task_id")
         if not task_id:
             # The create call succeeded, so a task may exist that cannot be
             # polled. Record it as unmeasured rather than leave a possible
             # charge invisible, and do not retry into a second one.
-            self._record_task_usage(None)
+            self._record_task_usage(None, input_has_video=input_has_video)
             raise BilledVideoTaskError("Ark did not return a video generation task id")
 
         deadline = time.monotonic() + (timeout or self.timeout)
         observations: list[dict[str, Any]] = []
         try:
             return await self._wait_for_task(
-                str(task_id), deadline, poll_interval, observations
+                str(task_id),
+                deadline,
+                poll_interval,
+                observations,
+                input_has_video=input_has_video,
             )
         except asyncio.CancelledError:
             # The task exists and keeps running after the caller gives up, so
@@ -484,7 +516,10 @@ class ArkVideoModel(BaseVideoModel):
             # its own row before leaving; cancellation is the one that cannot,
             # so it records here from the last observation and propagates
             # without submitting anything new.
-            self._record_task_usage(observations[-1] if observations else None)
+            self._record_task_usage(
+                observations[-1] if observations else None,
+                input_has_video=input_has_video,
+            )
             raise
 
     async def _wait_for_task(
@@ -493,6 +528,8 @@ class ArkVideoModel(BaseVideoModel):
         deadline: float,
         poll_interval: float,
         observations: list[dict[str, Any]],
+        *,
+        input_has_video: bool,
     ) -> dict[str, Any]:
         """Poll a created task to its end, recording its row on every exit."""
         while True:
@@ -509,7 +546,7 @@ class ArkVideoModel(BaseVideoModel):
                     redact_provider_detail(exc),
                 )
                 if time.monotonic() >= deadline:
-                    self._record_task_usage(None)
+                    self._record_task_usage(None, input_has_video=input_has_video)
                     raise BilledVideoTaskTimeout(
                         f"Timed out waiting for video generation task {task_id} "
                         "due to persistent polling errors"
@@ -519,16 +556,18 @@ class ArkVideoModel(BaseVideoModel):
             observations.append(task_result)
             status = task_result.get("status")
             if status == "succeeded":
-                self._record_task_usage(task_result, succeeded=True)
+                self._record_task_usage(
+                    task_result, input_has_video=input_has_video, succeeded=True
+                )
                 return task_result
             if status in _ARK_TERMINAL_FAILURE_STATUSES:
-                self._record_task_usage(task_result)
+                self._record_task_usage(task_result, input_has_video=input_has_video)
                 raise BilledVideoTaskError(
                     f"Video generation task {task_id} ended with status {status}: "
                     f"{task_result.get('error')}"
                 )
             if time.monotonic() >= deadline:
-                self._record_task_usage(task_result)
+                self._record_task_usage(task_result, input_has_video=input_has_video)
                 raise BilledVideoTaskTimeout(
                     f"Timed out waiting for video generation task {task_id}; "
                     f"last status: {status}"

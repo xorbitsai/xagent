@@ -1,4 +1,6 @@
 import os
+import struct
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
 from urllib.parse import parse_qs, urlsplit
@@ -661,6 +663,125 @@ def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path):
 
     with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
         issue()
+
+
+def _exif_with_thumbnail() -> bytes:
+    """EXIF whose IFD1 holds a small JPEG thumbnail, with its own end marker."""
+    thumbnail = BytesIO()
+    Image.new("RGB", (16, 16), "red").save(thumbnail, "JPEG")
+    thumbnail_bytes = thumbnail.getvalue()
+    ifd1_offset = 8 + 2 + 4  # TIFF header, then IFD0 with no entries
+    thumbnail_offset = ifd1_offset + 2 + 2 * 12 + 4
+    tiff = (
+        b"II*\x00"
+        + struct.pack("<I", 8)
+        + struct.pack("<HI", 0, ifd1_offset)
+        + struct.pack("<H", 2)
+        + struct.pack("<HHII", 0x0201, 4, 1, thumbnail_offset)
+        + struct.pack("<HHII", 0x0202, 4, 1, len(thumbnail_bytes))
+        + struct.pack("<I", 0)
+        + thumbnail_bytes
+    )
+    return b"Exif\x00\x00" + tiff
+
+
+def _jpeg(kind: str) -> bytes:
+    """A noisy 640x640 JPEG, so the main image has plenty of scan data."""
+    image = Image.effect_noise((640, 640), 64).convert("RGB")
+    output = BytesIO()
+    if kind == "plain":
+        image.save(output, "JPEG")
+    elif kind == "progressive":
+        image.save(output, "JPEG", progressive=True)
+    elif kind == "exif thumbnail":
+        image.save(output, "JPEG", exif=_exif_with_thumbnail())
+    elif kind == "trailing data":
+        # Like a phone's motion photo: a video appended after the end marker.
+        image.save(output, "JPEG")
+        output.write(b"\x00\x00\x00\x18ftypmp42" + bytes(4096))
+    else:
+        assert kind == "MPO with an EXIF thumbnail"
+        image.save(
+            output,
+            "MPO",
+            save_all=True,
+            append_images=[Image.new("RGB", (32, 32), "green")],
+            exif=_exif_with_thumbnail(),
+        )
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "kind", ["plain", "exif thumbnail", "MPO with an EXIF thumbnail"]
+)
+def test_issue_facebook_rejects_a_truncated_jpeg(monkeypatch, tmp_path, kind):
+    # Why: JPEG's verify() parses only the header, so a JPEG cut short by an
+    # interrupted write would get a URL that Meta then fails to fetch, and a
+    # native grant would lose its upload fallback. An EXIF thumbnail ends with
+    # its own end marker before the main image's scan data; that one must not
+    # count, and Image.open rewinds an MPO to its start after parsing it.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    complete = _jpeg(kind)
+    truncated = complete[: len(complete) // 2]
+    if kind != "plain":
+        assert b"\xff\xd9" in truncated  # the thumbnail's end marker
+    if kind.startswith("MPO"):
+        assert Image.open(BytesIO(truncated)).format == "MPO"
+
+    _, _, issue = _facebook_issue(
+        monkeypatch,
+        tmp_path,
+        name="post.jpg",
+        write=lambda path: path.write_bytes(truncated),
+    )
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
+        issue()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "plain",
+        "progressive",
+        "exif thumbnail",
+        "MPO with an EXIF thumbnail",
+        "trailing data",
+    ],
+)
+def test_issue_facebook_accepts_a_complete_jpeg(monkeypatch, tmp_path, kind):
+    # Why: the end-marker check must not refuse whole JPEGs: progressive ones
+    # with several scans, ones carrying an EXIF thumbnail, MPO files whose
+    # extra images follow the main image's end marker, and files with other
+    # data after that marker, so the file need not end with one.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    content = _jpeg(kind)
+    if kind == "trailing data":
+        assert not content.endswith(b"\xff\xd9")
+    _, _, issue = _facebook_issue(
+        monkeypatch,
+        tmp_path,
+        name="post.jpg",
+        write=lambda path: path.write_bytes(content),
+    )
+
+    assert issue().url.startswith("https://api.example.test/")
+
+
+@pytest.mark.parametrize("registered_type", ["image/png", "image/jpeg"])
+def test_delivered_image_type_keeps_the_registered_type_for_other_bytes(
+    registered_type,
+):
+    # Why: delivery names the type of the bytes it sends, but a file rewritten
+    # after issue may carry neither signature; the registered type then stays
+    # rather than a guess.
+    gif = BytesIO()
+    Image.new("RGB", (8, 8), "blue").save(gif, "GIF")
+
+    assert (
+        external_media.delivered_image_media_type(gif.getvalue(), registered_type)
+        == registered_type
+    )
 
 
 def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tmp_path):

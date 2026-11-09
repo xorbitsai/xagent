@@ -315,6 +315,34 @@ def get_alembic_revision(connectable: Engine | Connection) -> str | None:
         return cast(str | None, context.get_current_revision())
 
 
+def check_standby_schema(engine: Engine) -> None:
+    """Read-only schema admission for a standby process.
+
+    A standby starts against the *deployed* schema, which is the same as or
+    older than its code. Every current revision must therefore be one this
+    code's revision graph contains: a revision at or before a head is accepted,
+    and one the graph does not know (the database was written by newer code, or
+    by a different branch) is refused. It never upgrades, stamps or writes; the
+    strict equality check stays with activation, after the migration.
+    """
+    alembic_cfg = create_alembic_config(engine)
+    script = ScriptDirectory.from_config(alembic_cfg)
+    known = {revision.revision for revision in script.walk_revisions()}
+    with engine.connect() as connection:
+        actual = set(MigrationContext.configure(connection).get_current_heads())
+    if not actual:
+        raise RuntimeError(
+            "Standby start needs an initialized database; this one has no "
+            "Alembic revision."
+        )
+    unknown = sorted(actual - known)
+    if unknown:
+        raise RuntimeError(
+            f"Standby refused: database revision(s) {unknown} are unknown to this "
+            "release, so the database is newer than this code or on another branch."
+        )
+
+
 def _check_revision_is_known(alembic_cfg: Any, engine: Engine, version: str) -> None:
     """Fail with an actionable message when the DB revision is unknown.
 

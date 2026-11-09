@@ -91,6 +91,7 @@ def record_provider_usage(
     output_tokens: Any = 0,
     resolution: str = "",
     provider_billed_units: Any = _ABSENT,
+    input_has_video: Any = _ABSENT,
 ) -> None:
     """Record one billed provider call; never raises.
 
@@ -104,6 +105,8 @@ def record_provider_usage(
         extras: dict[str, Any] = {}
         if provider_billed_units is not _ABSENT:
             extras["provider_billed_units"] = provider_billed_units
+        if input_has_video is not _ABSENT:
+            extras["input_has_video"] = input_has_video
         add_media_usage(
             call_type=call_type,
             quantity=0 if quantity is None else quantity,

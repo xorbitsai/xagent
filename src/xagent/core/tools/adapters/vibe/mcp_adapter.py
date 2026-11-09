@@ -549,9 +549,20 @@ class _ExternalMediaBinding:
     file_argument: str
     url_argument: str
     purpose: str
-    # When no URL can be issued for the file (no public base URL, or a type or
-    # size the purpose does not deliver), leave the file argument for the
-    # connector's own upload instead of failing.
+    # When no URL is issued for the file, leave the file argument as given
+    # instead of failing: a FileRef (file:<id> or a bare id) is then staged,
+    # and a plain path goes to the connector, which reads it itself. No URL is
+    # issued when
+    # - the argument is neither a FileRef nor a path to a registered file;
+    # - issuance does not find an available registered file of this task
+    #   (FileNotFoundError), for example a task-less upload, an internal-* id,
+    #   or a workspace with no database task;
+    # - issuance refuses the file (ExternalMediaNotIssuableError): no public
+    #   HTTPS base URL; an image the purpose does not deliver (its name is not
+    #   PNG or JPEG, it is too large, or its bytes do not decode, as when
+    #   truncated); or bytes external media cannot reach in its own scope
+    #   (ExternalMediaOutOfScope).
+    # Read, integrity and storage errors still fail the call.
     upload_fallback: bool = False
 
 
@@ -565,9 +576,12 @@ _EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
         purpose="instagram-publish",
     ),
     # A Composio-proxied grant cannot send multipart bytes, so Meta fetches the
-    # image from a URL for every grant (#3586). When no URL can be issued (no
-    # public base URL, or GIF/BMP/TIFF or over 10 MB), native grants keep the
-    # connector's own multipart upload, staged as before.
+    # image from a URL for every grant (#3586). When no URL is issued (see
+    # upload_fallback: a path or id that is not a registered file of this
+    # task, no public HTTPS base URL, an image that is not a PNG or JPEG of at
+    # most 10 MB that decodes, or bytes outside external media's scope),
+    # native grants keep the connector's own multipart upload as before, and a
+    # Composio grant gets the connector's refusal.
     ("facebook-pages", "facebook_publish_image_post"): _ExternalMediaBinding(
         file_argument="file_path",
         url_argument="image_url",

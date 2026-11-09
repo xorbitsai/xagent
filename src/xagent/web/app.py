@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import logging
 import mimetypes
@@ -6,7 +7,7 @@ import os
 import random
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -105,7 +106,7 @@ from .browser_security import is_widget_page
 from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
-from .models.database import init_db
+from .models.database import complete_standby_db_init, init_db, init_db_standby
 from .oauth_handoff import router as oauth_handoff_router
 from .runtime_telemetry import (
     start_process_runtime_telemetry,
@@ -132,10 +133,12 @@ from .services.ops_signals import (
     register_degradation,
 )
 from .services.orphan_upload_gc import run_orphan_upload_gc_loop
+from .services.release_hold import release_hold
 from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
 )
+from .services.standby import standby
 from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
@@ -1855,10 +1858,17 @@ async def stop_app_process_diagnostics(app_instance: FastAPI) -> None:
     await stop_process_diagnostics(task)
 
 
-async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
-    """Prepare the database, admit the host, then open runtime work ingress."""
+async def _admit_database_and_host(app_instance: FastAPI, *, bound: bool) -> None:
+    """Migrate and seed, admit the host, then validate the trace backend.
+
+    ``bound`` is a standby that already bound its engine and passed the
+    read-only checks: it completes the deferred half instead of ``init_db``.
+    """
     with _startup_phase("database init"):
-        init_db()
+        if bound:
+            complete_standby_db_init()
+        else:
+            init_db()
 
     # Host checks may rely on the fully migrated database. Nothing below this
     # boundary may admit tasks or launch a writer/dispatcher until every check
@@ -1872,11 +1882,13 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     with _startup_phase("trace database init"):
         get_trace_database_runtime()
 
-    # Keep built-in task-runtime providers scoped to the application lifespan.
-    # Register even when disabled so task creation receives a precise 403
-    # instead of an ambiguous "unknown extension" error.
-    register_local_browser_runtime()
 
+async def _open_admission() -> None:
+    """Standby activation: let this process admit and claim execution."""
+    release_hold.reopen()
+
+
+async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
     from .services.task_execution import background_task_manager
@@ -1893,6 +1905,40 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     start_orphan_upload_gc_task(app_instance)
     start_retention_purge_task(app_instance)
     start_task_cleanup_retry_task(app_instance)
+
+
+async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
+    """Prepare the database, admit the host, then open runtime work ingress.
+
+    A standby process binds the database read-only here and defers every
+    write, the admission hold and the background loops to activation, in the
+    order a normal start runs them.
+    """
+    if standby.standby:
+        with _startup_phase("database bind (standby)"):
+            init_db_standby()
+        # Keep built-in task-runtime providers scoped to the application
+        # lifespan; registration only, no I/O.
+        register_local_browser_runtime()
+        standby.defer(
+            "database and host admission",
+            functools.partial(_admit_database_and_host, app_instance, bound=True),
+        )
+        standby.defer("open admission", _open_admission)
+        standby.defer(
+            "local runtime loops",
+            functools.partial(_start_local_runtime_loops, app_instance),
+        )
+        return
+
+    await _admit_database_and_host(app_instance, bound=False)
+
+    # Keep built-in task-runtime providers scoped to the application lifespan.
+    # Register even when disabled so task creation receives a precise 403
+    # instead of an ambiguous "unknown extension" error.
+    register_local_browser_runtime()
+
+    await _start_local_runtime_loops(app_instance)
 
 
 async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
@@ -1940,94 +1986,21 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
         raise
 
 
-# initial database and skill manager
-@app.on_event("startup")
-async def startup_event() -> None:
+async def _run_or_defer(name: str, step: Callable[[], Awaitable[None]]) -> None:
+    """Run a startup step now, or postpone it to activation in standby."""
+    if standby.standby:
+        standby.defer(name, step)
+    else:
+        await step()
+
+
+def _lancedb_auto_migrate() -> bool:
+    return os.getenv("LANCEDB_AUTO_MIGRATE", "true").lower() == "true"
+
+
+async def _admit_memory_and_lancedb() -> None:
+    """Memory admission, LanceDB migrations and the background reconciles."""
     global _migration_task
-    from ..config import get_task_execution_role, validate_task_execution_host_config
-
-    validate_auth_config()
-    from ..core.model.network_policy import ModelNetworkPolicy
-    from ..core.tools.core.mcp.http import MCPNetworkPolicy
-
-    ModelNetworkPolicy()  # Fail before admitting work if operator policy is invalid.
-    MCPNetworkPolicy()
-    from .services.auth_attempts import validate_auth_attempt_storage
-
-    await asyncio.to_thread(validate_auth_attempt_storage)
-    validate_task_execution_host_config()
-    if get_task_execution_role() == "worker":
-        raise ValueError("Use python -m xagent.web.worker for the worker role")
-    logger.info("Agent runtime configured: %s", get_agent_runtime())
-    validate_interaction_rollout_at_startup()
-    from ..core.tools.core.RAG_tools.storage.vector_backend import (
-        lock_deployment_kb_engine,
-    )
-
-    lock_deployment_kb_engine()
-    await _initialize_database_and_admit_runtime(app)
-
-    # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
-    # sub-task scoped across process restarts. With no resolver registered
-    # they are the sole answer; with one registered they are a
-    # corroborating candidate (see
-    # xagent.core.execution_scope.resolve_execution_scope).
-    from ..core.execution_scope import execution_scope_resolver_registered
-    from .services.execution_scope_snapshot import (
-        register_execution_scope_snapshot_loader,
-    )
-
-    register_execution_scope_snapshot_loader()
-    # This reflects only whether a resolver is registered at this point in
-    # startup; it is not re-evaluated afterward. An embedder that registers
-    # its resolver later (e.g. from its own startup hook running after this
-    # one) leaves this line reporting "snapshot-only" even once a resolver
-    # is in fact authoritative -- the mode itself is live and re-checked on
-    # every resolution (see resolve_execution_scope), only this log line is
-    # a startup-time snapshot of it.
-    logger.info(
-        "Execution scope authority mode at startup: %s",
-        "resolver-authoritative (snapshot is a corroborating candidate)"
-        if execution_scope_resolver_registered()
-        else "snapshot-only (no resolver registered yet)",
-    )
-
-    from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
-
-    warn_if_rate_limits_are_per_process()
-
-    from .services.trigger_providers.gmail import (
-        warn_if_gmail_oidc_verification_degraded,
-        warn_if_gmail_watch_registration_degraded,
-    )
-
-    warn_if_gmail_oidc_verification_degraded()
-    warn_if_gmail_watch_registration_degraded()
-
-    initialize_langfuse()
-
-    # Initialize skill manager
-    from ..skills.utils import create_skill_manager
-
-    skill_manager = create_skill_manager()
-    with _startup_phase("skill manager init"):
-        await skill_manager.initialize()
-    app.state.skill_manager = skill_manager
-    logger.info(
-        f"Skill manager initialized with {len(await skill_manager.list_skills())} skills"
-    )
-
-    # Initialize template manager
-    from ..templates.utils import create_template_manager
-
-    template_manager = create_template_manager()
-    with _startup_phase("template manager init"):
-        await template_manager.initialize()
-    app.state.template_manager = template_manager
-    logger.info(
-        f"Template manager initialized with {len(await template_manager.list_templates())} templates"
-    )
-
     # Admit persistent memory storage before anything is allowed to use it.
     # Startup is the only moment at which this process is guaranteed to have no
     # memory writers, and no store is published unless admission succeeds.
@@ -2040,7 +2013,7 @@ async def startup_event() -> None:
 
     # Auto-migrate LanceDB tables if needed (for multi-tenancy support)
     # Controlled by LANCEDB_AUTO_MIGRATE environment variable (default: true)
-    auto_migrate = os.getenv("LANCEDB_AUTO_MIGRATE", "true").lower() == "true"
+    auto_migrate = _lancedb_auto_migrate()
 
     try:
         from ..core.tools.core.RAG_tools.kb.collection_handle import (
@@ -2375,43 +2348,29 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-    # Warmup sandbox manager
-    from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
-    # WHY: the getter can construct the backend service and inventory
-    # containers on a cold process, so a hang here needs its own phase line.
-    with _startup_phase("sandbox manager init"):
-        sandbox_mgr = get_sandbox_manager()
-    if sandbox_mgr:
-        # Readiness runs before cleanup/warmup and is deliberately not
-        # wrapped in try/except: a static SANDBOX_VOLUMES/code-mount/
-        # external-upload-dir conflict must fail startup outright rather
-        # than surface later as a per-task SandboxRuntimeConflictError.
-        # This also resolves and caches the backend-capability probe as a
-        # side effect, so cleanup() below reads the cached value instead of
-        # resolving it again.
-        # cleanup() quiesce can be awaited inline for minutes with no logs.
-        # Time each sub-phase so the next slow start names the exact one; the
-        # quiesce summary breaks it down further.
-        with _startup_phase("sandbox static readiness"):
-            await check_sandbox_static_readiness(sandbox_mgr)
-        with _startup_phase("sandbox cleanup"):
-            await sandbox_mgr.cleanup()
-        with _startup_phase("sandbox warmup"):
-            await sandbox_mgr.warmup()
-        logger.info("Sandbox manager initialized and warmed up")
+async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
+    # cleanup() quiesce can be awaited inline for minutes with no logs.
+    # Time each sub-phase so the next slow start names the exact one; the
+    # quiesce summary breaks it down further.
+    with _startup_phase("sandbox cleanup"):
+        await sandbox_mgr.cleanup()
+    with _startup_phase("sandbox warmup"):
+        await sandbox_mgr.warmup()
+    logger.info("Sandbox manager initialized and warmed up")
 
-        from ..config import get_sandbox_idle_ttl
+    from ..config import get_sandbox_idle_ttl
 
-        if get_sandbox_idle_ttl() is not None:
-            global _sandbox_idle_sweep_task
-            _sandbox_idle_sweep_task = asyncio.create_task(
-                sandbox_mgr.run_idle_sweep_loop()
-            )
-            logger.info("Started sandbox idle sweep task")
-    else:
-        logger.info("Sandbox manager not available (disabled or init failed)")
+    if get_sandbox_idle_ttl() is not None:
+        global _sandbox_idle_sweep_task
+        _sandbox_idle_sweep_task = asyncio.create_task(
+            sandbox_mgr.run_idle_sweep_loop()
+        )
+        logger.info("Started sandbox idle sweep task")
 
+
+async def _start_commands_and_channels() -> None:
+    """Command dispatch (and shared runtime) plus the configured chat channels."""
     # Recover accepted-but-unfinished task commands only after the runtime,
     # skill/template managers, tracing, and sandbox services are ready.
     from .services.task_command_execution import execute_durable_task_command
@@ -2459,6 +2418,10 @@ async def startup_event() -> None:
     except Exception as e:
         logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
 
+
+async def _start_late_tasks() -> None:
+    """Temp-file cleanup and Composio reconcile, deliberately started last."""
+    auto_migrate = _lancedb_auto_migrate()
     # Kept under the same migration toggle as the uploaded-files reconcile above;
     # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
     #
@@ -2474,40 +2437,20 @@ async def startup_event() -> None:
     # Last for the same reason: a Composio reconcile pass runs in an executor
     # thread that only its stop event (set by shutdown_event) can end.
     start_composio_reconcile_task(app)
-    start_runtime_performance_monitor(app)
-    start_app_process_diagnostics(app)
 
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
+async def _stop_runtime_loops() -> None:
+    """Stop the background loops and dispatchers startup (or activation) started.
+
+    Shared by shutdown and by a failed standby activation, which must not leave
+    the claim paths it already started running.
+    """
     global \
         _file_storage_startup_sync_task, \
         _migration_task, \
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
-
-    # WHY: signal the background temp-file cleanup walk to unwind before any other
-    # teardown runs. It sweeps in an executor thread that a task cancel cannot
-    # stop, and asyncio.run()'s teardown joins that thread at loop close, so if an
-    # earlier shutdown step hangs (e.g. an unresponsive flush_langfuse) the walk
-    # would keep running and block process exit — the exact F1 regression this
-    # guards against. Setting the flag first is unconditional and cannot hang.
-    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
-    if temp_file_cleanup_stop is not None:
-        temp_file_cleanup_stop.set()
-
-    # WHY: same shape and same reason as the flag above. The purge runs its
-    # batch in a to_thread worker, which a later task cancel cannot stop, so
-    # the signal has to be set before any step that can hang -- otherwise an
-    # unresponsive flush_langfuse leaves the sweep deleting while the process
-    # tries to exit. Setting it is unconditional and cannot hang; the draining
-    # happens later, in stop_retention_purge_task.
-    retention_purge_stop = getattr(app.state, "retention_purge_stop", None)
-    if retention_purge_stop is not None:
-        retention_purge_stop.set()
-
-    flush_langfuse()
 
     if _task_command_dispatcher_task is not None:
         from .services.task_command_transport import stop_task_command_dispatcher
@@ -2559,7 +2502,9 @@ async def shutdown_event() -> None:
             with suppress(asyncio.CancelledError):
                 await task
 
-    # Shutdown chat channels before draining task finalizers.
+
+async def _stop_chat_channels() -> None:
+    """Cancel the chat channel tasks and stop each channel; shared by shutdown and abort."""
     try:
         channel_tasks = [
             task
@@ -2586,6 +2531,203 @@ async def shutdown_event() -> None:
         await slack_channel.stop()
     except Exception as e:
         logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+
+
+async def _abort_standby_activation() -> None:
+    """A failed activation must not leave an open hold or running claim paths.
+
+    Stops what the already-run activation steps started: the loops and
+    dispatchers, any chat channel, and (shared execution) the event bridge.
+    The process is then stopped by its host; a failed standby is never retried.
+    """
+    release_hold.seal("standby activation failed")
+    await _stop_runtime_loops()
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
+    cleanup_task = getattr(app.state, "temp_file_cleanup_task", None)
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+    await _stop_chat_channels()
+    if get_shared_task_execution_enabled():
+        from .api.websocket import manager
+        from .services.task_event_bridge import stop_task_event_bridge
+
+        try:
+            await manager.stop_stream_reconciliation()
+            await stop_task_event_bridge()
+        except Exception:
+            logger.exception(
+                "Failed to stop the task event bridge after a failed activation"
+            )
+
+
+# initial database and skill manager
+@app.on_event("startup")
+async def startup_event() -> None:
+    from ..config import (
+        get_standby_enabled,
+        get_task_execution_role,
+        validate_task_execution_host_config,
+    )
+
+    if get_standby_enabled():
+        standby.begin()
+        standby.on_failure(_abort_standby_activation)
+        release_hold.seal("standby")
+    validate_auth_config()
+    from ..core.model.network_policy import ModelNetworkPolicy
+    from ..core.tools.core.mcp.http import MCPNetworkPolicy
+
+    ModelNetworkPolicy()  # Fail before admitting work if operator policy is invalid.
+    MCPNetworkPolicy()
+    from .services.auth_attempts import validate_auth_attempt_storage
+
+    await asyncio.to_thread(validate_auth_attempt_storage)
+    validate_task_execution_host_config()
+    if get_task_execution_role() == "worker":
+        raise ValueError("Use python -m xagent.web.worker for the worker role")
+    logger.info("Agent runtime configured: %s", get_agent_runtime())
+    validate_interaction_rollout_at_startup()
+    from ..core.tools.core.RAG_tools.storage.vector_backend import (
+        lock_deployment_kb_engine,
+    )
+
+    lock_deployment_kb_engine()
+    await _initialize_database_and_admit_runtime(app)
+
+    # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
+    # sub-task scoped across process restarts. With no resolver registered
+    # they are the sole answer; with one registered they are a
+    # corroborating candidate (see
+    # xagent.core.execution_scope.resolve_execution_scope).
+    from ..core.execution_scope import execution_scope_resolver_registered
+    from .services.execution_scope_snapshot import (
+        register_execution_scope_snapshot_loader,
+    )
+
+    register_execution_scope_snapshot_loader()
+    # This reflects only whether a resolver is registered at this point in
+    # startup; it is not re-evaluated afterward. An embedder that registers
+    # its resolver later (e.g. from its own startup hook running after this
+    # one) leaves this line reporting "snapshot-only" even once a resolver
+    # is in fact authoritative -- the mode itself is live and re-checked on
+    # every resolution (see resolve_execution_scope), only this log line is
+    # a startup-time snapshot of it.
+    logger.info(
+        "Execution scope authority mode at startup: %s",
+        "resolver-authoritative (snapshot is a corroborating candidate)"
+        if execution_scope_resolver_registered()
+        else "snapshot-only (no resolver registered yet)",
+    )
+
+    from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
+
+    warn_if_rate_limits_are_per_process()
+
+    from .services.trigger_providers.gmail import (
+        warn_if_gmail_oidc_verification_degraded,
+        warn_if_gmail_watch_registration_degraded,
+    )
+
+    warn_if_gmail_oidc_verification_degraded()
+    warn_if_gmail_watch_registration_degraded()
+
+    initialize_langfuse()
+
+    # Initialize skill manager
+    from ..skills.utils import create_skill_manager
+
+    skill_manager = create_skill_manager()
+    with _startup_phase("skill manager init"):
+        await skill_manager.initialize()
+    app.state.skill_manager = skill_manager
+    logger.info(
+        f"Skill manager initialized with {len(await skill_manager.list_skills())} skills"
+    )
+
+    # Initialize template manager
+    from ..templates.utils import create_template_manager
+
+    template_manager = create_template_manager()
+    with _startup_phase("template manager init"):
+        await template_manager.initialize()
+    app.state.template_manager = template_manager
+    logger.info(
+        f"Template manager initialized with {len(await template_manager.list_templates())} templates"
+    )
+
+    await _run_or_defer("memory and LanceDB admission", _admit_memory_and_lancedb)
+
+    # Warmup sandbox manager
+    from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
+
+    # WHY: the getter can construct the backend service and inventory
+    # containers on a cold process, so a hang here needs its own phase line.
+    with _startup_phase("sandbox manager init"):
+        sandbox_mgr = get_sandbox_manager()
+    if sandbox_mgr:
+        # Readiness runs before cleanup/warmup and is deliberately not
+        # wrapped in try/except: a static SANDBOX_VOLUMES/code-mount/
+        # external-upload-dir conflict must fail startup outright rather
+        # than surface later as a per-task SandboxRuntimeConflictError.
+        # This also resolves and caches the backend-capability probe as a
+        # side effect, so cleanup() below reads the cached value instead of
+        # resolving it again. It only reads, so a standby runs it too.
+        with _startup_phase("sandbox static readiness"):
+            await check_sandbox_static_readiness(sandbox_mgr)
+        # cleanup() removes containers the serving process may still own, so
+        # a standby leaves it (and the warmup that follows) to activation.
+        await _run_or_defer(
+            "sandbox cleanup and warmup",
+            functools.partial(_start_sandbox_runtime, sandbox_mgr),
+        )
+    else:
+        logger.info("Sandbox manager not available (disabled or init failed)")
+
+    await _run_or_defer("command dispatch and channels", _start_commands_and_channels)
+
+    await _run_or_defer("temp-file cleanup and Composio reconcile", _start_late_tasks)
+    start_runtime_performance_monitor(app)
+    start_app_process_diagnostics(app)
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    # A standby that never activated owns nothing shared: it must not clean up
+    # sandboxes (or anything else) the serving process still runs.
+    was_standby = standby.standby
+    # A next lifespan in this process starts from a clean standby ledger, and
+    # steps a never-activated standby postponed are dropped with it.
+    standby.reset()
+
+    # WHY: signal the background temp-file cleanup walk to unwind before any other
+    # teardown runs. It sweeps in an executor thread that a task cancel cannot
+    # stop, and asyncio.run()'s teardown joins that thread at loop close, so if an
+    # earlier shutdown step hangs (e.g. an unresponsive flush_langfuse) the walk
+    # would keep running and block process exit — the exact F1 regression this
+    # guards against. Setting the flag first is unconditional and cannot hang.
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
+
+    # WHY: same shape and same reason as the flag above. The purge runs its
+    # batch in a to_thread worker, which a later task cancel cannot stop, so
+    # the signal has to be set before any step that can hang -- otherwise an
+    # unresponsive flush_langfuse leaves the sweep deleting while the process
+    # tries to exit. Setting it is unconditional and cannot hang; the draining
+    # happens later, in stop_retention_purge_task.
+    retention_purge_stop = getattr(app.state, "retention_purge_stop", None)
+    if retention_purge_stop is not None:
+        retention_purge_stop.set()
+
+    flush_langfuse()
+
+    await _stop_runtime_loops()
+
+    # Shutdown chat channels before draining task finalizers.
+    await _stop_chat_channels()
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.
@@ -2640,7 +2782,7 @@ async def shutdown_event() -> None:
     from .sandbox_manager import get_sandbox_manager
 
     sandbox_mgr = get_sandbox_manager()
-    if sandbox_mgr:
+    if sandbox_mgr and not was_standby:
         await sandbox_mgr.cleanup()
 
     # Wait briefly for the background orphaned temp-file cleanup to unwind (its

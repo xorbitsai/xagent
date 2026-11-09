@@ -42,7 +42,8 @@ own interpreter and so its own hold) needs two more answers from every worker:
 
 Nothing here cancels, times out or queues work. Default state is open with an
 empty ledger, so a process that never closes the hold behaves exactly as
-before -- the ledger only adds counting around existing code paths.
+before (unless ``XAGENT_STANDBY`` is set: then the module seals the hold at
+import, and a malformed value raises on import) -- the ledger only adds counting around existing code paths.
 
 Constraints:
 
@@ -51,8 +52,9 @@ Constraints:
 - One process. Each interpreter has its own hold; a pooled host must collect
   every process's ``execution_status`` and treat a missing report as busy,
   never read one process as the whole pool.
-- Stdlib only at import time: ``task_execution`` imports this module, so it
-  must stay a leaf to avoid import cycles.
+- Imports only ``xagent.config`` (itself a leaf) besides the stdlib:
+  ``task_execution`` imports this module, so it must stay a leaf to avoid
+  import cycles.
 """
 
 from __future__ import annotations
@@ -66,6 +68,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+
+from ...config import get_standby_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +289,10 @@ class ReleaseHold:
 
 
 release_hold = ReleaseHold()
+# A standby process starts closed and sealed, from import on: no ingress exists
+# yet, so nothing can be admitted in between. Activation reopens it.
+if get_standby_enabled():
+    release_hold.seal("standby")
 
 
 def execution_status() -> dict[str, Any]:

@@ -438,6 +438,101 @@ def test_route_serves_the_stored_png_for_facebook(
     assert response.headers["content-type"] == "image/png"
 
 
+@pytest.mark.parametrize(
+    ("filename", "image_format", "expected_type"),
+    [("edited.png", "JPEG", "image/jpeg"), ("photo.jpg", "PNG", "image/png")],
+)
+def test_route_serves_facebook_images_with_the_type_of_their_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+    filename: str,
+    image_format: str,
+    expected_type: str,
+):
+    # Why: issuance accepts PNG or JPEG bytes whatever the extension, and
+    # image_tool saves every edit as .png. Under nosniff the declared type is
+    # final, so it must name the bytes sent, not the file name.
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / filename
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), "blue").save(image_path, image_format)
+    expected = image_path.read_bytes()
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename=filename,
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        ).url
+    )
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code == 200
+    assert response.content == expected
+    assert response.headers["content-type"] == expected_type
+
+
+def test_route_refuses_a_facebook_image_over_the_delivery_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    db: Session,
+    client: TestClient,
+):
+    # Why: the sandbox can rewrite a registered image after its URL is issued;
+    # delivery reads at most the connector's limit and refuses anything larger
+    # rather than sending a cut-off image.
+    uploads_dir = tmp_path / "uploads"
+    image_path = uploads_dir / "user_7" / "web_task_11" / "post.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), "blue").save(image_path)
+    monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://testserver")
+    file_id = str(uuid4())
+    _record(
+        db,
+        file_id,
+        filename="post.png",
+        storage_path=str(image_path),
+        storage_status="legacy",
+        storage_key=None,
+    )
+    target = urlsplit(
+        external_media.issue_external_media_url(
+            db,
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.FACEBOOK_PUBLISH,
+        ).url
+    )
+    # files imports the limit by value, so the route's copy is the one to patch.
+    monkeypatch.setattr(files, "FACEBOOK_MAX_IMAGE_BYTES", 32)
+
+    response = client.get(f"{target.path}?{target.query}")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Registered image exceeds the delivery size limit"
+    )
+
+
 def test_route_does_not_serve_a_file_swapped_for_a_link_after_issue(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -479,7 +574,7 @@ def test_route_does_not_serve_a_file_swapped_for_a_link_after_issue(
 
     response = client.get(f"{target.path}?{target.query}")
 
-    assert response.status_code != 200
+    assert response.status_code == 404
     assert response.content != other.read_bytes()
 
 

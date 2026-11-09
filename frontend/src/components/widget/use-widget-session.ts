@@ -33,7 +33,10 @@ export interface WidgetSessionFileUploads {
 // usable advertisement has no `capabilities` key, so no capability-gated
 // feature is offered.
 export interface WidgetSessionCapabilities {
-  fileUploads: WidgetSessionFileUploads
+  fileUploads?: WidgetSessionFileUploads
+  // Present when the server lets this session read its earlier conversations
+  // and continue from one.
+  conversationHistory?: true
 }
 
 export interface WidgetSession {
@@ -107,26 +110,35 @@ const isAllowedExtension = (value: unknown): value is string =>
   && value.startsWith(".")
   && value === value.toLowerCase()
 
-// The parent forwards the server's capabilities untouched, so everything here
-// is untrusted. Anything that does not match the documented shape counts as
-// "no capabilities" (undefined) instead of failing the session.
-export const parseCapabilities = (value: unknown): WidgetSessionCapabilities | undefined => {
-  if (!isRecord(value) || !isRecord(value.file_uploads)) return undefined
-  const uploads = value.file_uploads
-  const extensions = uploads.allowed_extensions
+const parseFileUploads = (value: unknown): WidgetSessionFileUploads | undefined => {
+  if (!isRecord(value)) return undefined
+  const extensions = value.allowed_extensions
   if (
     !Array.isArray(extensions)
     || extensions.length === 0
     || !extensions.every(isAllowedExtension)
-    || !isPositiveInteger(uploads.max_file_bytes)
-    || !isPositiveInteger(uploads.max_files_per_message)
+    || !isPositiveInteger(value.max_file_bytes)
+    || !isPositiveInteger(value.max_files_per_message)
   ) return undefined
   return {
-    fileUploads: {
-      allowedExtensions: [...extensions],
-      maxFileBytes: uploads.max_file_bytes,
-      maxFilesPerMessage: uploads.max_files_per_message,
-    },
+    allowedExtensions: [...extensions],
+    maxFileBytes: value.max_file_bytes,
+    maxFilesPerMessage: value.max_files_per_message,
+  }
+}
+
+// The parent forwards the server's capabilities untouched, so everything here
+// is untrusted. Each capability is read on its own: one that does not match
+// its documented shape is dropped without affecting the other, and a session
+// with none left counts as "no capabilities" (undefined) instead of failing.
+export const parseCapabilities = (value: unknown): WidgetSessionCapabilities | undefined => {
+  if (!isRecord(value)) return undefined
+  const fileUploads = parseFileUploads(value.file_uploads)
+  const conversationHistory = isRecord(value.conversation_history)
+  if (!fileUploads && !conversationHistory) return undefined
+  return {
+    ...(fileUploads ? { fileUploads } : {}),
+    ...(conversationHistory ? { conversationHistory: true as const } : {}),
   }
 }
 

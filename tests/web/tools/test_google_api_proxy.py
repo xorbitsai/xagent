@@ -671,6 +671,21 @@ def test_a_batch_above_the_request_cap_is_refused_before_sending(proxy):
     assert proxy.calls == []
 
 
+def test_a_batch_object_without_the_private_attributes_is_refused_clearly(proxy):
+    """``pyproject.toml`` sets only a lower bound for
+    google-api-python-client, and the fallback reads private attributes. A
+    release that renames one must not surface as an opaque AttributeError on
+    every search."""
+
+    class OpaqueBatch:
+        pass
+
+    with pytest.raises(RuntimeError, match="missing _order"):
+        google_api_proxy.execute_batch(OpaqueBatch())
+
+    assert proxy.calls == []
+
+
 def test_a_request_that_finishes_after_the_deadline_snapshot_keeps_its_result(
     proxy, monkeypatch
 ):

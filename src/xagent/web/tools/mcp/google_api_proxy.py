@@ -351,7 +351,19 @@ def execute_batch(
     awaited, so the caller returns inside its budget.
     """
     # BatchHttpRequest keeps its requests, their order and its callbacks in
-    # these attributes and googleapiclient has no public accessor for them.
+    # these attributes and googleapiclient has no public accessor for them. A
+    # release that renames one must fail with a readable message rather than
+    # an AttributeError on every proxied batch.
+    missing = [
+        name
+        for name in ("_order", "_requests", "_callbacks", "_callback")
+        if not hasattr(batch, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "this google-api-python-client does not expose the batch "
+            f"attributes the proxy fallback reads (missing {', '.join(missing)})"
+        )
     order: list[str] = list(batch._order)
     if not order:
         return

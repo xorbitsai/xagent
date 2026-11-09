@@ -203,17 +203,21 @@ describe("WidgetHistoryList", () => {
       expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.disabled")
     })
 
-    it.each(["refreshToLoad", "tryLater"] as const)(
-      "shows the %s notice for an unrefreshed rejected token",
-      async (unauthorizedNotice) => {
-        history.list.mockRejectedValue(new WidgetSessionHistoryError("unauthorized"))
-        renderList({ unauthorizedNotice })
+    it("asks for a reload and offers no retry when a rejected token cannot be refreshed", async () => {
+      history.list.mockRejectedValue(new WidgetSessionHistoryError("unauthorized"))
+      renderList({ unauthorizedNotice: "refreshToLoad" })
 
-        expect(await screen.findByRole("alert")).toHaveTextContent(
-          `widgetSession.history.${unauthorizedNotice}`,
-        )
-      },
-    )
+      expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.refreshToLoad")
+      expect(screen.queryByRole("button", { name: "widgetSession.history.retry" })).not.toBeInTheDocument()
+    })
+
+    it("says to try later and still offers a retry for a rejected token", async () => {
+      history.list.mockRejectedValue(new WidgetSessionHistoryError("unauthorized"))
+      renderList({ unauthorizedNotice: "tryLater" })
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("widgetSession.history.tryLater")
+      expect(screen.getByRole("button", { name: "widgetSession.history.retry" })).toBeInTheDocument()
+    })
 
     it("treats an error that is not a history error as a load failure", async () => {
       history.list.mockRejectedValue(new Error("boom"))

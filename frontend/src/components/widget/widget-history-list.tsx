@@ -109,16 +109,21 @@ export function WidgetHistoryList({
       ? t("widgetSession.history.disabled")
       : t("widgetSession.history.loadFailed")
 
+  // A reload is the only way past "refreshToLoad", so a retry would only fail again.
+  const offersRetry = !(errorKind === "unauthorized" && unauthorizedNotice === "refreshToLoad")
+
   const failure = (retry: () => void) => (
     <div className="flex flex-col items-start gap-2 text-sm">
       <p className="text-destructive" role="alert">{failureText}</p>
-      <button
-        type="button"
-        onClick={retry}
-        className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        {t("widgetSession.history.retry")}
-      </button>
+      {offersRetry ? (
+        <button
+          type="button"
+          onClick={retry}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {t("widgetSession.history.retry")}
+        </button>
+      ) : null}
     </div>
   )
 

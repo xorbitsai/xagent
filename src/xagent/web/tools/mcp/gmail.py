@@ -29,11 +29,12 @@ mcp = FastMCP("gmail-mcp")
 # fail the real send with an opaque API error. This is a budget shared
 # across every message in one gmail_send_messages call, not per-message —
 # a batch of many medium attachments is capped the same as one big one.
-# A Composio grant never reaches this budget: an attachment is base64-encoded
-# inside the MIME part and the whole message is base64-encoded again into
-# `raw`, so one message's JSON body is about 1.8 times the attachment and
-# composio_proxy.MAX_JSON_BODY_BYTES binds first (about 2.5 MB per message;
-# see gmail_send_messages).
+# A Composio grant has a lower per-message limit than this shared budget:
+# an attachment is base64-encoded inside the MIME part and the whole message
+# is base64-encoded again into `raw`, so one message's JSON body is about
+# 1.8 times its attachment and composio_proxy.MAX_JSON_BODY_BYTES allows
+# only about 2.5 MB per message (see gmail_send_messages). A call with
+# several messages can still exhaust this shared budget first.
 _MAX_ATTACHMENT_BYTES = int(25 * 1024 * 1024 * 3 / 4)
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_GMAIL_FILE_ALLOWED_DIRS"
 # The Gmail API's own host. The proxy transport refuses any other, so

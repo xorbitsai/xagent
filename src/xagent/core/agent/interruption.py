@@ -54,7 +54,7 @@ class InterruptionReason(str, Enum):
     """Why a run was interrupted rather than finished.
 
     Only the system-caused reasons (``LEASE_EXPIRED``, ``PERSISTENCE_FAILURE``,
-    ``LLM_UNAVAILABLE``, ``MODEL_OUTPUT_INVALID`` and the reserved
+    ``LLM_UNAVAILABLE``, ``MODEL_OUTPUT_INVALID`` and the planned-release
     ``SHUTDOWN``) describe a run that may be resumed without the user. The
     rest are recorded so a paused task can say why it is paused.
     """

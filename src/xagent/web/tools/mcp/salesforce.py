@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
@@ -271,16 +271,24 @@ def _headers() -> dict[str, str]:
 def _extract_error_detail(response: requests.Response) -> str | None:
     """Pull the human-readable message out of a Salesforce error body.
 
-    Salesforce REST API errors are a top-level JSON *array* of
-    {"message", "errorCode", ...} objects (unlike most APIs here, which wrap
-    errors in a dict) -- joining every message is more useful to the LLM
-    than the raw envelope. Returns None if the body isn't in the expected
-    shape, so the caller can fall back to the raw response text.
+    Returns None if the body isn't JSON or isn't in the expected shape, so
+    the caller can fall back to the raw response text.
     """
     try:
         payload = response.json()
     except ValueError:
         return None
+    return _error_detail_from_payload(payload)
+
+
+def _error_detail_from_payload(payload: Any) -> str | None:
+    """Join the messages of a Salesforce error array.
+
+    Salesforce REST API errors are a top-level JSON *array* of
+    {"message", "errorCode", ...} objects (unlike most APIs here, which wrap
+    errors in a dict) -- joining every message is more useful to the LLM
+    than the raw envelope. None when ``payload`` is not such an array.
+    """
     if not isinstance(payload, list) or not payload:
         return None
 
@@ -315,18 +323,19 @@ def _request_absolute(
         detail = _extract_error_detail(response)
         if detail is None:
             detail = response.text.strip()
-        # Applies to both branches -- a long or numerous structured error
-        # array (_extract_error_detail's case) is just as unbounded as raw
-        # response text, and was previously only capped in the latter.
-        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
-        raise RuntimeError(
-            f"Salesforce API error (status {response.status_code}): {detail}"
-        )
+        _raise_api_error(response.status_code, detail)
 
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _raise_api_error(status: int, detail: str) -> NoReturn:
+    # Applies to every source of ``detail`` -- a long or numerous structured
+    # error array is just as unbounded as raw response text.
+    if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+        detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    raise RuntimeError(f"Salesforce API error (status {status}): {detail}")
 
 
 def _request(

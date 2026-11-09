@@ -40,7 +40,7 @@ ConnectorChecks(
 
 - Every tool an in-repo (`python -m`) connector's server registers has a check or an exemption, and every tool a declaration names is registered. A remote (`url`) or `npx` connector is not held to per-tool coverage (see Today's L3 probes).
 - The legacy list only shrinks. A connector leaves it in the PR that adds its declaration; a new builtin connector ships with its declaration and cannot join it.
-- An exemption's reason says why the tool has no check yet, in one of the shared reasons in `registry.py`: a read whose check is not declared yet, a write waiting for #3564, or a write that creates an object no tool of the server deletes.
+- An exemption's reason says why the tool has no check yet. A read or write whose check is still to come names the issue of its connector family that decides it (#3567 for the Google document connectors, #3569 for the Microsoft 365 ones; a write check also needs the rules of #3653). A write that creates an object no tool of the server deletes has its own reason, since a write check would have nothing to clean up with. When a check is added for a tool, its exemption goes in the same change: a tool cannot be both.
 
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`. A write check's steps can also use a `RunScopedName`, its `verify`, `cleanup` and `cleanup_guard` a `CreatedRef`, and a sweep's `delete` an `ItemRef`. None of them ever comes from the caller of the engine.
 

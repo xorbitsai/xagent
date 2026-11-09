@@ -25,10 +25,12 @@ from .declarations import (
 )
 from .fixtures import FixtureRef
 
-# Why a tool of an in-repo connector has no check yet (#3565).
-_READ_PENDING = "read; no read check is declared for it yet"
-_WRITE_PENDING = "write; write checks wait for the safety rails of #3564"
-_WRITE_WITHOUT_CLEANUP = (
+# Why a tool of an in-repo connector has no check yet (#3565). A reason for
+# work still to come names the issue of the connector's family that decides
+# it; a write whose object no tool can delete is a reason of its own.
+_GOOGLE_TIER_1 = "#3567"
+_MICROSOFT_365_TIER_1 = "#3569"
+WRITE_WITHOUT_CLEANUP = (
     "write that creates an object no tool of this server deletes, so a write "
     "check has nothing to clean up with"
 )
@@ -36,15 +38,28 @@ _WRITE_WITHOUT_CLEANUP = (
 
 def _exemptions(
     *,
+    issue: str,
     reads: tuple[str, ...] = (),
     writes: tuple[str, ...] = (),
     writes_without_cleanup: tuple[str, ...] = (),
 ) -> tuple[ToolExemption, ...]:
     return (
-        *(ToolExemption(tool, _READ_PENDING) for tool in reads),
-        *(ToolExemption(tool, _WRITE_PENDING) for tool in writes),
         *(
-            ToolExemption(tool, _WRITE_WITHOUT_CLEANUP)
+            ToolExemption(
+                tool, f"read; whether it gets a read check is decided in {issue}"
+            )
+            for tool in reads
+        ),
+        *(
+            ToolExemption(
+                tool,
+                "write; whether it gets a write check under the rules of #3653 "
+                f"is decided in {issue}",
+            )
+            for tool in writes
+        ),
+        *(
+            ToolExemption(tool, WRITE_WITHOUT_CLEANUP)
             for tool in writes_without_cleanup
         ),
     )
@@ -80,6 +95,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
         exemptions=_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
             reads=(
                 "excel_get_range",
                 "excel_get_used_range",
@@ -115,6 +131,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
         exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
             reads=(),
             writes=(
                 "google_docs_append_text",
@@ -138,6 +155,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
         exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
             reads=("google_sheets_read_range",),
             writes=(
                 "google_sheets_update_range",
@@ -163,6 +181,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
         exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
             reads=("google_slides_get_slide_thumbnail",),
             writes=(
                 "google_slides_add_slide",
@@ -217,6 +236,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
         exemptions=_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
             reads=(
                 "powerpoint_get_presentation_text",
                 "powerpoint_get_slide_text",
@@ -244,6 +264,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
         exemptions=_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
             reads=("word_list_paragraphs",),
             writes=(
                 "word_set_paragraph_text",

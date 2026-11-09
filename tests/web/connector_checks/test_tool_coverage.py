@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import re
 from typing import Any
 
 import pytest
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-from xagent.web.connector_checks.registry import CONNECTOR_CHECKS, LEGACY_CONNECTORS
+from xagent.web.connector_checks.registry import (
+    CONNECTOR_CHECKS,
+    LEGACY_CONNECTORS,
+    WRITE_WITHOUT_CLEANUP,
+)
 
 # The legacy list when coverage became required. LEGACY_CONNECTORS may only
 # lose names; never add one here.
@@ -116,11 +121,27 @@ def test_an_adopted_connector_is_not_legacy():
 
 
 def test_every_builtin_connector_is_adopted_or_legacy():
-    undeclared = set(_rows()) - set(CONNECTOR_CHECKS) - LEGACY_CONNECTORS
+    """Remote and ``npx`` connectors included: per-tool coverage skips them,
+    so this is what stops one shipping with no V2 declaration."""
+    rows = _rows()
+    assert any(row["launch_config"].get("url") for row in rows.values())
+    assert any(row["launch_config"].get("command") == "npx" for row in rows.values())
+    undeclared = set(rows) - set(CONNECTOR_CHECKS) - LEGACY_CONNECTORS
     assert not undeclared, (
         f"{sorted(undeclared)} need a V2 declaration in "
         "web/connector_checks/registry.py"
     )
+
+
+@pytest.mark.parametrize("app_id", _adopted_in_repo())
+def test_a_pending_exemption_names_the_issue_that_decides_it(app_id):
+    pending = [
+        exemption
+        for exemption in CONNECTOR_CHECKS[app_id].exemptions
+        if exemption.reason != WRITE_WITHOUT_CLEANUP
+    ]
+    unnamed = [e.tool for e in pending if not re.search(r"decided in #\d+$", e.reason)]
+    assert not unnamed, f"{app_id}: {unnamed} need the issue that decides their check"
 
 
 @pytest.mark.parametrize("app_id", _adopted_in_repo())

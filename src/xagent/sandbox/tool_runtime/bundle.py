@@ -27,7 +27,7 @@ _RUNTIME_FILES = {
 }
 
 # -I ignores PYTHONPATH and the caller's cwd. Restore the guest's user-installed
-# dependencies explicitly: Boxlite executes as the sandbox user, whose declared
+# dependencies explicitly: sandbox tools execute as the non-root sandbox user, whose declared
 # packages may have been installed with pip --user. No backend path is added.
 _BOOTSTRAP = """import base64, importlib.util, os, pathlib, runpy, site, sys
 if any(pathlib.Path(path).exists() for path in ('/app/src', '/app/tests')):

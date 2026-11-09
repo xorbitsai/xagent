@@ -625,23 +625,6 @@ wheels = [
 ]
 
 [[package]]
-name = "boxlite"
-version = "0.10.7"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/b1/a445910349760041c290bc1a7227fc68cb5b2f19b845ad660841165fdaa0/boxlite-0.10.7-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:9758254058b1ff0de5d5c2a1338e87ecd071d2704ba90ac70c42a5a81a83cb9a", size = 40618823, upload-time = "2026-10-18T01:34:00.027Z" },
-    { url = "https://files.pythonhosted.org/packages/6b/e9/2d2476edfb04f85168363a39d27746f0864c80d4031dcc3efcd84bcf9bbc/boxlite-0.10.7-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:40c0c0cf551e29837642e5bd81c9e3e00baec1f4cd93e0dac5c012a8a8223953", size = 38895777, upload-time = "2026-10-18T01:34:08.257Z" },
-    { url = "https://files.pythonhosted.org/packages/48/36/35d0ff82b375969906f7f3b080ef7fbbb8371a2b58ffddc9c0cd3427b071/boxlite-0.10.7-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:97a3c9a7fba9b76182fafe5696288efba4c5e2057530942146192360d8378463", size = 40622820, upload-time = "2026-10-18T01:34:12.737Z" },
-    { url = "https://files.pythonhosted.org/packages/9c/63/389cf73c6dbd0c115601b60528942edbf0485fc002c40f58de4761e269d5/boxlite-0.10.7-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:8d29b231dfca853a3d75165b45ab4b0fd2edbc7fe5ee4067c5caf8b2e5f7d7c5", size = 38893454, upload-time = "2026-10-18T01:34:21.841Z" },
-    { url = "https://files.pythonhosted.org/packages/69/8c/2e78a99992d1b5acb0d3bbcce99fa078a92095e4c53cc3de090be51d831c/boxlite-0.10.7-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:dce36e669094d382e09496ec844d5dfef6b3c6fec07a0f44a6f56c3ed7b86fe3", size = 40622921, upload-time = "2026-10-18T01:34:26.35Z" },
-    { url = "https://files.pythonhosted.org/packages/6b/ff/fa26bcb7af001d84d25e9eef17689324bbdfc1944e44c7dd3196831568d5/boxlite-0.10.7-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:81b2579749d29a89481863e37b27c6c919a8279573a8601826eaed1430a6e5e4", size = 38892539, upload-time = "2026-10-18T01:34:35.588Z" },
-    { url = "https://files.pythonhosted.org/packages/e2/13/6d1baf5a822d736e218e7b8d3305839ca1b2a97a31c9a954f26856a6bd4a/boxlite-0.10.7-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:fd11510b9e3f2d1dc38e706dfa2eb569671e7079468bb9075f250804306fa133", size = 40621587, upload-time = "2026-10-18T01:34:39.858Z" },
-    { url = "https://files.pythonhosted.org/packages/85/01/63eb2bba2581ff912a575930c40ce2feb090ddcda5404112edf4a2b69b8e/boxlite-0.10.7-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:417a8ed052796179a0680f9a58ab0cc0c302c635c7e4d207d2071ee5c4c25705", size = 38895278, upload-time = "2026-10-18T01:34:48.677Z" },
-    { url = "https://files.pythonhosted.org/packages/d2/0b/6807ba036c3818bbcc62c7ca7c61fd6c4534c958001fcb05f3cfff258d50/boxlite-0.10.7-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:f36f9af56f355d08776f782963fa71a7868d028723df24efd9fc01c27142783f", size = 40620576, upload-time = "2026-10-18T01:34:52.543Z" },
-    { url = "https://files.pythonhosted.org/packages/fb/aa/f26445cbc397256edb2b73abb67a7f4345a1bdca3cfa358be211f60ac811/boxlite-0.10.7-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:b9586e737242bed22f9a875846c09d98c2998d778c530647590764fd13b42450", size = 38892912, upload-time = "2026-10-18T01:35:00.586Z" },
-]
-
-[[package]]
 name = "build"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -8407,7 +8390,6 @@ dependencies = [
     { name = "beartype" },
     { name = "beautifulsoup4" },
     { name = "boto3" },
-    { name = "boxlite", marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "byteplus-python-sdk-v2" },
     { name = "cairosvg" },
     { name = "celery", extra = ["redis"] },
@@ -8658,8 +8640,6 @@ requires-dist = [
     { name = "beartype", specifier = ">=0.18.5" },
     { name = "beautifulsoup4", specifier = ">=4.12.3" },
     { name = "boto3", specifier = ">=1.34.59" },
-    { name = "boxlite", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.10.7,<0.11" },
-    { name = "boxlite", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.10.7,<0.11" },
     { name = "byteplus-python-sdk-v2", specifier = ">=3.0.52" },
     { name = "cairosvg", specifier = ">=2.9.1" },
     { name = "celery", extras = ["redis"], specifier = ">=5.4.0,<6.0.0" },

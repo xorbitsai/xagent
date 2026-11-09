@@ -963,29 +963,6 @@ async def test_ssh_sandbox_lease_capacity_fails_closed(monkeypatch) -> None:
     assert exc.value.code == SshErrorCode.SANDBOX_UNAVAILABLE
 
 
-async def test_create_ssh_tools_are_disabled_on_boxlite_backend(monkeypatch) -> None:
-    import xagent.web.sandbox_manager as sm
-    from xagent.core.tools.adapters.vibe import ssh_tools
-    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
-
-    provider = _Provider(targets=[SimpleNamespace()])  # one bound target
-    set_ssh_target_provider_hook(lambda _sf: provider)
-    monkeypatch.setattr(ssh_tools, "_agent_id_for_task", lambda _sf, _tid, _uid: 1)
-    monkeypatch.setattr(sm, "get_sandbox_manager", lambda: _FakeManager(object()))
-    monkeypatch.setenv("SANDBOX_IMPLEMENTATION", "boxlite")
-    config = SimpleNamespace(
-        get_session_factory=lambda: object(),
-        get_user_id=lambda: 42,
-        get_task_id=lambda: "web_task_30",
-        get_workspace_config=lambda: None,
-    )
-    try:
-        tools = await ssh_tools.create_ssh_tools(config)
-        assert tools == []
-    finally:
-        set_ssh_target_provider_hook(None)
-
-
 def test_ssh_creator_registered_under_ssh_category() -> None:
     # Managed SSH tools get their own assignable "ssh" category so the agent
     # editor can auto-enable it when a target is bound (mirrors connectors).

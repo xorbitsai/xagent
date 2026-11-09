@@ -255,9 +255,8 @@ class TestDBDockerStore:
         assert model is None
 
 
-def test_sandbox_store_imports_without_boxlite():
+def test_sandbox_store_exposes_only_docker_store():
     code = (
-        "import sys; sys.modules['boxlite'] = None\n"
         "import xagent.web.sandbox_store as m\n"
         "assert m.DBDockerStore\n"
         "assert not hasattr(m, 'DBBoxliteStore')\n"

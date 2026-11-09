@@ -644,7 +644,7 @@ async def test_cleanup_handles_non_managed_sandbox(
 async def test_legacy_cleanup_uses_direct_stop_when_backend_supports_it(
     manager: SandboxManager, service: FakeSandboxService
 ):
-    """BoxLite cleanup must not enter get_or_create and trigger migration."""
+    """Legacy cleanup must not enter get_or_create and trigger migration."""
     sb = _make_sb_info("__warmup__", image="img:v1")
     service.list_sandboxes.return_value = [sb]
     service.stop_existing = AsyncMock()
@@ -768,7 +768,7 @@ class TestQuiesceReconcilingBackend:
 
 
 class TestLegacyCleanupSummary:
-    """``_legacy_cleanup`` (Boxlite route) emits one structured summary on every
+    """``_legacy_cleanup`` emits one structured summary on every
     path — empty, stop, and error — with the same ``running``/``stop_time``
     fields the quiesce route carries, so cleanup telemetry stays consistent
     across supported backends."""

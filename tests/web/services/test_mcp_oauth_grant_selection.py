@@ -471,3 +471,60 @@ async def test_runtime_connection_selects_against_the_url_it_sends_to(
     else:
         assert build.connection is None
         assert build.diagnostic is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "connection_url", "expect_code"),
+    [
+        pytest.param(
+            "member_with_grant",
+            MCP_URL,
+            "grant_not_allowed_for_task_source",
+            id="member_grant_withheld",
+        ),
+        pytest.param(
+            "member_with_grant",
+            OTHER_URL,
+            "authorization_required",
+            id="member_grant_for_another_url",
+        ),
+        pytest.param(
+            "member_without_grant",
+            MCP_URL,
+            "authorization_required",
+            id="member_without_grant",
+        ),
+        pytest.param(
+            "association_holder_without_grant",
+            MCP_URL,
+            "authorization_required",
+            id="association_holder_without_grant",
+        ),
+    ],
+)
+async def test_runtime_names_a_grant_withheld_by_the_task_source(
+    db_session, caller: str, connection_url: str, expect_code: str
+) -> None:
+    user = _add_user(db_session, "selection-member")
+    server = _add_server(db_session, url=MCP_URL)
+    if caller == "member_with_grant":
+        _add_grant(db_session, server=server, user=user)
+    elif caller == "association_holder_without_grant":
+        db_session.add(
+            UserMCPServer(
+                user_id=user.id, mcpserver_id=server.id, is_owner=True, is_active=True
+            )
+        )
+        db_session.commit()
+    # The stored URL still equals the grant's resource; only the URL the token
+    # would be sent to differs, so the second selection must compare it too.
+    server.url = connection_url
+
+    build = await build_mcp_runtime_connection(
+        db_session, server, user_id=user.id, allow_team_member_grants=False
+    )
+
+    assert build.connection is None
+    assert build.diagnostic is not None
+    assert build.diagnostic["code"] == expect_code

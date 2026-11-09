@@ -8,7 +8,11 @@ API: the file is uploaded once, then named by the key the tool receives.
 
 A staged object is not read again here, so the bytes that were sent are the
 bytes the tool sees. The upload request carries the file's MD5, which is what
-Composio's own deduplication keys on.
+Composio's own deduplication keys on. A failed tool leaves its staged object
+in Composio's storage until Composio's retention expires it (about a day in
+the published documentation); this module does not call a delete endpoint, so
+confirming that retention and whether such an endpoint exists is a stage
+check. The object holds the user's bytes for that window.
 
 Nothing raised here names the API key, the connected account id, the user id,
 or the presigned URL: a presigned URL is a bearer credential for the staged
@@ -20,12 +24,14 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Protocol
 from urllib.parse import urlsplit
 
 from ....core.utils import public_requests as requests
+from ....core.utils.security import PrivateNetworkHostError
 from .composio_proxy import (
     COMPOSIO_API_KEY_ENV,
     COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
@@ -96,6 +102,7 @@ def stage_file(
     data: bytes | BinaryIO | ReadableBody,
     length: int,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    on_dedup: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     """Upload ``data`` to Composio's file storage for ``tool_slug``.
 
@@ -106,9 +113,11 @@ def stage_file(
 
     Composio deduplicates on ``md5``. When it answers with a key but no
     upload URL, the bytes are already stored under that key and nothing is
-    uploaded again.
+    uploaded again. ``on_dedup`` is then called once, so a caller whose body
+    is a local file can confirm the file did not change while the request was
+    in flight; on the upload path that read itself detects a change.
     """
-    if not isinstance(length, int) or length < 0:
+    if type(length) is not int or length < 0:
         raise ValueError("length must be a non-negative byte count")
     payload = {
         "toolkit_slug": GOOGLEDRIVE_TOOLKIT_SLUG,
@@ -125,8 +134,13 @@ def stage_file(
     key = answer.get("key")
     if not isinstance(key, str) or not key:
         raise ComposioToolError("Composio returned no key for the uploaded file")
-    url = answer.get("new_presigned_url") or answer.get("newPresignedUrl")
-    if isinstance(url, str) and url:
+    url = _upload_url(answer)
+    if url is None:
+        # A missing or empty URL is Composio's documented deduplication: the
+        # bytes for this md5 are already stored under the returned key.
+        if on_dedup is not None:
+            on_dedup()
+    else:
         backend = _storage_backend(answer)
         _put_file(
             url,
@@ -137,6 +151,27 @@ def stage_file(
             timeout=timeout,
         )
     return {"name": filename, "mimetype": mimetype, "s3key": key}
+
+
+def _upload_url(answer: Mapping[str, Any]) -> str | None:
+    """The presigned PUT URL in an upload-request answer, or ``None`` for a
+    deduplicated upload.
+
+    A member that is present with another type is not a deduplication: the
+    bytes would silently never be uploaded, so it is refused rather than
+    treated as "no URL".
+    """
+    if "new_presigned_url" in answer:
+        url = answer["new_presigned_url"]
+    elif "newPresignedUrl" in answer:
+        url = answer["newPresignedUrl"]
+    else:
+        return None
+    if url is None or url == "":
+        return None
+    if not isinstance(url, str):
+        raise ComposioToolError("Composio returned an unusable upload URL")
+    return url
 
 
 def execute_tool(
@@ -212,6 +247,11 @@ def _put_file(
             timeout=timeout,
             allow_redirects=False,
         )
+    except PrivateNetworkHostError:
+        # The public-only client refused a destination before opening a
+        # socket. Keep the same ComposioToolError contract as any other
+        # unusable upload URL; the message names neither the host nor the URL.
+        raise ComposioToolError("Composio returned an unusable upload URL") from None
     except (requests.RequestException, OSError) as exc:
         # Type only: an exception's text can name the presigned URL. A
         # caller-supplied stream's own read error is not one of these and
@@ -242,8 +282,10 @@ def _call(path: str, payload: Mapping[str, Any], timeout: float) -> tuple[int, A
             json=dict(payload),
             timeout=timeout,
         )
-    except Exception as exc:
-        # Type only: a connection error's text can name the request.
+    except (requests.RequestException, OSError) as exc:
+        # Type only: a connection error's text can name the request. A
+        # programming error is not a network failure and is allowed to
+        # propagate with its own message.
         logger.warning(
             "Composio tool request failed (path=%s exception_type=%s)",
             path,
@@ -276,6 +318,24 @@ def _api_error(prefix: str, status: int, answer: Any) -> ComposioToolError:
     return ComposioToolError(message, status=status, slug=slug)
 
 
+_REDACTED = "[redacted]"
+# A vendor error can echo a credential by member name or as an assignment,
+# which the shared launch-secret redaction does not know. Match the value and
+# keep the name so the message still says what kind of credential leaked.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(refresh_token|client_secret|access_token|id_token|api_key)"
+    r"\s*[=:]\s*[\"']?[^\s&\"',;]+"
+)
+# A presigned storage URL is a bearer credential for a staged object. Drop
+# the whole URL rather than only the signature: the object path is a
+# capability too, and an error has no use for it.
+_SIGNED_URL_RE = re.compile(
+    r"https?://[^\s\"']*"
+    r"(?:X-Amz-Signature|X-Goog-Signature|[?&](?:sig|Signature|token)=)"
+    r"[^\s\"']*"
+)
+
+
 def _required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -286,6 +346,10 @@ def _required_env(name: str) -> str:
 def _safe_text(value: str) -> str:
     redacted = redact(value)
     text = redacted if isinstance(redacted, str) else str(redacted)
+    text = _SIGNED_URL_RE.sub("[redacted-url]", text)
+    text = _SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}={_REDACTED}", text
+    )
     if len(text) > MAX_ERROR_TEXT_CHARS:
         return f"{text[:MAX_ERROR_TEXT_CHARS]}...[truncated]"
     return text

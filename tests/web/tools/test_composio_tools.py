@@ -96,6 +96,7 @@ def _stage(
     *,
     answer: dict[str, Any] | None = None,
     put_status: int = 200,
+    on_dedup: Any = None,
 ) -> dict[str, str]:
     http.answer("/files/upload/request", 200, answer or _upload_answer())
     http.answer(UPLOAD_URL, put_status, None, method="PUT")
@@ -106,6 +107,7 @@ def _stage(
         md5="0" * 32,
         data=_BYTES,
         length=len(_BYTES),
+        on_dedup=on_dedup,
     )
 
 
@@ -148,6 +150,80 @@ def test_stage_file_skips_the_upload_when_composio_already_has_the_bytes(http):
 
     assert staged["s3key"] == "projects/pr_1/requests/googledrive/report.pdf"
     assert http.calls_to(UPLOAD_URL) == []
+
+
+def test_stage_file_calls_the_dedup_hook_only_when_no_upload_happened(http):
+    deduped: list[bool] = []
+    staged = _stage(
+        http,
+        answer=_upload_answer(new_presigned_url=None),
+        on_dedup=lambda: deduped.append(True),
+    )
+
+    assert staged["s3key"]
+    assert deduped == [True]
+
+    # A fresh answer with a URL must upload and must not call the hook.
+    http.by_url.clear()
+    deduped.clear()
+    _stage(http, on_dedup=lambda: deduped.append(True))
+    assert deduped == []
+
+
+def test_stage_file_refuses_a_non_string_presigned_url(http):
+    """An answer field with the wrong type is not a deduplication: the bytes
+    would otherwise never be uploaded and the tool would name a stale key."""
+    with pytest.raises(composio_tools.ComposioToolError, match="unusable upload URL"):
+        _stage(http, answer=_upload_answer(new_presigned_url={"url": UPLOAD_URL}))
+
+    assert http.calls_to(UPLOAD_URL) == []
+
+
+def test_stage_file_refuses_a_bool_as_a_length(http):
+    """``bool`` is an ``int`` in Python, but ``True`` is not a byte count."""
+    with pytest.raises(ValueError, match="byte count"):
+        composio_tools.stage_file(
+            tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+            filename="report.pdf",
+            mimetype="application/pdf",
+            md5="0" * 32,
+            data=b"x",
+            length=True,
+        )
+
+
+def test_a_private_upload_destination_keeps_the_composio_error_contract(monkeypatch):
+    from xagent.core.utils.security import PrivateNetworkHostError
+
+    def refuse(method: str, url: str, **kwargs: Any) -> Any:
+        raise PrivateNetworkHostError("destination is not public")
+
+    monkeypatch.setattr(composio_proxy.requests, "request", refuse)
+
+    with pytest.raises(composio_tools.ComposioToolError, match="unusable upload URL"):
+        composio_tools._put_file(
+            UPLOAD_URL,
+            data=b"x",
+            length=1,
+            mimetype="text/plain",
+            backend=None,
+            timeout=1,
+        )
+
+
+def test_a_programming_error_in_the_http_client_is_not_hidden(http, monkeypatch):
+    """Only transport failures become ``ComposioToolError``; a bug in the
+    caller's payload must keep its own type instead of looking like an
+    unreachable server."""
+    http.answer("/tools/execute/GOOGLEDRIVE_CREATE_FILE", 200, {})
+
+    def boom(**kwargs: Any) -> Any:
+        raise ValueError("payload is not serializable")
+
+    monkeypatch.setattr(composio_proxy.requests, "request", boom)
+
+    with pytest.raises(ValueError, match="not serializable"):
+        composio_tools.execute_tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
 
 
 def test_stage_file_refuses_an_answer_without_a_key(http):
@@ -271,6 +347,26 @@ def test_execute_tool_redacts_a_secret_composio_echoes_back(http):
     assert ACCOUNT_ID not in message
     assert raised.value.status == 400
     assert raised.value.slug == "InvalidApiKey"
+
+
+def test_an_error_text_redacts_a_token_assignment_and_a_signed_url():
+    """A vendor can echo a credential by member name or a presigned URL; the
+    error must not carry either into the model's transcript or the log."""
+    error = composio_tools.ComposioToolError(
+        "bad access_token=ACCESS-SECRET and refresh_token: 'REFRESH-SECRET' "
+        "at https://storage.example.com/a?X-Amz-Signature=SIGNED-SECRET&x=1"
+    )
+
+    text = str(error)
+    assert "ACCESS-SECRET" not in text
+    assert "REFRESH-SECRET" not in text
+    assert "SIGNED-SECRET" not in text
+    assert "storage.example.com" not in text
+    assert "access_token=[redacted]" in text
+    assert "refresh_token=[redacted]" in text
+    assert "[redacted-url]" in text
+    # The name survives so the message still says what leaked.
+    assert "bad " in text
 
 
 def test_execute_tool_refuses_an_answer_without_a_result(http):

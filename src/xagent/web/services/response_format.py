@@ -262,9 +262,9 @@ def store_response_format(
     return new_agent_config
 
 
-_STORED_KEYS = frozenset({"type", "name", "schema", "description"})
 # The order in which a missing key is reported.
 _STORED_KEY_ORDER = ("type", "name", "schema", "description")
+_STORED_KEYS = frozenset(_STORED_KEY_ORDER)
 
 
 def _stored_violation(value: Any) -> tuple[str, list[PathSegment]] | None:
@@ -302,7 +302,7 @@ def _stored_violation(value: Any) -> tuple[str, list[PathSegment]] | None:
 
 
 def parse_stored_response_format(
-    value: Any, *, task_id: object = None
+    value: Any, *, task_id: object
 ) -> StructuredOutputFormat:
     """Check the format stored on a task again and return it for a run.
 

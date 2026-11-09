@@ -277,6 +277,30 @@ def test_a_long_composio_message_is_cut_after_redaction(proxy):
     assert API_KEY[:kept] not in text
 
 
+def test_a_request_with_a_body_cuts_only_after_the_secret_is_redacted(proxy):
+    """The decoded-body pass truncates the text before it runs; the launch
+    secrets must already be gone when that happens, or a key across the cut
+    would keep its prefix."""
+    prefix = "Composio proxy request failed with HTTP 400: "
+    kept = 8
+    padding = "x" * (composio_proxy.MAX_ERROR_TEXT_CHARS - len(prefix) - kept)
+    proxy.response = _Response(
+        400, {"error": {"message": padding + API_KEY + "y" * 2000}}
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"name": "a body that keeps the decoded pass in play"},
+        )
+
+    text = str(raised.value)
+    assert API_KEY[:kept] not in text
+    assert API_KEY not in text
+
+
 def test_a_query_mapping_sends_each_name_and_value(proxy):
     composio_proxy.proxy_request(
         "GET",
@@ -722,3 +746,31 @@ def test_an_error_that_echoes_the_decoded_message_hides_its_content(proxy):
     text = str(raised.value)
     assert "DECODED-ECHO-SUBJECT" not in text
     assert "DECODED-BODY-MARKER" not in text
+
+
+def test_a_large_decoded_body_is_redacted_from_a_truncated_error_text(proxy):
+    """The error text is cut to ``MAX_ERROR_TEXT_CHARS`` before the per-line
+    pass. A 4.5 MB message decodes to tens of thousands of lines, and each
+    one used to run a ``replace`` over the whole untruncated text."""
+    lines = [f"attachment-line-{number:05d}-{'x' * 40}" for number in range(20000)]
+    raw = base64.urlsafe_b64encode(
+        b"Subject: long body\r\n\r\n" + "\r\n".join(lines).encode()
+    ).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "y" * 1_000_000}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert lines[0] not in text
+    assert len(text) == composio_proxy.MAX_ERROR_TEXT_CHARS + len("...[truncated]")
+    assert elapsed < 1.0, "the per-line pass must run on the truncated text"

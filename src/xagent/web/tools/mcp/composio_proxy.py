@@ -199,6 +199,14 @@ def _redact_echoed_body(message: str, body: Any) -> str:
     )
     if body is None:
         return message
+    # A launch secret or provider token can straddle the cut, so redact them
+    # while the text is still whole. ``ComposioProxyError`` redacts again
+    # before its own cut; this one only bounds the pass below.
+    message = redact(message)
+    # The error text is cut to this length anyway; doing it before the
+    # per-line pass keeps that pass bounded (a 4.5 MB message decodes to tens
+    # of thousands of lines).
+    message = _truncated(message)
     for value in _decoded_mime_fragments(body):
         message = message.replace(value, _REDACTED)
     return message

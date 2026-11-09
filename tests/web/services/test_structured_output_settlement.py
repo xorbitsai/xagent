@@ -29,7 +29,6 @@ from xagent.web.services.task_execution import (
 from xagent.web.services.task_lease_service import TaskLease, acquire_task_lease
 
 canonical = canonical_fixture
-db_session = wiring.db_session
 engine = engine_fixture
 task_id = task_id_fixture
 
@@ -214,16 +213,21 @@ def _tuple_argument_call() -> dict[str, Any]:
 
 @pytest.mark.parametrize("path", ["new_turn", "resume"])
 async def test_a_tuple_value_in_the_arguments_does_not_break_the_settlement(
-    db_session, monkeypatch, path
+    canonical, monkeypatch, path
 ) -> None:
+    # ``canonical`` runs this on SQLite and on PostgreSQL. A jsonb column on
+    # PostgreSQL, such as the payload of the settlement fact, refuses a NUL
+    # and SQLite does not, so a NUL from these arguments that reached such a
+    # write would break the settlement only on PostgreSQL.
+    factory, _ = canonical
     config = wiring._config(wiring._stored(schema=copy.deepcopy(_LIST_SCHEMA)))
     llm = wiring.ScriptedModel([_tuple_argument_call() for _ in range(3)])
     run = wiring._run_new_turn if path == "new_turn" else wiring._run_resume
 
-    outcome = await run(db_session, monkeypatch, config, llm)
-
-    task_id = outcome[0]
-    status, record = wiring._read_task(db_session, task_id)
+    with factory() as db:
+        outcome = await run(db, monkeypatch, config, llm)
+        task_id = outcome[0]
+        status, record = wiring._read_task(db, task_id)
     assert status == TaskStatus.COMPLETED
     assert record["status"] == "failed"
     assert record["reason"]["code"] == "schema_mismatch"

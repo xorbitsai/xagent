@@ -1943,7 +1943,9 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
-    global _migration_task
+    global _migration_task, _writers_retired
+    # A new lifespan starts new writers; the next retire must stop them.
+    _writers_retired = False
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
     validate_auth_config()
@@ -2478,6 +2480,128 @@ async def startup_event() -> None:
     start_app_process_diagnostics(app)
 
 
+_writers_retired = False
+_retire_writers_lock: asyncio.Lock | None = None
+
+
+async def retire_writers() -> None:
+    """Stop every background writer and singleton; the web server keeps serving.
+
+    The producers of the shutdown sequence -- command dispatcher, upload,
+    retention, cleanup and recovery loops, auto-resume and lease recovery,
+    sandbox sweep, trigger dispatcher, chat channels -- and nothing else:
+    sockets, requests, execution drain and database runtime stay as they are,
+    so a host that replaces this process on purpose (the SaaS thin Gate) can
+    quiet the old writers while the old process still answers until the
+    switch. The later ``shutdown_event`` calls this too and skips it.
+
+    Idempotent and safe to call concurrently: the first caller does the work,
+    later ones wait for it and return. A step that raises leaves the function
+    unfinished (the caller sees the error) and every step is itself a no-op
+    once done, so calling again continues where it stopped.
+    """
+    global \
+        _file_storage_startup_sync_task, \
+        _migration_task, \
+        _task_command_dispatcher_task, \
+        _trigger_dispatcher_task, \
+        _sandbox_idle_sweep_task, \
+        _retire_writers_lock, \
+        _writers_retired
+
+    if _retire_writers_lock is None:
+        _retire_writers_lock = asyncio.Lock()
+    async with _retire_writers_lock:
+        if _writers_retired:
+            return
+        if _task_command_dispatcher_task is not None:
+            from .services.task_command_transport import stop_task_command_dispatcher
+
+            await stop_task_command_dispatcher()
+        _task_command_dispatcher_task = None
+
+        await stop_orphan_upload_gc_task(app)
+        await stop_composio_reconcile_task(app)
+        await stop_retention_purge_task(app)
+        await stop_task_cleanup_retry_task(app)
+        await stop_uploaded_file_recovery_task(app)
+        await stop_task_auto_resume_task(app)
+        await stop_task_lease_recovery_task(app)
+
+        if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
+            logger.info("Cancelling sandbox idle sweep task...")
+            _sandbox_idle_sweep_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _sandbox_idle_sweep_task
+        _sandbox_idle_sweep_task = None
+
+        if (
+            _file_storage_startup_sync_task
+            and not _file_storage_startup_sync_task.done()
+        ):
+            logger.info("Cancelling background startup file storage sync task...")
+            _file_storage_startup_sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _file_storage_startup_sync_task
+        _file_storage_startup_sync_task = None
+
+        if _trigger_dispatcher_task and not _trigger_dispatcher_task.done():
+            logger.info("Cancelling trigger dispatcher task...")
+            _trigger_dispatcher_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _trigger_dispatcher_task
+        _trigger_dispatcher_task = None
+
+        if _migration_task and not _migration_task.done():
+            logger.info("Cancelling background LanceDB migration task...")
+            _migration_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _migration_task
+        _migration_task = None
+
+        # Cancel metadata rebuild background task
+        if hasattr(app.state, "metadata_rebuild_task"):
+            task = app.state.metadata_rebuild_task
+            if task and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+        # Shutdown chat channels before draining task finalizers.
+        try:
+            channel_tasks = [
+                task
+                for name in ("telegram_task", "feishu_task", "slack_task")
+                if (task := getattr(app.state, name, None)) is not None
+            ]
+            for task in channel_tasks:
+                task.cancel()
+            await asyncio.gather(*channel_tasks, return_exceptions=True)
+
+            from .channels.feishu.bot import get_feishu_channel
+            from .channels.slack.bot import get_slack_channel
+            from .channels.telegram.bot import get_telegram_channel
+
+            telegram_channel = get_telegram_channel()
+            if telegram_channel.enabled:
+                await telegram_channel.stop()
+                logger.info("Telegram channel stopped successfully")
+
+            feishu_channel = get_feishu_channel()
+            await feishu_channel.stop()
+
+            slack_channel = get_slack_channel()
+            await slack_channel.stop()
+        except Exception as e:
+            logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+        _writers_retired = True
+
+
+def writers_retired() -> bool:
+    """Whether :func:`retire_writers` has completed in this process."""
+    return _writers_retired
+
+
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     global \
@@ -2509,83 +2633,7 @@ async def shutdown_event() -> None:
 
     flush_langfuse()
 
-    if _task_command_dispatcher_task is not None:
-        from .services.task_command_transport import stop_task_command_dispatcher
-
-        await stop_task_command_dispatcher()
-    _task_command_dispatcher_task = None
-
-    await stop_orphan_upload_gc_task(app)
-    await stop_composio_reconcile_task(app)
-    await stop_retention_purge_task(app)
-    await stop_task_cleanup_retry_task(app)
-    await stop_uploaded_file_recovery_task(app)
-    await stop_task_auto_resume_task(app)
-    await stop_task_lease_recovery_task(app)
-
-    if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():
-        logger.info("Cancelling sandbox idle sweep task...")
-        _sandbox_idle_sweep_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _sandbox_idle_sweep_task
-    _sandbox_idle_sweep_task = None
-
-    if _file_storage_startup_sync_task and not _file_storage_startup_sync_task.done():
-        logger.info("Cancelling background startup file storage sync task...")
-        _file_storage_startup_sync_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _file_storage_startup_sync_task
-    _file_storage_startup_sync_task = None
-
-    if _trigger_dispatcher_task and not _trigger_dispatcher_task.done():
-        logger.info("Cancelling trigger dispatcher task...")
-        _trigger_dispatcher_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _trigger_dispatcher_task
-    _trigger_dispatcher_task = None
-
-    if _migration_task and not _migration_task.done():
-        logger.info("Cancelling background LanceDB migration task...")
-        _migration_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await _migration_task
-    _migration_task = None
-
-    # Cancel metadata rebuild background task
-    if hasattr(app.state, "metadata_rebuild_task"):
-        task = app.state.metadata_rebuild_task
-        if task and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-
-    # Shutdown chat channels before draining task finalizers.
-    try:
-        channel_tasks = [
-            task
-            for name in ("telegram_task", "feishu_task", "slack_task")
-            if (task := getattr(app.state, name, None)) is not None
-        ]
-        for task in channel_tasks:
-            task.cancel()
-        await asyncio.gather(*channel_tasks, return_exceptions=True)
-
-        from .channels.feishu.bot import get_feishu_channel
-        from .channels.slack.bot import get_slack_channel
-        from .channels.telegram.bot import get_telegram_channel
-
-        telegram_channel = get_telegram_channel()
-        if telegram_channel.enabled:
-            await telegram_channel.stop()
-            logger.info("Telegram channel stopped successfully")
-
-        feishu_channel = get_feishu_channel()
-        await feishu_channel.stop()
-
-        slack_channel = get_slack_channel()
-        await slack_channel.stop()
-    except Exception as e:
-        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+    await retire_writers()
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

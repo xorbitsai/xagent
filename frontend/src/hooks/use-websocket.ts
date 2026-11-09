@@ -1707,8 +1707,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         throw deliveryError("Message not sent: an attached file id is not valid.", "not_sent")
       }
     }
-    // The server also closes the connection on a frame whose conversation
-    // source it cannot accept, so those shapes are refused here first.
+    // The server closes the connection on a frame whose conversation source is
+    // malformed or arrives together with a request id, so those frames are
+    // refused here first.
     if (sourceTaskId !== undefined) {
       if (connection.chatTaskIdMode !== "omit") {
         throw deliveryError("A conversation source is not supported for this connection.", "not_sent")

@@ -2,7 +2,7 @@
 
 Usage: ``python -m xagent.web.connector_checks --user NAME [--connector LABEL]...
 [--check CHECK_ID]... [--environment LABEL] [--check-timeout SECONDS]
-[--total-timeout SECONDS]``, run in the backend container with the running
+[--total-timeout SECONDS] [--sweep]``, run in the backend container with the running
 service's environment, the same way as ``oauth_readiness``::
 
     docker compose exec -T backend /opt/xagent/deploy/entrypoint.sh \\
@@ -13,6 +13,12 @@ It runs the engine (``engine.run_checks``) under the ``user`` identity
 ``XAGENT_CONNECTOR_PROBE_USERS``, and any other user is refused before a
 connector starts. It takes selectors only (the user, connector labels and
 check ids), never a tool name or an argument.
+
+With ``--sweep`` it runs the sweeper (``sweeper.run_sweep``) instead and
+prints the sweep document (``sweep.schema.json``); ``--check`` does not apply.
+The ``user`` identity has no write policy, so its sweep refuses every
+switched-on connector: it shows the wiring, while a runner whose identity
+governs writes (Xagent SaaS's Toby module) calls ``run_sweep`` itself.
 
 Stdout carries exactly one JSON document, the run result
 (``result.schema.json``), and logs go to stderr. During the run, file
@@ -44,13 +50,17 @@ from typing import Any
 
 from .engine import DEFAULT_TOTAL_TIMEOUT_SECONDS, run_checks
 from .results import ENVIRONMENT_PATTERN, Outcome, RunResult
+from .sweeper import DEFAULT_SWEEP_TIMEOUT_SECONDS, SweepResult, run_sweep
 from .user_identity import USER_IDENTITY_LABEL, UserIdentityAdapter
 
 logger = logging.getLogger(__name__)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.sweep and args.check:
+        parser.error("--check does not apply to --sweep")
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
     with _stdout_to_stderr():
         result = asyncio.run(_run(args))
@@ -59,11 +69,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0 if result.complete and not failed else 1
 
 
-async def _run(args: argparse.Namespace) -> RunResult:
+async def _run(args: argparse.Namespace) -> RunResult | SweepResult:
     started_at = datetime.now(timezone.utc)
+    document = SweepResult if args.sweep else RunResult
 
-    def failure(code: str) -> RunResult:
-        return RunResult(
+    def failure(code: str) -> RunResult | SweepResult:
+        return document(
             identity=USER_IDENTITY_LABEL,
             environment=args.environment,
             started_at=started_at,
@@ -77,13 +88,22 @@ async def _run(args: argparse.Namespace) -> RunResult:
         with _database() as db:
             adapter = UserIdentityAdapter(db, args.user)
             try:
+                if args.sweep:
+                    return await run_sweep(
+                        adapter,
+                        environment=args.environment,
+                        connectors=_flatten(args.connector),
+                        call_timeout=args.check_timeout,
+                        total_timeout=args.total_timeout
+                        or DEFAULT_SWEEP_TIMEOUT_SECONDS,
+                    )
                 return await run_checks(
                     adapter,
                     environment=args.environment,
                     connectors=_flatten(args.connector),
                     checks=_flatten(args.check),
                     check_timeout=args.check_timeout,
-                    total_timeout=args.total_timeout,
+                    total_timeout=args.total_timeout or DEFAULT_TOTAL_TIMEOUT_SECONDS,
                 )
             except Exception as error:
                 # The class name only: the text can carry a value.
@@ -173,10 +193,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--total-timeout",
         type=_seconds,
-        default=DEFAULT_TOTAL_TIMEOUT_SECONDS,
         help="the run's budget in seconds, counted from before the connectors "
         "are enumerated; only connector sessions and tool calls are cut short "
-        "(default: %(default)g)",
+        f"(default: {DEFAULT_TOTAL_TIMEOUT_SECONDS:g}, or "
+        f"{DEFAULT_SWEEP_TIMEOUT_SECONDS:g} with --sweep)",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="sweep the write areas of the user's switched-on connectors "
+        "instead of running checks, and print the sweep document",
     )
     return parser
 

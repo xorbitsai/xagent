@@ -130,7 +130,7 @@ At run time (see [Running write checks](#running-write-checks)):
 - The pin runs before any write, and a tenant id that differs from the registry's refuses the write.
 - The probe path bypasses both the approval gate and the per-user tool overrides, so the engine compares each declared verdict with the identity's write policy before any call.
 - Cleanup runs even when verify fails, which is why the guard belongs to cleanup and not to verify. The guard's `Equals` compares the whole run-scoped name.
-- The sweeper (#3564, a later PR) lists only the write area, so an object created outside it would never be swept. It matches each item's name against `xagent-smoke-` and reads the object's age from it.
+- The sweeper (see [The sweeper](#the-sweeper)) lists only the write area, so an object created outside it would never be swept. It matches each item's name against `xagent-smoke-` and reads the object's age from it.
 
 Review each write flow against these, which validation cannot check:
 
@@ -233,7 +233,7 @@ Today's L3 probes run as their derived `<app_id>.l3_probe` checks with the probe
 
 ### Running write checks
 
-**Do not switch writes on before the sweeper runs** (#3564, a later PR): a write that could not delete its object (a failed create, a failed guard or cleanup, a killed run) leaves it to the sweeper.
+**Switch writes on only where the sweeper also runs** ([The sweeper](#the-sweeper); the V2 workflow runs it before each run, xorbitsai/xagent-saas#2536): a write that could not delete its object (a failed create, a failed guard or cleanup, a killed run) leaves it to the sweeper.
 
 A write check creates, verifies and deletes a real object in the connector's test tenant (`writes.py`), so it runs only for a connector whose catalog app id is listed in `XAGENT_CONNECTOR_SMOKE_WRITE_APPS` (comma-separated, empty by default, set per environment; `config.get_connector_smoke_write_apps`). The engine reads the switch once at the start of a run. It is not a CLI argument, and an identity adapter cannot set it; the V2 workflow's kill switch still turns the whole run off (xorbitsai/xagent-saas#2536).
 
@@ -258,6 +258,25 @@ Otherwise it runs, each call under `check_timeout`:
 
 The row reports the first of: a refusal, `cleanup_failed`, a failed create (`create:<detail>`), a failed verify (`verify:<detail>`), `pass`. A step's detail is the reason a read check would report: `exception`, `check_call`, `tool_error`, `invalid_result` or an assertion kind such as `status_success` or `equals`. Rows and logs carry no fixture value, response body or name.
 
+### The sweeper
+
+`sweeper.run_sweep(adapter, ...)` removes what write checks left behind. It sweeps each connector that declares a `Sweep` and whose writes are switched on; a connector whose writes are off is `skip`/`writes_disabled`, and one without a sweep has no row. Its keywords are `environment`, `connectors` (labels), `call_timeout` (each call's bound, by default the L3 probe call's) and `total_timeout` (600 seconds by default; the CLI's `--sweep` uses the same default).
+
+Before any connector starts, it asks the identity's write policy for the sweep's delete tool, which is the write checks' cleanup tool, and resolves the sweep's fixtures; a policy or a resolver that raises fails the sweep as `write_policy:exception` or `fixtures:exception`. A connector is then refused, without calling anything, as a write check is: `verdict_mismatch` (`no_write_policy`, or `delete` when the policy's verdict is not the one the write checks declare), `tenant_mismatch` (a fixture with no value), `tool_missing` (`pin`, `find` or `delete`), `tenant_mismatch` (`pin_failed`, `mismatch`). A session that does not pass fails with its own class.
+
+Otherwise the sweeper lists the write area with `find`, its first page only, so further leftovers wait for the next sweep, and reads each item's `name`:
+
+| Item | What the sweeper does | Counted as |
+|---|---|---|
+| no `xagent-smoke-` prefix | nothing | not counted |
+| prefixed, minute in its name more than 2 hours ago | deletes it by its `ItemRef` | `found`, then `deleted` or `failed` |
+| prefixed, two hours old or younger, or dated in the future | keeps it: a run may still be cleaning it up | `found`, `kept` |
+| prefixed, but no minute parses | keeps it, and reports it | `found`, `unparsed` |
+
+The minute in a name is when its run started. A run with the engine's default total timeout lasts at most 15 minutes, so two hours keeps a sweep off every object a run in any environment may still be using; keep a run's `--total-timeout` well under two hours. An item listed twice is swept once. One sweep deletes at most 50 items of a connector (`cleanup_failed`/`cap_reached` beyond); the rest are counted as `kept` and wait for the next sweep. After a failed delete, `find` lists the area once more: an item missing from that second listing counts as deleted, as when another environment's sweeper took it first. An empty second listing proves nothing, since search can lag behind a delete, and an id is compared as text, so `17` and `"17"` are one item. An item still listed, or one whose `ItemRef` finds no id, is `cleanup_failed`/`delete:<detail>`. The pin, `find` and each delete start only when a call timeout of the sweep's total timeout is left; otherwise the connector is `not_reached`/`time_budget`, the items still due are counted as `kept`, and the sweep is not `complete`.
+
+The result is its own document, `xagent.connector_smoke.sweep` (`sweep.schema.json`, `SWEEP_SCHEMA_VERSION` 1): the run fields of the result document, `older_than_seconds` and `max_deletes`, and one row per connector with its outcome, failure class, reason and the counts `found`, `deleted`, `failed`, `kept` and `unparsed`. It carries no name, id or value. The CLI prints it with `--sweep`.
+
 ## CLI and the `user` identity
 
 `python -m xagent.web.connector_checks` runs the engine as a local user, to verify it locally and on stage. The V2 workflow does not schedule it: the web identity's scheduled coverage stays V1's HTTP L2/L3. Run it in the backend container with the service's environment, the same way as `oauth_readiness`:
@@ -272,7 +291,8 @@ The options are selectors and bounds, never a tool name or an argument:
 - `--user` (required): a username, or an email address compared case-insensitively;
 - `--connector LABEL` and `--check CHECK_ID`, each repeatable or comma-separated: the engine's selectors;
 - `--environment LABEL`: the result's environment label;
-- `--check-timeout SECONDS` and `--total-timeout SECONDS`: the engine's bounds, finite and above 0.
+- `--check-timeout SECONDS` and `--total-timeout SECONDS`: the engine's bounds, finite and above 0;
+- `--sweep`: run the sweeper instead and print the sweep document. `--check` does not apply. The `user` identity has no write policy, so its sweep refuses every switched-on connector: the option shows the wiring, while a runner whose identity governs writes, such as Xagent SaaS's Toby module, calls `run_sweep` itself.
 
 Stdout carries exactly one JSON document, the run result, and logs go to stderr. While the run lasts, file descriptor 1 and `sys.stdout` point at stderr, so nothing a connector, a tool, a library or a child process writes can reach the document's stream. A run that cannot be set up still prints its document, with a `failure`: the adapter's or the engine's code, `setup:database` when the database cannot be opened, or `run:exception` when the engine raises (the log names the exception class only). Invalid arguments exit 2 with the usage on stderr and nothing on stdout. Otherwise the exit status is 0 when the run is `complete` and no row is `fail`, and 1 when it is not; a `skip` or `unprobeable` row does not fail the run.
 
@@ -351,5 +371,6 @@ The `user` adapter (`user_identity.py`):
 ## Versioning
 
 - `DECLARATION_FORMAT_VERSION` (`declarations.py`) changes when a declared check or a consumer of declarations must adapt. Version 2 added `CreatedRef`, `ItemRef`, the cleanup guard, the sweep and the rules on write areas, fixture keys in cleanup, read steps, run-scoped suffixes and `@` in arguments (#3564). It also refuses a path that is not a tuple: version 1 took a list, or a string as a path of one-letter keys.
+- `SWEEP_SCHEMA_VERSION` (`sweeper.py`) and `sweep.schema.json` follow the same rule for the sweep document.
 - `RESULT_SCHEMA_VERSION` (`results.py`) and the schema's `schema_version` const change together when a consumer of results must adapt: a field removed or renamed, a class removed, a meaning changed. A test pins the schema's enums to the Python enums.
 - A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change.

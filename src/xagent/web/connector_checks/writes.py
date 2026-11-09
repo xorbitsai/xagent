@@ -25,8 +25,8 @@ and must confirm its name (``cleanup_failed``/``ownership``). The guard and
 the cleanup run under their own call timeouts, not the run's deadline, and
 finish even when the run is cancelled, which is then re-raised. A create
 that raised, timed out or returned an error, or returned no usable id,
-leaves whatever it made to the sweeper, which a later PR of #3564 adds:
-until it runs, such an object stays in the tenant.
+leaves whatever it made to the sweeper (``sweeper.py``), which removes it
+from the write area's listing once it is more than two hours old.
 
 A row reports the first of: a refusal, ``cleanup_failed``, a failed create,
 a failed verify, ``pass``. A step's failure is ``<step>:<detail>``, the
@@ -57,6 +57,7 @@ from .declarations import (
     CreatedRef,
     Equals,
     ExpectedVerdict,
+    PayloadPath,
     PayloadSource,
     RunScopedName,
     ToolStep,
@@ -95,7 +96,7 @@ def new_run_id(started_at: datetime) -> str:
 
 
 @dataclass(frozen=True)
-class _Step:
+class Step:
     """One tool call with its fixtures resolved and its names filled in; a
     ``CreatedRef`` stays until create has run. Values stay out of ``repr``."""
 
@@ -113,7 +114,7 @@ class PreparedWrite:
     """
 
     check: WriteCheck
-    steps: Mapping[str, _Step] = field(default_factory=dict, repr=False)
+    steps: Mapping[str, Step] = field(default_factory=dict, repr=False)
     tenant: FixtureValue | None = field(default=None, repr=False)
     verdicts: Mapping[str, ExpectedVerdict | None] | None = None
     missing_key: str | None = None
@@ -194,37 +195,37 @@ def unavailable_write_row(connector: str, check: WriteCheck) -> CheckRow:
     )
 
 
-def _prepare_step(step: ToolStep, resolver: FixtureResolver, run_id: str) -> _Step:
+def _prepare_step(step: ToolStep, resolver: FixtureResolver, run_id: str) -> Step:
     def name(value: Any) -> Any:
         if isinstance(value, RunScopedName):
             return f"{RUN_SCOPED_PREFIX}{run_id}-{value.suffix}"
         return value
 
-    arguments = _map_leaves(resolve_fixtures(dict(step.arguments), resolver), name)
+    arguments = map_leaves(resolve_fixtures(dict(step.arguments), resolver), name)
     assertions = tuple(
         replace(item, value=name(item.value)) if isinstance(item, Equals) else item
         for item in resolve_expected(step.assertions, resolver)
     )
-    return _Step(step.tool, arguments, step.payload, assertions)
+    return Step(step.tool, arguments, step.payload, assertions)
 
 
-def _map_leaves(value: Any, leaf: Callable[[Any], Any]) -> Any:
+def map_leaves(value: Any, leaf: Callable[[Any], Any]) -> Any:
     if isinstance(value, Mapping):
-        return {key: _map_leaves(item, leaf) for key, item in value.items()}
+        return {key: map_leaves(item, leaf) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_map_leaves(item, leaf) for item in value]
+        return [map_leaves(item, leaf) for item in value]
     return leaf(value)
 
 
 @dataclass(frozen=True)
-class _Called:
+class Called:
     raw: Any = None
     error: BaseException | None = None
     timed_out: bool = False
 
 
 # A failed step: its failure class and the detail its reason ends with.
-_Fault = tuple[FailureClass, str]
+Fault = tuple[FailureClass, str]
 
 
 async def run_write(
@@ -269,37 +270,40 @@ async def run_write(
         # refusal is the write's alone: later checks still run.
         return row(Outcome.FAIL, FailureClass.NOT_REACHED, "time_budget")
 
-    pinned = await _call(found[_PIN], steps[_PIN], check_timeout)
-    _raise_if_cancelled()
-    if _fault(pinned, steps[_PIN], check.id, _PIN) is not None:
-        return row(Outcome.FAIL, FailureClass.TENANT_MISMATCH, "pin_failed")
-    tenant = value_at(pinned.raw, steps[_PIN].payload, check.tenant_pin.path)
-    if tenant is MISSING or not json_equal(tenant, prepared.tenant):
-        return row(Outcome.FAIL, FailureClass.TENANT_MISMATCH, "mismatch")
+    mismatch = await pin_tenant(
+        found[_PIN],
+        steps[_PIN],
+        check.tenant_pin.path,
+        prepared.tenant,
+        check_timeout,
+        check.id,
+    )
+    if mismatch is not None:
+        return row(Outcome.FAIL, FailureClass.TENANT_MISMATCH, mismatch)
 
     created: Any = None
-    create_fault: _Fault | None = None
-    verify_fault: _Fault | None = None
+    create_fault: Fault | None = None
+    verify_fault: Fault | None = None
     cancelled = False
     try:
-        called = await _call(found[_CREATE], steps[_CREATE], check_timeout)
-        create_fault = _fault(called, steps[_CREATE], check.id, _CREATE)
+        called = await call_step(found[_CREATE], steps[_CREATE], check_timeout)
+        create_fault = step_fault(called, steps[_CREATE], check.id, _CREATE)
         if create_fault is None or create_fault[0] is FailureClass.ASSERTION_FAILED:
             # A result to clean up: the object may exist even when an
             # assertion on it failed.
             created = called.raw
-        _raise_if_cancelled()
+        raise_if_cancelled()
         resolved = _resolve_created(steps, created)
         if created is not None and create_fault is None and _VERIFY not in resolved:
             create_fault = (FailureClass.ASSERTION_FAILED, "created_ref_missing")
         if create_fault is None:
-            verified = await _call(found[_VERIFY], resolved[_VERIFY], check_timeout)
-            verify_fault = _fault(verified, resolved[_VERIFY], check.id, _VERIFY)
-            _raise_if_cancelled()
+            verified = await call_step(found[_VERIFY], resolved[_VERIFY], check_timeout)
+            verify_fault = step_fault(verified, resolved[_VERIFY], check.id, _VERIFY)
+            raise_if_cancelled()
     except asyncio.CancelledError:
         cancelled = True
 
-    cleanup_fault: _Fault | None = None
+    cleanup_fault: Fault | None = None
     if created is not None:
         resolved = _resolve_created(steps, created)
         if _CLEANUP not in resolved or (_GUARD in steps and _GUARD not in resolved):
@@ -332,6 +336,27 @@ async def run_write(
     return row(Outcome.PASS)
 
 
+async def pin_tenant(
+    tool: Any,
+    step: Step,
+    path: PayloadPath,
+    expected: Any,
+    timeout: float,
+    where: str,
+) -> str | None:
+    """Read the connection's tenant id at ``path`` with ``step``: the
+    ``tenant_mismatch`` reason (``pin_failed``, ``mismatch``), or None when
+    it is ``expected``. The sweeper pins its tenant the same way."""
+    pinned = await call_step(tool, step, timeout)
+    raise_if_cancelled()
+    if step_fault(pinned, step, where, _PIN) is not None:
+        return "pin_failed"
+    tenant = value_at(pinned.raw, step.payload, path)
+    if tenant is MISSING or not json_equal(tenant, expected):
+        return "mismatch"
+    return None
+
+
 def _refusal(prepared: PreparedWrite) -> tuple[FailureClass, str] | None:
     """Why the write may not start, before any call."""
     check = prepared.check
@@ -348,11 +373,11 @@ def _refusal(prepared: PreparedWrite) -> tuple[FailureClass, str] | None:
     return None
 
 
-def _resolve_created(steps: Mapping[str, _Step], created: Any) -> dict[str, _Step]:
+def _resolve_created(steps: Mapping[str, Step], created: Any) -> dict[str, Step]:
     """Every step after create whose ``CreatedRef``s the create result holds,
     with them filled in; a step it does not hold is left out."""
     create = steps[_CREATE]
-    resolved: dict[str, _Step] = {}
+    resolved: dict[str, Step] = {}
     for name in (_VERIFY, _GUARD, _CLEANUP):
         step = steps.get(name)
         if step is None:
@@ -364,22 +389,22 @@ def _resolve_created(steps: Mapping[str, _Step], created: Any) -> dict[str, _Ste
             if not isinstance(value, CreatedRef):
                 return value
             found = value_at(created, create.payload, value.path)
-            if found is MISSING or not _is_id(found):
+            if found is MISSING or not is_id(found):
                 missing = True
                 return value
             return found
 
-        arguments = _map_leaves(step.arguments, fill)
+        arguments = map_leaves(step.arguments, fill)
         assertions = tuple(
             replace(item, value=fill(item.value)) if isinstance(item, Equals) else item
             for item in step.assertions
         )
         if not missing:
-            resolved[name] = _Step(step.tool, arguments, step.payload, assertions)
+            resolved[name] = Step(step.tool, arguments, step.payload, assertions)
     return resolved
 
 
-def _is_id(value: Any) -> bool:
+def is_id(value: Any) -> bool:
     """An object id: a non-empty string or a finite number, never a bool."""
     if isinstance(value, bool):
         return False
@@ -392,36 +417,36 @@ def _is_id(value: Any) -> bool:
 
 async def _clean(
     found: Mapping[str, Any],
-    resolved: Mapping[str, _Step],
+    resolved: Mapping[str, Step],
     check_id: str,
     check_timeout: float,
-) -> _Fault | None:
+) -> Fault | None:
     """The guard, if any, then the cleanup; the failure, or None."""
     guard = resolved.get(_GUARD)
     if guard is not None:
-        guarded = await _call(found[_GUARD], guard, check_timeout)
-        fault = _fault(guarded, guard, check_id, _GUARD)
+        guarded = await call_step(found[_GUARD], guard, check_timeout)
+        fault = step_fault(guarded, guard, check_id, _GUARD)
         if fault is not None:
             # The object it read is not shown to be this run's: keep it.
             if fault[0] is FailureClass.ASSERTION_FAILED:
                 return FailureClass.CLEANUP_FAILED, "ownership"
             return FailureClass.CLEANUP_FAILED, f"{_GUARD}:{fault[1]}"
-    cleaned = await _call(found[_CLEANUP], resolved[_CLEANUP], check_timeout)
-    fault = _fault(cleaned, resolved[_CLEANUP], check_id, _CLEANUP)
+    cleaned = await call_step(found[_CLEANUP], resolved[_CLEANUP], check_timeout)
+    fault = step_fault(cleaned, resolved[_CLEANUP], check_id, _CLEANUP)
     if fault is not None:
         return FailureClass.CLEANUP_FAILED, f"{_CLEANUP}:{fault[1]}"
     return None
 
 
 async def _run_through_cancellation(
-    cleanup: Coroutine[Any, Any, _Fault | None],
-) -> _Fault | None:
+    cleanup: Coroutine[Any, Any, Fault | None],
+) -> Fault | None:
     """Run ``cleanup`` to its end, through any cancellation of the run.
 
     Its calls run under their own timeouts. A cancellation that arrives
     meanwhile is re-raised once it is done.
     """
-    task: asyncio.Future[_Fault | None] = asyncio.ensure_future(cleanup)
+    task: asyncio.Future[Fault | None] = asyncio.ensure_future(cleanup)
     cancelled = False
     while not task.done():
         try:
@@ -434,7 +459,7 @@ async def _run_through_cancellation(
     return outcome
 
 
-async def _call(tool: Any, step: _Step, timeout: float) -> _Called:
+async def call_step(tool: Any, step: Step, timeout: float) -> Called:
     bound = asyncio.timeout(timeout)
     try:
         async with bound:
@@ -443,18 +468,18 @@ async def _call(tool: Any, step: _Step, timeout: float) -> _Called:
         # A tool that turned its bound's cancellation into another error timed
         # out all the same, as a read check's call does.
         timed_out = isinstance(error, TimeoutError) or bound.expired()
-        return _Called(error=error, timed_out=timed_out)
+        return Called(error=error, timed_out=timed_out)
     # A tool that swallowed its bound's cancellation and returned.
-    return _Called(raw=raw, timed_out=bound.expired())
+    return Called(raw=raw, timed_out=bound.expired())
 
 
-def _fault(called: _Called, step: _Step, check_id: str, name: str) -> _Fault | None:
+def step_fault(called: Called, step: Step, where: str, name: str) -> Fault | None:
     if called.timed_out:
         return FailureClass.TIMED_OUT, "check_call"
     if called.error is not None:
         logger.warning(
-            "Write check %s: %s (%s) raised %s",
-            check_id,
+            "%s: %s (%s) raised %s",
+            where,
             name,
             step.tool,
             type(called.error).__name__,
@@ -466,7 +491,7 @@ def _fault(called: _Called, step: _Step, check_id: str, name: str) -> _Fault | N
     return failure_class, reason or failure_class.value
 
 
-def _raise_if_cancelled() -> None:
+def raise_if_cancelled() -> None:
     # A cancellation a tool swallowed is still a cancellation of the run.
     task = asyncio.current_task()
     if task is not None and task.cancelling() > 0:

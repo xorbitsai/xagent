@@ -71,8 +71,8 @@ const message = (
   id: number,
   role: "user" | "assistant",
   content: string,
-  attachments: Array<{ filename: string; file_size: number | null; mime_type: string | null }> = [],
-) => ({ id, role, content, created_at: "2026-01-02T03:04:05Z", attachments })
+  attachments: Array<{ filename: string; fileSize: number | null; mimeType: string | null }> = [],
+) => ({ id, role, content, createdAt: "2026-01-02T03:04:05Z", attachments })
 
 const messagePage = (messages = [message(1, "user", "Where is my order?")], nextCursor: string | null = null) => ({
   messages,
@@ -156,8 +156,8 @@ describe("WidgetHistoryView", () => {
     it("shows an attached file by name only, without an id or a way to open it", async () => {
       history.read.mockResolvedValue(messagePage([
         message(1, "user", "See attached", [
-          { filename: "receipt.pdf", file_size: 11, mime_type: "application/pdf" },
-          { filename: "note.txt", file_size: null, mime_type: null },
+          { filename: "receipt.pdf", fileSize: 11, mimeType: "application/pdf" },
+          { filename: "note.txt", fileSize: null, mimeType: null },
         ]),
       ]))
       renderView()

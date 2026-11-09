@@ -82,8 +82,8 @@ const messageContent = (message: WidgetConversationMessage): React.ReactNode => 
       message={message.content}
       files={message.attachments.map((attachment) => ({
         name: attachment.filename,
-        type: attachment.mime_type ?? undefined,
-        size: attachment.file_size ?? undefined,
+        type: attachment.mimeType ?? undefined,
+        size: attachment.fileSize ?? undefined,
       }))}
     />
   )
@@ -244,7 +244,7 @@ export function WidgetHistoryView({
                   content={messageContent(message)}
                   rawContent={message.role === "assistant" ? message.content : undefined}
                   showProcessView={false}
-                  timestamp={message.created_at}
+                  timestamp={message.createdAt}
                 />
               ))}
             </div>

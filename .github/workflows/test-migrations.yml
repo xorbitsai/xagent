@@ -117,6 +117,13 @@ on:
       - 'tests/web/services/test_task_lease_heartbeat_batch.py'
       - 'tests/web/services/test_task_settlement_locking.py'
       - 'tests/web/services/test_structured_output_settlement.py'
+      - 'tests/web/services/test_structured_output_wiring.py'
+      - 'tests/web/services/test_task_execution_event_writer.py'
+      - 'src/xagent/core/agent/structured_output.py'
+      - 'src/xagent/core/agent/structured_schema.py'
+      - 'src/xagent/web/services/structured_output_projection.py'
+      - 'src/xagent/web/services/task_event_context_service.py'
+      - 'src/xagent/web/models/task_execution_event.py'
       - 'src/xagent/web/services/task_auto_recovery.py'
       - 'tests/web/services/test_task_lease_expiry_interruption.py'
       - 'tests/web/services/test_persistence_failure_pause.py'
@@ -345,6 +352,13 @@ jobs:
             tests/web/services/test_task_lease_heartbeat_batch.py
             tests/web/services/test_task_settlement_locking.py
             tests/web/services/test_structured_output_settlement.py
+            tests/web/services/test_structured_output_wiring.py
+            tests/web/services/test_task_execution_event_writer.py
+            src/xagent/core/agent/structured_output.py
+            src/xagent/core/agent/structured_schema.py
+            src/xagent/web/services/structured_output_projection.py
+            src/xagent/web/services/task_event_context_service.py
+            src/xagent/web/models/task_execution_event.py
             src/xagent/web/services/task_auto_recovery.py
             tests/web/services/test_task_lease_expiry_interruption.py
             tests/web/services/test_persistence_failure_pause.py

@@ -36,6 +36,8 @@ const app = vi.hoisted(() => ({
   panelProps: null as null | Record<string, unknown>,
   listProps: null as null | Record<string, unknown>,
   viewProps: null as null | Record<string, unknown>,
+  // Run from the mocked list's own mount effect, as the real list's first read is.
+  onListMount: null as null | ((props: Record<string, unknown>) => void),
   sendMessage: vi.fn(),
   startNewConversation: vi.fn(() => Promise.resolve()),
   state: {
@@ -128,6 +130,8 @@ vi.mock("@/components/task/task-conversation-panel", () => ({
 vi.mock("./widget-history-list", () => ({
   WidgetHistoryList: (props: Record<string, unknown>) => {
     app.listProps = props
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    React.useEffect(() => app.onListMount?.(props), [])
     return (
       <div data-testid="history-list">
         <button type="button" onClick={() => (props.onOpen as (id: number, title: string) => void)(7, "Earlier chat")}>
@@ -215,6 +219,7 @@ describe("SessionAgentChatPage", () => {
     app.panelProps = null
     app.listProps = null
     app.viewProps = null
+    app.onListMount = null
     app.sendMessage.mockReset()
     app.startNewConversation.mockReset()
     app.startNewConversation.mockResolvedValue()
@@ -1592,6 +1597,30 @@ describe("SessionAgentChatPage", () => {
         expect(getAuth().refreshToken).toBeUndefined()
       })
 
+      it("reads with the phase and token of the render in which the list mounts", async () => {
+        const reads: Array<Promise<string>> = []
+        app.onListMount = (props) => {
+          reads.push((props.getAuth as () => HistoryAuth)().getToken())
+        }
+        bridge.value.ensureFreshSession.mockResolvedValue({ token: "fresh_token" })
+        const { rerender } = mountWithHistory({ sessionConversationState: "bound" })
+        goToList()
+        await expect(reads[0]).resolves.toBe("fresh_token")
+
+        // The list goes while the session is down and comes back in the render
+        // that brings a new phase and a new token together.
+        setBridge("degraded", null)
+        rerender(<SessionAgentChatPage />)
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        app.sessionConversationState = "replacement_ready"
+        setBridge("active", activeSession({ token: "st_restored", capabilities: { conversationHistory: true } }))
+        rerender(<SessionAgentChatPage />)
+
+        expect(reads).toHaveLength(2)
+        await expect(reads[1]).resolves.toBe("st_restored")
+        expect(bridge.value.ensureFreshSession).toHaveBeenCalledTimes(1)
+      })
+
       it("hands the view the current phase, replay state and notice", () => {
         mountWithHistory({ sessionConversationAttachment: "unsupported", sessionConversationState: "replacement_ready" })
         goToView()
@@ -1665,6 +1694,17 @@ describe("SessionAgentChatPage", () => {
         hand()
 
         expect(app.startProps?.isSending).toBe(true)
+      })
+
+      it("keeps the conversation panel from sending another message while one is handed over", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound", sessionConversationAttachment: "pending" })
+        goToView()
+        expect(app.panelProps?.attachmentsBusy).toBe(false)
+
+        hand()
+
+        expect(app.panelProps?.attachmentsBusy).toBe(true)
       })
 
       it("lets a message in delivery finish before the hand-over resets the conversation", async () => {

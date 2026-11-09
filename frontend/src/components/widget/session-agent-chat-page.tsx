@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import React, { useCallback, useMemo, useRef, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
@@ -317,10 +317,11 @@ function SessionConversationContent({
   // is refreshed when needed and retried once after a rejection; while one is
   // being replaced, a refresh would rebuild the connection and cost the
   // visitor the new conversation, so the current token is used as it is.
+  // The phase is recorded while rendering, not in an effect: a list or view
+  // mounting in this commit reads it from its own effect, and a child's
+  // effects run before this component's.
   const phaseRef = useRef(sessionConversationState)
-  useEffect(() => {
-    phaseRef.current = sessionConversationState
-  }, [sessionConversationState])
+  phaseRef.current = sessionConversationState
   const getHistoryAuth = useCallback((): WidgetSessionHistoryAuth => {
     const phase = phaseRef.current
     if (phase === "unbound" || phase === "bound") {
@@ -513,7 +514,10 @@ function SessionConversationContent({
               attachments={attachments}
               attachmentStatuses={attachments ? attachmentStatuses : undefined}
               onRetryAttachment={attachments ? retryAttachment : undefined}
-              attachmentsBusy={isAttachmentBusy}
+              // A message handed over from history holds the composer as the
+              // start screen's isSending does: a reply sent here meanwhile
+              // would go into the conversation the hand-over then resets.
+              attachmentsBusy={isAttachmentBusy || continueBusy}
               attachmentFiles={attachments ? panelFiles : []}
               onAttachmentFilesChange={attachments ? onPanelFilesChange : undefined}
             />
@@ -612,10 +616,11 @@ export function SessionAgentChatPage() {
   const historyAvailable = bridge.session
     ? advertisedHistory
     : bridge.status === "refreshing" ? heldHistory : false
+  // Recorded while rendering for the same reason as the phase in
+  // SessionConversationContent: a history list or view that mounts in this
+  // commit asks for the token from an effect that runs before this one's.
   const sessionTokenRef = useRef<string | null>(null)
-  useEffect(() => {
-    sessionTokenRef.current = bridge.session?.token ?? null
-  }, [bridge.session])
+  sessionTokenRef.current = bridge.session?.token ?? null
   const readCurrentToken = useCallback(() => sessionTokenRef.current, [])
   const uploads = useMemo<SessionUploadControls>(() => ({
     ensureFreshSession: bridge.ensureFreshSession,

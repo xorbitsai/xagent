@@ -27,6 +27,7 @@ from ..connector_probes import ConnectorProbe
 from ..services.connector_probe import ConnectorProbeOutcome, evaluate_probe_result
 from .declarations import (
     Assertion,
+    CreatedRef,
     EachHasKeys,
     Equals,
     HasKeys,
@@ -75,12 +76,13 @@ def judge_result(
     """The failure class and reason of ``raw`` under ``assertions``, or
     ``(None, None)`` when the check passes.
 
-    Every fixture in an ``Equals`` value must already be resolved
-    (``resolve_expected``); an unresolved one raises ``TypeError``.
+    Every fixture, run-scoped name and created-object reference in an
+    ``Equals`` value must already be resolved (``resolve_expected`` resolves
+    fixtures); an unresolved one raises ``TypeError``.
     """
     for assertion in assertions:
         if isinstance(assertion, Equals) and isinstance(
-            assertion.value, (FixtureRef, RunScopedName)
+            assertion.value, (FixtureRef, RunScopedName, CreatedRef)
         ):
             raise TypeError("an expected value must be resolved before judging")
     if len(assertions) == 1 and isinstance(assertions[0], L3Envelope):

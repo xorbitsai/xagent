@@ -19,10 +19,12 @@ from xagent.web.connector_checks.declarations import (
     ConnectorChecks,
     Equals,
     HasKeys,
+    ItemRef,
     L3Envelope,
     ReadCheck,
     RunScopedName,
     StatusSuccess,
+    Sweep,
     TenantPin,
     ToolExemption,
     ToolStep,
@@ -64,22 +66,47 @@ def read(check_id: str, tool: str, **fields: Any) -> ReadCheck:
     return ReadCheck(check_id, tool, **fields)
 
 
+def pin(app: str) -> TenantPin:
+    return TenantPin(
+        ToolStep(f"{app}_whoami", assertions=(StatusSuccess(),)),
+        ("tenant",),
+        FixtureRef(f"{app}.tenant_id"),
+    )
+
+
 def write(check_id: str) -> WriteCheck:
     app = check_id.partition(".")[0]
     name = RunScopedName("draft")
+    folder = FixtureRef(f"{app}.write_folder_id")
     return WriteCheck(
         check_id,
-        create=ToolStep(f"{app}_create", {"name": name}, assertions=(StatusSuccess(),)),
+        create=ToolStep(
+            f"{app}_create",
+            {"folder": folder, "name": name},
+            assertions=(StatusSuccess(),),
+        ),
         verify=ToolStep(f"{app}_get", {"name": name}, assertions=(StatusSuccess(),)),
         cleanup=ToolStep(
             f"{app}_delete", {"name": name}, assertions=(StatusSuccess(),)
         ),
-        tenant_pin=TenantPin(
-            ToolStep(f"{app}_whoami", assertions=(StatusSuccess(),)),
-            ("tenant",),
-            FixtureRef(f"{app}.tenant_id"),
-        ),
+        tenant_pin=pin(app),
         expected_verdicts={f"{app}_create": "allow", f"{app}_delete": "allow"},
+    )
+
+
+def sweep(app: str) -> Sweep:
+    return Sweep(
+        tenant_pin=pin(app),
+        find=ToolStep(
+            f"{app}_list",
+            {"folder": FixtureRef(f"{app}.write_folder_id")},
+            assertions=(StatusSuccess(),),
+        ),
+        items=("items",),
+        name=("name",),
+        delete=ToolStep(
+            f"{app}_delete", {"id": ItemRef(("id",))}, assertions=(StatusSuccess(),)
+        ),
     )
 
 
@@ -141,6 +168,7 @@ async def test_a_failed_session_skips_its_checks_and_keeps_static_ones() -> None
             UnprobeableCheck("jira.boards", "needs_fixture"),
         ),
         writes=(write("jira.issue_round_trip"),),
+        sweep=sweep("jira"),
     )
 
     result = await run_checks(adapter, declarations=declared(checks))
@@ -182,6 +210,7 @@ async def test_a_target_the_identity_skips_is_never_started() -> None:
         "slack",
         reads=(read("slack.channels", "slack_channels"),),
         writes=(write("slack.message_round_trip"),),
+        sweep=sweep("slack"),
     )
 
     result = await run_checks(adapter, declarations=declared(checks))
@@ -247,7 +276,11 @@ async def test_a_write_check_starts_the_session_for_tool_calls() -> None:
     # The purpose follows the declarations, so the session starts the same
     # way once the write switch is on.
     adapter = FakeAdapter(targets("jira"), {"jira": listed(FakeTool("jira_x"))})
-    checks = ConnectorChecks("jira", writes=(write("jira.issue_round_trip"),))
+    checks = ConnectorChecks(
+        "jira",
+        writes=(write("jira.issue_round_trip"),),
+        sweep=sweep("jira"),
+    )
 
     await run_checks(adapter, declarations=declared(checks))
 
@@ -258,7 +291,11 @@ async def test_no_write_check_calls_a_tool() -> None:
     tools = [FakeTool(f"jira_{name}") for name in ("create", "get", "delete")]
     whoami = FakeTool("jira_whoami")
     adapter = FakeAdapter(targets("jira"), {"jira": listed(*tools, whoami)})
-    checks = ConnectorChecks("jira", writes=(write("jira.issue_round_trip"),))
+    checks = ConnectorChecks(
+        "jira",
+        writes=(write("jira.issue_round_trip"),),
+        sweep=sweep("jira"),
+    )
 
     result = await run_checks(adapter, declarations=declared(checks))
 
@@ -679,6 +716,7 @@ async def test_the_total_timeout_cuts_the_run_and_marks_what_it_kept_out() -> No
                 UnprobeableCheck("gmail.labels", "needs_fixture"),
             ),
             writes=(write("gmail.draft_round_trip"),),
+            sweep=sweep("gmail"),
         ),
         ConnectorChecks(
             "jira",

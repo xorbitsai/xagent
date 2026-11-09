@@ -487,8 +487,9 @@ def proxy_request(
         and "data" not in answer
         and not isinstance(binary_data, Mapping)
     ):
-        # A 2xx without a body is not a successful provider answer (R3: a
-        # truncated answer used to reach a callback and fail opaquely there).
+        # A 2xx without a body is not a successful provider answer: a
+        # truncated answer would otherwise reach a callback and fail opaquely
+        # there.
         raise ComposioProxyError(
             "Composio proxy returned an answer without the provider's data",
             status=status,

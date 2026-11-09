@@ -458,9 +458,9 @@ def test_an_error_that_echoes_a_provider_token_is_redacted(proxy):
 
 
 def test_a_multiline_query_value_is_passed_through(proxy):
-    """M2: a Salesforce SOQL/SOSL query or a Gmail ``q`` can be multi-line.
-    The value is Composio's to encode, so it must not be refused here; only
-    names, headers and the endpoint are checked for control characters."""
+    """A Salesforce SOQL/SOSL query or a Gmail ``q`` can be multi-line. The
+    value is Composio's to encode, so it must not be refused here; only names,
+    headers and the endpoint are checked for control characters."""
     soql = "SELECT Id, Name\nFROM Account\nWHERE Name = 'Acme'"
 
     response = composio_proxy.proxy_request(
@@ -479,11 +479,12 @@ def test_a_multiline_query_value_is_passed_through(proxy):
     "query, headers",
     [
         ([("q\nX-Injected", "1")], None),
+        (None, {"accept\nX-Injected": "1"}),
         (None, {"accept": "application/json\nX-Injected: 1"}),
         (None, {"accept": "application/json\rX-Injected: 1"}),
         (None, {"accept": "application/json\r\nX-Injected: 1"}),
     ],
-    ids=["query-name-lf", "header-lf", "header-cr", "header-crlf"],
+    ids=["query-name-lf", "header-name-lf", "header-lf", "header-cr", "header-crlf"],
 )
 def test_a_control_character_in_a_query_name_or_header_is_refused_before_sending(
     proxy, query, headers

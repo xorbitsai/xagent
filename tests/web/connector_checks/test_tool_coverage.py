@@ -25,9 +25,10 @@ from xagent.web.connector_checks.registry import (
     WRITE_WITHOUT_CLEANUP,
 )
 
-# The legacy list when coverage became required. LEGACY_CONNECTORS may only
-# lose names; never add one here.
-_INITIAL_LEGACY = frozenset(
+# LEGACY_CONNECTORS, pinned. A connector that adopts V2 leaves both lists in
+# the same PR; never add a name here, so going back to legacy shows up in the
+# diff of this file.
+_PINNED_LEGACY = frozenset(
     {
         "aws",
         "chartmogul",
@@ -108,11 +109,15 @@ def _adopted_in_repo() -> list[str]:
     )
 
 
-def test_the_legacy_list_only_shrinks():
-    added = LEGACY_CONNECTORS - _INITIAL_LEGACY
+def test_the_legacy_list_is_pinned():
+    added = LEGACY_CONNECTORS - _PINNED_LEGACY
     assert not added, (
         f"{sorted(added)} joined the legacy list; a connector ships its V2 "
         "declaration instead"
+    )
+    left = _PINNED_LEGACY - LEGACY_CONNECTORS
+    assert not left, (
+        f"{sorted(left)} left the legacy list; remove them from _PINNED_LEGACY too"
     )
 
 
@@ -133,7 +138,12 @@ def test_every_builtin_connector_is_adopted_or_legacy():
     )
 
 
-@pytest.mark.parametrize("app_id", _adopted_in_repo())
+def test_a_legacy_connector_is_a_builtin_connector():
+    removed = LEGACY_CONNECTORS - set(_rows())
+    assert not removed, f"{sorted(removed)} are no longer builtin connectors"
+
+
+@pytest.mark.parametrize("app_id", sorted(CONNECTOR_CHECKS))
 def test_a_pending_exemption_names_the_issue_that_decides_it(app_id):
     pending = [
         exemption
@@ -166,7 +176,7 @@ def test_a_remote_connector_declares_no_exemptions():
     rows = _rows()
     remote = [
         app_id
-        for app_id, checks in CONNECTOR_CHECKS.items()
+        for app_id in CONNECTOR_CHECKS
         if app_id in rows and rows[app_id]["launch_config"].get("url")
     ]
     assert remote, "expected remote connectors in CONNECTOR_CHECKS"

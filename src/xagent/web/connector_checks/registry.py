@@ -132,7 +132,6 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
         exemptions=_exemptions(
             issue=_GOOGLE_TIER_1,
-            reads=(),
             writes=(
                 "google_docs_append_text",
                 "google_docs_replace_text",

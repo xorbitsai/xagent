@@ -101,10 +101,6 @@ FACEBOOK_AUTH_BACKEND_ENV = "XAGENT_FACEBOOK_AUTH_BACKEND"
 COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
 COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV = "COMPOSIO_FACEBOOK_AUTH_CONFIG_ID"
 COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
-# xagent-saas's switch for per-connection region routing of OAuth callbacks.
-# The verification trip carries no ``state``, so it cannot be routed that way
-# (tracked in xorbitsai/xagent-saas#2461); the start refuses while it is on.
-CONNECTOR_OAUTH_ROUTE_ENV = "XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED"
 
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 GRAPH_ME_URL = "https://graph.facebook.com/v25.0/me"
@@ -268,12 +264,6 @@ def _uses_composio(app: ComposioApp) -> bool:
 _WARNED_BACKENDS: set[tuple[str, str]] = set()
 
 
-def connector_oauth_route_enabled() -> bool:
-    """Read xagent-saas's switch the same way xagent-saas does."""
-    value = _env(CONNECTOR_OAUTH_ROUTE_ENV)
-    return value is not None and value.lower() == "true"
-
-
 def load_config(app_id: str) -> ComposioConfig | None:
     api_key = _env(COMPOSIO_API_KEY_ENV)
     auth_config_id = _env(COMPOSIO_APPS[app_id].auth_config_env)
@@ -342,23 +332,11 @@ def _unavailable_page(*app_ids: str) -> HTMLResponse:
 def start_preflight(app_id: str) -> HTMLResponse | None:
     """Refuse a Composio start this deployment cannot finish."""
     label = COMPOSIO_APPS[app_id].label
-    if connector_oauth_route_enabled():
-        # Fail closed instead of letting the verification trip be routed by
-        # region preference (xorbitsai/xagent-saas#2461).
-        logger.warning(
-            "Composio %s connect refused: %s is on, and the verification "
-            "step cannot be routed per connection",
-            label,
-            CONNECTOR_OAUTH_ROUTE_ENV,
-        )
-        return HTMLResponse(
-            content=(
-                f"<h1>{label} connection is unavailable</h1>"
-                f"<p>{label} connections through Composio are not supported "
-                "while per-connection OAuth routing is enabled.</p>"
-            ),
-            status_code=503,
-        )
+    # xagent-saas's per-connection region routing
+    # (XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED) routes the verification and
+    # denial trips, which carry no ``state``, by a fixed-name route cookie
+    # (xorbitsai/xagent-saas#2461). A trip that still reaches another region
+    # binds nothing there: see tests/web/test_composio_cross_region.py.
     try:
         _configured_callback_url()
     except _CallbackUrlInvalid as problem:

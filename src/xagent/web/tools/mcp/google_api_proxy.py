@@ -18,7 +18,10 @@ order the requests were added.
 
 A binary answer (``ProxyResponse.binary_data``) is not in ``data``: Composio
 stores the file and returns a signed URL. The transport downloads that URL and
-returns its bytes, with the file's own content type and length.
+returns its bytes, with the file's own content type and length. The body must
+be the whole file: a 206, or bytes whose length differs from the size Composio
+declared (or the signed URL's own ``Content-Length``), raises instead of
+reaching a downloader as a completed file.
 """
 
 from __future__ import annotations
@@ -92,6 +95,44 @@ def _content(response_data: Any) -> tuple[bytes, str]:
     return json.dumps(response_data).encode("utf-8"), _JSON_CONTENT_TYPE
 
 
+def _declared_size(value: Any) -> int | None:
+    """A declared byte count, or ``None`` when none was given.
+
+    A value that is present but unusable is refused: silently skipping the
+    check would turn a vendor shape change into a truncated download that
+    still reports success.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ComposioProxyError(
+            "the proxied binary response declared an unusable size"
+        )
+    if isinstance(value, int):
+        if value < 0:
+            raise ComposioProxyError(
+                "the proxied binary response declared an unusable size"
+            )
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    raise ComposioProxyError("the proxied binary response declared an unusable size")
+
+
+def _download_length(response: Any) -> int | None:
+    """The signed-URL response's own Content-Length, when it declares one."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    for name in ("Content-Length", "content-length"):
+        try:
+            if name in headers:
+                return _declared_size(headers[name])
+        except TypeError:
+            return None
+    return None
+
+
 def _binary_content(
     binary_data: Mapping[str, Any], *, timeout: float
 ) -> tuple[bytes, str]:
@@ -102,12 +143,17 @@ def _binary_content(
     kept, and it must not appear in an error either (it is a bearer-like
     credential for the file). ``public_requests`` keeps the download off a
     non-public destination.
+
+    The bytes must be the whole body: a 206, or a body shorter or longer than
+    the size Composio declared (or the signed URL's own Content-Length),
+    raises instead of reaching a downloader as a complete file.
     """
     url = binary_data.get("url")
     if not isinstance(url, str) or not url.startswith("https://"):
         raise ComposioProxyError(
             "the proxied binary response has no usable download URL"
         )
+    expected = _declared_size(binary_data.get("size"))
     try:
         response = requests.get(url, timeout=timeout)
     except Exception:
@@ -115,21 +161,58 @@ def _binary_content(
         raise ComposioProxyError(
             "the proxied binary response could not be downloaded"
         ) from None
+    if response.status_code == 206:
+        # This transport never asks for a range, so a partial body is not a
+        # complete file even when its length matches what the caller needs.
+        raise ComposioProxyError(
+            "the proxied binary response was partial (HTTP 206); "
+            "the whole file is required"
+        )
     if not 200 <= response.status_code < 300:
         raise ComposioProxyError(
             "the proxied binary response could not be downloaded "
             f"(HTTP {response.status_code})"
         )
+    content = response.content
+    for declared in (expected, _download_length(response)):
+        if declared is not None and len(content) != declared:
+            raise ComposioProxyError(
+                "the proxied binary response was truncated "
+                f"(expected {declared} bytes, got {len(content)})"
+            )
     content_type = binary_data.get("content_type")
     if not isinstance(content_type, str) or not content_type:
         content_type = "application/octet-stream"
-    return response.content, content_type
+    return content, content_type
 
 
 def _body_and_type(answer: ProxyResponse, *, timeout: float) -> tuple[bytes, str]:
     if answer.binary_data is not None:
         return _binary_content(answer.binary_data, timeout=timeout)
     return _content(answer.data)
+
+
+def _is_media_request(prepared: _PreparedRequest) -> bool:
+    """Whether this is a file-body read (``alt=media`` or ``files.export``)."""
+    if any(name == "alt" and value == "media" for name, value in prepared.query):
+        return True
+    return urlsplit(prepared.endpoint).path.endswith("/export")
+
+
+def _refuse_relayed_media_object(data: Any) -> None:
+    """Refuse a successful media answer whose body is a parsed JSON value.
+
+    A JSON API call's normal answer is a dict, but a media read's body is the
+    file itself. Re-serializing a parsed value does not reproduce the file's
+    bytes (key order, separators and non-ASCII escaping all change), so this
+    is reported rather than silently handed back as the file's content.
+    """
+    if data is None or isinstance(data, (str, bytes, bytearray)):
+        return
+    raise ComposioProxyError(
+        "the proxied media response was relayed as a parsed object, so the "
+        "file's exact bytes cannot be recovered"
+    )
 
 
 @dataclass(frozen=True)
@@ -242,6 +325,8 @@ class GoogleApiProxyHttp:
             timeout=self._timeout,
             max_body_bytes=self._max_body_bytes,
         )
+        if answer.ok and answer.binary_data is None and _is_media_request(prepared):
+            _refuse_relayed_media_object(answer.data)
         content, content_type = _body_and_type(answer, timeout=self._timeout)
         response_headers = {
             str(name).lower(): str(value)

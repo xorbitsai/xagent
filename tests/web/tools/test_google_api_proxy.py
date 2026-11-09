@@ -475,9 +475,15 @@ def test_a_batch_with_no_requests_sends_nothing(proxy):
 class _Download:
     """The public_requests response shape a binary download returns."""
 
-    def __init__(self, status_code: int, content: bytes) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        content: bytes,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.content = content
+        self.headers = headers or {}
 
 
 def test_a_binary_answer_is_downloaded_from_its_signed_url(proxy, monkeypatch):
@@ -501,7 +507,7 @@ def test_a_binary_answer_is_downloaded_from_its_signed_url(proxy, monkeypatch):
             "binary_data": {
                 "url": "https://files.composio.dev/signed",
                 "content_type": "application/pdf",
-                "size": 18,
+                "size": 19,
             },
             "headers": {"x-goog-generation": "7"},
         },
@@ -563,6 +569,184 @@ def test_a_failed_binary_download_names_no_signed_url(proxy, monkeypatch):
     assert "HTTP 403" in str(raised.value)
     assert "files.composio.dev" not in str(raised.value)
     assert "signed-secret" not in str(raised.value)
+
+
+def test_a_short_binary_answer_is_refused(proxy, monkeypatch):
+    """A signed URL whose object is shorter than the size Composio declared
+    must not reach a downloader as a complete file."""
+    monkeypatch.setattr(
+        google_api_proxy.requests,
+        "get",
+        lambda url, timeout: _Download(200, b"short"),
+    )
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed-secret",
+                "content_type": "application/pdf",
+                "size": 100,
+            },
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    text = str(raised.value)
+    assert "truncated" in text
+    assert "100" in text and "5" in text
+    assert "files.composio.dev" not in text
+    assert "signed-secret" not in text
+
+
+def test_a_binary_answer_with_a_conflicting_content_length_is_refused(
+    proxy, monkeypatch
+):
+    """The signed URL's own Content-Length is checked too, so a stale
+    ``binary_data.size`` cannot hide a short object."""
+    monkeypatch.setattr(
+        google_api_proxy.requests,
+        "get",
+        lambda url, timeout: _Download(
+            200, b"short", headers={"Content-Length": "100"}
+        ),
+    )
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed",
+                "content_type": "application/pdf",
+                "size": 5,
+            },
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    assert "truncated" in str(raised.value)
+
+
+def test_a_partial_binary_answer_is_refused(proxy, monkeypatch):
+    """This transport never asks for a range, so a 206 is not the whole
+    file even when its length looks usable."""
+    monkeypatch.setattr(
+        google_api_proxy.requests,
+        "get",
+        lambda url, timeout: _Download(206, b"part"),
+    )
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed",
+                "content_type": "application/pdf",
+                "size": 100,
+            },
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    assert "206" in str(raised.value)
+    assert "partial" in str(raised.value)
+
+
+def test_a_binary_answer_with_an_unusable_size_is_refused(proxy, monkeypatch):
+    """A size that is present but not a byte count is not silently skipped."""
+    monkeypatch.setattr(
+        google_api_proxy.requests,
+        "get",
+        lambda url, timeout: _Download(200, b"bytes"),
+    )
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed",
+                "content_type": "application/pdf",
+                "size": "all of them",
+            },
+        },
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/messages/m1")
+
+    assert "unusable size" in str(raised.value)
+
+
+def test_a_media_answer_relayed_as_a_parsed_object_is_refused(proxy):
+    """A JSON body Composio parsed cannot be re-serialized into the file's
+    exact bytes, so a media read refuses it instead of returning changed
+    content as success."""
+    proxy.answer_with(200, {"status": 200, "data": {"b": 2, "a": "é"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/"
+            "attachments/a?alt=media"
+        )
+
+    assert "parsed object" in str(raised.value)
+    assert "exact bytes" in str(raised.value)
+
+
+def test_a_media_error_answer_relayed_as_an_object_keeps_its_status(proxy):
+    """A failed media read is a provider error, not a body-fidelity case:
+    its status and JSON error text must still reach googleapiclient."""
+    proxy.answer_with(
+        200,
+        {
+            "status": 404,
+            "data": {"error": {"code": 404, "message": "File not found."}},
+        },
+    )
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/"
+        "attachments/a?alt=media"
+    )
+
+    assert response.status == 404
+    assert b"File not found." in content
+
+
+def test_a_media_answer_relayed_as_text_is_still_returned(proxy):
+    proxy.answer_with(200, {"status": 200, "data": "plain text"})
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/"
+        "attachments/a?alt=media"
+    )
+
+    assert response.status == 200
+    assert content == b"plain text"
+    assert response["content-type"].startswith("text/plain")
+
+
+def test_a_json_api_answer_relayed_as_an_object_is_still_returned(proxy):
+    """The parsed-object refusal applies only to a media read; a normal JSON
+    call's dict answer is exactly what the caller expects."""
+    proxy.answer_with(200, {"status": 200, "data": {"b": 2, "a": "é"}})
+
+    response, content = _http().request(
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels"
+    )
+
+    assert response.status == 200
+    assert json.loads(content) == {"b": 2, "a": "é"}
 
 
 def test_a_redirect_keeps_its_location_header(proxy):
@@ -697,7 +881,7 @@ def test_a_binary_answer_without_a_data_key_is_downloaded(proxy, monkeypatch):
             "binary_data": {
                 "url": "https://files.composio.dev/signed",
                 "content_type": "application/pdf",
-                "size": 21,
+                "size": 20,
             },
         },
     )

@@ -1704,33 +1704,20 @@ class ConnectionManager:
     async def _close_for_restart(
         self, websocket: WebSocket, timeout: float, generation: int
     ) -> None:
+        # No await sits between this check and ``close()`` starting, so an
+        # abort cannot land in between on any supported Python. A close that
+        # has started finishes and unregisters; an aborted one never starts.
         if self._restart_drain_generation != generation:
             return
-        started = False
-
-        async def start_close() -> None:
-            # ``wait_for`` runs this in its own task, so an abort can land
-            # between the check above and here. Checking at the moment
-            # ``close()`` is invoked leaves no gap: after this point the 1012
-            # is going out and the close is allowed to finish.
-            nonlocal started
-            if self._restart_drain_generation != generation:
-                return
-            started = True
-            await websocket.close(
-                code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
-            )
-
         try:
-            await asyncio.wait_for(start_close(), timeout=timeout)
-        except asyncio.CancelledError:
-            # The caller was cancelled mid-close: the socket stays registered.
-            raise
+            async with asyncio.timeout(timeout):
+                await websocket.close(
+                    code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
+                )
         except Exception:
             # Already closed, or the peer is gone; either way it is leaving.
             pass
-        if started:
-            self.disconnect(websocket)
+        self.disconnect(websocket)
 
     def was_closed_by_server(self, websocket: Any, exc: BaseException) -> bool:
         """Whether ``exc`` is just the receive that follows our own close.

@@ -460,25 +460,41 @@ async def test_end_restart_drain_stops_a_scheduled_close_that_has_not_started(
 
 
 @pytest.mark.asyncio
-async def test_abort_between_the_generation_check_and_close_sends_no_1012(
-    manager, monkeypatch
-):
+async def test_close_is_never_invoked_after_the_drain_generation_moved(manager):
+    seen: list[int] = []
+
+    class GenerationSocket(FakeSocket):
+        async def close(self, code: int = 1000, reason: str | None = None) -> None:
+            seen.append(manager._restart_drain_generation)
+            await super().close(code, reason)
+
+    ws = GenerationSocket()
+    manager.register_connection(ws, 1)
+    generation = manager._restart_drain_generation
+    closing = asyncio.create_task(manager._close_for_restart(ws, 1.0, generation))
+    # Queued behind the close's first step: an abort that lands as soon as
+    # the close yields for the first time.
+    asyncio.get_running_loop().call_soon(manager.end_restart_drain)
+    await closing
+    await asyncio.sleep(0)
+
+    # Whether or not the close got in first, it was never invoked after the
+    # abort, and the socket is unregistered exactly when its close went out.
+    assert all(gen == generation for gen in seen)
+    assert (ws.closed == []) == (seen == [])
+    assert (manager.connection_count() == 1) == (seen == [])
+
+
+@pytest.mark.asyncio
+async def test_zero_close_timeout_still_closes_and_unregisters(manager):
     ws = FakeSocket()
     manager.register_connection(ws, 1)
-    real_wait_for = asyncio.wait_for
 
-    async def abort_in_the_gap(awaitable, timeout):
-        # ``wait_for`` has not started the close yet: the abort lands exactly
-        # between the generation check and the transport ``close()``.
-        manager.end_restart_drain()
-        return await real_wait_for(awaitable, timeout)
+    handled = await manager.close_for_restart(close_timeout_seconds=0)
 
-    monkeypatch.setattr(ws_module.asyncio, "wait_for", abort_in_the_gap)
-
-    await manager.close_for_restart()
-
-    assert ws.closed == []
-    assert manager.connection_count() == 1
+    assert handled == 1
+    assert ws.closed == [(1012, "Service Restart")]
+    assert manager.connection_count() == 0
 
 
 @pytest.mark.asyncio

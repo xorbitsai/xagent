@@ -15,11 +15,11 @@ from sqlalchemy.orm import sessionmaker
 import xagent.web.api.auth  # noqa: F401  (see test_oauth_refresh_retry.py)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.builtin_mcp_registry import get_builtin_oauth_provider_rows
+from xagent.web.mcp_apps import catalog_mcp_credential_provider_for_client_id
 from xagent.web.models.database import Base
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
-from xagent.web.mcp_apps import catalog_mcp_credential_provider_for_client_id
 from xagent.web.oauth_client_verification import (
     client_rejected_reason,
     is_client_rejected,

@@ -1617,7 +1617,9 @@ def _field_description(text: str) -> str:
     """The description part of a field line: ``""`` or ``": "`` and the text.
 
     A text over 120 characters keeps its constraint suffix and is cut in front
-    of it, so a format or range stays in view; leading spaces are dropped.
+    of it with an ellipsis, so a format or range stays in view. A suffix of
+    120 characters or more is itself cut to its first 120 characters, with no
+    ellipsis and none of the text in front of it. Leading spaces are dropped.
     """
     text = _single_line_text(text)
     if len(text) > FIELD_DESCRIPTION_MAX_CHARS:
@@ -1663,7 +1665,8 @@ def schema_field_list(schema: dict[str, Any]) -> str:
     and describes the caller's own schema: references and nullable unions are
     followed, but nothing the nullable copy adds is shown. The elements of an
     array get a line of their own unless they are objects, whose properties are
-    listed instead. Lines run in document order. When the list is over
+    listed instead; the description and nullability of such an element are not
+    shown. Lines run in document order. When the list is over
     ``FIELD_LIST_MAX_BYTES`` bytes of UTF-8 it keeps the longest run of first
     lines that leaves room for a last line counting the rest.
     """

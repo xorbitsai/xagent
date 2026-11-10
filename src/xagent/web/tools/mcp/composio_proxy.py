@@ -27,6 +27,7 @@ Composio echoes back (a Gmail message's body and attachments travel in it).
 from __future__ import annotations
 
 import base64
+import bisect
 import json
 import logging
 import os
@@ -214,10 +215,15 @@ def _redact_echoed_body(message: str, body: Any) -> str:
     return _redacted_decoded_fragments(message, _decoded_mime_fragments(body))
 
 
-# A decoded fragment is looked up by its first characters, so a pass over the
-# start of the text costs one lookup per character instead of one search per
-# fragment: a 4.5 MB message decodes to tens of thousands of lines.
+# A decoded fragment is looked up by the characters it opens with, so a pass
+# over the start of the text costs one key lookup per position instead of one
+# search per fragment: a 4.5 MB message decodes to tens of thousands of lines.
 _FRAGMENT_KEY_CHARS = 32
+# How many positions one match is looked through while it grows over the
+# fragments that overlap it. Reaching the limit takes the rest of the text as
+# one region: that redacts more than needed, where stopping would leave
+# fragment text in view.
+_MAX_REGION_SCAN_CHARS = 4 * MAX_ERROR_TEXT_CHARS
 
 
 def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
@@ -241,21 +247,19 @@ def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
     variants = _decoded_fragment_variants(fragments)
     if not variants:
         return message
-    prefix_index, length_index = _fragment_index(variants)
+    index = _fragment_index(variants)
     pieces: list[str] = []
     kept = 0
     position = 0
     size = len(message)
     while position < size and kept < MAX_ERROR_TEXT_CHARS:
-        value = _fragment_at(message, position, prefix_index, length_index)
-        if value is None:
+        length = _fragment_at(message, position, index)
+        if length is None:
             pieces.append(message[position])
             kept += 1
             position += 1
             continue
-        end = _fragment_region_end(
-            message, position, position + len(value), prefix_index, length_index
-        )
+        end = _fragment_region_end(message, position, position + length, index)
         pieces.append(_REDACTED)
         kept += len(_REDACTED)
         position = end
@@ -277,65 +281,121 @@ def _decoded_fragment_variants(fragments: list[str]) -> set[str]:
     return variants
 
 
-def _fragment_index(
-    variants: set[str],
-) -> tuple[dict[str, list[str]], dict[int, set[str]]]:
-    """Index the fragments by their first characters, and short ones by
-    length; both are read by ``_fragment_at``."""
-    prefix_index: dict[str, list[str]] = {}
-    length_index: dict[int, set[str]] = {}
+@dataclass(frozen=True)
+class _FragmentIndex:
+    """The fragments of one decoded message, indexed for an exact lookup at
+    one position.
+
+    ``by_length`` maps a length to the fragments of that length, and
+    ``lengths_by_key`` maps a fragment's opening characters to the sorted
+    lengths of the fragments that open with them. Many fragments can share an
+    opening -- the body and its first line, a body whose lines start with the
+    same run, an attachment's base64 padding -- and they collapse into the
+    lengths that share the key. A lookup is then one key lookup plus one set
+    membership test per distinct length that shares the opening and still
+    fits, never one per fragment: thousands of same-prefix fragments of one
+    length cost one test, and the number of tests is bounded by the distinct
+    line lengths of the message, not by how many fragments share the prefix.
+
+    ``short_lengths`` holds the lengths below the key: a fragment shorter
+    than ``_FRAGMENT_KEY_CHARS`` is found from its length alone, and there
+    are fewer than that many possible lengths.
+    """
+
+    by_length: dict[int, set[str]]
+    lengths_by_key: dict[str, tuple[int, ...]]
+    short_lengths: tuple[int, ...]
+
+
+def _fragment_index(variants: set[str]) -> _FragmentIndex:
+    """Index the fragments by their opening characters and by length."""
+    by_length: dict[int, set[str]] = {}
+    keyed: dict[str, set[int]] = {}
     for value in variants:
-        if len(value) >= _FRAGMENT_KEY_CHARS:
-            prefix_index.setdefault(value[:_FRAGMENT_KEY_CHARS], []).append(value)
-        else:
-            length_index.setdefault(len(value), set()).add(value)
-    return prefix_index, length_index
+        length = len(value)
+        by_length.setdefault(length, set()).add(value)
+        if length >= _FRAGMENT_KEY_CHARS:
+            keyed.setdefault(value[:_FRAGMENT_KEY_CHARS], set()).add(length)
+    return _FragmentIndex(
+        by_length=by_length,
+        lengths_by_key={key: tuple(sorted(lengths)) for key, lengths in keyed.items()},
+        short_lengths=tuple(
+            sorted(length for length in by_length if length < _FRAGMENT_KEY_CHARS)
+        ),
+    )
 
 
 def _fragment_at(
     message: str,
     position: int,
-    prefix_index: dict[str, list[str]],
-    length_index: dict[int, set[str]],
-) -> str | None:
-    """The longest fragment starting at ``position``, or None."""
+    index: _FragmentIndex,
+    *,
+    longer_than: int = 0,
+) -> int | None:
+    """The length of the longest fragment starting at ``position`` and longer
+    than ``longer_than``, or None."""
     remaining = len(message) - position
-    best = ""
+    if remaining <= 0:
+        return None
     if remaining >= _FRAGMENT_KEY_CHARS:
-        key = message[position : position + _FRAGMENT_KEY_CHARS]
-        for value in prefix_index.get(key, ()):
-            if len(value) > len(best) and message.startswith(value, position):
-                best = value
-    for length, values in length_index.items():
-        if length <= remaining and length > len(best):
-            candidate = message[position : position + length]
-            if candidate in values:
-                best = candidate
-    return best or None
+        lengths = index.lengths_by_key.get(
+            message[position : position + _FRAGMENT_KEY_CHARS], ()
+        )
+        for slot in _candidate_slots(lengths, longer_than, remaining):
+            length = lengths[slot]
+            if message[position : position + length] in index.by_length[length]:
+                return length
+    for slot in _candidate_slots(index.short_lengths, longer_than, remaining):
+        length = index.short_lengths[slot]
+        if message[position : position + length] in index.by_length[length]:
+            return length
+    return None
+
+
+def _candidate_slots(
+    lengths: tuple[int, ...], longer_than: int, remaining: int
+) -> range:
+    """The positions in ``lengths`` (sorted) whose value is in
+    ``(longer_than, remaining]``, longest first, so the region scan walks
+    only lengths that can reach past its end and the main loop stops at the
+    longest match."""
+    return range(
+        bisect.bisect_right(lengths, remaining) - 1,
+        bisect.bisect_right(lengths, longer_than) - 1,
+        -1,
+    )
 
 
 def _fragment_region_end(
     message: str,
     start: int,
     end: int,
-    prefix_index: dict[str, list[str]],
-    length_index: dict[int, set[str]],
+    index: _FragmentIndex,
 ) -> int:
     """``end`` extended over fragments that start inside the match and reach
     past it, so one region is replaced once and no tail is left behind.
 
-    A match longer than the kept text is the body or one of its own lines;
-    scanning inside it would cost as much as the message, and a decoded
-    message yields no fragment that crosses out of its own line.
+    Only the last ``MAX_ERROR_TEXT_CHARS`` characters of the match are walked.
+    A fragment that starts further back is longer than that window, so it can
+    only be the body or one of its own long lines, and a decoded message does
+    not make one of those start inside another: the body is matched whole
+    where it begins. Walking a multi-megabyte body from its start would cost
+    as much as the text itself.
+
+    The walk has a fixed budget. If a text ever keeps growing the region past
+    it, the rest of the text becomes one region: that redacts more than
+    needed, where stopping would leave fragment text in view.
     """
-    if end - start > MAX_ERROR_TEXT_CHARS:
-        return end
-    position = start + 1
-    while position < end:
-        value = _fragment_at(message, position, prefix_index, length_index)
-        if value is not None and position + len(value) > end:
-            end = position + len(value)
+    position = max(start + 1, end - MAX_ERROR_TEXT_CHARS)
+    budget = _MAX_REGION_SCAN_CHARS
+    while position < end and budget:
+        length = _fragment_at(message, position, index, longer_than=end - position)
+        if length is not None:
+            end = position + length
         position += 1
+        budget -= 1
+    if position < end:
+        return len(message)
     return end
 
 

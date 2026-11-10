@@ -35,6 +35,7 @@ from .connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from .conversation_storage_rollout import new_task_conversation_storage_version
 from .db_runtime import (
     await_task_settlement,
     drain_async_task_cancellation_safe,
@@ -941,6 +942,9 @@ def prepare_channel_task_no_commit(
                 }
                 if mcp_runtime_authorization_policy_required is True
                 else None
+            ),
+            conversation_storage_version=new_task_conversation_storage_version(
+                entry="channel", owner_user_id=owner_id
             ),
         )
         selected_refs = prepare_connector_runtime_selection_snapshot(

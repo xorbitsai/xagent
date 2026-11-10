@@ -4227,8 +4227,12 @@ def _generic_oauth_login(
 
     google_shared_has_refresh_token = False
     google_restricted_scopes = False
+    # A Composio start never enters shared-grant mode: it authorizes with
+    # Composio's Google app, not our client, and its grant is the app's own
+    # row (#3649).
     google_shared_mode = (
         get_google_shared_oauth_grants_enabled()
+        and auth_backend is None
         and provider.lower() == "google"
         and isinstance(app_id, str)
         and bool(app_id.strip())

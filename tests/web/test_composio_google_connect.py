@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from sqlalchemy.orm import Session
@@ -31,6 +32,12 @@ from xagent.web.models.mcp import UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.google_oauth_grants import (
+    resolve_google_shared_oauth_account,
+    write_google_shared_oauth_callback,
+)
+from xagent.web.services.user_oauth import delete_scoped_user_oauth_accounts
 
 from . import test_composio_facebook_connect as facebook_connect
 from .test_composio_facebook_connect import (
@@ -523,3 +530,172 @@ def test_startup_keeps_an_administrators_drive_description(tmp_path, monkeypatch
     with Session(engine) as db:
         drive = db.query(PublicMCPApp).filter_by(app_id="google-drive").one()
         assert drive.description == "Our own words"
+
+
+# --- Native shared Google grants ---------------------------------------------------
+
+SHARED_FLAG = "XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED"
+
+
+def _native_shared_grant(db: Session, user: User, *app_ids: str) -> UserOAuth:
+    """A native shared Google grant of the same Google account, owned by the
+    same actor and associated with ``app_ids``."""
+    shared = None
+    for app_id in app_ids:
+        legacy = UserOAuth(
+            user_id=int(user.id),
+            provider=app_id,
+            resource_owner_key=OWNER,
+            provider_user_id=GOOGLE_SUBJECT,
+            access_token=f"native-{app_id}",
+        )
+        db.add(legacy)
+        db.flush()
+        shared, _, _ = write_google_shared_oauth_callback(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=OWNER,
+            oauth_client_id="google-client-id",
+            app_id=app_id,
+            google_subject=GOOGLE_SUBJECT,
+            access_token="native-access",
+            refresh_token="native-refresh",
+            granted_scopes="openid email profile",
+            requested_scopes=["openid"],
+            email="a@example.com",
+            token_type="Bearer",
+            expires_at=None,
+            legacy_oauth_account=legacy,
+        )
+    db.commit()
+    assert shared is not None
+    return shared
+
+
+def _shared_for(db: Session, user: User, app_id: str) -> UserOAuth | None:
+    db.expire_all()
+    return resolve_google_shared_oauth_account(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=OWNER,
+        oauth_client_id="google-client-id",
+        app_id=app_id,
+    )
+
+
+def test_a_native_shared_grant_never_stands_in_for_the_composio_grant(
+    google, monkeypatch
+):
+    db, user, composio = google
+    monkeypatch.setenv(SHARED_FLAG, "true")
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+    shared = _native_shared_grant(db, user, "google-drive")
+    shared_id = int(shared.id)
+    assert _shared_for(db, user, "google-drive") is not None
+
+    response = _connect(db, user, composio, "google-drive")
+
+    assert response.status_code == 200, response.body
+    # The runtime prefers an associated shared grant over the app's own row.
+    # The association named the native Drive row the Composio grant replaced,
+    # so it no longer resolves and the native drive.file token cannot stand
+    # in for the Composio grant.
+    assert _shared_for(db, user, "google-drive") is None
+    (grant,) = [row for row in _grants(db) if row.provider == "google-drive"]
+    assert grant.token_type == "composio"
+    # Connecting through Composio deletes no native credential.
+    assert db.get(UserOAuth, shared_id).access_token == "native-access"
+
+
+def test_a_composio_grant_leaves_the_shared_grant_other_apps_use(google, monkeypatch):
+    db, user, composio = google
+    monkeypatch.setenv(SHARED_FLAG, "true")
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+    shared = _native_shared_grant(db, user, "google-drive", "google-docs")
+    shared_id = int(shared.id)
+
+    response = _connect(db, user, composio, "google-drive")
+
+    assert response.status_code == 200, response.body
+    assert _shared_for(db, user, "google-drive") is None
+    docs = _shared_for(db, user, "google-docs")
+    assert docs is not None and int(docs.id) == shared_id
+    assert db.get(UserOAuth, shared_id).access_token == "native-access"
+
+
+def test_disconnecting_the_composio_grant_leaves_the_native_shared_grant(
+    google, monkeypatch
+):
+    db, user, composio = google
+    monkeypatch.setenv(SHARED_FLAG, "true")
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+    shared = _native_shared_grant(db, user, "google-drive", "google-docs")
+    shared_id = int(shared.id)
+    _connect(db, user, composio, "google-drive")
+
+    delete_scoped_user_oauth_accounts(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=OWNER,
+        providers=["google-drive"],
+    )
+    db.commit()
+
+    assert [row.provider for row in _grants(db) if row.token_type == "composio"] == []
+    docs = _shared_for(db, user, "google-docs")
+    assert docs is not None and int(docs.id) == shared_id
+
+
+@pytest.mark.parametrize("app_id", GOOGLE_APPS)
+def test_a_composio_start_never_enters_shared_grant_mode(google, monkeypatch, app_id):
+    db, user, composio = google
+    monkeypatch.setenv(SHARED_FLAG, "true")
+    # Composio needs no Google client of ours; shared-grant mode keys on it.
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    _switch_on(monkeypatch, app_id)
+    _install(db, user, app_id)
+    provider = _google_provider()
+    provider.client_id = None
+    browser = Browser()
+
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="google",
+        app_id=app_id,
+        user=user,
+        resource_owner_key=OWNER,
+        redirect="https://toby.example.com/settings",
+        db=db,
+        db_provider=provider,
+    )
+    db.commit()
+    browser.receive(start)
+
+    assert start.status_code in (302, 307), start.body
+    state = auth_api.verify_token(
+        parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+    )
+    assert "google_shared_mode" not in state
+    assert browser.get(db, start.headers["location"]).status_code == 302
+    assert browser.get(db, _verify_url(composio)).status_code == 200
+
+
+def test_a_native_shared_connect_leaves_the_composio_gmail_grant(google, monkeypatch):
+    db, user, composio = google
+    monkeypatch.setenv(SHARED_FLAG, "true")
+    _switch_on(monkeypatch, "gmail")
+    _install(db, user, "gmail")
+    assert _connect(db, user, composio, "gmail").status_code == 200
+    (before,) = _grants(db)
+    account_id = before.access_token
+
+    # A native shared Google connect of the same Google account for another
+    # app, by the same actor.
+    _native_shared_grant(db, user, "google-docs")
+
+    (gmail,) = [row for row in _grants(db) if row.provider == "gmail"]
+    assert (gmail.token_type, gmail.access_token) == ("composio", account_id)
+    assert gmail.refresh_token is None
+    assert _shared_for(db, user, "gmail") is None

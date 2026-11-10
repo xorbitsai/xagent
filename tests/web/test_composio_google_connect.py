@@ -79,6 +79,8 @@ class GoogleComposio(FakeComposio):
     def __init__(self) -> None:
         super().__init__()
         self.google_identity: Any = {"sub": GOOGLE_SUBJECT, "email": "a@example.com"}
+        # Google's own status, as the proxy relays it.
+        self.google_status = 200
 
     def request(self, *, method, url, headers, json, timeout):  # noqa: A002
         path = url[len(composio_auth.COMPOSIO_API_BASE_URL) :]
@@ -88,7 +90,9 @@ class GoogleComposio(FakeComposio):
             and json["endpoint"] == USERINFO_URL
         ):
             self.calls.append((method, path, json))
-            return _Response(200, {"data": self.google_identity, "status": 200})
+            return _Response(
+                200, {"data": self.google_identity, "status": self.google_status}
+            )
         response = super().request(
             method=method, url=url, headers=headers, json=json, timeout=timeout
         )
@@ -228,6 +232,28 @@ def _connect(
     return browser.get(db, _verify_url(composio))
 
 
+def _native_start(
+    db: Session,
+    user: User,
+    app_id: str,
+    provider: SimpleNamespace | None = None,
+) -> Any:
+    """The ordinary (non-actor) web start, which never goes through Composio."""
+    return auth_api.generic_oauth_login(
+        "google",
+        token=auth_api.create_access_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "session_epoch": user.session_epoch,
+            }
+        ),
+        app_id=app_id,
+        db=db,
+        db_provider=provider or _google_provider(),
+    )
+
+
 # --- Registration ---------------------------------------------------------------
 
 
@@ -274,22 +300,37 @@ def test_a_google_app_connects_and_stores_its_google_subject(
     assert db.query(ActorOAuthFlowState).count() == 0
 
 
+_GOOGLE_ERROR = {"error": {"code": 401, "status": "UNAUTHENTICATED"}}
+
+
 @pytest.mark.parametrize(
-    "identity",
-    [{"sub": "not-a-google-subject"}, {"sub": 110248495921238986420}, {}],
-    ids=["text", "number", "missing"],
+    ("identity", "google_status"),
+    [
+        ({"sub": "not-a-google-subject"}, 200),
+        ({"sub": 110248495921238986420}, 200),
+        ({}, 200),
+        # What Google answers when the auth config does not request openid.
+        (_GOOGLE_ERROR, 401),
+        ({**_GOOGLE_ERROR, "sub": GOOGLE_SUBJECT}, 403),
+    ],
+    ids=["text", "number", "missing", "upstream-401", "upstream-403"],
 )
-def test_a_google_identity_must_be_a_google_subject(google, monkeypatch, identity):
+def test_a_google_identity_must_be_a_google_subject(
+    google, monkeypatch, identity, google_status
+):
     db, user, composio = google
     monkeypatch.setenv(RESTRICTED_FLAG, "true")
     _switch_on(monkeypatch, "gmail")
     _install(db, user, "gmail")
     composio.google_identity = identity
+    composio.google_status = google_status
 
     response = _connect(db, user, composio, "gmail")
 
     assert response.status_code == 503
     assert _grants(db) == []
+    # The refused account is not left behind at Composio.
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
 
 
 def test_a_google_flow_uses_the_shared_callback_not_googles(google, monkeypatch):
@@ -359,18 +400,8 @@ def test_restricted_provider_defaults_still_refuse_a_native_start(google, monkey
     _switch_on(monkeypatch, "google-drive")
     _install(db, user, "google-drive")
 
-    response = auth_api.generic_oauth_login(
-        "google",
-        token=auth_api.create_access_token(
-            data={
-                "sub": user.username,
-                "user_id": user.id,
-                "session_epoch": user.session_epoch,
-            }
-        ),
-        app_id="google-drive",
-        db=db,
-        db_provider=_restricted_defaults_provider(),
+    response = _native_start(
+        db, user, "google-drive", provider=_restricted_defaults_provider()
     )
 
     assert response.status_code == 403
@@ -415,20 +446,7 @@ def test_a_native_gmail_start_is_refused_while_the_composio_switch_is_on(
     _switch_on(monkeypatch, "gmail")
     _install(db, user, "gmail")
 
-    # The ordinary (non-actor) start never goes through Composio.
-    response = auth_api.generic_oauth_login(
-        "google",
-        token=auth_api.create_access_token(
-            data={
-                "sub": user.username,
-                "user_id": user.id,
-                "session_epoch": user.session_epoch,
-            }
-        ),
-        app_id="gmail",
-        db=db,
-        db_provider=_google_provider(),
-    )
+    response = _native_start(db, user, "gmail")
 
     assert response.status_code == 404
     assert "location" not in response.headers
@@ -473,19 +491,7 @@ def test_a_web_drive_connect_stays_native_while_the_composio_switch_is_on(
     _switch_on(monkeypatch, "google-drive")
     _install(db, user, "google-drive")
 
-    response = auth_api.generic_oauth_login(
-        "google",
-        token=auth_api.create_access_token(
-            data={
-                "sub": user.username,
-                "user_id": user.id,
-                "session_epoch": user.session_epoch,
-            }
-        ),
-        app_id="google-drive",
-        db=db,
-        db_provider=_google_provider(),
-    )
+    response = _native_start(db, user, "google-drive")
 
     assert response.status_code in (302, 307)
     location = urlsplit(response.headers["location"])
@@ -749,17 +755,7 @@ def test_a_composio_start_never_enters_shared_grant_mode(google, monkeypatch, ap
     provider.client_id = None
     browser = Browser()
 
-    start = auth_api.start_builtin_oauth_for_resource_owner(
-        provider="google",
-        app_id=app_id,
-        user=user,
-        resource_owner_key=OWNER,
-        redirect="https://toby.example.com/settings",
-        db=db,
-        db_provider=provider,
-    )
-    db.commit()
-    browser.receive(start)
+    start = _start_google(db, user, browser, app_id, provider)
 
     assert start.status_code in (302, 307), start.body
     state = auth_api.verify_token(

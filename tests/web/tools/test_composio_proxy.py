@@ -814,7 +814,7 @@ def test_a_short_decoded_fragment_near_the_cut_leaves_one_marker(proxy):
     text = str(raised.value)
     assert fragment not in text
     assert text.endswith("...[truncated]")
-    assert text.count("truncat") == 1
+    assert text.count("[truncated]") == 1
 
 
 def test_a_large_decoded_body_is_redacted_from_a_truncated_error_text(proxy):

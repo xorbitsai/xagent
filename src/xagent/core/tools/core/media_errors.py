@@ -788,6 +788,14 @@ _OTHER_SIZE_PHRASES = (
     "in the prompt",
 )
 
+# DashScope keeps the provider body inside the exception message rather than a
+# ``body`` mapping, so a quoted ``"param": "size"`` there is the same evidence
+# as the attribute. Both the key and the value have to be quoted, which a prose
+# sentence does not normally do.
+_PROVIDER_TARGET_IN_TEXT_PATTERN = re.compile(
+    r"""(?i)["'](?:param|field|target)["']\s*:\s*["']([^"']{1,40})["']"""
+)
+
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     """The nearest multiple of ``multiple`` at or above ``value``."""
@@ -807,13 +815,21 @@ def _names_size(text: str, pair: tuple[int, int]) -> bool:
     return re.search(rf"(?<!\d){pair[0]}\s*[*xX×]\s*{pair[1]}(?!\d)", text) is not None
 
 
-def _target_strings(exc: BaseException) -> list[str]:
+def _target_strings(exc: BaseException, text: str) -> list[str]:
     """The parameters the provider blames, from ``param``/``field``/``target``.
 
-    ``code`` is deliberately not read: ``invalid_value`` says the request was
-    refused, not which parameter it was about.
+    Read from the exception's mapping first. DashScope flattens its JSON body
+    into the exception message instead of keeping a ``body`` attribute, so a
+    quoted ``"param": "n"`` inside that text is read too -- without it the
+    message alone would decide, and a rule about ``n`` could be taken for a
+    rule about the output size. ``code`` is deliberately not read:
+    ``invalid_value`` says the request was refused, not which parameter it was
+    about.
     """
-    return _field_strings(exc, ("param", "target", "field"))
+    targets = _field_strings(exc, ("param", "target", "field"))
+    if targets:
+        return targets
+    return _PROVIDER_TARGET_IN_TEXT_PATTERN.findall(text)
 
 
 def _names_output_size_field(value: str) -> bool:
@@ -843,7 +859,7 @@ def _targets_output_size(
     requested size -- and :func:`_mentions_other_size` has already ruled out a
     message about some other size.
     """
-    targets = _target_strings(exc)
+    targets = _target_strings(exc, text)
     if targets:
         return any(_names_output_size_field(target) for target in targets)
     return _names_size(text, requested_pair)

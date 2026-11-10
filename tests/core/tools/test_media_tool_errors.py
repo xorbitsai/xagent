@@ -1301,6 +1301,31 @@ class TestNonSizeRejectionsStayGeneric:
         assert "allowed_values" not in result
         assert session.calls == 1
 
+    @pytest.mark.asyncio
+    async def test_a_flattened_body_that_names_another_field_stays_generic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DashScope puts the JSON body in the exception message, so the field
+        has to be read from that text as well."""
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "invalid_value",
+                    "param": "n",
+                    "message": (
+                        "Invalid size '1080x1350'. Width and height must both "
+                        "be divisible by 16."
+                    ),
+                }
+            }
+        )
+        tool, session = _dashscope_tool(monkeypatch, _FakeHTTPResponse(400, body))
+
+        result = await tool.generate_image("A product shot", size="1080*1350")
+
+        assert "allowed_values" not in result
+        assert session.calls == 1
+
 
 class TestSizeRuleShapes:
     """The multiple rule is read per dimension, not collapsed into one."""

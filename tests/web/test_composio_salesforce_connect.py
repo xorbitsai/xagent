@@ -346,6 +346,7 @@ def test_the_identity_is_read_on_whichever_org_host_the_account_names(salesforce
         {"base_url": "https://salesforce.com/services/data/v67.0"},
         {"base_url": "https://evilsalesforce.com/services/data/v67.0"},
         {"base_url": "https://acme my.salesforce.com/services/data"},
+        {"base_url": "https://[acme.my.salesforce.com/services/data"},
         {"base_url": ""},
         {"base_url": 42},
         {"subdomain": "login"},
@@ -361,6 +362,7 @@ def test_the_identity_is_read_on_whichever_org_host_the_account_names(salesforce
         "bare-domain",
         "suffix-only",
         "space",
+        "unparsable",
         "empty",
         "not-a-string",
         "missing",
@@ -380,7 +382,8 @@ def test_an_unusable_org_host_is_refused_without_echoing_it(salesforce, data, ca
     assert _grants(db) == []
     raw = data.get("base_url") if isinstance(data, dict) else None
     if isinstance(raw, str) and raw:
-        host = urlsplit(raw).netloc
+        # The host part, even where the URL itself can't be parsed.
+        host = raw.split("://", 1)[-1].split("/", 1)[0]
         for shown in (raw, host, "sneaky"):
             assert shown not in caplog.text
             assert shown not in response.body.decode()

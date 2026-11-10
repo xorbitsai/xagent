@@ -190,9 +190,10 @@ def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
     """The userinfo URL on the org host of the account's ``data.base_url``.
 
     Composio finds the org at sign-in and keeps its host plus
-    ``/services/data/vNN.0`` there (#3646 live test). The check is the one
-    the Salesforce runtime applies to the same value (#3669): https, no
-    credentials or port, a subdomain of salesforce.com. The value comes from
+    ``/services/data/vNN.0`` there (#3646 live test). The check is at least as
+    strict as the one the Salesforce runtime applies to the same value
+    (#3669): https, no credentials or port, a subdomain of salesforce.com made
+    of ``[a-z0-9-]`` labels, so every host accepted here is accepted there. The value comes from
     what the member typed on Composio's page, so it is refused, never
     trimmed, and never logged.
     """
@@ -200,11 +201,12 @@ def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
     base_url = data.get("base_url") if isinstance(data, dict) else None
     if not isinstance(base_url, str):
         return None
-    parts = urlsplit(base_url)
-    hostname = (parts.hostname or "").rstrip(".")
     try:
+        parts = urlsplit(base_url)
+        hostname = (parts.hostname or "").rstrip(".")
         port = parts.port
     except ValueError:
+        # Unparsable (an unclosed "[" bracket) or an invalid port.
         return None
     if (
         parts.scheme != "https"
@@ -220,7 +222,9 @@ def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
 _SALESFORCE_INSTALL = (
     "A Salesforce admin has to install Composio's app in your org first: in "
     "Setup, open Connected Apps OAuth Usage, click Install next to Composio's "
-    'app, then set Permitted Users to "All users may self-authorize".'
+    'app, then set Permitted Users to "All users may self-authorize". If '
+    "Composio's app isn't listed there yet, connect once as an admin first, "
+    "then install it."
 )
 _SALESFORCE_LOGIN_POLICY = (
     "change the Salesforce subdomain on Composio's page to your My Domain "

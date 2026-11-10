@@ -4628,6 +4628,12 @@ class ReActPattern(AgentPattern):
         if stamp is None or (
             component.last_scanned_at is not None and stamp <= component.last_scanned_at
         ):
+            logger.info(
+                "Deferred preload skipped: message not newer than last scan "
+                "(stamp=%s, last_scanned_at=%s)",
+                stamp,
+                component.last_scanned_at,
+            )
             return
         component.last_scanned_at = stamp
         if not text:
@@ -4656,6 +4662,20 @@ class ReActPattern(AgentPattern):
             if group and cost <= remaining:
                 to_load.extend(group)
                 remaining -= cost
+            else:
+                logger.info(
+                    "Deferred preload skipped connector %r: %d tools, ~%d "
+                    "tokens against %d remaining",
+                    server,
+                    len(group),
+                    cost,
+                    remaining,
+                )
+        logger.info(
+            "Deferred preload: text_chars=%d preloaded=%d tools",
+            len(text),
+            len(to_load),
+        )
         self._load_names(context, to_load)
 
     def _normal_tool_schemas(
@@ -4698,6 +4718,23 @@ class ReActPattern(AgentPattern):
             *(self._build_tool_schema(by_name[n]) for n in loaded if n in by_name),
         ]
 
+    def _case_insensitive_matches(self, name: str) -> list[str]:
+        """Deferred tool names equal to ``name`` ignoring case."""
+        folded = name.casefold()
+        return [n for n in self._deferred_order if n.casefold() == folded]
+
+    def _resolve_deferred_name(self, name: str) -> str | None:
+        """The deferred tool ``name`` refers to, or None.
+
+        An exact name wins. Otherwise a case-insensitive match counts only
+        when it is unique: connector tool names embed the server name as
+        registered ("mcp_Jira_..."), which a model easily writes in lower case.
+        """
+        if name in self._deferred_tool_names:
+            return name
+        matches = self._case_insensitive_matches(name)
+        return matches[0] if len(matches) == 1 else None
+
     def _plan_load(
         self, requested: list[str], context: Any
     ) -> tuple[list[str], list[str], list[str], list[str]]:
@@ -4709,7 +4746,9 @@ class ReActPattern(AgentPattern):
         """
         component = self._loaded_component(context)
         taken = set(component.names)
-        requested = list(dict.fromkeys(requested))
+        requested = list(
+            dict.fromkeys(self._resolve_deferred_name(n) or n for n in requested)
+        )
         known = [n for n in requested if n in self._deferred_tool_names]
         unknown = [n for n in requested if n not in self._deferred_tool_names]
         already = [n for n in known if n in taken]
@@ -4740,7 +4779,9 @@ class ReActPattern(AgentPattern):
                 + ". Call load_tools again for these."
             )
         for name in unknown:
-            close = difflib.get_close_matches(name, list(self._deferred_order), n=3)
+            close = self._case_insensitive_matches(name) or difflib.get_close_matches(
+                name, list(self._deferred_order), n=3
+            )
             hint = f" Did you mean: {', '.join(close)}?" if close else ""
             parts.append(
                 f"Unknown tool {name!r}: not in the connector inventory.{hint}"

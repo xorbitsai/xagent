@@ -3993,7 +3993,19 @@ def _generic_oauth_login(
     force_google_consent: bool = False,
     auth_backend: str | None = None,
 ) -> Any:
-    """Build an ordinary or trusted actor provider authorization redirect."""
+    """Build an ordinary or trusted actor provider authorization redirect.
+
+    ``auth_backend`` is ``None`` for a native start, or Composio's backend for
+    an actor start of an app that goes through Composio. Any other value is a
+    programming error and raises ``ValueError`` before anything is read.
+    """
+    from .. import composio_auth
+
+    if auth_backend not in (None, composio_auth.AUTH_BACKEND):
+        raise ValueError("unsupported OAuth auth_backend")
+    # Every native-only rule below (our client id, the Google gates, shared
+    # grants) keys on this one flag (#3649).
+    native_start = auth_backend is None
     if db is None:
         raise RuntimeError("db session is required")
     if not db_provider:
@@ -4006,7 +4018,7 @@ def _generic_oauth_login(
     # authorizes, so our client id is never sent (composio_auth). The one
     # later reader, Google shared-grant mode below, never takes a Composio
     # start (#3649).
-    if not client_id and auth_backend is None:
+    if not client_id and native_start:
         return _oauth_provider_config_error(
             provider, [_oauth_env_name(provider, "CLIENT_ID")]
         )
@@ -4030,9 +4042,7 @@ def _generic_oauth_login(
 
     # Only the actor start passes ``auth_backend``, and only for an app that
     # goes through Composio, whose start never reaches Google (see above).
-    if auth_backend is None and (
-        error_response := _google_gmail_error(provider, app_id)
-    ):
+    if native_start and (error_response := _google_gmail_error(provider, app_id)):
         return error_response
 
     if not app_id:
@@ -4166,10 +4176,8 @@ def _generic_oauth_login(
             resource_owner_key=encrypted_owner_key,
             actor_flow_nonce=actor_flow_nonce,
         )
-        if auth_backend is not None:
-            from ..composio_auth import AUTH_BACKEND_CLAIM
-
-            state_payload[AUTH_BACKEND_CLAIM] = auth_backend
+        if not native_start:
+            state_payload[composio_auth.AUTH_BACKEND_CLAIM] = auth_backend
     app_scopes: list[str] | None = None
     app_optional_scopes: list[str] = []
     app_info: dict[str, Any] | None = None
@@ -4232,7 +4240,7 @@ def _generic_oauth_login(
     # row (#3649).
     google_shared_mode = (
         get_google_shared_oauth_grants_enabled()
-        and auth_backend is None
+        and native_start
         and provider.lower() == "google"
         and isinstance(app_id, str)
         and bool(app_id.strip())
@@ -4244,7 +4252,7 @@ def _generic_oauth_login(
         # a native start. A Composio start sends none of these scopes: it
         # authorizes with Composio's Google app and its own scopes (#3649).
         if (
-            auth_backend is None
+            native_start
             and not google_restricted_scopes
             and GOOGLE_RESTRICTED_SCOPES.intersection(scopes + app_optional_scopes)
         ):

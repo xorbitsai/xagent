@@ -916,3 +916,34 @@ def test_a_bare_google_login_links_gmail_only_while_the_gate_is_open(
     } & {"Gmail", "Google Drive"}
     expected = {"Google Drive", "Gmail"} if gate_open else {"Google Drive"}
     assert linked == expected
+
+
+@pytest.mark.parametrize("auth_backend", ["", "native", "Composio", "nango"])
+def test_an_unknown_auth_backend_is_a_programming_error(
+    google, monkeypatch, auth_backend
+):
+    """Only ``None`` (a native start) and Composio's backend are known. Any
+    other value is refused before anything is written, instead of being read
+    as "not native" and skipping the native-only Google gates."""
+    db, user, _ = google
+    _switch_on(monkeypatch, "gmail")
+    _install(db, user, "gmail")
+    flows_before = db.query(ActorOAuthFlowState).count()
+
+    with pytest.raises(ValueError, match="auth_backend"):
+        auth_api._generic_oauth_login(
+            "google",
+            token=None,
+            app_id="gmail",
+            redirect=None,
+            db=db,
+            db_provider=_google_provider(),
+            trusted_user_id=int(user.id),
+            resource_owner_key=OWNER,
+            actor_flow_nonce="nonce-digest",
+            account=None,
+            auth_backend=auth_backend,
+        )
+
+    assert db.query(ActorOAuthFlowState).count() == flows_before
+    assert _grants(db) == []

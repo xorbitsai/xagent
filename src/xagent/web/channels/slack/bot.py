@@ -31,6 +31,7 @@ from ....core.file_ref import build_file_id_ref
 from ....core.file_storage.keys import build_upload_storage_key
 from ...models.task import TaskStatus
 from ...services.agent_service_manager import get_agent_manager
+from ...services.assistant_history_safety import INPUT_REVIEW_REJECTED_MESSAGE_TYPE
 from ...services.channel_delivery import (
     ChannelDelivery,
     deliver_channel_result,
@@ -666,6 +667,9 @@ class SlackBotInstance:
             if managed_lease is not None and not await managed_lease.finalize_result(
                 status=projection.task_status,
                 assistant_content=projection.transcript_content,
+                turn_id=turn_id
+                if projection.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+                else None,
                 interactions=projection.interactions,
                 message_type=projection.message_type,
                 error_message=projection.diagnostic_error,

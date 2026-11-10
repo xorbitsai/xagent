@@ -4428,8 +4428,10 @@ clarification questions as plain assistant text.
                 }
                 result.setdefault("output", result.get("message", ""))
 
-            # Append interaction to chat history
-            if hasattr(websocket.state, "builder_chat_history"):
+            # Keep rejected turns visible to the client, but out of model history.
+            if result.get("input_review_rejected") is not True and hasattr(
+                websocket.state, "builder_chat_history"
+            ):
                 # Make sure we don't end up with consecutive user messages
                 if (
                     websocket.state.builder_chat_history

@@ -134,7 +134,6 @@ from .services.ops_signals import (
 )
 from .services.orphan_upload_gc import run_orphan_upload_gc_loop
 from .services.release_hold import release_hold
-from .services.writer_workers import drain_workers, run_tracked
 from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
@@ -146,6 +145,7 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .services.writer_workers import drain_workers, run_tracked
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)

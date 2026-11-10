@@ -157,7 +157,7 @@ class ReleaseHold:
         # Socket-owned writers (command enqueue, builder turns, ASR sessions)
         # admitted before the retire fence, each with an optional callback that
         # asks a long-running one to wind down once the fence is up.
-        self._socket_writes: dict[int, Callable[[], None] | None] = {}
+        self._socket_writes: dict[int, Callable[[], object] | None] = {}
         # Sticky for the life of the process: the blocking evidence.
         self._unsettled_total = 0
         self._unsettled: deque[dict[str, str]] = deque(
@@ -199,7 +199,7 @@ class ReleaseHold:
         self._socket_writes.clear()
 
     def acquire_socket_write(
-        self, interrupt: Callable[[], None] | None = None
+        self, interrupt: Callable[[], object] | None = None
     ) -> SocketWriteToken:
         """Admit one socket-owned write or raise :class:`WritersRetired`.
 

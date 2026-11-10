@@ -4137,17 +4137,26 @@ async def websocket_builder_chat_endpoint(
             # An admitted turn is a socket write the retire waits for, and is
             # cancelled when the fence goes up.
             turn_task: asyncio.Task[None] | None = None
+
+            def _cancel_turn() -> None:
+                if turn_task is not None:
+                    turn_task.cancel()
+
             try:
-                write_token = release_hold.acquire_socket_write(
-                    lambda: turn_task.cancel() if turn_task is not None else None
-                )
+                write_token = release_hold.acquire_socket_write(_cancel_turn)
             except WritersRetired:
                 await send_execution_paused(websocket)
                 continue
             turn_task = asyncio.create_task(
                 handle_builder_chat(websocket, message_data, user)
             )
-            turn_task.add_done_callback(lambda _t, tok=write_token: tok.release())
+
+            def _release_write(
+                _done: asyncio.Future[None], token: SocketWriteToken = write_token
+            ) -> None:
+                token.release()
+
+            turn_task.add_done_callback(_release_write)
             active_chat_task = turn_task
             websocket.state.chat_task = active_chat_task
 

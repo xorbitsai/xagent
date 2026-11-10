@@ -35,8 +35,9 @@ for, and only accepted under, its app's own provider:
    Composio user id, derived from *our* session. The account it activates
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
    of its app's auth config and toolkit. The app's own identity read through
-   the proxy (``identity_url`` with ``identity_params``) gives the provider
-   user id, which must match ``identity_id_pattern``, and the grant is stored
+   the proxy (``identity_url``, fixed or built from that account, with
+   ``identity_params``) gives the provider user id, which must match
+   ``identity_id_pattern``, and the grant is stored
    for the app's runtime to execute. A refused completion spends nothing.
 
 A begin needs a state carrying the Composio marker, a verification carries a
@@ -153,7 +154,11 @@ class ComposioApp(NamedTuple):
     # GET this through the proxy with ``identity_params`` as its query;
     # ``identity_field`` of the reply, which must fully match
     # ``identity_id_pattern``, is stored as the grant's provider_user_id.
-    identity_url: str
+    # Either a fixed URL, or, for an app whose identity lives on the
+    # account's own host, a function of the connected account that
+    # ``verify_account`` read, returning None when the account names no
+    # usable host.
+    identity_url: str | Callable[[Mapping[str, Any]], str | None]
     identity_field: str
     identity_params: tuple[tuple[str, str], ...]
     identity_id_pattern: re.Pattern[str]
@@ -633,8 +638,12 @@ def verify_account(
     account_id: str,
     user_id: str,
     toolkit_slug: str,
-) -> None:
-    """Require the account to be ACTIVE, ours, of our auth config and toolkit."""
+) -> dict[str, Any]:
+    """Require the account to be ACTIVE, ours, of our auth config and toolkit.
+
+    Returns the account as Composio reported it, for an identity read that
+    depends on it; it is never logged or stored.
+    """
     payload = _get_account(config, account_id)
     if payload is None:
         raise ComposioError("account_lookup_failed")
@@ -657,6 +666,7 @@ def verify_account(
             "Composio account failed verification (checks=%s)", ",".join(failed)
         )
         raise ComposioError("account_invalid", rejected=True)
+    return payload
 
 
 def fetch_provider_user_id(
@@ -665,15 +675,30 @@ def fetch_provider_user_id(
     account_id: str,
     user_id: str,
     app_id: str,
+    account: Mapping[str, Any],
 ) -> str:
-    """Read the account's own id once through Composio's proxy."""
+    """Read the account's own id once through Composio's proxy.
+
+    ``account`` is the connected account ``verify_account`` returned.
+    """
     app = COMPOSIO_APPS[app_id]
+    if isinstance(app.identity_url, str):
+        identity_url: str | None = app.identity_url
+    else:
+        identity_url = app.identity_url(account)
+    if identity_url is None:
+        # The account's own values are never logged: they come from what the
+        # member typed on Composio's page.
+        logger.warning(
+            "Composio account names no usable %s host for its identity", app.label
+        )
+        raise ComposioError("identity_host_invalid", rejected=True)
     status, payload = _call(
         config.api_key,
         "POST",
         "/tools/execute/proxy",
         body={
-            "endpoint": app.identity_url,
+            "endpoint": identity_url,
             "method": "GET",
             "connected_account_id": account_id,
             "user_id": user_id,
@@ -1529,14 +1554,18 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
         delete_account(shared.api_key, account_id)
         return _clear_flow_cookies(_unavailable_page(app_id), callback, dead)
     try:
-        verify_account(
+        account = verify_account(
             config,
             account_id=account_id,
             user_id=composio_user,
             toolkit_slug=COMPOSIO_APPS[app_id].toolkit_slug,
         )
         provider_user_id = fetch_provider_user_id(
-            config, account_id=account_id, user_id=composio_user, app_id=app_id
+            config,
+            account_id=account_id,
+            user_id=composio_user,
+            app_id=app_id,
+            account=account,
         )
         stored = _store_grant(
             db,

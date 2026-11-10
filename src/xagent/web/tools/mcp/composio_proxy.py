@@ -115,6 +115,7 @@ _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 # no backslash, whitespace or control character, so no URL parser on the
 # way can read it as another host ("//evil", "/\\evil").
 _RELATIVE_ENDPOINT_RE = re.compile(r"/(?!/)[^\\\s\x00-\x1f\x7f]*")
+_BACKSLASH_OR_SPACE_RE = re.compile(r"[\\\s]")
 
 logger = logging.getLogger(__name__)
 
@@ -755,6 +756,9 @@ def _checked_endpoint(endpoint: str, allowed_hosts: Collection[str]) -> str:
                 "backslash, whitespace or control character"
             )
         return endpoint
+    if _BACKSLASH_OR_SPACE_RE.search(endpoint):
+        # urlsplit keeps these in a hostname; another parser may not.
+        raise ValueError("endpoint must not contain a backslash or whitespace")
     parts = urlsplit(endpoint)
     if parts.scheme != "https" or not parts.netloc:
         raise ValueError("endpoint must be an https URL or a path starting with '/'")
@@ -777,7 +781,8 @@ def _checked_parameter(value: Any, kind: str) -> str:
 def connected_account_base_url() -> str | None:
     """The launched grant's connected account ``base_url`` as Composio keeps
     it, None when the account has none. Raises ``ComposioProxyError`` when
-    Composio does not answer with the account."""
+    Composio does not answer with the account, or answers in a shape this
+    client does not know."""
     api_key = _required_env(COMPOSIO_API_KEY_ENV)
     connected_account_id = _required_env(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV)
     try:
@@ -799,7 +804,13 @@ def connected_account_base_url() -> str | None:
         raise ComposioProxyError(message, status=status, slug=slug)
     data = answer.get("data") if isinstance(answer, dict) else None
     base_url = data.get("base_url") if isinstance(data, dict) else None
-    return base_url if isinstance(base_url, str) and base_url else None
+    if not isinstance(data, dict) or not isinstance(base_url, (str, type(None))):
+        # Not the same as an account without a base_url: that is a fact about
+        # the connection, this one is about Composio's answer.
+        raise ComposioProxyError(
+            "Composio account lookup returned an unexpected answer"
+        )
+    return base_url or None
 
 
 def _json_or_none(response: Any) -> Any:

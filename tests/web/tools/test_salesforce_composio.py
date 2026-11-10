@@ -3,10 +3,11 @@
 Such a grant holds no Salesforce token and no instance URL: the subprocess is
 launched with the Composio ids only (``tools/config._composio_grant_env``),
 and every call goes through Composio's Proxy Execute as an absolute URL on
-the org's host. That host is read once from the connected account's
-``base_url``, which Composio keeps as the org's host plus
-``/services/data/vNN.0`` -- a relative path would be appended to it.
-Composio is faked here; no request leaves the process.
+the org's host. Every call reads that host from the connected account's
+``base_url`` (each tool call runs in its own subprocess), which Composio
+keeps as the org's host plus ``/services/data/vNN.0`` -- a relative path
+would be appended to it. Composio is faked here; no request leaves the
+process.
 """
 
 from __future__ import annotations
@@ -74,7 +75,6 @@ def proxy(monkeypatch) -> FakeProxy:
     monkeypatch.delenv("SALESFORCE_INSTANCE_URL", raising=False)
     fake = FakeProxy()
     monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
-    monkeypatch.setattr(salesforce, "_COMPOSIO_ORG_ORIGINS", {})
     return fake
 
 
@@ -319,7 +319,9 @@ def test_a_3xx_requests_would_not_follow_is_not_turned_into_a_redirect_error(pro
     assert salesforce._request("GET", f"{API}/sobjects") == {}
 
 
-def test_the_orgs_host_is_read_from_composio_once_for_every_request(proxy):
+def test_every_request_reads_the_orgs_host_from_composio(proxy):
+    """Each MCP tool call runs in a fresh subprocess, so a cache would never
+    be hit: every call reads the account, then sends one proxy request."""
     proxy.answer(200, {"totalSize": 0, "done": True, "records": []})
     proxy.answer(200, {"user_id": "005xx"})
     proxy.answer(201, {"id": "001xx", "success": True})
@@ -328,9 +330,10 @@ def test_the_orgs_host_is_read_from_composio_once_for_every_request(proxy):
     salesforce.salesforce_get_current_user()
     salesforce.salesforce_create_record("Account", {"Name": "Acme"})
 
-    (lookup,) = proxy.lookups
-    assert lookup["method"] == "GET"
-    assert lookup["headers"]["x-api-key"] == API_KEY
+    assert len(proxy.lookups) == 3
+    for lookup in proxy.lookups:
+        assert lookup["method"] == "GET"
+        assert lookup["headers"]["x-api-key"] == API_KEY
     assert [call["endpoint"] for call in proxy.calls] == [
         f"{ORG}{API}/query",
         f"{ORG}/services/oauth2/userinfo",
@@ -348,6 +351,12 @@ def test_the_orgs_host_is_read_from_composio_once_for_every_request(proxy):
         "https://user:s3cret@acme.my.salesforce.com/services/data/v67.0",
         "https://acme.my.salesforce.com:443/services/data/v67.0",
         "https://acme.my.salesforce.com:s3cret/services/data/v67.0",
+        # urlsplit keeps "\\" in the hostname; a WHATWG parser reads it as "/".
+        "https://evil.example\\.salesforce.com/services/data/v67.0",
+        "https://evil.example .salesforce.com/services/data/v67.0",
+        "https://-evil.my.salesforce.com/services/data/v67.0",
+        "https://evil_example.my.salesforce.com/services/data/v67.0",
+        "https://.salesforce.com/services/data/v67.0",
     ],
 )
 def test_a_base_url_that_is_not_a_plain_salesforce_host_sends_nothing(
@@ -365,7 +374,6 @@ def test_a_base_url_that_is_not_a_plain_salesforce_host_sends_nothing(
         "*.salesforce.com host without credentials or a port"
     )
     assert proxy.calls == []
-    assert salesforce._COMPOSIO_ORG_ORIGINS == {}
     for text in (result["message"], caplog.text):
         assert "s3cret" not in text
         assert "evil" not in text
@@ -407,7 +415,7 @@ def test_a_connection_without_a_base_url_sends_nothing(proxy, base_url):
     assert proxy.calls == []
 
 
-def test_an_unreachable_lookup_is_an_error_and_not_cached(proxy, monkeypatch):
+def test_an_unreachable_lookup_is_a_fixed_error(proxy, monkeypatch):
     def unreachable(**kwargs: Any) -> _Response:
         raise ConnectionError(f"cannot reach {kwargs['url']}")
 
@@ -416,4 +424,26 @@ def test_an_unreachable_lookup_is_an_error_and_not_cached(proxy, monkeypatch):
     result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
 
     assert result["message"] == "Composio could not be reached"
-    assert salesforce._COMPOSIO_ORG_ORIGINS == {}
+
+
+@pytest.mark.parametrize(
+    ("base_url", "origin"),
+    [
+        # A fully qualified host's trailing dot is dropped.
+        ("https://acme.my.salesforce.com./services/data/v67.0", ORG),
+        (
+            "https://acme--dev.sandbox.my.salesforce.com/services/data/v67.0",
+            "https://acme--dev.sandbox.my.salesforce.com",
+        ),
+        ("https://ACME.my.salesforce.com/services/data/v67.0", ORG),
+    ],
+)
+def test_a_salesforce_host_in_the_base_url_is_used_normalized(proxy, base_url, origin):
+    proxy.account = _Response(200, {"id": ACCOUNT_ID, "data": {"base_url": base_url}})
+    proxy.answer(200, {"totalSize": 0, "done": True, "records": []})
+
+    result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
+
+    assert result["status"] == "success"
+    (call,) = proxy.calls
+    assert call["endpoint"] == f"{origin}{API}/query"

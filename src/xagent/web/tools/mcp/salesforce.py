@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Any, NoReturn
 from urllib.parse import urlparse, urlsplit
 
@@ -30,9 +31,13 @@ USERINFO_URL = "https://login.salesforce.com/services/oauth2/userinfo"
 # own host, through the proxy: login.salesforce.com does not serve sandbox
 # orgs, and the org's host is known to Composio only.
 ORG_USERINFO_PATH = "/services/oauth2/userinfo"
-# The org origin of each Composio connected account this process has served,
-# read once from Composio (_composio_org_origin).
-_COMPOSIO_ORG_ORIGINS: dict[str, str] = {}
+# A host a Composio connection's base_url may name: DNS labels of letters,
+# digits and inner hyphens under salesforce.com. Nothing else -- urlsplit
+# keeps a backslash or a space in a hostname, and a parser downstream could
+# read the host before it as the target.
+_SALESFORCE_HOST_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+salesforce\.com"
+)
 # The redirects requests follows on the direct path (requests' REDIRECT_STATI).
 _FOLLOWED_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
@@ -348,28 +353,24 @@ def _raise_api_error(status: int, detail: str) -> NoReturn:
     raise RuntimeError(f"Salesforce API error (status {status}): {detail}")
 
 
-def _composio_org_origin() -> str:
-    """The connected org's ``https://host``, read once per connected account
-    from the ``base_url`` Composio keeps for it.
+def _composio_org_host() -> str:
+    """The connected org's host, read from the ``base_url`` Composio keeps
+    for the connected account.
 
     That ``base_url`` is the org's host plus ``/services/data/vNN.0`` (#3646
     live test), and Composio appends a relative path to it, so the tools send
     absolute URLs on the host instead, at this module's pinned API_VERSION,
-    as on the direct path. A failed lookup is not cached.
+    as on the direct path. It is read on every call: each MCP tool call runs
+    in a fresh subprocess, so a per-process cache would never be hit.
     """
-    account_id = os.environ.get(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, "")
-    origin = _COMPOSIO_ORG_ORIGINS.get(account_id)
-    if origin is None:
-        base_url = composio_proxy.connected_account_base_url()
-        if base_url is None:
-            raise ValueError("the Composio connection has no base_url")
-        origin = _composio_base_url_origin(base_url)
-        _COMPOSIO_ORG_ORIGINS[account_id] = origin
-    return origin
+    base_url = composio_proxy.connected_account_base_url()
+    if base_url is None:
+        raise ValueError("the Composio connection has no base_url")
+    return _composio_base_url_host(base_url)
 
 
-def _composio_base_url_origin(base_url: str) -> str:
-    """``https://host`` of a Composio connection's ``base_url``.
+def _composio_base_url_host(base_url: str) -> str:
+    """The host of a Composio connection's ``base_url``.
 
     Stricter than ``_instance_url``: the value comes from the
     connected account's record, built from what the user typed when
@@ -388,13 +389,13 @@ def _composio_base_url_origin(base_url: str) -> str:
         or parts.username is not None
         or parts.password is not None
         or port is not None
-        or not hostname.endswith(".salesforce.com")
+        or not _SALESFORCE_HOST_RE.fullmatch(hostname)
     ):
         raise ValueError(
             "the Composio connection's base_url is not an https URL on a "
             "*.salesforce.com host without credentials or a port"
         )
-    return f"https://{hostname}"
+    return hostname
 
 
 def _request_via_composio(
@@ -406,11 +407,11 @@ def _request_via_composio(
 ) -> Any:
     """Send ``path`` on the connected org's host through Composio, which adds
     the token."""
-    origin = _composio_org_origin()
+    host = _composio_org_host()
     response = composio_proxy.proxy_request(
         method,
-        f"{origin}{path}",
-        allowed_hosts=(urlsplit(origin).hostname or "",),
+        f"https://{host}{path}",
+        allowed_hosts=(host,),
         query=params or {},
         body=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,

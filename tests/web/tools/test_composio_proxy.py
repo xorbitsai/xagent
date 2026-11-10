@@ -123,6 +123,8 @@ def test_a_path_is_passed_on_for_composio_to_append_to_the_base_url(proxy):
         "/gmail/v1/users/me labels",
         "/gmail/v1/users/me\nlabels",
         "/gmail/v1/users/me\x7f",
+        "https://gmail.googleapis.com/gmail\\v1/users/me",
+        "https://gmail.googleapis.com/gmail/v1/users/me labels",
     ],
     ids=[
         "http",
@@ -137,6 +139,8 @@ def test_a_path_is_passed_on_for_composio_to_append_to_the_base_url(proxy):
         "space-in-path",
         "control-in-path",
         "delete-in-path",
+        "absolute-backslash",
+        "absolute-space",
     ],
 )
 def test_an_endpoint_off_the_allowed_hosts_is_refused_before_sending(proxy, endpoint):
@@ -1408,3 +1412,101 @@ def test_a_pass_that_runs_out_preparing_hides_the_whole_text(proxy, monkeypatch)
     assert text == "[redacted]"
     assert "invalid argument" not in text
     assert "BODY-LINE-0000" not in text
+
+
+def test_a_backslash_host_is_refused_even_when_allowed(proxy):
+    """``urlsplit`` keeps a backslash in the hostname, so a host built from
+    such a value could pass a membership check; Composio may read the
+    backslash as a path separator and send the token to the host before it."""
+    host = "evil.example\\.salesforce.com"
+    with pytest.raises(ValueError):
+        composio_proxy.proxy_request(
+            "GET", f"https://{host}/services/data", allowed_hosts=(host,)
+        )
+
+    assert proxy.calls == []
+
+
+ACCOUNT_URL = f"{composio_proxy.COMPOSIO_CONNECTED_ACCOUNTS_URL}/{ACCOUNT_ID}"
+
+
+def test_the_account_base_url_is_read_with_the_api_key(proxy):
+    proxy.response = _Response(
+        200, {"id": ACCOUNT_ID, "data": {"base_url": "https://acme.example/v1"}}
+    )
+
+    assert composio_proxy.connected_account_base_url() == "https://acme.example/v1"
+    (call,) = proxy.calls
+    assert call["method"] == "GET"
+    assert call["url"] == ACCOUNT_URL
+    assert call["headers"]["x-api-key"] == API_KEY
+
+
+def test_the_account_id_is_quoted_as_one_path_segment(proxy, monkeypatch):
+    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, "ca_1/../x?y")
+    proxy.response = _Response(200, {"data": {"base_url": "https://acme.example"}})
+
+    composio_proxy.connected_account_base_url()
+
+    (call,) = proxy.calls
+    assert call["url"] == (
+        f"{composio_proxy.COMPOSIO_CONNECTED_ACCOUNTS_URL}/ca_1%2F..%2Fx%3Fy"
+    )
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        composio_proxy.COMPOSIO_API_KEY_ENV,
+        composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
+    ],
+)
+def test_an_account_read_without_a_launch_variable_sends_nothing(
+    proxy, monkeypatch, missing
+):
+    monkeypatch.delenv(missing)
+
+    with pytest.raises(ValueError, match=missing):
+        composio_proxy.connected_account_base_url()
+
+    assert proxy.calls == []
+
+
+@pytest.mark.parametrize(
+    "data", [{}, {"base_url": ""}, {"base_url": None}], ids=["absent", "empty", "null"]
+)
+def test_an_account_without_a_base_url_reads_as_none(proxy, data):
+    proxy.response = _Response(200, {"id": ACCOUNT_ID, "data": data})
+
+    assert composio_proxy.connected_account_base_url() is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        ["not", "an", "object"],
+        {"id": ACCOUNT_ID},
+        {"id": ACCOUNT_ID, "data": "https://acme.example"},
+        {"id": ACCOUNT_ID, "data": {"base_url": 123}},
+    ],
+    ids=[
+        "not-json",
+        "not-an-object",
+        "no-data",
+        "data-not-an-object",
+        "base-url-not-text",
+    ],
+)
+def test_an_account_answer_of_an_unexpected_shape_is_a_composio_error(proxy, payload):
+    """Told apart from an account that has no base_url, which is a fact about
+    the connection rather than about Composio's answer."""
+    proxy.response = _Response(200, payload)
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.connected_account_base_url()
+
+    assert "unexpected" in str(raised.value)
+    assert "no base_url" not in str(raised.value)
+    assert raised.value.status is None
+    assert _secrets_in(str(raised.value)) == []

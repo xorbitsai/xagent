@@ -12,11 +12,11 @@ adopts V2 and still wants its L3 call declares it again through
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import cast
 
 from ..connector_probes import get_connector_probe, get_unprobeable_reason
 from .declarations import (
     ConnectorChecks,
+    DeclarationError,
     EachHasKeys,
     HasKeys,
     IsType,
@@ -89,6 +89,15 @@ def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:
         probe.arguments,
         assertions=(L3Envelope(probe.expect_keys),),
     )
+
+
+def _declared_l3(app_id: str) -> ReadCheck:
+    # A probe removed from connector_probes.py must fail at import, not put
+    # None or an UnprobeableCheck into the declaration.
+    check = l3_read_check(app_id)
+    if not isinstance(check, ReadCheck):
+        raise DeclarationError(f"{app_id} declares no L3 read check")
+    return check
 
 
 # Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
@@ -311,7 +320,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     "zendesk": ConnectorChecks(
         "zendesk",
         reads=(
-            cast(ReadCheck, l3_read_check("zendesk")),
+            _declared_l3("zendesk"),
             ReadCheck(
                 "zendesk.list_tickets",
                 "zendesk_list_tickets",
@@ -399,7 +408,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     "zoom": ConnectorChecks(
         "zoom",
         reads=(
-            cast(ReadCheck, l3_read_check("zoom")),
+            _declared_l3("zoom"),
             ReadCheck(
                 "zoom.list_meetings",
                 "zoom_list_meetings",
@@ -417,7 +426,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "zoom_list_recordings",
                 "zoom_get_meeting_transcript",
             ),
-            writes=("zoom_create_meeting",),
+            writes_without_cleanup=("zoom_create_meeting",),
         ),
     ),
 }

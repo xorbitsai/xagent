@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 from unittest.mock import Mock
 
@@ -18,6 +18,7 @@ from xagent.web.connector_checks.assertions import judge_result
 from xagent.web.connector_checks.declarations import (
     Assertion,
     ConnectorChecks,
+    DeclarationError,
     EachHasKeys,
     FixtureRef,
     HasKeys,
@@ -31,6 +32,8 @@ from xagent.web.connector_checks.declarations import (
 )
 from xagent.web.connector_checks.registry import (
     CONNECTOR_CHECKS,
+    WRITE_WITHOUT_CLEANUP,
+    _declared_l3,
     connector_checks_for,
     l3_read_check,
 )
@@ -577,59 +580,70 @@ def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     assert l3_checks == [expected]
 
 
+@pytest.mark.parametrize("app_id", ["acme", "hubspot"])
+def test_the_declared_l3_helper_rejects_anything_but_a_read_check(app_id: str) -> None:
+    with pytest.raises(DeclarationError, match=app_id):
+        _declared_l3(app_id)
+
+
+def test_zoom_create_meeting_has_no_cleanup_tool() -> None:
+    assert [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["zoom"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ] == ["zoom_create_meeting"]
+
+
 def _list_payload(list_key: str, item: dict[str, Any], count: int) -> dict[str, Any]:
     return {list_key: [item] * count, "meta": {"has_more": False}}
 
 
+@pytest.mark.parametrize(
+    ("check_id", "list_key", "item", "tool"),
+    [
+        (
+            "zendesk.list_tickets",
+            "tickets",
+            {
+                "id": 7,
+                "subject": "Printer down",
+                "status": "open",
+                "priority": "normal",
+                "requester_id": 3,
+                "tags": ["hardware"],
+            },
+            zendesk.zendesk_list_tickets,
+        ),
+        (
+            "zendesk.list_organizations",
+            "organizations",
+            {"id": 4, "name": "Acme", "domain_names": ["acme.example"]},
+            zendesk.zendesk_list_organizations,
+        ),
+        (
+            "zendesk.list_macros",
+            "macros",
+            {"id": 5, "title": "Close ticket", "description": "Closes it"},
+            zendesk.zendesk_list_macros,
+        ),
+    ],
+)
 @pytest.mark.parametrize("count", [0, 1])
-def test_zendesk_list_tickets_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch, count: int
+def test_a_zendesk_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+    check_id: str,
+    list_key: str,
+    item: dict[str, Any],
+    tool: Callable[..., str],
+    count: int,
 ) -> None:
-    item = {
-        "id": 7,
-        "subject": "Printer down",
-        "status": "open",
-        "priority": "normal",
-        "requester_id": 3,
-        "tags": ["hardware"],
-    }
     monkeypatch.setattr(
         zendesk,
         "_request",
-        lambda *args, **kwargs: _list_payload("tickets", item, count),
+        lambda *args, **kwargs: _list_payload(list_key, item, count),
     )
 
-    _assert_check_output("zendesk.list_tickets", zendesk.zendesk_list_tickets(limit=1))
-
-
-@pytest.mark.parametrize("count", [0, 1])
-def test_zendesk_list_organizations_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch, count: int
-) -> None:
-    item = {"id": 4, "name": "Acme", "domain_names": ["acme.example"]}
-    monkeypatch.setattr(
-        zendesk,
-        "_request",
-        lambda *args, **kwargs: _list_payload("organizations", item, count),
-    )
-
-    _assert_check_output(
-        "zendesk.list_organizations", zendesk.zendesk_list_organizations(limit=1)
-    )
-
-
-@pytest.mark.parametrize("count", [0, 1])
-def test_zendesk_list_macros_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch, count: int
-) -> None:
-    item = {"id": 5, "title": "Close ticket", "description": "Closes it"}
-    monkeypatch.setattr(
-        zendesk,
-        "_request",
-        lambda *args, **kwargs: _list_payload("macros", item, count),
-    )
-
-    _assert_check_output("zendesk.list_macros", zendesk.zendesk_list_macros(limit=1))
+    _assert_check_output(check_id, tool(limit=1))
 
 
 @pytest.mark.parametrize("count", [0, 1])

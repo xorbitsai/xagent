@@ -7,7 +7,13 @@ from typing import Any
 
 import pytest
 
-from xagent.web.connector_checks.assertions import judge_result, resolve_expected
+from xagent.web.connector_checks.assertions import (
+    MISSING,
+    json_equal,
+    judge_result,
+    resolve_expected,
+    value_at,
+)
 from xagent.web.connector_checks.declarations import (
     CreatedRef,
     EachHasKeys,
@@ -255,6 +261,39 @@ def test_an_unresolved_value_never_reaches_the_evaluator(value: Any) -> None:
         judge_result(
             json_result(_DOCUMENT), "json_text", (Equals(("site", "id"), value),)
         )
+
+
+# Reading one value, for a tenant pin and a created-object reference
+
+
+def test_value_at_reads_a_path_of_the_payload() -> None:
+    raw = json_result(_DOCUMENT)
+
+    assert value_at(raw, "json_text", ("site", "id")) == "s-1"
+    assert value_at(raw, "json_text", ("items", 1, "name")) == "b"
+
+
+@pytest.mark.parametrize(
+    ("raw", "path"),
+    [
+        (json_result(_DOCUMENT), ("site", "missing")),
+        (json_result(_DOCUMENT), ("items", 5)),
+        ({**json_result(_DOCUMENT), "is_error": True}, ("site", "id")),
+        (text_result("not json"), ("site", "id")),
+        ("not a result", ("site", "id")),
+    ],
+)
+def test_value_at_has_no_value_where_the_payload_has_none(
+    raw: Any, path: tuple[str | int, ...]
+) -> None:
+    assert value_at(raw, "json_text", path) is MISSING
+
+
+def test_json_equal_never_equates_a_boolean_and_a_number() -> None:
+    assert json_equal(1, 1.0)
+    assert json_equal("site-1", "site-1")
+    assert not json_equal(True, 1)
+    assert not json_equal("1", 1)
 
 
 # L3Envelope

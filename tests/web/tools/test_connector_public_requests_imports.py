@@ -26,6 +26,7 @@ MIGRATED_MODULES = [
             "intercom",
             "jira",
             "jira_attachment",
+            "jira_ticket",
             "linear",
             "linkedin",
             "magento",

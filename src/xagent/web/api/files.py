@@ -76,14 +76,15 @@ from ..services.db_runtime import (
 )
 from ..services.external_media import (
     FACEBOOK_MAX_IMAGE_BYTES,
-    INSTAGRAM_MAX_JPEG_BYTES,
     ExternalMediaPurpose,
     ExternalMediaTicketRejected,
     ExternalMediaUnavailable,
+    delivered_image_media_type,
     instagram_image_requires_normalization,
     instagram_jpeg_bytes,
     local_record_path_is_trusted,
     open_delivery_file,
+    read_instagram_source,
     redeem_external_media_ticket,
 )
 from ..services.kb_file_service import (
@@ -1829,20 +1830,25 @@ def external_media_file(
         delivered = open_delivery_file(record, path)
     except OSError:
         raise HTTPException(status_code=404, detail="File not found") from None
+    normalize_for_instagram = False
     with delivered:
         try:
-            normalize_for_instagram = (
-                instagram and instagram_image_requires_normalization(delivered)
-            )
-            delivered.seek(0)
-            if normalize_for_instagram:
-                content = instagram_jpeg_bytes(delivered)
-            else:
-                limit = (
-                    INSTAGRAM_MAX_JPEG_BYTES if instagram else FACEBOOK_MAX_IMAGE_BYTES
+            if instagram:
+                # Check, convert or send one bounded copy; Pillow never reads
+                # the file itself.
+                source = read_instagram_source(delivered)
+                normalize_for_instagram = instagram_image_requires_normalization(source)
+                source.seek(0)
+                # A JPEG that needs no conversion is within
+                # INSTAGRAM_MAX_JPEG_BYTES, so it is sent as read.
+                content = (
+                    instagram_jpeg_bytes(source)
+                    if normalize_for_instagram
+                    else source.getvalue()
                 )
-                content = delivered.read(limit + 1)
-                if len(content) > limit:
+            else:
+                content = delivered.read(FACEBOOK_MAX_IMAGE_BYTES + 1)
+                if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
                     raise ExternalMediaUnavailable(
                         "Registered image exceeds the delivery size limit"
                     )
@@ -1856,7 +1862,11 @@ def external_media_file(
         filename = f"{Path(filename).stem}.jpg"
     return Response(
         content=content,
-        media_type="image/jpeg" if instagram else redeemed.media_type,
+        media_type=(
+            "image/jpeg"
+            if instagram
+            else delivered_image_media_type(content, redeemed.media_type)
+        ),
         headers={
             **response_headers,
             "Content-Disposition": _content_disposition_header("inline", filename),

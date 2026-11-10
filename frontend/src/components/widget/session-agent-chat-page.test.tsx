@@ -34,6 +34,10 @@ const app = vi.hoisted(() => ({
   },
   startProps: null as null | Record<string, unknown>,
   panelProps: null as null | Record<string, unknown>,
+  listProps: null as null | Record<string, unknown>,
+  viewProps: null as null | Record<string, unknown>,
+  // Run from the mocked list's own mount effect, as the real list's first read is.
+  onListMount: null as null | ((props: Record<string, unknown>) => void),
   sendMessage: vi.fn(),
   startNewConversation: vi.fn(() => Promise.resolve()),
   state: {
@@ -123,6 +127,41 @@ vi.mock("@/components/task/task-conversation-panel", () => ({
   },
 }))
 
+vi.mock("./widget-history-list", () => ({
+  WidgetHistoryList: (props: Record<string, unknown>) => {
+    app.listProps = props
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    React.useEffect(() => app.onListMount?.(props), [])
+    return (
+      <div data-testid="history-list">
+        <button type="button" onClick={() => (props.onOpen as (id: number, title: string) => void)(7, "Earlier chat")}>
+          list-open-other
+        </button>
+        {/* The real list answers a click on the current conversation with onBack. */}
+        <button type="button" onClick={() => (props.onBack as () => void)()}>list-open-current</button>
+        <button type="button" onClick={() => (props.onBack as () => void)()}>list-back</button>
+      </div>
+    )
+  },
+}))
+
+vi.mock("./widget-history-view", () => ({
+  WidgetHistoryView: (props: Record<string, unknown>) => {
+    app.viewProps = props
+    return (
+      <div data-testid="history-view">
+        <button
+          type="button"
+          onClick={() => (props.onContinue as (message: string, id: number) => void)("a follow-up", props.taskId as number)}
+        >
+          view-continue
+        </button>
+        <button type="button" onClick={() => (props.onBack as () => void)()}>view-back</button>
+      </div>
+    )
+  },
+}))
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string) => (i18n.locale === "en" ? key : `${i18n.locale}:${key}`),
@@ -178,6 +217,9 @@ describe("SessionAgentChatPage", () => {
     app.provider = null
     app.startProps = null
     app.panelProps = null
+    app.listProps = null
+    app.viewProps = null
+    app.onListMount = null
     app.sendMessage.mockReset()
     app.startNewConversation.mockReset()
     app.startNewConversation.mockResolvedValue()
@@ -1079,4 +1121,840 @@ describe("SessionAgentChatPage", () => {
       },
     )
   })
+
+  describe("conversation history", () => {
+    type HistoryAuth = {
+      getToken: () => Promise<string>
+      refreshToken?: (rejected: string) => Promise<string>
+    }
+    const historySession = () => activeSession({ capabilities: { conversationHistory: true } })
+
+    const mountWithHistory = (overrides: Record<string, unknown> = {}) => {
+      setBridge("active", historySession())
+      app.isConnected = true
+      app.sessionConversationAttachment = "attached"
+      Object.assign(app, overrides)
+      return render(<SessionAgentChatPage />)
+    }
+
+    const openMenu = () => fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const historyItem = () => screen.queryByRole("menuitem", { name: "widgetSession.history.menuLabel" })
+    const goToList = () => {
+      openMenu()
+      fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+    }
+    const goToView = () => {
+      goToList()
+      fireEvent.click(screen.getByRole("button", { name: "list-open-other" }))
+    }
+    const hand = () => fireEvent.click(screen.getByRole("button", { name: "view-continue" }))
+    const authOf = (props: Record<string, unknown> | null) => (props?.getAuth as () => HistoryAuth)()
+    const deliverOpenMessage = (value = "Book a shift") => act(() => {
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "open_message", id: "1", value },
+        source: window.parent as unknown as MessageEventSource,
+      }))
+    })
+    const refreshingWithAgent = () => {
+      setBridge("refreshing", null)
+      bridge.value.agent = historySession().agent
+    }
+
+    beforeEach(() => {
+      vi.stubGlobal("parent", { postMessage: vi.fn() })
+    })
+
+    describe("the menu entry", () => {
+      const uploads = { allowedExtensions: [".pdf"], maxFileBytes: 10, maxFilesPerMessage: 1 }
+
+      it.each([
+        ["the server offers history", { conversationHistory: true as const }, true],
+        ["the server offers history and uploads", { conversationHistory: true as const, fileUploads: uploads }, true],
+        ["the server offers only uploads", { fileUploads: uploads }, false],
+        ["the server offers nothing", undefined, false],
+      ])("is shown only when %s", (_label, capabilities, shown) => {
+        setBridge("active", activeSession({ capabilities }))
+
+        render(<SessionAgentChatPage />)
+        openMenu()
+
+        expect(Boolean(historyItem())).toBe(shown)
+      })
+
+      it("keeps the entry while the session refreshes", () => {
+        setBridge("active", historySession())
+        const { rerender } = render(<SessionAgentChatPage />)
+
+        refreshingWithAgent()
+        rerender(<SessionAgentChatPage />)
+        openMenu()
+
+        expect(historyItem()).toBeInTheDocument()
+      })
+
+      it("drops the entry when the refreshed session no longer offers history", () => {
+        setBridge("active", historySession())
+        const { rerender } = render(<SessionAgentChatPage />)
+
+        setBridge("active", activeSession())
+        rerender(<SessionAgentChatPage />)
+        openMenu()
+
+        expect(historyItem()).not.toBeInTheDocument()
+      })
+
+      it("offers no entry for a session that is neither active nor refreshing", () => {
+        setBridge("active", historySession())
+        const { rerender } = render(<SessionAgentChatPage />)
+
+        setBridge("degraded", null, "network_unavailable")
+        bridge.value.agent = historySession().agent
+        rerender(<SessionAgentChatPage />)
+
+        expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).not.toBeInTheDocument()
+      })
+
+      it("sits between the new-conversation item and the expand toggle", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+        openMenu()
+
+        expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+          "widgetSession.startNewConversation",
+          "widgetSession.history.menuLabel",
+          "widgetChat.expandWindow",
+        ])
+      })
+
+      it.each([
+        ["a reset is under way", { isConversationResetPending: true }],
+        ["a message is being delivered", { isMessageDeliveryPending: true }],
+        ["the session needs a reload", {
+          isSessionInteractionLocked: true,
+          sessionConversationState: "reload_required",
+        }],
+      ])("is withdrawn while %s", (_label, overrides) => {
+        mountWithHistory(overrides)
+        openMenu()
+
+        expect(historyItem()).not.toBeInTheDocument()
+      })
+
+      it("is withdrawn while a file for a start-page message uploads, and comes back once it is done", async () => {
+        setBridge("active", activeSession({ capabilities: { conversationHistory: true, fileUploads: uploads } }))
+        app.isConnected = true
+        app.sessionConversationAttachment = "attached"
+        let releaseToken!: (reason: unknown) => void
+        bridge.value.ensureFreshSession.mockReturnValueOnce(
+          new Promise((_resolve, reject) => { releaseToken = reject }),
+        )
+        render(<SessionAgentChatPage />)
+        const onSend = app.startProps?.onSend as (message: string, files: File[]) => Promise<void>
+
+        let sending!: Promise<void>
+        act(() => { sending = onSend("with a file", [new File(["x"], "a.pdf", { type: "application/pdf" })]) })
+        openMenu()
+        expect(historyItem()).not.toBeInTheDocument()
+        openMenu()
+
+        await act(async () => {
+          releaseToken(Object.assign(new Error("gone"), { errorCode: "upload_failed" }))
+          await sending.catch(() => undefined)
+        })
+        openMenu()
+        expect(historyItem()).toBeInTheDocument()
+      })
+
+      it("is withdrawn while a host page message waits to be sent", () => {
+        mountWithHistory({ sessionConversationAttachment: "pending" })
+        deliverOpenMessage()
+        openMenu()
+
+        expect(historyItem()).not.toBeInTheDocument()
+      })
+
+      it("is shown again once the pending work has finished", () => {
+        const { rerender } = mountWithHistory({ isMessageDeliveryPending: true })
+
+        app.isMessageDeliveryPending = false
+        rerender(<SessionAgentChatPage />)
+        openMenu()
+
+        expect(historyItem()).toBeInTheDocument()
+      })
+    })
+
+    describe("moving between the chat, the list and one conversation", () => {
+      it("opens the list from the menu and hides the chat without unmounting it", () => {
+        mountWithHistory()
+        const startButton = screen.getByRole("button", { name: "start:Support Agent" })
+
+        goToList()
+
+        expect(screen.getByTestId("history-list")).toBeInTheDocument()
+        // Hidden elements have no accessible name, so look it up by its text.
+        expect(screen.getByText("start:Support Agent")).toBe(startButton)
+        const layer = startButton.closest("[aria-hidden='true']") as HTMLElement
+        expect(layer.style.visibility).toBe("hidden")
+        expect(screen.queryByRole("button", { name: "start:Support Agent" })).not.toBeInTheDocument()
+      })
+
+      it("gives the chat back, unhidden and still the same element, when the visitor goes back", () => {
+        mountWithHistory()
+        const startButton = screen.getByRole("button", { name: "start:Support Agent" })
+
+        goToList()
+        fireEvent.click(screen.getByRole("button", { name: "list-back" }))
+
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(screen.getByRole("button", { name: "start:Support Agent" })).toBe(startButton)
+        expect(startButton.closest("[aria-hidden='true']")).toBeNull()
+        expect(startButton.closest("[style*='visibility']")).toBeNull()
+      })
+
+      it("keeps the conversation panel mounted and hidden while history is open", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+        const panel = screen.getByTestId("session-conversation-panel")
+
+        goToList()
+
+        expect(screen.getByTestId("session-conversation-panel", { })).toBe(panel)
+        expect(panel.closest("[aria-hidden='true']")).not.toBeNull()
+      })
+
+      it("passes the list the origin, the current conversation and the notice for the phase", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+
+        goToList()
+
+        expect(app.listProps).toMatchObject({
+          origin: window.location.origin,
+          currentTaskId: 61,
+          unauthorizedNotice: "tryLater",
+        })
+      })
+
+      it("goes from the list to one earlier conversation, back to the list, and back to the chat", () => {
+        mountWithHistory()
+
+        goToView()
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(app.viewProps).toMatchObject({
+          origin: window.location.origin,
+          taskId: 7,
+          title: "Earlier chat",
+          sessionPhase: "unbound",
+          sessionAttachment: "attached",
+        })
+
+        fireEvent.click(screen.getByRole("button", { name: "view-back" }))
+        expect(screen.getByTestId("history-list")).toBeInTheDocument()
+        fireEvent.click(screen.getByRole("button", { name: "list-back" }))
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+      })
+
+      it("returns to the chat without reading or sending anything when the current conversation is chosen", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+
+        goToList()
+        fireEvent.click(screen.getByRole("button", { name: "list-open-current" }))
+
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        expect(fetch).not.toHaveBeenCalled()
+        expect(app.startNewConversation).not.toHaveBeenCalled()
+        expect(app.sendMessage).not.toHaveBeenCalled()
+      })
+
+      it.each(["list", "view"] as const)(
+        "starts a new conversation from the %s and shows the chat again",
+        async (where) => {
+          app.state.taskId = 61
+          mountWithHistory({ sessionConversationState: "bound" })
+
+          if (where === "list") goToList()
+          else goToView()
+          openMenu()
+          fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
+
+          await waitFor(() => expect(app.startNewConversation).toHaveBeenCalledTimes(1))
+          expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+          expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        },
+      )
+
+      it("opens the list again from the menu while one conversation is open", () => {
+        mountWithHistory()
+
+        goToView()
+        openMenu()
+        fireEvent.click(historyItem() as HTMLElement)
+
+        expect(screen.getByTestId("history-list")).toBeInTheDocument()
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+      })
+
+      it("shows the same conversation again after the session was degraded and came back", () => {
+        const { rerender } = mountWithHistory()
+        goToView()
+
+        setBridge("degraded", null, "network_unavailable")
+        bridge.value.agent = historySession().agent
+        rerender(<SessionAgentChatPage />)
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+
+        setBridge("active", historySession())
+        rerender(<SessionAgentChatPage />)
+        expect(screen.getByTestId("history-view")).toBeInTheDocument()
+        expect(app.viewProps).toMatchObject({ taskId: 7, title: "Earlier chat" })
+      })
+
+      it("keeps the start screen from taking focus while history is open, and lets it back on return", () => {
+        mountWithHistory()
+        expect(app.startProps?.autoFocus).toBe(true)
+
+        goToList()
+        expect(app.startProps?.autoFocus).toBe(false)
+        fireEvent.click(screen.getByRole("button", { name: "list-back" }))
+        expect(app.startProps?.autoFocus).toBe(true)
+      })
+
+      it("keeps the conversation panel from taking focus while history is open", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+        expect(app.panelProps?.autoFocusInput).toBe(true)
+
+        goToList()
+        expect(app.panelProps?.autoFocusInput).toBe(false)
+      })
+    })
+
+    describe("going back to the chat by itself", () => {
+      it.each(["list", "view"] as const)(
+        "leaves the %s when the session needs a reload, and offers no way back in",
+        (where) => {
+          const { rerender } = mountWithHistory()
+          if (where === "list") goToList()
+          else goToView()
+
+          app.sessionConversationState = "reload_required"
+          app.isSessionInteractionLocked = true
+          rerender(<SessionAgentChatPage />)
+
+          expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+          expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+          openMenu()
+          expect(historyItem()).not.toBeInTheDocument()
+        },
+      )
+
+      it.each([
+        ["a reset starts", { isConversationResetPending: true }],
+        ["a message is being delivered", { isMessageDeliveryPending: true }],
+      ])("leaves the list and the view when %s", (_label, overrides) => {
+        const { rerender } = mountWithHistory()
+        goToView()
+        expect(screen.getByTestId("history-view")).toBeInTheDocument()
+
+        Object.assign(app, overrides)
+        rerender(<SessionAgentChatPage />)
+
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+      })
+
+      it.each(["list", "view"] as const)("leaves the %s when the session stops offering history", (where) => {
+        const { rerender } = mountWithHistory()
+        if (where === "list") goToList()
+        else goToView()
+
+        setBridge("active", activeSession())
+        rerender(<SessionAgentChatPage />)
+
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        expect(screen.getByRole("button", { name: "start:Support Agent" })).toBeVisible()
+      })
+
+      it.each(["list", "view"] as const)("leaves the %s when a host page message arrives", (where) => {
+        mountWithHistory({ sessionConversationAttachment: "pending" })
+        if (where === "list") goToList()
+        else goToView()
+
+        deliverOpenMessage()
+
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+      })
+
+      it("closes a list opened just before the host page message starts sending", () => {
+        // Between the host message's reset and its send there is one render in
+        // which nothing is pending, so the entry is still offered. The send
+        // starts in that render's own effect, and the next render closes the
+        // list again: nothing can be handed over from it in between.
+        const { rerender } = mountWithHistory()
+        goToList()
+        expect(screen.getByTestId("history-list")).toBeInTheDocument()
+
+        app.isMessageDeliveryPending = true
+        rerender(<SessionAgentChatPage />)
+
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        openMenu()
+        expect(historyItem()).not.toBeInTheDocument()
+      })
+
+      it("leaves the view for the chat when the host page's initial message arrives", async () => {
+        const post = vi.fn()
+        vi.stubGlobal("parent", { postMessage: post })
+        app.sendMessage.mockResolvedValue(undefined)
+        setBridge("active", historySession())
+        app.isConnected = true
+        app.sessionConversationAttachment = "pending"
+        const { rerender } = render(<SessionAgentChatPage />)
+        goToView()
+
+        app.sessionConversationAttachment = "attached"
+        rerender(<SessionAgentChatPage />)
+        await waitFor(() => expect(
+          post.mock.calls.filter(([data]) => data.type === "initial_message_request"),
+        ).toHaveLength(1))
+        act(() => {
+          window.dispatchEvent(new MessageEvent("message", {
+            data: { xagent: true, v: 1, type: "initial_message", value: "hello agent" },
+            source: window.parent as unknown as MessageEventSource,
+          }))
+        })
+
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        await waitFor(() => expect(app.sendMessage).toHaveBeenCalledWith("hello agent", undefined, []))
+      })
+    })
+
+    describe("how the list and the view read with the session token", () => {
+      it.each(["unbound", "bound"] as const)(
+        "refreshes a token that is nearly out of date and retries a rejected one in phase %s",
+        async (phase) => {
+          mountWithHistory({ sessionConversationState: phase })
+          bridge.value.ensureFreshSession.mockResolvedValue({ token: "fresh_token" })
+          bridge.value.refreshSession.mockResolvedValue({ token: "newer_token" })
+          goToList()
+
+          const auth = authOf(app.listProps)
+
+          await expect(auth.getToken()).resolves.toBe("fresh_token")
+          await expect(auth.refreshToken?.("rejected_token")).resolves.toBe("newer_token")
+          expect(bridge.value.refreshSession).toHaveBeenCalledWith("rejected_token")
+          expect(app.listProps?.unauthorizedNotice).toBe("tryLater")
+        },
+      )
+
+      it.each([
+        ["replacement_ready", "refreshToLoad"],
+        ["reset_requested", "tryLater"],
+        ["replacement_sending", "tryLater"],
+        ["replacement_awaiting_task", "tryLater"],
+      ] as const)("reads with the current token and never refreshes in phase %s", async (phase, notice) => {
+        const { rerender } = mountWithHistory()
+        goToList()
+        // A phase the page would not open history in, reached while it is open.
+        app.sessionConversationState = phase
+        rerender(<SessionAgentChatPage />)
+        const auth = authOf(app.listProps)
+
+        await expect(auth.getToken()).resolves.toBe(SESSION_TOKEN)
+        expect(auth.refreshToken).toBeUndefined()
+        expect(bridge.value.ensureFreshSession).not.toHaveBeenCalled()
+        expect(app.listProps?.unauthorizedNotice).toBe(notice)
+      })
+
+      it("fails the token request when the page has no session token to offer", async () => {
+        const { rerender } = mountWithHistory()
+        goToList()
+        app.sessionConversationState = "replacement_ready"
+        rerender(<SessionAgentChatPage />)
+        const getAuth = app.listProps?.getAuth as () => HistoryAuth
+
+        refreshingWithAgent()
+        rerender(<SessionAgentChatPage />)
+
+        await expect(getAuth().getToken()).rejects.toThrow()
+      })
+
+      it("reads the phase at the moment of the request, not at the moment the list opened", () => {
+        const { rerender } = mountWithHistory()
+        goToList()
+        const getAuth = app.listProps?.getAuth as () => HistoryAuth
+        expect(getAuth().refreshToken).toBeDefined()
+
+        app.sessionConversationState = "replacement_ready"
+        rerender(<SessionAgentChatPage />)
+
+        expect(getAuth().refreshToken).toBeUndefined()
+      })
+
+      it("reads with the phase and token of the render in which the list mounts", async () => {
+        const reads: Array<Promise<string>> = []
+        app.onListMount = (props) => {
+          reads.push((props.getAuth as () => HistoryAuth)().getToken())
+        }
+        bridge.value.ensureFreshSession.mockResolvedValue({ token: "fresh_token" })
+        const { rerender } = mountWithHistory({ sessionConversationState: "bound" })
+        goToList()
+        await expect(reads[0]).resolves.toBe("fresh_token")
+
+        // The list goes while the session is down and comes back in the render
+        // that brings a new phase and a new token together.
+        setBridge("degraded", null)
+        rerender(<SessionAgentChatPage />)
+        expect(screen.queryByTestId("history-list")).not.toBeInTheDocument()
+        app.sessionConversationState = "replacement_ready"
+        setBridge("active", activeSession({ token: "st_restored", capabilities: { conversationHistory: true } }))
+        rerender(<SessionAgentChatPage />)
+
+        expect(reads).toHaveLength(2)
+        await expect(reads[1]).resolves.toBe("st_restored")
+        expect(bridge.value.ensureFreshSession).toHaveBeenCalledTimes(1)
+      })
+
+      it("hands the view the current phase, replay state and notice", () => {
+        mountWithHistory({ sessionConversationAttachment: "unsupported", sessionConversationState: "replacement_ready" })
+        goToView()
+
+        expect(app.viewProps).toMatchObject({
+          sessionPhase: "replacement_ready",
+          sessionAttachment: "unsupported",
+          unauthorizedNotice: "refreshToLoad",
+        })
+      })
+    })
+
+    describe("continuing from an earlier conversation", () => {
+      it("sends the message into a new conversation with the earlier conversation as its source", async () => {
+        app.sendMessage.mockResolvedValue(undefined)
+        mountWithHistory()
+        goToView()
+
+        hand()
+
+        expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
+        await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+        expect(app.sendMessage).toHaveBeenCalledWith("a follow-up", { sourceTaskId: 7 }, [])
+        expect(app.startNewConversation).not.toHaveBeenCalled()
+      })
+
+      it("starts a new conversation first when one is bound, and sends once it is ready", async () => {
+        app.sendMessage.mockResolvedValue(undefined)
+        // The reset is acknowledged before it settles, as the provider does:
+        // the conversation is gone and the new one is ready for its first message.
+        app.startNewConversation.mockImplementation(async () => {
+          app.state.taskId = null
+          app.sessionConversationState = "replacement_ready"
+        })
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+        goToView()
+
+        hand()
+
+        await waitFor(() => expect(app.sendMessage).toHaveBeenCalledWith("a follow-up", { sourceTaskId: 7 }, []))
+        expect(app.startNewConversation).toHaveBeenCalledTimes(1)
+      })
+
+      it("sends straight away when the new conversation is already open for the first message", async () => {
+        app.sendMessage.mockResolvedValue(undefined)
+        mountWithHistory({ sessionConversationState: "replacement_ready" })
+        goToView()
+
+        hand()
+
+        await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+        expect(app.startNewConversation).not.toHaveBeenCalled()
+      })
+
+      it("waits for the replay of the current socket before doing anything", () => {
+        mountWithHistory({ sessionConversationAttachment: "pending" })
+        goToView()
+
+        hand()
+
+        expect(app.sendMessage).not.toHaveBeenCalled()
+        expect(app.startNewConversation).not.toHaveBeenCalled()
+      })
+
+      it("keeps the start screen from sending another message while one is handed over", () => {
+        mountWithHistory({ sessionConversationAttachment: "pending" })
+        goToView()
+        expect(app.startProps?.isSending).toBe(false)
+
+        hand()
+
+        expect(app.startProps?.isSending).toBe(true)
+      })
+
+      it("keeps the conversation panel from sending another message while one is handed over", () => {
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound", sessionConversationAttachment: "pending" })
+        goToView()
+        expect(app.panelProps?.attachmentsBusy).toBe(false)
+
+        hand()
+
+        expect(app.panelProps?.attachmentsBusy).toBe(true)
+      })
+
+      it("lets a message in delivery finish before the hand-over resets the conversation", async () => {
+        app.sendMessage.mockResolvedValue(undefined)
+        app.state.taskId = 61
+        const { rerender } = mountWithHistory({ sessionConversationState: "bound" })
+        goToView()
+        const onContinue = app.viewProps?.onContinue as (message: string, sourceTaskId: number) => void
+
+        // The visitor sent a message in the old conversation; the view closes.
+        app.isMessageDeliveryPending = true
+        rerender(<SessionAgentChatPage />)
+        act(() => onContinue("a follow-up", 7))
+        expect(app.startNewConversation).not.toHaveBeenCalled()
+
+        app.isMessageDeliveryPending = false
+        rerender(<SessionAgentChatPage />)
+        await waitFor(() => expect(app.startNewConversation).toHaveBeenCalledTimes(1))
+      })
+
+      it("never asks for the host page's initial message once a hand-over is under way, even if it fails", async () => {
+        const post = vi.fn()
+        vi.stubGlobal("parent", { postMessage: post })
+        app.sendMessage.mockRejectedValue(new Error("delivery failed"))
+        setBridge("active", historySession())
+        app.isConnected = true
+        app.sessionConversationAttachment = "pending"
+        const { rerender } = render(<SessionAgentChatPage />)
+        goToView()
+        hand()
+
+        app.sessionConversationAttachment = "attached"
+        rerender(<SessionAgentChatPage />)
+        await waitFor(() => expect(app.startProps?.isSending).toBe(false))
+        await act(async () => undefined)
+
+        expect(app.sendMessage).toHaveBeenCalledTimes(1)
+        expect(post.mock.calls.filter(([data]) => data.type === "initial_message_request")).toEqual([])
+      })
+
+      describe("what the visitor is told when it does not go through", () => {
+        const noticeText = "widgetSession.history.continueNotSent"
+
+        it("says the message was not sent when the conversation is bound again after the reset", async () => {
+          app.state.taskId = 61
+          mountWithHistory({ sessionConversationState: "bound" })
+          goToView()
+
+          hand()
+
+          expect(await screen.findByText(noticeText)).toBeInTheDocument()
+          expect(screen.getByRole("alert")).toHaveTextContent(noticeText)
+          expect(app.sendMessage).not.toHaveBeenCalled()
+          expect(app.startNewConversation).toHaveBeenCalledTimes(1)
+        })
+
+        it("says the message was not sent when the server stops announcing replay completion", async () => {
+          const { rerender } = mountWithHistory({ sessionConversationAttachment: "pending" })
+          goToView()
+          hand()
+
+          app.sessionConversationAttachment = "unsupported"
+          rerender(<SessionAgentChatPage />)
+
+          expect(await screen.findByText(noticeText)).toBeInTheDocument()
+          // The dropped message leaves nothing in hand: the start screen sends
+          // again and the history entry is back.
+          expect(app.startProps?.isSending).toBe(false)
+          openMenu()
+          expect(historyItem()).toBeInTheDocument()
+        })
+
+        it("clears the line when the conversation changes", async () => {
+          const { rerender } = mountWithHistory({ sessionConversationAttachment: "pending" })
+          goToView()
+          hand()
+          app.sessionConversationAttachment = "unsupported"
+          rerender(<SessionAgentChatPage />)
+          await screen.findByText(noticeText)
+
+          app.state.taskId = 62
+          rerender(<SessionAgentChatPage />)
+
+          expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
+        })
+
+        it("clears the line when another hand-over begins", async () => {
+          const { rerender } = mountWithHistory({ sessionConversationAttachment: "pending" })
+          goToView()
+          hand()
+          app.sessionConversationAttachment = "unsupported"
+          rerender(<SessionAgentChatPage />)
+          await screen.findByText(noticeText)
+
+          goToView()
+          app.sessionConversationAttachment = "pending"
+          rerender(<SessionAgentChatPage />)
+          hand()
+
+          expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
+        })
+
+        it("shows only the reload instruction when the session needs a reload", async () => {
+          const { rerender } = mountWithHistory({ sessionConversationAttachment: "pending" })
+          goToView()
+          hand()
+          app.sessionConversationAttachment = "unsupported"
+          rerender(<SessionAgentChatPage />)
+          await screen.findByText(noticeText)
+
+          app.sessionConversationState = "reload_required"
+          app.isSessionInteractionLocked = true
+          rerender(<SessionAgentChatPage />)
+
+          expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
+          expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
+        })
+
+        it("does not say anything when the message was sent", async () => {
+          app.sendMessage.mockResolvedValue(undefined)
+          mountWithHistory()
+          goToView()
+
+          hand()
+          await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+
+          expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
+        })
+
+        it("says the message was not sent when it is refused after a conversation opened", async () => {
+          let refuse!: (reason: unknown) => void
+          app.sendMessage.mockReturnValueOnce(new Promise((_resolve, reject) => { refuse = reject }))
+          const { rerender } = mountWithHistory()
+          goToView()
+          hand()
+          await waitFor(() => expect(app.sendMessage).toHaveBeenCalledTimes(1))
+
+          // Another message opened a conversation before the refusal came back,
+          // so the start screen and its failure line are gone.
+          app.state.taskId = 42
+          rerender(<SessionAgentChatPage />)
+          await act(async () => {
+            refuse(Object.assign(new Error("refused"), { errorCode: "invalid_message" }))
+          })
+
+          expect(await screen.findByText(noticeText)).toBeInTheDocument()
+          expect(screen.getByRole("alert")).toHaveTextContent(noticeText)
+          expect(screen.queryByText("clientErrors.invalidMessage")).not.toBeInTheDocument()
+        })
+
+        it("leaves a refusal on the start page to the failure line there", async () => {
+          app.sendMessage.mockRejectedValueOnce(Object.assign(new Error("refused"), { errorCode: "invalid_message" }))
+          mountWithHistory()
+          goToView()
+
+          hand()
+
+          expect(await screen.findByText("clientErrors.invalidMessage")).toBeInTheDocument()
+          expect(screen.queryByText(noticeText)).not.toBeInTheDocument()
+        })
+
+        it("shows the reset failure line when the new conversation cannot be started", async () => {
+          app.startNewConversation.mockRejectedValue(new Error("reset refused"))
+          app.state.taskId = 61
+          mountWithHistory({ sessionConversationState: "bound" })
+          goToView()
+
+          hand()
+
+          expect(await screen.findByText("widgetSession.resetFailed")).toBeInTheDocument()
+          expect(app.sendMessage).not.toHaveBeenCalled()
+        })
+      })
+    })
+
+    describe("the failure line on the start screen", () => {
+      const sendFrom = async (config: Record<string, unknown>, error: unknown) => {
+        app.sendMessage.mockRejectedValueOnce(error)
+        const onSend = app.startProps?.onSend as (
+          message: string,
+          files: File[],
+          config?: Record<string, unknown>,
+        ) => Promise<void>
+        await act(async () => {
+          await onSend("hi", [], config).catch(() => undefined)
+        })
+      }
+      const coded = (code: string, handled = false) => Object.assign(new Error("failed"), {
+        errorCode: code,
+        ...(handled ? { notificationHandled: true } : {}),
+      })
+
+      it.each([
+        ["with a source and task_unavailable", { sourceTaskId: 5 }, "task_unavailable",
+          "widgetSession.history.continueUnavailable"],
+        ["with a source and invalid_message", { sourceTaskId: 5 }, "invalid_message",
+          "clientErrors.invalidMessage"],
+        ["with a source and no known code", { sourceTaskId: 5 }, "not_a_code",
+          "widgetSession.startMessageFailed"],
+        ["with a source and message_processing_failed", { sourceTaskId: 5 }, "message_processing_failed",
+          "clientErrors.messageProcessingFailed"],
+        ["without a source and task_unavailable", {}, "task_unavailable", "clientErrors.taskUnavailable"],
+        ["without a source and invalid_message", {}, "invalid_message", "clientErrors.invalidMessage"],
+        ["without a source and no known code", {}, "not_a_code", "widgetSession.startMessageFailed"],
+        ["with a source that is not a number", { sourceTaskId: "5" }, "task_unavailable",
+          "clientErrors.taskUnavailable"],
+      ])("says the right thing for a send %s", async (_label, config, code, expected) => {
+        setBridge("active", activeSession())
+        render(<SessionAgentChatPage />)
+
+        await sendFrom(config, coded(code))
+
+        expect(screen.getByRole("alert")).toHaveTextContent(expected)
+        if (expected !== "widgetSession.history.continueUnavailable") {
+          expect(screen.queryByText("widgetSession.history.continueUnavailable")).not.toBeInTheDocument()
+        }
+      })
+
+      it.each([
+        ["with a source", { sourceTaskId: 5 }],
+        ["without a source", {}],
+      ])("shows nothing for a failure that was already announced, %s", async (_label, config) => {
+        setBridge("active", activeSession())
+        render(<SessionAgentChatPage />)
+
+        await sendFrom(config, coded("task_unavailable", true))
+
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+      })
+
+      it("shows the dedicated line when a handed-over message is refused as unavailable", async () => {
+        app.sendMessage.mockRejectedValue(coded("task_unavailable"))
+        mountWithHistory()
+        goToView()
+
+        hand()
+
+        expect(await screen.findByText("widgetSession.history.continueUnavailable")).toBeInTheDocument()
+      })
+
+      it("shows the ordinary line when a handed-over message is refused as invalid", async () => {
+        app.sendMessage.mockRejectedValue(coded("invalid_message"))
+        mountWithHistory()
+        goToView()
+
+        hand()
+
+        expect(await screen.findByText("clientErrors.invalidMessage")).toBeInTheDocument()
+      })
+    })
+  })
+
 })

@@ -62,6 +62,8 @@ _KINDS: Mapping[type, str] = {
 }
 
 _MISSING = object()
+# What ``value_at`` returns where the result holds no value.
+MISSING: Any = _MISSING
 
 
 class _NoPayload(Exception):
@@ -118,6 +120,27 @@ def resolve_expected(
     return tuple(resolved)
 
 
+def value_at(raw: Any, payload: PayloadSource, path: PayloadPath) -> Any:
+    """The value at ``path`` in ``raw``'s ``payload``, or ``MISSING``.
+
+    A write check reads its tenant id and a created object's id this way. A
+    result that is not a mapping, is flagged ``is_error`` or has no such
+    payload holds no value.
+    """
+    if not isinstance(raw, Mapping) or raw.get("is_error"):
+        return MISSING
+    try:
+        value = _payload(raw, payload)
+    except _NoPayload:
+        return MISSING
+    return at_path(value, path)
+
+
+def json_equal(actual: Any, expected: Any) -> bool:
+    """Whether two values are equal as JSON compares them (``Equals``)."""
+    return _json_equal(actual, expected)
+
+
 def _judge_l3(raw: Any, assertion: L3Envelope) -> Judgement:
     # evaluate_probe_result reads only the probe's expect_keys.
     probe = ConnectorProbe("", expect_keys=assertion.expect_keys)
@@ -171,7 +194,8 @@ def _parse(text: str) -> Any:
         return _MISSING
 
 
-def _at(value: Any, path: PayloadPath) -> Any:
+def at_path(value: Any, path: PayloadPath) -> Any:
+    """The value at ``path`` in ``value``, or ``MISSING``."""
     for segment in path:
         if isinstance(segment, str):
             if not isinstance(value, Mapping) or segment not in value:
@@ -188,7 +212,7 @@ def _holds(assertion: Assertion, payload: Any) -> bool:
     if isinstance(assertion, L3Envelope):
         # The declaration rules make it a check's only assertion.
         raise TypeError("L3Envelope must be a check's only assertion")
-    value = _at(payload, assertion.path)
+    value = at_path(payload, assertion.path)
     if value is _MISSING:
         return False
     if isinstance(assertion, HasKeys):

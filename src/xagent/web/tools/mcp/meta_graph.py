@@ -5,6 +5,13 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from ....core.utils import public_requests as requests
+from .composio_proxy import (
+    COMPOSIO_API_KEY_ENV,
+    COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
+    COMPOSIO_PROXY_URL,
+    COMPOSIO_USER_ID_ENV,
+    _required_env,
+)
 
 GRAPH_BASE_URL = "https://graph.facebook.com/v25.0"
 # Instagram Login (Composio's Instagram toolkit, #3533). Its tokens are not
@@ -15,17 +22,14 @@ ALLOWED_GRAPH_BASE_URLS = frozenset({GRAPH_BASE_URL, INSTAGRAM_GRAPH_BASE_URL})
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 
-# A Composio-backed grant (#3531) launches with these instead of
-# META_ACCESS_TOKEN. Composio keeps the user token and injects it itself, so
-# every Graph call goes through Proxy Execute.
-COMPOSIO_PROXY_URL = "https://backend.composio.dev/api/v3.1/tools/execute/proxy"
-COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
-COMPOSIO_CONNECTED_ACCOUNT_ID_ENV = "COMPOSIO_CONNECTED_ACCOUNT_ID"
-COMPOSIO_USER_ID_ENV = "COMPOSIO_USER_ID"
+# A Composio-backed grant (#3531) launches with the COMPOSIO_* variables
+# (composio_proxy) instead of META_ACCESS_TOKEN. Composio keeps the user token
+# and injects it itself, so every Graph call goes through Proxy Execute.
 PROXY_FILE_UPLOAD_UNSUPPORTED = (
     "Uploading a local file is not supported for this connection. A workspace "
-    "image works when it is a PNG or JPEG of at most 10 MB and this deployment "
-    "has a public HTTPS base URL; otherwise use a public image_url"
+    "image works when it is a registered file of this task, a complete PNG or "
+    "JPEG named .png, .jpg or .jpeg, of at most 10 MB, and this deployment has "
+    "a public HTTPS base URL; otherwise use a public image_url"
 )
 # Proxy responses carry Page tokens in plaintext (/me/accounts). They are
 # redacted from everything this process reports afterwards.
@@ -224,13 +228,6 @@ def graph_request(
 def uses_composio_proxy() -> bool:
     """Whether this process serves a Composio-backed grant (#3531)."""
     return bool(os.environ.get(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
-
-
-def _required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise ValueError(f"{name} environment variable is missing")
-    return value
 
 
 def _remember_proxy_response_secrets(value: Any) -> None:

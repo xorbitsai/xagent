@@ -662,11 +662,15 @@ async def test_mcp_oauth_runtime_refreshes_discovered_grant_without_resource_sel
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
 
-    async def fake_refresh_grant(oauth_client, *, refresh_token, resource, client):
+    async def fake_refresh_grant(
+        oauth_client, *, refresh_token, resource, client, credential_provider
+    ):
         assert oauth_client.client_id == "client-123"
         assert refresh_token == "refresh-token-123"
         assert resource == "https://mcp.example.com/mcp"
         assert client is None
+        # Not the deployment's pre-registered client (#3580).
+        assert credential_provider is None
         return {
             "access_token": "fresh-access-token",
             "refresh_token": "fresh-refresh-token",
@@ -688,6 +692,42 @@ async def test_mcp_oauth_runtime_refreshes_discovered_grant_without_resource_sel
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "fresh-access-token"
     assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_a_preregistered_client_rejected_on_refresh_is_client_rejected(
+    db_session, monkeypatch
+):
+    """#3580: the deployment's own pre-registered client is platform-held, so
+    its rejection is reported as client_rejected:<provider> and the grant is
+    kept."""
+    monkeypatch.setenv("XAGENT_HUBSPOT_MCP_CLIENT_ID", "client-123")
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    async def rejected(oauth_client, *, credential_provider, **_kwargs):
+        assert credential_provider == "hubspot"
+        raise mcp_oauth_service.MCPOAuthRuntimeError(
+            "client_rejected:hubspot",
+            "The OAuth provider rejected the platform's client",
+        )
+
+    monkeypatch.setattr(mcp_oauth_service, "_refresh_mcp_oauth_grant", rejected)
+
+    configs, _ = await _load_configs(db, user)
+
+    assert configs[0]["config"]["reason"] == "client_rejected:hubspot"
+    db.refresh(grant)
+    assert decrypt_value(grant.refresh_token) == "refresh-token-123"
 
 
 @pytest.mark.asyncio

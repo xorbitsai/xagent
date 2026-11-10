@@ -5,8 +5,8 @@ connector (starting it and listing its tools) and one ``check`` row per
 declared check, keyed by ``(identity, connector, check)`` so the result diff
 can compare runs. When a session does not pass, none of its checks runs:
 each reports ``skip`` (``session_unavailable``, or ``writes_disabled`` for a
-write check) or stays ``unprobeable``, so one broken connector is one
-failure, not one per check. A run that could not be set up (the identity or
+write check whose connector's writes are off) or stays ``unprobeable``, so
+one broken connector is one failure, not one per check. A run that could not be set up (the identity or
 its connectors could not be resolved) carries a ``failure`` code and no
 rows, and is never ``complete``.
 
@@ -38,7 +38,7 @@ from .codes import APP_ID_PATTERN, TOOL_NAME_PATTERN, is_check_id, is_code
 from .declarations import DECLARATION_FORMAT_VERSION
 
 RESULT_SCHEMA_ID = "xagent.connector_smoke.result"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 
 IDENTITY_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 ENVIRONMENT_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
@@ -65,7 +65,9 @@ class FailureClass(str, Enum):
     FAILED_TO_START = "failed_to_start"
     NO_TOOLS = "no_tools"
     TIMED_OUT = "timed_out"
-    # The run's total timeout ended before the connector was reached.
+    # The run's total timeout ended before the connector or the call was
+    # reached; or, with reason ``time_budget``, too little of it was left to
+    # start a write check, in a run that goes on.
     NOT_REACHED = "not_reached"
     # Typically one check's.
     TOOL_MISSING = "tool_missing"

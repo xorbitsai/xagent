@@ -2806,6 +2806,32 @@ class TestConnectorProbeUsersConfig:
         assert get_connector_probe_users() == frozenset()
 
 
+class TestConnectorSmokeWriteAppsConfig:
+    """#3564: the connectors whose smoke V2 write checks may run."""
+
+    def test_unset_runs_no_write_check(self, monkeypatch):
+        from xagent.config import get_connector_smoke_write_apps
+
+        monkeypatch.delenv("XAGENT_CONNECTOR_SMOKE_WRITE_APPS", raising=False)
+        result = get_connector_smoke_write_apps()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_parses_and_strips_app_ids(self, monkeypatch):
+        from xagent.config import get_connector_smoke_write_apps
+
+        monkeypatch.setenv(
+            "XAGENT_CONNECTOR_SMOKE_WRITE_APPS", " jira , google-drive,,  "
+        )
+        assert get_connector_smoke_write_apps() == {"jira", "google-drive"}
+
+    def test_blank_runs_no_write_check(self, monkeypatch):
+        from xagent.config import get_connector_smoke_write_apps
+
+        monkeypatch.setenv("XAGENT_CONNECTOR_SMOKE_WRITE_APPS", "  ,  ")
+        assert get_connector_smoke_write_apps() == frozenset()
+
+
 class TestLlmStreamProgressConfig:
     """#2785: knobs for aborting an OpenAI-compatible LLM stream that stops
     making progress."""
@@ -3528,6 +3554,31 @@ def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
 
     assert config.get_toby_personal_stdio_enabled() is True
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, False),
+        ("", False),
+        ("0", False),
+        ("off", False),
+        ("1", True),
+        ("True", True),
+    ],
+)
+def test_standby_enabled_parses_boolean(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv(config.STANDBY, raising=False)
+    else:
+        monkeypatch.setenv(config.STANDBY, value)
+    assert config.get_standby_enabled() is expected
+
+
+def test_standby_enabled_rejects_a_typo(monkeypatch):
+    monkeypatch.setenv(config.STANDBY, "maybe")
+    with pytest.raises(ValueError, match="XAGENT_STANDBY"):
+        config.get_standby_enabled()
 
 
 @pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
@@ -4856,3 +4907,43 @@ def test_platform_git_roots_follow_relative_alternates_without_looping(
     assert (checkout / ".git").resolve() in roots
     assert objects.resolve() in roots
     assert pool.resolve() in roots
+
+
+class TestComposioCallbackUrlConfig:
+    """XAGENT_COMPOSIO_CALLBACK_URL: the one callback of every Composio connect."""
+
+    def test_constant(self):
+        assert config.COMPOSIO_CALLBACK_URL == "XAGENT_COMPOSIO_CALLBACK_URL"
+
+    def test_unset_or_blank_keeps_the_meta_callback(self, monkeypatch):
+        monkeypatch.delenv(config.COMPOSIO_CALLBACK_URL, raising=False)
+        assert config.get_composio_callback_url() is None
+
+        monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, "   ")
+        assert config.get_composio_callback_url() is None
+
+    def test_strips_whitespace_and_a_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(
+            config.COMPOSIO_CALLBACK_URL,
+            " https://app.example.com/api/auth/composio/callback/ ",
+        )
+        assert (
+            config.get_composio_callback_url()
+            == "https://app.example.com/api/auth/composio/callback"
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "app.example.com/api/auth/composio/callback",
+            "ftp://app.example.com/api/auth/composio/callback",
+            "https://app.example.com/api/auth/composio/callback?x=1",
+            "https://app.example.com/api/auth/composio/callback#x",
+            "https://user:pass@app.example.com/api/auth/composio/callback",
+        ],
+        ids=["no-scheme", "ftp", "query", "fragment", "credentials"],
+    )
+    def test_rejects_an_unusable_url(self, monkeypatch, value):
+        monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, value)
+        with pytest.raises(ValueError, match="XAGENT_COMPOSIO_CALLBACK_URL"):
+            config.get_composio_callback_url()

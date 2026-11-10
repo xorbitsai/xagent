@@ -94,7 +94,6 @@ from xagent.web.services.external_task_cancel import (
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
-    MCPBuiltinOAuthActorPolicyRequiredError,
 )
 from xagent.web.services.task_execution_controller import task_execution_controller
 from xagent.web.services.task_lease_service import (
@@ -3175,35 +3174,6 @@ async def test_marked_append_rejects_before_persisting_turn(db_session) -> None:
         .count()
         == 0
     )
-
-
-@pytest.mark.asyncio
-async def test_marked_legacy_execution_rejects_before_scheduling(db_session) -> None:
-    user = _create_user(db_session)
-    task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
-    task.agent_config = {MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY: True}
-    db_session.commit()
-
-    with (
-        patch("xagent.web.services.task_orchestrator._schedule_bg") as schedule,
-        pytest.raises(
-            MCPBuiltinOAuthActorPolicyRequiredError,
-            match="legacy execution is unsupported",
-        ),
-    ):
-        await TaskTurnOrchestrator.schedule_existing_task_execution(
-            task_id=int(task.id),
-            task_owner_user_id=int(user.id),
-            task_source=task.source,
-            payload=TaskTurnPayload("generic execute"),
-        )
-
-    schedule.assert_not_called()
-    db_session.expire_all()
-    persisted = db_session.get(Task, int(task.id))
-    assert persisted is not None
-    assert persisted.status == TaskStatus.COMPLETED
-    assert persisted.runner_id is None
 
 
 @pytest.mark.asyncio

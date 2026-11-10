@@ -1,4 +1,4 @@
-"""Fixtures shared by the ``user`` identity and CLI tests."""
+"""Fixtures shared by the smoke V2 tests."""
 
 from __future__ import annotations
 
@@ -10,6 +10,13 @@ from tests.web.services.test_mcp_connector_session import SANDBOX_MANAGER
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
+
+
+@pytest.fixture(autouse=True)
+def _writes_off(monkeypatch):
+    """No write check runs unless a test switches writes on: an environment
+    that sets the switch must not change what these tests see."""
+    monkeypatch.delenv("XAGENT_CONNECTOR_SMOKE_WRITE_APPS", raising=False)
 
 
 @pytest.fixture()

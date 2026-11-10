@@ -1116,6 +1116,37 @@ async def test_facebook_registered_workspace_path_becomes_a_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["not issuable", "not found"])
+async def test_facebook_registered_workspace_path_falls_back_when_no_url_is_issued(
+    monkeypatch, error
+):
+    # Why: a registered workspace path takes the same issuance step as
+    # file:<id>. When no URL is issued for it, a native grant must still post
+    # the image: the path goes to the connector unchanged, which reads it
+    # itself, rather than the call failing.
+    from xagent.core.workspace import ExternalMediaNotIssuableError
+
+    def no_url(_file_id):
+        if error == "not issuable":
+            raise ExternalMediaNotIssuableError("no public base URL")
+        raise FileNotFoundError("Registered image was not found")
+
+    workspace = _FacebookWorkspace(
+        issue=no_url,
+        registered_paths={"/task/output/generated.png": _FACEBOOK_FILE_ID},
+    )
+
+    _, arguments, result = await _run_facebook_publish(
+        monkeypatch, workspace, "/task/output/generated.png"
+    )
+
+    assert result["is_error"] is False
+    assert workspace.issued == [(_FACEBOOK_FILE_ID, "facebook-publish")]
+    assert arguments == {"page_id": "p-1", "file_path": "/task/output/generated.png"}
+    assert workspace.staged == []
+
+
+@pytest.mark.asyncio
 async def test_instagram_still_fails_without_a_public_base_url(monkeypatch):
     # Why: only Facebook has an upload to fall back to; Instagram must keep
     # reporting the missing base URL instead of passing file_path through.

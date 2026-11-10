@@ -11,11 +11,18 @@ from enum import Enum
 from io import BytesIO
 from math import ceil, floor
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import IO, Any, BinaryIO
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
+from PIL import (
+    ExifTags,
+    Image,
+    ImageFile,
+    ImageOps,
+    JpegImagePlugin,
+    UnidentifiedImageError,
+)
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -44,6 +51,9 @@ _IMAGE_MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".png": "image/png",
 }
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
+_JPEG_END_OF_IMAGE = b"\xff\xd9"
 
 
 class ExternalMediaPurpose(str, Enum):
@@ -103,6 +113,11 @@ class RedeemedExternalMedia:
 # Matches the Facebook connector's own limit for an uploaded image.
 FACEBOOK_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 INSTAGRAM_MAX_JPEG_BYTES = 8 * 1024 * 1024
+# A source may be larger than the JPEG Meta accepts, since it is converted
+# first (a large generated PNG, say). This limit bounds what Pillow reads: it
+# reads a PNG chunk or JPEG segment it does not decode in full, and keeps some,
+# so its memory follows the file's size, not its pixels.
+INSTAGRAM_MAX_SOURCE_BYTES = 50 * 1024 * 1024
 INSTAGRAM_MIN_ASPECT_RATIO = 4 / 5
 INSTAGRAM_MAX_ASPECT_RATIO = 1.91
 INSTAGRAM_MIN_WIDTH = 320
@@ -136,6 +151,21 @@ def _image_media_type(record: Any) -> str:
     if media_type is None:
         raise ExternalMediaUnsupportedImage("Only PNG or JPEG images can be delivered")
     return media_type
+
+
+def delivered_image_media_type(content: bytes, registered_type: str) -> str:
+    """The type of the image bytes being delivered, read from their signature.
+
+    Issuance accepts PNG or JPEG bytes under any of .png, .jpg or .jpeg, and
+    image_tool saves every edited image as .png, so the extension can name the
+    wrong one of the two; delivery sends nosniff, so the declared type is
+    final. Bytes with neither signature keep the registered type.
+    """
+    if content.startswith(_PNG_SIGNATURE):
+        return "image/png"
+    if content.startswith(_JPEG_SIGNATURE):
+        return "image/jpeg"
+    return registered_type
 
 
 def _load_record(
@@ -290,17 +320,101 @@ def redeem_external_media_ticket(
     )
 
 
-def _validate_instagram_source(image: Image.Image) -> None:
+# SOFn markers carry the frame header; C4 (DHT), C8 (JPG) and CC (DAC) do not.
+_JPEG_FRAME_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+# Lossless frames: SOF3, and SOF7, SOF11 and SOF15, which libjpeg cannot decode.
+_JPEG_LOSSLESS_FRAME_MARKERS = frozenset({0xC3, 0xC7, 0xCB, 0xCF})
+# TEM and RST0-RST7 stand alone, with no length.
+_JPEG_MARKERS_WITHOUT_LENGTH = frozenset({0x01, *range(0xD0, 0xD8)})
+
+
+def _jpeg_markers(stream: IO[bytes] | None) -> tuple[int | None, bool]:
+    """A JPEG's frame marker, and whether its first scan omits components.
+
+    A first scan that codes fewer components than the frame makes libjpeg
+    keep coefficients for the whole image, as for a progressive JPEG
+    (``has_multiple_scans`` in its ``jdinput.c``). The markers are read up to
+    the first scan as libjpeg reads them: stray bytes, FF fill bytes and
+    stuffed FF00 pairs before a marker are skipped, and each segment by its
+    length. Markers that cannot be read that far count as omitting components,
+    so they never earn the higher limit; the frame marker is then the one read
+    so far, or None. The stream's position is kept.
+    """
+    if stream is None:
+        return None, True
+    position = stream.tell()
+    frame_marker = None
+    try:
+        stream.seek(0)
+        if stream.read(2) != b"\xff\xd8":
+            return None, True
+        frame_components = None
+        while True:
+            byte = stream.read(1)
+            if byte != b"\xff":
+                if not byte:
+                    return frame_marker, True
+                continue
+            while byte == b"\xff":
+                byte = stream.read(1)
+            if not byte or byte in (b"\xd8", b"\xd9"):
+                return frame_marker, True
+            marker = byte[0]
+            if marker == 0 or marker in _JPEG_MARKERS_WITHOUT_LENGTH:
+                continue
+            header = stream.read(2)
+            length = int.from_bytes(header, "big") - 2
+            if len(header) < 2 or length < 0:
+                return frame_marker, True
+            if marker == 0xDA:
+                scan = stream.read(1)
+                return frame_marker, (
+                    frame_components is None or not scan or scan[0] < frame_components
+                )
+            if marker in _JPEG_FRAME_MARKERS:
+                frame_marker = marker
+                frame = stream.read(length)
+                if len(frame) < 6:
+                    return frame_marker, True
+                frame_components = frame[5]
+            else:
+                stream.seek(length, os.SEEK_CUR)
+    finally:
+        stream.seek(position)
+
+
+def _validate_instagram_source(image: ImageFile.ImageFile) -> None:
     if image.width <= 0 or image.height <= 0:
         raise ExternalMediaUnavailable("Registered image has invalid dimensions")
-    pixel_limit = (
-        INSTAGRAM_MAX_JPEG_SOURCE_PIXELS
-        if image.format == "JPEG"
-        else INSTAGRAM_MAX_SOURCE_PIXELS
-    )
-    if image.width * image.height > pixel_limit:
+    # The higher JPEG limit relies on draft() letting libjpeg decode a JPEG at
+    # a fraction of its size. That takes a draft target well below the image's
+    # size, which instagram_jpeg_bytes() asks for by drafting to the size it
+    # sends, and a JPEG coded in one scan. With more than one (progressive, or
+    # a first scan that codes only some components) libjpeg keeps coefficients
+    # for the whole image whatever draft() asks for: about 370 MB at 100
+    # million pixels, and about 650 MB without chroma subsampling. A lossless
+    # JPEG is never drafted smaller (see instagram_jpeg_bytes). Those JPEGs
+    # get the PNG limit. Within it both limits pass, so the markers are read only
+    # above it.
+    pixels = image.width * image.height
+    if image.format != "JPEG":
+        pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, str(image.format)
+    elif image.info.get("progressive"):
+        pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "progressive JPEG"
+    elif pixels <= INSTAGRAM_MAX_SOURCE_PIXELS:
+        return
+    else:
+        frame_marker, first_scan_omits_components = _jpeg_markers(image.fp)
+        if frame_marker in _JPEG_LOSSLESS_FRAME_MARKERS:
+            pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "lossless JPEG"
+        elif first_scan_omits_components:
+            pixel_limit, kind = INSTAGRAM_MAX_SOURCE_PIXELS, "multi-scan JPEG"
+        else:
+            pixel_limit, kind = INSTAGRAM_MAX_JPEG_SOURCE_PIXELS, "single-scan JPEG"
+    if pixels > pixel_limit:
         raise ExternalMediaUnavailable(
-            "Registered image exceeds the Instagram source pixel limit"
+            "Registered image exceeds the Instagram source pixel limit of "
+            f"{pixel_limit:,} for {kind}; downscale it and try again"
         )
 
 
@@ -391,10 +505,27 @@ def open_delivery_file(record: UploadedFile, path: Path) -> BinaryIO:
         raise
 
 
-def _source_size(source: Path | BinaryIO) -> int:
-    if isinstance(source, Path):
-        return source.stat().st_size
-    return os.fstat(source.fileno()).st_size
+def read_instagram_source(source: BinaryIO) -> BytesIO:
+    """Read an opened Instagram source into memory, within its byte limit.
+
+    Pillow is given this copy, never the file, so it cannot read more than the
+    limit. A file already over the limit is refused unread; reading at most one
+    byte past it catches a file the sandbox grows or rewrites after that check.
+
+    Raises ``ExternalMediaUnavailable`` when the file is over the limit (the
+    route answers it with 422; it is not an ``OSError``, so issuance's
+    ``except OSError`` lets it through), and ``OSError`` when the file cannot
+    be read.
+    """
+    limit = INSTAGRAM_MAX_SOURCE_BYTES
+    if os.fstat(source.fileno()).st_size <= limit:
+        content = source.read(limit + 1)
+        if len(content) <= limit:
+            return BytesIO(content)
+    raise ExternalMediaUnavailable(
+        f"Registered image exceeds the {limit // (1024 * 1024)} MB Instagram "
+        "source limit; compress or downscale it and try again"
+    )
 
 
 def _validate_instagram_header(source: BinaryIO) -> None:
@@ -437,11 +568,12 @@ def _validate_instagram_record(record: UploadedFile) -> None:
         # The same safe open as delivery: a FIFO or link swapped in after
         # materialization fails here instead of blocking or being followed.
         with open_delivery_file(record, path) as source:
-            _validate_instagram_header(source)
+            content = read_instagram_source(source)
     except OSError as exc:
         raise ExternalMediaUnavailable(
             "Registered image could not be read for external delivery"
         ) from exc
+    _validate_instagram_header(content)
 
 
 def _validate_facebook_record(record: UploadedFile) -> None:
@@ -466,21 +598,48 @@ def _validate_facebook_record(record: UploadedFile) -> None:
     if len(content) > FACEBOOK_MAX_IMAGE_BYTES:
         raise ExternalMediaUnsupportedImage("Registered image exceeds the 10 MB limit")
     try:
-        # verify() checks the whole stream (a truncated body fails) without
-        # decoding pixels. The bytes are in memory, so any error is a decode error.
+        # Neither check decodes pixels. PNG's verify() reads every chunk and
+        # checks its CRC, so a truncated or damaged PNG fails. JPEG's verify()
+        # only parses the header, so the main image must also be seen to end;
+        # a JPEG damaged in the middle still passes. The bytes are in memory,
+        # so any error is a decode error.
         with Image.open(BytesIO(content), formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+            is_jpeg = image.format in {"JPEG", "MPO"}
             image.verify()
+        if is_jpeg and not _jpeg_main_image_ends(content):
+            raise SyntaxError("JPEG ends before its main image does")
     except Exception as exc:
         raise ExternalMediaUnsupportedImage(
             "Registered image could not be decoded as PNG or JPEG"
         ) from exc
 
 
-def instagram_image_requires_normalization(source: Path | BinaryIO) -> bool:
-    """Return whether a local image must be normalized before Instagram fetches it."""
+def _jpeg_main_image_ends(content: bytes) -> bool:
+    """Whether the end-of-image marker follows the main image's scan data.
+
+    Pillow's JPEG open stops right after the first start-of-scan header, so
+    the position it leaves is where the main image's scan data begins. An EXIF
+    thumbnail ends with its own marker before that point and does not count;
+    data after the marker, such as extra MPF images, is allowed. The plugin is
+    opened directly because ``Image.open`` turns a JPEG carrying MPF images
+    into an ``MpoImageFile``, which rewinds to the start of the file.
+    """
+    buffer = BytesIO(content)
+    with JpegImagePlugin.JpegImageFile(buffer):
+        scan_start = buffer.tell()
+    return content.find(_JPEG_END_OF_IMAGE, scan_start) != -1
+
+
+def instagram_image_requires_normalization(source: BytesIO) -> bool:
+    """Return whether a local image must be normalized before Instagram fetches it.
+
+    ``source`` is the bounded copy ``read_instagram_source`` returns, so Pillow
+    never reads the file itself.
+    """
 
     try:
-        file_size = _source_size(source)
+        with source.getbuffer() as content:
+            file_size = content.nbytes
         with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
             if image.format != "JPEG":
@@ -494,7 +653,12 @@ def instagram_image_requires_normalization(source: Path | BinaryIO) -> bool:
                 or not INSTAGRAM_MIN_WIDTH <= image.width <= INSTAGRAM_MAX_WIDTH
                 or not INSTAGRAM_MIN_ASPECT_RATIO <= ratio <= INSTAGRAM_MAX_ASPECT_RATIO
             )
-            if requires_normalization:
+            # Few decoders read a lossless JPEG, and Meta is not known to, so
+            # one is converted rather than sent as stored.
+            if (
+                requires_normalization
+                or _jpeg_markers(image.fp)[0] in _JPEG_LOSSLESS_FRAME_MARKERS
+            ):
                 return True
             image.load()
             return False
@@ -515,21 +679,24 @@ def _instagram_canvas_size(image: Image.Image) -> tuple[int, int]:
     return image.size
 
 
-def _resize_for_instagram_canvas(image: Image.Image) -> Image.Image:
+def _instagram_fitted_size(width: int, height: int) -> tuple[int, int]:
+    """An upright size scaled down to Instagram's maximum width and height.
+
+    It is never scaled up.
+    """
     max_height = floor(INSTAGRAM_MAX_WIDTH / INSTAGRAM_MIN_ASPECT_RATIO)
-    scale = min(
-        1.0,
-        INSTAGRAM_MAX_WIDTH / image.width,
-        max_height / image.height,
-    )
-    if scale < 1.0:
-        image = image.resize(
-            (
-                max(1, floor(image.width * scale)),
-                max(1, floor(image.height * scale)),
-            ),
-            Image.Resampling.LANCZOS,
-        )
+    scale = min(1.0, INSTAGRAM_MAX_WIDTH / width, max_height / height)
+    return max(1, floor(width * scale)), max(1, floor(height * scale))
+
+
+def _resize_for_instagram_canvas(
+    image: Image.Image, upright_size: tuple[int, int]
+) -> Image.Image:
+    # Fit from the source's full upright size, not the decoded one: a drafted
+    # JPEG is decoded smaller, and the size sent must not depend on that.
+    fitted = _instagram_fitted_size(*upright_size)
+    if image.size != fitted:
+        image = image.resize(fitted, Image.Resampling.LANCZOS)
 
     canvas_width, _ = _instagram_canvas_size(image)
     if canvas_width < INSTAGRAM_MIN_WIDTH:
@@ -547,14 +714,41 @@ def _resize_for_instagram_canvas(image: Image.Image) -> Image.Image:
     return image
 
 
-def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
-    """Normalize a local image to Instagram's JPEG and aspect-ratio contract."""
+def instagram_jpeg_bytes(source: BytesIO) -> bytes:
+    """Normalize a local image to Instagram's JPEG and aspect-ratio contract.
+
+    ``source`` is the bounded copy ``read_instagram_source`` returns.
+    """
 
     try:
         with Image.open(source, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
             _validate_instagram_source(opened)
+            # Orientations 5-8 swap width and height, as exif_transpose() does.
+            width, height = opened.size
+            turned = opened.getexif().get(ExifTags.Base.Orientation, 1) in (5, 6, 7, 8)
+            upright_size = (height, width) if turned else (width, height)
             if opened.format == "JPEG":
-                opened.draft("RGB", (INSTAGRAM_MAX_WIDTH, 1800))
+                # libjpeg scales a single-scan JPEG down by up to 8 toward the
+                # draft target, so ask for the size it is sent at. A fixed
+                # target box left a long, narrow image at full size.
+                fitted_width, fitted_height = _instagram_fitted_size(*upright_size)
+                target = (
+                    (fitted_height, fitted_width)
+                    if turned
+                    else (fitted_width, fitted_height)
+                )
+                # libjpeg does not scale a lossless JPEG: drafting one by 2 or
+                # more breaks its decode, and with Pillow 12.3.0 can crash the
+                # process. It is decoded at full size instead, within the PNG
+                # limit. Its markers are read only when draft() would scale.
+                scaled = (
+                    opened.width // target[0] >= 2 and opened.height // target[1] >= 2
+                )
+                if (
+                    not scaled
+                    or _jpeg_markers(opened.fp)[0] not in _JPEG_LOSSLESS_FRAME_MARKERS
+                ):
+                    opened.draft("RGB", target)
             image = ImageOps.exif_transpose(opened)
             image.load()
 
@@ -566,7 +760,7 @@ def instagram_jpeg_bytes(source: Path | BinaryIO) -> bytes:
         else:
             image = image.convert("RGB")
 
-        image = _resize_for_instagram_canvas(image)
+        image = _resize_for_instagram_canvas(image, upright_size)
         canvas_size = _instagram_canvas_size(image)
         if canvas_size != image.size:
             canvas = Image.new("RGB", canvas_size, "white")

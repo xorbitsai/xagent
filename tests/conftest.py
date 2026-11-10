@@ -37,7 +37,12 @@ from xagent.core.tracing.langfuse import reset_langfuse_client
 
 # The guard against rewriting a command's tenant key lives in a plugin so that a
 # test can run it in an inner pytest session; pytester runs that session.
-pytest_plugins = ["pytester", "tests.shared.fairness_key_guard_plugin"]
+pytest_plugins = [
+    "pytester",
+    "tests.shared.fairness_key_guard_plugin",
+    # `--shard=K/N`, which splits a CI leg across jobs.
+    "tests.shared.ci_shard_plugin",
+]
 
 # ==========================================
 # ENVIRONMENT AND PROJECT SETUP

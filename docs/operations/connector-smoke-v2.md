@@ -24,17 +24,28 @@ ConnectorChecks(
             ),
         ),
     ),
-    exemptions=(ToolExemption("jira_transition_issue", "moves a real issue"),),
+    exemptions=(
+        ToolExemption(
+            "jira_transition_issue",
+            "write; whether it gets a write check under the rules of #3653 is decided in #3570",
+        ),
+    ),
 )
 ```
 
 - **Check id.** Every check has a declared id, `<app_id>.<snake_case_name>`, at most 80 characters and unique within the connector. The result and the result diff key on it, so an id is never derived from a position and never reused for a different check.
 - **Read check.** One tool, its arguments and assertions on the result. `require_read_only_hint=True` skips the check unless the server advertises the tool with `readOnlyHint: true`, for servers whose tools are vendor-owned (#3566).
-- **Unprobeable check.** A slot that cannot run, with an L3 reason (`covered_by_l2`, `sandboxed`, `execution_scoped`, `needs_fixture`). Its row is always `unprobeable`.
-- **Write check.** `create`, `verify` and `cleanup` steps, an optional `cleanup_guard`, a `tenant_pin` and `expected_verdicts`; see [Write checks and the sweep](#write-checks-and-the-sweep). The write switch is per connector, keyed by its app id. **No write check runs until #3564 lands**: each one reports `skip` with `writes_disabled`.
+- **Unprobeable check.** A slot that cannot run, with an L3 reason (`covered_by_l2`, `sandboxed`, `execution_scoped`, `needs_fixture`, `write_only`). Its row is always `unprobeable`.
+- **Write check.** `create`, `verify` and `cleanup` steps, an optional `cleanup_guard`, a `tenant_pin` and `expected_verdicts`; see [Write checks and the sweep](#write-checks-and-the-sweep). A write check runs only for a connector whose app id is listed in `XAGENT_CONNECTOR_SMOKE_WRITE_APPS` (see [Running write checks](#running-write-checks)); otherwise it reports `skip` with `writes_disabled`.
 - **Exemption.** A tool that has no check carries an exemption and a reason, keyed by its wire name. A tool cannot be both checked and exempted.
 
 - **Sweep.** A connector with a write check declares one `Sweep`, which removes the objects aborted runs left behind; a connector without write checks declares none.
+
+**Coverage (#3565).** A builtin connector is either in `CONNECTOR_CHECKS` or on `LEGACY_CONNECTORS` (`registry.py`), the connectors that have not adopted V2 yet. `tests/web/connector_checks/test_tool_coverage.py` holds these rules:
+
+- Every tool an in-repo (`python -m`) connector's server registers has a check or an exemption, and every tool a declaration names is registered. A remote (`url`) or `npx` connector is not held to per-tool coverage (see Today's L3 probes).
+- The legacy list only shrinks, and the test pins it. A connector leaves both `LEGACY_CONNECTORS` and the test's pinned list in the PR that adds its declaration; a new builtin connector ships with its declaration and cannot join it, and a name on it must still be a builtin connector.
+- An exemption's reason says why the tool has no check yet. A read or write whose check is still to come names the issue of its connector family that decides it (#3567 for the Google document connectors, #3569 for the Microsoft 365 ones; a write check also needs the rules of #3653). A write that creates an object no tool of the server deletes has its own reason, since a write check would have nothing to clean up with. When a check is added for a tool, its exemption goes in the same change: a tool cannot be both.
 
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`. A write check's steps can also use a `RunScopedName`, its `verify`, `cleanup` and `cleanup_guard` a `CreatedRef`, and a sweep's `delete` an `ItemRef`. None of them ever comes from the caller of the engine.
 
@@ -114,13 +125,12 @@ Validation enforces these:
 - **Sweep.** A connector with a write check declares one, and only such a connector does. `find` lists the write area, `items` is the path of the array of objects in its payload, and `name` the path of an item's name. `delete` takes one item by an `ItemRef` (a path inside the item), takes no fixture key but the pin's and write-area keys, and uses the cleanup tool of every write check of the connector, so its verdict is declared. A sweep lists one kind of object, so a connector's write checks all create, and clean up, that one kind.
 - **Literal addresses.** No string in the arguments of a write check's or a sweep's step contains an `@`, as a key or a value: an address comes from a fixture in the test tenant.
 
-At run time, which #3564 adds to the engine (it does none of this yet):
+At run time (see [Running write checks](#running-write-checks)):
 
 - The pin runs before any write, and a tenant id that differs from the registry's refuses the write.
-- The probe path bypasses both the approval gate and the per-user tool overrides, so the engine compares each declared verdict with the identity adapter's answer before any call.
-- Cleanup runs even when verify fails, which is why the guard belongs to cleanup and not to verify.
-- The sweeper lists only the write area, so an object created outside it would never be swept. It matches each item's name against `xagent-smoke-` and reads the object's age from it.
-- A cleanup or a guard that finds an object by its run-scoped name matches the whole name, never part of it: one suffix can begin another (`issue`, `issue-2`).
+- The probe path bypasses both the approval gate and the per-user tool overrides, so the engine compares each declared verdict with the identity's write policy before any call.
+- Cleanup runs even when verify fails, which is why the guard belongs to cleanup and not to verify. The guard's `Equals` compares the whole run-scoped name.
+- The sweeper (see [The sweeper](#the-sweeper)) lists only the write area, so an object created outside it would never be swept. It matches each item's name against `xagent-smoke-` and reads the object's age from it.
 
 Review each write flow against these, which validation cannot check:
 
@@ -132,6 +142,7 @@ Review each write flow against these, which validation cannot check:
 - The sweep's `ItemRef` is the id of the item whose `name` the sweeper matched, not a parent's or a sibling's.
 - Every read step only reads. Validation refuses the connector's own create and cleanup tools there, not every tool that writes.
 - A pin over a list, such as Jira's sites, asserts that the list has exactly one item.
+- A cleanup that deletes by run-scoped name matches the whole name, never part of it: one suffix can begin another (`issue`, `issue-2`), and the engine passes the name to the tool as it is.
 - Gmail creates drafts and never sends.
 - Jira sets no assignee and no watcher.
 - Slack posts only to the tenant's write channel.
@@ -188,6 +199,8 @@ The engine runs as an identity through an `IdentityAdapter` (`identity.py`):
 - `open_session(target, purpose=...)`: starts the connector as a task of that identity would and returns its `ConnectorToolsResult`. A failure is reported through the listing's outcome, not raised. The engine finds a check's tool by its MCP wire name, so the listing's name prefix is the adapter's choice;
 - `resolve_fixture(key)`: the fixture value, or None.
 
+An identity whose deployment governs writes also implements `WritePolicy.write_policy_verdict(target, tool)`: the verdict its write policy gives a restricted actor for a tool, by its wire name, or None. Xagent SaaS's Toby adapter answers `deny` for a tool withheld from a non-installer member and `allow` otherwise (xorbitsai/xagent-saas#2534). The `user` adapter has no write policy, so its switched-on write checks fail as `verdict_mismatch`/`no_write_policy` once their session has passed.
+
 An adapter starts a target only for a connection that is the catalog's own: for a server row, the probe route's catalog-identity rule (`owns_catalog_identity` in `services/connector_probe.py`); an actor stdio connection is synthesized from the catalog. A lookalike or custom row never gets a builtin app's checks run: the adapter leaves it out, or offers it with a skip reason, as the `user` adapter does with `not_catalog_identity`. App ids are unique per enumeration: where an identity has several rows of one app, the adapter offers the one its catalog resolution selects, the one a task of that identity would load.
 
 `SessionPurpose.CALL_TOOLS` refuses a sandboxed (`npx`/`uvx`) connection, because the listing's lease is released before any call. `SessionPurpose.LIST_ONLY`, for a connector where no check will call a tool (each is unprobeable, or the app has no declaration), lets such a connection list through a lease, as V1's Toby probe does. This is the one departure from "sandboxed connections stay refused": no tool is called after the lease is released.
@@ -196,7 +209,7 @@ An adapter starts a target only for a connection that is the catalog's own: for 
 
 `engine.run_checks(adapter, ...)` runs the identity's checks and returns a `RunResult`. It is meant for a one-shot CLI process: it does not take the web process's probe slot (`services/connector_probe.py`), so it must not run inside the web server. Its keywords are `environment` (the result's label), `connectors` (connector labels) and `checks` (check ids) as selectors, `check_timeout` (each call's bound, by default the L3 probe call's, `connector_probe.probe_call_timeout_seconds`), `total_timeout` (the run's bound, 900 seconds by default) and `declarations` (`registry.connector_checks_for` by default). A timeout that is a bool, NaN, infinite or not above 0 raises `ValueError` (a non-number raises `TypeError`). With a check selector, a selected connector none of whose checks it names is left out; without one, a connector whose declaration has only exemptions still gets its session row (it opens as `LIST_ONLY`) and no check rows.
 
-Before any connector starts, the engine enumerates the targets, validates every selected declaration and resolves, through the adapter, the fixtures of every selected read check on a target the adapter does not skip. An invalid declaration, or one that names another app, raises `ValueError`. A key without a value makes its check `skip`/`fixture_missing`, and the check is never called; a value that is not a JSON scalar raises `TypeError`, and a resolver that raises fails the run as `fixtures:exception`, because a broken fixture store is a failure of the run, never a skipped check. Then, for each target in the adapter's order:
+Before any connector starts, the engine enumerates the targets, validates every selected declaration and resolves, through the adapter, the fixtures of every selected read check on a target the adapter does not skip. An invalid declaration, or one that names another app, raises `ValueError`. A key without a value makes its check `skip`/`fixture_missing`, and the check is never called; a value that is not a JSON scalar raises `TypeError`, and a resolver that raises fails the run as `fixtures:exception`, because a broken fixture store is a failure of the run, never a skipped check. The write checks of a connector whose writes are switched on are prepared at the same point (see [Running write checks](#running-write-checks)). Then, for each target in the adapter's order:
 
 1. A target with a `skip_reason` is never started.
 2. One session: one config build and one tool listing (`adapter.open_session`), which becomes the `session` row. It opens as `LIST_ONLY` when the app has no declaration or every check it declares is unprobeable, otherwise as `CALL_TOOLS`. The purpose follows the whole declaration, so neither a selector, setting a fixture nor turning on writes changes how a connector starts or its session row. An exception while opening it is `failed_to_start`/`exception`.
@@ -208,14 +221,61 @@ A check's row depends on the session:
 |---|---|---|
 | read check | run; or `fixture_missing`, `read_only_hint_missing`, `tool_missing` | `skip`/`session_unavailable` |
 | unprobeable check | `unprobeable` | `unprobeable` |
-| write check | `skip`/`writes_disabled` | `skip`/`writes_disabled` |
+| write check, writes switched on | run; or a refusal (see [Running write checks](#running-write-checks)) | `skip`/`session_unavailable` |
+| write check, writes switched off | `skip`/`writes_disabled` | `skip`/`writes_disabled` |
 | app with no declaration | `<connector>.l3_probe` `skip`/`not_declared` | the same |
 
-Connectors run in sequence under the total timeout. The step it interrupts, a session or a call, fails as `timed_out` with the reason `run_deadline`, also when the step swallowed the cancellation and returned. A connector it keeps from starting has a `fail`/`not_reached` session row and the check rows of any session that did not pass; under a session that passed, a call it keeps from starting is `fail`/`not_reached`. The run is then not `complete`.
+Connectors run in sequence under the total timeout. The step it interrupts, a session or a call, fails as `timed_out` with the reason `run_deadline`, also when the step swallowed the cancellation and returned. A connector it keeps from starting has a `fail`/`not_reached` session row and the check rows of any session that did not pass; under a session that passed, a call it keeps from starting is `fail`/`not_reached`. The run is then not `complete`. A write check refused as `not_reached`/`time_budget` is the exception: it is refused before the deadline, and the run goes on (see [Running write checks](#running-write-checks)).
 
-A run with no rows carries a `failure`. It is the adapter's `IdentitySetupError` code, or one of the engine's codes: `enumeration:exception` (the enumeration raised something else), `enumeration:no_connectors`, `enumeration:duplicate_connector` (two targets with one label), `fixtures:exception` (the fixture resolver raised) or `selection:no_targets` (the selectors matched nothing).
+A run with no rows carries a `failure`. It is the adapter's `IdentitySetupError` code, or one of the engine's codes: `enumeration:exception` (the enumeration raised something else), `enumeration:no_connectors`, `enumeration:duplicate_connector` (two targets with one label), `fixtures:exception` (the fixture resolver raised), `write_policy:exception` (the identity's write policy raised) or `selection:no_targets` (the selectors matched nothing).
 
 Today's L3 probes run as their derived `<app_id>.l3_probe` checks with the probe route's verdicts: `tests/web/connector_checks/test_l3_parity.py` feeds the same listing and tool behaviour to the route's call path and to the engine, and compares them. A probe outcome maps to a check row as `ok` → `pass`, `probe_failed` → `call_failed`, `probe_assertion_failed` → `assertion_failed`, `probe_tool_missing` → `tool_missing` and `timed_out` → `timed_out`, with the same reasons except the call's own bound (`probe_call` there, `check_call` here). A listing outcome is the session row's class.
+
+### Running write checks
+
+**Do not switch writes on until the V2 workflow runs the sweeper in that environment** ([The sweeper](#the-sweeper)). Scheduling it before each run is xorbitsai/xagent-saas#2536, which has not landed yet. A write that could not delete its object (a failed create, a failed guard or cleanup, a killed run) leaves it to the sweeper.
+
+A write check creates, verifies and deletes a real object in the connector's test tenant (`writes.py`), so it runs only for a connector whose catalog app id is listed in `XAGENT_CONNECTOR_SMOKE_WRITE_APPS` (comma-separated, empty by default, set per environment; `config.get_connector_smoke_write_apps`). The engine reads the switch once at the start of a run. It is not a CLI argument, and an identity adapter cannot set it; the V2 workflow's kill switch still turns the whole run off (xorbitsai/xagent-saas#2536).
+
+Each run has one id, `<yyyymmddhhmm>-<6 hex digits>` in UTC, and every `RunScopedName` becomes `xagent-smoke-<run_id>-<suffix>`. The id is logged on stderr when the run has a switched-on write check; it is not in the result, since the time in an object's name, with the environment, ties it to a run's `started_at`. Before any connector starts, the engine resolves a switched-on write check's fixtures (the pin's `expected` and every step's arguments and `Equals` values) and asks the identity's write policy for its create and cleanup tools' verdicts.
+
+Once its connector's session has passed, a write check is refused, without calling anything, when:
+
+| Refusal | Row |
+|---|---|
+| the identity has no write policy, or says nothing about a write tool | `fail`/`verdict_mismatch`, `no_write_policy` |
+| the policy's verdict for the create or the cleanup tool is not the declared one | `fail`/`verdict_mismatch`, `create` or `cleanup` |
+| a fixture has no value | `fail`/`tenant_mismatch`, the key |
+| the listing lacks a tool the check calls | `fail`/`tool_missing`, the step (`pin`, `create`, `verify`, `guard`, `cleanup`) |
+| the run's remaining time does not cover one call timeout per step | `fail`/`not_reached`, `time_budget`; later checks still run |
+
+Otherwise it runs, each call under `check_timeout`:
+
+1. **Pin.** The pin's step is called. A call that fails is `tenant_mismatch`/`pin_failed`, and a tenant id that is not the registry's is `tenant_mismatch`/`mismatch`.
+2. **Create.** If the call raises, times out or returns an error, nothing is cleaned up: whatever it may have made is the sweeper's. If only an assertion fails, the object may exist, so cleanup still runs.
+3. **Verify** runs when create passed. Every `CreatedRef` reads create's payload; a step whose id is not there, or is not a non-empty string or a finite number, makes create `assertion_failed`/`create:created_ref_missing`, and a cleanup that would delete by that id is left to the sweeper.
+4. **Cleanup guard and cleanup** run whenever create returned something to clean up, including after a failed verify. The guard reads the object by its `CreatedRef` and must confirm its run-scoped name; if not, nothing is deleted and the row is `cleanup_failed`/`ownership` (`cleanup_failed`/`guard:<detail>` when the guard's call fails). A failed cleanup is `cleanup_failed`/`cleanup:<detail>`. Both calls run under their own call timeouts rather than the run's deadline, and finish even when the run is cancelled, which is re-raised afterwards.
+
+The row reports the first of: a refusal, `cleanup_failed`, a failed create (`create:<detail>`), a failed verify (`verify:<detail>`), `pass`. A step's detail is the reason a read check would report: `exception`, `check_call`, `tool_error`, `invalid_result` or an assertion kind such as `status_success` or `equals`. Rows and logs carry no fixture value, response body or name.
+
+### The sweeper
+
+`sweeper.run_sweep(adapter, ...)` removes what write checks left behind. It sweeps each connector that declares a `Sweep` and whose writes are switched on; a connector whose writes are off is `skip`/`writes_disabled`, and one without a sweep has no row. Its keywords are `environment`, `connectors` (labels), `call_timeout` (each call's bound, by default the L3 probe call's) and `total_timeout` (600 seconds by default; the CLI's `--sweep` uses the same default).
+
+Before any connector starts, it asks the identity's write policy for the sweep's delete tool, which is the write checks' cleanup tool, and resolves the sweep's fixtures; a policy or a resolver that raises fails the sweep as `write_policy:exception` or `fixtures:exception`. A connector is then refused, without calling anything, as a write check is: `verdict_mismatch` (`no_write_policy`, or `delete` when the policy's verdict is not the one the write checks declare), `tenant_mismatch` (a fixture with no value), `tool_missing` (`pin`, `find` or `delete`), `tenant_mismatch` (`pin_failed`, `mismatch`). A session that does not pass fails with its own class.
+
+Otherwise the sweeper lists the write area with `find`, its first page only, so further leftovers wait for the next sweep, and reads each item's `name`:
+
+| Item | What the sweeper does | Counted as |
+|---|---|---|
+| no `xagent-smoke-` prefix | nothing | not counted |
+| prefixed, minute in its name more than 2 hours ago | deletes it by its `ItemRef` | `found`, then `deleted` or `failed` |
+| prefixed, two hours old or younger, or dated in the future | keeps it: a run may still be cleaning it up | `found`, `kept` |
+| prefixed, but no minute parses | keeps it, and reports it | `found`, `unparsed` |
+
+The minute in a name is when its run started. A run with the engine's default total timeout lasts at most 15 minutes, so two hours keeps a sweep off every object a run in any environment may still be using; keep a run's `--total-timeout` well under two hours. An item listed twice is swept once. One sweep deletes at most 50 items of a connector (`cleanup_failed`/`cap_reached` beyond); the rest are counted as `kept` and wait for the next sweep. After a failed delete, `find` lists the area once more: an item missing from that second listing counts as deleted, as when another environment's sweeper took it first. A second listing that is empty, or in which no item has an id at the `ItemRef` path, proves nothing, since search can lag behind a delete; an id is compared as text, so `17`, `17.0` and `"17"` are one item. An item still listed, or one whose `ItemRef` finds no id, is `cleanup_failed`/`delete:<detail>`. The pin, `find`, each delete and the second listing start only when a call timeout of the sweep's total timeout is left; otherwise the connector is `not_reached`/`time_budget`, the items still due are counted as `kept`, and the sweep is not `complete`.
+
+The result is its own document, `xagent.connector_smoke.sweep` (`sweep.schema.json`, `SWEEP_SCHEMA_VERSION` 1): the run fields of the result document, `older_than_seconds` and `max_deletes`, and one row per connector with its outcome, failure class, reason and the counts `found`, `deleted`, `failed`, `kept` and `unparsed`. It carries no name, id or value. The CLI prints it with `--sweep`.
 
 ## CLI and the `user` identity
 
@@ -231,9 +291,10 @@ The options are selectors and bounds, never a tool name or an argument:
 - `--user` (required): a username, or an email address compared case-insensitively;
 - `--connector LABEL` and `--check CHECK_ID`, each repeatable or comma-separated: the engine's selectors;
 - `--environment LABEL`: the result's environment label;
-- `--check-timeout SECONDS` and `--total-timeout SECONDS`: the engine's bounds, finite and above 0.
+- `--check-timeout SECONDS` and `--total-timeout SECONDS`: the engine's bounds, finite and above 0;
+- `--sweep`: run the sweeper instead and print the sweep document. `--check` does not apply. The `user` identity has no write policy, so its sweep refuses every switched-on connector: the option shows the wiring, while a runner whose identity governs writes, such as Xagent SaaS's Toby module, calls `run_sweep` itself.
 
-Stdout carries exactly one JSON document, the run result, and logs go to stderr. While the run lasts, file descriptor 1 and `sys.stdout` point at stderr, so nothing a connector, a tool, a library or a child process writes can reach the document's stream. A run that cannot be set up still prints its document, with a `failure`: the adapter's or the engine's code, `setup:database` when the database cannot be opened, or `run:exception` when the engine raises (the log names the exception class only). Invalid arguments exit 2 with the usage on stderr and nothing on stdout. Otherwise the exit status is 0 when the run is `complete` and no row is `fail`, and 1 when it is not; a `skip` or `unprobeable` row does not fail the run.
+Stdout carries exactly one JSON document, the run result (with `--sweep`, the sweep document), and logs go to stderr. While the run lasts, file descriptor 1 and `sys.stdout` point at stderr, so nothing a connector, a tool, a library or a child process writes can reach the document's stream. A run that cannot be set up still prints its document, with a `failure`: the adapter's or the engine's code, `setup:database` when the database cannot be opened, or `run:exception` when the engine raises (the log names the exception class only). Invalid arguments exit 2 with the usage on stderr and nothing on stdout. Otherwise the exit status is 0 when the run is `complete` and no row is `fail`, and 1 when it is not; a `skip` or `unprobeable` row does not fail the run.
 
 The `user` adapter (`user_identity.py`):
 
@@ -250,7 +311,7 @@ The `user` adapter (`user_identity.py`):
 ```json
 {
   "schema": "xagent.connector_smoke.result",
-  "schema_version": 1,
+  "schema_version": 2,
   "declaration_format_version": 1,
   "identity": "toby",
   "environment": "production-au",
@@ -274,10 +335,10 @@ The `user` adapter (`user_identity.py`):
 }
 ```
 
-- **Rows.** Each connector has one `session` row (starting it and listing its tools), followed by one `check` row per declared check. The diff keys on `(identity, connector, check)`, with `check` null for the session row. When a session does not pass, none of its checks runs: each is `skip` with `session_unavailable` (`writes_disabled` for a write check) or stays `unprobeable`, so one broken connector is one failure.
+- **Rows.** Each connector has one `session` row (starting it and listing its tools), followed by one `check` row per declared check. The diff keys on `(identity, connector, check)`, with `check` null for the session row. When a session does not pass, none of its checks runs: each is `skip` with `session_unavailable` (`writes_disabled` for a write check whose connector's writes are off) or stays `unprobeable`, so one broken connector is one failure.
 - **`connector`** is the catalog app id. An admin-created app's id is free text, so one that is not a kebab-case id of at most 64 characters, or that starts with `custom-`, is named `custom-<16 hex digits>` from its SHA-256 (`ConnectorTarget.connector`): stable across runs, and never the text itself. Hashing ids that start with `custom-` too means a generated label never names another app.
 - **`environment`** is the deployment's label, or null when the caller gives none, so the diff can confirm it compares runs of one environment.
-- **`complete`** is false when the run's total timeout cut it, or when it failed to set up; what the timeout kept from starting fails with `not_reached` (see [Engine](#engine)).
+- **`complete`** is false when the run's total timeout cut it, or when it failed to set up; what the timeout kept from starting fails with `not_reached` (see [Engine](#engine)). A write check refused as `not_reached`/`time_budget` does not make the run incomplete: the run goes on.
 - **`failure`** is a code for a run that could not be set up (`<stage>:<reason>`, such as `enumeration:no_connectors`; the engine's codes are listed under [Engine](#engine)), and null otherwise. Such a run has no rows; the diff reads it as no data, never as every connector recovering.
 - **Outcomes.** `pass` and `unprobeable` carry no class; an `unprobeable` row's `reason` is its L3 reason. `fail` and `skip` carry a class from the tables below, and `reason` optionally refines it with a code.
 - **What a document never holds.** Tokens, secrets, response bodies, fixture values or end-user ids. Every reason is a code (`^[a-z0-9][a-z0-9_.:-]{0,79}$`): a listing's reason that is not a code is dropped, and a row refuses one. A code-shaped value can still be anything, so the callers that build rows put only codes in them.
@@ -292,11 +353,11 @@ The `user` adapter (`user_identity.py`):
 | `failed_to_start` | the server did not start; `reason` is the load phase, or `exception` when opening the session raised |
 | `no_tools` | the server listed no tools |
 | `timed_out` | starting, listing or a check's call exceeded its bound; `reason` is `check_call` for a call's own bound and `run_deadline` for the run's |
-| `not_reached` | the run's total timeout ended before this connector, or before this check's call |
+| `not_reached` | the run's total timeout ended before this connector, or before this check's call; with reason `time_budget`, too little time was left to start this write check |
 | `tool_missing` | the server does not list the check's tool |
 | `call_failed` | the call raised (`exception`), the result was flagged as an error (`tool_error`), or it was not a mapping (`invalid_result`) |
 | `assertion_failed` | an assertion did not hold; `reason` names which kind |
-| `tenant_mismatch`, `verdict_mismatch`, `cleanup_failed` | write-check safety (#3564) |
+| `tenant_mismatch`, `verdict_mismatch`, `cleanup_failed` | a write check's safety rail stopped it, or its cleanup failed (see [Running write checks](#running-write-checks)) |
 
 | Skip class (`skip`) | Meaning |
 |---|---|
@@ -305,10 +366,11 @@ The `user` adapter (`user_identity.py`):
 | `not_declared` | the app has no declaration |
 | `fixture_missing` | a fixture key has no value in this environment and identity; `reason` is the key |
 | `read_only_hint_missing` | the check requires `readOnlyHint` and the server does not list the tool with it, including when the tool is gone: such a check is skipped, never called and never `tool_missing` |
-| `writes_disabled` | write checks are off |
+| `writes_disabled` | the connector's writes are not switched on (`XAGENT_CONNECTOR_SMOKE_WRITE_APPS`) |
 
 ## Versioning
 
 - `DECLARATION_FORMAT_VERSION` (`declarations.py`) changes when a declared check or a consumer of declarations must adapt. Version 2 added `CreatedRef`, `ItemRef`, the cleanup guard, the sweep and the rules on write areas, fixture keys in cleanup, read steps, run-scoped suffixes and `@` in arguments (#3564). It also refuses a path that is not a tuple: version 1 took a list, or a string as a path of one-letter keys.
+- `SWEEP_SCHEMA_VERSION` (`sweeper.py`) and `sweep.schema.json` follow the same rule for the sweep document.
 - `RESULT_SCHEMA_VERSION` (`results.py`) and the schema's `schema_version` const change together when a consumer of results must adapt: a field removed or renamed, a class removed, a meaning changed. A test pins the schema's enums to the Python enums.
-- A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change.
+- A new failure class or a new optional field is still a version bump, because the schema refuses unknown values; the result diff must be updated in the same change. Version 2 added the unprobeable reason `write_only` (#3655).

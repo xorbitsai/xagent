@@ -28,6 +28,7 @@ from tests.web.services.test_mcp_connector_session import (
 from xagent.web.connector_checks import cli
 from xagent.web.connector_checks.identity import ConnectorTarget
 from xagent.web.connector_checks.results import RunResult, load_result_schema
+from xagent.web.connector_checks.sweeper import load_sweep_schema
 from xagent.web.services.mcp_connector_session import ConnectorToolsOutcome
 
 from .fakes import FakeAdapter, FakeTool, failed, listed
@@ -268,6 +269,8 @@ def test_an_engine_that_raises_is_a_run_failure(monkeypatch, capfd, caplog):
         ["--user", "monitor", "--connector", ""],
         ["--user", "monitor", "--connector", ","],
         ["--user", "monitor", "--check", ""],
+        # A sweep has no checks to select.
+        ["--user", "monitor", "--sweep", "--check", "gmail.l3_probe"],
     ],
 )
 def test_invalid_arguments_exit_2_with_nothing_on_stdout(monkeypatch, capfd, argv):
@@ -280,6 +283,71 @@ def test_invalid_arguments_exit_2_with_nothing_on_stdout(monkeypatch, capfd, arg
     assert exited.value.code == 2
     assert out == ""
     assert names == []
+
+
+def test_sweep_prints_the_sweep_document(monkeypatch, capfd):
+    adapter = _gmail()
+    names = _install_adapter(monkeypatch, adapter)
+
+    code = cli.main(["--user", "monitor", "--sweep", "--environment", "stage"])
+
+    out, _ = capfd.readouterr()
+    document = json.loads(out)
+    jsonschema.validate(document, load_sweep_schema())
+    assert document["schema"] == "xagent.connector_smoke.sweep"
+    assert document["environment"] == "stage"
+    # Writes are off, so whatever the registry declares, nothing starts.
+    assert document["complete"] is True
+    assert code == 0
+    assert names == ["monitor"]
+    assert adapter.opened == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        ([], {"total_timeout": 600.0, "call_timeout": None, "connectors": None}),
+        (
+            ["--total-timeout", "60", "--check-timeout", "5", "--connector", "jira"],
+            {"total_timeout": 60.0, "call_timeout": 5.0, "connectors": {"jira"}},
+        ),
+    ],
+)
+def test_sweep_options_reach_the_sweeper(monkeypatch, capfd, argv, expected):
+    _install_adapter(monkeypatch, _gmail())
+    seen: dict[str, Any] = {}
+
+    async def record(adapter: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(cli, "run_sweep", record)
+
+    cli.main(["--user", "monitor", "--sweep", *argv])
+
+    assert seen["total_timeout"] == expected["total_timeout"]
+    assert seen["call_timeout"] == expected["call_timeout"]
+    assert seen["connectors"] == expected["connectors"]
+
+
+def test_a_sweep_that_cannot_open_the_database_prints_a_sweep_failure(
+    monkeypatch, capfd
+):
+    @contextlib.contextmanager
+    def database() -> Iterator[Any]:
+        raise RuntimeError(SECRET)
+        yield
+
+    monkeypatch.setattr(cli, "_database", database)
+
+    code = cli.main(["--user", "monitor", "--sweep"])
+
+    out, _ = capfd.readouterr()
+    document = json.loads(out)
+    jsonschema.validate(document, load_sweep_schema())
+    assert document["failure"] == "setup:database"
+    assert SECRET not in out
+    assert code == 1
 
 
 # --- the real adapter ------------------------------------------------------

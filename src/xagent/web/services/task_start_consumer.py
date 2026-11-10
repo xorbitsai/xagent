@@ -37,6 +37,7 @@ from .task_command_transport import (
     COMMAND_PROCESSING,
     ClaimedTaskCommand,
     SettledTaskCommand,
+    TaskCommandDeferred,
     TaskCommandRejected,
     command_identity_matches_task,
     command_processing_predicates,
@@ -56,12 +57,22 @@ from .task_orchestrator import (
     _EnqueuedTurn,
     _retire_turn_session_best_effort,
     _schedule_committed_turn,
+    bg_turn_inflight,
     timezone_schedule_context,
 )
 from .task_runtime_secrets import delete_runtime_values_no_commit, load_runtime_values
 from .task_start_protocol import TaskStartPayload, read_task_start_command
 
 logger = logging.getLogger(__name__)
+
+
+class PostCommitStartFailure(RuntimeError):
+    """Scheduling failed after the START's handoff had already committed.
+
+    The command is COMPLETED and the run's lease was settled, so a retry or a
+    command-failure write cannot say anything: the client was told here
+    (``report_post_commit_start_failure``) and callers must not notify again.
+    """
 
 
 @dataclass(frozen=True)
@@ -246,7 +257,10 @@ def settle_failed_start_no_commit(db: Session, row: TaskExecutionCommand) -> Non
 
 
 def _commit_handoff(
-    command: ClaimedTaskCommand, owner_lease: TaskOwnerLease | None
+    command: ClaimedTaskCommand,
+    owner_lease: TaskOwnerLease | None,
+    *,
+    local_run_in_flight: bool = False,
 ) -> _StartHandoff | SettledTaskCommand:
     """Fence, admit and complete one START in a single transaction.
 
@@ -254,6 +268,9 @@ def _commit_handoff(
     begun under it. Combined mode has no coordinator (``None``): the same fence
     then opens the run by acquiring a fresh local lease for ``start.run_id``,
     and only an ``existing`` START (``execute_task``) is consumed.
+
+    ``local_run_in_flight`` is read by the caller on the event loop (this runs
+    on a database worker thread, which must not touch loop-owned runner state).
     """
     db = get_session_local()()
     local = owner_lease is None
@@ -302,10 +319,15 @@ def _commit_handoff(
             or (start.kind == "create" and task.status != TaskStatus.PENDING)
         ):
             return _reject_start(db, row, "start_state_changed")
-        if local and _local_run_in_flight(int(task.id)):
+        if local and local_run_in_flight:
             # This process still registers a runner whose terminal status has
             # already committed; starting beside it would race its cleanup.
-            return _reject_start(db, row, "start_state_changed")
+            # The runner is about to deregister, so wait it out instead of
+            # refusing: nothing was applied, and the retry re-validates.
+            raise TaskCommandDeferred(
+                "A previous run of this task is still cleaning up",
+                resend_safe=True,
+            )
         if start.channel is not None:
             from .channel_runtime import (
                 ChannelAuthorizationError,
@@ -428,13 +450,6 @@ def _commit_handoff(
         _retire_turn_session_best_effort(db, task_id=command.task_id)
 
 
-def _local_run_in_flight(task_id: int) -> bool:
-    from .task_execution import background_task_manager
-
-    running = background_task_manager.running_tasks.get(task_id)
-    return running is not None and not running.done()
-
-
 def _handoff_was_committed(command_id: int, lease: TaskLease) -> bool:
     with get_session_local()() as db:
         row = db.get(TaskExecutionCommand, command_id)
@@ -449,6 +464,52 @@ def _handoff_was_committed(command_id: int, lease: TaskLease) -> bool:
             and task.runner_id == lease.runner_id
             and task.lease_attempt_id == lease.attempt_id
         )
+
+
+async def _settle_failed_schedule(
+    command: ClaimedTaskCommand,
+    handoff: _StartHandoff,
+    error: BaseException,
+    error_message: str,
+) -> None:
+    """Settle the committed lease of a START whose scheduling failed.
+
+    Then tell the client, which saw the run begin, that it did not run. The
+    notice follows the settlement the way the runner path does: a settlement
+    that reports ``False`` was fenced or reconciled by someone else, whose
+    outcome the client must not see contradicted. A settlement that raised
+    leaves the lease to TTL recovery, which fails the run, so it still
+    notifies. Cancellation passes through; any other error becomes a
+    ``PostCommitStartFailure`` once notified.
+    """
+    from .task_orchestrator import settle_task_lease_isolated
+
+    settled = False
+    try:
+        settled = bool(
+            await run_db_io_cancellation_safe(
+                lambda: settle_task_lease_isolated(
+                    handoff.claimed.task_lease,
+                    error_message=error_message,
+                    turn_id=handoff.start.turn_id,
+                )
+            )
+        )
+    except Exception:
+        logger.warning(
+            "task %s START %s: settling the lease after a scheduling failure "
+            "failed; leaving it to TTL recovery",
+            command.task_id,
+            command.command_id,
+            exc_info=True,
+        )
+        settled = True
+    if not settled or not isinstance(error, Exception):
+        return
+    from .task_command_execution import report_post_commit_start_failure
+
+    await report_post_commit_start_failure(command, error)
+    raise PostCommitStartFailure(str(error)) from error
 
 
 async def execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand:
@@ -472,8 +533,12 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
             coordinator = current_task_coordinator(command.task_id)
             assert coordinator is not None and coordinator.lease is not None
             owner_lease = coordinator.lease
+        # Loop-owned runner state is read here, under the controller lock, and
+        # passed to the database worker as a plain value.
+        local_run_in_flight = owner_lease is None and bg_turn_inflight(command.task_id)
+        handoff_flags = {"local_run_in_flight": True} if local_run_in_flight else {}
         handoff = await run_db_io_cancellation_safe(
-            lambda: _commit_handoff(command, owner_lease)
+            lambda: _commit_handoff(command, owner_lease, **handoff_flags)
         )
         if isinstance(handoff, SettledTaskCommand):
             return handoff
@@ -484,7 +549,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
             if key in config:
                 context[key] = config[key]
         if start.kind == "channel":
-            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+            from .task_orchestrator import _schedule_bg
 
             try:
                 _schedule_bg(
@@ -504,18 +569,14 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     before_message_id=start.before_message_id,
                     channel_command=command,
                 )
-            except BaseException:
-                await run_db_io_cancellation_safe(
-                    lambda: settle_task_lease_isolated(
-                        handoff.claimed.task_lease,
-                        error_message="Channel execution scheduling failed",
-                        turn_id=start.turn_id,
-                    )
+            except BaseException as exc:
+                await _settle_failed_schedule(
+                    command, handoff, exc, "Channel execution scheduling failed"
                 )
                 raise
             return SettledTaskCommand({"run_id": start.run_id})
         if start.kind == "existing":
-            from .task_orchestrator import _schedule_bg, settle_task_lease_isolated
+            from .task_orchestrator import _schedule_bg
 
             assert start.existing_context is not None
             try:
@@ -533,13 +594,9 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     force_fresh=False,
                     context=start.existing_context.model_dump(exclude_none=True),
                 )
-            except BaseException:
-                await run_db_io_cancellation_safe(
-                    lambda: settle_task_lease_isolated(
-                        handoff.claimed.task_lease,
-                        error_message="Existing execution scheduling failed",
-                        turn_id=start.turn_id,
-                    )
+            except BaseException as exc:
+                await _settle_failed_schedule(
+                    command, handoff, exc, "Existing execution scheduling failed"
                 )
                 raise
             return SettledTaskCommand({"run_id": start.run_id})

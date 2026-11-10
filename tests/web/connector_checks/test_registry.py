@@ -317,7 +317,8 @@ def test_declared_v2_checks_are_valid_and_keyed_by_their_app() -> None:
 
 @pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
 def test_a_document_connector_declares_its_fixture_read(app_id: str) -> None:
-    assert connector_checks_for(app_id) == _expected_checks(app_id)
+    # Its other tools are exempted; test_tool_coverage.py covers those.
+    assert connector_checks_for(app_id).reads == _expected_checks(app_id).reads
 
 
 def test_every_document_fixture_key_is_namespaced_by_its_app() -> None:

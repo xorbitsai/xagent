@@ -1,15 +1,28 @@
 import os
+import struct
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, Mock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from tests.web.services.external_media_source_shared import (
+    LOSSLESS_JPEG,
+    MULTI_SCAN_PIXEL_LIMIT_CASES,
+    OVERSIZED,
+    OVERSIZED_SOURCES,
+    SOURCE_LIMIT,
+    count_source_reads,
+    jpeg_400px,
+    write_png_with_private_chunk,
+    write_small_image,
+)
 from xagent.web import models
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import external_media
@@ -355,7 +368,7 @@ def test_instagram_jpeg_conversion_flattens_alpha_and_pads_aspect_ratio(tmp_path
     source = tmp_path / "tall.png"
     Image.new("RGBA", (100, 300), (255, 0, 0, 128)).save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "converted.jpg"
     output.write_bytes(converted)
 
@@ -371,7 +384,7 @@ def test_instagram_conversion_upscales_tiny_tall_image_to_minimum_width(tmp_path
     source = tmp_path / "tiny-tall.png"
     Image.new("RGB", (3, 4), "blue").save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "tiny-tall.jpg"
     output.write_bytes(converted)
 
@@ -384,7 +397,7 @@ def test_instagram_conversion_resizes_before_padding_extreme_tall_image(tmp_path
     source = tmp_path / "extreme-tall.png"
     Image.new("RGB", (10, 50_000), "blue").save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "extreme-tall.jpg"
     output.write_bytes(converted)
 
@@ -397,7 +410,7 @@ def test_instagram_conversion_pads_wide_image_and_downscales_width(tmp_path):
     source = tmp_path / "wide.png"
     Image.new("RGB", (2000, 500), "blue").save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "wide.jpg"
     output.write_bytes(converted)
 
@@ -413,7 +426,7 @@ def test_instagram_conversion_flattens_palette_transparency(tmp_path):
     image.info["transparency"] = 0
     image.save(source)
 
-    converted = external_media.instagram_jpeg_bytes(source)
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "palette.jpg"
     output.write_bytes(converted)
 
@@ -428,8 +441,13 @@ def test_instagram_conversion_applies_exif_orientation(tmp_path):
     exif[274] = 6
     Image.new("RGB", (400, 800), "blue").save(source, exif=exif)
 
-    assert external_media.instagram_image_requires_normalization(source) is True
-    converted = external_media.instagram_jpeg_bytes(source)
+    assert (
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
+        is True
+    )
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
     output = tmp_path / "oriented-normalized.jpg"
     output.write_bytes(converted)
 
@@ -438,11 +456,99 @@ def test_instagram_conversion_applies_exif_orientation(tmp_path):
         assert image.getexif().get(274, 1) == 1
 
 
+def _sized_jpeg(size, orientation=1):
+    exif = Image.Exif()
+    exif[274] = orientation
+    buffer = BytesIO()
+    Image.new("RGB", size, "blue").save(buffer, "JPEG", exif=exif.tobytes())
+    return BytesIO(buffer.getvalue())
+
+
+@pytest.mark.parametrize(
+    ("stored", "orientation"),
+    [((400, 12000), 1), ((12000, 400), 6)],
+    ids=["narrow-tall", "narrow-tall-after-exif-orientation-6"],
+)
+def test_instagram_conversion_decodes_a_narrow_jpeg_at_reduced_size(
+    monkeypatch, stored, orientation
+):
+    # Why: a fixed draft target left a long, narrow JPEG decoding at full size,
+    # about 1.2 GB at 100 million pixels (#3596). Drafting to the size it is
+    # sent at lets libjpeg scale it down, but never below that size: upright,
+    # this 400x12000 image is resized to 60x1800 before padding.
+    decoded = []
+    exif_transpose = external_media.ImageOps.exif_transpose
+
+    def record_decoded_size(image, **kwargs):
+        decoded.append(image.size)  # drafted, not yet loaded
+        return exif_transpose(image, **kwargs)
+
+    monkeypatch.setattr(external_media.ImageOps, "exif_transpose", record_decoded_size)
+
+    external_media.instagram_jpeg_bytes(_sized_jpeg(stored, orientation))
+
+    [(width, height)] = decoded
+    assert stored[0] // width > 1 and stored[1] // height > 1
+    upright = (width, height) if orientation == 1 else (height, width)
+    assert upright[0] >= 60 and upright[1] >= 1800
+
+
+@pytest.mark.parametrize(
+    ("stored", "orientation", "sent"),
+    [
+        ((4000, 4000), 1, (1440, 1440)),
+        ((4000, 3000), 1, (1440, 1080)),
+        ((3013, 1800), 1, (1440, 860)),
+        ((400, 12000), 1, (1440, 1800)),
+        ((6000, 1000), 1, (1440, 754)),
+        ((3000, 1200), 2, (1440, 754)),
+        ((3000, 1200), 3, (1440, 754)),
+        ((3000, 1200), 4, (1440, 754)),
+        ((3000, 1200), 5, (1440, 1800)),
+        ((3000, 1200), 6, (1440, 1800)),
+        ((3000, 1200), 7, (1440, 1800)),
+        ((3000, 1200), 8, (1440, 1800)),
+    ],
+    ids=[
+        "square",
+        "photo",
+        "photo-fitted-from-full-size",
+        "narrow-tall",
+        "wide-panorama",
+        "exif-orientation-2",
+        "exif-orientation-3",
+        "exif-orientation-4",
+        "exif-orientation-5",
+        "exif-orientation-6",
+        "exif-orientation-7",
+        "exif-orientation-8",
+    ],
+)
+def test_instagram_conversion_sends_the_same_size_whatever_it_decodes_at(
+    stored, orientation, sent
+):
+    # Why: how small a JPEG is decoded must not change what is sent. These are
+    # the sizes the fixed draft target produced before (#3596). The 3013x1800
+    # photo was decoded at full size then; fitting it from a drafted copy
+    # instead would send 1440x859. Orientations 2-4 keep the stored 3000x1200
+    # image's width and height; 5-8 (mirrored or not) turn it upright as
+    # 1200x3000.
+    converted = external_media.instagram_jpeg_bytes(_sized_jpeg(stored, orientation))
+
+    with Image.open(BytesIO(converted)) as image:
+        assert image.size == sent
+
+
 def test_instagram_conforming_jpeg_does_not_require_normalization(tmp_path):
     source = tmp_path / "ready.jpg"
     Image.new("RGB", (1080, 1080), "blue").save(source)
 
-    assert external_media.instagram_image_requires_normalization(source) is False
+    assert (
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
+        is False
+    )
 
 
 def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_path):
@@ -468,7 +574,9 @@ def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_pa
     )
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="pixel limit"):
-        external_media.instagram_image_requires_normalization(source)
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
 
 
 @pytest.mark.parametrize(
@@ -480,7 +588,9 @@ def test_instagram_decoder_errors_are_mapped(monkeypatch, tmp_path, error):
     monkeypatch.setattr(external_media.Image, "open", Mock(side_effect=error))
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="decoded"):
-        external_media.instagram_image_requires_normalization(source)
+        external_media.instagram_image_requires_normalization(
+            BytesIO(source.read_bytes())
+        )
 
 
 def test_issue_preflights_image_header(monkeypatch, tmp_path):
@@ -537,7 +647,14 @@ def test_issue_rejects_corrupt_image_before_ticket(monkeypatch, tmp_path):
 
 
 def test_large_jpeg_header_uses_higher_source_pixel_limit():
-    image = Mock(format="JPEG", width=8000, height=6000)
+    # The scan layout is read from the stream Pillow opened: one interleaved scan.
+    image = Mock(
+        format="JPEG",
+        width=8000,
+        height=6000,
+        info={},
+        fp=BytesIO(jpeg_400px("interleaved")),
+    )
 
     external_media._validate_instagram_source(image)
 
@@ -556,7 +673,305 @@ def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):
     )
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="normalized"):
-        external_media.instagram_jpeg_bytes(source)
+        external_media.instagram_jpeg_bytes(BytesIO(source.read_bytes()))
+
+
+def _instagram_issue(monkeypatch, tmp_path, *, name="launch.png", write):
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / name
+    source.parent.mkdir(parents=True)
+    write(source)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    db = _DB(
+        _record(
+            file_id,
+            filename=name,
+            storage_path=str(source),
+            storage_status="legacy",
+            storage_key=None,
+        )
+    )
+    issue = lambda: external_media.issue_external_media_url(  # noqa: E731
+        db,
+        file_id=file_id,
+        user_id=7,
+        task_id=11,
+        purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+    )
+    return source, issue
+
+
+@OVERSIZED_SOURCES
+@pytest.mark.parametrize(
+    ("rewritten", "bytes_read"),
+    [("before-open", 0), ("while-open", SOURCE_LIMIT + 1)],
+)
+def test_issue_instagram_bounds_what_it_reads_of_an_oversized_source(
+    monkeypatch, tmp_path, filename, write_oversized, rewritten, bytes_read
+):
+    # Why: Pillow reads a PNG chunk or JPEG segment it does not decode in full
+    # and keeps it, so a few pixels in a large file cost memory by the file's
+    # size, and the sandbox can rewrite its outputs at any time (#3596). A file
+    # already over the limit is refused unread; one rewritten after that check
+    # is read only to one byte past the limit.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_BYTES", SOURCE_LIMIT)
+    if rewritten == "before-open":
+        _, issue = _instagram_issue(
+            monkeypatch,
+            tmp_path,
+            name=filename,
+            write=lambda path: write_oversized(path, OVERSIZED),
+        )
+        opened = count_source_reads(monkeypatch, external_media)
+    else:
+        source, issue = _instagram_issue(
+            monkeypatch, tmp_path, name=filename, write=write_small_image
+        )
+        opened = count_source_reads(
+            monkeypatch,
+            external_media,
+            before_first_read=lambda: write_oversized(source, OVERSIZED),
+        )
+    tickets = _count_encode_calls(monkeypatch)
+
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="exceeds the 1 MB Instagram source limit; compress or downscale",
+    ):
+        issue()
+
+    assert [reader.bytes_read for reader in opened] == [bytes_read]
+    assert tickets == []
+
+
+def test_issue_instagram_refuses_a_source_over_50_mb_unread(monkeypatch, tmp_path):
+    # Why: the other byte-limit tests lower the limit to stay fast; this one
+    # pins the production default. A sparse file one byte over 50 MB is
+    # refused from its size alone, without reading any of it.
+    source, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        write=lambda path: write_png_with_private_chunk(path, 50 * 1024 * 1024 + 1),
+    )
+    opened = count_source_reads(monkeypatch, external_media)
+
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="exceeds the 50 MB Instagram source limit",
+    ):
+        issue()
+
+    assert source.stat().st_size == 50 * 1024 * 1024 + 1
+    assert [reader.bytes_read for reader in opened] == [0]
+
+
+@pytest.mark.parametrize(("slack", "issued"), [(0, True), (-1, False)])
+def test_issue_instagram_source_byte_limit_includes_the_limit(
+    monkeypatch, tmp_path, slack, issued
+):
+    # Why: an ordinary image is held to the same byte limit, and one within it
+    # still issues; the limit itself is allowed.
+    source, issue = _instagram_issue(monkeypatch, tmp_path, write=write_small_image)
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_BYTES", source.stat().st_size + slack
+    )
+
+    if issued:
+        assert issue().url.startswith("https://api.example.test/")
+    else:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable, match="Instagram source limit"
+        ):
+            issue()
+
+
+@MULTI_SCAN_PIXEL_LIMIT_CASES
+def test_issue_instagram_holds_a_multi_scan_jpeg_to_the_png_pixel_limit(
+    monkeypatch, tmp_path, layout, slack, refused_as
+):
+    # Why: the higher JPEG pixel limit relies on draft() letting libjpeg decode
+    # a JPEG at a fraction of its size. With more than one scan (progressive,
+    # or a first scan that codes only some components) libjpeg keeps
+    # coefficients for the whole image, so such a JPEG gets the PNG limit
+    # (#3596). One interleaved scan of the same size keeps the higher limit.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(jpeg_400px(layout)),
+    )
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 + slack
+    )
+
+    if refused_as is None:
+        assert issue().url.startswith("https://api.example.test/")
+    else:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable,
+            match=f"pixel limit of 159,999 for {refused_as}; downscale it",
+        ):
+            issue()
+
+
+@pytest.mark.parametrize(("slack", "refused"), [(-1, True), (0, False)])
+def test_issue_instagram_holds_a_lossless_jpeg_to_the_png_pixel_limit(
+    monkeypatch, tmp_path, slack, refused
+):
+    # Why: libjpeg does not scale a lossless JPEG, so draft() cannot keep its
+    # decode small; drafting one by 2 or more breaks its decode, and with
+    # Pillow 12.3.0 can crash the process. Conversion therefore decodes it at
+    # full size, and it gets the PNG limit like any image decoded in full.
+    # Issuance refuses it, before a URL is handed out, not Meta's fetch later.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(LOSSLESS_JPEG.read_bytes()),
+    )
+    monkeypatch.setattr(
+        external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 160 * 160 + slack
+    )
+
+    if refused:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable,
+            match="pixel limit of 25,599 for lossless JPEG; downscale it",
+        ):
+            issue()
+    else:
+        assert issue().url.startswith("https://api.example.test/")
+
+
+def test_instagram_conversion_decodes_a_lossless_jpeg_without_drafting(monkeypatch):
+    # Why: drafting a lossless JPEG by 2 or more breaks its decode (see the
+    # pixel limit test above). It is decoded at full size and then resized.
+    # A maximum width of 64 makes the 160x160 fixture one draft() would scale
+    # by 2.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_WIDTH", 64)
+    drafted = []
+    monkeypatch.setattr(
+        JpegImagePlugin.JpegImageFile,
+        "draft",
+        lambda image, mode, size: drafted.append(size),
+    )
+
+    converted = external_media.instagram_jpeg_bytes(BytesIO(LOSSLESS_JPEG.read_bytes()))
+
+    assert drafted == []
+    with Image.open(BytesIO(converted)) as image:
+        assert image.format == "JPEG"
+        assert image.size == (320, 320)
+        assert image.getpixel((160, 160)) == pytest.approx((0, 0, 254), abs=2)
+
+
+def test_instagram_converts_a_lossless_jpeg_that_otherwise_conforms(monkeypatch):
+    # Why: few decoders read a lossless JPEG, and Meta is not known to. One
+    # that meets every other condition would be sent as stored and fail only
+    # when Meta fetches it, so it is converted to a baseline JPEG first. A
+    # minimum width of 100 makes the 160x160 fixture otherwise conforming.
+    monkeypatch.setattr(external_media, "INSTAGRAM_MIN_WIDTH", 100)
+    source = LOSSLESS_JPEG.read_bytes()
+
+    assert external_media.instagram_image_requires_normalization(BytesIO(source))
+    converted = external_media.instagram_jpeg_bytes(BytesIO(source))
+    assert external_media._jpeg_markers(BytesIO(converted))[0] == 0xC0
+
+
+def test_issue_instagram_reads_jpeg_markers_only_over_the_png_pixel_limit(
+    monkeypatch, tmp_path
+):
+    # Why: within the PNG limit both limits pass, so the scan layout cannot
+    # change the outcome; the byte-by-byte marker walk is skipped there.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(jpeg_400px("interleaved")),
+    )
+    walked = []
+    jpeg_markers = external_media._jpeg_markers
+    monkeypatch.setattr(
+        external_media,
+        "_jpeg_markers",
+        lambda stream: walked.append(True) or jpeg_markers(stream),
+    )
+
+    issue()
+    assert walked == []
+
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 - 1)
+    issue()
+    assert walked == [True]
+
+
+def _with_fill_bytes(jpeg: bytes) -> bytes:
+    # Extra FF bytes may precede any marker.
+    return jpeg.replace(b"\xff\xc0", b"\xff\xff\xff\xc0").replace(
+        b"\xff\xda", b"\xff\xff\xda"
+    )
+
+
+def _with_fake_scan_in_a_comment(jpeg: bytes) -> bytes:
+    # A COM segment whose payload looks like a one-component scan header.
+    return (
+        jpeg[:2] + b"\xff\xfe\x00\x0a" + b"\xff\xda\x00\x08\x01\x01\x00\x00" + jpeg[2:]
+    )
+
+
+def _with_second_soi(jpeg: bytes) -> bytes:
+    # A second SOI before the first scan: Pillow opens it, libjpeg refuses it.
+    return jpeg[:2] + b"\xff\xd8" + jpeg[2:]
+
+
+def _with_zero_length_segment(jpeg: bytes) -> bytes:
+    # An APP5 segment before the frame whose length field is 0, below the 2 it
+    # must count; Pillow and libjpeg both read past it.
+    return jpeg[:2] + b"\xff\xe5\x00\x00" + jpeg[2:]
+
+
+@pytest.mark.parametrize(
+    ("transform", "layout", "refused"),
+    [
+        (_with_fill_bytes, "interleaved", False),
+        (_with_fill_bytes, "non-interleaved", True),
+        (_with_fake_scan_in_a_comment, "interleaved", False),
+        (_with_second_soi, "interleaved", True),
+        (_with_zero_length_segment, "interleaved", True),
+    ],
+    ids=[
+        "fill-bytes-interleaved",
+        "fill-bytes-non-interleaved",
+        "fake-scan-in-a-comment",
+        "unreadable-second-soi",
+        "unreadable-zero-length-segment",
+    ],
+)
+def test_issue_instagram_reads_the_jpeg_scan_layout_from_its_markers(
+    monkeypatch, tmp_path, transform, layout, refused
+):
+    # Why: the scan layout comes from the markers up to the first scan. Fill
+    # bytes before a marker are skipped, and each segment by its length, so a
+    # scan header inside a comment does not count. Markers that cannot be read
+    # that far (a second SOI, which Pillow opens but libjpeg refuses, or a
+    # segment length below 2) must not earn the higher limit.
+    _, issue = _instagram_issue(
+        monkeypatch,
+        tmp_path,
+        name="launch.jpg",
+        write=lambda path: path.write_bytes(transform(jpeg_400px(layout))),
+    )
+    monkeypatch.setattr(external_media, "INSTAGRAM_MAX_SOURCE_PIXELS", 400 * 400 - 1)
+
+    if refused:
+        with pytest.raises(
+            external_media.ExternalMediaUnavailable, match="for multi-scan JPEG"
+        ):
+            issue()
+    else:
+        assert issue().url.startswith("https://api.example.test/")
 
 
 def _facebook_issue(monkeypatch, tmp_path, *, name="post.png", write=None):
@@ -661,6 +1076,125 @@ def test_issue_facebook_rejects_a_truncated_image(monkeypatch, tmp_path):
 
     with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
         issue()
+
+
+def _exif_with_thumbnail() -> bytes:
+    """EXIF whose IFD1 holds a small JPEG thumbnail, with its own end marker."""
+    thumbnail = BytesIO()
+    Image.new("RGB", (16, 16), "red").save(thumbnail, "JPEG")
+    thumbnail_bytes = thumbnail.getvalue()
+    ifd1_offset = 8 + 2 + 4  # TIFF header, then IFD0 with no entries
+    thumbnail_offset = ifd1_offset + 2 + 2 * 12 + 4
+    tiff = (
+        b"II*\x00"
+        + struct.pack("<I", 8)
+        + struct.pack("<HI", 0, ifd1_offset)
+        + struct.pack("<H", 2)
+        + struct.pack("<HHII", 0x0201, 4, 1, thumbnail_offset)
+        + struct.pack("<HHII", 0x0202, 4, 1, len(thumbnail_bytes))
+        + struct.pack("<I", 0)
+        + thumbnail_bytes
+    )
+    return b"Exif\x00\x00" + tiff
+
+
+def _jpeg(kind: str) -> bytes:
+    """A noisy 640x640 JPEG, so the main image has plenty of scan data."""
+    image = Image.effect_noise((640, 640), 64).convert("RGB")
+    output = BytesIO()
+    if kind == "plain":
+        image.save(output, "JPEG")
+    elif kind == "progressive":
+        image.save(output, "JPEG", progressive=True)
+    elif kind == "exif thumbnail":
+        image.save(output, "JPEG", exif=_exif_with_thumbnail())
+    elif kind == "trailing data":
+        # Like a phone's motion photo: a video appended after the end marker.
+        image.save(output, "JPEG")
+        output.write(b"\x00\x00\x00\x18ftypmp42" + bytes(4096))
+    else:
+        assert kind == "MPO with an EXIF thumbnail"
+        image.save(
+            output,
+            "MPO",
+            save_all=True,
+            append_images=[Image.new("RGB", (32, 32), "green")],
+            exif=_exif_with_thumbnail(),
+        )
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "kind", ["plain", "exif thumbnail", "MPO with an EXIF thumbnail"]
+)
+def test_issue_facebook_rejects_a_truncated_jpeg(monkeypatch, tmp_path, kind):
+    # Why: JPEG's verify() parses only the header, so a JPEG cut short by an
+    # interrupted write would get a URL that Meta then fails to fetch, and a
+    # native grant would lose its upload fallback. An EXIF thumbnail ends with
+    # its own end marker before the main image's scan data; that one must not
+    # count, and Image.open rewinds an MPO to its start after parsing it.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    complete = _jpeg(kind)
+    truncated = complete[: len(complete) // 2]
+    if kind != "plain":
+        assert b"\xff\xd9" in truncated  # the thumbnail's end marker
+    if kind.startswith("MPO"):
+        assert Image.open(BytesIO(truncated)).format == "MPO"
+
+    _, _, issue = _facebook_issue(
+        monkeypatch,
+        tmp_path,
+        name="post.jpg",
+        write=lambda path: path.write_bytes(truncated),
+    )
+
+    with pytest.raises(external_media.ExternalMediaUnsupportedImage, match="decoded"):
+        issue()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "plain",
+        "progressive",
+        "exif thumbnail",
+        "MPO with an EXIF thumbnail",
+        "trailing data",
+    ],
+)
+def test_issue_facebook_accepts_a_complete_jpeg(monkeypatch, tmp_path, kind):
+    # Why: the end-marker check must not refuse whole JPEGs: progressive ones
+    # with several scans, ones carrying an EXIF thumbnail, MPO files whose
+    # extra images follow the main image's end marker, and files with other
+    # data after that marker, so the file need not end with one.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    content = _jpeg(kind)
+    if kind == "trailing data":
+        assert not content.endswith(b"\xff\xd9")
+    _, _, issue = _facebook_issue(
+        monkeypatch,
+        tmp_path,
+        name="post.jpg",
+        write=lambda path: path.write_bytes(content),
+    )
+
+    assert issue().url.startswith("https://api.example.test/")
+
+
+@pytest.mark.parametrize("registered_type", ["image/png", "image/jpeg"])
+def test_delivered_image_type_keeps_the_registered_type_for_other_bytes(
+    registered_type,
+):
+    # Why: delivery names the type of the bytes it sends, but a file rewritten
+    # after issue may carry neither signature; the registered type then stays
+    # rather than a guess.
+    gif = BytesIO()
+    Image.new("RGB", (8, 8), "blue").save(gif, "GIF")
+
+    assert (
+        external_media.delivered_image_media_type(gif.getvalue(), registered_type)
+        == registered_type
+    )
 
 
 def test_issue_facebook_read_failure_is_not_an_unsupported_image(monkeypatch, tmp_path):

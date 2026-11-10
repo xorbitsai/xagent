@@ -20,12 +20,54 @@ from .declarations import (
     L3Envelope,
     ReadCheck,
     StatusSuccess,
+    ToolExemption,
     UnprobeableCheck,
 )
 from .fixtures import FixtureRef
 
-# Connectors that have adopted V2, by catalog app id. Tool coverage and
-# exemptions for the six document connectors follow with #3565.
+# Why a tool of an in-repo connector has no check yet (#3565). A reason for
+# work still to come names the issue of the connector's family that decides
+# it; a write whose object no tool can delete is a reason of its own.
+_GOOGLE_TIER_1 = "#3567"
+_MICROSOFT_365_TIER_1 = "#3569"
+WRITE_WITHOUT_CLEANUP = (
+    "write that creates an object no tool of this server deletes, so a write "
+    "check has nothing to clean up with"
+)
+
+
+def _exemptions(
+    *,
+    issue: str,
+    reads: tuple[str, ...] = (),
+    writes: tuple[str, ...] = (),
+    writes_without_cleanup: tuple[str, ...] = (),
+) -> tuple[ToolExemption, ...]:
+    return (
+        *(
+            ToolExemption(
+                tool, f"read; whether it gets a read check is decided in {issue}"
+            )
+            for tool in reads
+        ),
+        *(
+            ToolExemption(
+                tool,
+                "write; whether it gets a write check under the rules of #3653 "
+                f"is decided in {issue}",
+            )
+            for tool in writes
+        ),
+        *(
+            ToolExemption(tool, WRITE_WITHOUT_CLEANUP)
+            for tool in writes_without_cleanup
+        ),
+    )
+
+
+# Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
+# connector has a check or an exemption (#3565, tests/web/connector_checks/
+# test_tool_coverage.py); a remote one declares the checks it has.
 CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     "atlassian": ConnectorChecks(
         "atlassian",
@@ -52,6 +94,28 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
+            reads=(
+                "excel_get_range",
+                "excel_get_used_range",
+                "excel_count_values",
+                "excel_find_rows",
+                "excel_list_tables",
+                "excel_list_table_rows",
+            ),
+            writes=(
+                "excel_add_worksheet",
+                "excel_delete_worksheet",
+                "excel_update_range",
+                "excel_delete_columns",
+                "excel_delete_rows",
+                "excel_clear_range",
+                "excel_add_table_rows",
+                "excel_delete_table_row",
+            ),
+            writes_without_cleanup=("excel_add_table",),
+        ),
     ),
     "google-docs": ConnectorChecks(
         "google-docs",
@@ -65,6 +129,15 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                     HasKeys((), ("document_id", "title")),
                 ),
             ),
+        ),
+        exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
+            writes=(
+                "google_docs_append_text",
+                "google_docs_replace_text",
+                "google_docs_batch_update",
+            ),
+            writes_without_cleanup=("google_docs_create_document",),
         ),
     ),
     "google-sheets": ConnectorChecks(
@@ -80,6 +153,18 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
+            reads=("google_sheets_read_range",),
+            writes=(
+                "google_sheets_update_range",
+                "google_sheets_append_rows",
+                "google_sheets_clear_range",
+                "google_sheets_add_sheet",
+                "google_sheets_delete_sheet",
+            ),
+            writes_without_cleanup=("google_sheets_create_spreadsheet",),
+        ),
     ),
     "google-slides": ConnectorChecks(
         "google-slides",
@@ -94,6 +179,27 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
+            reads=("google_slides_get_slide_thumbnail",),
+            writes=(
+                "google_slides_add_slide",
+                "google_slides_update_slide",
+                "google_slides_delete_slide",
+                "google_slides_batch_update",
+            ),
+            writes_without_cleanup=(
+                "google_slides_create_presentation",
+                "google_slides_import_pptx",
+            ),
+        ),
+    ),
+    # Create-only (#3655): its one tool files a ticket no tool of the server
+    # can delete, and its L3 slot stays unprobeable for the same reason.
+    "jira-ticket": ConnectorChecks(
+        "jira-ticket",
+        reads=(UnprobeableCheck("jira-ticket.l3_probe", "write_only"),),
+        exemptions=(ToolExemption("jira_ticket_create", WRITE_WITHOUT_CLEANUP),),
     ),
     "miro": ConnectorChecks(
         "miro",
@@ -135,6 +241,20 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
+            reads=(
+                "powerpoint_get_presentation_text",
+                "powerpoint_get_slide_text",
+                "powerpoint_list_slide_layouts",
+            ),
+            writes=(
+                "powerpoint_set_shape_text",
+                "powerpoint_add_slide",
+                "powerpoint_delete_slide",
+            ),
+            writes_without_cleanup=("powerpoint_create_presentation",),
+        ),
     ),
     "word": ConnectorChecks(
         "word",
@@ -149,8 +269,73 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 ),
             ),
         ),
+        exemptions=_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
+            reads=("word_list_paragraphs",),
+            writes=(
+                "word_set_paragraph_text",
+                "word_append_paragraph",
+                "word_add_heading",
+                "word_insert_page_break",
+                "word_replace_text",
+            ),
+            writes_without_cleanup=("word_create_document",),
+        ),
     ),
 }
+
+
+# Builtin connectors that have not adopted V2 yet (#3565). The coverage test
+# skips them; every other builtin connector is in CONNECTOR_CHECKS, and each
+# tool of an in-repo (``python -m``) one has a check or an exemption. The list
+# only shrinks: a connector leaves it in the PR that adds its declaration, and
+# a new connector ships with its declaration instead of joining it.
+LEGACY_CONNECTORS: frozenset[str] = frozenset(
+    {
+        "aws",
+        "chartmogul",
+        "chrome-devtools",
+        "deputy",
+        "employment-hero",
+        "facebook",
+        "fireflies",
+        "freshdesk",
+        "github",
+        "gmail",
+        "google-ads",
+        "google-analytics",
+        "google-calendar",
+        "google-drive",
+        "google-maps",
+        "google-search-console",
+        "granola",
+        "hubspot",
+        "instagram",
+        "intercom",
+        "jira",
+        "linear",
+        "linkedin",
+        "magento",
+        "meta-ads",
+        "mixpanel",
+        "myob",
+        "onedrive",
+        "outlook",
+        "planner",
+        "posthog",
+        "rocketlane",
+        "salesforce",
+        "sharepoint",
+        "shopify",
+        "slack",
+        "stripe",
+        "teams",
+        "whatsapp",
+        "xero",
+        "zendesk",
+        "zoom",
+    }
+)
 
 
 def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:

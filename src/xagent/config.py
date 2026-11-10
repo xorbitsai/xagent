@@ -52,6 +52,7 @@ AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
+STANDBY = "XAGENT_STANDBY"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
 WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
@@ -184,6 +185,7 @@ _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
+CONNECTOR_SMOKE_WRITE_APPS = "XAGENT_CONNECTOR_SMOKE_WRITE_APPS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
 LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
 AUTO_PRIMARY_MAX_ATTEMPTS = "XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS"
@@ -304,6 +306,7 @@ GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
 EMAIL_CONFIRMATION_EXPIRE_MINUTES = "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
+COMPOSIO_CALLBACK_URL = "XAGENT_COMPOSIO_CALLBACK_URL"
 SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
 SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
 SLACK_APP_TOKEN = "XAGENT_SLACK_APP_TOKEN"
@@ -914,6 +917,21 @@ def get_app_base_url() -> str | None:
     return _normalized_env_url(APP_BASE_URL)
 
 
+def get_composio_callback_url() -> str | None:
+    """Return the full callback URL every Composio-backed connect returns to.
+
+    Composio's OAuth user verification is one URL per Composio project, so all
+    apps connected through Composio share this one callback. Unset keeps the
+    Meta callback URL. Point it at ``/api/auth/composio/callback`` together
+    with the project's verifier URL. Raises ``ValueError`` for a value that is
+    not an absolute http(s) URL, or that carries a query, fragment or
+    credentials.
+    """
+    return _reject_url_userinfo(
+        COMPOSIO_CALLBACK_URL, _normalized_http_env_url(COMPOSIO_CALLBACK_URL)
+    )
+
+
 def get_sql_worker_url() -> str | None:
     """Return the internal SQL execution service URL, when isolation is enabled."""
 
@@ -1196,6 +1214,21 @@ def get_shared_task_execution_enabled() -> bool:
     if configured is not None and configured.strip():
         return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
     return get_worker_count() is not None or get_task_execution_role() != "combined"
+
+
+def get_standby_enabled() -> bool:
+    """Whether this process starts as a warmed standby (``XAGENT_STANDBY``).
+
+    A standby binds the database read-only, writes nothing and starts no claim
+    path or singleton until it is activated. Strict on purpose: a typo must not
+    silently fall back to a normal start that writes beside the serving process.
+    """
+    raw = os.getenv(STANDBY, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{STANDBY} must be a boolean, got {raw!r}")
 
 
 def get_task_execution_role() -> Literal["combined", "web", "worker"]:
@@ -3861,6 +3894,26 @@ def get_connector_probe_users() -> frozenset[str]:
         Frozenset of usernames and email addresses; empty when unset or blank.
     """
     return frozenset(_csv_env(CONNECTOR_PROBE_USERS))
+
+
+def get_connector_smoke_write_apps() -> frozenset[str]:
+    """Get the connectors whose smoke V2 write checks may run.
+
+    A write check creates, verifies and deletes a real object in a test
+    tenant (``web/connector_checks/writes.py``, #3564), so each connector's
+    write checks stay off until its app id is listed here, per environment.
+    The smoke V2 engine reads this once at the start of a run; neither the
+    CLI nor an identity adapter can turn writes on.
+
+    Priority:
+        1. XAGENT_CONNECTOR_SMOKE_WRITE_APPS environment variable
+           (comma-separated catalog app ids, such as ``jira,google-drive``)
+        2. empty (no write check runs)
+
+    Returns:
+        Frozenset of app ids; empty when unset or blank.
+    """
+    return frozenset(_csv_env(CONNECTOR_SMOKE_WRITE_APPS))
 
 
 def get_llm_retry_deadline_seconds() -> float:

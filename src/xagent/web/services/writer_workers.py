@@ -16,6 +16,8 @@ import threading
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+from .release_hold import wait_until
+
 T = TypeVar("T")
 
 _lock = threading.Lock()
@@ -62,9 +64,4 @@ def active_workers() -> int:
 
 async def drain_workers(timeout: float) -> bool:
     """Wait for every tracked thread to return; ``False`` if some did not."""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while active_workers():
-        if asyncio.get_running_loop().time() >= deadline:
-            return False
-        await asyncio.sleep(0.05)
-    return True
+    return await wait_until(lambda: not active_workers(), timeout)

@@ -1146,7 +1146,10 @@ def start_temp_file_cleanup_task(
         started = time.monotonic()
         logger.info("Background orphaned temp-file cleanup started")
         try:
-            cleaned_count = await run_tracked(
+            # Deliberately not ``run_tracked``: the walk deletes temp files, it
+            # is not a database writer, and a host's retire must not wait on a
+            # minutes-long sweep. ``_stop_runtime_loops`` sets its stop event.
+            cleaned_count = await asyncio.to_thread(
                 cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
             )
         except Exception:  # noqa: BLE001
@@ -2458,6 +2461,12 @@ async def _stop_runtime_loops() -> None:
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
 
+    # The temp-file walk runs in a thread a task cancel cannot stop; its stop
+    # event is what ends it (see ``start_temp_file_cleanup_task``).
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
+
     if _task_command_dispatcher_task is not None:
         from .services.task_command_transport import stop_task_command_dispatcher
 
@@ -2716,27 +2725,50 @@ _retire_writers_lock: asyncio.Lock | None = None
 
 
 async def retire_writers() -> None:
-    """Stop every background writer and singleton; the web server keeps serving.
+    """Stop the background writers listed here; the web server keeps serving.
 
-    The producers of the shutdown sequence -- command dispatcher, upload,
-    retention, cleanup and recovery loops, auto-resume and lease recovery,
-    sandbox sweep, trigger dispatcher, chat channels -- and nothing else:
-    sockets, requests, execution drain and database runtime stay as they are,
-    so a host that replaces this process on purpose (the SaaS thin Gate) can
-    quiet the old writers while the old process still answers until the
-    switch. The later ``shutdown_event`` calls this too and skips it.
+    **Stopped (tasks cancelled and awaited):** command dispatcher and its
+    detached prompt dispatches, orphan-upload GC, Composio reconcile,
+    retention purge, task-cleanup retry, uploaded-file recovery and reconcile,
+    auto-resume, lease recovery, sandbox idle sweep, startup file-storage
+    sync, LanceDB migration, trigger dispatcher, chat channels.
 
-    Success is published only once the writers have really settled: the
-    fence goes up first (no socket write is admitted after it), and after the
-    stops this waits for the worker threads cancelled tasks left behind and
-    for every socket write admitted before the fence. If either does not
-    settle in time the function raises, so the host takes its fallback
-    instead of starting migrations beside a live writer.
+    **Fenced:** socket-owned writes. After the fence no WebSocket handler
+    starts a write (message/start commands, builder turns, ASR sessions,
+    missing-task chat, preview), ``dispatch_task_command_promptly`` only
+    wakes the dispatcher, and the writes admitted before it are cancelled
+    (long-running ones) and waited for. Pause/resume/cancel commands are
+    still accepted: they only enqueue a durable row for whoever owns the run.
+
+    **Waited for before success (``run_tracked`` threads, audited list):**
+    startup file-storage sync, uploaded-file reconcile, gmail watch renewal
+    and provisioning sweep, scheduled-trigger scan, preview-run reaper,
+    trigger run start and pending-run scan (``services/triggers``), the
+    LanceDB user-id, documents and uploaded-file-link backfills, the
+    retention-purge batch, task-cleanup retry (workspace removal, live-id
+    check, claim, settle), the Composio reconcile pass, and the socket
+    command enqueue. ``asyncio.to_thread`` threads
+    that are not database or remote writers (the temp-file walk, which this
+    stops through its own event and does not wait for) are not tracked.
+
+    **Not covered -- the host must quiesce these itself:** HTTP producers
+    (for example the A2A, triggers, MCP and file API routes, webhook
+    ingress) and writers owned by running executions (task coordinators,
+    ``background_task_manager``, which ``execution_status()`` reports). A
+    host that must see no write at all stops routing HTTP traffic here first.
+
+    Success is published only once the tracked work has really settled: the
+    fence goes up first, and after the stops this waits for the prompt
+    dispatches, the worker threads cancelled tasks left behind and every
+    socket write admitted before the fence. If one does not settle in time
+    the function raises, so the host takes its fallback instead of starting
+    migrations beside a live writer.
 
     Idempotent and safe to call concurrently: the first caller does the work,
     later ones wait for it and return. A step that raises leaves the function
     unfinished (the caller sees the error) and every step is itself a no-op
-    once done, so calling again continues where it stopped.
+    once done, so calling again continues where it stopped. The later
+    ``shutdown_event`` calls this too and skips it once it completed.
     """
     global _retire_writers_lock, _writers_retired
 
@@ -2753,8 +2785,12 @@ async def retire_writers() -> None:
         await _stop_chat_channels()
 
         # Cancelling a task that awaits a worker thread does not stop the
-        # thread, and an admitted socket write is not a task this function
-        # owns.
+        # thread, and an admitted socket write or a detached prompt dispatch
+        # is not a task this function owns.
+        from .services.task_command_transport import drain_prompt_dispatches
+
+        if not await drain_prompt_dispatches(RETIRE_SETTLE_SECONDS):
+            raise RuntimeError("detached command dispatches did not settle")
         if not await drain_workers(RETIRE_SETTLE_SECONDS):
             raise RuntimeError("background writer threads did not settle")
         if not await release_hold.drain_socket_writes(RETIRE_SETTLE_SECONDS):
@@ -2799,7 +2835,13 @@ async def shutdown_event() -> None:
     flush_langfuse()
 
     # Stops the writers (the same step a host may run earlier, then skipped).
-    await retire_writers()
+    # A retire that cannot settle must not skip the coordinator drain, the
+    # heartbeat wait and the sandbox cleanup below: this is the last chance to
+    # run them.
+    try:
+        await retire_writers()
+    except Exception:
+        logger.exception("Retiring the writers failed at shutdown; continuing teardown")
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

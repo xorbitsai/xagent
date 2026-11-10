@@ -1008,11 +1008,11 @@ async def run_reconcile_loop(
     """
     import asyncio
 
+    from .services.writer_workers import run_tracked
+
     while not stop_event.is_set():
         try:
-            await asyncio.to_thread(
-                reconcile_orphan_accounts_isolated, stop_event=stop_event
-            )
+            await run_tracked(reconcile_orphan_accounts_isolated, stop_event=stop_event)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

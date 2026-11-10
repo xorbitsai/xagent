@@ -1013,6 +1013,10 @@ def _isolate_retire_writers_state():
         app_module._retire_writers_lock = None
         app_module._uploaded_file_reconcile_task = None
         app_module.release_hold.reset_writers_retired()
+        # A test that leaked a tracked worker must not skew the next one.
+        from xagent.web.services import writer_workers
+
+        writer_workers._active = 0
 
     reset()
     yield

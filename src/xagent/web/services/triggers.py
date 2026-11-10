@@ -66,6 +66,7 @@ from .trigger_providers.schemas import (
     parse_trigger_config,
 )
 from .user_oauth import get_scoped_user_oauth_account, is_ordinary_gmail
+from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -1939,7 +1940,7 @@ async def _start_prepared_trigger_run_id(
     wait_for_completion: bool = False,
 ) -> bool:
     """Start one prepared trigger task from the backend process."""
-    start = await asyncio.to_thread(_load_prepared_trigger_start, run_id)
+    start = await run_tracked(_load_prepared_trigger_start, run_id)
     if start is None:
         return False
 
@@ -1963,14 +1964,14 @@ async def _start_prepared_trigger_run_id(
             actor_user_id=start.task_owner_user_id,
         )
     except TaskTurnError as exc:
-        marked_running = await asyncio.to_thread(
+        marked_running = await run_tracked(
             _mark_trigger_run_running_if_task_running,
             start.run_id,
             start.task_id,
         )
         if marked_running:
             return False
-        await asyncio.to_thread(
+        await run_tracked(
             _mark_trigger_run_failed_by_id,
             start.run_id,
             f"TaskTurnError: {exc.reason}",
@@ -1978,14 +1979,14 @@ async def _start_prepared_trigger_run_id(
         logger.info("Trigger run %s was not started: %s", start.run_id, exc.reason)
         return False
     except TaskTurnNotFoundError as exc:
-        await asyncio.to_thread(
+        await run_tracked(
             _mark_trigger_run_failed_by_id,
             start.run_id,
             f"{type(exc).__name__}: {exc}",
         )
         return False
     except Exception as exc:
-        await asyncio.to_thread(
+        await run_tracked(
             _mark_trigger_run_failed_by_id,
             start.run_id,
             f"{type(exc).__name__}: {exc}",
@@ -1993,7 +1994,7 @@ async def _start_prepared_trigger_run_id(
         logger.exception("Trigger run %s failed to start task", start.run_id)
         return False
 
-    await asyncio.to_thread(_mark_trigger_run_started, start)
+    await run_tracked(_mark_trigger_run_started, start)
 
     # Count one billable action for the trigger firing itself (webhook /
     # scheduled). Best-effort; never let metering break a trigger run.
@@ -2015,7 +2016,7 @@ async def _start_prepared_trigger_run_id(
                 return False
         elif asyncio.isfuture(started.background_task):
             await started.background_task
-        await asyncio.to_thread(_finish_trigger_run_after_task, start, started.run_id)
+        await run_tracked(_finish_trigger_run_after_task, start, started.run_id)
 
     return True
 
@@ -2109,7 +2110,7 @@ async def dispatch_pending_trigger_runs(
     wait_for_completion: bool = False,
 ) -> int:
     """Start prepared trigger tasks from the backend process."""
-    pending_run_ids = await asyncio.to_thread(
+    pending_run_ids = await run_tracked(
         _get_pending_trigger_run_ids,
         max(1, min(limit, 100)),
     )

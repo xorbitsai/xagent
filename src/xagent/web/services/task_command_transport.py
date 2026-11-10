@@ -55,7 +55,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
-from .release_hold import release_hold
+from .release_hold import release_hold, wait_until
 from .task_admission_execution import (
     AdmissionWaiting,
     admission_execution,
@@ -3061,9 +3061,16 @@ async def dispatch_task_command_promptly(
     Fast commands usually finish during the short handoff window. Slow file or
     checkpoint work continues in its own task, allowing the socket receive loop
     to accept the next pause/message command instead of blocking behind it.
+
+    The chokepoint of the retire fence: once the host fenced this process's
+    writers (``app.retire_writers``) nothing is applied here any more. The
+    command row is already durable, so this only wakes the dispatcher and the
+    successor claims the row. Every producer that enqueues a command and then
+    kicks it (socket handlers, ``execute_existing_task``, task start, workforce
+    pauses) goes through here, so none needs its own check.
     """
 
-    if not consumes_task_commands():
+    if release_hold.socket_writes_fenced or not consumes_task_commands():
         notify_task_command_dispatcher()
         return
 
@@ -3082,6 +3089,19 @@ def prompt_dispatch_count() -> int:
     """Detached prompt dispatches still running (``dispatch_task_command_promptly``)."""
 
     return sum(1 for task in _prompt_dispatch_tasks if not task.done())
+
+
+async def drain_prompt_dispatches(timeout: float) -> bool:
+    """Cancel the detached prompt dispatches and wait until they have finished.
+
+    ``stop_task_command_dispatcher`` does the same, but only when this process
+    runs a dispatcher task; the retire must not publish success while a
+    dispatch that started before the fence can still apply a command.
+    """
+
+    for task in list(_prompt_dispatch_tasks):
+        task.cancel()
+    return await wait_until(lambda: prompt_dispatch_count() == 0, timeout)
 
 
 def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:

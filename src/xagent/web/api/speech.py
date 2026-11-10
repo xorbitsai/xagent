@@ -255,10 +255,9 @@ async def stream_asr(
     # retired process cannot write, so the client reconnects to the new one;
     # the close frame needs the handshake accepted first.
     session_task = asyncio.current_task()
+    assert session_task is not None
     try:
-        write_token = release_hold.acquire_socket_write(
-            session_task.cancel if session_task is not None else None
-        )
+        write_token = release_hold.acquire_socket_write(session_task.cancel)
     except WritersRetired:
         await _close_asr_socket(websocket, 1012, "Service restart")
         return
@@ -315,6 +314,15 @@ async def stream_asr(
                 await _close_model(model)
     except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         return
+    except asyncio.CancelledError:
+        if not release_hold.socket_writes_fenced:
+            raise
+        # The retire fence wound this session down: tell the client to
+        # reconnect to the successor instead of leaking the cancellation. The
+        # usage scope has already delivered what was metered (on its own
+        # tracked worker), and the token is held until the finally below.
+        session_task.uncancel()
+        await _close_asr_socket(websocket, 1012, "Service restart")
     except _ASRWriteTimeout:
         await _close_asr_socket(websocket, 1000, "Speech session timed out")
     except _ASRSessionTimeout:

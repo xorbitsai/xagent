@@ -1095,7 +1095,8 @@ def test_a_body_of_long_lines_with_distinct_lengths_is_bounded(proxy, line_count
     """The same shape with lines just over the kept text (1000..2599
     characters, 0.14..3.8 MB of raw) and one distinct length per line, so
     every match costs the full scan window rather than its own length. The
-    cost rose with the number of lengths here: 3.2 s at 100, 81 s at 1600.
+    cost rose with the number of lengths here: 6.8 s at 200, 81 s at 1600.
+    At 100 the echo is the whole body, so it matched in one region there.
     The counted work has to cut every count short with the rest of the text
     hidden, and no line may stay visible."""
     lines = ["A" * (1000 + index - 12) + f"{index:012d}" for index in range(line_count)]

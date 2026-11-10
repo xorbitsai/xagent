@@ -267,11 +267,12 @@ _MAX_COMPARE_CHARS = 4096
 # distinct length that shares its opening, and a comparison stops at the first
 # slice that differs (or at the fragment's length for a real match). Once the
 # allowance is gone the rest of the text is hidden as one region -- more
-# redaction, never less. The allowance leaves room for every shape in this
-# repository's tests (a body that costs 90k positions, a 3.2 MB body echoed
-# whole) and still cuts the adversarial ones below 0.3 s here; the report
-# records both.
-_MAX_REDACTION_WORK = 9_000_000
+# redaction, never less. It is sized from both ends: every shape in this
+# repository's tests and the reference cases that used to take a few hundred
+# milliseconds stay exact (the most expensive spends 3.7M of it), while the
+# shapes that took seconds are cut; the largest body the 4.5 MB limit admits
+# spends all of it in about 0.25 s here. The report records the measurements.
+_MAX_REDACTION_WORK = 15_000_000
 
 
 class _Work:

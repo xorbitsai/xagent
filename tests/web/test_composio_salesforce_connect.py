@@ -433,3 +433,64 @@ def test_the_identity_is_never_taken_from_sub(salesforce):
 
     assert response.status_code == 503
     assert _grants(db) == []
+
+
+# --- Connect guidance -----------------------------------------------------------
+#
+# An org admin has to install Composio's connected app before anyone else in
+# the org can connect, and nothing comes back when they haven't: Salesforce
+# stops on its own error page. So Toby explains it before the popup opens and
+# again when it closes without a connection (#3646).
+
+
+def _catalog_entry(db: Session, app_id: str) -> dict[str, Any]:
+    from xagent.web.mcp_apps import get_app_by_id
+
+    entry = get_app_by_id(db, app_id)
+    assert entry is not None
+    return entry
+
+
+def test_the_catalog_carries_connect_guidance_while_salesforce_is_on_composio(
+    salesforce,
+):
+    db, _user, _composio = salesforce
+
+    guidance = _catalog_entry(db, "salesforce")["connect_guidance"]
+
+    assert set(guidance) == {"before_connect", "not_connected"}
+    for text in guidance.values():
+        assert "Connected Apps OAuth Usage" in text
+        assert "All users may self-authorize" in text
+        assert "acme.my" in text
+        assert "Use Custom Domain" in text
+    assert "admins" in guidance["before_connect"]
+    # Only after a failed attempt: the two ways it fails without saying why.
+    assert "mistyped" in guidance["not_connected"]
+    assert "Please check your username and password" in guidance["not_connected"]
+
+
+@pytest.mark.parametrize("backend", [None, "native", "other"])
+def test_no_connect_guidance_while_salesforce_is_native(
+    salesforce, monkeypatch, backend
+):
+    db, _user, _composio = salesforce
+    if backend is None:
+        monkeypatch.delenv("XAGENT_SALESFORCE_AUTH_BACKEND")
+    else:
+        monkeypatch.setenv("XAGENT_SALESFORCE_AUTH_BACKEND", backend)
+
+    assert "connect_guidance" not in _catalog_entry(db, "salesforce")
+
+
+def test_other_apps_on_composio_carry_no_connect_guidance(salesforce):
+    """Facebook's switch is on here too; its entry is unchanged."""
+    db, _user, _composio = salesforce
+    from xagent.web.mcp_apps import get_all_mcp_apps
+
+    entries = {entry["id"]: entry for entry in get_all_mcp_apps(db)}
+
+    assert "connect_guidance" in entries["salesforce"]
+    assert [
+        app_id for app_id, entry in entries.items() if "connect_guidance" in entry
+    ] == ["salesforce"]

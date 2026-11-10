@@ -170,6 +170,10 @@ class ComposioApp(NamedTuple):
     identity_field: str
     identity_params: tuple[tuple[str, str], ...]
     identity_id_pattern: re.Pattern[str]
+    # Shown by the connect UI while the app goes through Composio:
+    # ``before_connect`` before the sign-in window opens, ``not_connected``
+    # when it closes without a connection. None for an app that needs none.
+    connect_guidance: Mapping[str, str] | None = None
 
 
 # Graph ids, Facebook user ids and Instagram professional account ids alike.
@@ -211,6 +215,37 @@ def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
     ):
         return None
     return f"https://{hostname}{SALESFORCE_USERINFO_PATH}"
+
+
+_SALESFORCE_INSTALL = (
+    "A Salesforce admin has to install Composio's app in your org first: in "
+    "Setup, open Connected Apps OAuth Usage, click Install next to Composio's "
+    'app, then set Permitted Users to "All users may self-authorize".'
+)
+_SALESFORCE_LOGIN_POLICY = (
+    "change the Salesforce subdomain on Composio's page to your My Domain "
+    "prefix (for example acme.my, or acme.develop.my for a Developer Edition "
+    'org), or choose "Use Custom Domain" on the Salesforce login page.'
+)
+# Salesforce stops on its own page when the app is not installed, the
+# subdomain is mistyped, or the org refuses logins from login.salesforce.com;
+# nothing comes back to Composio or to us, so the only help is this text.
+SALESFORCE_CONNECT_GUIDANCE: Mapping[str, str] = {
+    "before_connect": (
+        f"{_SALESFORCE_INSTALL} Admins can connect without installing it, but "
+        "nobody else in the org can until it is installed, so admins should "
+        "install it too. If your org doesn't allow logins from "
+        f"login.salesforce.com, {_SALESFORCE_LOGIN_POLICY}"
+    ),
+    "not_connected": (
+        "Salesforce wasn't connected. If Salesforce showed "
+        'OAUTH_APPROVAL_ERROR_GENERIC or "app must be installed into org": '
+        f"{_SALESFORCE_INSTALL} If the page couldn't be reached, the subdomain "
+        "on Composio's page may be mistyped. If Salesforce said \"Please check "
+        'your username and password" although they are right, your org may '
+        f"not allow logins from login.salesforce.com: {_SALESFORCE_LOGIN_POLICY}"
+    ),
+}
 
 
 COMPOSIO_APPS: dict[str, ComposioApp] = {
@@ -279,6 +314,7 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_field="user_id",
         identity_params=(),
         identity_id_pattern=_SALESFORCE_USER_ID_RE,
+        connect_guidance=SALESFORCE_CONNECT_GUIDANCE,
     ),
 }
 
@@ -342,6 +378,15 @@ def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
     if app is None or app.provider != provider.lower() or not _uses_composio(app):
         return None
     return app
+
+
+def connect_guidance(provider: str, app_id: str | None) -> dict[str, str] | None:
+    """The app's connect guidance while its new connects go through
+    Composio; None otherwise, so a catalog entry can leave the field out."""
+    app = composio_app(provider, app_id)
+    if app is None or app.connect_guidance is None:
+        return None
+    return dict(app.connect_guidance)
 
 
 def _uses_composio(app: ComposioApp) -> bool:

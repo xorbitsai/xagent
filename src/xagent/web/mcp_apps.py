@@ -395,6 +395,15 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     account_host = get_oauth_account_host(execution_fields["provider_name"])
     if account_host is not None and app_dict["auth_type"] == "builtin_oauth":
         app_dict["oauth_account_input"] = account_host.input_metadata()
+    # Only while the app's actor connect goes through Composio (Salesforce:
+    # an org admin must install Composio's app first), so every other entry,
+    # and Salesforce's while native, is unchanged.
+    if app_dict["auth_type"] == "builtin_oauth":
+        from .composio_auth import connect_guidance
+
+        guidance = connect_guidance(execution_fields["provider_name"] or "", app.app_id)
+        if guidance is not None:
+            app_dict["connect_guidance"] = guidance
     return app_dict
 
 

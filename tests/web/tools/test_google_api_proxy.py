@@ -14,61 +14,14 @@ import pytest
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from tests.web.tools.conftest import (
+    ACCOUNT_ID,
+    API_KEY,
+    COMPOSIO_USER,
+    GMAIL_HOSTS,
+    _Response,
+)
 from xagent.web.tools.mcp import composio_proxy, google_api_proxy
-
-API_KEY = "test-composio-api-key-value"
-ACCOUNT_ID = "ca_gmail_account_1"
-COMPOSIO_USER = "xagent-0123456789abcdef"
-GMAIL_HOSTS = ("gmail.googleapis.com",)
-
-
-class _Response:
-    def __init__(self, status_code: int, payload: Any = None) -> None:
-        self.status_code = status_code
-        self._payload = payload
-
-    def json(self) -> Any:
-        if self._payload is None:
-            raise ValueError("no JSON body")
-        return self._payload
-
-
-class FakeProxy:
-    """Answers by endpoint substring; records every proxy payload."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-        self.by_endpoint: list[tuple[str, _Response]] = []
-        self.default = _Response(200, {"status": 200, "data": {}})
-        self.lock = threading.Lock()
-
-    def answer(self, needle: str, status: int, data: Any = None) -> None:
-        self.by_endpoint.append(
-            (needle, _Response(200, {"status": status, "data": data}))
-        )
-
-    def answer_with(self, status_code: int, payload: Any) -> None:
-        self.default = _Response(status_code, payload)
-
-    def request(self, **kwargs: Any) -> _Response:
-        assert kwargs["url"] == composio_proxy.COMPOSIO_PROXY_URL
-        payload = kwargs["json"]
-        with self.lock:
-            self.calls.append(payload)
-        for needle, response in self.by_endpoint:
-            if needle in payload["endpoint"]:
-                return response
-        return self.default
-
-
-@pytest.fixture
-def proxy(monkeypatch) -> FakeProxy:
-    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
-    fake = FakeProxy()
-    monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
-    return fake
 
 
 def _http() -> google_api_proxy.GoogleApiProxyHttp:
@@ -124,6 +77,23 @@ def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
     assert "body" not in call
     assert {"name": "q", "value": long_query, "type": "query"} in call["parameters"]
     assert all(item["name"] != "content-type" for item in call["parameters"])
+
+
+def test_a_long_get_keeps_its_repeated_parameters(proxy):
+    """The form body googleapiclient moves a long GET's query into keeps a
+    repeated parameter as its pairs; restoring the GET must not collapse them
+    into one."""
+    _gmail_service().users().messages().list(
+        userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]
+    ).execute()
+
+    (call,) = proxy.calls
+    assert call["method"] == "GET"
+    assert "body" not in call
+    assert [item for item in call["parameters"] if item["name"] == "labelIds"] == [
+        {"name": "labelIds", "value": "INBOX", "type": "query"},
+        {"name": "labelIds", "value": "STARRED", "type": "query"},
+    ]
 
 
 def test_only_headers_that_change_the_answer_are_forwarded(proxy):
@@ -200,28 +170,38 @@ def test_a_no_content_answer_has_an_empty_body(proxy):
 
     assert response.status == 204
     assert content == b""
+    assert response["content-type"] == "application/json; charset=UTF-8"
 
 
 @pytest.mark.parametrize(
-    "data, expected, content_type",
-    [
-        ("%PDF-1.4 bytes", b"%PDF-1.4 bytes", "text/plain; charset=UTF-8"),
-        (b"%PDF-1.4 bytes", b"%PDF-1.4 bytes", "application/octet-stream"),
-        (None, b"", "application/json; charset=UTF-8"),
-    ],
-    ids=["text", "bytes", "empty"],
+    "answer",
+    [{"status": 200}, {"status": 200, "data": None}],
+    ids=["absent", "null"],
 )
-def test_a_non_json_answer_is_returned_as_bytes(proxy, data, expected, content_type):
+def test_a_200_without_a_body_is_refused(proxy, answer):
+    """Gmail answers an empty success with 204, so a 200 with neither a body
+    nor a file is an incomplete answer and fails this request here. The
+    shared client leaves that rule to each API: Salesforce (#3669) reads the
+    same answer as ``{}``."""
+    proxy.answer_with(200, answer)
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        _http().request("https://gmail.googleapis.com/gmail/v1/users/me/labels")
+
+    assert "without the provider's data" in str(raised.value)
+
+
+def test_a_text_answer_is_returned_as_bytes(proxy):
     """A later media download reuses this transport; its answer may not be
     JSON."""
-    proxy.answer_with(200, {"status": 200, "data": data})
+    proxy.answer_with(200, {"status": 200, "data": "%PDF-1.4 bytes"})
 
     response, content = _http().request(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/x"
     )
 
-    assert content == expected
-    assert response["content-type"] == content_type
+    assert content == b"%PDF-1.4 bytes"
+    assert response["content-type"] == "text/plain; charset=UTF-8"
 
 
 def test_an_upstream_error_keeps_its_status_and_body(proxy):
@@ -462,6 +442,76 @@ def test_one_composio_failure_does_not_lose_the_other_requests(proxy):
     assert seen[0][1] == {"id": "m1"}
     assert isinstance(seen[1][2], composio_proxy.ComposioProxyError)
     assert _secrets_in(str(seen[1][2])) == []
+
+
+def test_a_200_with_a_null_body_fails_only_its_request(proxy):
+    """Composio answers ``{"status": 200, "data": null}`` for an empty 2xx
+    body. That is no body at all, not a 0-byte JSON document: it must reach
+    its own callback as a Composio error, not escape and lose the batch."""
+    proxy.answer("/messages/m1", 200, {"id": "m1"})
+    proxy.answer("/messages/m2", 200, None)
+    proxy.answer("/messages/m3", 200, {"id": "m3"})
+    seen: list[tuple[str, Any, Any]] = []
+
+    def callback(request_id, response, exception):
+        seen.append((request_id, response, exception))
+
+    google_api_proxy.execute_batch(
+        _added_batch(_gmail_service(), ["m1", "m2", "m3"], callback)
+    )
+
+    assert [item[0] for item in seen] == ["1", "2", "3"]
+    assert seen[0][1] == {"id": "m1"}
+    assert seen[1][1] is None
+    assert isinstance(seen[1][2], composio_proxy.ComposioProxyError)
+    assert "without the provider's data" in str(seen[1][2])
+    assert seen[2][1] == {"id": "m3"}
+
+
+def test_a_postproc_error_fails_only_its_request(proxy):
+    """``postproc`` runs after every request has been sent. An error there
+    used to escape and leave the remaining callbacks uncalled."""
+    proxy.answer("/messages/m1", 200, {"id": "m1"})
+    proxy.answer("/messages/m3", 200, {"id": "m3"})
+    seen: list[tuple[str, Any, Any]] = []
+
+    def callback(request_id, response, exception):
+        seen.append((request_id, response, exception))
+
+    def postproc(resp, content):
+        raise ValueError("not a result")
+
+    batch = _added_batch(_gmail_service(), ["m1", "m2", "m3"], callback)
+    batch._requests["2"].postproc = postproc
+
+    google_api_proxy.execute_batch(batch)
+
+    assert [item[0] for item in seen] == ["1", "2", "3"]
+    assert seen[0][1] == {"id": "m1"}
+    assert seen[1][1] is None
+    assert isinstance(seen[1][2], ValueError)
+    assert seen[2][1] == {"id": "m3"}
+
+
+def test_a_callback_that_raises_mid_batch_is_not_swallowed(proxy):
+    """A native batch lets a callback's exception propagate; the fallback
+    does the same instead of hiding a connector's own bug and silently
+    dropping that request."""
+    proxy.answer("/messages/m1", 200, {"id": "m1"})
+    proxy.answer("/messages/m3", 200, {"id": "m3"})
+    seen: list[str] = []
+
+    def callback(request_id, response, exception):
+        seen.append(request_id)
+        if request_id == "2":
+            raise RuntimeError("the callback itself failed")
+
+    with pytest.raises(RuntimeError, match="the callback itself failed"):
+        google_api_proxy.execute_batch(
+            _added_batch(_gmail_service(), ["m1", "m2", "m3"], callback)
+        )
+
+    assert seen == ["1", "2"]
 
 
 def test_a_batch_with_no_requests_sends_nothing(proxy):
@@ -781,6 +831,21 @@ def test_a_batch_above_the_request_cap_is_refused_before_sending(proxy):
         google_api_proxy.execute_batch(
             _added_batch(_gmail_service(), ids, lambda *_args: None)
         )
+
+    assert proxy.calls == []
+
+
+def test_a_batch_object_without_the_private_attributes_is_refused_clearly(proxy):
+    """``pyproject.toml`` sets only a lower bound for
+    google-api-python-client, and the fallback reads private attributes. A
+    release that renames one must not surface as an opaque AttributeError on
+    every search."""
+
+    class OpaqueBatch:
+        pass
+
+    with pytest.raises(RuntimeError, match="missing _order"):
+        google_api_proxy.execute_batch(OpaqueBatch())
 
     assert proxy.calls == []
 

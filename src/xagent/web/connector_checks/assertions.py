@@ -133,7 +133,7 @@ def value_at(raw: Any, payload: PayloadSource, path: PayloadPath) -> Any:
         value = _payload(raw, payload)
     except _NoPayload:
         return MISSING
-    return _at(value, path)
+    return at_path(value, path)
 
 
 def json_equal(actual: Any, expected: Any) -> bool:
@@ -194,7 +194,8 @@ def _parse(text: str) -> Any:
         return _MISSING
 
 
-def _at(value: Any, path: PayloadPath) -> Any:
+def at_path(value: Any, path: PayloadPath) -> Any:
+    """The value at ``path`` in ``value``, or ``MISSING``."""
     for segment in path:
         if isinstance(segment, str):
             if not isinstance(value, Mapping) or segment not in value:
@@ -211,7 +212,7 @@ def _holds(assertion: Assertion, payload: Any) -> bool:
     if isinstance(assertion, L3Envelope):
         # The declaration rules make it a check's only assertion.
         raise TypeError("L3Envelope must be a check's only assertion")
-    value = _at(payload, assertion.path)
+    value = at_path(payload, assertion.path)
     if value is _MISSING:
         return False
     if isinstance(assertion, HasKeys):

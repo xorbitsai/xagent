@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import base64
 import json
+import random
+import time
 from typing import Any
 
 import pytest
@@ -277,6 +279,30 @@ def test_a_long_composio_message_is_cut_after_redaction(proxy):
     assert API_KEY[:kept] not in text
 
 
+def test_a_request_with_a_body_cuts_only_after_the_secret_is_redacted(proxy):
+    """The decoded-body pass truncates the text before it runs; the launch
+    secrets must already be gone when that happens, or a key across the cut
+    would keep its prefix."""
+    prefix = "Composio proxy request failed with HTTP 400: "
+    kept = 8
+    padding = "x" * (composio_proxy.MAX_ERROR_TEXT_CHARS - len(prefix) - kept)
+    proxy.response = _Response(
+        400, {"error": {"message": padding + API_KEY + "y" * 2000}}
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"name": "a body that keeps the decoded pass in play"},
+        )
+
+    text = str(raised.value)
+    assert API_KEY[:kept] not in text
+    assert API_KEY not in text
+
+
 def test_a_query_mapping_sends_each_name_and_value(proxy):
     composio_proxy.proxy_request(
         "GET",
@@ -527,19 +553,26 @@ def test_a_per_call_body_limit_overrides_the_shared_default(proxy):
     assert proxy.calls == []
 
 
-def test_a_successful_answer_without_data_or_binary_data_is_a_composio_error(proxy):
-    """A truncated 2xx used to reach a callback and fail opaquely there; with
-    neither a body nor a file there is nothing to return."""
-    proxy.response = _Response(200, {"status": 200})
+@pytest.mark.parametrize(
+    "answer",
+    [{"status": 200}, {"status": 200, "data": None}],
+    ids=["absent", "null"],
+)
+def test_a_successful_answer_without_data_is_returned_as_no_body(proxy, answer):
+    """Composio's schema makes ``data`` optional and nullable. Whether an
+    empty 2xx is a complete answer is the connector's own API's rule:
+    Salesforce (#3669) reads it as ``{}``, while Gmail refuses it in its
+    transport. The shared client only reports that there is no body."""
+    proxy.response = _Response(200, answer)
 
-    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
-        composio_proxy.proxy_request(
-            "GET",
-            "https://gmail.googleapis.com/gmail/v1/users/me/labels",
-            allowed_hosts=GMAIL_HOSTS,
-        )
+    response = composio_proxy.proxy_request(
+        "GET",
+        "https://gmail.googleapis.com/gmail/v1/users/me/labels",
+        allowed_hosts=GMAIL_HOSTS,
+    )
 
-    assert "without the provider's data" in str(raised.value)
+    assert response.status == 200
+    assert response.data is None
 
 
 def test_a_redirect_without_data_is_still_a_provider_answer(proxy):
@@ -714,3 +747,663 @@ def test_an_error_that_echoes_the_decoded_message_hides_its_content(proxy):
     text = str(raised.value)
     assert "DECODED-ECHO-SUBJECT" not in text
     assert "DECODED-BODY-MARKER" not in text
+
+
+def test_a_decoded_fragment_across_the_cut_is_redacted_whole(proxy):
+    """A decoded body line can cross the cut. Cutting the text before the
+    per-line pass used to keep the line's visible prefix."""
+    line = "BODY-MARKER-" + "x" * 1188
+    raw = base64.urlsafe_b64encode(b"Subject: x\r\n\r\n" + line.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": f"invalid body {line}"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert line[:80] not in text
+    assert "x" * 100 not in text
+
+
+def test_a_decoded_fragment_that_contains_a_token_is_redacted_whole(proxy):
+    """Redacting the token first rewrites the fragment, so the decoded line
+    used to survive with only the token masked. The line must be gone in the
+    form redaction leaves it too."""
+    line = "please read the Bearer sk-secret-token-value section in this mail"
+    raw = base64.urlsafe_b64encode(b"Subject: x\r\n\r\n" + line.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": f"invalid body {line}"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "please read the" not in text
+    assert "section in this mail" not in text
+    assert "[redacted]" in text
+
+
+def test_a_short_decoded_fragment_near_the_cut_leaves_one_marker(proxy):
+    """Cutting the text once in the body pass and again in the error made the
+    tail read ``...[truncated...[truncated]`` when a short fragment near the
+    cut shortened the kept text."""
+    prefix = "Composio proxy request failed with HTTP 400: "
+    fragment = "DECODED-FRAGMENT-1234"
+    message = prefix + "z" * (979 - len(prefix)) + fragment + "y" * 500
+    raw = base64.urlsafe_b64encode(
+        b"Subject: x\r\n\r\n" + f"{fragment}\r\n{'p' * 100}".encode()
+    ).decode()
+    proxy.response = _Response(400, {"error": {"message": message[len(prefix) :]}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert fragment not in text
+    assert text.endswith("...[truncated]")
+    assert text.count("truncat") == 1
+
+
+def test_a_large_decoded_body_is_redacted_from_a_truncated_error_text(proxy):
+    """Only the part of the decoded content that can reach the kept text is
+    scanned. A 4.5 MB message decodes to tens of thousands of lines, and each
+    one used to run a ``replace`` over the whole untruncated text. The lines
+    that do show must still be gone, including one across the cut and one
+    whose token redaction rewrote."""
+    cross_cut = "CROSS-CUT-MARKER-" + "x" * 1188
+    token_line = "please read the Bearer sk-secret-token-value section in this mail"
+    lines = [f"attachment-line-{number:05d}-{'x' * 40}" for number in range(20000)]
+    raw = base64.urlsafe_b64encode(
+        b"Subject: long body\r\n\r\n"
+        + f"{cross_cut}\r\n{token_line}\r\n".encode()
+        + "\r\n".join(lines).encode()
+    ).decode()
+    # The error text repeats some of the decoded content, not the whole
+    # message, so the body fragment itself is not what redacts it.
+    proxy.response = _Response(
+        400,
+        {
+            "error": {
+                "message": "invalid body "
+                + token_line
+                + " "
+                + cross_cut
+                + " "
+                + "y" * 1_000_000
+            }
+        },
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "please read the" not in text
+    assert "section in this mail" not in text
+    assert cross_cut[:80] not in text
+    assert len(text) == composio_proxy.MAX_ERROR_TEXT_CHARS + len("...[truncated]")
+    assert elapsed < 1.0, "the decoded pass must not scan the whole message per line"
+
+
+def test_a_long_recipient_header_does_not_pull_the_body_into_view(proxy):
+    """A group send keeps its recipients on one very long ``To:`` line. When
+    the vendor echoes the decoded message, redacting that line shortened the
+    text in front of the body, which then started after the kept window: the
+    body used to be pulled into the error as a whole."""
+    recipients = ",".join(f"user{index:02d}@example.com" for index in range(70))
+    body_lines = [
+        f"BODY-LINE-{number}-" + marker * 40 for number, marker in enumerate("bcd")
+    ]
+    decoded = (
+        f"To: {recipients}\r\n"
+        "Subject: group send\r\n"
+        "MIME-Version: 1.0\r\n"
+        "\r\n" + "\r\n".join(body_lines)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": "invalid body " + decoded}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "user00@example.com" not in text
+    assert "user69@example.com" not in text
+    assert all(line not in text for line in body_lines)
+    assert "[redacted]" in text
+
+
+def test_a_truncated_decoded_echo_does_not_pull_later_lines_into_view(proxy):
+    """The vendor can echo only the start of the decoded body. Redacting the
+    echoed lines shortened the text, and lines that were never echoed into
+    the kept window before were pulled in as whole lines."""
+    lines = [f"SECRET-BODY-LINE-{number:03d}-" + "x" * 22 for number in range(100)]
+    raw = base64.urlsafe_b64encode(
+        b"Subject: x\r\n\r\n" + "\r\n".join(lines).encode()
+    ).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\r\n".join(lines[:40])}}
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert all(line not in text for line in lines)
+    assert "[redacted]" in text
+
+
+def test_a_normalised_decoded_echo_does_not_pull_later_lines_into_view(proxy):
+    """The vendor can echo the decoded body with LF line endings. The whole
+    body then no longer matches and each line is replaced on its own, which
+    shortens the text and used to pull the later lines into view."""
+    lines = [f"SECRET-BODY-LINE-{number:03d}-" + "x" * 22 for number in range(100)]
+    raw = base64.urlsafe_b64encode(
+        b"Subject: x\r\n\r\n" + "\r\n".join(lines).encode()
+    ).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\n".join(lines)}}
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert all(line not in text for line in lines)
+    assert len(text) == composio_proxy.MAX_ERROR_TEXT_CHARS + len("...[truncated]")
+
+
+def test_a_decoded_body_of_repeated_short_lines_is_looked_at_once(proxy):
+    """A body of identical short lines (an attachment's base64 padding, for
+    one) yields tens of thousands of the same fragment. One ``find`` and one
+    ``redact`` per line made this take over a second; each distinct fragment
+    must be looked at once."""
+    decoded = "Subject: perf\r\n\r\n" + "\r\n".join(["x" * 8] * 20000) + "\r\n"
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": "invalid body " + decoded}})
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "x" * 8 not in text
+    assert elapsed < 0.5, "the pass must look at each distinct fragment once"
+
+
+def test_a_body_of_same_prefix_lines_is_looked_up_by_length(proxy):
+    """The lookup's worst shape: thousands of distinct lines that all open
+    with the same 32 characters, and a vendor that echoes only the first 100
+    of them. Every position inside a matched line used to try every fragment
+    that shared that opening -- about 2.5 million ``startswith`` calls for
+    this echo. A bucket must cost one lookup per distinct length, not one per
+    fragment."""
+    lines = ["X" * 894 + f"{number:06d}" for number in range(2800)]
+    decoded = "Subject: many\r\n\r\n" + "\r\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\n".join(lines[:100])}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert lines[0][:200] not in text
+    assert "X" * 100 not in text
+    assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
+
+
+@pytest.mark.parametrize("prefix_len", [45, 76])
+def test_a_partial_echo_of_same_prefix_lines_is_looked_up_by_length(proxy, prefix_len):
+    """The same bucket when the vendor echoes only the start of the decoded
+    body: the whole-body fragment no longer matches and every line is looked
+    up on its own. 20k lines sharing a 45- or 76-character opening used to
+    cost a scan over the whole bucket at every position."""
+    lines = ["A" * prefix_len + f"{number:05d}" + "y" * 20 for number in range(20000)]
+    decoded = "Subject: perf\r\n\r\n" + "\r\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + decoded[:6000]}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
+
+
+@pytest.mark.parametrize("header_len", [900, 1000, 1001, 1200])
+def test_a_fragment_that_starts_inside_a_long_match_keeps_no_tail(proxy, header_len):
+    """A vendor's echo can put the start of a body line inside a very long
+    ``To:`` value and let the line run past the value's end. A match longer
+    than the kept text used to be skipped whole, which left the rest of that
+    line in view; the scan now starts at the last kept-text worth of
+    characters of the match, so a line that overlaps its end is merged into
+    one region. 900 and 1000 are the controls that the old scan already
+    covered."""
+    header = "A" * header_len
+    tail = "EDGE-TAIL-SECRET-" + "z" * 280
+    body_line = "A" * 500 + tail
+    decoded = f"To: {header}\r\nSubject: edge\r\nMIME-Version: 1.0\r\n\r\n{body_line}"
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + header + tail}}
+    )
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "EDGE-TAIL-SECRET-" not in text
+    assert "z" * 100 not in text
+
+
+def test_a_body_of_distinct_lengths_echoed_from_its_tail_is_bounded(proxy):
+    """A body whose lines share one opening *and* have 1000 different lengths,
+    echoed from its end: every match is just over the kept text, so the scan
+    walks the full window at every one of them. The same body echoed from its
+    start cost 0.8 s here and its end cost 12.7 s; the work the pass may
+    spend is counted, so the tail echo is bounded like the others."""
+    lines = ["A" * 32 + "A" * index + "z" for index in range(1000)]
+    decoded = "Subject: w\r\n\r\n" + "\r\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\r\n".join(lines[-100:])}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "distinct lengths must not multiply the work per match"
+
+
+@pytest.mark.parametrize("line_count", [100, 200, 400, 800, 1000, 1600])
+def test_a_body_of_long_lines_with_distinct_lengths_is_bounded(proxy, line_count):
+    """The same shape with lines just over the kept text (1000..2599
+    characters, 0.14..3.8 MB of raw) and one distinct length per line, so
+    every match costs the full scan window rather than its own length. The
+    cost rose with the number of lengths here: 6.8 s at 200, 81 s at 1600.
+    At 100 the echo is the whole body, so it matched in one region there.
+    The counted work has to cut every count short with the rest of the text
+    hidden, and no line may stay visible."""
+    lines = ["A" * (1000 + index - 12) + f"{index:012d}" for index in range(line_count)]
+    decoded = "Subject: w\r\n\r\n" + "\r\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\r\n".join(lines[:100])}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines[:100] if line in text]
+    assert elapsed < 1.0, (
+        "a long match must not turn distinct lengths into unbounded work"
+    )
+
+
+def test_a_pass_that_runs_out_of_its_work_hides_the_rest(proxy, monkeypatch):
+    """The work allowance is a counted bound, not a clock: when the next
+    comparison does not fit, everything after it is dropped behind one
+    marker. The marker after a 3000-character match is what a growing region
+    would otherwise leave in view.
+
+    The preparation of the fragment spends the same allowance, so the
+    allowance here is that preparation (its length and the fixed charge) plus
+    enough for the match itself but not for walking its region."""
+    preparation = 3000 + composio_proxy._FRAGMENT_PREP_CHARS
+    monkeypatch.setattr(
+        composio_proxy, "_MAX_REDACTION_WORK", preparation + 6000, raising=False
+    )
+    message = "invalid body " + "A" * 3000 + "AFTER-THE-MATCH-SECRET"
+    decoded = "Subject: w\r\n\r\n" + "A" * 3000
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": message}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "invalid body " in text
+    assert "AFTER-THE-MATCH-SECRET" not in text
+    assert "A" * 100 not in text
+
+
+def test_a_pass_with_enough_work_keeps_the_text_after_a_long_match(proxy):
+    """The control for the allowance above: with the shipped budget the same
+    message is scanned, the match is replaced, and the text after it stays."""
+    message = "invalid body " + "A" * 3000 + "AFTER-THE-MATCH-KEPT"
+    decoded = "Subject: w\r\n\r\n" + "A" * 3000
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": message}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "AFTER-THE-MATCH-KEPT" in text
+    assert "A" * 100 not in text
+
+
+def test_a_growing_region_that_spends_the_work_hides_the_rest(proxy, monkeypatch):
+    """A run that a fragment keeps extending walks its region until the work
+    allowance is gone, then takes the rest of the text as one region. The
+    later marker must not survive; the shorter allowance only makes the bound
+    deterministic, it must never leave fragment text in view."""
+    monkeypatch.setattr(composio_proxy, "_MAX_REDACTION_WORK", 1_000_000, raising=False)
+    message = "invalid body " + "A" * 40_000 + "\r\nLATE-BODY-SECRET-0123456789"
+    decoded = "Subject: w\r\n\r\n" + "A" * 2000 + "\r\n" + "A" * 1001
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": message}})
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "LATE-BODY-SECRET-0123456789" not in text
+    assert "A" * 100 not in text
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize("rewrite", ["lf", "crlf", "double-blank", "indent"])
+def test_random_bodies_of_distinct_lengths_stay_bounded(proxy, rewrite):
+    """A fixed-seed sweep over the shapes the pass used to be slow on: bodies
+    whose lines share a 40-character opening and have random lengths, echoed
+    with the line endings and indentation a vendor may add. None of the
+    lines may stay visible, and each pass has to stay inside the bound."""
+    rng = random.Random(20261110)
+    for case, (low, high, count) in enumerate(
+        ((200, 4000, 120), (900, 1100, 300), (64, 5000, 200))
+    ):
+        widths = [rng.randint(low, high) for _ in range(count)]
+        lines = [
+            "Q" * 40 + f"{case}{index:04d}" + "d" * (width - 46)
+            for index, width in enumerate(widths)
+        ]
+        decoded = "Subject: random\r\n\r\n" + "\r\n".join(lines)
+        raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+        echo = {
+            "lf": decoded.replace("\r\n", "\n"),
+            "crlf": decoded.replace("\n", "\r\n"),
+            "double-blank": decoded.replace("\n", "\n\n"),
+            "indent": "\n".join("  " + line for line in decoded.split("\n")),
+        }[rewrite]
+        proxy.response = _Response(400, {"error": {"message": "invalid body " + echo}})
+
+        started = time.monotonic()
+        with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+            composio_proxy.proxy_request(
+                "POST",
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                allowed_hosts=GMAIL_HOSTS,
+                body={"raw": raw},
+            )
+        elapsed = time.monotonic() - started
+
+        text = str(raised.value)
+        assert not [line for line in lines if line in text]
+        assert elapsed < 1.0, f"{rewrite} case {case} took {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("line_count", [100, 200])
+def test_a_hand_written_body_of_long_lines_echoed_with_lf_is_bounded(proxy, line_count):
+    """A hand-written MIME body whose lines are all just over the kept text
+    (5,001..5,600 characters) and all a different length, echoed with LF
+    endings. Every line matches near its start, so the scan walks its whole
+    window at each one and the lookup tries every distinct length that shares
+    the opening: 100 and 200 of them cost 12.2 s and 25.0 s here. The counted
+    allowance has to cut both, and no line may stay visible."""
+    lines = ["A" * (length - 1) + "z" for length in range(5001, 5001 + line_count)]
+    decoded = (
+        "To: a@example.com\r\nSubject: bench\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: text/plain; charset="utf-8"\r\n'
+        "Content-Transfer-Encoding: 7bit\r\n\r\n" + "\r\n".join(lines)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + decoded.replace("\r\n", "\n")}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "distinct long lengths must not multiply the work"
+
+
+def test_a_long_run_echoed_over_long_lines_stays_bounded(proxy):
+    """The same hand-written body at 600 lines, a 5,000-character ``To`` value
+    and an echo that is one 4 MB run of ``A``. The run keeps growing the
+    region over the ``To`` match while every line length shares the opening,
+    which cost 8.6 s here. The allowance has to cut it, and neither the run
+    nor a line of the body may stay visible."""
+    lines = ["A" * (length - 1) + "z" for length in range(5001, 5601)]
+    decoded = (
+        "To: " + "A" * 5000 + "\r\nSubject: bench\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: text/plain; charset="utf-8"\r\n'
+        "Content-Transfer-Encoding: 7bit\r\n\r\n" + "\r\n".join(lines)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "A" * 4_000_000}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "A" * 100 not in text
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "a growing run must not multiply the work"
+
+
+# A decoded body of the shortest lines the pass still treats as content (8
+# characters, 9 bytes with the newline) carries the most fragments a send can:
+# 4.5 MB of ``raw`` decodes to 3.375 MB, so about 375k lines fit.
+_SHORT_LINE_COUNT = 366_666
+
+
+def _captured_index(monkeypatch) -> dict[str, Any]:
+    """The index one pass builds, so a test can read what it spent."""
+    box: dict[str, Any] = {}
+    real = composio_proxy._fragment_index
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        index = real(*args, **kwargs)
+        box["index"] = index
+        return index
+
+    monkeypatch.setattr(composio_proxy, "_fragment_index", capture)
+    return box
+
+
+@pytest.mark.parametrize("echo", [False, True])
+def test_a_body_cut_into_short_lines_pays_for_its_preparation(proxy, monkeypatch, echo):
+    """The part of the pass before the scan -- decoding, the fragments, their
+    redacted forms and the index -- was outside the work allowance: this body
+    (a 4.4 MB send, inside the payload limit) spent 0.74 s there with a
+    one-line error while the allowance had not been touched at all (2,029 of
+    15,000,000), and 0.79 s with the whole body echoed.
+
+    Every distinct fragment now pays its length and a fixed charge from the
+    same allowance, and a fragment's redacted form is only looked up when the
+    text it came from carried a secret, which is what 0.17 s and 0.21 s here
+    buy. A one-line error must still be shown; an echo of the whole body must
+    not leave a line of it."""
+    lines = ["DD" + f"{number:06d}" for number in range(_SHORT_LINE_COUNT)]
+    decoded = "Subject: short lines\r\n\r\n" + "\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    detail = "invalid body " + decoded if echo else "invalid argument"
+    proxy.response = _Response(400, {"error": {"message": detail}})
+    box = _captured_index(monkeypatch)
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    if echo:
+        assert "DD000000" not in text
+        assert lines[-1] not in text
+        assert not [line for line in lines[:200] if line in text]
+    else:
+        assert text.endswith("invalid argument")
+    assert elapsed < 1.0, "the preparation must be part of the counted allowance"
+    # This message's fragments are its body and each of its lines, and the
+    # preparation charges every one of them its own length, so a pass that
+    # charges it has spent at least the decoded text plus its lines. A pass
+    # that charged the scan alone spent 1,953 here without an echo and
+    # 3,341,039 with one.
+    spent = composio_proxy._MAX_REDACTION_WORK - box["index"].work.left
+    assert spent >= len(decoded) + sum(map(len, lines))
+
+
+def test_a_pass_that_runs_out_preparing_hides_the_whole_text(proxy, monkeypatch):
+    """The preparation spends the same allowance as the scan, and it runs
+    first. When the fragments cannot even be charged for, nothing has been
+    looked for yet, so the whole error text goes behind one marker -- more
+    redaction, never less."""
+    monkeypatch.setattr(composio_proxy, "_MAX_REDACTION_WORK", 100, raising=False)
+    decoded = "Subject: x\r\n\r\n" + "\r\n".join(
+        f"BODY-LINE-{number:04d}" for number in range(100)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": "invalid argument"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    # Nothing of the text is kept, not even the status line: the allowance was
+    # gone before a single position could be looked at.
+    assert text == "[redacted]"
+    assert "invalid argument" not in text
+    assert "BODY-LINE-0000" not in text

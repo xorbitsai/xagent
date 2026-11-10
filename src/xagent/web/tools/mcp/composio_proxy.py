@@ -27,6 +27,7 @@ Composio echoes back (a Gmail message's body and attachments travel in it).
 from __future__ import annotations
 
 import base64
+import bisect
 import json
 import logging
 import os
@@ -60,9 +61,10 @@ _REDACTED = "[redacted]"
 # A provider token can be echoed back in an error the proxy relays (for
 # example an upstream Authorization header). Its value is not a launch
 # variable we know, so it is redacted by shape: a Bearer credential, or a
-# Google access token's ``ya29.`` prefix.
-_BEARER_TOKEN_RE = re.compile(r"\bBearer\s+[^\s\"',;]+", re.IGNORECASE)
-_GOOGLE_ACCESS_TOKEN_RE = re.compile(r"\bya29\.[A-Za-z0-9._-]+")
+# Google access token's ``ya29.`` prefix. One pattern, so a multi-megabyte
+# error text is scanned once instead of twice; the case-insensitive part is
+# scoped to the Bearer word, so a ``YA29.`` value keeps no special meaning.
+_TOKEN_RE = re.compile(r"(?i:\bBearer\s+[^\s\"',;]+)|\bya29\.[A-Za-z0-9._-]+")
 # A JSON body member that carries a message: the ``raw`` of a Gmail message
 # is base64, so a vendor echoing the request body leaks the body and the
 # attachments. Redacted by shape too, in case the echo re-encodes it. A
@@ -119,8 +121,9 @@ class ProxyResponse:
     carries ``location`` there). A binary answer puts its bytes in
     ``binary_data`` (``url``, ``content_type``, ``size``) and ``data`` is
     null or absent: Composio stores the file and returns a signed URL, it
-    never relays the bytes in ``data``. ``data`` is optional in Composio's
-    schema, so ``None`` means no body, not a malformed answer.
+    never relays the bytes in ``data``. ``data`` is optional and nullable in
+    Composio's schema, so ``None`` means no body; whether an empty 2xx is a
+    complete answer is the provider's own API's rule, not this client's.
     """
 
     status: int
@@ -135,8 +138,9 @@ class ProxyResponse:
 
 class ComposioProxyError(RuntimeError):
     """Composio itself refused or failed the call; the provider may never
-    have seen it. ``status`` is Composio's HTTP status, None when Composio
-    could not be reached."""
+    have seen it. ``status`` is Composio's HTTP status; None means the
+    failure is not one of those statuses, either because Composio could not
+    be reached or because it answered and the answer was refused here."""
 
     def __init__(
         self, message: str, *, status: int | None = None, slug: str | None = None
@@ -156,8 +160,21 @@ def serves_composio_grant() -> bool:
 def redact(value: Any) -> Any:
     """``value`` with every launch secret and provider token replaced, in
     nested values too."""
-    secrets = [os.environ.get(name) for name in _LAUNCH_SECRET_ENVS]
-    return _redact(value, [secret for secret in secrets if secret])
+    return _redact(value, _launch_secrets())
+
+
+def _launch_secrets() -> list[str]:
+    """The launch variables that are set, read once per use.
+
+    A pass that redacts a value per fragment reads them once and hands the
+    list down: reading three environment variables per fragment is what a
+    decoded body of hundreds of thousands of short lines paid for.
+    """
+    return [
+        secret
+        for secret in (os.environ.get(name) for name in _LAUNCH_SECRET_ENVS)
+        if secret
+    ]
 
 
 def _redact(value: Any, secrets: list[str]) -> Any:
@@ -173,8 +190,22 @@ def _redact(value: Any, secrets: list[str]) -> Any:
 def _redacted_text(value: str, secrets: list[str]) -> str:
     for secret in secrets:
         value = value.replace(secret, _REDACTED)
-    value = _BEARER_TOKEN_RE.sub(f"Bearer {_REDACTED}", value)
-    return _GOOGLE_ACCESS_TOKEN_RE.sub(_REDACTED, value)
+    # Both token shapes carry one of these runs whichever case the Bearer
+    # word is in, so a multi-megabyte error text (or the decoded body's
+    # fragments) is dropped without scanning it with the pattern itself; the
+    # pattern only runs when one of them is there.
+    lowered = value.lower()
+    if "earer" not in lowered and "ya29." not in lowered:
+        return value
+    return _TOKEN_RE.sub(_redacted_token, value)
+
+
+def _redacted_token(match: re.Match[str]) -> str:
+    """A token of either shape, in the form ``redact`` leaves it: a Bearer
+    credential keeps its scheme, a bare access token goes whole."""
+    if match.group(0)[:6].lower() == "bearer":
+        return f"Bearer {_REDACTED}"
+    return _REDACTED
 
 
 def _redact_echoed_body(message: str, body: Any) -> str:
@@ -198,9 +229,440 @@ def _redact_echoed_body(message: str, body: Any) -> str:
     )
     if body is None:
         return message
-    for value in _decoded_mime_fragments(body):
-        message = message.replace(value, _REDACTED)
-    return message
+    # A launch secret or provider token can straddle the cut, so redact them
+    # while the text is still whole. ``ComposioProxyError`` redacts again
+    # before its own cut; this one keeps the fragments below matching the text
+    # the error will show.
+    redacted = redact(message)
+    # A fragment the pass can meet is a piece of this text, so its redacted
+    # form differs from itself only if the text carried a secret or a token.
+    # ``redact`` hands the same string back when it replaced nothing, so the
+    # identity test says whether any fragment has to be looked at twice too;
+    # a replacement that happens to leave the text unchanged also counts,
+    # which is the conservative side. Reading the launch variables and
+    # redacting per fragment is what a body of hundreds of thousands of short
+    # lines paid for, and this is what keeps it to the fragments that can
+    # carry one.
+    redact_fragments = redacted is not message
+    # The decoded content is replaced before the error text is cut: a fragment
+    # that crosses the cut would otherwise keep its visible prefix, and one
+    # whose token ``redact`` rewrote would no longer match at all. The pass
+    # walks the original text in order and stops once it has produced the
+    # text that will be kept, so a replacement cannot shorten the text in
+    # front of a fragment and pull it into the kept text.
+    return _redacted_decoded_fragments(
+        redacted,
+        _decoded_mime_fragments(body),
+        redact_fragments=redact_fragments,
+    )
+
+
+# A decoded fragment is looked up by the characters it opens with and the
+# characters it ends with: a pass over the start of the text costs one key
+# lookup per position instead of one search per fragment, and a bucket of
+# thousands of fragments that share an opening still costs one tail lookup
+# per distinct length instead of one comparison per fragment. A 4.5 MB
+# message decodes to tens of thousands of lines.
+_FRAGMENT_KEY_CHARS = 32
+_FRAGMENT_TAIL_CHARS = 16
+# A fragment at most this long is looked up by hashing the whole slice at the
+# position and testing it against the set of fragments of that length: one
+# C-level hash over a few hundred characters, and exact. A longer fragment is
+# looked up by its opening, length and tail first, because hashing or copying
+# it at every position is what made a multi-megabyte body fragment cost
+# seconds.
+_EXACT_LOOKUP_CHARS = 256
+# How many positions one match is looked through while it grows over the
+# fragments that overlap it. Reaching the limit takes the rest of the text as
+# one region: that redacts more than needed, where stopping would leave
+# fragment text in view.
+_MAX_REGION_SCAN_CHARS = 4 * MAX_ERROR_TEXT_CHARS
+# A long candidate is compared in slices that double up to this size, then in
+# one ``startswith`` over the rest. Charging each slice for the characters it
+# reads keeps the work counted below honest: a 4 MB body fragment that
+# differs from the echo at its first newline costs one 32-character slice,
+# not the whole fragment.
+_MAX_COMPARE_CHARS = 4096
+# The preparation the scan needs spends the same allowance: every distinct
+# fragment is deduplicated, hashed into the index and, if the text still
+# carried a secret, redacted. The first two cost a fixed amount per fragment
+# whatever its length, so each fragment is charged this many characters on top
+# of its own length.
+_FRAGMENT_PREP_CHARS = 8
+# A fragment that has to be looked at for a secret costs one more scan of its
+# own text (a ``replace`` per launch secret, a ``lower`` and the token
+# pattern), which the charge above does not cover; it is charged this many
+# characters on top of its length again.
+_FRAGMENT_REDACT_CHARS = 24
+# What one redaction pass may look at, counted in characters rather than
+# seconds so the same message always costs the same on any machine.
+#
+# The scan pays ``_FRAGMENT_KEY_CHARS`` for the opening of every position it
+# looks at, ``_FRAGMENT_TAIL_CHARS`` for the tail of every long candidate, its
+# own length for every fragment of at most ``_EXACT_LOOKUP_CHARS``, and the
+# characters of every slice it compares. The preparation pays
+# ``_FRAGMENT_PREP_CHARS`` and the fragment's length for every distinct
+# fragment, plus ``_FRAGMENT_REDACT_CHARS`` and its length again for the
+# fragments that have to be redacted.
+#
+# Each term is bounded on its own as well: a region walks at most
+# ``_MAX_REGION_SCAN_CHARS`` positions, a position tries one candidate per
+# distinct length that shares its opening, a comparison stops at the first
+# slice that differs (or at the fragment's length for a real match), and the
+# number of fragments follows from the decoded size: the 4.5 MB payload limit
+# decodes to 3.375 MB, so a body cut into the 8-character lines the pass still
+# treats as content carries at most about 375k fragments. Once the allowance
+# is gone the rest of the text is hidden as one region -- more redaction,
+# never less; in the preparation that means the whole text, because nothing
+# has been looked for yet.
+#
+# It is sized from both ends: every shape this repository's tests and the
+# reference cases used to take a few hundred milliseconds stay exact (the most
+# expensive spends 8.8M of it), and the shapes that took seconds are cut. The
+# largest term this bound has is the preparation of a fragment-dense body:
+# 366,666 short lines spend 9.2M on it and 3.3M on the scan of their whole
+# echo, and the pass takes 0.16-0.21 s here. The report records the
+# measurements.
+_MAX_REDACTION_WORK = 15_000_000
+
+
+class _Work:
+    """The characters one redaction pass may still look at.
+
+    ``left`` goes negative when the next slice does not fit; that is how a
+    caller knows the rest of the text has to be hidden. The allowance is
+    counted, never timed, so a pass costs the same whatever the machine is
+    doing.
+    """
+
+    __slots__ = ("left",)
+
+    def __init__(self, left: int) -> None:
+        self.left = left
+
+
+def _redacted_decoded_fragments(
+    message: str, fragments: list[str], *, redact_fragments: bool = True
+) -> str:
+    """``message`` with every decoded fragment that can reach its kept text
+    removed.
+
+    ``ComposioProxyError`` cuts the text to ``MAX_ERROR_TEXT_CHARS`` after
+    this pass, so the kept text is the first characters of the result. The
+    pass copies the original text in order, replaces a fragment where it
+    starts with one marker, and stops once it has produced that many
+    characters: a character or fragment after that point can never reach the
+    kept text, however much an earlier replacement shortens the text. A
+    fragment that crosses the cut is still met whole, because the scan sees
+    its start.
+
+    ``redact_fragments`` says whether a fragment can also be met in the form
+    ``redact`` leaves it in, because the text has already been redacted. It is
+    True by default: a caller that does not know spends the extra work rather
+    than risk leaving a rewritten fragment in view. Overlapping fragments are
+    replaced as one region, so a shorter match cannot leave the tail of a
+    longer one visible.
+
+    Both the preparation of the fragments and the scan spend the same work
+    allowance (``_MAX_REDACTION_WORK``). When it is gone the rest of the text
+    is dropped behind one marker: a caller's error text may lose context, but
+    no fragment can stay in view. The preparation runs first, so an allowance
+    that runs out there hides the whole text, which is the conservative side:
+    none of the fragments has been looked for yet.
+    """
+    variants, preparation = _decoded_fragment_variants(
+        fragments, redact_fragments=redact_fragments
+    )
+    if preparation > _MAX_REDACTION_WORK:
+        return _REDACTED
+    if not variants:
+        return message
+    index = _fragment_index(variants)
+    # The preparation and the scan share one allowance: what preparing the
+    # fragments cost is taken off the index's before the first lookup.
+    index.work.left -= preparation
+    pieces: list[str] = []
+    kept = 0
+    position = 0
+    size = len(message)
+    while position < size and kept < MAX_ERROR_TEXT_CHARS:
+        length = _fragment_at(message, position, index)
+        if index.work.left < 0:
+            pieces.append(_REDACTED)
+            position = size
+            break
+        if length is None:
+            pieces.append(message[position])
+            kept += 1
+            position += 1
+            continue
+        position = _fragment_region_end(message, position, position + length, index)
+        pieces.append(_REDACTED)
+        kept += len(_REDACTED)
+    if position < size:
+        # The error cuts here anyway; the rest only keeps the cut visible.
+        pieces.append(message[position:])
+    return "".join(pieces)
+
+
+def _decoded_fragment_variants(
+    fragments: list[str], *, redact_fragments: bool = True
+) -> tuple[set[str], int]:
+    """The distinct fragments to look for, including the form ``redact``
+    leaves them in when a fragment can carry a secret, and what preparing them
+    charged the pass's allowance.
+
+    The preparation is part of the pass, so it pays from the same allowance:
+    every distinct fragment is charged its own length and
+    ``_FRAGMENT_PREP_CHARS`` for the deduplication, the hash and its index
+    entry, and one that has to be redacted pays ``_FRAGMENT_REDACT_CHARS`` and
+    its length again. A decoded body of hundreds of thousands of short lines
+    used to run ``redact`` -- three environment reads and three ``replace`` --
+    once per fragment, which the allowance did not cover at all.
+
+    The fixed charge is taken for the whole set at once: taking it per
+    fragment in Python is itself a loop over every fragment, which is the cost
+    this is meant to bound. A charge above the allowance stops the walk and
+    goes back to the caller, which hides the whole text: nothing has been
+    looked for yet.
+    """
+    variants = set(fragments)
+    variants.discard("")
+    if not variants:
+        return variants, 0
+    charged = sum(map(len, variants)) + len(variants) * _FRAGMENT_PREP_CHARS
+    if charged > _MAX_REDACTION_WORK or not redact_fragments:
+        return variants, charged
+    secrets = _launch_secrets()
+    for fragment in list(variants):
+        charged += len(fragment) + _FRAGMENT_REDACT_CHARS
+        if charged > _MAX_REDACTION_WORK:
+            return variants, charged
+        redacted = _redacted_text(fragment, secrets)
+        if redacted != fragment:
+            variants.add(redacted)
+    return variants, charged
+
+
+@dataclass(frozen=True)
+class _KeyBucket:
+    """The long fragments that open with one key.
+
+    ``lengths`` is sorted and each entry of ``tails`` maps the characters a
+    fragment of that length ends with to the fragments themselves. A
+    candidate at a position can only match if its opening, its length and its
+    closing characters all match, so one lookup in ``tails`` rules out every
+    fragment whose middle differs; only the survivors are compared whole.
+    Thousands of long lines that share an opening therefore cost one tail
+    lookup per position, not one comparison per line. The value is a single
+    string unless several fragments of that length share both the opening and
+    the closing characters; those are decided by one exact lookup in
+    ``_FragmentIndex.by_length``.
+    """
+
+    lengths: tuple[int, ...]
+    tails: dict[int, dict[str, str | tuple[str, ...]]]
+
+
+@dataclass(frozen=True)
+class _FragmentIndex:
+    """The fragments of one decoded message, indexed for an exact lookup at
+    one position, together with the work one pass may spend.
+
+    ``by_length`` maps a length to the fragments of that length and answers a
+    position with one hash of the slice. ``keyed`` maps the opening
+    ``_FRAGMENT_KEY_CHARS`` characters of a long fragment (> ``_EXACT_LOOKUP_CHARS``)
+    to its lengths and tails: a lookup there is one key lookup, one tail
+    lookup per distinct length that shares the key and still fits, and one
+    whole comparison only for a candidate whose opening, length and tail all
+    matched -- never one per fragment.
+
+    ``work`` belongs to the pass: it starts with the whole allowance, the
+    preparation takes its share off before the first lookup, and every lookup
+    spends from it.
+    """
+
+    by_length: dict[int, set[str]]
+    exact_lengths: tuple[int, ...]
+    keyed: dict[str, _KeyBucket]
+    work: _Work
+
+
+def _fragment_index(variants: set[str]) -> _FragmentIndex:
+    """Index the fragments by length, and the long ones by opening and tail."""
+    by_length: dict[int, set[str]] = {}
+    keyed: dict[str, dict[int, dict[str, str | tuple[str, ...]]]] = {}
+    for value in variants:
+        length = len(value)
+        by_length.setdefault(length, set()).add(value)
+        if length <= _EXACT_LOOKUP_CHARS:
+            continue
+        tails = keyed.setdefault(value[:_FRAGMENT_KEY_CHARS], {}).setdefault(length, {})
+        tail = value[-_FRAGMENT_TAIL_CHARS:]
+        found = tails.get(tail)
+        if found is None:
+            tails[tail] = value
+        elif isinstance(found, str):
+            tails[tail] = (found, value)
+        else:
+            tails[tail] = (*found, value)
+    return _FragmentIndex(
+        by_length=by_length,
+        exact_lengths=tuple(
+            sorted(length for length in by_length if length <= _EXACT_LOOKUP_CHARS)
+        ),
+        keyed={
+            key: _KeyBucket(tuple(sorted(lengths)), lengths)
+            for key, lengths in keyed.items()
+        },
+        work=_Work(_MAX_REDACTION_WORK),
+    )
+
+
+def _fragment_at(
+    message: str,
+    position: int,
+    index: _FragmentIndex,
+    *,
+    longer_than: int = 0,
+) -> int | None:
+    """The length of the longest fragment starting at ``position`` and longer
+    than ``longer_than``, or None.
+
+    Work: one opening lookup plus one tail lookup per distinct long length
+    that shares it, a comparison only for a candidate whose opening, length
+    and tail matched, and one hash per short length that fits. Leaves
+    ``index.work.left`` negative when the pass's allowance is gone; the caller
+    then hides the rest of the text.
+    """
+    remaining = len(message) - position
+    if remaining <= 0:
+        return None
+    work = index.work
+    if remaining >= _FRAGMENT_KEY_CHARS:
+        work.left -= _FRAGMENT_KEY_CHARS
+        if work.left < 0:
+            return None
+        bucket = index.keyed.get(message[position : position + _FRAGMENT_KEY_CHARS])
+        if bucket is not None:
+            for slot in _candidate_slots(bucket.lengths, longer_than, remaining):
+                length = bucket.lengths[slot]
+                work.left -= _FRAGMENT_TAIL_CHARS
+                if work.left < 0:
+                    return None
+                tail = message[
+                    position + length - _FRAGMENT_TAIL_CHARS : position + length
+                ]
+                found = bucket.tails[length].get(tail)
+                if found is None:
+                    continue
+                if isinstance(found, str):
+                    if _fragment_matches(message, position, found, work):
+                        return length
+                    if work.left < 0:
+                        return None
+                    continue
+                # Several long fragments share this opening, length and tail:
+                # one hash of the whole slice decides between them.
+                work.left -= length
+                if work.left < 0:
+                    return None
+                if message[position : position + length] in index.by_length[length]:
+                    return length
+    for slot in _candidate_slots(index.exact_lengths, longer_than, remaining):
+        length = index.exact_lengths[slot]
+        work.left -= length
+        if work.left < 0:
+            return None
+        if message[position : position + length] in index.by_length[length]:
+            return length
+    return None
+
+
+def _candidate_slots(
+    lengths: tuple[int, ...], longer_than: int, remaining: int
+) -> range:
+    """The positions in ``lengths`` (sorted) whose value is in
+    ``(longer_than, remaining]``, longest first, so the region scan walks
+    only lengths that can reach past its end and the main loop stops at the
+    longest match."""
+    return range(
+        bisect.bisect_right(lengths, remaining) - 1,
+        bisect.bisect_right(lengths, longer_than) - 1,
+        -1,
+    )
+
+
+def _fragment_matches(message: str, position: int, value: str, work: _Work) -> bool:
+    """Whether ``value`` is at ``position``, compared in doubling slices.
+
+    The opening already matched, so the comparison starts after it. Doubling
+    the slice keeps a failed comparison proportional to the characters it
+    actually disagreed on -- a multi-megabyte body fragment that differs from
+    the echo at its first newline costs one slice -- while a real match ends
+    in one ``startswith`` over the rest. Every slice is charged before it is
+    compared, so the allowance bounds the characters looked at even on a
+    miss.
+    """
+    length = len(value)
+    offset = _FRAGMENT_KEY_CHARS
+    step = _FRAGMENT_KEY_CHARS
+    while offset < length and step <= _MAX_COMPARE_CHARS:
+        chunk = min(step, length - offset)
+        work.left -= chunk
+        if work.left < 0:
+            return False
+        if (
+            message[position + offset : position + offset + chunk]
+            != value[offset : offset + chunk]
+        ):
+            return False
+        offset += chunk
+        step *= 2
+    if offset >= length:
+        return True
+    work.left -= length - offset
+    if work.left < 0:
+        return False
+    return message.startswith(value[offset:], position + offset)
+
+
+def _fragment_region_end(
+    message: str,
+    start: int,
+    end: int,
+    index: _FragmentIndex,
+) -> int:
+    """``end`` extended over fragments that start inside the match and reach
+    past it, so one region is replaced once and no tail is left behind.
+
+    Only the last ``MAX_ERROR_TEXT_CHARS`` characters of the match are walked.
+    A fragment that starts further back is longer than that window, so it can
+    only be the body or one of its own long lines, and a decoded message does
+    not make one of those start inside another: the body is matched whole
+    where it begins. Walking a multi-megabyte body from its start would cost
+    as much as the text itself. That is a property of a decoded message, not
+    of an arbitrary echo: an echo that puts a long fragment's start further
+    back is not walked, and the tail it leaves is a known limit.
+
+    The walk has a fixed budget and spends the pass's work allowance too. If a
+    text ever keeps growing the region past either one, the rest of the text
+    becomes one region: that redacts more than needed, where stopping would
+    leave fragment text in view.
+    """
+    position = max(start + 1, end - MAX_ERROR_TEXT_CHARS)
+    budget = _MAX_REGION_SCAN_CHARS
+    while position < end and budget:
+        length = _fragment_at(message, position, index, longer_than=end - position)
+        if index.work.left < 0:
+            return len(message)
+        if length is not None:
+            end = position + length
+        position += 1
+        budget -= 1
+    if position < end:
+        return len(message)
+    return end
 
 
 def _long_strings(value: Any) -> list[str]:
@@ -462,10 +924,9 @@ def proxy_request(
         )
     provider_status = answer["status"]
     # Composio's 200 schema only requires ``status``: ``data`` is optional and
-    # nullable, and a file answer carries ``binary_data`` instead. So only a
-    # real 2xx that has neither is an incomplete answer; a 3xx, 304, an
-    # upstream 4xx/5xx and a binary answer all go back to the caller with the
-    # provider's own status and headers.
+    # nullable, and a file answer carries ``binary_data`` instead. All of them
+    # go back to the caller with the provider's own status and headers; each
+    # connector decides what an empty 2xx means for the API it speaks.
     answer_headers = answer.get("headers")
     binary_data = answer.get("binary_data")
     if answer_headers is not None and not isinstance(answer_headers, Mapping):
@@ -479,19 +940,6 @@ def proxy_request(
         # answer into a successful 0-byte download.
         raise ComposioProxyError(
             "Composio proxy returned a binary answer in an unexpected shape",
-            status=status,
-        )
-    if (
-        200 <= provider_status < 300
-        and provider_status != 204
-        and "data" not in answer
-        and not isinstance(binary_data, Mapping)
-    ):
-        # A 2xx without a body is not a successful provider answer: a
-        # truncated answer would otherwise reach a callback and fail opaquely
-        # there.
-        raise ComposioProxyError(
-            "Composio proxy returned an answer without the provider's data",
             status=status,
         )
     return ProxyResponse(

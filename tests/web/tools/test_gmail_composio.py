@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from email import policy
 from email.parser import BytesParser
 from typing import Any
@@ -20,12 +21,14 @@ import httplib2
 import pytest
 from googleapiclient.discovery import build
 
+from tests.web.tools.conftest import (
+    ACCOUNT_ID,
+    API_KEY,
+    COMPOSIO_USER,
+    _Response,
+)
 from xagent.web.tools import config as tools_config
 from xagent.web.tools.mcp import composio_proxy, gmail, google_api_proxy
-
-API_KEY = "test-composio-api-key-value"
-ACCOUNT_ID = "ca_gmail_account_1"
-COMPOSIO_USER = "xagent-0123456789abcdef"
 
 _MESSAGE = {
     "id": "m1",
@@ -46,59 +49,6 @@ _NOT_FOUND = {
     }
 }
 _BATCH_BOUNDARY = "gmail-tools-batch"
-
-
-class _Response:
-    def __init__(self, status_code: int, payload: Any = None) -> None:
-        self.status_code = status_code
-        self._payload = payload
-
-    def json(self) -> Any:
-        if self._payload is None:
-            raise ValueError("no JSON body")
-        return self._payload
-
-
-class FakeProxy:
-    """Answers by endpoint substring, checked in insertion order."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-        self.by_endpoint: list[tuple[str, _Response]] = []
-        self.default = _Response(200, {"status": 200, "data": {}})
-
-    def answer(self, needle: str, status: int, data: Any = None) -> None:
-        self.by_endpoint.append(
-            (needle, _Response(200, {"status": status, "data": data}))
-        )
-
-    def request(self, **kwargs: Any) -> _Response:
-        assert kwargs["url"] == composio_proxy.COMPOSIO_PROXY_URL
-        payload = kwargs["json"]
-        self.calls.append(payload)
-        for needle, response in self.by_endpoint:
-            if needle in payload["endpoint"]:
-                return response
-        return self.default
-
-
-@pytest.fixture
-def composio_env(monkeypatch) -> None:
-    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
-    # A Composio grant launches without these.
-    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN", raising=False)
-    monkeypatch.delenv("GOOGLE_REFRESH_TOKEN", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
-    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
-
-
-@pytest.fixture
-def proxy(monkeypatch, composio_env) -> FakeProxy:
-    fake = FakeProxy()
-    monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
-    return fake
 
 
 def _proxy_service() -> Any:
@@ -764,3 +714,229 @@ def test_an_error_that_echoes_the_message_hides_its_body_and_attachment(
     assert b"BODY-SECRET" in decoded
     # The attachment body is base64 inside the MIME message.
     assert base64.b64encode(b"ATTACHMENT-SECRET") in decoded
+
+
+def test_an_error_that_echoes_the_decoded_message_hides_a_long_recipient_list(
+    proxy, monkeypatch, tmp_path, caplog
+):
+    """A group send keeps the recipients on one long ``To:`` line. When the
+    vendor echoes the decoded message instead of the request body, redacting
+    that line used to shorten the text in front of the mail body and the
+    attached file, which then reached the tool result and the server log."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    attachment_bytes = b"ATTACHMENT-SECRET-" + bytes(range(256)) * 20
+    attachment = tmp_path / "secret.bin"
+    attachment.write_bytes(attachment_bytes)
+    recipients = ",".join(f"user{index:03d}@example.com" for index in range(70))
+    body = "TOOL-BODY-MARKER this is the mail body"
+    encoded_attachment = base64.b64encode(attachment_bytes).decode()
+    attachment_lines = [
+        encoded_attachment[index : index + 76]
+        for index in range(0, len(encoded_attachment), 76)
+    ]
+
+    def request(**kwargs: Any) -> _Response:
+        raw = kwargs["json"]["body"]["raw"]
+        decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+        return _Response(400, {"error": {"message": f"invalid body {decoded}"}})
+
+    monkeypatch.setattr(composio_proxy.requests, "request", request)
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    with caplog.at_level(logging.ERROR, logger="gmail-mcp"):
+        result = json.loads(
+            gmail.gmail_send_messages(
+                [
+                    {
+                        "to": recipients,
+                        "subject": "Group send",
+                        "body": body,
+                        "attachments": [str(attachment)],
+                    }
+                ],
+                action="send",
+            )
+        )
+
+    assert result["status"] == "error"
+    seen = (
+        result["message"]
+        + "\n"
+        + "\n".join(record.getMessage() for record in caplog.records)
+    )
+    assert body not in seen
+    assert "user000@example.com" not in seen
+    assert "user069@example.com" not in seen
+    assert not [line for line in attachment_lines if line[:24] in seen]
+
+
+def test_an_attachment_of_same_prefix_base64_lines_stays_bounded(
+    monkeypatch, composio_env
+):
+    """The lookup's worst shape reached through the real message builder: a
+    2.4 MB attachment (inside the documented passing boundary) whose base64
+    lines all open with the same 32 characters, and a vendor that echoes only
+    the first 100 decoded lines. Each matched line used to try all 42k
+    fragments that shared its opening; the index must cost one lookup per
+    distinct length instead."""
+    attachment = b"".join(
+        b"\x00" * 45 + number.to_bytes(12, "big") for number in range(42000)
+    )
+    create, _ = gmail._build_message(
+        {"to": "a@example.com", "subject": "Many", "body": "hi"},
+        [("blob.bin", attachment)],
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    lines = decoded.split("\n")
+    base64_lines = [line for line in lines if len(line) == 76 and line[:32] == "A" * 32]
+    assert len(base64_lines) > 40000
+    echo = "invalid body " + "\n".join(lines[: len(lines) - len(base64_lines) + 100])
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert base64_lines[0][:24] not in text
+    assert not [line for line in base64_lines if line in text]
+    assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
+
+
+def test_a_text_body_of_same_prefix_lines_stays_bounded(monkeypatch, composio_env):
+    """The same shape as a plain 7bit text body through the real builder:
+    30k lines of 76 characters that all open with the same 70, and a vendor
+    that echoes the first 100 of them."""
+    lines = ["X" * 70 + f"{number:06d}" for number in range(30000)]
+    create, _ = gmail._build_message(
+        {"to": "a@example.com", "subject": "Many", "body": "\r\n".join(lines)}, []
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded_lines = (
+        base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode().split("\n")
+    )
+    echo = "invalid body " + "\n".join(
+        decoded_lines[: len(decoded_lines) - len(lines) + 100]
+    )
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert lines[0][:20] not in text
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
+
+
+def test_a_builder_body_echoed_with_crlf_stays_bounded(monkeypatch, composio_env):
+    """The shape a real send can reach: one recipient and a 3.24 MB 7-bit body
+    of 41k 78-character lines, whose whole decoded echo the vendor rewrites
+    with CRLF line endings. The body fragment fits at every position near its
+    start, so the pass hashed the whole body at each of them (3.5 s here,
+    while the previous lookup took 0.05 s on the same output). The tail probe
+    has to make the mismatch cost one slice, and no line of the body or the
+    recipient may survive."""
+    create, _ = gmail._build_message(
+        {
+            "to": "a@example.com",
+            "subject": "s",
+            "body": "\n".join(["A" * 78] * 41000),
+        },
+        [],
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    echo = decoded.replace("\n", "\r\n")
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": "invalid body " + echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "A" * 78 not in text
+    assert "a@example.com" not in text
+    assert elapsed < 1.0, "a body fragment must not be hashed at every position"
+
+
+@pytest.mark.parametrize("rewrite", ["double-blank", "indent"])
+def test_a_group_send_echoed_with_rewritten_whitespace_stays_bounded(
+    monkeypatch, composio_env, rewrite
+):
+    """The same message with 500 recipients (a 40 kB ``To`` header) and an echo
+    that doubles every blank line or indents every line. Both rewrites add a
+    character per line to the echo, which keeps the 3.24 MB body fragment a
+    candidate for the first lines after its start; the pass then paid for the
+    whole body at each of them. Neither the body nor the recipient list may
+    survive, and the pass stays bounded."""
+    recipients = ",".join(
+        "A" * 64 + f"{number:04d}@example.com" for number in range(500)
+    )
+    create, _ = gmail._build_message(
+        {"to": recipients, "subject": "s", "body": "\n".join(["A" * 78] * 41000)},
+        [],
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    echo = {
+        "double-blank": decoded.replace("\n", "\n\n"),
+        "indent": "\n".join("  " + line for line in decoded.split("\n")),
+    }[rewrite]
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": "invalid body " + echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "A" * 78 not in text
+    assert "A" * 64 not in text
+    assert "@example.com" not in text
+    assert elapsed < 1.0, "a rewritten echo must not multiply the body's cost"

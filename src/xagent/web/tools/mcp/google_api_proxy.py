@@ -11,10 +11,10 @@ Pass an instance as ``http=`` to ``googleapiclient.discovery.build`` and pass
 googleapiclient's bundled copy and is never fetched through the proxy.
 
 A batch request is one ``multipart/mixed`` body, which the proxy does not
-carry. ``execute_batch`` sends the batch's requests one at a time instead,
-with bounded concurrency, a cap on the requests one batch may hold, and an
-overall deadline, and hands the results to the batch's own callbacks in the
-order the requests were added.
+carry. ``execute_batch`` sends the batch's requests individually instead, with
+bounded concurrency, a cap on the requests one batch may hold, and an overall
+deadline, and hands the results to the batch's own callbacks in the order the
+requests were added.
 
 A binary answer (``ProxyResponse.binary_data``) is not in ``data``: Composio
 stores the file and returns a signed URL. The transport downloads that URL and
@@ -46,8 +46,9 @@ from .composio_proxy import (
 )
 
 # How many batch requests may be in flight at once. A Gmail message search
-# asks for 10 messages by default, so 8 keeps the common case to two waves
-# without opening a connection per request when a caller asks for many more.
+# asks for 10 messages by default, so 8 keeps the common case to two waves and
+# caps how many sessions are open at once when a caller asks for many more;
+# each proxied call opens its own session.
 DEFAULT_BATCH_CONCURRENCY = 8
 # The whole batch must finish inside this budget. It matches the per-call
 # proxy timeout: without it a batch of N requests against an unresponsive
@@ -88,8 +89,6 @@ def _content(response_data: Any) -> tuple[bytes, str]:
     """The response body and content type for one proxied JSON answer."""
     if response_data is None:
         return b"", _JSON_CONTENT_TYPE
-    if isinstance(response_data, bytes):
-        return response_data, "application/octet-stream"
     if isinstance(response_data, str):
         return response_data.encode("utf-8"), "text/plain; charset=UTF-8"
     return json.dumps(response_data).encode("utf-8"), _JSON_CONTENT_TYPE
@@ -187,8 +186,21 @@ def _binary_content(
 
 
 def _body_and_type(answer: ProxyResponse, *, timeout: float) -> tuple[bytes, str]:
+    """The body and content type of one provider answer.
+
+    Gmail answers an empty success with 204, so a 2xx other than 204 that
+    carries neither a body nor a file is an incomplete answer for this
+    transport. Failing that one request is better than handing an empty body
+    to a caller that reads it as a JSON document. The shared client leaves
+    that judgment to each API: Salesforce, for one, reads an empty answer as
+    an empty object.
+    """
     if answer.binary_data is not None:
         return _binary_content(answer.binary_data, timeout=timeout)
+    if answer.ok and answer.status != 204 and answer.data is None:
+        raise ComposioProxyError(
+            "Composio proxy returned an answer without the provider's data"
+        )
     return _content(answer.data)
 
 
@@ -364,7 +376,7 @@ class GoogleApiProxyHttp:
         """httplib2 closes its connection pool here; this transport has none."""
 
 
-def check_request(request: Any) -> None:
+def precheck_body_size(request: Any) -> None:
     """Refuse one googleapiclient request the proxy would reject for its body
     size, before it is sent.
 
@@ -403,11 +415,7 @@ def _replays_a_get(headers: Mapping[str, str]) -> bool:
 
 
 def _form_text(body: str | bytes | None) -> str:
-    if body is None:
-        return ""
-    if isinstance(body, str):
-        return body
-    return body.decode("utf-8")
+    return (body.decode("utf-8") if isinstance(body, bytes) else body) or ""
 
 
 def execute_batch(
@@ -436,7 +444,19 @@ def execute_batch(
     awaited, so the caller returns inside its budget.
     """
     # BatchHttpRequest keeps its requests, their order and its callbacks in
-    # these attributes and googleapiclient has no public accessor for them.
+    # these attributes and googleapiclient has no public accessor for them. A
+    # release that renames one must fail with a readable message rather than
+    # an AttributeError on every proxied batch.
+    missing = [
+        name
+        for name in ("_order", "_requests", "_callbacks", "_callback")
+        if not hasattr(batch, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "this google-api-python-client does not expose the batch "
+            f"attributes the proxy fallback reads (missing {', '.join(missing)})"
+        )
     order: list[str] = list(batch._order)
     if not order:
         return
@@ -446,10 +466,10 @@ def execute_batch(
             f"{MAX_BATCH_REQUESTS} request limit for one proxied batch; "
             "ask for fewer at a time"
         )
-    requests = batch._requests
+    batch_requests = batch._requests
 
     def run(request_id: str) -> tuple[Any, bytes] | BaseException:
-        request = requests[request_id]
+        request = batch_requests[request_id]
         http = request.http
         if http is None:
             return ValueError("Missing a valid http object.")
@@ -492,7 +512,7 @@ def execute_batch(
         executor.shutdown(wait=False, cancel_futures=True)
 
     for request_id in order:
-        request = requests[request_id]
+        request = batch_requests[request_id]
         outcome = outcomes[request_id]
         response: Any = None
         exception: BaseException | None = None
@@ -504,7 +524,10 @@ def execute_batch(
                 if raw_response.status >= 300:
                     raise HttpError(raw_response, content, uri=request.uri)
                 response = request.postproc(raw_response, content)
-            except HttpError as exc:
+            except Exception as exc:
+                # A response that cannot be turned into a result fails that
+                # request alone; the other callbacks have not run yet and must
+                # still run.
                 exception = exc
         callback = batch._callbacks[request_id]
         if callback is not None:

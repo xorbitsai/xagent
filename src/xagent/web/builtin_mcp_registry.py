@@ -1710,6 +1710,61 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            # Why this exists alongside the Jira row above: that connector is a
+            # per-user Atlassian OAuth login and exposes every Jira tool
+            # (search, read, update, delete, transitions, comments) across every
+            # project the login can reach, and agents bind a connector as a
+            # whole server, not tool by tool. An agent that serves guests on its
+            # owner's credentials would therefore let any visitor search and
+            # read other reporters' tickets. This row's server has exactly one
+            # tool, create, in one project fixed by its own configuration.
+            #
+            # The app_id uses the same hyphenated form as the other multi-word
+            # rows: the catalog connect flow names the server row after the
+            # app_id, and runtime identity checks key on
+            # canonicalize_builtin_identity(server name) == "jira-ticket".
+            "app_id": "jira-ticket",
+            "name": "Jira Ticket",
+            "description": "Connect a Jira Cloud site with a classic (unscoped) API token to create tickets in one fixed project. This connector can only create tickets: it cannot read, search or change existing ones.",
+            "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            # Hidden until verified against a live Jira Cloud site -- the tests
+            # stub the HTTP layer -- the same rollout freshdesk followed (seeded
+            # hidden, shown by 20261028_enable_freshdesk once verified).
+            # is_visible_in_connector is not builtin-protected, so it can be
+            # flipped without a redeploy, and a follow-up migration shows it
+            # once verification lands (xorbitsai/xagent#3661).
+            "is_visible_in_connector": False,
+            # Key-based (non-oauth), like freshdesk/zendesk: the site, account
+            # email, API token and project key are all per-user values on the
+            # existing encrypted per-user env path. The site is user-supplied
+            # but the connector accepts only one label under atlassian.net and
+            # resolves it against private addresses, as the freshdesk row does.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.jira_ticket"],
+                "required_env": [
+                    "JIRA_TICKET_SITE",
+                    "JIRA_TICKET_EMAIL",
+                    "JIRA_TICKET_API_TOKEN",
+                    "JIRA_TICKET_PROJECT_KEY",
+                ],
+                # Ownership marker, same mechanism as the OAuth rows above. It
+                # is what lets runtime code tell this built-in server from a
+                # custom server that merely shares its name, and it makes the
+                # connect flow reject such a lookalike rather than attach a
+                # user's API token to it.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "jira-ticket",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "stripe",
             "name": "Stripe",
             "description": "Connect to Stripe with a Restricted API Key (not your full secret key) to look up customers, charges, invoices, and subscriptions, and issue refunds.",

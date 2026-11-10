@@ -38,7 +38,7 @@ from .codes import APP_ID_PATTERN, TOOL_NAME_PATTERN, is_check_id, is_code
 from .declarations import DECLARATION_FORMAT_VERSION
 
 RESULT_SCHEMA_ID = "xagent.connector_smoke.result"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 
 IDENTITY_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 ENVIRONMENT_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")

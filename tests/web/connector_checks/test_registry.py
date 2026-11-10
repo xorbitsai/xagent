@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 from unittest.mock import Mock
 
@@ -14,11 +14,17 @@ from docx import Document
 from pptx import Presentation
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+from xagent.web.connector_checks.assertions import judge_result
 from xagent.web.connector_checks.declarations import (
+    Assertion,
     ConnectorChecks,
+    DeclarationError,
+    EachHasKeys,
     FixtureRef,
     HasKeys,
+    IsType,
     L3Envelope,
+    Length,
     ReadCheck,
     StatusSuccess,
     UnprobeableCheck,
@@ -26,6 +32,8 @@ from xagent.web.connector_checks.declarations import (
 )
 from xagent.web.connector_checks.registry import (
     CONNECTOR_CHECKS,
+    WRITE_WITHOUT_CLEANUP,
+    _declared_l3,
     connector_checks_for,
     l3_read_check,
 )
@@ -36,6 +44,8 @@ from xagent.web.tools.mcp import (
     google_slides,
     powerpoint,
     word,
+    zendesk,
+    zoom,
 )
 
 # The six document connectors, and the read each one declares: the tool, the
@@ -467,3 +477,186 @@ def test_powerpoint_read_fixture_output_satisfies_its_declaration(
     _assert_declared_output(
         "powerpoint", powerpoint.powerpoint_list_slides("Deck.pptx")
     )
+
+
+# The Tier 2 read checks (issue #3573): the tool, its arguments, and every
+# assertion, so dropping an item key or a whole assertion fails here.
+_TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "zendesk.list_tickets": (
+        "zendesk_list_tickets",
+        {"limit": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("tickets", "has_more", "after_cursor", "truncated")),
+            EachHasKeys(
+                ("tickets",),
+                (
+                    "id",
+                    "subject",
+                    "status",
+                    "priority",
+                    "requester_id",
+                    "assignee_id",
+                    "group_id",
+                    "tags",
+                    "created_at",
+                    "updated_at",
+                ),
+            ),
+            Length(("tickets",), max=1),
+        ),
+    ),
+    "zendesk.list_organizations": (
+        "zendesk_list_organizations",
+        {"limit": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("organizations", "has_more", "after_cursor", "truncated")),
+            EachHasKeys(
+                ("organizations",), ("id", "name", "domain_names", "created_at")
+            ),
+            Length(("organizations",), max=1),
+        ),
+    ),
+    "zendesk.list_macros": (
+        "zendesk_list_macros",
+        {"limit": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("macros", "has_more", "after_cursor", "truncated")),
+            EachHasKeys(("macros",), ("id", "title", "description", "updated_at")),
+            Length(("macros",), max=1),
+        ),
+    ),
+    "zoom.list_meetings": (
+        "zoom_list_meetings",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("meetings", "next_page_token")),
+            IsType(("meetings",), "array"),
+        ),
+    ),
+}
+
+
+def _read_check(check_id: str) -> ReadCheck:
+    app_id = check_id.split(".", 1)[0]
+    check = next(c for c in CONNECTOR_CHECKS[app_id].reads if c.id == check_id)
+    assert isinstance(check, ReadCheck)
+    return check
+
+
+def _assert_check_output(check_id: str, result: str) -> None:
+    check = _read_check(check_id)
+    raw = {
+        "content": [{"type": "text", "text": result}],
+        "structured_content": None,
+        "is_error": False,
+    }
+    assert judge_result(raw, check.payload, check.assertions) == (None, None)
+
+
+@pytest.mark.parametrize(("check_id", "expected"), sorted(_TIER_2_READS.items()))
+def test_a_tier_2_read_check_is_declared_exactly(
+    check_id: str, expected: tuple[str, dict[str, Any], tuple[Assertion, ...]]
+) -> None:
+    tool, arguments, assertions = expected
+    check = _read_check(check_id)
+    assert (check.tool, dict(check.arguments)) == (tool, arguments)
+    assert check.assertions == assertions
+
+
+@pytest.mark.parametrize("app_id", ["zendesk", "zoom"])
+def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
+    expected = l3_read_check(app_id)
+    assert expected is not None
+
+    l3_checks = [
+        check
+        for check in CONNECTOR_CHECKS[app_id].reads
+        if check.id == f"{app_id}.l3_probe"
+    ]
+    assert l3_checks == [expected]
+
+
+@pytest.mark.parametrize("app_id", ["acme", "hubspot"])
+def test_the_declared_l3_helper_rejects_anything_but_a_read_check(app_id: str) -> None:
+    with pytest.raises(DeclarationError, match=app_id):
+        _declared_l3(app_id)
+
+
+def test_zoom_create_meeting_has_no_cleanup_tool() -> None:
+    assert [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["zoom"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ] == ["zoom_create_meeting"]
+
+
+def _list_payload(list_key: str, item: dict[str, Any], count: int) -> dict[str, Any]:
+    return {list_key: [item] * count, "meta": {"has_more": False}}
+
+
+@pytest.mark.parametrize(
+    ("check_id", "list_key", "item", "tool"),
+    [
+        (
+            "zendesk.list_tickets",
+            "tickets",
+            {
+                "id": 7,
+                "subject": "Printer down",
+                "status": "open",
+                "priority": "normal",
+                "requester_id": 3,
+                "tags": ["hardware"],
+            },
+            zendesk.zendesk_list_tickets,
+        ),
+        (
+            "zendesk.list_organizations",
+            "organizations",
+            {"id": 4, "name": "Acme", "domain_names": ["acme.example"]},
+            zendesk.zendesk_list_organizations,
+        ),
+        (
+            "zendesk.list_macros",
+            "macros",
+            {"id": 5, "title": "Close ticket", "description": "Closes it"},
+            zendesk.zendesk_list_macros,
+        ),
+    ],
+)
+@pytest.mark.parametrize("count", [0, 1])
+def test_a_zendesk_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+    check_id: str,
+    list_key: str,
+    item: dict[str, Any],
+    tool: Callable[..., str],
+    count: int,
+) -> None:
+    monkeypatch.setattr(
+        zendesk,
+        "_request",
+        lambda *args, **kwargs: _list_payload(list_key, item, count),
+    )
+
+    _assert_check_output(check_id, tool(limit=1))
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_zoom_list_meetings_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    monkeypatch.setattr(
+        zoom,
+        "_request",
+        lambda *args, **kwargs: {
+            "meetings": [{"id": 111, "topic": "Sync"}] * count,
+            "next_page_token": "",
+        },
+    )
+
+    _assert_check_output("zoom.list_meetings", zoom.zoom_list_meetings())

@@ -17,6 +17,7 @@ import re
 from typing import Any
 
 import pytest
+from mcp.server.fastmcp import FastMCP
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_checks.registry import (
@@ -70,8 +71,6 @@ _PINNED_LEGACY = frozenset(
         "teams",
         "whatsapp",
         "xero",
-        "zendesk",
-        "zoom",
     }
 )
 
@@ -97,7 +96,15 @@ def _registered_tools(module_name: str) -> set[str]:
     else:
         # The low-level Server modules (linkedin) expose the handler directly.
         tools = asyncio.run(module.list_tools())
-    return {tool.name for tool in tools}
+    registered = {tool.name for tool in tools}
+    # zoom offers its meeting-write tool only when a deployment switch is on;
+    # an exemption has to cover it whether or not this process sees it.
+    register_gated = getattr(module, "_register_meeting_write_tools", None)
+    if register_gated is not None:
+        gated = FastMCP(f"{module_name}-coverage")
+        register_gated(gated)
+        registered |= {tool.name for tool in asyncio.run(gated.list_tools())}
+    return registered
 
 
 def _adopted_in_repo() -> list[str]:

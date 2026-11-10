@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
@@ -271,3 +272,67 @@ async def test_trace_configuration_failure_stops_ingress_and_names_phase(
     log.error.assert_called_once_with(
         "startup phase failed: %s (after %.2fs)", "trace database init", ANY
     )
+
+
+@pytest.mark.asyncio
+async def test_invalid_conversation_storage_rollout_refuses_startup_before_database(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES", "not_an_entry")
+    initialize = AsyncMock()
+    monkeypatch.setattr(
+        app_module, "_initialize_database_and_admit_runtime", initialize
+    )
+    from xagent.web.services.conversation_storage_rollout import (
+        ConversationStorageConfigError,
+    )
+
+    with pytest.raises(ConversationStorageConfigError, match="not_an_entry"):
+        await app_module.startup_event()
+
+    initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telemetry_task", [None, object()])
+async def test_startup_reports_unobserved_execution_events_with_telemetry_flag(
+    monkeypatch, telemetry_task
+):
+    from xagent.skills import utils as skill_utils
+    from xagent.templates import utils as template_utils
+    from xagent.web.services import chrome_mcp_runtime  # noqa: F401
+
+    manager = SimpleNamespace(
+        initialize=AsyncMock(), list_skills=AsyncMock(return_value=[])
+    )
+    templates = SimpleNamespace(
+        initialize=AsyncMock(), list_templates=AsyncMock(return_value=[])
+    )
+    test_app = FastAPI()
+    monkeypatch.setattr(app_module, "app", test_app)
+    monkeypatch.setattr(skill_utils, "create_skill_manager", lambda: manager)
+    monkeypatch.setattr(template_utils, "create_template_manager", lambda: templates)
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.storage.vector_backend."
+        "lock_deployment_kb_engine",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        app_module, "_initialize_database_and_admit_runtime", AsyncMock()
+    )
+    monkeypatch.setattr(app_module, "_run_or_defer", AsyncMock())
+    monkeypatch.setattr(app_module, "get_sandbox_manager", lambda: None, raising=False)
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(app_module, "initialize_langfuse", lambda: None)
+    monkeypatch.setattr(app_module, "start_app_process_diagnostics", lambda _app: None)
+
+    def fake_monitor(app_instance):
+        app_instance.state.runtime_performance_task = telemetry_task
+
+    monkeypatch.setattr(app_module, "start_runtime_performance_monitor", fake_monitor)
+    report = Mock()
+    monkeypatch.setattr(app_module, "report_unobserved_execution_events", report)
+
+    await app_module.startup_event()
+
+    report.assert_called_once_with(telemetry_started=telemetry_task is not None)

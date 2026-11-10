@@ -59,6 +59,16 @@ nothing about the workers. A worker's active degradations appear, names only,
 at the end of its per-minute `runtime diagnostics` line (`degradations=`, `-`
 when none).
 
+`execution_events_unobserved` is set at startup, in the web process and in each
+worker, when `XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES` enables at least one entry
+(independent of `XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS`) but that process is
+not exporting runtime telemetry; the process also logs a WARNING naming the
+entries. V2 tasks would then run without the metrics in this document. It is
+never cleared at runtime. To resolve it, enable runtime telemetry export on that
+process, or remove the entries and restart. Limitation: after the entries are
+removed the signal disappears, although existing V2 tasks may still be
+continued, so keep telemetry enabled for as long as V2 tasks can be resumed.
+
 ## 2. Existing signals by problem class
 
 Metric names below are OpenTelemetry instrument names. Log messages are the

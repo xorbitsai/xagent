@@ -50,6 +50,8 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+EXECUTION_EVENT_STORAGE_ENTRIES = "XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES"
+EXECUTION_EVENT_STORAGE_USER_IDS = "XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 STANDBY = "XAGENT_STANDBY"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
@@ -408,6 +410,40 @@ def get_interaction_native_sources() -> list[str]:
         if token:
             result.append(token)
     return result
+
+
+def _split_csv_tokens(raw: str, *, lower: bool) -> list[str]:
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if lower:
+            token = token.lower()
+        if token:
+            result.append(token)
+    return result
+
+
+def get_execution_event_storage_entries() -> list[str]:
+    """Raw XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES reading: a token list.
+
+    Comma-splits the env value, strips and lowercases each token, and skips
+    blank tokens. Duplicates are preserved and tokens are not checked against
+    the entry vocabulary here; validation belongs to
+    ``web/services/conversation_storage_rollout.py``.
+    """
+    return _split_csv_tokens(os.getenv(EXECUTION_EVENT_STORAGE_ENTRIES, ""), lower=True)
+
+
+def get_execution_event_storage_user_ids() -> list[str]:
+    """Raw XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS reading: a token list.
+
+    Comma-splits the env value, strips each token, and skips blank tokens.
+    Tokens are not parsed as integers here; that validation belongs to
+    ``web/services/conversation_storage_rollout.py``.
+    """
+    return _split_csv_tokens(
+        os.getenv(EXECUTION_EVENT_STORAGE_USER_IDS, ""), lower=False
+    )
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:

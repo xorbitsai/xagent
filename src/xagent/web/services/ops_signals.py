@@ -152,6 +152,13 @@ INTERACTION_READ_PAYLOAD_UNREADABLE = "interaction_read_payload_unreadable"
 # not details. No clear site, for the same reason as those two signals.
 INTERACTION_READ_TASK_MARKER_UNRECOGNIZED = "interaction_read_task_marker_unrecognized"
 
+# Set once at startup (conversation_storage_rollout.py) when at least one
+# entry is enabled for V2 execution-event storage but this process is not
+# exporting runtime telemetry, so V2 tasks would run unobserved. Deliberately
+# not paired with a clear site: it is a startup-state signal, and telemetry
+# cannot be started later without a restart.
+EXECUTION_EVENTS_UNOBSERVED = "execution_events_unobserved"
+
 _signals: dict[str, str] = {}
 _lock = threading.Lock()
 

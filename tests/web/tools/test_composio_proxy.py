@@ -1128,8 +1128,15 @@ def test_a_pass_that_runs_out_of_its_work_hides_the_rest(proxy, monkeypatch):
     """The work allowance is a counted bound, not a clock: when the next
     comparison does not fit, everything after it is dropped behind one
     marker. The marker after a 3000-character match is what a growing region
-    would otherwise leave in view."""
-    monkeypatch.setattr(composio_proxy, "_MAX_REDACTION_WORK", 2000, raising=False)
+    would otherwise leave in view.
+
+    The preparation of the fragment spends the same allowance, so the
+    allowance here is that preparation (its length and the fixed charge) plus
+    enough for the match itself but not for walking its region."""
+    preparation = 3000 + composio_proxy._FRAGMENT_PREP_CHARS
+    monkeypatch.setattr(
+        composio_proxy, "_MAX_REDACTION_WORK", preparation + 6000, raising=False
+    )
     message = "invalid body " + "A" * 3000 + "AFTER-THE-MATCH-SECRET"
     decoded = "Subject: w\r\n\r\n" + "A" * 3000
     raw = base64.urlsafe_b64encode(decoded.encode()).decode()
@@ -1144,6 +1151,7 @@ def test_a_pass_that_runs_out_of_its_work_hides_the_rest(proxy, monkeypatch):
         )
 
     text = str(raised.value)
+    assert "invalid body " in text
     assert "AFTER-THE-MATCH-SECRET" not in text
     assert "A" * 100 not in text
 
@@ -1303,3 +1311,99 @@ def test_a_long_run_echoed_over_long_lines_stays_bounded(proxy):
     assert "A" * 100 not in text
     assert not [line for line in lines if line in text]
     assert elapsed < 1.0, "a growing run must not multiply the work"
+
+
+# A decoded body of the shortest lines the pass still treats as content (8
+# characters, 9 bytes with the newline) carries the most fragments a send can:
+# 4.5 MB of ``raw`` decodes to 3.375 MB, so about 375k lines fit.
+_SHORT_LINE_COUNT = 366_666
+
+
+def _captured_index(monkeypatch) -> dict[str, Any]:
+    """The index one pass builds, so a test can read what it spent."""
+    box: dict[str, Any] = {}
+    real = composio_proxy._fragment_index
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        index = real(*args, **kwargs)
+        box["index"] = index
+        return index
+
+    monkeypatch.setattr(composio_proxy, "_fragment_index", capture)
+    return box
+
+
+@pytest.mark.parametrize("echo", [False, True])
+def test_a_body_cut_into_short_lines_pays_for_its_preparation(proxy, monkeypatch, echo):
+    """The part of the pass before the scan -- decoding, the fragments, their
+    redacted forms and the index -- was outside the work allowance: this body
+    (a 4.4 MB send, inside the payload limit) spent 0.74 s there with a
+    one-line error while the allowance had not been touched at all (2,029 of
+    15,000,000), and 0.79 s with the whole body echoed.
+
+    Every distinct fragment now pays its length and a fixed charge from the
+    same allowance, and a fragment's redacted form is only looked up when the
+    text it came from carried a secret, which is what 0.17 s and 0.21 s here
+    buy. A one-line error must still be shown; an echo of the whole body must
+    not leave a line of it."""
+    lines = ["DD" + f"{number:06d}" for number in range(_SHORT_LINE_COUNT)]
+    decoded = "Subject: short lines\r\n\r\n" + "\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    detail = "invalid body " + decoded if echo else "invalid argument"
+    proxy.response = _Response(400, {"error": {"message": detail}})
+    box = _captured_index(monkeypatch)
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    if echo:
+        assert "DD000000" not in text
+        assert lines[-1] not in text
+        assert not [line for line in lines[:200] if line in text]
+    else:
+        assert text.endswith("invalid argument")
+    assert elapsed < 1.0, "the preparation must be part of the counted allowance"
+    # This message's fragments are its body and each of its lines, and the
+    # preparation charges every one of them its own length, so a pass that
+    # charges it has spent at least the decoded text plus its lines. A pass
+    # that charged the scan alone spent 1,953 here without an echo and
+    # 3,341,039 with one.
+    spent = composio_proxy._MAX_REDACTION_WORK - box["index"].work.left
+    assert spent >= len(decoded) + sum(map(len, lines))
+
+
+def test_a_pass_that_runs_out_preparing_hides_the_whole_text(proxy, monkeypatch):
+    """The preparation spends the same allowance as the scan, and it runs
+    first. When the fragments cannot even be charged for, nothing has been
+    looked for yet, so the whole error text goes behind one marker -- more
+    redaction, never less."""
+    monkeypatch.setattr(composio_proxy, "_MAX_REDACTION_WORK", 100, raising=False)
+    decoded = "Subject: x\r\n\r\n" + "\r\n".join(
+        f"BODY-LINE-{number:04d}" for number in range(100)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": "invalid argument"}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    # Nothing of the text is kept, not even the status line: the allowance was
+    # gone before a single position could be looked at.
+    assert text == "[redacted]"
+    assert "invalid argument" not in text
+    assert "BODY-LINE-0000" not in text

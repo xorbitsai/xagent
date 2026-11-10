@@ -421,7 +421,7 @@ def _upload_failure_reason(exc: Exception) -> str:
     response reaches here as the RuntimeError ``_send`` raises from an
     ``HTTPError`` that carries the response.
     """
-    check = "check the ticket's attachments"
+    check = "ask the user to check the ticket's attachments"
     response = getattr(exc.__cause__, "response", None)
     status = getattr(response, "status_code", None)
     if response is not None and isinstance(status, int):
@@ -462,32 +462,38 @@ def _upload_failure_reason(exc: Exception) -> str:
     return "The upload failed"
 
 
-def _attachment_failure(filename: str, exc: Exception) -> dict[str, str]:
-    """A failed_attachments entry for ``filename`` (a name, never a host path)."""
+def _attachment_failure(arg: str, filename: str, exc: Exception) -> dict[str, str]:
+    """A failed_attachments entry for ``filename`` (a name, never a host path).
+
+    ``argument`` names the tool argument the file came from, so two files with
+    the same name stay distinguishable.
+    """
     return {
+        "argument": arg,
         "path": Path(filename).name or "attachment",
         "error": f"{_upload_failure_reason(exc)}. {_UPLOAD_FAILURE_GUIDANCE}",
     }
 
 
-def _read_attachments(paths: dict[str, str]) -> list[tuple[str, bytes]]:
+def _read_attachments(paths: dict[str, str]) -> list[tuple[str, str, bytes]]:
     """Read every named local file up front, before any ticket exists.
 
     ``paths`` maps argument name to the raw path; blank ones are skipped.
-    Raises ValueError naming the argument for the first rejected file.
+    Returns (argument, file name, bytes) per file. Raises ValueError naming the argument for the first rejected file.
     Holds up to three files of MAX_ATTACHMENT_BYTES in memory at once.
     """
-    named = {arg: raw for arg, raw in paths.items() if raw and raw.strip()}
+    named = {arg: raw.strip() for arg, raw in paths.items() if raw and raw.strip()}
     if named and not (os.environ.get(UPLOAD_ALLOWED_DIRS_ENV_VAR) or "").strip():
         raise ValueError(
             f"{next(iter(named))}: attachments are not available in this run "
             "(no upload directory allowlist was provided). No ticket was "
             "created; mention the files in the description instead"
         )
-    files: list[tuple[str, bytes]] = []
+    files: list[tuple[str, str, bytes]] = []
     for arg, raw in named.items():
         try:
-            files.append(read_allowed_file(raw))
+            filename, data = read_allowed_file(raw)
+            files.append((arg, filename, data))
         except (ValueError, OSError) as exc:
             raise ValueError(
                 f"{arg} could not be attached: {_safe_text(exc)}. "
@@ -505,13 +511,7 @@ def _upload(site: str, key: str, filename: str, data: bytes) -> dict[str, Any]:
         files={"file": (filename, data)},
         timeout=UPLOAD_TIMEOUT_SECONDS,
     )
-    try:
-        body = response.json()
-    except ValueError as exc:
-        raise requests.exceptions.JSONDecodeError(
-            "Jira returned a non-JSON response to the upload", "", 0
-        ) from exc
-    return confirmed_attachment(body, len(data))
+    return confirmed_attachment(response.json(), len(data))
 
 
 def _outcome_unknown(exc: Exception) -> bool:
@@ -565,7 +565,7 @@ def jira_ticket_create(
 
     Returns the issue key and its browse URL, plus attachments (the files
     uploaded to the ticket) and failed_attachments (the files that could not
-    be, each with a reason).
+    be, each with its argument name, file name and reason).
     """
     try:
         # Jira Cloud rejects a summary containing newline characters.
@@ -630,11 +630,11 @@ def jira_ticket_create(
 
     attachments: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    for filename, data in files:
+    for arg, filename, data in files:
         try:
             attachments.append(_upload(site, key, filename, data))
         except Exception as exc:
-            failed.append(_attachment_failure(filename, exc))
+            failed.append(_attachment_failure(arg, filename, exc))
 
     return _success(
         key=key,

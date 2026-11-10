@@ -495,6 +495,51 @@ def test_no_attachment_needs_no_allowlist(session: _FakeSession) -> None:
     assert _call()["status"] == "success"
 
 
+@pytest.mark.parametrize("decorate", [lambda p: " " + p, lambda p: p + "\n"])
+def test_attachment_paths_are_stripped(
+    session: _FakeSession, allowed_dir: Path, decorate: Any
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    session.queue = [_created(), _attached(5, "a.txt")]
+    result = _call(attachment_path=decorate(a))
+    assert result["status"] == "success"
+    assert result["failed_attachments"] == []
+    assert [x["filename"] for x in result["attachments"]] == ["a.txt"]
+
+
+def test_failed_attachments_name_the_argument(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    (allowed_dir / "one").mkdir()
+    (allowed_dir / "two").mkdir()
+    a = _write(allowed_dir / "one", "image.png", b"hello")
+    b = _write(allowed_dir / "two", "image.png", b"world")
+    session.queue = [_created(), _nothing_sent(), _nothing_sent()]
+    result = _call(attachment_path=a, attachment_path_2=b)
+    assert [(x["argument"], x["path"]) for x in result["failed_attachments"]] == [
+        ("attachment_path", "image.png"),
+        ("attachment_path_2", "image.png"),
+    ]
+
+
+def test_upload_redirect_is_not_followed_and_is_a_generic_failure(
+    session: _FakeSession, allowed_dir: Path
+) -> None:
+    a = _write(allowed_dir, "a.txt", b"hello")
+    session.queue = [
+        _created(),
+        _FakeResponse(status_code=302, headers={"Location": "https://evil.example/"}),
+    ]
+    result = _call(attachment_path=a)
+    assert len(session.calls) == 2
+    assert session.calls[1]["allow_redirects"] is False
+    (failure,) = result["failed_attachments"]
+    assert failure["error"] == (
+        f"The upload failed. {jira_ticket._UPLOAD_FAILURE_GUIDANCE}"
+    )
+    assert "evil.example" not in json.dumps(result)
+
+
 def test_blank_attachment_arguments_are_ignored(session: _FakeSession) -> None:
     session.queue = [_created()]
     assert _call(attachment_path="  ", attachment_path_2="")["status"] == "success"
@@ -515,7 +560,7 @@ def _http(status: int, payload: Any = None, **kwargs: Any) -> _FakeResponse:
 
 
 _CONFIRM = "Jira did not confirm the attachment"
-_CHECK = "check the ticket's attachments"
+_CHECK = "ask the user to check the ticket's attachments"
 
 
 @pytest.mark.parametrize(
@@ -578,6 +623,7 @@ def test_failed_upload_reason_comes_from_the_fixed_vocabulary(
     assert result["attachments"] == []
     (failure,) = result["failed_attachments"]
     assert failure["path"] == "a.txt"
+    assert failure["argument"] == "attachment_path"
     error = failure["error"]
     assert error == f"{expected}. {jira_ticket._UPLOAD_FAILURE_GUIDANCE}"
     lowered = error.lower()

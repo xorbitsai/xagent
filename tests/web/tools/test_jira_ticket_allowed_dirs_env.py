@@ -66,6 +66,42 @@ def test_builtin_jira_ticket_server_gets_the_task_workspace_allowlist(
     assert json.loads(config["env"][ENV_VAR]) == [expected]
 
 
+@pytest.mark.parametrize("where", ["user", "shared", "server"])
+@pytest.mark.parametrize("with_workspace", [True, False])
+def test_connection_env_cannot_override_the_allowlist(
+    tmp_path: Path, where: str, with_workspace: bool
+) -> None:
+    """A user, shared or server-level env value for the hook's variable never
+    reaches the connector: the hook assigns it last."""
+    server = _server(auth={"builtin_provenance": PROVENANCE})
+    evil = json.dumps(["/etc"])
+    user_env: dict[int, Any] = {}
+    shared_env: dict[int, Any] = {}
+    if where == "user":
+        user_env[1] = {ENV_VAR: evil}
+    elif where == "shared":
+        shared_env[1] = {ENV_VAR: evil}
+    else:
+        server.env = {ENV_VAR: evil}
+    cfg = (
+        _cfg(tmp_path)
+        if with_workspace
+        else WebToolConfig(db=None, request=None, user_id=1)
+    )
+    built = asyncio.run(
+        cfg._build_mcp_server_config(
+            server=server,
+            user_env_by_id=user_env,
+            shared_env_by_id=shared_env,
+            env_source_by_id={},
+        )
+    )
+    value = built["config"]["env"][ENV_VAR]
+    assert "/etc" not in value
+    expected = [str((tmp_path / "task-123").resolve())] if with_workspace else []
+    assert json.loads(value) == expected
+
+
 def test_builtin_jira_ticket_server_without_a_workspace_denies_all_uploads() -> None:
     """With no allowlist the connector would fall back to its working
     directory, so the hook sends an empty one (deny everything) instead."""

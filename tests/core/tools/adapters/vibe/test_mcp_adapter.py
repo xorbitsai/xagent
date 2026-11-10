@@ -719,6 +719,49 @@ async def test_ticket_create_discards_every_staged_file_when_connector_raises(
     assert workspace.discarded == [_staged_path(f) for f in _TICKET_REFS]
 
 
+@pytest.mark.asyncio
+async def test_ticket_create_partial_staging_failure_discards_and_never_calls_tool(
+    monkeypatch,
+):
+    missing_id = _TICKET_REFS["attachment_path_2"].removeprefix("file:")
+
+    class PartialWorkspace(_TicketWorkspace):
+        def stage_file_for_external_upload(self, file_id):
+            if file_id == missing_id:
+                raise FileNotFoundError(file_id)
+            return super().stage_file_for_external_upload(file_id)
+
+    workspace = PartialWorkspace()
+    adapter = _ticket_create_adapter(workspace)
+    called = []
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called.append(name)
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "summary": "Login broken",
+            "attachment_path": _TICKET_REFS["attachment_path"],
+            "attachment_path_2": _TICKET_REFS["attachment_path_2"],
+        }
+    )
+
+    assert result["is_error"] is True
+    assert called == []
+    assert workspace.discarded == [_staged_path("attachment_path")]
+
+
 def test_external_media_mapping_is_limited_to_builtin_instagram():
     binding = _external_media_binding("Instagram", "instagram_publish_image")
 

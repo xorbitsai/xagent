@@ -292,6 +292,37 @@ def test_an_unreachable_upload_names_only_its_type(http, monkeypatch):
     assert API_KEY not in str(raised.value)
 
 
+def test_stage_file_sends_the_toolkit_it_is_given(http):
+    """The module is not Drive's own: the toolkit comes from the caller."""
+    http.answer("/files/upload/request", 200, _upload_answer())
+    http.answer(UPLOAD_URL, 200, None, method="PUT")
+
+    composio_tools.stage_file(
+        toolkit_slug="gmail",
+        tool_slug="GMAIL_SEND_EMAIL",
+        filename="report.pdf",
+        mimetype="application/pdf",
+        md5="0" * 32,
+        data=_BYTES,
+        length=len(_BYTES),
+    )
+
+    assert http.calls_to("/files/upload/request")[0]["json"]["toolkit_slug"] == "gmail"
+
+
+def test_execute_tool_names_the_toolkit_it_is_given(http):
+    http.answer(
+        "/tools/execute/GMAIL_SEND_EMAIL",
+        422,
+        {"error": {"message": "refused", "slug": "BadRequest"}},
+    )
+
+    with pytest.raises(composio_tools.ComposioToolError) as raised:
+        composio_tools.execute_tool("GMAIL_SEND_EMAIL", {}, toolkit="Gmail")
+
+    assert "could not run the Gmail tool" in str(raised.value)
+
+
 def test_execute_tool_sends_the_account_the_user_and_the_arguments(http):
     http.answer(
         "/tools/execute/GOOGLEDRIVE_CREATE_FILE",

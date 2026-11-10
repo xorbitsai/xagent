@@ -3,7 +3,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import { History, Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { listenForWidgetHostMessage, postToParentWidget } from "@/lib/widget-parent-message"
+import {
+  listenForWidgetExpandState,
+  listenForWidgetHostMessage,
+  postToParentWidget,
+} from "@/lib/widget-parent-message"
 
 // Exported so the standalone share-mode reset button (public-agent-chat-page.tsx)
 // can match this styling instead of drifting with its own duplicate string.
@@ -122,6 +126,14 @@ export function WidgetChromeControls({
     listenForWidgetHostMessage("widget_expand_rejected", () => setIsExpanded(false))
   ), [setIsExpanded])
 
+  useEffect(() => (
+    // The host page can also size the panel itself (XagentWidget.open({
+    // expanded }) or data-expanded), and widget.js re-sends the current size
+    // whenever this component mounts (in reply to widget_chrome_ready above),
+    // so the menu follows the panel's actual size rather than its own guess.
+    listenForWidgetExpandState((expanded) => setIsExpanded(expanded))
+  ), [setIsExpanded])
+
   const handleNewConversation = () => {
     setIsMenuOpen(false)
     newConversation?.onClick()
@@ -134,10 +146,13 @@ export function WidgetChromeControls({
 
   const handleToggleExpand = () => {
     setIsMenuOpen(false)
-    // Optimistic: widget.js owns the actual panel size and can't confirm
-    // back, but this is the same origin/deployment on both sides of the
-    // postMessage, not an untrusted round-trip -- nothing else can disagree
-    // with this state. The postMessage call is a side effect, so it belongs
+    // Optimistic: widget.js owns the actual panel size and doesn't confirm a
+    // click back, but this is the same origin/deployment on both sides of the
+    // postMessage, not an untrusted round-trip. The only other things that
+    // change the size are widget.js's mobile guard and the host page's own
+    // XagentWidget.open() / data-expanded; widget.js corrects this state for
+    // those through widget_expand_rejected and widget_expand_state (the two
+    // listeners above). The postMessage call is a side effect, so it belongs
     // here in the click handler, not inside setIsExpanded's updater (React
     // may invoke that updater more than once, e.g. under StrictMode).
     const next = !isExpanded

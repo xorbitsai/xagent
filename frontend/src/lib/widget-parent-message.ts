@@ -6,7 +6,9 @@
 // unlike the parent -> iframe session protocol.
 // widget_chrome_ready/widget_chrome_not_ready: sent by WidgetChromeControls
 // on mount/unmount so widget.js knows whether the iframe currently has its
-// own close control -- see the mobile FAB-hiding guard in widget.js.
+// own close control -- see the mobile FAB-hiding guard in widget.js. widget.js
+// answers each widget_chrome_ready with the panel's current size
+// (widget_expand_state), so a menu that mounts or remounts starts out right.
 export type WidgetParentMessageType =
   | "widget_close"
   | "widget_chrome_ready"
@@ -70,7 +72,10 @@ export function requestPromptContext(
 
 // The other direction: widget.js can reject a widget_expand (its own mobile
 // guard rejects it) and needs to correct the iframe's optimistic guess about
-// its own state; prompt_context replies go through requestPromptContext instead.
+// its own state. It also reports the panel size the host page set, or the
+// current size in reply to widget_chrome_ready, as widget_expand_state; that
+// message carries a value, so listenForWidgetExpandState below handles it.
+// prompt_context replies go through requestPromptContext instead.
 // event.source, not origin, is the check here:
 // the embedding page is an arbitrary third-party origin the iframe can't
 // allowlist in advance (unlike the host, which set iframe.src itself and so
@@ -88,6 +93,22 @@ export function listenForWidgetHostMessage(
     // same direct-visit guard postToParentWidget already applies above.
     if (window.parent === window || !hostMessageOfType(event, type)) return
     onMessage()
+  }
+  window.addEventListener("message", handleMessage)
+  return () => window.removeEventListener("message", handleMessage)
+}
+
+// Listens for widget_expand_state and passes on its boolean `expanded`; any
+// other value is ignored. Same source and direct-visit guards as
+// listenForWidgetHostMessage above.
+export function listenForWidgetExpandState(
+  onState: (expanded: boolean) => void,
+): () => void {
+  const handleMessage = (event: MessageEvent) => {
+    if (window.parent === window) return
+    const data = hostMessageOfType(event, "widget_expand_state")
+    if (!data || typeof data.expanded !== "boolean") return
+    onState(data.expanded)
   }
   window.addEventListener("message", handleMessage)
   return () => window.removeEventListener("message", handleMessage)

@@ -188,26 +188,33 @@ _GOOGLE_SUBJECT_RE = re.compile(r"[0-9]{1,255}")
 # userinfo's ``user_id`` gives it.
 _SALESFORCE_USER_ID_RE = re.compile(r"005[0-9A-Za-z]{15}")
 _SALESFORCE_HOST_RE = re.compile(r"(?:[a-z0-9-]+\.)+salesforce\.com")
+# Printable ASCII without the space: what a base_url may consist of, checked
+# before urlsplit, which would silently drop tabs and newlines.
+_VISIBLE_ASCII_RE = re.compile(r"[!-~]+")
 
 
 def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
     """The userinfo URL on the org host of the account's ``data.base_url``.
 
     Composio finds the org at sign-in and keeps its host plus
-    ``/services/data/vNN.0`` there (#3646 live test). The check is at least as
-    strict as the one the Salesforce runtime applies to the same value
-    (#3669): https, no credentials or port, a subdomain of salesforce.com made
-    of ``[a-z0-9-]`` labels, so every host accepted here is accepted there. The value comes from
-    what the member typed on Composio's page, so it is refused, never
-    trimmed, and never logged.
+    ``/services/data/vNN.0`` there (#3646 live test). The value comes from
+    what the member typed on Composio's page, so it is never logged, and is
+    refused unless it is made only of printable ASCII without spaces (checked
+    before parsing, since ``urlsplit`` drops tabs and newlines), is https,
+    has no credentials and no port (an empty one included), and its host,
+    lowercased by ``urlsplit`` and with at most one trailing dot removed, is
+    a subdomain of salesforce.com made of ``[a-z0-9-]`` labels. Only the
+    host is kept. This is at least as strict as the Salesforce runtime's
+    check on the same value (#3669), so every host accepted here is accepted
+    there.
     """
     data = account.get("data")
     base_url = data.get("base_url") if isinstance(data, dict) else None
-    if not isinstance(base_url, str):
+    if not isinstance(base_url, str) or not _VISIBLE_ASCII_RE.fullmatch(base_url):
         return None
     try:
         parts = urlsplit(base_url)
-        hostname = (parts.hostname or "").rstrip(".")
+        hostname = (parts.hostname or "").removesuffix(".")
         port = parts.port
     except ValueError:
         # Unparsable (an unclosed "[" bracket) or an invalid port.
@@ -217,6 +224,7 @@ def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
         or parts.username is not None
         or parts.password is not None
         or port is not None
+        or parts.netloc.endswith(":")
         or not _SALESFORCE_HOST_RE.fullmatch(hostname)
     ):
         return None

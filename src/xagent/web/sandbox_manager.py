@@ -3211,9 +3211,9 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
     Environment variables:
     - SANDBOX_ENABLED: Enable/disable sandbox (default: true)
-    - SANDBOX_IMPLEMENTATION: Implementation type. Only ``docker`` is
-      supported; the variable is retained so stale deployment configuration
-      fails closed instead of silently selecting a different runtime.
+    - SANDBOX_IMPLEMENTATION: Implementation type: ``docker`` (default) or
+      the experimental ``openshell``. Any other value, including the removed
+      ``boxlite``, fails closed instead of silently selecting a runtime.
 
     Returns:
         SandboxService instance or None if disabled
@@ -3229,6 +3229,8 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
     if implementation == "docker":
         return _create_docker_service()
+    if implementation == "openshell":
+        return _create_openshell_service()
     if implementation == "boxlite":
         raise ValueError(
             "BoxLite sandbox runtime has been removed; set "
@@ -3237,8 +3239,44 @@ def _create_sandbox_service() -> Optional[SandboxService]:
             "'Migrating from BoxLite'."
         )
     raise ValueError(
-        f"Unknown SANDBOX_IMPLEMENTATION {implementation!r}; only 'docker' is supported"
+        f"Unknown SANDBOX_IMPLEMENTATION {implementation!r}; "
+        "expected 'docker' or 'openshell' (experimental)"
     )
+
+
+def _create_openshell_service() -> Optional[SandboxService]:
+    """Create OpenShell sandbox service (experimental)."""
+    namespace = get_sandbox_worker_namespace()
+    if namespace is None:
+        # Same rule as Docker: without a stable per-deployment namespace, a
+        # deployment sharing the gateway would resolve the same sandbox names
+        # and could list and delete another deployment's sandboxes.
+        raise RuntimeError(
+            "XAGENT_SANDBOX_NAMESPACE is required when the OpenShell sandbox "
+            "implementation is enabled; set it to a stable, unique per-"
+            "deployment identifier"
+        )
+    try:
+        from ..sandbox.openshell_sandbox import OpenShellSandboxService
+    except Exception as exc:
+        # Not just ImportError: openshell 0.1.x ships protobuf 6 gencode, so an
+        # older protobuf runtime fails the import with a VersionError.
+        raise RuntimeError(
+            "SANDBOX_IMPLEMENTATION=openshell requires the openshell dependency "
+            "(install the 'openshell' extra)"
+        ) from exc
+
+    from .sandbox_store import DBOpenShellStore
+
+    store = DBOpenShellStore(namespace=namespace if get_sandbox_worker_id() else None)
+    try:
+        service = OpenShellSandboxService(store=store, namespace=namespace)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to initialize the OpenShell sandbox runtime"
+        ) from exc
+    logger.info("Created OpenShell sandbox service")
+    return service
 
 
 def _create_docker_service() -> Optional[SandboxService]:

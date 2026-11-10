@@ -23,6 +23,7 @@ from .models.sandbox import SandboxSnapshot as SandboxSnapshotModel
 logger = logging.getLogger(__name__)
 
 SANDBOX_TYPE_DOCKER = "docker"
+SANDBOX_TYPE_OPENSHELL = "openshell"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -206,6 +207,16 @@ class _DBSandboxStoreBase:
         # Convert Pydantic model to dict, then to JSON
         model.template = json.dumps(info.template.model_dump())  # type: ignore[assignment]
         model.config = json.dumps(info.config.model_dump())  # type: ignore[assignment]
+
+
+class DBOpenShellStore(_DBSandboxStoreBase):
+    """Database-backed store for the OpenShell backend.
+
+    Duck-typed against ``OpenShellStore`` so this module does not import the
+    openshell SDK when that backend is not in use.
+    """
+
+    sandbox_type = SANDBOX_TYPE_OPENSHELL
 
 
 class DBDockerStore(_DBSandboxStoreBase, DockerStore):

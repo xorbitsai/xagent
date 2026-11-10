@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import os
+import sys
 import threading
+import types
 from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +23,7 @@ from xagent.sandbox.base import (
 from xagent.web.sandbox_manager import (
     SandboxManager,
     _create_docker_service,
+    _create_openshell_service,
     _create_sandbox_service,
     get_sandbox_manager,
 )
@@ -101,6 +104,25 @@ class TestCreateSandboxService:
         assert result is not None
         mock_create.assert_called_once()
 
+    def test_openshell_selected(self):
+        """Test openshell implementation selection."""
+        with (
+            patch.dict(
+                "os.environ",
+                {"SANDBOX_ENABLED": "true", "SANDBOX_IMPLEMENTATION": "openshell"},
+                clear=False,
+            ),
+            patch(
+                "xagent.web.sandbox_manager._create_openshell_service"
+            ) as mock_openshell,
+            patch("xagent.web.sandbox_manager._create_docker_service") as mock_docker,
+        ):
+            mock_openshell.return_value = FakeSandboxService()
+            result = _create_sandbox_service()
+        assert result is mock_openshell.return_value
+        mock_openshell.assert_called_once()
+        mock_docker.assert_not_called()
+
 
 class TestGetSandboxManager:
     """Test get_sandbox_manager singleton."""
@@ -167,6 +189,111 @@ class TestGetSandboxManager:
 
         # All results should be the same instance
         assert all(r is results[0] for r in results)
+
+
+try:
+    from xagent.sandbox import openshell_sandbox  # noqa: F401
+
+    _has_openshell = True
+except ImportError:  # optional extra not installed; other failures must surface
+    _has_openshell = False
+
+
+class _UnimportableModule(types.ModuleType):
+    """Module whose attribute lookup fails like a protobuf VersionError."""
+
+    def __getattr__(self, name):
+        raise RuntimeError("Detected incompatible Protobuf Gencode/Runtime versions")
+
+
+class TestCreateOpenShellService:
+    """Test _create_openshell_service function."""
+
+    @pytest.fixture(autouse=True)
+    def _namespace_env(self, monkeypatch):
+        """Ownership is mandatory, as for Docker."""
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "test")
+
+    def test_missing_namespace_is_fatal(self, monkeypatch):
+        """Without a namespace two deployments on one gateway would share and
+        delete each other's sandboxes; refuse to start instead."""
+        monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
+        with patch(
+            "xagent.sandbox.openshell_sandbox.OpenShellSandboxService"
+        ) as mock_service_cls:
+            with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE"):
+                _create_openshell_service()
+        mock_service_cls.assert_not_called()
+
+    @pytest.mark.skipif(not _has_openshell, reason="openshell SDK not importable")
+    def test_uses_db_store(self):
+        """Test OpenShell sandbox service is created with the persistent store."""
+        with (
+            patch("xagent.web.sandbox_store.DBOpenShellStore") as mock_store_cls,
+            patch(
+                "xagent.sandbox.openshell_sandbox.OpenShellSandboxService",
+                return_value=FakeSandboxService(),
+            ) as mock_service_cls,
+        ):
+            result = _create_openshell_service()
+
+        assert result is mock_service_cls.return_value
+        mock_store_cls.assert_called_once_with(namespace=None)
+        assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
+        assert mock_service_cls.call_args[1]["namespace"] == "test"
+
+    @pytest.mark.skipif(not _has_openshell, reason="openshell SDK not importable")
+    def test_store_is_scoped_to_the_worker(self):
+        """Shared execution scopes the store and the gateway names to the
+        worker namespace, exactly like Docker."""
+        with (
+            patch(
+                "xagent.web.sandbox_manager.get_sandbox_worker_namespace",
+                return_value="test-1234",
+            ),
+            patch(
+                "xagent.web.sandbox_manager.get_sandbox_worker_id",
+                return_value="worker-a",
+            ),
+            patch("xagent.web.sandbox_store.DBOpenShellStore") as mock_store_cls,
+            patch(
+                "xagent.sandbox.openshell_sandbox.OpenShellSandboxService",
+                return_value=FakeSandboxService(),
+            ) as mock_service_cls,
+        ):
+            _create_openshell_service()
+
+        mock_store_cls.assert_called_once_with(namespace="test-1234")
+        assert mock_service_cls.call_args[1]["namespace"] == "test-1234"
+
+    @pytest.mark.skipif(not _has_openshell, reason="openshell SDK not importable")
+    def test_creation_failure_is_fatal(self):
+        """An enabled OpenShell runtime must not degrade to local execution."""
+        with (
+            patch(
+                "xagent.web.sandbox_store.DBOpenShellStore", return_value=MagicMock()
+            ),
+            patch(
+                "xagent.sandbox.openshell_sandbox.OpenShellSandboxService",
+                side_effect=RuntimeError("no active gateway"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="initialize the OpenShell"):
+                _create_openshell_service()
+
+    def test_sdk_not_installed_is_fatal(self):
+        """A missing SDK fails closed instead of running tools unsandboxed."""
+        with patch.dict(sys.modules, {"xagent.sandbox.openshell_sandbox": None}):
+            with pytest.raises(RuntimeError, match="openshell dependency"):
+                _create_openshell_service()
+
+    def test_sdk_non_import_error_is_fatal(self):
+        """A non-ImportError import failure (protobuf gencode/runtime mismatch)
+        fails closed too."""
+        broken = _UnimportableModule("xagent.sandbox.openshell_sandbox")
+        with patch.dict(sys.modules, {"xagent.sandbox.openshell_sandbox": broken}):
+            with pytest.raises(RuntimeError, match="openshell dependency"):
+                _create_openshell_service()
 
 
 class TestCreateDockerService:

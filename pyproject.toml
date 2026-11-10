@@ -161,6 +161,11 @@ waf-crawl = ["curl_cffi>=0.14.0"]
 chromadb = ["chromadb"]
 milvus = ["pymilvus>=2.6.9,<3.0.0"]
 
+# Experimental NVIDIA OpenShell sandbox backend (SANDBOX_IMPLEMENTATION=openshell).
+# openshell 0.1.x ships protobuf 6.31 gencode but only declares protobuf>=4.25,
+# so state the real floor here; an older runtime fails the import.
+openshell = ["openshell>=0.1.7,<0.2", "protobuf>=6.31,<7"]
+
 # All optional extras (for users who want everything)
 # Note: List packages directly since optional-dependencies doesn't support include-group
 all = [
@@ -181,6 +186,8 @@ all = [
   "curl_cffi>=0.14.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
+  "openshell>=0.1.7,<0.2",
+  "protobuf>=6.31,<7",
   "xrouter-llm>=0.3.6",
   "sentence-transformers>=3.0.0",
 ]

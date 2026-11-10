@@ -14,10 +14,10 @@ from xagent.sandbox import (
     SandboxSnapshot,
     SandboxTemplate,
 )
+from xagent.web import sandbox_store as sandbox_store_module
 from xagent.web.models.database import Base
 from xagent.web.models.sandbox import SandboxInfo as SandboxInfoModel
 from xagent.web.models.sandbox import SandboxSnapshot as SandboxSnapshotModel
-from xagent.web import sandbox_store as sandbox_store_module
 from xagent.web.sandbox_store import SANDBOX_TYPE_DOCKER, DBDockerStore
 
 # Test database setup - using in-memory database

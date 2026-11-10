@@ -34,19 +34,28 @@ from xagent.web.services.release_handover import (
     settle_handover_sync,
 )
 from xagent.web.services.release_hold import release_hold
+from xagent.web.services.task_auto_recovery import (
+    _user_command_since_dispatch,
+    handover_pause_owns_run,
+    record_lease_expiry_interruption_no_commit,
+    verdict_interruption_reason,
+)
 from xagent.web.services.task_auto_resume import (
     cancel_pending_auto_resume_no_commit,
+    check_auto_resume_claim_sync,
     run_auto_resume_tick,
 )
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
+    COMMAND_PENDING,
     TaskCommandKind,
     stage_task_command,
 )
 from xagent.web.services.task_lease_service import (
     CheckpointRecoveryResolution,
     CheckpointRecoveryVerdict,
+    TaskLeaseRecoveryCandidate,
     utc_now,
 )
 
@@ -151,9 +160,7 @@ def _row(factory: sessionmaker, task_id: int) -> TaskAutoRecovery | None:
         return row
 
 
-def _pause_requested(
-    factory: sessionmaker, task_id: int, *, release: str = RELEASE
-) -> None:
+def _pause_requested(factory: sessionmaker, task_id: int) -> None:
     """Phase one of the lease owner's pause: the command completes, the run still runs."""
     with factory() as db:
         task = db.get(Task, task_id)
@@ -182,7 +189,7 @@ def _step_boundary(factory: sessionmaker, task_id: int) -> None:
 
 def _handed_over(factory: sessionmaker, task_id: int, release: str = RELEASE) -> None:
     begin_handover_sync(release, {RUNNER})
-    _pause_requested(factory, task_id, release=release)
+    _pause_requested(factory, task_id)
     _step_boundary(factory, task_id)
 
 
@@ -198,6 +205,47 @@ def _user_command(factory: sessionmaker, task_id: int, kind: TaskCommandKind) ->
             payload={},
             target_run_id=RUN,
         )
+        db.commit()
+
+
+def _stage(
+    factory: sessionmaker,
+    task_id: int,
+    kind: TaskCommandKind,
+    command_id: str,
+    *,
+    status: str,
+    handover: bool = False,
+    reserved: bool = False,
+) -> None:
+    with factory() as db:
+        stage_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=db.get(Task, task_id).user_id,
+            command_id=command_id,
+            kind=kind,
+            payload={},
+            target_run_id=RUN,
+            handover=handover,
+            reserved=reserved,
+        )
+        db.flush()
+        db.execute(
+            sa.update(TaskExecutionCommand)
+            .where(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.command_id == command_id,
+            )
+            .values(status=status)
+        )
+        db.commit()
+
+
+def _set(factory: sessionmaker, task_id: int, **fields: Any) -> None:
+    with factory() as db:
+        for name, value in fields.items():
+            setattr(db.get(Task, task_id), name, value)
         db.commit()
 
 
@@ -243,8 +291,9 @@ def test_begin_covers_every_runner_of_a_pool(factory):
         {"source": "shared_link"},
         {"control_state": "pause_requested"},
         {"channel": True},
+        {"source": "sdk"},
     ],
-    ids=["a2a", "external", "widget", "shared_link", "user-pause", "channel"],
+    ids=["a2a", "external", "widget", "shared_link", "user-pause", "channel", "sdk"],
 )
 def test_begin_leaves_runs_the_successor_would_not_resume_to_the_drain(
     factory, fields, monkeypatch
@@ -509,3 +558,278 @@ def test_a_user_cancel_during_the_handover_keeps_the_run_paused(factory, checkpo
     with factory() as db:
         task = db.get(Task, task_id)
         assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+
+
+# -- round 2: one predicate, a durable marker, the user's pause first -----------
+
+
+def test_begin_skips_a_run_whose_user_pause_is_queued_but_not_applied(factory):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _stage(
+        factory, task_id, TaskCommandKind.PAUSE, "user:early", status=COMMAND_PENDING
+    )
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (0, 1)
+    assert [c.command_id for c in _commands(factory, task_id)] == ["user:early"]
+
+
+def test_a_user_pause_queued_before_the_handover_keeps_the_run_with_its_user(
+    factory, checkpoint
+):
+    # Even when both pauses ended up on the run, in this id order.
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _stage(
+        factory, task_id, TaskCommandKind.PAUSE, "user:early", status=COMMAND_COMPLETED
+    )
+    _stage(
+        factory,
+        task_id,
+        TaskCommandKind.PAUSE,
+        handover_command_id(RELEASE, task_id, RUN),
+        status=COMMAND_COMPLETED,
+        handover=True,
+    )
+    _set(factory, task_id, status=TaskStatus.PAUSED, control_state="paused")
+
+    report = settle_handover_sync(RELEASE)
+
+    assert (report.recorded, report.unsettled) == (0, 0)
+    assert _row(factory, task_id) is None
+    with factory() as db:
+        assert not handover_pause_owns_run(db, task_id, RUN)
+
+
+def test_a_person_pause_before_an_earlier_resume_is_not_this_stops(factory, checkpoint):
+    # The run id survives a resume: a pause the user lifted long ago must not
+    # make a later hand-over look like a user pause.
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _stage(
+        factory, task_id, TaskCommandKind.PAUSE, "user:old", status=COMMAND_COMPLETED
+    )
+    _stage(
+        factory, task_id, TaskCommandKind.RESUME, "user:lift", status=COMMAND_COMPLETED
+    )
+    _handed_over(factory, task_id)
+
+    assert settle_handover_sync(RELEASE).recorded == 1
+
+
+def test_a_run_that_ends_between_begin_and_settle_is_neither_recorded_nor_pending(
+    factory, checkpoint
+):
+    with factory() as db:
+        done = _task(db)
+        failed = _task(db)
+        db.commit()
+    begin_handover_sync(RELEASE, {RUNNER})
+    for task_id, status in ((done, TaskStatus.COMPLETED), (failed, TaskStatus.FAILED)):
+        _pause_requested(factory, task_id)
+        _set(factory, task_id, status=status, control_state="paused")
+
+    report = settle_handover_sync(RELEASE)
+
+    assert (report.recorded, report.unsettled, report.failed) == (0, 0, 0)
+    assert _row(factory, done) is None and _row(factory, failed) is None
+
+
+def test_settle_returns_the_recovery_notice_of_what_it_committed(factory, checkpoint):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _handed_over(factory, task_id)
+
+    report = settle_handover_sync(RELEASE)
+
+    assert [(n.task_id, n.run_id) for n in report.notices] == [(task_id, RUN)]
+    with factory() as db:
+        assert report.notices[0].state_version == db.get(Task, task_id).state_version
+    assert report.notices[0].auto_resume
+    assert settle_handover_sync(RELEASE).notices == ()
+
+
+def test_the_handover_pause_is_not_a_person_command_for_the_resume_episode(factory):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _stage(
+        factory,
+        task_id,
+        TaskCommandKind.RESUME,
+        "auto-resume:1:1:run",
+        status=COMMAND_COMPLETED,
+        reserved=True,
+    )
+    _stage(
+        factory,
+        task_id,
+        TaskCommandKind.PAUSE,
+        handover_command_id(RELEASE, task_id, RUN),
+        status=COMMAND_COMPLETED,
+        handover=True,
+    )
+    with factory() as db:
+        assert not _user_command_since_dispatch(db, task_id, "auto-resume:1:1:run")
+    _stage(factory, task_id, TaskCommandKind.PAUSE, "user:p", status=COMMAND_COMPLETED)
+    with factory() as db:
+        assert _user_command_since_dispatch(db, task_id, "auto-resume:1:1:run")
+
+
+def test_the_successor_claim_resumes_the_run_and_a_user_pause_before_it_wins(
+    factory, checkpoint
+):
+    with factory() as db:
+        resumed = _task(db)
+        paused = _task(db)
+        db.commit()
+    for task_id in (resumed, paused):
+        _handed_over(factory, task_id)
+    settle_handover_sync(RELEASE)
+    assert (
+        run_auto_resume_tick(now=utc_now() + timedelta(seconds=30)).staged_commands == 2
+    )
+    # A user pause lands between the recording and the claim.
+    _set(factory, paused, state_version=sa.text("state_version + 1"))
+
+    def claim(task_id: int):
+        command = next(c for c in _commands(factory, task_id) if c.kind == "resume")
+        with factory() as db:
+            task = db.get(Task, task_id)
+            return check_auto_resume_claim_sync(
+                task_id=task_id,
+                command_id=command.command_id,
+                auto_resume=command.payload["auto_resume"],
+                status=task.status,
+                control_state=task.control_state,
+                run_id=task.run_id,
+                state_version=task.state_version,
+                attempt_count=1,
+            )
+
+    assert claim(resumed).proceed
+    stale = claim(paused)
+    assert (stale.proceed, stale.why) == (False, "stale")
+
+
+def test_the_sweeper_records_a_handed_over_pause_nobody_settled(factory, checkpoint):
+    # The controller died after the pause applied: settle never ran.
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _handed_over(factory, task_id)
+    release_hold.reopen()
+
+    report = run_auto_resume_tick(now=utc_now())
+
+    assert report.handed_over == 1
+    assert [(n.task_id, n.run_id) for n in report.notices] == [(task_id, RUN)]
+    row = _row(factory, task_id)
+    assert (row.reason, row.state) == ("shutdown", "scheduled")
+    again = run_auto_resume_tick(now=utc_now())
+    assert again.handed_over == 0
+    # The process that is still serving the run resumes it, after an abort.
+    assert (
+        run_auto_resume_tick(now=utc_now() + timedelta(seconds=30)).staged_commands == 1
+    )
+
+
+def test_the_sweeper_leaves_a_user_paused_run_and_acts_only_when_enabled(
+    factory, checkpoint, monkeypatch
+):
+    with factory() as db:
+        user_paused = _task(db)
+        plain = _task(db)
+        db.commit()
+    _handed_over(factory, user_paused)
+    _user_command(factory, user_paused, TaskCommandKind.PAUSE)
+    _handed_over(factory, plain, "rel-2")
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    assert run_auto_resume_tick(now=utc_now()).handed_over == 0
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "true")
+
+    assert run_auto_resume_tick(now=utc_now()).handed_over == 1
+
+    assert _row(factory, user_paused) is None
+    assert _row(factory, plain) is not None
+
+
+def test_the_sweeper_ignores_handovers_older_than_its_window(factory, checkpoint):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _handed_over(factory, task_id)
+
+    assert run_auto_resume_tick(now=utc_now() + timedelta(hours=3)).handed_over == 0
+    assert _row(factory, task_id) is None
+
+
+def _lease_recovered_reason(factory: sessionmaker, task_id: int) -> str | None:
+    """Lease recovery of a run that died PAUSE_REQUESTED, reduced to its recording."""
+    with factory() as db:
+        task = db.get(Task, task_id)
+        candidate = TaskLeaseRecoveryCandidate(
+            task_id=task_id,
+            runner_id=RUNNER,
+            run_id=RUN,
+            lease_expires_at=utc_now(),
+            state_version=int(task.state_version),
+            last_checkpoint_event_id=None,
+            last_checkpoint_trace_event_id=None,
+            attempt_id=None,
+            control_state="pause_requested",
+        )
+        task.status, task.control_state = TaskStatus.PAUSED, "paused"
+        task.state_version = int(task.state_version) + 1
+        recorded = record_lease_expiry_interruption_no_commit(
+            db,
+            task=task,
+            candidate=candidate,
+            resolution=CheckpointRecoveryResolution(
+                CheckpointRecoveryVerdict.RECOVERABLE
+            ),
+            task_status=TaskStatus.PAUSED,
+            recovered_at=utc_now(),
+        )
+        db.commit()
+        return recorded.reason if recorded is not None else None
+
+
+def test_lease_recovery_of_a_run_that_died_pause_requested_records_shutdown(
+    factory, checkpoint
+):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    begin_handover_sync(RELEASE, {RUNNER})
+    _pause_requested(factory, task_id)
+
+    assert _lease_recovered_reason(factory, task_id) == "shutdown"
+
+
+def test_lease_recovery_keeps_user_pause_when_a_person_paused_too(factory, checkpoint):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    begin_handover_sync(RELEASE, {RUNNER})
+    _pause_requested(factory, task_id)
+    _user_command(factory, task_id, TaskCommandKind.PAUSE)
+
+    assert _lease_recovered_reason(factory, task_id) == "user_pause"
+
+
+def test_the_verdict_reason_is_shutdown_only_for_a_handover_pause():
+    for handover, expected in ((True, "shutdown"), (False, "user_pause")):
+        reason = verdict_interruption_reason(
+            CheckpointRecoveryVerdict.RECOVERABLE,
+            control_state="pause_requested",
+            recoverable_reason=release_handover.InterruptionReason.LEASE_EXPIRED,
+            handover_pause=handover,
+        )
+        assert reason is not None and reason.value == expected

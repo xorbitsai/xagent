@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -71,7 +72,12 @@ from .task_auto_recovery_policy import (
     plan_auto_resume,
     scheduled_trigger_superseded,
 )
-from .task_command_transport import AUTO_RESUME_COMMAND_PREFIX
+from .task_command_transport import (
+    AUTO_RESUME_COMMAND_PREFIX,
+    COMMAND_COMPLETED,
+    COMMAND_FAILED,
+    HANDOVER_COMMAND_PREFIX,
+)
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -251,6 +257,10 @@ def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
     nothing but the status, and a deploy should not keep it waiting on a
     lease TTL. Channel tasks are excluded too until their resumed reply is
     proven, and nothing is handed off while automatic resume is off.
+
+    This is the one place that decides which RUNNING runs a host hands over
+    instead of draining; ``release_handover`` calls it rather than keep its
+    own rules.
     """
 
     if not get_task_auto_resume_enabled():
@@ -261,6 +271,84 @@ def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
     if is_status_only_source(task.source) or task.channel_id is not None:
         return False
     return auto_recovery_eligibility(db, task).eligible
+
+
+def handover_pause_owns_run(db: Session, task_id: int, run_id: str | None) -> bool:
+    """Whether a release hand-over's pause, and no person's, stopped ``run_id``.
+
+    The durable marker of a planned shutdown (``release_handover``): a
+    *completed* hand-over PAUSE (command id in the reserved
+    ``release-handover:`` namespace) aimed at ``run_id``, and no other PAUSE
+    or CANCEL for it -- a person's, queued before or after, in any state but
+    failed. A CANCEL with no target counts too. Command id order does not
+    matter, so a user pause queued before the hand-over began is seen.
+
+    Only commands since the last RESUME completed before that hand-over count
+    (a resume keeps the run id, so a person's older pause of the same run is
+    not this stop's). ``SHUTDOWN`` is recorded for such a pause by the
+    release's settle step, by lease recovery and by the auto-resume sweeper
+    alike, so a controller that died or a release that was aborted after the
+    pause applied does not leave a user pause behind.
+    """
+
+    if run_id is None:
+        return False
+    from sqlalchemy import and_, func, or_
+
+    from ..models.task_command import TaskExecutionCommand as Command
+
+    def _handover(column: Any) -> Any:
+        return (
+            func.substr(column, 1, len(HANDOVER_COMMAND_PREFIX))
+            == HANDOVER_COMMAND_PREFIX
+        )
+
+    handover_id = db.execute(
+        select(func.max(Command.id)).where(
+            Command.task_id == task_id,
+            Command.kind == "pause",
+            Command.status == COMMAND_COMPLETED,
+            Command.target_run_id == run_id,
+            _handover(Command.command_id),
+        )
+    ).scalar_one_or_none()
+    if handover_id is None:
+        return False
+    epoch_start = (
+        db.execute(
+            select(func.max(Command.id)).where(
+                Command.task_id == task_id,
+                Command.kind == "resume",
+                Command.status == COMMAND_COMPLETED,
+                Command.id < handover_id,
+            )
+        ).scalar_one_or_none()
+        or 0
+    )
+    person = db.execute(
+        select(Command.id)
+        .where(
+            Command.task_id == task_id,
+            Command.id > epoch_start,
+            Command.status != COMMAND_FAILED,
+            or_(
+                and_(
+                    Command.kind == "pause",
+                    Command.target_run_id == run_id,
+                    ~_handover(Command.command_id),
+                ),
+                and_(
+                    Command.kind == "cancel",
+                    or_(
+                        Command.target_run_id == run_id,
+                        Command.target_run_id.is_(None),
+                    ),
+                ),
+            ),
+        )
+        .limit(1)
+    ).first()
+    return person is None
 
 
 def record_interruption_no_commit(
@@ -578,6 +666,16 @@ def _user_command_since_dispatch(
                 )
                 == AUTO_RESUME_COMMAND_PREFIX,
             ),
+            # A release hand-over's pause is the platform's, not a person's.
+            ~and_(
+                TaskExecutionCommand.kind == "pause",
+                func.substr(
+                    TaskExecutionCommand.command_id,
+                    1,
+                    len(HANDOVER_COMMAND_PREFIX),
+                )
+                == HANDOVER_COMMAND_PREFIX,
+            ),
         )
         .limit(1)
     ).first()
@@ -643,19 +741,40 @@ def current_auto_recovery_view(db: Session, task: Task) -> dict[str, Any] | None
 def lease_expiry_interruption_reason(
     candidate: TaskLeaseRecoveryCandidate,
     verdict: CheckpointRecoveryVerdict,
+    *,
+    handover_pause: bool = False,
 ) -> InterruptionReason | None:
     """Why lease recovery stopped ``candidate``'s run, by its verdict.
 
     A recoverable run becomes PAUSED: a user pause when the run died while
-    PAUSE_REQUESTED (the user already decided), else ``lease_expired``. The
-    FAILED verdicts keep their own terminal reasons. ``INDETERMINATE`` writes
-    nothing, so it has no reason.
+    PAUSE_REQUESTED (the user already decided; ``shutdown`` when the pause
+    was a release hand-over's, ``handover_pause``), else ``lease_expired``.
+    The FAILED verdicts keep their own terminal reasons. ``INDETERMINATE``
+    writes nothing, so it has no reason.
     """
 
     return verdict_interruption_reason(
         verdict,
         control_state=candidate.control_state,
         recoverable_reason=InterruptionReason.LEASE_EXPIRED,
+        handover_pause=handover_pause,
+    )
+
+
+def handover_pause_for_verdict(
+    db: Session,
+    verdict: CheckpointRecoveryVerdict,
+    *,
+    control_state: str | None,
+    task_id: int,
+    run_id: str | None,
+) -> bool:
+    """:func:`handover_pause_owns_run`, asked only where its answer is used."""
+
+    return (
+        verdict is CheckpointRecoveryVerdict.RECOVERABLE
+        and control_state == TaskControlState.PAUSE_REQUESTED.value
+        and handover_pause_owns_run(db, task_id, run_id)
     )
 
 
@@ -664,17 +783,24 @@ def verdict_interruption_reason(
     *,
     control_state: str | None,
     recoverable_reason: InterruptionReason,
+    handover_pause: bool = False,
 ) -> InterruptionReason | None:
     """The reason a checkpoint verdict records, shared by every writer.
 
     ``RECOVERABLE`` records ``recoverable_reason``, or a user pause when the
-    run was PAUSE_REQUESTED; the FAILED verdicts record their own terminal
-    reasons; ``INDETERMINATE`` writes nothing, so it has none.
+    run was PAUSE_REQUESTED -- ``shutdown`` instead when that pause was a
+    release hand-over's (``handover_pause``, from
+    :func:`handover_pause_owns_run`); the FAILED verdicts record their own
+    terminal reasons; ``INDETERMINATE`` writes nothing, so it has none.
     """
 
     if verdict is CheckpointRecoveryVerdict.RECOVERABLE:
         if control_state == TaskControlState.PAUSE_REQUESTED.value:
-            return InterruptionReason.USER_PAUSE
+            return (
+                InterruptionReason.SHUTDOWN
+                if handover_pause
+                else InterruptionReason.USER_PAUSE
+            )
         return recoverable_reason
     if verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
         return InterruptionReason.UNKNOWN_TOOL_EFFECT
@@ -790,7 +916,17 @@ def record_lease_expiry_interruption_no_commit(
       before this call must do the same.
     """
 
-    reason = lease_expiry_interruption_reason(candidate, resolution.verdict)
+    reason = lease_expiry_interruption_reason(
+        candidate,
+        resolution.verdict,
+        handover_pause=handover_pause_for_verdict(
+            db,
+            resolution.verdict,
+            control_state=candidate.control_state,
+            task_id=candidate.task_id,
+            run_id=candidate.run_id,
+        ),
+    )
     if reason is None:
         return None
     savepoint = db.begin_nested()
@@ -1048,6 +1184,13 @@ def decide_interruption(
             return legacy_interruption_decision(reason)
         candidate = _settlement_candidate(task)
         resolution = resolve_checkpoint_recovery_with_data(db, candidate)
+        handover_pause = handover_pause_for_verdict(
+            db,
+            resolution.verdict,
+            control_state=candidate.control_state,
+            task_id=int(task.id),
+            run_id=candidate.run_id,
+        )
     except Exception as exc:
         if not is_database_unavailable(exc):
             logger.exception(
@@ -1066,6 +1209,7 @@ def decide_interruption(
         resolution.verdict,
         control_state=candidate.control_state,
         recoverable_reason=reason,
+        handover_pause=handover_pause,
     )
     if outcome is None or recorded is None:
         raise InterruptionSettlementDeferred(

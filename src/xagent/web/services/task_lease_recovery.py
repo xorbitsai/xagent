@@ -380,7 +380,10 @@ def stage_task_lease_recovery_no_commit(
     from .chat_history_service import persist_assistant_message_no_commit
     from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
     from .routine_history_provenance import routine_history_turn_id
-    from .task_auto_recovery import lease_expiry_interruption_reason
+    from .task_auto_recovery import (
+        handover_pause_for_verdict,
+        lease_expiry_interruption_reason,
+    )
     from .task_auto_resume import trigger_error_for_recorded
     from .task_execution_controller import task_control_snapshot
     from .task_execution_event_writer import stage_result_fact_no_commit
@@ -433,7 +436,17 @@ def stage_task_lease_recovery_no_commit(
             task_id=candidate.task_id,
             report=SettlementReport(
                 control_state=task_control_snapshot(task).as_dict(),
-                paused_for=lease_expiry_interruption_reason(candidate, verdict),
+                paused_for=lease_expiry_interruption_reason(
+                    candidate,
+                    verdict,
+                    handover_pause=handover_pause_for_verdict(
+                        db,
+                        verdict,
+                        control_state=candidate.control_state,
+                        task_id=candidate.task_id,
+                        run_id=candidate.run_id,
+                    ),
+                ),
                 recovery=recorded,
             ),
         ),

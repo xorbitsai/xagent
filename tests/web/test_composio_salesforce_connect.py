@@ -12,6 +12,7 @@ request leaves the process.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -29,11 +30,13 @@ from xagent.web.models.mcp import UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 
 from . import test_composio_facebook_connect as facebook_connect
 from .test_composio_facebook_connect import (
     CALLBACK_URL,
     COMPOSIO_REDIRECT,
+    OTHER_OWNER,
     OWNER,
     Browser,
     FakeComposio,
@@ -270,6 +273,37 @@ def test_with_the_switch_off_a_salesforce_start_stays_native(
     assert composio.calls == []
 
 
+def test_with_the_switch_on_a_web_salesforce_connect_stays_native(salesforce):
+    """Only actor (Toby) connects go through Composio: an ordinary web connect,
+    which has no resource owner key, still uses our own connected app."""
+    db, user, composio = salesforce
+    token = auth_api.create_access_token(
+        data={"sub": user.username, "user_id": user.id, "type": "access"},
+        expires_delta=timedelta(minutes=5),
+    )
+
+    response = auth_api.generic_oauth_login(
+        provider="salesforce",
+        token=token,
+        app_id="salesforce",
+        db=db,
+        db_provider=_salesforce_provider(),
+    )
+
+    assert response.status_code in (302, 307)
+    location = urlsplit(response.headers["location"])
+    assert (location.netloc, location.path) == (
+        "login.salesforce.com",
+        "/services/oauth2/authorize",
+    )
+    query = parse_qs(location.query)
+    assert query["client_id"] == ["salesforce-client-id"]
+    state = auth_api.verify_token(query["state"][0])
+    assert state.get("resource_owner_key") is None
+    assert composio_auth.AUTH_BACKEND_CLAIM not in state
+    assert composio.calls == []
+
+
 # --- Connect end to end ---------------------------------------------------------
 
 
@@ -310,6 +344,55 @@ def test_a_salesforce_connect_stores_the_orgs_own_user_id(salesforce):
     assert grant.access_token == composio.created[-1]
     assert db.query(ActorOAuthFlowState).count() == 0
     assert _flow_cookies(browser) == []
+
+
+def _native_salesforce_grant(user: User, owner: str | None, token: str) -> UserOAuth:
+    return UserOAuth(
+        user_id=int(user.id),
+        provider="salesforce",
+        resource_owner_key=owner,
+        provider_user_id="005Hs00000OldOLDOLD",
+        access_token=token,
+        refresh_token="native-refresh-token",
+        token_type="bearer",
+        instance_url="https://acme.my.salesforce.com",
+    )
+
+
+def test_a_salesforce_connect_replaces_the_actors_native_grant(salesforce):
+    """Switching the backend to Composio: the actor's next connect replaces
+    its native grant. The native row is only deleted here (no Composio
+    account to delete, nothing sent to Salesforce); a web grant and another
+    actor's grant are left alone."""
+    db, user, composio = salesforce
+    db.add_all(
+        [
+            _native_salesforce_grant(user, OWNER, "native-actor-token"),
+            _native_salesforce_grant(user, None, "native-web-token"),
+            _native_salesforce_grant(user, OTHER_OWNER, "native-other-token"),
+        ]
+    )
+    db.commit()
+
+    response = _connect(db, user, composio)
+
+    assert response.status_code == 200, response.body
+    rows = _grants(db)
+    grants = {grant.resource_owner_key: grant for grant in rows}
+    assert len(rows) == 3
+    assert set(grants) == {OWNER, None, OTHER_OWNER}
+    new = grants[OWNER]
+    assert (new.token_type, new.access_token, new.provider_user_id) == (
+        "composio",
+        composio.created[-1],
+        SALESFORCE_USER_ID,
+    )
+    assert new.refresh_token is None
+    assert grants[None].access_token == "native-web-token"
+    assert grants[OTHER_OWNER].access_token == "native-other-token"
+    # The replaced grant was native: no Composio account to delete. (The
+    # fixture fails any direct call to Salesforce, so none was revoked.)
+    assert composio.paths("DELETE") == []
 
 
 @pytest.mark.parametrize(
@@ -380,14 +463,18 @@ def test_an_unusable_org_host_is_refused_without_echoing_it(salesforce, data, ca
     assert _identity_reads(composio) == []
     assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[-1]}"]
     assert _grants(db) == []
+    text = response.body.decode()
     raw = data.get("base_url") if isinstance(data, dict) else None
     if isinstance(raw, str) and raw:
-        # The host part, even where the URL itself can't be parsed.
+        # The host part, even where the URL itself can't be parsed, and the
+        # bare hostname without credentials, port or brackets.
         host = raw.split("://", 1)[-1].split("/", 1)[0]
-        for shown in (raw, host, "sneaky"):
+        hostname = host.rsplit("@", 1)[-1].split(":", 1)[0].strip("[")
+        for shown in (raw, raw.strip(), host, hostname, "sneaky"):
             assert shown not in caplog.text
-            assert shown not in response.body.decode()
+            assert shown not in text
     assert "no usable Salesforce host" in caplog.text
+    assert "reason=identity_host_invalid" in caplog.text
 
 
 def test_the_host_is_not_read_from_params_or_sub(salesforce):
@@ -468,7 +555,11 @@ def test_the_catalog_carries_connect_guidance_while_salesforce_is_on_composio(
         assert "acme.my" in text
         assert "Use Custom Domain" in text
         # A sandbox signs in through test.salesforce.com, not "login".
-        assert "sandbox" in text and "test" in text
+        assert (
+            "For a sandbox org, change the subdomain on Composio's page to "
+            "test, or to your sandbox's My Domain prefix (for example "
+            "acme--uat.sandbox.my)."
+        ) in text
     assert "admins" in guidance["before_connect"]
     # Only after a failed attempt: the two ways it fails without saying why.
     assert "mistyped" in guidance["not_connected"]

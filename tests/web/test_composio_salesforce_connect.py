@@ -467,6 +467,8 @@ def test_the_catalog_carries_connect_guidance_while_salesforce_is_on_composio(
         assert "All users may self-authorize" in text
         assert "acme.my" in text
         assert "Use Custom Domain" in text
+        # A sandbox signs in through test.salesforce.com, not "login".
+        assert "sandbox" in text and "test" in text
     assert "admins" in guidance["before_connect"]
     # Only after a failed attempt: the two ways it fails without saying why.
     assert "mistyped" in guidance["not_connected"]

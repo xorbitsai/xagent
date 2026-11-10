@@ -231,6 +231,13 @@ _SALESFORCE_LOGIN_POLICY = (
     "prefix (for example acme.my, or acme.develop.my for a Developer Edition "
     'org), or choose "Use Custom Domain" on the Salesforce login page.'
 )
+# A sandbox org signs in through test.salesforce.com, not the default
+# subdomain "login". Not tested live (no sandbox at hand, #3646); this
+# follows Salesforce's own login rules.
+_SALESFORCE_SANDBOX = (
+    "For a sandbox org, change the subdomain on Composio's page to test, or "
+    "to your sandbox's My Domain prefix (for example acme--uat.sandbox.my)."
+)
 # Salesforce stops on its own page when the app is not installed, the
 # subdomain is mistyped, or the org refuses logins from login.salesforce.com;
 # nothing comes back to Composio or to us, so the only help is this text.
@@ -239,7 +246,7 @@ SALESFORCE_CONNECT_GUIDANCE: Mapping[str, str] = {
         f"{_SALESFORCE_INSTALL} Admins can connect without installing it, but "
         "nobody else in the org can until it is installed, so admins should "
         "install it too. If your org doesn't allow logins from "
-        f"login.salesforce.com, {_SALESFORCE_LOGIN_POLICY}"
+        f"login.salesforce.com, {_SALESFORCE_LOGIN_POLICY} {_SALESFORCE_SANDBOX}"
     ),
     "not_connected": (
         "Salesforce wasn't connected. If Salesforce showed "
@@ -247,7 +254,8 @@ SALESFORCE_CONNECT_GUIDANCE: Mapping[str, str] = {
         f"{_SALESFORCE_INSTALL} If the page couldn't be reached, the subdomain "
         "on Composio's page may be mistyped. If Salesforce said \"Please check "
         'your username and password" although they are right, your org may '
-        f"not allow logins from login.salesforce.com: {_SALESFORCE_LOGIN_POLICY}"
+        f"not allow logins from login.salesforce.com: {_SALESFORCE_LOGIN_POLICY} "
+        f"{_SALESFORCE_SANDBOX}"
     ),
 }
 

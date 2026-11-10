@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # Sandbox type constant
 SANDBOX_TYPE_BOXLITE = "boxlite"
 SANDBOX_TYPE_DOCKER = "docker"
+SANDBOX_TYPE_OPENSHELL = "openshell"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -220,6 +221,16 @@ else:
         """Database-backed implementation of BoxliteStore."""
 
         sandbox_type = SANDBOX_TYPE_BOXLITE
+
+
+class DBOpenShellStore(_DBSandboxStoreBase):
+    """Database-backed store for the OpenShell backend.
+
+    Duck-typed against ``OpenShellStore`` so this module does not import the
+    openshell SDK when that backend is not in use.
+    """
+
+    sandbox_type = SANDBOX_TYPE_OPENSHELL
 
 
 class DBDockerStore(_DBSandboxStoreBase, DockerStore):

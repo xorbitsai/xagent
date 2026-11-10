@@ -1,0 +1,17 @@
+id: poc-httpbin
+display_name: POC httpbin
+category: other
+credentials:
+  - name: api_key
+    env_vars: [HTTPBIN_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: httpbin.org
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    access: full
+binaries:
+  - /usr/bin/python3.11

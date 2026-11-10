@@ -3232,12 +3232,14 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
     if implementation == "boxlite":
         return _create_boxlite_service()
+    elif implementation == "openshell":
+        return _create_openshell_service()
     elif implementation == "docker":
         return _create_docker_service()
     else:
         raise ValueError(
             "Unknown SANDBOX_IMPLEMENTATION "
-            f"{implementation!r}; expected 'docker' or 'boxlite'"
+            f"{implementation!r}; expected 'docker', 'boxlite' or 'openshell'"
         )
 
 
@@ -3266,6 +3268,31 @@ def _create_boxlite_service() -> Optional[SandboxService]:
     except Exception as e:
         raise RuntimeError("Failed to initialize the BoxLite sandbox runtime") from e
 
+    return service
+
+
+def _create_openshell_service() -> Optional[SandboxService]:
+    """Create OpenShell sandbox service (experimental)."""
+    try:
+        from ..sandbox.openshell_sandbox import OpenShellSandboxService
+    except Exception as exc:
+        # Not just ImportError: openshell 0.1.x ships protobuf 6 gencode, so an
+        # older protobuf runtime fails the import with a VersionError.
+        raise RuntimeError(
+            "SANDBOX_IMPLEMENTATION=openshell requires the openshell dependency "
+            "(install the 'openshell' extra)"
+        ) from exc
+
+    from .sandbox_store import DBOpenShellStore
+
+    store = DBOpenShellStore(namespace=get_sandbox_worker_id())
+    try:
+        service = OpenShellSandboxService(store=store)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to initialize the OpenShell sandbox runtime"
+        ) from exc
+    logger.info("Created OpenShell sandbox service")
     return service
 
 

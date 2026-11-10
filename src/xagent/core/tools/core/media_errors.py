@@ -625,9 +625,9 @@ def is_parameter_rejection(exc: BaseException) -> bool:
     or a provider wrapper can put those words in an error that is still a
     transient failure; refusing to retry an outage is worse than one extra
     attempt. Every image adapter keeps the status on the provider error
-    (OpenAI's SDK, Gemini's ``code``, DashScope's ``status_code``, Xinference's
-    response), so a rejected parameter reaches this predicate with a status in
-    the paths the image tools actually use.
+    (OpenAI's SDK error, Gemini's ``httpx.HTTPStatusError``, DashScope's
+    ``status_code``, Xinference's client error), so a rejected parameter
+    reaches this predicate with a status in the paths the image tools use.
 
     A retry policy asks this before sending the identical request again -- no
     attempt can turn a refused parameter into an accepted one, and each

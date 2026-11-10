@@ -368,3 +368,87 @@ async def test_worker_runs_process_diagnostics_until_stop(
     assert order.index("dispatch") < order.index("diagnostics_start")
     assert seen["stopped"] is diagnostics
     assert seen["telemetry_stopped"] is telemetry
+
+
+def _stub_worker_boot(monkeypatch, telemetry):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    for name in (
+        "configure_db",
+        "validate_worker_schema",
+        "validate_interaction_rollout_at_startup",
+        "register_local_browser_runtime",
+        "register_execution_scope_snapshot_loader",
+        "initialize_langfuse",
+        "shutdown_task_runtime_hook_executor",
+        "unregister_local_browser_runtime",
+        "flush_langfuse",
+        "admit_memory_storage_at_startup",
+        "start_task_command_dispatcher",
+        "start_process_diagnostics",
+    ):
+        monkeypatch.setattr(worker, name, Mock())
+    monkeypatch.setattr(
+        worker,
+        "background_task_manager",
+        SimpleNamespace(start_accepting=lambda: None, shutdown=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "close_task_coordinators", AsyncMock())
+    monkeypatch.setattr(
+        worker, "create_skill_manager", lambda: SimpleNamespace(initialize=AsyncMock())
+    )
+    monkeypatch.setattr(
+        worker,
+        "create_template_manager",
+        lambda: SimpleNamespace(initialize=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    for name in (
+        "start_task_event_bridge",
+        "stop_task_event_bridge",
+        "wait_for_heartbeat_manager_idle",
+        "run_task_lease_recovery_loop",
+        "run_task_auto_resume_loop",
+        "stop_task_command_dispatcher",
+        "supervise_task_command_dispatcher",
+        "stop_process_diagnostics",
+        "stop_process_runtime_telemetry",
+    ):
+        monkeypatch.setattr(worker, name, AsyncMock())
+    monkeypatch.setattr(worker, "start_process_runtime_telemetry", lambda: telemetry)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("telemetry", [None, SimpleNamespace(name="telemetry")])
+async def test_worker_reports_unobserved_execution_events_with_telemetry_flag(
+    monkeypatch, telemetry
+):
+    _stub_worker_boot(monkeypatch, telemetry)
+    report = Mock()
+    monkeypatch.setattr(worker, "report_unobserved_execution_events", report)
+    stop = asyncio.Event()
+    stop.set()
+
+    await worker.run_worker(stop=stop)
+
+    report.assert_called_once_with(telemetry_started=telemetry is not None)
+
+
+@pytest.mark.asyncio
+async def test_worker_invalid_conversation_storage_rollout_fails_startup(
+    monkeypatch,
+):
+    _stub_worker_boot(monkeypatch, None)
+    monkeypatch.setenv("XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES", "not_an_entry")
+    from xagent.web.services.conversation_storage_rollout import (
+        ConversationStorageConfigError,
+    )
+
+    stop = asyncio.Event()
+    stop.set()
+    with pytest.raises(ConversationStorageConfigError, match="not_an_entry"):
+        await worker.run_worker(stop=stop)

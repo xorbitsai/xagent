@@ -4914,3 +4914,35 @@ class TestComposioCallbackUrlConfig:
         monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, value)
         with pytest.raises(ValueError, match="XAGENT_COMPOSIO_CALLBACK_URL"):
             config.get_composio_callback_url()
+
+
+@pytest.mark.parametrize(
+    ("getter", "env", "lower"),
+    [
+        (
+            config.get_execution_event_storage_entries,
+            config.EXECUTION_EVENT_STORAGE_ENTRIES,
+            True,
+        ),
+        (
+            config.get_execution_event_storage_user_ids,
+            config.EXECUTION_EVENT_STORAGE_USER_IDS,
+            False,
+        ),
+    ],
+)
+def test_execution_event_storage_getters_raw_parsing(monkeypatch, getter, env, lower):
+    monkeypatch.delenv(env, raising=False)
+    assert getter() == []
+    monkeypatch.setenv(env, "")
+    assert getter() == []
+    monkeypatch.setenv(env, "   ")
+    assert getter() == []
+    monkeypatch.setenv(env, " Sdk ,, A2A , sdk,")
+    expected = ["sdk", "a2a", "sdk"] if lower else ["Sdk", "A2A", "sdk"]
+    assert getter() == expected
+
+
+def test_execution_event_storage_getters_do_not_validate(monkeypatch):
+    monkeypatch.setenv(config.EXECUTION_EVENT_STORAGE_USER_IDS, "1, abc, -2")
+    assert config.get_execution_event_storage_user_ids() == ["1", "abc", "-2"]

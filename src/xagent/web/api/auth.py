@@ -33,7 +33,7 @@ from pydantic import (
     StrictStr,
     field_validator,
 )
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
@@ -101,7 +101,7 @@ from ..models.database import (
 )
 from ..models.system_setting import SystemSetting
 from ..models.user import User, email_confirmation_clear_values
-from ..models.user_oauth import UserOAuth
+from ..models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
 from ..oauth_account_hosts import (
     OAuthAccountError,
     get_oauth_account_host,
@@ -3547,7 +3547,13 @@ def start_builtin_oauth_for_resource_owner(
     if owner_key is None:  # pragma: no cover - normalization preserves only None
         raise ValueError("resource_owner_key must not be null")
     app_id = app_id.strip()
-    if error_response := _google_gmail_error(provider, app_id):
+    from .. import composio_auth
+
+    composio_app = composio_auth.composio_app(provider, app_id)
+    via_composio = composio_app is not None
+    # Composio's Google app holds Google's restricted-scope approval; only a
+    # native Gmail start obeys our review gate (#3649).
+    if not via_composio and (error_response := _google_gmail_error(provider, app_id)):
         return error_response
 
     _require_actor_oauth_personal_link(
@@ -3557,10 +3563,6 @@ def start_builtin_oauth_for_resource_owner(
         app_id=app_id,
     )
 
-    from .. import composio_auth
-
-    composio_app = composio_auth.composio_app(provider, app_id)
-    via_composio = composio_app is not None
     if composio_app is not None and (
         refusal := composio_auth.start_preflight(composio_app.app_id)
     ):
@@ -3991,7 +3993,19 @@ def _generic_oauth_login(
     force_google_consent: bool = False,
     auth_backend: str | None = None,
 ) -> Any:
-    """Build an ordinary or trusted actor provider authorization redirect."""
+    """Build an ordinary or trusted actor provider authorization redirect.
+
+    ``auth_backend`` is ``None`` for a native start, or Composio's backend for
+    an actor start of an app that goes through Composio. Any other value is a
+    programming error and raises ``ValueError`` before anything is read.
+    """
+    from .. import composio_auth
+
+    if auth_backend not in (None, composio_auth.AUTH_BACKEND):
+        raise ValueError("unsupported OAuth auth_backend")
+    # Every native-only rule below (our client id, the Google gates, shared
+    # grants) keys on this one flag (#3649).
+    native_start = auth_backend is None
     if db is None:
         raise RuntimeError("db session is required")
     if not db_provider:
@@ -4004,7 +4018,7 @@ def _generic_oauth_login(
     # authorizes, so our client id is never sent (composio_auth). The one
     # later reader, Google shared-grant mode below, never takes a Composio
     # start (#3649).
-    if not client_id and auth_backend is None:
+    if not client_id and native_start:
         return _oauth_provider_config_error(
             provider, [_oauth_env_name(provider, "CLIENT_ID")]
         )
@@ -4026,7 +4040,9 @@ def _generic_oauth_login(
             status_code=401,
         )
 
-    if error_response := _google_gmail_error(provider, app_id):
+    # Only the actor start passes ``auth_backend``, and only for an app that
+    # goes through Composio, whose start never reaches Google (see above).
+    if native_start and (error_response := _google_gmail_error(provider, app_id)):
         return error_response
 
     if not app_id:
@@ -4160,10 +4176,8 @@ def _generic_oauth_login(
             resource_owner_key=encrypted_owner_key,
             actor_flow_nonce=actor_flow_nonce,
         )
-        if auth_backend is not None:
-            from ..composio_auth import AUTH_BACKEND_CLAIM
-
-            state_payload[AUTH_BACKEND_CLAIM] = auth_backend
+        if not native_start:
+            state_payload[composio_auth.AUTH_BACKEND_CLAIM] = auth_backend
     app_scopes: list[str] | None = None
     app_optional_scopes: list[str] = []
     app_info: dict[str, Any] | None = None
@@ -4221,8 +4235,12 @@ def _generic_oauth_login(
 
     google_shared_has_refresh_token = False
     google_restricted_scopes = False
+    # A Composio start never enters shared-grant mode: it authorizes with
+    # Composio's Google app, not our client, and its grant is the app's own
+    # row (#3649).
     google_shared_mode = (
         get_google_shared_oauth_grants_enabled()
+        and native_start
         and provider.lower() == "google"
         and isinstance(app_id, str)
         and bool(app_id.strip())
@@ -4230,9 +4248,13 @@ def _generic_oauth_login(
     )
     if provider.lower() == "google":
         google_restricted_scopes = get_google_restricted_scopes()
-        # Provider defaults and custom apps must obey the same review gate.
-        if not google_restricted_scopes and GOOGLE_RESTRICTED_SCOPES.intersection(
-            scopes + app_optional_scopes
+        # Provider defaults and custom apps must obey the same review gate on
+        # a native start. A Composio start sends none of these scopes: it
+        # authorizes with Composio's Google app and its own scopes (#3649).
+        if (
+            native_start
+            and not google_restricted_scopes
+            and GOOGLE_RESTRICTED_SCOPES.intersection(scopes + app_optional_scopes)
         ):
             logger.warning("Rejected Google restricted scopes: app_id=%s", app_id)
             return HTMLResponse(
@@ -5780,7 +5802,10 @@ def generic_oauth_callback(
                 # Preserve an exact same-subject legacy row so an incremental
                 # response that omits refresh_token can reuse the credential
                 # proved by the previous callback. Never reuse it after the
-                # user selects another Google account.
+                # user selects another Google account. A Composio grant of
+                # the same subject holds no Google token to reuse; it is
+                # replaced below through the delete path, which also deletes
+                # its Composio account.
                 oauth_account = (
                     scoped_user_oauth_query(
                         db,
@@ -5790,6 +5815,10 @@ def generic_oauth_callback(
                     .filter(
                         UserOAuth.provider == connector_key,
                         UserOAuth.provider_user_id == str(provider_user_id),
+                        or_(
+                            UserOAuth.token_type.is_(None),
+                            UserOAuth.token_type != COMPOSIO_TOKEN_TYPE,
+                        ),
                     )
                     .order_by(UserOAuth.id.desc())
                     .first()
@@ -6190,6 +6219,18 @@ def generic_oauth_callback(
                     except HTTPException:
                         logger.info(
                             "Skipping hidden app %s during bare %s OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+                        continue
+                    # While the review gate is closed Gmail stays gated here
+                    # even when its Composio switch shows it for Toby's
+                    # Composio connect (#3649): this bare grant carries no
+                    # Gmail scope, so linking Gmail would show it connected on
+                    # a grant its tools cannot use.
+                    if _google_gmail_error(provider, app_info.get("id")):
+                        logger.info(
+                            "Skipping gated app %s during bare %s OAuth batch connect",
                             app_info.get("id"),
                             provider,
                         )

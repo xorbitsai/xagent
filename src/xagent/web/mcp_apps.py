@@ -364,10 +364,14 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
 
     transport = execution_fields["transport"]
     launch_config = deepcopy(execution_fields["launch_config"])
-    # A stale or admin-edited row cannot expose Gmail while the gate is closed.
+    # A stale or admin-edited row cannot expose Gmail while the gate is closed,
+    # unless Gmail goes through Composio's Google app, which holds Google's
+    # restricted-scope approval (#3649).
     visible = bool(app.is_visible_in_connector)
     if app.app_id == "gmail" and not get_google_restricted_scopes():
-        visible = False
+        from .composio_auth import composio_app
+
+        visible = visible and composio_app("google", "gmail") is not None
 
     app_dict: Dict[str, Any] = {
         "id": app.app_id,

@@ -366,9 +366,9 @@ def _composio_org_origin() -> str:
     origin = _COMPOSIO_ORG_ORIGINS.get(account_id)
     if origin is None:
         base_url = composio_proxy.connected_account_base_url()
-        origin = _salesforce_origin(
-            base_url or "", "the Composio connection's base_url"
-        )
+        if base_url is None:
+            raise ValueError("the Composio connection has no base_url")
+        origin = _salesforce_origin(base_url, "the Composio connection's base_url")
         _COMPOSIO_ORG_ORIGINS[account_id] = origin
     return origin
 

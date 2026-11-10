@@ -338,8 +338,6 @@ def test_the_orgs_host_is_read_from_composio_once(proxy):
         "https://evil.example.com/services/data/v67.0",
         "http://acme.my.salesforce.com/services/data/v67.0",
         "https://acme.my.salesforce.com.evil.example/services/data/v67.0",
-        "",
-        None,
     ],
 )
 def test_a_base_url_that_is_not_a_salesforce_host_sends_nothing(proxy, base_url):
@@ -376,3 +374,25 @@ def test_a_failed_lookup_is_retried_on_the_next_call(proxy):
 
     assert result["status"] == "success"
     assert len(proxy.lookups) == 2
+
+
+@pytest.mark.parametrize("base_url", ["", None])
+def test_a_connection_without_a_base_url_sends_nothing(proxy, base_url):
+    proxy.account = _Response(200, {"id": ACCOUNT_ID, "data": {"base_url": base_url}})
+
+    result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
+
+    assert result["message"] == "the Composio connection has no base_url"
+    assert proxy.calls == []
+
+
+def test_an_unreachable_lookup_is_an_error_and_not_cached(proxy, monkeypatch):
+    def unreachable(**kwargs: Any) -> _Response:
+        raise ConnectionError(f"cannot reach {kwargs['url']}")
+
+    monkeypatch.setattr(composio_proxy.requests, "request", unreachable)
+
+    result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
+
+    assert result["message"] == "Composio could not be reached"
+    assert salesforce._COMPOSIO_ORG_ORIGINS == {}

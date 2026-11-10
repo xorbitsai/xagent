@@ -111,7 +111,7 @@ _MIME_MARKERS = (
 # Composio to encode. Tab is the one C0 exception HTTP allows in a header
 # value.
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
-# A path Composio resolves against the account's own host: one leading "/",
+# A path Composio appends to the account's base_url: one leading "/",
 # no backslash, whitespace or control character, so no URL parser on the
 # way can read it as another host ("//evil", "/\\evil").
 _RELATIVE_ENDPOINT_RE = re.compile(r"/(?!/)[^\\\s\x00-\x1f\x7f]*")

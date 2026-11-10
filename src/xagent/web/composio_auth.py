@@ -187,7 +187,12 @@ _GOOGLE_SUBJECT_RE = re.compile(r"[0-9]{1,255}")
 # A Salesforce User id in its 18-character form (key prefix 005), as OIDC
 # userinfo's ``user_id`` gives it.
 _SALESFORCE_USER_ID_RE = re.compile(r"005[0-9A-Za-z]{15}")
-_SALESFORCE_HOST_RE = re.compile(r"(?:[a-z0-9-]+\.)+salesforce\.com")
+# DNS labels of letters, digits and inner hyphens under salesforce.com: the
+# Salesforce runtime's pattern for the same value (#3708), so every host
+# accepted here is one the runtime calls.
+_SALESFORCE_HOST_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+salesforce\.com"
+)
 # Printable ASCII without the space: what a base_url may consist of, checked
 # before urlsplit, which would silently drop tabs and newlines.
 _VISIBLE_ASCII_RE = re.compile(r"[!-~]+")
@@ -203,10 +208,10 @@ def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
     before parsing, since ``urlsplit`` drops tabs and newlines), is https,
     has no credentials and no port (an empty one included), and its host,
     lowercased by ``urlsplit`` and with at most one trailing dot removed, is
-    a subdomain of salesforce.com made of ``[a-z0-9-]`` labels. Only the
-    host is kept. This is at least as strict as the Salesforce runtime's
-    check on the same value (#3669), so every host accepted here is accepted
-    there.
+    a subdomain of salesforce.com whose labels are letters, digits and inner
+    hyphens, at most 63 characters each. Only the host is kept. This is at
+    least as strict as the Salesforce runtime's check on the same value
+    (#3708), so every host accepted here is accepted there.
     """
     data = account.get("data")
     base_url = data.get("base_url") if isinstance(data, dict) else None

@@ -13,7 +13,7 @@ import hashlib
 import io
 import json
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -889,31 +889,35 @@ def test_upload_file_does_not_claim_success_without_the_new_file_id(
     assert [call for call in http.proxy_calls if "name = " in str(call)] != []
 
 
-def _created_lookup(**overrides: Any) -> dict[str, Any]:
+def _same_name_file(**overrides: Any) -> dict[str, Any]:
+    """A file the same-name lookup finds: the lookup's only diagnostic fields.
+
+    Its id, name and creation time are what a person checks by hand; none of
+    them, and no checksum, proves this call created it.
+    """
     entry = {
         "id": _NEW_ID,
         "name": "Report.pdf",
-        "mimeType": "application/pdf",
-        "size": str(len(NEW_CONTENT)),
-        "md5Checksum": _md5(NEW_CONTENT),
-        "webViewLink": f"https://drive.google.com/file/d/{_NEW_ID}/view",
         "createdTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     entry.update(overrides)
     return entry
 
 
-def _recent_folder(**overrides: Any) -> dict[str, Any]:
-    """A same-name folder created during the call: no checksum either."""
+def _same_name_folder(**overrides: Any) -> dict[str, Any]:
+    """A same-name folder in the folder being written to."""
     entry = {
         "id": "folder1",
         "name": "Report.pdf",
-        "mimeType": "application/vnd.google-apps.folder",
-        "webViewLink": "https://drive.google.com/drive/folders/folder1",
         "createdTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     entry.update(overrides)
     return entry
+
+
+def _seconds_ago(seconds: int) -> str:
+    moment = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return moment.isoformat().replace("+00:00", "Z")
 
 
 def _timeout_on_execute(monkeypatch: Any) -> list[tuple[Any, ...]]:
@@ -949,18 +953,28 @@ def test_upload_file_says_nothing_was_uploaded_when_staging_fails(
     assert http.tool_calls == []
 
 
-def test_upload_file_returns_the_file_a_lost_answer_created(
+def test_upload_file_does_not_take_a_same_bytes_file_for_the_upload(
     http, monkeypatch, _isolate_environment
 ):
+    """A same-name file holding the uploaded bytes, created 20 seconds before
+    this call, is exactly what the reviewer's counter-example describes: its
+    name, its folder, its checksum and its creation time all match, and none
+    of them is an operation identity. It is reported as a candidate to check,
+    and the upload's outcome stays unknown instead of becoming a success."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.proxy("name = ", 200, {"files": [_created_lookup()]})
+    candidate = _same_name_file(createdTime=_seconds_ago(20))
+    http.proxy("name = ", 200, {"files": [candidate]})
     calls = _timeout_on_execute(monkeypatch)
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
-    assert result["status"] == "success"
-    assert result["file"]["id"] == _NEW_ID
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert f"id '{_NEW_ID}'" in result["message"]
+    assert "may be the file this call was making" in result["message"]
+    assert "It is not known whether this call uploaded a file" in result["message"]
+    assert result["candidates"] == [candidate]
     # One tool call, no retry: a retry could create a duplicate.
     assert len(calls) == 1
     lookup = [call for call in http.proxy_calls if "name = " in str(call)]
@@ -968,6 +982,8 @@ def test_upload_file_returns_the_file_a_lost_answer_created(
     query = _query(lookup[0])
     assert query["q"].startswith("name = 'Report.pdf'")
     assert "'root' in parents" in query["q"]
+    # The lookup asks only for what a person needs to check the candidate.
+    assert query["fields"] == "files(id, name, createdTime)"
 
 
 def test_upload_file_looks_in_the_parent_a_lost_answer_may_have_used(
@@ -975,7 +991,7 @@ def test_upload_file_looks_in_the_parent_a_lost_answer_may_have_used(
 ):
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.proxy("name = ", 200, {"files": [_created_lookup()]})
+    http.proxy("name = ", 200, {"files": [_same_name_file()]})
     _timeout_on_execute(monkeypatch)
 
     json.loads(google_drive.google_drive_upload_file(str(local), parent_id="folder1"))
@@ -1007,18 +1023,21 @@ def test_upload_file_says_the_outcome_is_unknown_when_the_lookup_finds_nothing(
 def test_upload_file_does_not_take_a_same_name_folder_for_the_upload(
     http, monkeypatch, _isolate_environment
 ):
-    """A folder has no checksum either. It is never this upload's result."""
+    """A same-name folder is only another candidate: it is never the upload's
+    result, and it is listed for the user to check like any other file."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.proxy("name = ", 200, {"files": [_recent_folder()]})
+    folder = _same_name_folder()
+    http.proxy("name = ", 200, {"files": [folder]})
     _timeout_on_execute(monkeypatch)
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
     assert result["status"] == "error"
     assert "file" not in result
-    assert "'folder1'" in result["message"]
-    assert "It is not known whether this call created a file" in result["message"]
+    assert f"id '{folder['id']}'" in result["message"]
+    assert "It is not known whether this call uploaded a file" in result["message"]
+    assert result["candidates"] == [folder]
 
 
 def test_upload_file_treats_a_408_as_unknown_and_looks_the_file_up(
@@ -1111,7 +1130,7 @@ def test_upload_file_treats_a_5xx_as_unknown_and_looks_the_file_up(
 ):
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.proxy("name = ", 200, {"files": [_created_lookup()]})
+    http.proxy("name = ", 200, {"files": [_same_name_file()]})
 
     def fail(*args: Any, **kwargs: Any) -> Any:
         raise composio_tools.ComposioToolError(
@@ -1123,10 +1142,13 @@ def test_upload_file_treats_a_5xx_as_unknown_and_looks_the_file_up(
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
-    # A 5xx can arrive after the tool created the file, so the answer is
-    # settled by the lookup, not by the status.
-    assert result["status"] == "success"
-    assert result["file"]["id"] == _NEW_ID
+    # A 5xx can arrive after the tool created the file, so the answer is not a
+    # definite failure: the lookup is made, and its finding is a candidate.
+    assert result["status"] == "error"
+    assert "It is not known whether this call uploaded a file" in result["message"]
+    assert "was not uploaded" not in result["message"]
+    assert f"id '{_NEW_ID}'" in result["message"]
+    assert [call for call in http.proxy_calls if "name = " in str(call)] != []
 
 
 def test_upload_file_refuses_a_resourcekey_parent_before_any_call(
@@ -1169,19 +1191,23 @@ def test_upload_file_looks_the_file_up_when_the_read_back_is_a_404(
     http, _isolate_environment
 ):
     """The id the tool answered with does not resolve, so it proves nothing:
-    the file is looked up by name instead of being reported as a success."""
+    the same-name files are reported as candidates instead of one of them
+    being reported as a success."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
+    candidate = _same_name_file()
     http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
     # The read-back is a files.get of the id the tool answered with; the
     # lookup that follows is a files.list, so the id names only the read-back.
     http.proxy(_NEW_ID, 404, {"error": {"code": 404, "message": "not found"}})
-    http.proxy("name = ", 200, {"files": [_created_lookup()]})
+    http.proxy("name = ", 200, {"files": [candidate]})
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
-    assert result["status"] == "success"
-    assert result["file"]["id"] == _NEW_ID
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert f"id '{candidate['id']}'" in result["message"]
+    assert result["candidates"] == [candidate]
     lookup = [call for call in http.proxy_calls if "name = " in str(call)]
     assert len(lookup) == 1
 
@@ -1230,27 +1256,25 @@ def test_upload_file_sends_a_type_outside_the_tool_enum_as_octet_stream(
     assert http.tool_calls[0][1]["mimeType"] == "application/octet-stream"
 
 
-def test_upload_file_does_not_take_an_older_same_bytes_file_for_the_upload(
+def test_upload_file_does_not_take_an_older_same_name_file_for_the_upload(
     http, monkeypatch, _isolate_environment
 ):
-    """A checksum match also has to have been created during this call: an
-    older file with the same name and bytes was not this upload."""
+    """An older file with the same name is a candidate like any other: it is
+    listed for the user to check, and the upload stays unknown."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.proxy(
-        "name = ",
-        200,
-        {"files": [_created_lookup(createdTime="2026-01-02T03:04:05.000Z")]},
-    )
+    older = _same_name_file(createdTime="2026-01-02T03:04:05.000Z")
+    http.proxy("name = ", 200, {"files": [older]})
     _timeout_on_execute(monkeypatch)
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
     assert result["status"] == "error"
     assert "file" not in result
-    assert f"'{_NEW_ID}'" in result["message"]
-    assert "It is not known whether this call created a file" in result["message"]
+    assert f"id '{_NEW_ID}'" in result["message"]
+    assert "It is not known whether this call uploaded a file" in result["message"]
     assert "the upload may still be finishing in Composio" not in result["message"]
+    assert result["candidates"] == [older]
 
 
 def test_the_create_lookup_searches_every_drive(
@@ -1435,25 +1459,51 @@ def test_create_file_does_not_claim_success_without_the_new_file_id(http):
     assert "not known whether it was created" in result["message"]
 
 
-def test_create_file_returns_a_google_doc_a_lost_answer_created(http, monkeypatch):
+def test_create_file_keeps_a_recent_same_name_doc_an_unknown_outcome(http, monkeypatch):
+    """A same-name, same-type Google Doc created 20 seconds before this call,
+    with the create's own answer lost, is the case this rule exists for: the
+    lookup cannot show it is this call's Doc, so it is reported as a
+    candidate and the create stays unknown rather than becoming a success."""
+    earlier_doc = {
+        "id": "doc1",
+        "name": "Meeting notes",
+        "createdTime": _seconds_ago(20),
+    }
+    http.proxy("name = ", 200, {"files": [earlier_doc]})
+    calls = _timeout_on_execute(monkeypatch)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "Meeting notes", "hi", mime_type=GOOGLE_DOC_MIME
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert "'doc1'" in result["message"]
+    assert earlier_doc["createdTime"] in result["message"]
+    assert "may be the file this call was making" in result["message"]
+    assert "It is not known whether this call created a file" in result["message"]
+    assert result["candidates"] == [earlier_doc]
+    assert len(calls) == 1
+
+
+def test_create_file_keeps_a_verified_read_back_a_success(http):
+    """The negative control for the rule above: when the tool's own answer is
+    confirmed by Drive's read-back, the create is still a success."""
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "doc1"})
     http.proxy(
-        "name = ",
+        "webViewLink",
         200,
         {
-            "files": [
-                {
-                    "id": "doc1",
-                    "name": "Meeting notes",
-                    "mimeType": GOOGLE_DOC_MIME,
-                    "webViewLink": "https://docs.google.com/document/d/doc1/edit",
-                    "createdTime": datetime.now(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                }
-            ]
+            "id": "doc1",
+            "name": "Meeting notes",
+            "webViewLink": "https://docs.google.com/document/d/doc1/edit",
+            "mimeType": GOOGLE_DOC_MIME,
         },
     )
-    calls = _timeout_on_execute(monkeypatch)
+    # Nothing is looked up: the read-back settled the result.
+    http.proxy("name = ", 200, {"files": [_same_name_file(id="doc1")]})
 
     result = json.loads(
         google_drive.google_drive_create_file(
@@ -1463,15 +1513,16 @@ def test_create_file_returns_a_google_doc_a_lost_answer_created(http, monkeypatc
 
     assert result["status"] == "success"
     assert result["file"]["id"] == "doc1"
-    assert len(calls) == 1
+    assert [call for call in http.proxy_calls if "name = " in str(call)] == []
 
 
 def test_create_file_does_not_take_a_same_name_folder_for_the_created_doc(
     http, monkeypatch
 ):
-    """The lookup's no-checksum branch must match the requested type, so a
-    folder a user made with that name during the call is not the result."""
-    http.proxy("name = ", 200, {"files": [_recent_folder(name="Meeting notes")]})
+    """A same-name folder is only another candidate, never the created Doc's
+    result: the answer stays unknown and lists it to check."""
+    folder = _same_name_folder(name="Meeting notes")
+    http.proxy("name = ", 200, {"files": [folder]})
     _timeout_on_execute(monkeypatch)
 
     result = json.loads(
@@ -1482,8 +1533,9 @@ def test_create_file_does_not_take_a_same_name_folder_for_the_created_doc(
 
     assert result["status"] == "error"
     assert "file" not in result
-    assert "'folder1'" in result["message"]
+    assert f"id '{folder['id']}'" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
+    assert result["candidates"] == [folder]
 
 
 def test_create_file_says_the_outcome_is_unknown_when_the_lookup_finds_nothing(
@@ -1638,15 +1690,12 @@ def test_create_file_reports_a_conversion_that_did_not_happen(http):
 def test_create_file_does_not_take_an_unconverted_same_bytes_file_for_the_doc(
     http, monkeypatch
 ):
-    """A lost answer plus a same-name file with the uploaded bytes is not the
-    requested Doc: the conversion did not happen there, so the lookup's
-    checksum branch has to compare the type too."""
+    """A lost answer plus a same-name file holding the uploaded bytes is only
+    a candidate: nothing the lookup can see shows whether this call made it,
+    or whether the requested conversion happened there."""
     content = NEW_CONTENT.decode("utf-8")
-    http.proxy(
-        "name = ",
-        200,
-        {"files": [_created_lookup(name="Meeting notes", mimeType="text/plain")]},
-    )
+    file = _same_name_file(name="Meeting notes")
+    http.proxy("name = ", 200, {"files": [file]})
     _timeout_on_execute(monkeypatch)
 
     result = json.loads(
@@ -1657,8 +1706,59 @@ def test_create_file_does_not_take_an_unconverted_same_bytes_file_for_the_doc(
 
     assert result["status"] == "error"
     assert "file" not in result
-    assert f"'{_NEW_ID}'" in result["message"]
+    assert f"id '{_NEW_ID}'" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
+    assert result["candidates"] == [file]
+
+
+@pytest.mark.parametrize(
+    "tool_data",
+    [
+        # The usual shape: only the new id.
+        {"id": "doc1"},
+        # A tool answer that claims the requested type is still its own claim,
+        # not what Drive stored.
+        {"id": "doc1", "name": "Meeting notes", "mimeType": GOOGLE_DOC_MIME},
+    ],
+)
+def test_create_file_reports_an_unverified_conversion_when_the_type_is_unreadable(
+    http, tool_data
+):
+    """The tool answered with an id, but the read-back failed, so the stored
+    type is unknown: an id proves the file exists, not that Drive converted
+    it, so this is an unverified outcome rather than a success."""
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=tool_data)
+    http.proxy("webViewLink", 500, {"error": {"code": 500, "message": "backend"}})
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "Meeting notes", "hi", mime_type=GOOGLE_DOC_MIME
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert "'doc1'" in result["message"]
+    assert f"'{GOOGLE_DOC_MIME}'" in result["message"]
+    assert "not known whether the conversion" in result["message"]
+    assert "unverified" in result["message"]
+    assert "would create a duplicate" in result["message"]
+    # The read-back failed, so there is no lookup either: the id is known.
+    assert [call for call in http.proxy_calls if "name = " in str(call)] == []
+
+
+def test_create_file_keeps_a_non_conversion_success_when_the_type_is_unreadable(
+    http,
+):
+    """The negative control for the rule above: a create that asked for no
+    conversion is not held to a type the read-back could not establish."""
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.proxy("webViewLink", 500, {"error": {"code": 500, "message": "backend"}})
+
+    result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello"))
+
+    assert result["status"] == "success"
+    assert result["file"]["id"] == "file1"
 
 
 # --- update_file_content on a Composio grant -------------------------------

@@ -8,7 +8,6 @@ import mimetypes
 import os
 import re
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import ParseResult, parse_qs, urlparse
@@ -128,11 +127,9 @@ _CREATED_FILE_FIELDS = "id, name, webViewLink, mimeType"
 # fields are used for the check and not added to the result, whose shape
 # stays the four fields above, as native.
 _CREATED_FILE_READ_FIELDS = f"{_CREATED_FILE_FIELDS}, md5Checksum, size"
-# How far before a Composio create's request its candidate file may have been
-# created and still count as that call's own. Covers clock skew between this
-# host and Google, not a long-running call: the file is created when the tool
-# runs, close to the call.
-_CREATED_FILE_CLOCK_TOLERANCE = timedelta(seconds=60)
+# What a lost create's same-name lookup reports for a caller to check by
+# hand: nothing here is evidence that this call created the file.
+_CREATED_FILE_CANDIDATE_FIELDS = "id, name, createdTime"
 
 # "owner" is deliberately excluded: ownership transfer needs
 # transferOwnership=True, is not reversible the way a role change is, and is
@@ -2469,19 +2466,21 @@ def _tool_file_object(data: Any) -> dict[str, Any]:
 
 def _created_file_metadata(
     service: Any, file_id: str, tool_data: Any
-) -> dict[str, Any] | None:
-    """The new file's metadata, matching what the native create path returns.
+) -> tuple[dict[str, Any] | None, bool]:
+    """The new file's metadata, matching what the native create path returns,
+    and whether Drive itself was read for it.
 
     Read back through the proxy so the output shape does not depend on the
     Composio tool's answer. The extra checksum and size fields are used by
     the caller's integrity check and dropped from the result. If the read
     fails, the tool's answer (which at least names the new id) is used
     instead of reporting a failure: the file exists, and a retry would
-    create a second one. That fallback can carry as little as the id, so a
-    caller must not assume the name or link is present. A read that answers
-    404 is different: Drive says no file has that id, so the id proves
-    nothing and ``None`` is returned for the caller to look the file up by
-    name instead.
+    create a second one. That fallback can carry as little as the id, and
+    whatever type it carries is the tool's claim, not what Drive stored, so
+    the second element is what tells a caller which of the two it has. A
+    read that answers 404 is different: Drive says no file has that id, so
+    the id proves nothing and ``(None, False)`` is returned for the caller to
+    report the same-name files it finds instead.
     """
     try:
         file = (
@@ -2494,18 +2493,18 @@ def _created_file_metadata(
             .execute()
         )
         if isinstance(file, dict):
-            return file
+            return file, True
     except Exception as exc:
         logger.warning("Could not read the created file %s: %s", file_id, exc)
         if google_api_error_status(exc) == 404:
-            return None
+            return None, False
     fallback = {
         key: value
         for key, value in _tool_file_object(tool_data).items()
         if key in ("id", "name", "webViewLink", "mimeType") and isinstance(value, str)
     }
     fallback.setdefault("id", file_id)
-    return fallback
+    return fallback, False
 
 
 def _created_file_output(file: dict[str, Any]) -> dict[str, Any]:
@@ -2548,54 +2547,47 @@ def _drive_query_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _parse_drive_time(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
+def _create_candidate(file: dict[str, Any]) -> dict[str, str]:
+    """A same-name file as reported to the caller: what to check, not proof.
+
+    Only the fields a person needs to find the file in Drive: the id, the
+    name and the creation time. A checksum, size or type is not reported
+    because none of them identifies this call's own file either.
+    """
+    entry = {"id": str(file.get("id") or "")}
+    for key in ("name", "createdTime"):
+        value = file.get(key)
+        if isinstance(value, str) and value:
+            entry[key] = value
+    return entry
 
 
-def _created_during_call(file: dict[str, Any], started_at: datetime) -> bool:
-    created = _parse_drive_time(file.get("createdTime"))
-    return created is not None and (
-        created >= started_at - _CREATED_FILE_CLOCK_TOLERANCE
-    )
+def _create_candidate_label(candidate: dict[str, str]) -> str:
+    """One candidate in a sentence: ``id 'doc1' (created <time>)``."""
+    label = f"id '{candidate['id']}'"
+    if "createdTime" in candidate:
+        label += f" (created {candidate['createdTime']})"
+    return label
 
 
-def _find_created_file(
-    service: Any,
-    *,
-    name: str,
-    parent_id: str | None,
-    md5: str,
-    size: int,
-    target_mime_type: str | None,
-    started_at: datetime,
-) -> tuple[dict[str, Any] | None, list[dict[str, Any]], Exception | None]:
-    """Look for the file a create tool may have made before its answer was
-    lost.
+def _same_name_files(
+    service: Any, *, name: str, parent_id: str | None
+) -> tuple[list[dict[str, Any]], Exception | None]:
+    """Files Drive already has under this name and parent.
 
-    A Composio timeout can arrive after the tool created the file. The lookup
-    narrows the unknown: a same-name file whose checksum and size match the
-    bytes just uploaded *and* that was created during this call is that file;
-    with no checksum (a Google Workspace conversion) a single file created
-    during this call *of the target type* is the best evidence available. The
-    creation time matters in both branches: without it an older file with the
-    same name and the same bytes would be reported as this call's result even
-    if nothing was created. The type matters in both branches: a folder has
-    no checksum either, and a folder a user happened to create with that name
-    during the call is not the upload; and for a Google Docs/Sheets/Slides
-    target a same-bytes file of another type is that create stored
-    unconverted, not the converted file the caller asked for.
-    ``target_mime_type`` is ``None`` for a caller that can never convert (an
-    upload never does), and for a target that is not a conversion target the
-    label is not compared either (see ``_needs_exact_create_type``). Anything
-    else stays a candidate for the caller to describe.
+    A create whose answer was lost is looked up by name and parent so the
+    caller can be told what Drive holds. These files are only diagnostic:
+    Drive allows duplicate names, and neither the tool's request nor the
+    create itself leaves an operation-specific marker on the file, so
+    nothing collected here -- name, parent, creation time, type or checksum,
+    or all of them together -- shows that this call created the file. A
+    file made earlier with the same name, folder and bytes matches every one
+    of those checks. The caller therefore keeps the outcome unknown and
+    lists these files for the user to check; it never reports one of them as
+    this create's result.
+
+    Shared drives are searched too: without ``corpora="allDrives"`` a file
+    created in one is never even named as a candidate.
     """
     query = f"name = '{_drive_query_literal(name)}' and trashed = false"
     if parent_id is None:
@@ -2609,58 +2601,27 @@ def _find_created_file(
                 q=query,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
-                # Without this a folder in a shared drive is never found.
+                # Without this a file in a shared drive is never found.
                 corpora="allDrives",
                 pageSize=10,
+                # The newest first: the closest thing to the file this call
+                # may have made, for a reader to check first.
                 orderBy="createdTime desc",
-                fields=(
-                    "files(id, name, mimeType, size, md5Checksum, "
-                    "webViewLink, createdTime)"
-                ),
+                fields=f"files({_CREATED_FILE_CANDIDATE_FIELDS})",
             )
             .execute()
         )
     except Exception as exc:
         logger.warning("Could not look for the new file %r: %s", name, exc)
-        return None, [], exc
+        return [], exc
     files = answer.get("files") if isinstance(answer, dict) else None
     if not isinstance(files, list):
-        return None, [], RuntimeError("Drive returned an invalid file list")
-    candidates = [
+        return [], RuntimeError("Drive returned an invalid file list")
+    return [
         file
         for file in files
         if isinstance(file, dict) and isinstance(file.get("id"), str) and file["id"]
-    ]
-    for candidate in candidates:
-        stored_md5 = candidate.get("md5Checksum")
-        stored_size = _as_int(candidate.get("size"))
-        if (
-            isinstance(stored_md5, str)
-            and stored_md5
-            and stored_md5.lower() == md5.lower()
-            and stored_size in (None, size)
-            and _created_during_call(candidate, started_at)
-            and (
-                not _needs_exact_create_type(target_mime_type)
-                or _normalize_mime_type(str(candidate.get("mimeType") or ""))
-                == target_mime_type
-            )
-        ):
-            return candidate, candidates, None
-    recent = [
-        candidate
-        for candidate in candidates
-        if _created_during_call(candidate, started_at)
-        and target_mime_type is not None
-        and _normalize_mime_type(str(candidate.get("mimeType") or ""))
-        == target_mime_type
-    ]
-    if len(recent) == 1 and not isinstance(recent[0].get("md5Checksum"), str):
-        # A Google Workspace file has no checksum; a single file created
-        # during this call with the requested type is the only evidence this
-        # lookup can offer.
-        return recent[0], candidates, None
-    return None, candidates, None
+    ], None
 
 
 def _unconfirmed_create_message(
@@ -2678,9 +2639,10 @@ def _unconfirmed_create_message(
     retry that would make a duplicate. In particular, a lookup that finds
     nothing is not proof: the tool may still be running in Composio, and a
     write can land after this read, so the result of this call stays
-    unknown. ``reason`` is what the tool itself said when it reported a
-    failure; it does not settle the outcome, but it can tell the user what to
-    check.
+    unknown. Nor is a same-name file proof: it is reported as a candidate to
+    check, because it may be this call's file or an earlier one. ``reason``
+    is what the tool itself said when it reported a failure; it does not
+    settle the outcome, but it can tell the user what to check.
     """
     if lookup_error is not None:
         message = (
@@ -2690,15 +2652,23 @@ def _unconfirmed_create_message(
             "first; a retry could create a second file."
         )
     elif candidates:
-        shown = ", ".join(f"'{candidate['id']}'" for candidate in candidates[:3])
+        shown = "; ".join(
+            _create_candidate_label(_create_candidate(candidate))
+            for candidate in candidates[:3]
+        )
         if len(candidates) > 3:
-            shown += f" and {len(candidates) - 3} more"
+            shown += f"; and {len(candidates) - 3} more"
+        found = f"{len(candidates)} files" if len(candidates) > 1 else "a file"
+        verb = "uploaded" if action == "uploaded" else "created"
         message = (
             f"Composio did not confirm that the file was {action}, and Google "
-            f"Drive already has a file named '{name}' in that folder (id "
-            f"{shown}) that this call's result cannot be matched to. It is not "
-            "known whether this call created a file. Do not retry blindly: "
-            "check Google Drive first; a retry could create a duplicate."
+            f"Drive already has {found} named '{name}' in that folder that "
+            "cannot be shown to be this call's result: "
+            f"{shown}. It may be the file this call was making, or an earlier "
+            "one; a name, folder and creation time are not proof of which. "
+            f"It is not known whether this call {verb} a file. Check those "
+            "files in Google Drive before retrying; a retry could create a "
+            "duplicate."
         )
     else:
         noun = "upload" if action == "uploaded" else "create"
@@ -2742,17 +2712,21 @@ def _created_file_result(
     success. ``target_mime_type`` is the type the create was asked for; a
     Google Docs/Sheets/Slides conversion happens inside the create, so for
     such a target a file that came back as another type was not converted,
-    and that is a failure rather than a success on matching bytes. Any other
-    target is not compared (see ``_needs_exact_create_type``): the type the
-    tool sends there may be the enum's fallback or the staged object's real
-    type, so a different label is not evidence that the create failed. The
-    read-back fields beyond the native four are not returned.
+    and that is a failure rather than a success on matching bytes. A
+    conversion target whose stored type Drive's own read-back did not
+    establish is an unknown outcome, not a success: an id proves the file
+    exists, not that it was converted, and a type the tool's answer claims is
+    not what Drive stored. Any other target is not compared (see
+    ``_needs_exact_create_type``): the type the tool sends there may be the
+    enum's fallback or the staged object's real type, so a different label is
+    not evidence that the create failed. The read-back fields beyond the
+    native four are not returned.
 
     ``None`` means the read-back found no file with that id: nothing about
-    this call is known, and the caller looks the file up by name and parent
-    instead of reporting an id that does not resolve.
+    this call is known, and the caller reports the same-name files it finds
+    as candidates instead of reporting an id that does not resolve.
     """
-    metadata = _created_file_metadata(service, file_id, tool_data)
+    metadata, read_back = _created_file_metadata(service, file_id, tool_data)
     if metadata is None:
         return None
     mismatch = _created_content_mismatch(metadata, md5=md5, size=size)
@@ -2764,19 +2738,27 @@ def _created_file_result(
             "would create a duplicate."
         )
     stored_mime_type = _normalize_mime_type(str(metadata.get("mimeType") or ""))
-    if (
-        _needs_exact_create_type(target_mime_type)
-        and stored_mime_type
-        and stored_mime_type != target_mime_type
-    ):
-        return _content_update_error(
-            f"Google Drive created a file with id '{file_id}', but its type is "
-            f"'{stored_mime_type}', not the requested '{target_mime_type}': the "
-            "conversion to the requested type did not happen, so the file does "
-            f"not hold the content that was {action} in that format. Do not "
-            "create it again before checking or removing that file: a retry "
-            "would create a duplicate."
-        )
+    if _needs_exact_create_type(target_mime_type):
+        if not read_back or not stored_mime_type:
+            # An id, or the tool's own claim about the type, proves neither
+            # that nor which conversion happened.
+            return _content_update_error(
+                f"Google Drive has a file with id '{file_id}', but its type was "
+                "not established from Google Drive's own read-back, so it is not "
+                f"known whether the conversion to '{target_mime_type}' happened. "
+                "The file was created; whether it holds the requested format is "
+                "unverified. Check that file in Google Drive before creating it "
+                "again: a retry would create a duplicate."
+            )
+        if stored_mime_type != target_mime_type:
+            return _content_update_error(
+                f"Google Drive created a file with id '{file_id}', but its type is "
+                f"'{stored_mime_type}', not the requested '{target_mime_type}': the "
+                "conversion to the requested type did not happen, so the file does "
+                f"not hold the content that was {action} in that format. Do not "
+                "create it again before checking or removing that file: a retry "
+                "would create a duplicate."
+            )
     return json.dumps(
         {"status": "success", "file": _created_file_output(metadata)},
         ensure_ascii=False,
@@ -2789,41 +2771,28 @@ def _unconfirmed_create_result(
     action: str,
     name: str,
     parent_id: str | None,
-    md5: str,
-    size: int,
-    target_mime_type: str | None,
-    started_at: datetime,
     reason: str | None = None,
 ) -> str:
-    """Look for a file a create may have made, then report what is known.
+    """Report what a create that could not be confirmed did, and what to check.
 
-    A file that matches the uploaded bytes is returned as the success it
-    is. Otherwise the message says whether Drive could be checked at all;
-    it never claims a definite failure while the file may exist.
+    The same-name lookup is diagnostic only: a file it finds is named as a
+    candidate with its id, name and creation time, and the answer says the
+    user has to check it. Nothing found by name, folder, time, type or
+    checksum is reported as this call's success, because none of those ties
+    the file to this execution.
     """
-    match, candidates, lookup_error = _find_created_file(
-        service,
+    candidates, lookup_error = _same_name_files(service, name=name, parent_id=parent_id)
+    message = _unconfirmed_create_message(
+        action=action,
         name=name,
-        parent_id=parent_id,
-        md5=md5,
-        size=size,
-        target_mime_type=target_mime_type,
-        started_at=started_at,
+        candidates=candidates,
+        lookup_error=lookup_error,
+        reason=reason,
     )
-    if match is not None:
-        return json.dumps(
-            {"status": "success", "file": _created_file_output(match)},
-            ensure_ascii=False,
-        )
-    return _content_update_error(
-        _unconfirmed_create_message(
-            action=action,
-            name=name,
-            candidates=candidates,
-            lookup_error=lookup_error,
-            reason=reason,
-        )
-    )
+    diagnostic = [_create_candidate(candidate) for candidate in candidates]
+    if diagnostic:
+        return _content_update_error(message, candidates=diagnostic)
+    return _content_update_error(message)
 
 
 def _upload_file_via_composio(
@@ -2842,8 +2811,8 @@ def _upload_file_via_composio(
     is not trusted for the output shape; the file is read back through the
     proxy instead. Staging and execution are separate failures: a staging
     failure leaves Drive untouched, while a lost tool answer can mean the
-    file exists, so the file is looked up by name and parent before anything
-    is reported as not created.
+    file exists, so the answer stays unknown and the same-name files already
+    in that folder are listed as candidates to check.
     """
     if parent_resource_key is not None:
         return _content_update_error(
@@ -2909,20 +2878,17 @@ def _upload_file_via_composio(
             )
 
         service = get_drive_service()
-        started_at = datetime.now(timezone.utc)
 
         def _unconfirmed(reason: str | None = None) -> str:
             # A timed-out or unanswered tool may still be running in
-            # Composio, so nothing here is reported as "not created".
+            # Composio, so nothing here is reported as "not created". A
+            # same-name file only becomes a candidate to check, never this
+            # upload's result.
             return _unconfirmed_create_result(
                 service,
                 action="uploaded",
                 name=name,
                 parent_id=parent_id,
-                md5=local_md5,
-                size=size,
-                target_mime_type=None,
-                started_at=started_at,
                 reason=reason,
             )
 
@@ -2991,7 +2957,8 @@ def _create_file_via_composio(
     create's multipart request, so the staged upload's type is the source
     type (``upload_mime_type``) while the tool's ``mimeType`` is the target.
     The failure split is the same as the upload path's: staging does not
-    touch Drive, while a lost tool answer sends the caller to a lookup.
+    touch Drive, while a lost tool answer keeps the outcome unknown and
+    lists the same-name files it finds as candidates to check.
     """
     if parent_resource_key is not None:
         return _content_update_error(
@@ -3021,25 +2988,21 @@ def _create_file_via_composio(
         )
 
     service = get_drive_service()
-    started_at = datetime.now(timezone.utc)
     # What the tool is asked to create. Only the tool's own enum can be sent,
     # so a caller's type outside it becomes application/octet-stream; the
-    # read-back and the lookup are then compared with that same value, since
-    # that is the type a file created by this call can have.
+    # read-back is then compared with that same value, since that is the type
+    # a file created by this call can have.
     target_mime_type = _create_tool_mime_type(mime_type)
 
     def _unconfirmed(reason: str | None = None) -> str:
         # A timed-out or unanswered tool may still be running in Composio, so
-        # nothing here is reported as "not created".
+        # nothing here is reported as "not created". A same-name file only
+        # becomes a candidate to check, never this create's result.
         return _unconfirmed_create_result(
             service,
             action="created",
             name=name,
             parent_id=parent_id,
-            md5=md5,
-            size=len(data),
-            target_mime_type=target_mime_type,
-            started_at=started_at,
             reason=reason,
         )
 

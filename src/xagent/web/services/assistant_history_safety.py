@@ -7,6 +7,7 @@ LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE = "assistant_message"
 ASSISTANT_RESPONSE_MESSAGE_TYPE = "assistant_response"
 TASK_FAILURE_MESSAGE_TYPE = "task_failure"
 CLIENT_SAFE_FAILURE_MESSAGE_TYPE = "client_safe_failure"
+INPUT_REVIEW_REJECTED_MESSAGE_TYPE = "input_review_rejected"
 KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES = frozenset(
     {
         ASSISTANT_RESPONSE_MESSAGE_TYPE,
@@ -32,7 +33,7 @@ def assistant_history_values_for_persistence(
 ) -> tuple[str, str]:
     """Choose durable client content and provenance for one assistant result."""
 
-    if is_failure:
+    if is_failure and message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE:
         return CLIENT_SAFE_TASK_FAILURE, TASK_FAILURE_MESSAGE_TYPE
     return content, message_type
 
@@ -51,7 +52,10 @@ def client_safe_assistant_history_content(
     also fail closed until they are explicitly classified as client-visible.
     """
 
-    if message_type not in KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES:
+    if (
+        message_type not in KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES
+        and message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+    ):
         return CLIENT_SAFE_TASK_FAILURE
     return content
 

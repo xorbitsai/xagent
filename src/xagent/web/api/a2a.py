@@ -18,6 +18,7 @@ from ...core.agent.checkpoint import (
     CheckpointReadError,
     UnknownToolEffectError,
 )
+from ...core.guardrails.input import InputReviewRejected
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -221,6 +222,12 @@ async def _start_a2a_turn(
         )
     except TaskTurnNotFoundError as exc:
         raise a2a_error("task_not_found", "Task not found.", status_code=404) from exc
+    except InputReviewRejected as exc:
+        raise a2a_error(
+            "temporarily_unavailable" if exc.unavailable else "invalid_argument",
+            str(exc),
+            status_code=503 if exc.unavailable else 400,
+        ) from exc
     except task_start_service.TaskStartRejected as exc:
         if exc.reason == "a2a_input_conflict":
             raise a2a_error(

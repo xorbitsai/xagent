@@ -92,6 +92,7 @@ from ...core.execution_scope import (
     resolve_execution_scope,
 )
 from ...core.file_ref import build_file_ref
+from ...core.guardrails.input import InputReviewRejected
 from ...core.workspace import _is_sandbox_prepared
 from ..models.database import (
     get_db,
@@ -148,6 +149,7 @@ from ..user_isolated_memory import UserContext
 from ..utils.json_payload_sanitizer import sanitize_json_payload
 from .assistant_history_safety import (
     ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
     TASK_FAILURE_MESSAGE_TYPE,
     assistant_history_values_for_persistence,
     safe_str,
@@ -166,6 +168,7 @@ from .client_error_messages import (
     CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
     ClientErrorCode,
     client_error_message,
+    input_review_delivery_failure,
 )
 from .db_runtime import (
     await_task_settlement,
@@ -550,7 +553,7 @@ def _resume_cancel_settlement_error(task_source: str | None) -> str:
 
 
 def client_safe_error_message(
-    error: BaseException,
+    error: BaseException | None,
     *,
     fallback: str = CLIENT_SAFE_VALIDATION_ERROR,
 ) -> str:
@@ -572,7 +575,7 @@ def client_safe_error_message(
     """
     if isinstance(error, AutoModelUnavailableError):
         return client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
-    if not isinstance(error, ClientVisibleError):
+    if not isinstance(error, (ClientVisibleError, InputReviewRejected)):
         return fallback
     message = str(error)
     return message if message.strip() else fallback
@@ -2178,8 +2181,10 @@ def _finalize_task_execution_result_isolated(
     resolved_scope_segments: tuple[str, ...],
     prepared_outputs: _PreparedTaskFileOutputs | None = None,
     turn_id: str | None = None,
+    input_message_id: int | None = None,
 ) -> _TaskExecutionFinalization:
     """Persist one task result in a worker-owned, ownership-fenced session."""
+    from ..models.chat_message import TaskChatMessage
     from .chat_history_service import persist_assistant_message_no_commit
 
     if prepared_outputs is None:
@@ -2270,6 +2275,25 @@ def _finalize_task_execution_result_isolated(
                 task_lease.run_id if task_lease is not None else expected_run_id
             ),
         )
+        # V2 history only replays inputs with an application fact. Legacy
+        # history needs a marker on this exact row, independent of delivery.
+        input_review_rejected = result.get("input_review_rejected") is True
+        if (
+            input_review_rejected
+            and task_updated is not None
+            and task_updated.conversation_storage_version != 2
+            and (input_message_id is not None or turn_id is not None)
+        ):
+            identity = (
+                TaskChatMessage.id == input_message_id
+                if input_message_id is not None
+                else TaskChatMessage.turn_id == turn_id
+            )
+            finalize_db.query(TaskChatMessage).filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                identity,
+            ).update({TaskChatMessage.message_type: INPUT_REVIEW_REJECTED_MESSAGE_TYPE})
 
         (
             normalized_outputs,
@@ -2493,7 +2517,11 @@ def _finalize_task_execution_result_isolated(
                 history_content, history_message_type = (
                     assistant_history_values_for_persistence(
                         content=safe_str(ai_response),
-                        message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
+                        message_type=(
+                            INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+                            if input_review_rejected
+                            else ASSISTANT_RESPONSE_MESSAGE_TYPE
+                        ),
                         is_failure=task_updated.status == TaskStatus.FAILED,
                     )
                 )
@@ -2943,6 +2971,7 @@ async def execute_task_background(
                         else ()
                     ),
                     turn_id=history_turn_id,
+                    input_message_id=before_message_id,
                 )
             )
         )
@@ -4331,7 +4360,10 @@ async def execute_resume_background(
             assert lease_heartbeat_task is not None
             with track_user_message_injection() as attempt:
                 try:
-                    with bind_task_lease_context(lease):
+                    with (
+                        bind_task_lease_context(lease),
+                        UserContext(task_owner_user_id),
+                    ):
                         posted = await run_while_task_lease_owned(
                             agent_service.post_user_message(
                                 str(task_id),
@@ -4871,7 +4903,12 @@ async def execute_resume_background(
             return
         elif delivery_outcome_unknown:
             await fail_deferred_delivery()
-        elif isinstance(e, _DeferredInjectionRejectedRetryableError):
+        elif isinstance(
+            e, (_DeferredInjectionRejectedRetryableError, InputReviewRejected)
+        ):
+            fenced = (
+                isinstance(e, _DeferredInjectionRejectedRetryableError) and e.fenced
+            )
             # Nothing was written for this message, so it is never failed or
             # resumed for. A fence left by an earlier uncertain input keeps the
             # task paused for the user. Without one (a read-back proved this
@@ -4879,7 +4916,7 @@ async def execute_resume_background(
             # prior status that cannot be restored without re-running or
             # re-announcing a result is paused instead.
             if (
-                not e.fenced
+                not fenced
                 and lease is not None
                 and not lease_released
                 and resume_prior_status
@@ -4891,13 +4928,18 @@ async def execute_resume_background(
             logger.warning(
                 "Task %s deferred message was not accepted (fenced=%s)",
                 task_id,
-                e.fenced,
+                fenced,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
+                error_code, retry_with_new_id = input_review_delivery_failure(
+                    e if isinstance(e, InputReviewRejected) else None
+                )
                 await fail_deferred_delivery(
-                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                    retry_with_new_id=True,
+                    client_safe_error_message(
+                        e, fallback=client_error_message(error_code)
+                    ),
+                    error_code=error_code,
+                    retry_with_new_id=retry_with_new_id,
                     rejection_outcome="not_accepted",
                 )
         elif (

@@ -4,7 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { useAuth } from "@/contexts/auth-context"
 import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
-import { clientErrorFallback, readClientErrorCode, readServerRejectionCode, type ClientErrorCode } from "@/lib/client-errors"
+import { clientErrorFallback, isInputReviewErrorCode, readClientErrorCode, readServerRejectionCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { isCanonicalUuid } from "@/lib/widget-session-upload"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
@@ -1428,8 +1428,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               // never be reused; release it. outcome_unknown is excluded so a
               // still-allowed same-id retry keeps its first attempt's zone.
               releaseAttemptBindings(clientMessageId)
+              // The durable queue acknowledges the send before the worker
+              // reviews it. Surface a later refusal as a non-terminal notice.
+              if (data.type === "message_rejected" && isInputReviewErrorCode(data.error_code)) {
+                data.type = "error"
+              }
             }
-            return
+            if (data.type !== "error") return
           }
 
           // Handle different message types from the backend

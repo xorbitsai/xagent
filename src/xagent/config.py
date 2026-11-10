@@ -506,6 +506,11 @@ def get_task_reply_wait_timeout_seconds() -> int:
     return 30
 
 
+def get_input_review_timeout_seconds() -> float:
+    """Leave part of the durable reply wait for command handoff and settlement."""
+    return min(20.0, get_task_reply_wait_timeout_seconds() * 0.8)
+
+
 def get_task_lease_ttl_seconds() -> int:
     """Get task execution lease TTL in seconds.
 

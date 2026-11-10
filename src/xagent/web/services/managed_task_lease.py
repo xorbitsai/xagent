@@ -9,11 +9,13 @@ from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
 
+from ..models.chat_message import TaskChatMessage
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task, TaskStatus
 from ..models.task_auto_recovery import TaskAutoRecoveryState
 from .assistant_history_safety import (
     ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
     assistant_history_values_for_persistence,
 )
 from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
@@ -160,6 +162,18 @@ def finalize_managed_task_lease_result(
             "completion_outcome",
             completion_outcome_for_status(execution_result, status),
         )
+        # V2 only replays applied inputs. Legacy channels persist the input
+        # before execution, so exclude its exact turn from model history.
+        if (
+            message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+            and task.conversation_storage_version != 2
+            and turn_id is not None
+        ):
+            db.query(TaskChatMessage).filter(
+                TaskChatMessage.task_id == lease.task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+            ).update({TaskChatMessage.message_type: INPUT_REVIEW_REJECTED_MESSAGE_TYPE})
         history_content, history_message_type = (
             assistant_history_values_for_persistence(
                 content=assistant_content or "",

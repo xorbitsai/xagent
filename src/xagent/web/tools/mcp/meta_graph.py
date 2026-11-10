@@ -5,6 +5,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from ....core.utils import public_requests as requests
+from . import composio_proxy
 from .composio_proxy import (
     COMPOSIO_API_KEY_ENV,
     COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
@@ -227,7 +228,7 @@ def graph_request(
 
 def uses_composio_proxy() -> bool:
     """Whether this process serves a Composio-backed grant (#3531)."""
-    return bool(os.environ.get(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
+    return composio_proxy.serves_composio_grant()
 
 
 def _remember_proxy_response_secrets(value: Any) -> None:

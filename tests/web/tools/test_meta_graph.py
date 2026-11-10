@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from xagent.web.tools.mcp import meta_graph
+from xagent.web.tools.mcp import composio_proxy, meta_graph
 
 
 class MockResponse:
@@ -516,3 +516,12 @@ def test_graph_request_accepts_the_instagram_host_natively(monkeypatch):
     meta_graph.graph_request("GET", "/me", base_url="https://graph.instagram.com/v25.0")
 
     assert request.call_args.kwargs["url"] == "https://graph.instagram.com/v25.0/me"
+
+
+@pytest.mark.parametrize("serves", [True, False], ids=["composio", "native"])
+def test_uses_composio_proxy_defers_to_the_shared_client(monkeypatch, serves):
+    """The grant check has one definition, in composio_proxy; meta_graph must
+    not keep a second copy that can drift from it."""
+    monkeypatch.setattr(composio_proxy, "serves_composio_grant", lambda: serves)
+
+    assert meta_graph.uses_composio_proxy() is serves

@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, cast
 
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.orm.attributes import set_committed_value
@@ -52,6 +52,7 @@ DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
 DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
+INPUT_REVIEW_REJECTED_MESSAGE_TYPE = "input_review_rejected"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
@@ -990,7 +991,14 @@ def load_task_transcript_window(
 
     summary = _latest_compact_summary(db, task_id, before_message_id=before_message_id)
 
-    query = db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id)
+    query = db.query(TaskChatMessage).filter(
+        TaskChatMessage.task_id == task_id,
+        or_(
+            TaskChatMessage.role != "user",
+            (TaskChatMessage.message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE)
+            & TaskChatMessage.delivery_status.is_distinct_from(DELIVERY_FAILED),
+        ),
+    )
     if before_message_id is not None:
         query = query.filter(TaskChatMessage.id < before_message_id)
     if summary is not None:

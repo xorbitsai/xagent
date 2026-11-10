@@ -103,8 +103,10 @@ from .chat_history_service import (
 from .client_error_messages import (
     CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
     CLIENT_SAFE_TASK_FAILURE,
+    INPUT_REVIEW_CLIENT_ERROR_CODES,
     ClientErrorCode,
     client_error_message,
+    input_review_error_code,
 )
 from .db_runtime import (
     drain_async_task_cancellation_safe,
@@ -359,13 +361,21 @@ def _safe_log_argument(value: object) -> object:
 
 
 def make_delivery_notifier(
-    reply: CommandReply, client_message_id: str | None
+    reply: CommandReply,
+    client_message_id: str | None,
+    *,
+    input_review_only: bool = False,
 ) -> DeliveryNotifier | None:
     """Bind a client connection to the execution service's delivery callback."""
     if client_message_id is None:
         return None
 
     async def notify(*, turn_id: str | None, **outcome: Any) -> None:
+        if (
+            input_review_only
+            and outcome.get("error_code") not in INPUT_REVIEW_CLIENT_ERROR_CODES
+        ):
+            return
         await send_message_delivery(
             reply,
             client_message_id=client_message_id,
@@ -1450,7 +1460,7 @@ async def handle_task_message(
         delivery_finished = True
         if not accepted:
             message_data["_durable_command_error"] = message or "Message was rejected"
-        if suppress_delivery_ack:
+        if suppress_delivery_ack and error_code not in INPUT_REVIEW_CLIENT_ERROR_CODES:
             return
         await send_message_delivery(
             reply,
@@ -2496,14 +2506,18 @@ async def handle_task_message(
                             task_id
                         )
                         reservation_released = True
+                        error_code = (
+                            input_review_error_code(review_rejection.unavailable)
+                            if review_rejection is not None
+                            else ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                        )
                         await finish_delivery_failure(
                             client_safe_error_message(review_rejection)
                             if review_rejection is not None
-                            else client_error_message(
-                                ClientErrorCode.MESSAGE_DELIVERY_FAILED
-                            ),
-                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
-                            retry_with_new_id=True,
+                            else client_error_message(error_code),
+                            error_code=error_code.value,
+                            retry_with_new_id=review_rejection is None
+                            or review_rejection.unavailable,
                         )
                         return
                     if disposition is InjectionDisposition.UNKNOWN:
@@ -2794,8 +2808,12 @@ async def handle_task_message(
                             delivery_already_dispatched=bool(posted),
                             delivery_notifier=(
                                 None
-                                if posted or suppress_delivery_ack
-                                else make_delivery_notifier(reply, client_message_id)
+                                if posted
+                                else make_delivery_notifier(
+                                    reply,
+                                    client_message_id,
+                                    input_review_only=suppress_delivery_ack,
+                                )
                             ),
                         )
                     )

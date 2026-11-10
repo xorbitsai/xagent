@@ -673,8 +673,9 @@ async def _wait_for_resume_to_finish(background_manager: Any, task_id: int) -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("unavailable", [False, True])
 async def test_input_review_rejects_websocket_delivery_without_resuming(
-    db_session, live_task_lease, monkeypatch, live
+    db_session, live_task_lease, recording_reply, monkeypatch, live, unavailable
 ) -> None:
     owner = _user(db_session, "review-owner")
     task = _live_task(db_session, int(owner.id))
@@ -694,7 +695,9 @@ async def test_input_review_rejects_websocket_delivery_without_resuming(
     context = ExecutionContext(execution_id=str(task_id))
     runner.context_manager.set_context(context)
     hook = AsyncMock(
-        return_value=input_review.InputReviewResult(refusal="Reply refused.")
+        return_value=input_review.InputReviewResult(
+            refusal="Reply refused.", unavailable=unavailable
+        )
     )
     monkeypatch.setattr(input_review, "_review", hook)
     agent = MagicMock()
@@ -726,6 +729,18 @@ async def test_input_review_rejects_websocket_delivery_without_resuming(
     assert context.messages == []
     agent.resume_task.assert_not_called()
     assert _row_status(db_session, task_id) == DELIVERY_FAILED
+    notices = [
+        frame
+        for frame in recording_reply.frames
+        if frame.get("type") == "message_rejected"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["error_code"] == (
+        ClientErrorCode.INPUT_REVIEW_UNAVAILABLE.value
+        if unavailable
+        else ClientErrorCode.INPUT_REVIEW_BLOCKED.value
+    )
+    assert notices[0].get("retry_with_new_id", False) is unavailable
     db_session.expire_all()
     assert db_session.get(Task, task_id).status == prior_status
 

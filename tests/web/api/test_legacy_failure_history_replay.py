@@ -1,9 +1,15 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from tests.web.api.conftest import _direct_db_session
+from xagent.core.agent.execution_adapter import (
+    AgentExecutionAdapter,
+    AgentExecutionConfig,
+)
+from xagent.core.guardrails import input as input_review
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
@@ -12,7 +18,13 @@ from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
 )
-from xagent.web.services.chat_history_service import persist_assistant_message_no_commit
+from xagent.web.services.chat_history_service import (
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+    load_task_transcript_window,
+    persist_assistant_message_no_commit,
+)
 from xagent.web.services.hot_path_cache import (
     cache_version_token,
     web_task_history_key,
@@ -602,6 +614,90 @@ async def test_new_plain_assistant_response_replays_unchanged(
         for event in events
     )
     assert CLIENT_SAFE_TASK_FAILURE not in repr(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", ["blocked", "exception", "timeout"])
+async def test_input_review_refusal_excludes_only_the_rejected_legacy_turn(
+    _test_db,
+    monkeypatch,
+    verdict,
+) -> None:
+    unavailable = verdict != "blocked"
+    task_id, user_id = _running_task(username="review-history", title="Review history")
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        task.conversation_storage_version = 1
+        messages = [
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=user_id,
+                role="user",
+                content=content,
+                message_type="user_message",
+                delivery_status=DELIVERY_DISPATCHED,
+            )
+            for content in (
+                "Approved earlier",
+                "Failed to deliver",
+                "This turn is under review",
+            )
+        ]
+        messages[1].delivery_status = DELIVERY_FAILED
+        db.add_all(messages)
+        db.flush()
+        candidate_id = int(messages[-1].id)
+        db.commit()
+
+    async def review(_request):
+        if verdict == "timeout":
+            await asyncio.Event().wait()
+        if verdict == "exception":
+            raise RuntimeError("Reviewer offline")
+        return input_review.InputReviewResult(refusal=input_review.BLOCKED_INPUT)
+
+    monkeypatch.setattr(input_review, "_review", review)
+    monkeypatch.setattr(input_review, "INPUT_REVIEW_TIMEOUT_SECONDS", 0)
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="review-history",
+            pattern="react",
+            llm=object(),
+            workspace_enabled=False,
+        )
+    )
+    result = await adapter.execute(
+        task="This turn is under review", task_id=str(task_id)
+    )
+    assert result["input_review_rejected"] is True
+    finalized = task_execution_service._finalize_task_execution_result_isolated(
+        task_id=task_id,
+        task_user_id=user_id,
+        pre_run_status=TaskStatus.RUNNING,
+        result=result,
+        expected_run_id=None,
+        task_lease=None,
+        resolved_scope_segments=(),
+        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
+        input_message_id=candidate_id,
+    )
+    assert not finalized.late_result
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        assert task.status == (
+            TaskStatus.FAILED if unavailable else TaskStatus.COMPLETED
+        )
+        assert task.completion_outcome == (None if unavailable else "blocked")
+        candidate = db.get(TaskChatMessage, candidate_id)
+        assert candidate.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        assert candidate.content == "This turn is under review"
+        assert candidate.delivery_status == DELIVERY_DISPATCHED
+        replay = load_task_transcript_window(db, task_id)
+        assert [
+            message["content"]
+            for message in replay.messages
+            if message["role"] == "user"
+        ] == ["Approved earlier"]
 
 
 def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(

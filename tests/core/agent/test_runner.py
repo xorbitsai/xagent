@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    context_checkpoint_gate,
     tool_evidence_state,
 )
 from xagent.core.agent.context.memory_retrieval import (
@@ -609,8 +611,6 @@ async def test_rejected_reply_leaves_context_and_checkpoint_untouched(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timeout", [False, True])
 async def test_input_review_contains_host_failure(monkeypatch, caplog, timeout) -> None:
-    import asyncio
-
     async def hook(_request):
         if timeout:
             await asyncio.Event().wait()
@@ -636,6 +636,77 @@ def test_input_history_filters_both_prompt_representations() -> None:
         map(input_review.input_fingerprint, ("Candidate", "Candidate with context"))
     )
     assert input_review.filter_input_history(messages, excluded) == messages[2:]
+
+
+@pytest.mark.asyncio
+async def test_allowed_turn_replays_only_approved_history(monkeypatch) -> None:
+    hook = AsyncMock(
+        return_value=input_review.InputReviewResult(
+            excluded_inputs=frozenset(
+                {input_review.input_fingerprint("Rejected earlier")}
+            )
+        )
+    )
+    monkeypatch.setattr(input_review, "_review", hook)
+    runner = AgentRunner(
+        agent=Agent(
+            name="reviewed",
+            patterns=[FakePattern({"success": True, "output": "Done"})],
+            llm=None,
+        )
+    )
+    result = await runner.run(
+        "New turn",
+        initial_messages=[
+            {"role": "user", "content": "Approved earlier"},
+            {"role": "user", "content": "Rejected earlier"},
+        ],
+    )
+    assert [
+        message.content
+        for message in result["context"].messages
+        if message.role == "user"
+    ] == ["Approved earlier", "New turn"]
+
+
+@pytest.mark.asyncio
+async def test_reply_review_does_not_hold_checkpoint_gate_and_replay_skips_review(
+    monkeypatch,
+) -> None:
+    review_started, finish_review = asyncio.Event(), asyncio.Event()
+
+    async def review(_request):
+        review_started.set()
+        await finish_review.wait()
+        return input_review.InputReviewResult()
+
+    hook = AsyncMock(side_effect=review)
+    monkeypatch.setattr(input_review, "_review", hook)
+    runner = AgentRunner(
+        agent=Agent(name="reviewed", patterns=[], llm=None),
+        tracer=TracerCheckpointStore(),
+    )
+    context = ExecutionContext(execution_id="reviewed")
+    runner.context_manager.set_context(context)
+    injection = asyncio.create_task(
+        runner.inject_user_message(
+            "reviewed", "Reply", turn_id="turn", request_interrupt=False
+        )
+    )
+    try:
+        async with asyncio.timeout(5):
+            await review_started.wait()
+            async with context_checkpoint_gate(context).shared():
+                assert not injection.done()
+    finally:
+        finish_review.set()
+        result = await injection
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    replay = await runner.inject_user_message(
+        "reviewed", "Reply", turn_id="turn", request_interrupt=False
+    )
+    assert replay.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+    hook.assert_awaited_once()
 
 
 @pytest.mark.asyncio

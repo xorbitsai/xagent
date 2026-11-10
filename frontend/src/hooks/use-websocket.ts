@@ -1428,8 +1428,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               // never be reused; release it. outcome_unknown is excluded so a
               // still-allowed same-id retry keeps its first attempt's zone.
               releaseAttemptBindings(clientMessageId)
+              // The durable queue acknowledges the send before the worker
+              // reviews it. Surface a later refusal as a non-terminal notice.
+              if (data.type === "message_rejected"
+                && (data.error_code === "input_review_blocked" || data.error_code === "input_review_unavailable")) {
+                data.type = "error"
+              }
             }
-            return
+            if (data.type !== "error") return
           }
 
           // Handle different message types from the backend

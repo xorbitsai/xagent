@@ -710,6 +710,9 @@ async def test_generation_resolves_voice_from_the_user_row(
 
     async def fake_build_workforce_prompt_plan(**kwargs: Any) -> dict[str, Any]:
         captured_voice.append(kwargs["voice"])
+        from xagent.core.user_context import current_user_id
+
+        assert current_user_id.get() == 7
         return {"name": "Research Workforce"}
 
     monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)

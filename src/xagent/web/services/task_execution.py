@@ -167,6 +167,7 @@ from .client_error_messages import (
     CONNECTOR_RUNTIME_CLIENT_ERROR_CODES,
     ClientErrorCode,
     client_error_message,
+    input_review_error_code,
 )
 from .db_runtime import (
     await_task_settlement,
@@ -2179,9 +2180,14 @@ def _finalize_task_execution_result_isolated(
     resolved_scope_segments: tuple[str, ...],
     prepared_outputs: _PreparedTaskFileOutputs | None = None,
     turn_id: str | None = None,
+    input_message_id: int | None = None,
 ) -> _TaskExecutionFinalization:
     """Persist one task result in a worker-owned, ownership-fenced session."""
-    from .chat_history_service import persist_assistant_message_no_commit
+    from ..models.chat_message import TaskChatMessage
+    from .chat_history_service import (
+        INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+        persist_assistant_message_no_commit,
+    )
 
     if prepared_outputs is None:
         resolved_output_user_id = task_user_id
@@ -2271,6 +2277,24 @@ def _finalize_task_execution_result_isolated(
                 task_lease.run_id if task_lease is not None else expected_run_id
             ),
         )
+        # V2 history only replays inputs with an application fact. Legacy
+        # history needs a marker on this exact row, independent of delivery.
+        if (
+            result.get("input_review_rejected") is True
+            and task_updated is not None
+            and task_updated.conversation_storage_version != 2
+            and (input_message_id is not None or turn_id is not None)
+        ):
+            identity = (
+                TaskChatMessage.id == input_message_id
+                if input_message_id is not None
+                else TaskChatMessage.turn_id == turn_id
+            )
+            finalize_db.query(TaskChatMessage).filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                identity,
+            ).update({TaskChatMessage.message_type: INPUT_REVIEW_REJECTED_MESSAGE_TYPE})
 
         (
             normalized_outputs,
@@ -2944,6 +2968,7 @@ async def execute_task_background(
                         else ()
                     ),
                     turn_id=history_turn_id,
+                    input_message_id=before_message_id,
                 )
             )
         )
@@ -4903,12 +4928,18 @@ async def execute_resume_background(
                 fenced,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
+                error_code = (
+                    input_review_error_code(e.unavailable)
+                    if isinstance(e, InputReviewRejected)
+                    else ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                )
                 await fail_deferred_delivery(
                     client_safe_error_message(e)
                     if isinstance(e, InputReviewRejected)
-                    else client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                    retry_with_new_id=True,
+                    else client_error_message(error_code),
+                    error_code=error_code,
+                    retry_with_new_id=not isinstance(e, InputReviewRejected)
+                    or e.unavailable,
                     rejection_outcome="not_accepted",
                 )
         elif (

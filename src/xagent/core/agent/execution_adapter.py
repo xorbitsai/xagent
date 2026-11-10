@@ -495,6 +495,8 @@ class AgentExecutionAdapter:
             # tell from a real answer; this key is the supported way to know
             # the run produced none.
             normalized["output_missing"] = True
+        if result.get("input_review_rejected") is True:
+            normalized["input_review_rejected"] = True
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome

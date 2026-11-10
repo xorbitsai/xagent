@@ -17,6 +17,7 @@ from xagent.web.services.agent_management import (
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
 from ..models.workforce import Workforce, WorkforceBuilderMessage
+from ..user_isolated_memory import UserContext
 from .agent_access import list_accessible_published_agents
 from .agent_store import AgentStore
 from .execution_budget import budget_policy_provider
@@ -64,9 +65,8 @@ async def generate_workforce_creation_plan(
     from .agent_prompt import voice_from_runtime_user
 
     voice = voice_from_runtime_user(user)
-    budget_provider = budget_policy_provider(
-        user_id=int(user.id), task_id=None, scope=None
-    )
+    owner_id = int(user.id)
+    budget_provider = budget_policy_provider(user_id=owner_id, task_id=None, scope=None)
 
     normalized_prompt = normalize_text(prompt, "prompt", required=True)
     agents = list_accessible_published_agents(
@@ -84,7 +84,7 @@ async def generate_workforce_creation_plan(
         for agent in agents
     ]
     storage = UserAwareModelStorage(db)
-    llm, _, _, compact_llm = storage.get_configured_defaults(int(user.id))
+    llm, _, _, compact_llm = storage.get_configured_defaults(owner_id)
     if not llm:
         llm, _, _, fallback_compact_llm = storage.get_configured_defaults(None)
         if compact_llm is None:
@@ -108,14 +108,15 @@ async def generate_workforce_creation_plan(
         )
 
     try:
-        return await build_workforce_prompt_plan(
-            prompt=normalized_prompt,
-            llm=llm,
-            compact_llm=compact_llm,
-            available_agents=available_agents,
-            voice=voice,
-            budget_policy_provider=budget_provider,
-        )
+        with UserContext(owner_id):
+            return await build_workforce_prompt_plan(
+                prompt=normalized_prompt,
+                llm=llm,
+                compact_llm=compact_llm,
+                available_agents=available_agents,
+                voice=voice,
+                budget_policy_provider=budget_provider,
+            )
     except WorkforcePromptBuilderUnavailableError as exc:
         logger.exception("ReAct Workforce builder runtime is unavailable")
         raise HTTPException(

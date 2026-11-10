@@ -24,7 +24,13 @@ InputReviewSource = Literal[
 
 @dataclass(frozen=True)
 class InputReviewRequest:
-    """User text at the agent boundary. Hosts review attachment bytes separately."""
+    """Text at the agent boundary.
+
+    Hosts must review both the displayed `text` and `execution_text` when
+    they differ. The latter can include additional context such as a task's
+    appended prompt context. Attachment bytes are outside this hook, and a
+    file-only reply with empty execution text does not invoke it.
+    """
 
     execution_id: str
     user_id: int | None
@@ -58,12 +64,16 @@ def set_input_review_hook(review: InputReviewHook | None) -> None:
     _review = review
 
 
+def input_review_configured() -> bool:
+    return _review is not None
+
+
 async def review_input(
     execution_id: str,
     text: str,
     *,
     execution_text: str,
-    source: InputReviewSource = "new_run",
+    review_source: InputReviewSource = "new_run",
 ) -> InputReviewResult:
     hook = _review
     if hook is None:
@@ -73,7 +83,7 @@ async def review_input(
         current_user_id.get(),
         text,
         execution_text,
-        source=source,
+        source=review_source,
         delegated_agent_id=get_delegated_review_agent_id(),
     )
     try:

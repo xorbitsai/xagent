@@ -1090,13 +1090,14 @@ def test_a_body_of_distinct_lengths_echoed_from_its_tail_is_bounded(proxy):
     assert elapsed < 1.0, "distinct lengths must not multiply the work per match"
 
 
-@pytest.mark.parametrize("line_count", [1000, 1600])
+@pytest.mark.parametrize("line_count", [100, 200, 400, 800, 1000, 1600])
 def test_a_body_of_long_lines_with_distinct_lengths_is_bounded(proxy, line_count):
     """The same shape with lines just over the kept text (1000..2599
-    characters, 2.0/3.8 MB of raw), so every match costs the full scan window
-    rather than its own length. It took 41 s and 77 s here; the counted work
-    has to cut it short with the rest of the text hidden, and no line may
-    stay visible."""
+    characters, 0.14..3.8 MB of raw) and one distinct length per line, so
+    every match costs the full scan window rather than its own length. The
+    cost rose with the number of lengths here: 3.2 s at 100, 81 s at 1600.
+    The counted work has to cut every count short with the rest of the text
+    hidden, and no line may stay visible."""
     lines = ["A" * (1000 + index - 12) + f"{index:012d}" for index in range(line_count)]
     decoded = "Subject: w\r\n\r\n" + "\r\n".join(lines)
     raw = base64.urlsafe_b64encode(decoded.encode()).decode()

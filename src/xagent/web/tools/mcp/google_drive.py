@@ -1735,8 +1735,8 @@ _SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 # application/javascript, text/css, ...). Sending one of those would turn an
 # upload that works on a native grant into a definite rejection, so
 # _create_tool_mime_type() sends application/octet-stream instead. Whether
-# Composio enforces the enum is a stage check (see the report); if it turns
-# out not to, this mapping can go.
+# Composio enforces the enum is a stage check (listed in the PR's stage
+# checks); if it turns out not to, this mapping can go.
 _CREATE_TOOL_MIME_TYPES = frozenset(
     {
         "application/vnd.google-apps.folder",
@@ -2421,6 +2421,23 @@ def _create_tool_mime_type(mime_type: str) -> str:
     return _OCTET_STREAM
 
 
+def _needs_exact_create_type(target_mime_type: str | None) -> bool:
+    """Whether a created file's type has to equal ``target_mime_type``.
+
+    Only a Google Docs/Sheets/Slides conversion changes the file's type
+    inside the create, so only that kind of target is compared exactly: a
+    file that came back as another type was not converted, and the caller
+    asked for the converted file. For any other target the tool may send the
+    enum's fallback (see ``_create_tool_mime_type``) while the staged object
+    keeps the real type, and which of the two labels Drive stores is not
+    settled, so the bytes are the evidence and a different label is not a
+    failed create. A caller that can never convert passes ``None``.
+    """
+    return target_mime_type is not None and _is_google_workspace_mime_type(
+        target_mime_type
+    )
+
+
 def _tool_file_object(data: Any) -> dict[str, Any]:
     """The file object in a Drive tool's answer, or an empty mapping.
 
@@ -2570,12 +2587,15 @@ def _find_created_file(
     during this call *of the target type* is the best evidence available. The
     creation time matters in both branches: without it an older file with the
     same name and the same bytes would be reported as this call's result even
-    if nothing was created. The type matters for the checksum-less branch: a
-    folder has no checksum either, and a folder a user happened to create
-    with that name during the call is not the upload. ``target_mime_type`` is
-    ``None`` for a caller that can never convert (an upload never does), which
-    turns that branch off. Anything else stays a candidate for the caller to
-    describe.
+    if nothing was created. The type matters in both branches: a folder has
+    no checksum either, and a folder a user happened to create with that name
+    during the call is not the upload; and for a Google Docs/Sheets/Slides
+    target a same-bytes file of another type is that create stored
+    unconverted, not the converted file the caller asked for.
+    ``target_mime_type`` is ``None`` for a caller that can never convert (an
+    upload never does), and for a target that is not a conversion target the
+    label is not compared either (see ``_needs_exact_create_type``). Anything
+    else stays a candidate for the caller to describe.
     """
     query = f"name = '{_drive_query_literal(name)}' and trashed = false"
     if parent_id is None:
@@ -2620,6 +2640,11 @@ def _find_created_file(
             and stored_md5.lower() == md5.lower()
             and stored_size in (None, size)
             and _created_during_call(candidate, started_at)
+            and (
+                not _needs_exact_create_type(target_mime_type)
+                or _normalize_mime_type(str(candidate.get("mimeType") or ""))
+                == target_mime_type
+            )
         ):
             return candidate, candidates, None
     recent = [
@@ -2714,11 +2739,14 @@ def _created_file_result(
 
     The file is read back and its checksum checked against the bytes that
     were staged, so a vendor that stored something else is not reported as a
-    success. ``target_mime_type`` is the type the create was asked for;
-    since a Google Docs/Sheets/Slides conversion happens inside the create,
-    a file that came back as another type was not converted, and that is a
-    failure rather than a success on matching bytes. The read-back fields
-    beyond the native four are not returned.
+    success. ``target_mime_type`` is the type the create was asked for; a
+    Google Docs/Sheets/Slides conversion happens inside the create, so for
+    such a target a file that came back as another type was not converted,
+    and that is a failure rather than a success on matching bytes. Any other
+    target is not compared (see ``_needs_exact_create_type``): the type the
+    tool sends there may be the enum's fallback or the staged object's real
+    type, so a different label is not evidence that the create failed. The
+    read-back fields beyond the native four are not returned.
 
     ``None`` means the read-back found no file with that id: nothing about
     this call is known, and the caller looks the file up by name and parent
@@ -2737,7 +2765,7 @@ def _created_file_result(
         )
     stored_mime_type = _normalize_mime_type(str(metadata.get("mimeType") or ""))
     if (
-        target_mime_type is not None
+        _needs_exact_create_type(target_mime_type)
         and stored_mime_type
         and stored_mime_type != target_mime_type
     ):

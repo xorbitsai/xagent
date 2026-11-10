@@ -1572,6 +1572,37 @@ def test_create_file_sends_a_type_outside_the_tool_enum_as_octet_stream(http):
     assert http.tool_calls[0][1]["mimeType"] == "application/octet-stream"
 
 
+def test_create_file_accepts_a_non_conversion_type_drive_stored_as_sent(http):
+    """Outside the tool's enum, the tool is asked for octet-stream while the
+    staged object keeps the real type. Drive may store either label, and a
+    create that is not a conversion must not be reported as a failed one."""
+    content = "print(1)"
+    data = content.encode("utf-8")
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.proxy(
+        "webViewLink",
+        200,
+        {
+            "id": "file1",
+            "name": "gen.py",
+            "webViewLink": "https://drive.google.com/file/d/file1/view",
+            "mimeType": "text/x-python",
+            "md5Checksum": _md5(data),
+            "size": str(len(data)),
+        },
+    )
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "gen.py", content, mime_type="text/x-python"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["file"]["mimeType"] == "text/x-python"
+    assert http.tool_calls[0][1]["mimeType"] == "application/octet-stream"
+
+
 def test_create_file_reports_a_conversion_that_did_not_happen(http):
     """The bytes match, but the read-back type is not the requested one: the
     Google Docs conversion did not happen, so this is not a success."""
@@ -1602,6 +1633,32 @@ def test_create_file_reports_a_conversion_that_did_not_happen(http):
     assert "'text/plain'" in result["message"]
     assert f"'{GOOGLE_DOC_MIME}'" in result["message"]
     assert "would create a duplicate" in result["message"]
+
+
+def test_create_file_does_not_take_an_unconverted_same_bytes_file_for_the_doc(
+    http, monkeypatch
+):
+    """A lost answer plus a same-name file with the uploaded bytes is not the
+    requested Doc: the conversion did not happen there, so the lookup's
+    checksum branch has to compare the type too."""
+    content = NEW_CONTENT.decode("utf-8")
+    http.proxy(
+        "name = ",
+        200,
+        {"files": [_created_lookup(name="Meeting notes", mimeType="text/plain")]},
+    )
+    _timeout_on_execute(monkeypatch)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "Meeting notes", content, mime_type=GOOGLE_DOC_MIME
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert f"'{_NEW_ID}'" in result["message"]
+    assert "It is not known whether this call created a file" in result["message"]
 
 
 # --- update_file_content on a Composio grant -------------------------------

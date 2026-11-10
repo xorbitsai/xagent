@@ -32,13 +32,13 @@ from urllib.parse import urlsplit
 from ....core.utils import public_requests as requests
 from ....core.utils.security import PrivateNetworkHostError
 from .composio_proxy import (
+    _REDACTED,
+    _SECRET_ASSIGNMENT_RE,
+    _SECRET_MEMBER_RE,
     COMPOSIO_API_KEY_ENV,
     COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
     COMPOSIO_USER_ID_ENV,
     DEFAULT_TIMEOUT_SECONDS,
-    _REDACTED,
-    _SECRET_ASSIGNMENT_RE,
-    _SECRET_MEMBER_RE,
     _required_env,
     _truncated,
     redact,

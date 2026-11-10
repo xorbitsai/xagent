@@ -475,6 +475,25 @@ def test_an_unusable_org_host_is_refused_without_echoing_it(salesforce, data, ca
             assert shown not in text
     assert "no usable Salesforce host" in caplog.text
     assert "reason=identity_host_invalid" in caplog.text
+    _assert_org_host_help(text)
+
+
+def _assert_org_host_help(text: str) -> None:
+    """The page for an account on no usable org host. Connecting again the
+    same way can't fix it, so it says what to change on Composio's page."""
+    assert "Salesforce wasn't connected" in text
+    assert (
+        "select Connect again, and on Composio's page change the Salesforce "
+        "subdomain to your My Domain prefix (for example acme.my, or "
+        "acme.develop.my for a Developer Edition org)."
+    ) in text
+    assert (
+        "For a sandbox org, change the subdomain on Composio's page to test, "
+        "or to your sandbox's My Domain prefix (for example "
+        "acme--uat.sandbox.my)."
+    ) in text
+    # Not the generic page for a sign-in that could not be verified.
+    assert "could not be verified" not in text
 
 
 def test_the_host_is_not_read_from_params_or_sub(salesforce):
@@ -489,6 +508,7 @@ def test_the_host_is_not_read_from_params_or_sub(salesforce):
     assert response.status_code == 400
     assert _identity_reads(composio) == []
     assert _grants(db) == []
+    _assert_org_host_help(response.body.decode())
 
 
 @pytest.mark.parametrize(

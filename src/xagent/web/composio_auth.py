@@ -174,6 +174,10 @@ class ComposioApp(NamedTuple):
     # ``before_connect`` before the sign-in window opens, ``not_connected``
     # when it closes without a connection. None for an app that needs none.
     connect_guidance: Mapping[str, str] | None = None
+    # For an app whose identity URL is a function of the account: what to
+    # change on Composio's page when the account names no usable host. Ends
+    # the sentence "Close this window, select Connect again, and ...".
+    identity_host_help: str | None = None
 
 
 # Graph ids, Facebook user ids and Instagram professional account ids alike.
@@ -237,6 +241,13 @@ _SALESFORCE_LOGIN_POLICY = (
 _SALESFORCE_SANDBOX = (
     "For a sandbox org, change the subdomain on Composio's page to test, or "
     "to your sandbox's My Domain prefix (for example acme--uat.sandbox.my)."
+)
+# Shown when the connected account names no usable org host: connecting
+# again the same way can't fix that.
+_SALESFORCE_IDENTITY_HOST_HELP = (
+    "on Composio's page change the Salesforce subdomain to your My Domain "
+    "prefix (for example acme.my, or acme.develop.my for a Developer Edition "
+    f"org). {_SALESFORCE_SANDBOX}"
 )
 # Salesforce stops on its own page when the app is not installed, the
 # subdomain is mistyped, or the org refuses logins from login.salesforce.com;
@@ -327,6 +338,7 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_params=(),
         identity_id_pattern=_SALESFORCE_USER_ID_RE,
         connect_guidance=SALESFORCE_CONNECT_GUIDANCE,
+        identity_host_help=_SALESFORCE_IDENTITY_HOST_HELP,
     ),
 }
 
@@ -359,7 +371,13 @@ class ComposioConfig(NamedTuple):
 
 
 class ComposioError(Exception):
-    """A Composio call failed. ``rejected`` means Composio refused it."""
+    """A Composio call failed or returned an unusable account.
+
+    ``rejected`` means repeating the same request won't help: Composio
+    refused it, or the account it returned can't be bound (not ours, not
+    active, or, for ``identity_host_invalid``, on no usable host, which the
+    member fixes on Composio's page). Otherwise the failure may be temporary.
+    """
 
     def __init__(self, reason: str, *, rejected: bool = False) -> None:
         super().__init__(reason)
@@ -487,6 +505,24 @@ def _unavailable_page(*app_ids: str) -> HTMLResponse:
         "complete the request.",
         "Close this window and select Connect again in a few minutes.",
         status_code=503,
+    )
+
+
+def _identity_host_invalid_page(app_id: str) -> HTMLResponse:
+    """The account names no usable host for its identity.
+
+    The host comes from what the member typed on Composio's page, so this
+    says what to change there; the value itself is never shown.
+    """
+    app = COMPOSIO_APPS[app_id]
+    if app.identity_host_help is None:  # pragma: no cover - fixed URL apps
+        return _reject("composio_rejected").response
+    return _page(
+        f"{app.label} wasn't connected",
+        f"The {app.label} account Composio returned doesn't name an address "
+        f"this app can use, so {app.label} wasn't connected.",
+        f"Close this window, select Connect again, and {app.identity_host_help}",
+        status_code=400,
     )
 
 
@@ -1691,11 +1727,12 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     except ComposioError as exc:
         _log_rejection(exc.reason, app_id)
         delete_account(config.api_key, account_id)
-        response = (
-            _reject("composio_rejected").response
-            if exc.rejected
-            else _unavailable_page(app_id)
-        )
+        if exc.reason == "identity_host_invalid":
+            response = _identity_host_invalid_page(app_id)
+        elif exc.rejected:
+            response = _reject("composio_rejected").response
+        else:
+            response = _unavailable_page(app_id)
         return _clear_flow_cookies(response, callback, dead)
     except _Rejected as rejected:
         _log_rejection(rejected.reason, app_id)

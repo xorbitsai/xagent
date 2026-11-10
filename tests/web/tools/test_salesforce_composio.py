@@ -248,8 +248,8 @@ def test_a_composio_id_echoed_in_an_error_is_redacted(proxy):
 
 
 def test_multiple_choices_is_returned_as_data(proxy):
-    """Salesforce answers 300 when an external id matches several records,
-    and the body lists them; the direct path returns it as data too."""
+    """requests does not follow 300, so the direct path returns its body as
+    data; the proxy path does the same."""
     proxy.answer(300, [{"id": "001xx", "url": "/services/data/v59.0/x"}])
 
     result = salesforce._request("GET", f"{API}/sobjects/Account/ExtId__c/x")
@@ -271,8 +271,10 @@ def test_a_redirect_composio_did_not_follow_is_an_error(proxy, status):
 
     result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
 
-    assert result["status"] == "error"
-    assert result["message"].startswith(f"Salesforce API error (status {status}): ")
+    assert result["message"] == (
+        f"Salesforce API error (status {status}): "
+        "the request was redirected and the redirect not followed"
+    )
 
 
 def test_an_echoed_id_cut_by_the_bound_is_redacted_whole(proxy):
@@ -287,3 +289,10 @@ def test_an_echoed_id_cut_by_the_bound_is_redacted_whole(proxy):
     assert result["status"] == "error"
     assert result["message"].endswith("... [truncated]")
     assert ACCOUNT_ID[:kept] not in result["message"]
+
+
+def test_a_3xx_requests_would_not_follow_is_not_turned_into_a_redirect_error(proxy):
+    """Only the redirects requests follows are errors; 304 is not one."""
+    proxy.answer(304, None)
+
+    assert salesforce._request("GET", f"{API}/sobjects") == {}

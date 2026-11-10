@@ -30,6 +30,8 @@ USERINFO_URL = "https://login.salesforce.com/services/oauth2/userinfo"
 # own host, through the proxy: login.salesforce.com does not serve sandbox
 # orgs, and the org's host is known to Composio only.
 ORG_USERINFO_PATH = "/services/oauth2/userinfo"
+# The redirects requests follows on the direct path (requests' REDIRECT_STATI).
+_FOLLOWED_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # Pinned to a long-supported version rather than the latest release --
 # Salesforce supports past API versions for many years (not indefinitely;
@@ -362,11 +364,11 @@ def _request_via_composio(
         body=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
     )
-    # The direct path never sees a redirect: requests follows it. One that
-    # comes back through Composio was not followed, and its empty body would
-    # read as an empty result. 300 is Salesforce's answer when an external id
-    # matches several records and carries the candidates, so it stays data.
-    if 300 < response.status < 400:
+    # The direct path never sees these: requests follows them. One that comes
+    # back through Composio was not followed, and its empty body would read as
+    # an empty result. Any other 3xx (300 included) is returned as data, as on
+    # the direct path.
+    if response.status in _FOLLOWED_REDIRECT_STATUSES:
         _raise_api_error(
             response.status, "the request was redirected and the redirect not followed"
         )

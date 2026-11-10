@@ -34,6 +34,7 @@ from xagent.core.agent.runtime import (
     LLMCallInterrupted,
     ToolCallInterrupted,
     prepare_llm_for_context,
+    resolve_compact_llm,
     resolved_llm_metadata,
 )
 from xagent.core.model.chat.basic.adapter import create_base_llm
@@ -3739,7 +3740,9 @@ async def test_virtual_compact_model_is_resolved_before_compacting(
 
     with caplog.at_level("WARNING"):
         result = await PatternRuntime().compact_context_if_needed(
-            context=context, llm=virtual, metadata={"phase": "test"}
+            context=context,
+            llm=await resolve_compact_llm(llm=virtual, context=context),
+            metadata={"phase": "test"},
         )
 
     assert virtual.prepared == 1
@@ -3759,7 +3762,11 @@ async def test_resolving_a_virtual_compact_model_keeps_the_main_threshold() -> N
     concrete.context_window = 1_048_576  # would derive a far larger threshold
 
     await PatternRuntime().compact_context_if_needed(
-        context=context, llm=_VirtualCompactLLM(concrete), metadata={}
+        context=context,
+        llm=await resolve_compact_llm(
+            llm=_VirtualCompactLLM(concrete), context=context
+        ),
+        metadata={},
     )
 
     assert context.compact_config.threshold == 30_000
@@ -3774,7 +3781,9 @@ async def test_unresolvable_virtual_compact_model_falls_back_to_dropping() -> No
     virtual = _VirtualCompactLLM(error=RuntimeError("no candidate available"))
 
     result = await PatternRuntime().compact_context_if_needed(
-        context=context, llm=virtual, metadata={}
+        context=context,
+        llm=await resolve_compact_llm(llm=virtual, context=context),
+        metadata={},
     )
 
     assert virtual.prepared == 1

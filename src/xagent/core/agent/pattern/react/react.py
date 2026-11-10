@@ -169,6 +169,7 @@ from ...runtime import (
     PatternRuntime,
     ToolCallInterrupted,
     prepare_llm_for_context,
+    resolve_compact_llm,
     resolved_llm_metadata,
 )
 from ...tool_access import connector_tool_sources, tool_access_context
@@ -1217,7 +1218,11 @@ class ReActPattern(AgentPattern):
                     # model reuses this turn's routing decision instead of
                     # routing again on the compaction prompt, whose only user
                     # message is the whole transcript.
-                    llm=compact_llm if compact_llm is not None else call_llm,
+                    llm=(
+                        await resolve_compact_llm(llm=compact_llm, context=context)
+                        if compact_llm is not None
+                        else call_llm
+                    ),
                     metadata={"iteration": iteration},
                 )
                 note_compaction_evidence_loss(context, compact_result)

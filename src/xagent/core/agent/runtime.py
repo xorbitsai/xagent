@@ -338,6 +338,39 @@ async def prepare_llm_for_context(
     return prepared
 
 
+async def resolve_compact_llm(*, llm: Any, context: Any) -> Any:
+    """Resolve an explicitly configured compact model before it compacts.
+
+    A virtual compact model (Auto) carries no context window of its own; only
+    the concrete model it selects does. Handed over unresolved, it reads as
+    "no context_window" and switches compaction off. Patterns resolve their
+    main model per turn already, so this is for the explicit compact model
+    only, and it leaves the compaction threshold the main model's window set
+    untouched. A model that cannot be resolved yields ``None``, which
+    compaction treats as having no summarizer and so drops messages instead of
+    failing the turn.
+    """
+    if llm is None or not callable(getattr(llm, "prepare_for_call", None)):
+        return llm
+    try:
+        return await resolve_virtual_llm(
+            llm=llm,
+            messages=_messages_for_compact_routing(context),
+            context=context,
+        )
+    except (LLMCallInterrupted, ExecutionEventPersistenceError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not resolve the compact model for context compaction "
+            "(%s: %s); falling back to dropping messages. execution_id=%s",
+            type(exc).__name__,
+            exc,
+            getattr(context, "execution_id", None),
+        )
+        return None
+
+
 def _messages_for_compact_routing(context: Any) -> list[dict[str, Any]]:
     getter = getattr(context, "get_messages_for_llm", None)
     if not callable(getter):
@@ -2209,33 +2242,6 @@ class PatternRuntime:
         # degrade markers.
         compact_outcome: dict[str, Any] = {}
         compaction_blocked = False
-        # A virtual compact model (Auto) carries no context window of its own;
-        # only the concrete model it selects does. Callers hand over the main
-        # model already resolved, but an explicitly configured compact model
-        # arrives unresolved, which would read as "no context_window" and
-        # switch compaction off. Resolve it here, for every pattern, without
-        # touching the threshold the main model's window set.
-        if llm is not None and callable(getattr(llm, "prepare_for_call", None)):
-            try:
-                llm = await resolve_virtual_llm(
-                    llm=llm,
-                    messages=_messages_for_compact_routing(context),
-                    context=context,
-                )
-            except (LLMCallInterrupted, ExecutionEventPersistenceError):
-                raise
-            except Exception as exc:  # noqa: BLE001
-                # No concrete summarizer could be chosen: degrade to the
-                # message-dropping fallback instead of failing the turn.
-                logger.warning(
-                    "Could not resolve the compact model for context "
-                    "compaction (%s: %s); falling back to dropping messages. "
-                    "execution_id=%s",
-                    type(exc).__name__,
-                    exc,
-                    getattr(context, "execution_id", None),
-                )
-                llm = None
         if (
             llm is not None
             and callable(getattr(llm, "chat", None))

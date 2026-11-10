@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -786,3 +787,72 @@ def test_a_native_shared_connect_leaves_the_composio_gmail_grant(google, monkeyp
     assert (gmail.token_type, gmail.access_token) == ("composio", account_id)
     assert gmail.refresh_token is None
     assert _shared_for(db, user, "gmail") is None
+
+
+@pytest.mark.parametrize("shared_mode", [True, False], ids=["shared", "legacy"])
+def test_a_native_reconnect_replaces_the_composio_grant_and_deletes_its_account(
+    google, monkeypatch, shared_mode
+):
+    """Switching Drive back to native and reconnecting the same Google account
+    replaces the Composio grant like any other reconnect, so its Composio
+    account is deleted rather than orphaned."""
+    db, user, composio = google
+    if shared_mode:
+        monkeypatch.setenv(SHARED_FLAG, "true")
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+    assert _connect(db, user, composio, "google-drive").status_code == 200
+    (before,) = _grants(db)
+    account_id = before.access_token
+    backend_env, auth_config_env = SWITCHES["google-drive"]
+    monkeypatch.delenv(backend_env)
+    monkeypatch.delenv(auth_config_env)
+
+    browser = Browser()
+    start = _start_google(db, user, browser, "google-drive")
+    assert start.status_code in (302, 307), start.body
+    location = urlsplit(start.headers["location"])
+    assert location.netloc == "accounts.google.com"
+    state = parse_qs(location.query)["state"][0]
+    assert ("google_shared_mode" in auth_api.verify_token(state)) is shared_mode
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=_Response(
+                200,
+                {
+                    "access_token": "native-access",
+                    "refresh_token": "native-refresh",
+                    "token_type": "Bearer",
+                    "scope": "openid email profile "
+                    "https://www.googleapis.com/auth/drive.file",
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=_Response(
+                200,
+                {"id": GOOGLE_SUBJECT, "sub": GOOGLE_SUBJECT, "email": "a@example.com"},
+            )
+        ),
+    )
+    response = auth_api.generic_oauth_callback(
+        "google",
+        SimpleNamespace(
+            query_params={"code": "code", "state": state},
+            cookies=browser.for_path("/api/auth/google/callback"),
+        ),
+        db,
+        _google_provider(),
+    )
+
+    assert response.status_code == 200, response.body
+    drive = [row for row in _grants(db) if row.provider == "google-drive"]
+    assert [row.token_type for row in drive] == ["Bearer"]
+    assert [row.access_token for row in drive] == ["native-access"]
+    assert composio.paths("DELETE") == [f"/connected_accounts/{account_id}"]

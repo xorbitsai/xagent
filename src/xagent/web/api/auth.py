@@ -33,7 +33,7 @@ from pydantic import (
     StrictStr,
     field_validator,
 )
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
@@ -101,7 +101,7 @@ from ..models.database import (
 )
 from ..models.system_setting import SystemSetting
 from ..models.user import User, email_confirmation_clear_values
-from ..models.user_oauth import UserOAuth
+from ..models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
 from ..oauth_account_hosts import (
     OAuthAccountError,
     get_oauth_account_host,
@@ -5794,7 +5794,10 @@ def generic_oauth_callback(
                 # Preserve an exact same-subject legacy row so an incremental
                 # response that omits refresh_token can reuse the credential
                 # proved by the previous callback. Never reuse it after the
-                # user selects another Google account.
+                # user selects another Google account. A Composio grant of
+                # the same subject holds no Google token to reuse; it is
+                # replaced below through the delete path, which also deletes
+                # its Composio account.
                 oauth_account = (
                     scoped_user_oauth_query(
                         db,
@@ -5804,6 +5807,10 @@ def generic_oauth_callback(
                     .filter(
                         UserOAuth.provider == connector_key,
                         UserOAuth.provider_user_id == str(provider_user_id),
+                        or_(
+                            UserOAuth.token_type.is_(None),
+                            UserOAuth.token_type != COMPOSIO_TOKEN_TYPE,
+                        ),
                     )
                     .order_by(UserOAuth.id.desc())
                     .first()

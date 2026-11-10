@@ -9,8 +9,11 @@ Graph-specific client (``meta_graph.py``).
 
 Composio adds the user's token to the call, and nothing here relies on it
 refusing a foreign host, so an absolute endpoint must be on one of the hosts
-the caller allows. A path is resolved by Composio against the connected
-account's own host.
+the caller allows. A path is appended by Composio to the connected account's
+``base_url``, which can carry a path of its own: a Salesforce connection's is
+the org's host plus ``/services/data/vNN.0`` (#3646 live test). A connector
+that needs the account's host reads it with ``connected_account_base_url``
+and sends absolute URLs.
 
 Two kinds of failure stay apart:
 
@@ -35,11 +38,14 @@ import re
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from ....core.utils import public_requests as requests
 
 COMPOSIO_PROXY_URL = "https://backend.composio.dev/api/v3.1/tools/execute/proxy"
+COMPOSIO_CONNECTED_ACCOUNTS_URL = (
+    "https://backend.composio.dev/api/v3.1/connected_accounts"
+)
 COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
 COMPOSIO_CONNECTED_ACCOUNT_ID_ENV = "COMPOSIO_CONNECTED_ACCOUNT_ID"
 COMPOSIO_USER_ID_ENV = "COMPOSIO_USER_ID"
@@ -738,8 +744,8 @@ def _required_env(name: str) -> str:
 
 
 def _checked_endpoint(endpoint: str, allowed_hosts: Collection[str]) -> str:
-    """An HTTPS URL on an allowed host, or a path Composio resolves against
-    the connected account's own host (a Salesforce org's My Domain)."""
+    """An HTTPS URL on an allowed host, or a path Composio appends to the
+    connected account's ``base_url``."""
     if _CONTROL_CHARS_RE.search(endpoint):
         raise ValueError("endpoint must not contain control characters")
     if endpoint.startswith("/"):
@@ -766,6 +772,55 @@ def _checked_parameter(value: Any, kind: str) -> str:
     if _CONTROL_CHARS_RE.search(text):
         raise ValueError(f"a {kind} contains a control character")
     return text
+
+
+def connected_account_base_url() -> str | None:
+    """The launched grant's connected account ``base_url`` as Composio keeps
+    it, None when the account has none. Raises ``ComposioProxyError`` when
+    Composio does not answer with the account."""
+    api_key = _required_env(COMPOSIO_API_KEY_ENV)
+    connected_account_id = _required_env(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV)
+    try:
+        response = requests.request(
+            method="GET",
+            url=f"{COMPOSIO_CONNECTED_ACCOUNTS_URL}/{quote(connected_account_id, safe='')}",
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Composio account lookup failed (exception_type=%s)", type(exc).__name__
+        )
+        raise ComposioProxyError("Composio could not be reached") from None
+    answer = _json_or_none(response)
+    status = int(response.status_code)
+    if not 200 <= status < 300:
+        message, slug = _composio_refusal("Composio account lookup", status, answer)
+        raise ComposioProxyError(message, status=status, slug=slug)
+    data = answer.get("data") if isinstance(answer, dict) else None
+    base_url = data.get("base_url") if isinstance(data, dict) else None
+    return base_url if isinstance(base_url, str) and base_url else None
+
+
+def _json_or_none(response: Any) -> Any:
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _composio_refusal(what: str, status: int, answer: Any) -> tuple[str, str | None]:
+    """The message and slug for a call Composio refused with ``status``."""
+    error = answer.get("error") if isinstance(answer, dict) else None
+    error = error if isinstance(error, dict) else {}
+    slug = error.get("slug") if isinstance(error.get("slug"), str) else None
+    detail = error.get("message")
+    message = f"{what} failed with HTTP {status}"
+    if slug:
+        message = f"{message} ({slug})"
+    if isinstance(detail, str) and detail:
+        message = f"{message}: {detail}"
+    return message, slug
 
 
 def _proxy_payload(
@@ -898,22 +953,10 @@ def proxy_request(
             "Composio proxy request failed (exception_type=%s)", type(exc).__name__
         )
         raise ComposioProxyError("Composio proxy could not be reached") from None
-    try:
-        answer = response.json()
-    except Exception:
-        answer = None
-
+    answer = _json_or_none(response)
     status = int(response.status_code)
     if not 200 <= status < 300:
-        error = answer.get("error") if isinstance(answer, dict) else None
-        error = error if isinstance(error, dict) else {}
-        slug = error.get("slug") if isinstance(error.get("slug"), str) else None
-        detail = error.get("message")
-        message = f"Composio proxy request failed with HTTP {status}"
-        if slug:
-            message = f"{message} ({slug})"
-        if isinstance(detail, str) and detail:
-            message = f"{message}: {detail}"
+        message, slug = _composio_refusal("Composio proxy request", status, answer)
         raise ComposioProxyError(
             _redact_echoed_body(message, body), status=status, slug=slug
         )

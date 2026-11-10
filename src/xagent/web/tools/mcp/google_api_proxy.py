@@ -118,20 +118,6 @@ def _declared_size(value: Any) -> int | None:
     raise ComposioProxyError("the proxied binary response declared an unusable size")
 
 
-def _download_length(response: Any) -> int | None:
-    """The signed-URL response's own Content-Length, when it declares one."""
-    headers = getattr(response, "headers", None)
-    if headers is None:
-        return None
-    for name in ("Content-Length", "content-length"):
-        try:
-            if name in headers:
-                return _declared_size(headers[name])
-        except TypeError:
-            return None
-    return None
-
-
 def _binary_content(
     binary_data: Mapping[str, Any], *, timeout: float
 ) -> tuple[bytes, str]:
@@ -144,8 +130,9 @@ def _binary_content(
     non-public destination.
 
     The bytes must be the whole body: a 206, or a body shorter or longer than
-    the size Composio declared (or the signed URL's own Content-Length),
-    raises instead of reaching a downloader as a complete file.
+    the size Composio declared (or, unless the answer is compressed, the
+    signed URL's own Content-Length), raises instead of reaching a downloader
+    as a complete file.
     """
     url = binary_data.get("url")
     if not isinstance(url, str) or not url.startswith("https://"):
@@ -154,7 +141,14 @@ def _binary_content(
         )
     expected = _declared_size(binary_data.get("size"))
     try:
-        response = requests.get(url, timeout=timeout)
+        # An identity encoding is asked for so the signed URL's own
+        # Content-Length describes the bytes ``requests`` hands back. Without
+        # it the client would ask for gzip/deflate, decode the body, and
+        # compare the decoded length with the encoded one -- refusing a
+        # perfectly good download as truncated.
+        response = requests.get(
+            url, timeout=timeout, headers={"Accept-Encoding": "identity"}
+        )
     except Exception:
         # Type only: the exception's text can name the signed URL.
         raise ComposioProxyError(
@@ -173,7 +167,14 @@ def _binary_content(
             f"(HTTP {response.status_code})"
         )
     content = response.content
-    for declared in (expected, _download_length(response)):
+    # A server that compresses the answer anyway (ignoring the identity
+    # request) declares the encoded length, which cannot be compared with the
+    # decoded bytes; ``binary_data.size`` still can, and still does.
+    if response.headers.get("Content-Encoding"):
+        lengths: tuple[int | None, ...] = (expected,)
+    else:
+        lengths = (expected, _declared_size(response.headers.get("Content-Length")))
+    for declared in lengths:
         if declared is not None and len(content) != declared:
             raise ComposioProxyError(
                 "the proxied binary response was truncated "

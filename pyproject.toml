@@ -93,8 +93,6 @@ dependencies = [
   # it's present regardless of platform (calendar/outlook conflict-check
   # timezone math needs real zone offsets, not just zone names).
   "tzdata>=2024.1",
-  "boxlite>=0.10.7,<0.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "boxlite>=0.10.7,<0.11; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.32.7",
   "fsspec>=2026.9.0",
   "cloudpickle>=3.0.0",

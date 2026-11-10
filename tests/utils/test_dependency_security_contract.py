@@ -32,7 +32,6 @@ def _requirements() -> Iterator[Requirement]:
     [
         ("aiohttp", "3.14.5"),
         ("asyncssh", "2.24.1"),
-        ("boxlite", "0.10.7"),
         ("cairosvg", "2.9.1"),
         ("cryptography", "50.0.2"),
         ("docling", "2.140.0"),

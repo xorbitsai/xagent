@@ -37,8 +37,7 @@ class _ProbeStub:
 
 @pytest.mark.asyncio
 async def test_readiness_skipped_when_backend_does_not_support_reconciliation():
-    """Legacy (Boxlite) backends never reconcile a spec; nothing to protect
-    here even when SANDBOX_VOLUMES would otherwise conflict."""
+    """Non-reconciling backends have no live spec to protect here."""
     with (
         patch.dict(
             "os.environ",

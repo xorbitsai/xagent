@@ -2,7 +2,7 @@
 
 Sandbox runtime image for [Xagent](https://github.com/xorbitsai/xagent), an open-source framework for building and running AI agents. With sandboxing enabled, Xagent delegates untrusted work — generated Python and JavaScript, shell commands, `npx`/`uvx` MCP servers — to a sandbox built from this image rather than running it in the backend process.
 
-A sandbox is a **named, stateful workspace**, not a throwaway container. Xagent creates one on demand, keeps it alive, and execs into it for each subsequent tool call. Stopping a sandbox preserves its filesystem; the next request resumes it. On the Docker backend, Xagent can also commit a sandbox's filesystem to a snapshot and use that snapshot — rather than this image — as the template for a new one; the Boxlite backend does not support snapshots.
+A sandbox is a **named, stateful workspace**, not a throwaway container. Xagent creates one on demand, keeps it alive, and execs into it for each subsequent tool call. Stopping a sandbox preserves its filesystem; the next request resumes it. Xagent can also commit a sandbox's filesystem to a snapshot and use that snapshot — rather than this image — as the template for a new one.
 
 This image is that starting template. It has no service of its own: its `CMD` is a plain `bash`, which the Docker backend replaces with a long-running idle process.
 
@@ -23,8 +23,7 @@ Sandboxing is opt-in: Xagent runs eligible tool calls in the backend process unl
 The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, drops all Linux capabilities, and enforces CPU, memory, and PID limits. Docker does not itself filter private/metadata destinations when networking is enabled, so deployments using Docker must enforce public-only egress with host or network firewall policy. The backend stamps this policy into sandbox desired-state matching, so an existing sandbox created under a different profile is rebuilt before reuse. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for deployment details.
 
 The image defines an unprivileged `sandbox` user (uid 1100, gid 1010). The
-Docker backend enforces uid 1100/gid 1010, while Boxlite runs the image's
-`sandbox` user. Replacement images must provide that identity, a writable
+Docker backend enforces uid 1100/gid 1010. Replacement images must provide that identity, a writable
 `/home/sandbox` working directory, and writable cache directories.
 
 ### File upload wire contract
@@ -62,14 +61,13 @@ Custom volume mounts that expose known backend source, tests, or Git metadata
 and object stores are rejected, including parent paths and aliases resolvable
 in the backend's filesystem. In sibling-Docker deployments, operators must
 audit host-only aliases and Git storage paths that the backend cannot inspect;
-see [Sandbox Runtime Overlays](README.md#sandbox-runtime-overlays).
+see [Sandbox Runtime Overlay](README.md#sandbox-runtime-overlay).
 Do not install the full Xagent package in a custom sandbox image: execution
 refuses an environment where that package or the former `/app/src` and
 `/app/tests` directories are visible.
 
 On upgrade, drain running work and restart the backend. Docker reconciles the
-changed mount spec when resolving a sandbox. Boxlite recreates environments
-whose stored configuration is missing or changed. Managed bind-mounted task
+changed mount spec when resolving a sandbox. Managed bind-mounted task
 files survive recreation, but the disposable writable layer does not.
 Do not restore old snapshots without auditing them for copied platform source.
 Source copies already made into task files or disclosed to users need separate
@@ -112,7 +110,6 @@ A replacement image has to stay runtime-compatible with [`docker/Dockerfile.sand
 - `pip` — tools install their declared dependencies after the container starts
 - `cat`, `rm`, `mkdir`, `/bin/sh`, and a writable `/tmp` — staging input, reading results back, cleanup
 - `tail` — the Docker backend replaces the image's `CMD` with `tail -f /dev/null` to hold the container open
-- `test`, `cp`, `mv`, and a writable `/var/tmp` — the Boxlite backend stages every file transfer there before moving it into place, because `/tmp` is a tmpfs mount it cannot copy into
 
 The image must define uid 1100 and gid 1010, provide a writable home directory
 at `/home/sandbox`, and allow that identity to use Python's user site-packages.

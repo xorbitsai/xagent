@@ -48,6 +48,9 @@ POLICY = ROOT / "poc" / "openshell" / "policy.yaml"
 IMAGE = os.getenv("XAGENT_OPENSHELL_LIVE_IMAGE", "xprobe/xagent-sandbox:latest")
 WORKDIR = "/home/sandbox"
 RUN_ID = uuid.uuid4().hex[:8]
+# Per-run namespace: also proves the gateway honours namespace scoping, since
+# a leftover from another run (or deployment) must never show up here.
+NAMESPACE = f"xagent-live-{RUN_ID}"
 
 
 def _http_probe(url: str) -> str:
@@ -83,7 +86,7 @@ def host_dir() -> Iterator[Path]:
 @pytest_asyncio.fixture(scope="module", loop_scope="module")
 async def service() -> AsyncIterator[OpenShellSandboxService]:
     svc = OpenShellSandboxService(
-        MemOpenShellStore(), policy_file=str(POLICY), providers=[]
+        MemOpenShellStore(), namespace=NAMESPACE, policy_file=str(POLICY), providers=[]
     )
     created: list[str] = []
     svc._live_created = created  # type: ignore[attr-defined]
@@ -260,6 +263,49 @@ async def test_list_maps_names_back(service, sandbox) -> None:  # type: ignore[n
     assert sandbox.name in names
 
 
+async def test_long_names_survive_the_listing(service) -> None:  # type: ignore[no-untyped-def]
+    # Chrome sandboxes are named chrome-execution::<64-hex digest> (82 bytes),
+    # which needs several label chunks; SandboxManager's durable probe and
+    # worker discovery match on the listed name.
+    name = f"chrome-execution::{RUN_ID}" + "a" * 56
+    worker = f"{name}::worker::1"
+    for n in (name, worker):
+        service._live_created.append(n)  # type: ignore[attr-defined]
+        await service.get_or_create(
+            n,
+            SandboxTemplate(type="image", image=IMAGE),
+            SandboxConfig(working_dir=WORKDIR),
+        )
+    names = {i.name for i in await service.list_sandboxes()}
+    assert {name, worker} <= names
+    assert not any(n.startswith("xa-") for n in names)
+
+
+async def test_namespaces_sharing_the_gateway_are_isolated(service) -> None:  # type: ignore[no-untyped-def]
+    other = OpenShellSandboxService(
+        MemOpenShellStore(),
+        namespace=f"{NAMESPACE}-other",
+        policy_file=str(POLICY),
+        providers=[],
+    )
+    name = f"user::live-{RUN_ID}:shared"
+    template = SandboxTemplate(type="image", image=IMAGE)
+    config = SandboxConfig(working_dir=WORKDIR)
+    service._live_created.append(name)  # type: ignore[attr-defined]
+    mine = await service.get_or_create(name, template, config)
+    try:
+        theirs = await other.get_or_create(name, template, config)
+        await mine.write_file("mine", f"{WORKDIR}/owner.txt", overwrite=True)
+        # Same xagent name, different deployment: a different sandbox.
+        assert (await theirs.exec("cat", f"{WORKDIR}/owner.txt")).exit_code != 0
+        assert [i.name for i in await other.list_sandboxes()] == [name]
+        assert name in {i.name for i in await service.list_sandboxes()}
+    finally:
+        await other.delete(name)
+    # Deleting the other deployment's sandbox left ours alone.
+    assert (await mine.read_file(f"{WORKDIR}/owner.txt")) == "mine"
+
+
 async def test_stop_and_resume_keeps_writable_layer(service, sandbox) -> None:  # type: ignore[no-untyped-def]
     await sandbox.exec("sh", "-c", f"echo keep > {WORKDIR}/state.txt")
     await sandbox.stop()
@@ -412,7 +458,10 @@ async def test_provider_credentials_are_placeholders(service) -> None:  # type: 
             "set XAGENT_OPENSHELL_LIVE_PROVIDER and XAGENT_OPENSHELL_LIVE_SECRET"
         )
     svc = OpenShellSandboxService(
-        MemOpenShellStore(), policy_file=str(POLICY), providers=[provider]
+        MemOpenShellStore(),
+        namespace=NAMESPACE,
+        policy_file=str(POLICY),
+        providers=[provider],
     )
     name = f"user::live-{RUN_ID}:cred"
     sb = await svc.get_or_create(

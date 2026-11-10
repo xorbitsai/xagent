@@ -24,6 +24,8 @@ Configuration (environment):
   ``network_policies`` (and extra filesystem paths) are merged into every
   sandbox this backend creates.
 - ``XAGENT_OPENSHELL_PROVIDERS``: comma-separated provider names to attach.
+- ``XAGENT_SANDBOX_NAMESPACE`` (required, via the web factory): the
+  deployment's ownership boundary on a shared gateway, as for Docker.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ import os
 import posixpath
 import shlex
 import textwrap
+import uuid
 from typing import Any, Protocol
 
 import grpc  # type: ignore[import-untyped]
@@ -46,7 +49,7 @@ from openshell._proto import (  # type: ignore[import-not-found]
     sandbox_pb2,
 )
 
-from ..config import get_sandbox_image
+from ..config import get_sandbox_image, validate_sandbox_namespace
 from .base import (
     CodeType,
     ExecResult,
@@ -63,7 +66,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
 
 MANAGED_LABEL = "xagent.io/managed"
+# Digest of the deployment/worker namespace: label values only allow
+# [a-z0-9._-] and must start and end alphanumeric, which namespaces need not.
+NAMESPACE_LABEL = "xagent.io/namespace"
+# The xagent name rides base32hex-encoded in NAME_LABEL-0..N-1: one label
+# value holds at most 63 characters, and names such as
+# ``chrome-execution::<64-hex digest>`` need several.
 NAME_LABEL = "xagent.io/name"
+_LABEL_VALUE_MAX = 63
+_NAME_LABEL_CHUNKS_MAX = 16
 
 # Paths the workload may read even though Landlock is default-deny. OpenShell
 # adds its own baseline on top when network rules are present.
@@ -118,26 +129,57 @@ class MemOpenShellStore(OpenShellStore):
         self._metadata.pop(name, None)
 
 
-def openshell_name(name: str) -> str:
-    """Map an xagent sandbox name to a gateway name.
+def openshell_name(name: str, namespace: str) -> str:
+    """Map an xagent sandbox name to a gateway name, scoped to a namespace.
 
     The gateway caps names at 19 characters, too short for a readable slug
-    of ``user::{owner}:{suffix}``; the original name rides in NAME_LABEL.
+    of ``user::{owner}:{suffix}``; the original name rides in name labels.
+    The namespace is part of the hashed identity (as for the Docker backend's
+    container names), so two deployments or workers sharing one gateway
+    workspace never resolve the same xagent name to the same sandbox.
     """
-    return "xa-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(f"{namespace}\0{name}".encode()).hexdigest()
+    return "xa-" + digest[:16]
 
 
-def encode_name_label(name: str) -> dict[str, str]:
-    """Carry the original name in a label (values allow only [a-z0-9._-])."""
+def namespace_label_value(namespace: str) -> str:
+    return hashlib.sha256(namespace.encode("utf-8")).hexdigest()[:32]
+
+
+def encode_name_labels(name: str) -> dict[str, str]:
+    """Carry the original name across as many labels as it needs.
+
+    Raises ValueError for a name too long to carry, instead of creating a
+    sandbox whose listing could not map back to its xagent name.
+    """
     value = base64.b32hexencode(name.encode("utf-8")).decode().rstrip("=").lower()
-    return {NAME_LABEL: value} if len(value) <= 63 else {}
+    chunks = [
+        value[i : i + _LABEL_VALUE_MAX] for i in range(0, len(value), _LABEL_VALUE_MAX)
+    ]
+    if not chunks or len(chunks) > _NAME_LABEL_CHUNKS_MAX:
+        raise ValueError(
+            f"Sandbox name of {len(name.encode('utf-8'))} bytes cannot be "
+            "carried in OpenShell labels"
+        )
+    return {f"{NAME_LABEL}-{i}": chunk for i, chunk in enumerate(chunks)}
 
 
-def decode_name_label(value: str) -> str | None:
-    if not value:
+def decode_name_labels(labels: Any) -> str | None:
+    """Reassemble a name from its label chunks; None if absent or corrupt."""
+    chunks: list[str] = []
+    for i in range(_NAME_LABEL_CHUNKS_MAX):
+        chunk = labels.get(f"{NAME_LABEL}-{i}")
+        if not chunk:
+            break
+        chunks.append(chunk)
+    if not chunks:
         return None
-    padded = value.upper() + "=" * (-len(value) % 8)
-    return base64.b32hexdecode(padded).decode("utf-8")
+    value = "".join(chunks)
+    try:
+        padded = value.upper() + "=" * (-len(value) % 8)
+        return base64.b32hexdecode(padded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def _is_not_found(exc: BaseException) -> bool:
@@ -283,9 +325,10 @@ def _stage_oversized_args(argv: list[str]) -> tuple[list[str], bytes | None]:
         return argv, None
 
     payload = bytearray()
-    lines = ["f=$(mktemp) || exit 125", 'cat > "$f" || { rm -f "$f"; exit 125; }']
+    slices: list[str] = []
     refs: list[str] = []
     positional: list[str] = []
+    fail = '|| { rm -f "$f"; exit 125; }'
     for index, value in enumerate(encoded):
         position = index + 1
         if len(value) <= _GATEWAY_ARG_LIMIT:
@@ -295,14 +338,25 @@ def _stage_oversized_args(argv: list[str]) -> tuple[list[str], bytes | None]:
         positional.append("")
         var = f"a{position}"
         # `; printf x` + `${var%x}` keeps trailing newlines that $(...) strips.
-        lines.append(
+        slices.append(
             f'{var}=$(tail -c +{len(payload) + 1} "$f" | head -c {len(value)}; '
-            f'printf x) || {{ rm -f "$f"; exit 125; }}; {var}=${{{var}%x}}'
+            f"printf x); {var}=${{{var}%x}}"
+        )
+        # The substitution's exit status is printf's, so a failed tail/head
+        # would otherwise pass a short value: verify the byte count instead.
+        slices.append(
+            f'[ $(( $(printf %s "${var}" | wc -c) )) -eq {len(value)} ] {fail}'
         )
         refs.append(f'"${var}"')
         payload += value
-    lines.append('rm -f "$f"')
-    lines.append("exec " + " ".join(refs))
+    lines = [
+        "f=$(mktemp) || exit 125",
+        f'cat > "$f" {fail}',
+        f'[ $(( $(wc -c < "$f") )) -eq {len(payload)} ] {fail}',
+        *slices,
+        'rm -f "$f"',
+        "exec " + " ".join(refs),
+    ]
     return ["sh", "-c", "\n".join(lines), "sh", *positional], bytes(payload)
 
 
@@ -319,13 +373,14 @@ class OpenShellSandbox(Sandbox):
     def __init__(  # type: ignore[no-any-unimported]
         self,
         sandbox_name: str,
+        os_name: str,
         client: SandboxClient,
         workspace: str,
         info: SandboxInfo,
         store: OpenShellStore,
     ) -> None:
         self._name = sandbox_name
-        self._os_name = openshell_name(sandbox_name)
+        self._os_name = os_name
         self._client = client
         self._workspace = workspace
         self._info = info
@@ -415,7 +470,10 @@ class OpenShellSandbox(Sandbox):
         self, data: bytes, remote_path: str, overwrite: bool
     ) -> None:
         target = shlex.quote(remote_path)
-        tmp = shlex.quote(f"{remote_path}.xagent-upload")
+        # Unique per call: concurrent uploads to one path must not append into
+        # the same temp file and then move an interleaved result into place.
+        tmp_path = f"{remote_path}.xagent-upload-{uuid.uuid4().hex[:12]}"
+        tmp = shlex.quote(tmp_path)
         remote_dir = shlex.quote(posixpath.dirname(remote_path) or "/")
         guard = "" if overwrite else f"if [ -e {target} ]; then exit 100; fi; "
         prep = await self._exec(
@@ -429,12 +487,11 @@ class OpenShellSandbox(Sandbox):
             chunk = data[start : start + _UPLOAD_CHUNK_BYTES]
             res = await self._exec(["sh", "-c", f"cat >> {tmp}"], stdin=chunk)
             if res.exit_code != 0:
-                await self._exec(["rm", "-f", f"{remote_path}.xagent-upload"])
+                await self._exec(["rm", "-f", tmp_path])
                 raise RuntimeError(f"Failed to upload {remote_path}: {res.stderr}")
-        res = await self._exec(
-            ["mv", "-f", f"{remote_path}.xagent-upload", remote_path]
-        )
+        res = await self._exec(["mv", "-f", tmp_path, remote_path])
         if res.exit_code != 0:
+            await self._exec(["rm", "-f", tmp_path])
             raise RuntimeError(f"Failed to move file to {remote_path}: {res.stderr}")
 
     async def download_file(
@@ -470,11 +527,16 @@ class OpenShellSandboxService(SandboxService):
         self,
         store: OpenShellStore,
         *,
+        namespace: str,
         client: SandboxClient | None = None,
         workspace: str | None = None,
         policy_file: str | None = None,
         providers: list[str] | None = None,
     ) -> None:
+        # Ownership boundary on a shared gateway, like the Docker backend's
+        # namespace: names, labels and listing are all scoped to it.
+        validate_sandbox_namespace(namespace)
+        self._namespace = namespace
         self._client = client or SandboxClient.from_active_cluster(
             cluster=os.getenv("XAGENT_OPENSHELL_GATEWAY") or None, timeout=60.0
         )
@@ -514,7 +576,7 @@ class OpenShellSandboxService(SandboxService):
         if template is not None and template.type == "snapshot":
             raise NotImplementedError("Unsupported")
 
-        os_name = openshell_name(name)
+        os_name = openshell_name(name, self._namespace)
         async with await self._lock(name):
             ref = await self._get_ref(os_name)
             info = self._store.get_info(name)
@@ -531,7 +593,11 @@ class OpenShellSandboxService(SandboxService):
                     workspace=self._workspace,
                     spec=spec,
                     name=os_name,
-                    labels={MANAGED_LABEL: "true", **encode_name_label(name)},
+                    labels={
+                        MANAGED_LABEL: "true",
+                        NAMESPACE_LABEL: namespace_label_value(self._namespace),
+                        **encode_name_labels(name),
+                    },
                 )
                 info = SandboxInfo(name=name, state="running", template=tpl, config=cfg)
                 self._store.add_info(name, info)
@@ -556,18 +622,32 @@ class OpenShellSandboxService(SandboxService):
             info.state = "running"
             self._store.update_info_state(name, "running")
             return OpenShellSandbox(
-                name, self._client, self._workspace, info, self._store
+                name, os_name, self._client, self._workspace, info, self._store
             )
 
     async def list_sandboxes(self) -> list[SandboxInfo]:
         refs = await asyncio.to_thread(
             self._client.list_all,
             workspace=self._workspace,
-            label_selector=f"{MANAGED_LABEL}=true",
+            label_selector=(
+                f"{MANAGED_LABEL}=true,"
+                f"{NAMESPACE_LABEL}={namespace_label_value(self._namespace)}"
+            ),
         )
         result: list[SandboxInfo] = []
         for ref in refs:
-            name = decode_name_label(ref.labels.get(NAME_LABEL, "")) or ref.name
+            name = decode_name_labels(ref.labels)
+            # Report only sandboxes whose labels map back to their own gateway
+            # name: SandboxManager drives probes, worker discovery and cleanup
+            # from these names, and a raw ``xa-<hash>`` would be re-hashed
+            # into a different sandbox.
+            if name is None or openshell_name(name, self._namespace) != ref.name:
+                logger.warning(
+                    "Skipping OpenShell sandbox %s: its name labels do not map "
+                    "back to it",
+                    ref.name,
+                )
+                continue
             info = self._store.get_info(name) or SandboxInfo(
                 name=name,
                 state="unknown",
@@ -579,7 +659,7 @@ class OpenShellSandboxService(SandboxService):
         return result
 
     async def delete(self, name: str) -> None:
-        os_name = openshell_name(name)
+        os_name = openshell_name(name, self._namespace)
         result = await asyncio.to_thread(
             self._client.delete, os_name, workspace=self._workspace, allow_missing=True
         )

@@ -45,8 +45,9 @@ MemOpenShellStore = mod.MemOpenShellStore
 OpenShellSandboxService = mod.OpenShellSandboxService
 build_policy = mod.build_policy
 build_spec = mod.build_spec
-decode_name_label = mod.decode_name_label
-encode_name_label = mod.encode_name_label
+NAMESPACE_LABEL = mod.NAMESPACE_LABEL
+decode_name_labels = mod.decode_name_labels
+encode_name_labels = mod.encode_name_labels
 load_policy_file = mod.load_policy_file
 openshell_name = mod.openshell_name
 
@@ -159,8 +160,12 @@ class FakeSandboxClient:
 
     def list_all(self, *, workspace: str, label_selector: str) -> list[SimpleNamespace]:
         self._record("list_all", workspace=workspace, label_selector=label_selector)
-        key, _, value = label_selector.partition("=")
-        return [b.ref for b in self.boxes.values() if b.labels.get(key) == value]
+        terms = [term.partition("=") for term in label_selector.split(",")]
+        return [
+            b.ref
+            for b in self.boxes.values()
+            if all(b.labels.get(key) == value for key, _, value in terms)
+        ]
 
     def delete(
         self, name: str, *, workspace: str, allow_missing: bool
@@ -240,9 +245,12 @@ def store() -> MemOpenShellStore:
 def service(
     client: FakeSandboxClient, store: MemOpenShellStore
 ) -> OpenShellSandboxService:
-    return OpenShellSandboxService(store, client=client, workspace="ws", providers=[])
+    return OpenShellSandboxService(
+        store, namespace=NS, client=client, workspace="ws", providers=[]
+    )
 
 
+NS = "deploy-a"
 TEMPLATE = SandboxTemplate(type="image", image="img:1")
 CONFIG = SandboxConfig(working_dir="/home/sandbox", env={"A": "1"})
 NAME = "user::7:client-3"
@@ -255,23 +263,59 @@ NAME = "user::7:client-3"
 
 def test_openshell_name_fits_gateway_limit_and_is_stable() -> None:
     name = "user::12345678:client-987654321"
-    assert len(openshell_name(name)) <= 19
-    assert openshell_name(name) == openshell_name(name)
-    assert openshell_name(name) != openshell_name(name + "x")
+    assert len(openshell_name(name, NS)) <= 19
+    assert openshell_name(name, NS) == openshell_name(name, NS)
+    assert openshell_name(name, NS) != openshell_name(name + "x", NS)
 
 
-@pytest.mark.parametrize("name", ["user::7", "user::7:client-3", "task::a_b-c"])
-def test_name_label_round_trip(name: str) -> None:
-    labels = encode_name_label(name)
-    assert decode_name_label(labels[NAME_LABEL]) == name
+def test_openshell_name_is_scoped_to_the_namespace() -> None:
+    # Two deployments sharing a gateway never resolve one name to one sandbox.
+    assert openshell_name("user::42:default", "deploy-a") != openshell_name(
+        "user::42:default", "deploy-b"
+    )
+    # The separator keeps (namespace, name) pairs from colliding by concatenation.
+    assert openshell_name("b::c", "a") != openshell_name("c", "a::b")
 
 
-def test_name_label_skipped_when_too_long() -> None:
-    assert encode_name_label("user::" + "9" * 60) == {}
+CHROME_NAME = "chrome-execution::" + "f" * 64
 
 
-def test_decode_empty_label_is_none() -> None:
-    assert decode_name_label("") is None
+@pytest.mark.parametrize(
+    "name",
+    [
+        "user::7",
+        "user::7:client-3",
+        "task::a_b-c",
+        CHROME_NAME,  # 82 bytes: needs three label chunks
+        CHROME_NAME + "::worker::12",
+        "user::中文",
+    ],
+)
+def test_name_labels_round_trip(name: str) -> None:
+    labels = encode_name_labels(name)
+    assert all(len(value) <= 63 for value in labels.values())
+    assert decode_name_labels(labels) == name
+
+
+def test_name_labels_split_long_names() -> None:
+    assert len(encode_name_labels(CHROME_NAME)) == 3
+
+
+def test_name_labels_reject_names_too_long_to_carry() -> None:
+    with pytest.raises(ValueError, match="cannot be carried"):
+        encode_name_labels("x" * 700)
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {},
+        {f"{NAME_LABEL}-1": "aa"},  # chunk 0 missing
+        {f"{NAME_LABEL}-0": "!!"},  # not base32hex
+    ],
+)
+def test_decode_missing_or_corrupt_labels_is_none(labels: dict[str, str]) -> None:
+    assert decode_name_labels(labels) is None
 
 
 def test_load_policy_file_maps_cli_yaml_to_proto(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -463,6 +507,33 @@ def test_stage_oversized_args_round_trips_through_real_sh(tmp_path) -> None:  # 
     assert list(tmpdir.iterdir()) == []  # the staging file is removed
 
 
+@pytest.mark.parametrize("cut", [1, 40_000])
+def test_stage_oversized_args_refuses_a_short_payload(tmp_path, cut: int) -> None:  # type: ignore[no-untyped-def]
+    # A truncated payload must fail (125) rather than run with a short value.
+    argv = [sys.executable, "-c", _ARGV_ECHO, "y" * 50_000, "z" * 40_000]
+    staged, stdin = mod._stage_oversized_args(argv)
+    assert stdin is not None
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    proc = subprocess.run(  # noqa: S603 - fixed local interpreter, test-only
+        staged,
+        input=stdin[:-cut],
+        capture_output=True,
+        env={**os.environ, "TMPDIR": str(tmpdir)},
+        check=False,
+    )
+    assert proc.returncode == 125
+    assert proc.stdout == b""
+    assert list(tmpdir.iterdir()) == []
+
+
+def test_stage_oversized_args_checks_each_slice() -> None:
+    staged, _ = mod._stage_oversized_args(["cmd", "y" * 50_000, "z" * 40_000])
+    script = staged[2]
+    assert "-eq 90000 ]" in script  # whole payload
+    assert "-eq 50000 ]" in script and "-eq 40000 ]" in script  # each value
+
+
 def test_stage_oversized_args_preserves_exit_code(tmp_path) -> None:  # type: ignore[no-untyped-def]
     argv = [sys.executable, "-c", "import sys; sys.exit(7)", "y" * 50_000]
     assert _run_staged(argv, tmp_path).returncode == 7
@@ -495,7 +566,7 @@ def test_service_reads_environment(monkeypatch, tmp_path, client) -> None:  # ty
     monkeypatch.setenv("XAGENT_OPENSHELL_WORKSPACE", "team-a")
     monkeypatch.setenv("XAGENT_OPENSHELL_POLICY_FILE", str(policy))
     monkeypatch.setenv("XAGENT_OPENSHELL_PROVIDERS", " p1, ,p2 ")
-    svc = OpenShellSandboxService(MemOpenShellStore(), client=client)
+    svc = OpenShellSandboxService(MemOpenShellStore(), namespace=NS, client=client)
     assert svc._workspace == "team-a"
     assert svc._providers == ["p1", "p2"]
     assert svc._base_policy is not None and "x" in svc._base_policy.network_policies
@@ -508,7 +579,7 @@ def test_service_defaults_without_environment(monkeypatch, client) -> None:  # t
         "XAGENT_OPENSHELL_PROVIDERS",
     ):
         monkeypatch.delenv(var, raising=False)
-    svc = OpenShellSandboxService(MemOpenShellStore(), client=client)
+    svc = OpenShellSandboxService(MemOpenShellStore(), namespace=NS, client=client)
     assert svc._workspace == "default"
     assert svc._providers == []
     assert svc._base_policy is None
@@ -525,9 +596,15 @@ def test_service_builds_client_from_active_gateway(monkeypatch) -> None:  # type
     monkeypatch.setattr(
         mod.SandboxClient, "from_active_cluster", fake_from_active_cluster
     )
-    svc = OpenShellSandboxService(MemOpenShellStore(), providers=[])
+    svc = OpenShellSandboxService(MemOpenShellStore(), namespace=NS, providers=[])
     assert svc._client == "client"
     assert seen["cluster"] == "gw-1"
+
+
+@pytest.mark.parametrize("namespace", ["", "Upper", "-lead", "a/b"])
+def test_service_rejects_invalid_namespace(namespace: str, client) -> None:  # type: ignore[no-untyped-def]
+    with pytest.raises(ValueError, match="Invalid sandbox namespace"):
+        OpenShellSandboxService(MemOpenShellStore(), namespace=namespace, client=client)
 
 
 # ---------------------------------------------------------------------------
@@ -539,12 +616,13 @@ async def test_get_or_create_creates_new_sandbox(service, client, store) -> None
     sb = await service.get_or_create(NAME, TEMPLATE, CONFIG)
 
     assert sb.name == NAME
-    os_name = openshell_name(NAME)
+    os_name = openshell_name(NAME, NS)
     _, kwargs = client.last("create")
     assert kwargs["name"] == os_name
     assert kwargs["workspace"] == "ws"
     assert kwargs["labels"][MANAGED_LABEL] == "true"
-    assert decode_name_label(kwargs["labels"][NAME_LABEL]) == NAME
+    assert kwargs["labels"][NAMESPACE_LABEL] == mod.namespace_label_value(NS)
+    assert decode_name_labels(kwargs["labels"]) == NAME
     assert kwargs["spec"].template.image == "img:1"
     assert dict(kwargs["spec"].environment) == {"A": "1"}
     assert client.count("wait_ready") == 1
@@ -560,7 +638,12 @@ async def test_get_or_create_passes_base_policy_and_providers(
         "network_policies:\n  x:\n    endpoints: [{host: a.b, port: 443}]\n"
     )
     svc = OpenShellSandboxService(
-        store, client=client, workspace="ws", policy_file=str(policy), providers=["p1"]
+        store,
+        namespace=NS,
+        client=client,
+        workspace="ws",
+        policy_file=str(policy),
+        providers=["p1"],
     )
     await svc.get_or_create(NAME, TEMPLATE, CONFIG)
     spec = client.last("create")[1]["spec"]
@@ -651,22 +734,52 @@ async def test_list_sandboxes_maps_names_back(service, client, store) -> None:  
     await service.get_or_create(NAME, TEMPLATE, CONFIG)
     sb2 = await service.get_or_create("user::8", TEMPLATE, CONFIG)
     await sb2.stop()
-    # A managed sandbox without the name label (name too long to encode) and
-    # without a store row still shows up under its gateway name.
-    client.boxes["xa-orphan"] = _Box(
-        name="xa-orphan", labels={MANAGED_LABEL: "true"}, spec=None
+    # Long names (every Chrome sandbox) keep their identity, so SandboxManager's
+    # durable probe, worker discovery and cleanup can match them.
+    await service.get_or_create(CHROME_NAME, TEMPLATE, CONFIG)
+    store.delete_info(CHROME_NAME)  # and do so without a store row
+    managed = {MANAGED_LABEL: "true", NAMESPACE_LABEL: mod.namespace_label_value(NS)}
+    # Managed sandboxes whose labels do not map back to their gateway name are
+    # skipped rather than reported as a raw ``xa-<hash>`` the manager would
+    # re-hash into a different sandbox.
+    client.boxes["xa-nolabel"] = _Box(name="xa-nolabel", labels=managed, spec=None)
+    client.boxes["xa-forged"] = _Box(
+        name="xa-forged", labels={**managed, **encode_name_labels(NAME)}, spec=None
     )
     # Unmanaged sandboxes are filtered out by label.
     client.boxes["other"] = _Box(name="other", labels={}, spec=None)
 
     infos = {i.name: i for i in await service.list_sandboxes()}
 
-    assert client.last("list_all")[1]["label_selector"] == f"{MANAGED_LABEL}=true"
-    assert set(infos) == {NAME, "user::8", "xa-orphan"}
+    assert client.last("list_all")[1]["label_selector"] == (
+        f"{MANAGED_LABEL}=true,{NAMESPACE_LABEL}={mod.namespace_label_value(NS)}"
+    )
+    assert set(infos) == {NAME, "user::8", CHROME_NAME}
     assert infos[NAME].state == "running"
     assert infos[NAME].config is CONFIG
     assert infos["user::8"].state == "stopped"
-    assert infos["xa-orphan"].config == SandboxConfig()
+    assert infos[CHROME_NAME].config == SandboxConfig()
+
+
+async def test_namespaces_on_one_gateway_do_not_see_each_other(client) -> None:  # type: ignore[no-untyped-def]
+    def make(ns: str) -> OpenShellSandboxService:
+        return OpenShellSandboxService(
+            MemOpenShellStore(),
+            namespace=ns,
+            client=client,
+            workspace="ws",
+            providers=[],
+        )
+
+    a, b = make("deploy-a"), make("deploy-b")
+    await a.get_or_create(NAME, TEMPLATE, CONFIG)
+    await b.get_or_create(NAME, TEMPLATE, CONFIG)
+
+    assert client.count("create") == 2  # same xagent name, two sandboxes
+    assert [i.name for i in await a.list_sandboxes()] == [NAME]
+    assert [i.name for i in await b.list_sandboxes()] == [NAME]
+    await a.delete(NAME)
+    assert [i.name for i in await b.list_sandboxes()] == [NAME]
 
 
 async def test_delete_waits_for_removal_and_clears_store(
@@ -704,7 +817,7 @@ async def test_snapshot_and_runtime_spec_are_unsupported(service) -> None:  # ty
 
 async def test_info_refreshes_state_from_gateway(service, client) -> None:  # type: ignore[no-untyped-def]
     sb = await service.get_or_create(NAME, TEMPLATE, CONFIG)
-    client.boxes[openshell_name(NAME)].phase = STOPPED
+    client.boxes[openshell_name(NAME, NS)].phase = STOPPED
     assert (await sb.info()).state == "stopped"
 
 
@@ -768,7 +881,7 @@ async def sandbox(service):  # type: ignore[no-untyped-def]
 
 
 def _fs(client: FakeSandboxClient) -> dict[str, bytes]:
-    return client.boxes[openshell_name(NAME)].files
+    return client.boxes[openshell_name(NAME, NS)].files
 
 
 async def test_upload_round_trip_in_chunks(
@@ -830,7 +943,9 @@ async def test_upload_chunk_failure_removes_partial_file(sandbox, client) -> Non
     )
     with pytest.raises(RuntimeError, match="Failed to upload"):
         await sandbox.write_file("x", "/w/f")
-    assert client.execs()[-1]["argv"] == ["rm", "-f", "/w/f.xagent-upload"]
+    argv = client.execs()[-1]["argv"]
+    assert argv[:2] == ["rm", "-f"]
+    assert argv[2].startswith("/w/f.xagent-upload-")
     assert _fs(client) == {}
 
 
@@ -840,6 +955,26 @@ async def test_upload_move_failure(sandbox, client) -> None:  # type: ignore[no-
     )
     with pytest.raises(RuntimeError, match="Failed to move"):
         await sandbox.write_file("x", "/w/f")
+    assert client.execs()[-1]["argv"][:2] == ["rm", "-f"]
+    assert _fs(client) == {}
+
+
+async def test_concurrent_uploads_to_one_path_do_not_interleave(
+    sandbox, client
+) -> None:  # type: ignore[no-untyped-def]
+    temps: list[str] = []
+
+    def record(argv: list[str], stdin: bytes | None) -> None:
+        if argv[:2] == ["sh", "-c"] and argv[2].startswith("cat >> "):
+            temps.append(argv[2])
+
+    client.exec_hook = record
+    await asyncio.gather(
+        sandbox.write_file("a" * 10, "/w/same", overwrite=True),
+        sandbox.write_file("b" * 10, "/w/same", overwrite=True),
+    )
+    assert len(set(temps)) == 2  # each call appends into its own temp file
+    assert _fs(client)["/w/same"] in (b"a" * 10, b"b" * 10)
 
 
 async def test_download_refuses_existing_local_file(sandbox, tmp_path) -> None:  # type: ignore[no-untyped-def]

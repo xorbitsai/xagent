@@ -209,6 +209,22 @@ class _UnimportableModule(types.ModuleType):
 class TestCreateOpenShellService:
     """Test _create_openshell_service function."""
 
+    @pytest.fixture(autouse=True)
+    def _namespace_env(self, monkeypatch):
+        """Ownership is mandatory, as for Docker."""
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "test")
+
+    def test_missing_namespace_is_fatal(self, monkeypatch):
+        """Without a namespace two deployments on one gateway would share and
+        delete each other's sandboxes; refuse to start instead."""
+        monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
+        with patch(
+            "xagent.sandbox.openshell_sandbox.OpenShellSandboxService"
+        ) as mock_service_cls:
+            with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE"):
+                _create_openshell_service()
+        mock_service_cls.assert_not_called()
+
     @pytest.mark.skipif(not _has_openshell, reason="openshell SDK not importable")
     def test_uses_db_store(self):
         """Test OpenShell sandbox service is created with the persistent store."""
@@ -224,11 +240,17 @@ class TestCreateOpenShellService:
         assert result is mock_service_cls.return_value
         mock_store_cls.assert_called_once_with(namespace=None)
         assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
+        assert mock_service_cls.call_args[1]["namespace"] == "test"
 
     @pytest.mark.skipif(not _has_openshell, reason="openshell SDK not importable")
     def test_store_is_scoped_to_the_worker(self):
-        """Shared execution scopes store rows to this sandbox worker."""
+        """Shared execution scopes the store and the gateway names to the
+        worker namespace, exactly like Docker."""
         with (
+            patch(
+                "xagent.web.sandbox_manager.get_sandbox_worker_namespace",
+                return_value="test-1234",
+            ),
             patch(
                 "xagent.web.sandbox_manager.get_sandbox_worker_id",
                 return_value="worker-a",
@@ -237,11 +259,12 @@ class TestCreateOpenShellService:
             patch(
                 "xagent.sandbox.openshell_sandbox.OpenShellSandboxService",
                 return_value=FakeSandboxService(),
-            ),
+            ) as mock_service_cls,
         ):
             _create_openshell_service()
 
-        mock_store_cls.assert_called_once_with(namespace="worker-a")
+        mock_store_cls.assert_called_once_with(namespace="test-1234")
+        assert mock_service_cls.call_args[1]["namespace"] == "test-1234"
 
     @pytest.mark.skipif(not _has_openshell, reason="openshell SDK not importable")
     def test_creation_failure_is_fatal(self):

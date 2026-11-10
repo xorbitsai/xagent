@@ -3246,6 +3246,16 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
 def _create_openshell_service() -> Optional[SandboxService]:
     """Create OpenShell sandbox service (experimental)."""
+    namespace = get_sandbox_worker_namespace()
+    if namespace is None:
+        # Same rule as Docker: without a stable per-deployment namespace, a
+        # deployment sharing the gateway would resolve the same sandbox names
+        # and could list and delete another deployment's sandboxes.
+        raise RuntimeError(
+            "XAGENT_SANDBOX_NAMESPACE is required when the OpenShell sandbox "
+            "implementation is enabled; set it to a stable, unique per-"
+            "deployment identifier"
+        )
     try:
         from ..sandbox.openshell_sandbox import OpenShellSandboxService
     except Exception as exc:
@@ -3258,9 +3268,9 @@ def _create_openshell_service() -> Optional[SandboxService]:
 
     from .sandbox_store import DBOpenShellStore
 
-    store = DBOpenShellStore(namespace=get_sandbox_worker_id())
+    store = DBOpenShellStore(namespace=namespace if get_sandbox_worker_id() else None)
     try:
-        service = OpenShellSandboxService(store=store)
+        service = OpenShellSandboxService(store=store, namespace=namespace)
     except Exception as exc:
         raise RuntimeError(
             "Failed to initialize the OpenShell sandbox runtime"

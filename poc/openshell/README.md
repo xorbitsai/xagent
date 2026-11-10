@@ -16,19 +16,20 @@ no spec reconciliation (`supports_runtime_spec() == False`).
 | `src/xagent/sandbox/openshell_sandbox.py` | `OpenShellSandboxService` / `OpenShellSandbox` over the `openshell` Python SDK |
 | `src/xagent/web/sandbox_manager.py` | `SANDBOX_IMPLEMENTATION=openshell` wiring (fails closed like the other backends) |
 | `src/xagent/web/sandbox_store.py` | `DBOpenShellStore` (same table, `sandbox_type="openshell"`) |
-| `tests/sandbox/test_openshell_sandbox.py` | 55 unit tests over an in-memory fake gateway: helpers, lifecycle, concurrency, exec (incl. oversized-argument staging run through a real `sh`), chunked file transfer, error paths (no gateway). Run in CI via the `openshell` extra |
-| `tests/sandbox/test_openshell_live.py` | 21 live tests: isolation, mounts, Landlock, file transfer, egress, lifecycle, oversized exec arguments, real xagent tools (directly and through `SandboxManager` lease providers), credential placeholders. Skipped unless `XAGENT_OPENSHELL_LIVE=1` |
+| `tests/sandbox/test_openshell_sandbox.py` | 71 unit tests over an in-memory fake gateway: helpers, lifecycle, concurrency, exec (incl. oversized-argument staging run through a real `sh`), chunked file transfer, error paths (no gateway). Run in CI via the `openshell` extra |
+| `tests/sandbox/test_openshell_live.py` | 23 live tests: isolation, mounts, Landlock, file transfer, egress, lifecycle, oversized exec arguments, long (Chrome-length) names, namespace isolation on one gateway, real xagent tools (directly and through `SandboxManager` lease providers), credential placeholders. Skipped unless `XAGENT_OPENSHELL_LIVE=1` |
 | `tests/web/test_openshell_sandbox_store.py` | `DBOpenShellStore` round trip and isolation from Docker rows |
 | `tests/web/test_sandbox_manager.py` | `SANDBOX_IMPLEMENTATION=openshell` dispatch and `_create_openshell_service` |
 | `poc/openshell/policy.yaml` | base egress policy (pypi only, python binary only) |
 | `poc/openshell/httpbin-profile.yaml` | provider profile used by the live credential test |
 
 Config: `XAGENT_OPENSHELL_WORKSPACE`, `XAGENT_OPENSHELL_GATEWAY`,
-`XAGENT_OPENSHELL_POLICY_FILE`, `XAGENT_OPENSHELL_PROVIDERS`.
+`XAGENT_OPENSHELL_POLICY_FILE`, `XAGENT_OPENSHELL_PROVIDERS`, and (required,
+as for Docker) `XAGENT_SANDBOX_NAMESPACE`.
 
 ## Results (live, macOS arm64 + colima Docker 29.5, kernel 6.8)
 
-All 21 live tests pass (~75 s), including the credential checks, the
+All 23 live tests pass (~100 s; the pypi egress check depends on the host network), including the credential checks, the
 real tools, and the `SandboxManager` lease-provider route that agent tasks use.
 
 | Area | Result |
@@ -56,9 +57,13 @@ real tools, and the `SandboxManager` lease-provider route that agent tasks use.
    deliberately runs the sandbox as root. Anything relying on that (writing
    to `/home` - xagent's default `working_dir` - or system site-packages)
    breaks; POC uses `working_dir=/home/sandbox` and `pip --user`.
-3. **Name limit 19 chars.** Sandbox names are hashed (`xa-<16 hex>`); the
-   original xagent name rides in a base32 label so `list_sandboxes` can map
-   back.
+3. **Name limit 19 chars.** Gateway names are `xa-<16 hex>` of
+   sha256(namespace, name). The xagent name rides base32-encoded across
+   `xagent.io/name-0..N` labels (63 chars per value; Chrome names need three),
+   and a `xagent.io/namespace` digest label scopes listing. `list_sandboxes`
+   skips any sandbox whose labels do not hash back to its gateway name, so the
+   manager never sees a raw `xa-<hash>`. Names too long for 16 labels are
+   rejected at creation.
 4. **No SDK file-transfer API.** Done over exec stdin/stdout. Each stdin chunk
    is one gRPC message capped at 1 MiB (the documented 4 MiB is the total),
    so chunks are 768 KiB. Output is buffered fully by the SDK, so

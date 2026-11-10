@@ -52,11 +52,17 @@ def _md5(data: bytes) -> str:
 
 class _Response:
     def __init__(
-        self, status_code: int, payload: Any = None, content: bytes = b""
+        self,
+        status_code: int,
+        payload: Any = None,
+        content: bytes = b"",
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self._payload = payload
         self.content = content
+        # The transport reads these off a signed-URL download.
+        self.headers = headers or {}
 
     def json(self) -> Any:
         if self._payload is None:
@@ -490,7 +496,14 @@ def test_get_file_content_exports_a_google_doc(http):
     http.proxy(
         "fields",
         200,
-        {"id": "doc1", "name": "Notes", "mimeType": GOOGLE_DOC_MIME},
+        {
+            "id": "doc1",
+            "name": "Notes",
+            "mimeType": GOOGLE_DOC_MIME,
+            # Drive reports a size for a Workspace file too (the document's
+            # own blob), and it never equals the exported bytes.
+            "size": "4096",
+        },
     )
     http.proxy(
         "/export",
@@ -512,6 +525,46 @@ def test_get_file_content_exports_a_google_doc(http):
         0
     ]
     assert _query(export_call)["mimeType"] == "text/plain"
+
+
+def test_download_file_exports_a_document_despite_its_reported_size(
+    http, _isolate_environment
+):
+    """The #3648 acceptance case: export a Google Doc to PDF. Drive's own
+    size for the document is not the export's size, so it must not be
+    compared."""
+    http.proxy(
+        "version, headRevisionId",
+        200,
+        _metadata(
+            id="doc1",
+            name="Notes",
+            mimeType=GOOGLE_DOC_MIME,
+            size="4096",
+            md5Checksum=None,
+        ),
+    )
+    http.proxy(
+        "/export",
+        200,
+        binary_data={
+            "url": BINARY_URL,
+            "content_type": "application/pdf",
+            "size": len(NEW_CONTENT),
+        },
+    )
+    http.download(BINARY_URL, NEW_CONTENT)
+
+    result = json.loads(
+        google_drive.google_drive_download_file("doc1", mime_type="application/pdf")
+    )
+
+    assert result["status"] == "success"
+    assert result["size"] == len(NEW_CONTENT)
+    assert Path(result["path"]).read_bytes() == NEW_CONTENT
+    assert Path(result["path"]).name.endswith(".pdf")
+    # The check-only fields are not part of the tool's output shape.
+    assert "size" not in result["file"]
 
 
 def test_get_file_content_accepts_text_relayed_in_data(http):
@@ -594,7 +647,6 @@ def test_get_file_content_rejects_a_short_binary_answer(http):
 
     assert result["status"] == "error"
     assert "truncated" in result["message"]
-    assert "success" not in result
 
 
 def test_download_file_writes_nothing_when_the_body_is_short(
@@ -793,9 +845,11 @@ def test_upload_file_rejects_an_empty_file_before_any_composio_call(
     assert http.calls == []
 
 
-def test_upload_file_does_not_claim_success_when_the_tool_fails(
+def test_upload_file_keeps_a_failed_tool_answer_an_unknown_outcome(
     http, _isolate_environment
 ):
+    """Composio can fail the tool after Drive stored the file, so a failed
+    answer is no proof it was not uploaded: the lookup decides."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
     http.tool(
@@ -803,14 +857,17 @@ def test_upload_file_does_not_claim_success_when_the_tool_fails(
         successful=False,
         error="insufficient permissions",
     )
+    http.proxy("name = ", 200, {"files": []})
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
     assert result["status"] == "error"
     assert "insufficient permissions" in result["message"]
-    assert "success" not in result
-    # Drive refused the tool, so no name lookup is needed.
-    assert [call for call in http.proxy_calls if "name = " in str(call)] == []
+    assert "found no file named 'Report.pdf'" in result["message"]
+    assert "not known whether it was uploaded" in result["message"]
+    assert "was not uploaded" not in result["message"]
+    lookup = [call for call in http.proxy_calls if "name = " in str(call)]
+    assert len(lookup) == 1
 
 
 def test_upload_file_does_not_claim_success_without_the_new_file_id(
@@ -962,7 +1019,6 @@ def test_upload_file_does_not_take_a_same_name_folder_for_the_upload(
     assert "file" not in result
     assert "'folder1'" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
-    assert "success" not in result
 
 
 def test_upload_file_treats_a_408_as_unknown_and_looks_the_file_up(
@@ -1044,7 +1100,8 @@ def test_upload_file_says_nothing_was_uploaded_when_composio_rejects_the_call(
 
     assert result["status"] == "error"
     assert "was not uploaded to Google Drive" in result["message"]
-    assert "rejected the request" in result["message"]
+    assert "nothing was sent to Google Drive" in result["message"]
+    assert "HTTP 422" in result["message"]
     # A definite rejection needs no lookup.
     assert http.proxy_calls == []
 
@@ -1108,20 +1165,133 @@ def test_upload_file_does_not_report_success_when_drive_stored_other_bytes(
     assert "would create a duplicate" in result["message"]
 
 
-def test_upload_file_uses_the_tool_answer_when_the_read_back_fails(
+def test_upload_file_looks_the_file_up_when_the_read_back_is_a_404(
     http, _isolate_environment
 ):
+    """The id the tool answered with does not resolve, so it proves nothing:
+    the file is looked up by name instead of being reported as a success."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
     http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
-    http.proxy("webViewLink", 404, {"error": {"code": 404, "message": "not found"}})
+    # The read-back is a files.get of the id the tool answered with; the
+    # lookup that follows is a files.list, so the id names only the read-back.
+    http.proxy(_NEW_ID, 404, {"error": {"code": 404, "message": "not found"}})
+    http.proxy("name = ", 200, {"files": [_created_lookup()]})
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
 
-    # The file exists; reporting a failure would invite a duplicate upload.
+    assert result["status"] == "success"
+    assert result["file"]["id"] == _NEW_ID
+    lookup = [call for call in http.proxy_calls if "name = " in str(call)]
+    assert len(lookup) == 1
+
+
+def test_upload_file_keeps_the_tool_answer_when_the_read_back_fails(
+    http, _isolate_environment
+):
+    """A read-back that fails for any other reason still leaves the tool's own
+    answer: the file exists, and reporting a failure would invite a duplicate
+    upload."""
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
+    http.proxy(_NEW_ID, 500, {"error": {"code": 500, "message": "backend error"}})
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+
     assert result["status"] == "success"
     assert result["file"]["id"] == _NEW_ID
     assert result["file"]["name"] == "Report.pdf"
+
+
+def test_upload_file_sends_a_type_outside_the_tool_enum_as_octet_stream(
+    http, _isolate_environment
+):
+    """The create tool's mimeType is a closed enum. A legacy .doc type is not
+    in it, so the tool is asked for application/octet-stream while the staged
+    object keeps the file's real type."""
+    local = _isolate_environment / "Notes.doc"
+    local.write_bytes(NEW_CONTENT)
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
+    http.proxy(
+        "webViewLink",
+        200,
+        _created_metadata(name="Notes.doc", mimeType="application/octet-stream"),
+    )
+
+    result = json.loads(
+        google_drive.google_drive_upload_file(
+            str(local), mime_type="application/msword"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert _staged(http)["mimetype"] == "application/msword"
+    assert http.tool_calls[0][1]["mimeType"] == "application/octet-stream"
+
+
+def test_upload_file_does_not_take_an_older_same_bytes_file_for_the_upload(
+    http, monkeypatch, _isolate_environment
+):
+    """A checksum match also has to have been created during this call: an
+    older file with the same name and bytes was not this upload."""
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+    http.proxy(
+        "name = ",
+        200,
+        {"files": [_created_lookup(createdTime="2026-01-02T03:04:05.000Z")]},
+    )
+    _timeout_on_execute(monkeypatch)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert f"'{_NEW_ID}'" in result["message"]
+    assert "It is not known whether this call created a file" in result["message"]
+    assert "the upload may still be finishing in Composio" not in result["message"]
+
+
+def test_the_create_lookup_searches_every_drive(
+    http, monkeypatch, _isolate_environment
+):
+    """Without corpora=allDrives a file created in a shared drive is never
+    found by the lookup."""
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+    http.proxy("name = ", 200, {"files": []})
+    _timeout_on_execute(monkeypatch)
+
+    json.loads(google_drive.google_drive_upload_file(str(local)))
+
+    lookup = [call for call in http.proxy_calls if "name = " in str(call)][0]
+    query = _query(lookup)
+    assert query["corpora"] == "allDrives"
+    assert query["includeItemsFromAllDrives"] == "true"
+    assert query["supportsAllDrives"] == "true"
+
+
+def test_upload_file_says_nothing_was_sent_when_the_call_never_started(
+    http, monkeypatch, _isolate_environment
+):
+    """A missing launch variable raises before any request goes out, so
+    nothing reached Drive and no lookup is needed."""
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+
+    def missing(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("COMPOSIO_USER_ID environment variable is missing")
+
+    monkeypatch.setattr(composio_tools, "execute_tool", missing)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+
+    assert result["status"] == "error"
+    assert "was not uploaded to Google Drive" in result["message"]
+    assert "nothing was sent to Google Drive" in result["message"]
+    assert "COMPOSIO_USER_ID" in result["message"]
+    assert http.proxy_calls == []
 
 
 def test_upload_file_never_puts_the_api_key_or_upload_url_in_an_error(
@@ -1263,7 +1433,6 @@ def test_create_file_does_not_claim_success_without_the_new_file_id(http):
     assert "did not confirm" in result["message"]
     assert "found no file named 'notes.txt'" in result["message"]
     assert "not known whether it was created" in result["message"]
-    assert result["status"] != "success"
 
 
 def test_create_file_returns_a_google_doc_a_lost_answer_created(http, monkeypatch):
@@ -1313,7 +1482,6 @@ def test_create_file_does_not_take_a_same_name_folder_for_the_created_doc(
 
     assert result["status"] == "error"
     assert "file" not in result
-    assert "success" not in result
     assert "'folder1'" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
 
@@ -1355,6 +1523,84 @@ def test_create_file_does_not_report_success_when_drive_stored_other_bytes(http)
 
     assert result["status"] == "error"
     assert "checksum does not match" in result["message"]
+    assert "would create a duplicate" in result["message"]
+
+
+def test_create_file_keeps_a_failed_tool_answer_an_unknown_outcome(http):
+    """Composio can fail the create tool after Drive created the file, so a
+    failed answer is no proof it does not exist."""
+    http.tool(
+        composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        successful=False,
+        error="the drive account is not connected",
+    )
+    http.proxy("name = ", 200, {"files": []})
+
+    result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello"))
+
+    assert result["status"] == "error"
+    assert "the drive account is not connected" in result["message"]
+    assert "not known whether it was created" in result["message"]
+    assert "was not created in Google Drive" not in result["message"]
+    lookup = [call for call in http.proxy_calls if "name = " in str(call)]
+    assert len(lookup) == 1
+
+
+def test_create_file_sends_a_type_outside_the_tool_enum_as_octet_stream(http):
+    """text/x-python is a valid text type natively but not one of the create
+    tool's mimeType values, so the tool is asked for octet-stream."""
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.proxy(
+        "webViewLink",
+        200,
+        {
+            "id": "file1",
+            "name": "gen.py",
+            "webViewLink": "https://drive.google.com/file/d/file1/view",
+            "mimeType": "application/octet-stream",
+        },
+    )
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "gen.py", "print(1)", mime_type="text/x-python"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert _staged(http)["mimetype"] == "text/x-python"
+    assert http.tool_calls[0][1]["mimeType"] == "application/octet-stream"
+
+
+def test_create_file_reports_a_conversion_that_did_not_happen(http):
+    """The bytes match, but the read-back type is not the requested one: the
+    Google Docs conversion did not happen, so this is not a success."""
+    content = "hello from the meeting"
+    data = content.encode("utf-8")
+    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.proxy(
+        "webViewLink",
+        200,
+        {
+            "id": "file1",
+            "name": "Meeting notes",
+            "webViewLink": "https://drive.google.com/file/d/file1/view",
+            "mimeType": "text/plain",
+            "md5Checksum": _md5(data),
+            "size": str(len(data)),
+        },
+    )
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "Meeting notes", content, mime_type=GOOGLE_DOC_MIME
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "did not happen" in result["message"]
+    assert "'text/plain'" in result["message"]
+    assert f"'{GOOGLE_DOC_MIME}'" in result["message"]
     assert "would create a duplicate" in result["message"]
 
 
@@ -1721,6 +1967,26 @@ def test_a_deduplicated_update_detects_a_local_change(
     assert result["status"] == "error"
     assert "local file changed" in result["message"].lower()
     assert http.puts == []
+    assert http.tool_calls == []
+
+
+def test_update_content_refuses_a_resourcekey_file_before_staging(
+    http, _isolate_environment
+):
+    """The update tool takes a bare fileId and cannot carry a resource key, so
+    a link-shared file is refused before its bytes are staged."""
+    local = _replacement(_isolate_environment)
+    http.proxy("capabilities", 200, _current())
+    file_id = "https://drive.google.com/file/d/deck1/view?resourcekey=0-Rkey"
+
+    result = json.loads(
+        google_drive.google_drive_update_file_content(file_id, str(local))
+    )
+
+    assert result["status"] == "error"
+    assert "resource key" in result["message"]
+    assert "Nothing was changed" in result["message"]
+    assert http.calls_to("/files/upload/request") == []
     assert http.tool_calls == []
 
 

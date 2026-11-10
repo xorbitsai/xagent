@@ -23,11 +23,10 @@ it reaches a caller.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, BinaryIO, Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from ....core.utils import public_requests as requests
@@ -37,12 +36,19 @@ from .composio_proxy import (
     COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
     COMPOSIO_USER_ID_ENV,
     DEFAULT_TIMEOUT_SECONDS,
-    MAX_ERROR_TEXT_CHARS,
+    _REDACTED,
+    _SECRET_ASSIGNMENT_RE,
+    _SECRET_MEMBER_RE,
+    _required_env,
+    _truncated,
     redact,
 )
 
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 GOOGLEDRIVE_TOOLKIT_SLUG = "googledrive"
+# What the tool execution error calls the toolkit. The slug above is what the
+# Files API takes; this is only for a message a caller reads.
+GOOGLEDRIVE_TOOLKIT_NAME = "Google Drive"
 # The two Drive tools that move bytes. A create carries metadata and content
 # in one request; an update is a media-only upload. Neither fits Proxy
 # Execute, which takes one JSON body and no multipart or resumable session.
@@ -95,18 +101,19 @@ class ToolResult:
 
 def stage_file(
     *,
+    toolkit_slug: str,
     tool_slug: str,
     filename: str,
     mimetype: str,
     md5: str,
-    data: bytes | BinaryIO | ReadableBody,
+    data: bytes | ReadableBody,
     length: int,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
     on_dedup: Callable[[], None] | None = None,
 ) -> dict[str, str]:
     """Upload ``data`` to Composio's file storage for ``tool_slug``.
 
-    Returns the ``{name, mimetype, s3key}`` object a Drive tool takes as its
+    ``toolkit_slug`` is the Composio toolkit the tool belongs to. Returns the
+    ``{name, mimetype, s3key}`` object a Drive tool takes as its
     ``file_to_upload`` argument. ``length`` is the number of bytes ``data``
     holds; it becomes the upload's Content-Length, so a stream is read once
     and not buffered.
@@ -120,13 +127,13 @@ def stage_file(
     if type(length) is not int or length < 0:
         raise ValueError("length must be a non-negative byte count")
     payload = {
-        "toolkit_slug": GOOGLEDRIVE_TOOLKIT_SLUG,
+        "toolkit_slug": toolkit_slug,
         "tool_slug": tool_slug,
         "filename": filename,
         "mimetype": mimetype,
         "md5": md5,
     }
-    status, answer = _call("/files/upload/request", payload, timeout)
+    status, answer = _call("/files/upload/request", payload)
     if not 200 <= status < 300:
         raise _api_error("Composio refused the file upload request", status, answer)
     if not isinstance(answer, Mapping):
@@ -142,14 +149,7 @@ def stage_file(
             on_dedup()
     else:
         backend = _storage_backend(answer)
-        _put_file(
-            url,
-            data=data,
-            length=length,
-            mimetype=mimetype,
-            backend=backend,
-            timeout=timeout,
-        )
+        _put_file(url, data=data, length=length, mimetype=mimetype, backend=backend)
     return {"name": filename, "mimetype": mimetype, "s3key": key}
 
 
@@ -175,16 +175,14 @@ def _upload_url(answer: Mapping[str, Any]) -> str | None:
 
 
 def execute_tool(
-    tool_slug: str,
-    arguments: Mapping[str, Any],
-    *,
-    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    tool_slug: str, arguments: Mapping[str, Any], *, toolkit: str
 ) -> ToolResult:
     """Run ``tool_slug`` for the launched grant with ``arguments``.
 
     The connected account id and user id are those the MCP subprocess was
     launched with, the same ones every proxied call uses. Passing both keeps
-    the tool off a project-wide default account.
+    the tool off a project-wide default account. ``toolkit`` names the
+    toolkit in an error a caller reads ("Google Drive").
     """
     payload = {
         "connected_account_id": _required_env(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV),
@@ -192,9 +190,9 @@ def execute_tool(
         "user_id": _required_env(COMPOSIO_USER_ID_ENV),
         "arguments": dict(arguments),
     }
-    status, answer = _call(f"/tools/execute/{tool_slug}", payload, timeout)
+    status, answer = _call(f"/tools/execute/{tool_slug}", payload)
     if not 200 <= status < 300:
-        raise _api_error("Composio could not run the Google Drive tool", status, answer)
+        raise _api_error(f"Composio could not run the {toolkit} tool", status, answer)
     if not isinstance(answer, Mapping):
         raise ComposioToolError("Composio returned an unusable tool answer")
     successful = answer.get("successful")
@@ -219,11 +217,10 @@ def _storage_backend(answer: Mapping[str, Any]) -> str | None:
 def _put_file(
     url: str,
     *,
-    data: bytes | BinaryIO | ReadableBody,
+    data: bytes | ReadableBody,
     length: int,
     mimetype: str,
     backend: str | None,
-    timeout: float,
 ) -> None:
     """PUT the staged bytes to Composio's presigned URL.
 
@@ -244,7 +241,7 @@ def _put_file(
             url,
             data=data,
             headers=headers,
-            timeout=timeout,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
             allow_redirects=False,
         )
     except PrivateNetworkHostError:
@@ -268,7 +265,7 @@ def _put_file(
         )
 
 
-def _call(path: str, payload: Mapping[str, Any], timeout: float) -> tuple[int, Any]:
+def _call(path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
     api_key = _required_env(COMPOSIO_API_KEY_ENV)
     try:
         response = requests.request(
@@ -280,7 +277,7 @@ def _call(path: str, payload: Mapping[str, Any], timeout: float) -> tuple[int, A
                 "Content-Type": "application/json",
             },
             json=dict(payload),
-            timeout=timeout,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
         )
     except (requests.RequestException, OSError) as exc:
         # Type only: a connection error's text can name the request. A
@@ -318,17 +315,10 @@ def _api_error(prefix: str, status: int, answer: Any) -> ComposioToolError:
     return ComposioToolError(message, status=status, slug=slug)
 
 
-_REDACTED = "[redacted]"
-# A vendor error can echo a credential by member name or as an assignment,
-# which the shared launch-secret redaction does not know. Match the value and
-# keep the name so the message still says what kind of credential leaked.
-_SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(refresh_token|client_secret|access_token|id_token|api_key)"
-    r"\s*[=:]\s*[\"']?[^\s&\"',;]+"
-)
-# A presigned storage URL is a bearer credential for a staged object. Drop
-# the whole URL rather than only the signature: the object path is a
-# capability too, and an error has no use for it.
+# A presigned storage URL is a bearer credential for a staged object, and it
+# is not one of the shapes ``composio_proxy`` redacts (the proxy client never
+# handles one). Drop the whole URL rather than only the signature: the object
+# path is a capability too, and an error has no use for it.
 _SIGNED_URL_RE = re.compile(
     r"https?://[^\s\"']*"
     r"(?:X-Amz-Signature|X-Goog-Signature|[?&](?:sig|Signature|token)=)"
@@ -336,20 +326,20 @@ _SIGNED_URL_RE = re.compile(
 )
 
 
-def _required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise ValueError(f"{name} environment variable is missing")
-    return value
-
-
 def _safe_text(value: str) -> str:
-    redacted = redact(value)
-    text = redacted if isinstance(redacted, str) else str(redacted)
-    text = _SIGNED_URL_RE.sub("[redacted-url]", text)
+    """``value`` with a credential or a signed URL removed, then cut.
+
+    A vendor error can echo a credential by member name or as an assignment,
+    which the launch-secret redaction does not know; the member and
+    assignment patterns are ``composio_proxy``'s own, so an answer text is
+    redacted the same way whichever Composio client relays it.
+    """
+    text = _SIGNED_URL_RE.sub("[redacted-url]", value)
+    text = _SECRET_MEMBER_RE.sub(
+        lambda match: f'"{match.group(1)}": "{_REDACTED}"', text
+    )
     text = _SECRET_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}={_REDACTED}", text
     )
-    if len(text) > MAX_ERROR_TEXT_CHARS:
-        return f"{text[:MAX_ERROR_TEXT_CHARS]}...[truncated]"
-    return text
+    redacted = redact(text)
+    return _truncated(redacted if isinstance(redacted, str) else str(redacted))

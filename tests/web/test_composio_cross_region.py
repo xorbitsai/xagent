@@ -1,10 +1,11 @@
 """A Composio trip that reaches the wrong region fails closed (xagent-saas#2461).
 
-With connector OAuth routing on, the edge routes Composio's verification and
-denial trips (which carry no ``state``) by one fixed-name route cookie. A
-member of workspaces in two regions who starts a connect in one region and
-then another in the second, in one browser, overwrites that cookie, so the
-first flow's verification reaches the second region.
+With connector OAuth routing on, the edge is to route Composio's verification
+and denial trips (which carry no ``state``) by one fixed-name route cookie
+that xagent-saas mints (xagent-saas#2461). A member of workspaces in two
+regions who starts a connect in one region and then another in the second, in
+one browser, would overwrite that cookie, so the first flow's verification
+would reach the second region.
 
 Two databases stand in for the two regions here. They share every secret
 (the JWT key, ``ENCRYPTION_KEY``, ``COMPOSIO_USER_ID_SECRET``) and one

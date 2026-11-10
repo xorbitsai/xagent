@@ -417,8 +417,10 @@ def test_start_meets_the_xagent_saas_contract(db_session, composio_env, composio
 def test_start_proceeds_while_connector_oauth_routing_is_on(
     db_session, composio_env, composio, monkeypatch
 ):
-    """xagent-saas routes the trips per connection (xagent-saas#2461), so the
-    start no longer refuses while its switch is on."""
+    """The start no longer refuses while xagent-saas's switch is on: routing
+    Composio's trips per connection is left to xagent-saas and the edge
+    (xagent-saas#2461), and a trip that reaches the wrong region binds
+    nothing (test_composio_cross_region.py)."""
     monkeypatch.setenv("XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED", "true")
     db, user = db_session
 

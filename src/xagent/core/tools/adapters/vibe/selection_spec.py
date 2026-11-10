@@ -218,9 +218,11 @@ class ToolSelectionSpec(ABC):
         """Whether ``BINDING_AUTHORIZED_CATEGORIES`` ride along this spec.
 
         Such a category is never selectable, so its per-agent binding is the
-        opt-in. False for an explicit zero-tools spec and for one whose only
+        opt-in. False for an explicit zero-tools spec, for one whose only
         selection is an internal injection (the unconfigured workforce
-        manager's worker tools), which stays scoped to that injection.
+        manager's worker tools), which stays scoped to that injection, and for
+        one that withholds the category for this call
+        (:attr:`_SpecByCategories.excluded_binding_authorized`).
         """
 
     @abstractmethod
@@ -288,6 +290,7 @@ class ToolSelectionSpec(ABC):
         explicit_none: bool = False,
         extras_only_when_unconfigured: bool = False,
         exclude_custom_api_when_unconfigured: bool = False,
+        excluded_binding_authorized: frozenset[str] = frozenset(),
     ) -> "ToolSelectionSpec":
         """Build a spec from raw ORM / dict / SDK fields.
 
@@ -324,6 +327,19 @@ class ToolSelectionSpec(ABC):
         BY_CATEGORIES; ALL already includes everything, NONE rejects
         everything). It does NOT trigger any creator -- dispatch is
         declared by ``categories`` / ``published_agent_ids``.
+
+        ``excluded_binding_authorized`` withholds a
+        ``BINDING_AUTHORIZED_CATEGORIES`` member for this call (``ssh`` is the
+        only member today). Such a category is granted by a per-agent binding
+        rather than by ``tool_categories``, so an exclusion list that only
+        removes selectable names cannot reach it; this parameter is the signal
+        that can, through :meth:`ToolSelectionSpec.includes_binding_authorized`
+        (creator dispatch and name filter alike). The binding itself is not
+        touched. Default empty, so a caller that excludes nothing keeps today's
+        behaviour exactly; only members of the binding-authorized set are read,
+        and any other name here changes nothing. Like ``name_allowlist`` it is
+        carried by ``_SpecByCategories`` only -- ALL and NONE answer from their
+        mode.
         """
         if explicit_none:
             return _SpecNone()
@@ -350,6 +366,7 @@ class ToolSelectionSpec(ABC):
                     categories=frozenset(),
                     published_agent_ids=pids,
                     name_allowlist=names,
+                    excluded_binding_authorized=excluded_binding_authorized,
                 )
             # ``None`` means truly unconfigured (legacy "all tools" behaviour).
             # An explicit empty list ``[]`` means the caller intentionally
@@ -424,6 +441,7 @@ class ToolSelectionSpec(ABC):
             mcp_servers=final_mcp_servers,
             published_agent_ids=final_published_agent_ids,
             name_allowlist=names,
+            excluded_binding_authorized=excluded_binding_authorized,
         )
 
     # ── Backward-compat helper (kept from the original spec) ─────
@@ -626,6 +644,15 @@ class _SpecByCategories(ToolSelectionSpec):
     # meaningful in BY_CATEGORIES mode (ALL already includes everything;
     # NONE rejects everything).
     name_allowlist: frozenset[str] = field(default_factory=frozenset)
+    # ``BINDING_AUTHORIZED_CATEGORIES`` members this call withholds (usually
+    # empty). Such a category is never selectable, so its per-agent binding is
+    # the opt-in; this set is the one signal that can turn it off for a single
+    # call -- a caller that withholds remote access for a run, say -- without
+    # touching the agent's binding. Read only through
+    # ``includes_binding_authorized``, which covers both the creator dispatch
+    # and the name filter. Only members of that set are honored; any other
+    # name here changes nothing.
+    excluded_binding_authorized: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         # A by-categories spec must select *something*: a plain category,
@@ -692,6 +719,11 @@ class _SpecByCategories(ToolSelectionSpec):
         return "agent" in self.categories or bool(self.published_agent_ids)
 
     def includes_binding_authorized(self) -> bool:
+        # A caller that withholds the category for this call wins over every
+        # shape below: it names exactly the categories a binding would
+        # otherwise grant, so no selection shape may admit them.
+        if self.excluded_binding_authorized & BINDING_AUTHORIZED_CATEGORIES:
+            return False
         # Denied only for the injection-only shape: worker tool names with no
         # dimension a user could have selected. A connector-only selection
         # (``mcp:<server>`` -> mcp_servers, empty categories) is an opt-in.

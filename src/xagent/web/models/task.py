@@ -293,8 +293,9 @@ class Task(Base):  # type: ignore
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     title = Column(String(200), nullable=False)
     description = Column(Text)
-    # Production creation remains legacy; version 2 is exercised by migration
-    # tests until the event readers are ready for production routing.
+    # Production creation sites pick the version through
+    # ``conversation_storage_rollout.new_task_conversation_storage_version``
+    # (decided once at INSERT); the column default stays 1 (legacy).
     conversation_storage_version = Column(
         Integer,
         CheckConstraint(

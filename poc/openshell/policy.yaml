@@ -1,0 +1,19 @@
+# Base policy merged into every sandbox the OpenShell backend creates.
+# Egress is default-deny: only the rules below are reachable, and only from
+# the listed binaries (real paths inside xprobe/xagent-sandbox).
+version: 1
+network_policies:
+  pypi:
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      - host: files.pythonhosted.org
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - /usr/bin/python3.11

@@ -5,6 +5,9 @@ import pytest
 
 from xagent.web.channels.feishu.bot import FeishuBotInstance, FeishuChannelManager
 from xagent.web.models.task import TaskStatus
+from xagent.web.services.assistant_history_safety import (
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+)
 from xagent.web.services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.task_execution_context_service import (
@@ -282,6 +285,19 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
         ),
         (
             {
+                "success": True,
+                "completion_outcome": "blocked",
+                "input_review_rejected": True,
+                "output": "Input declined.",
+            },
+            TaskStatus.COMPLETED,
+            INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+            "Input declined.",
+            None,
+            "Input declined.",
+        ),
+        (
+            {
                 "success": False,
                 "status": "waiting_for_user",
                 "chat_response": {
@@ -461,6 +477,9 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
         {
             "status": expected_status,
             "assistant_content": expected_content,
+            "turn_id": persisted_turn_ids[0]
+            if expected_message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+            else None,
             "interactions": (
                 [{"label": "Continue?", "options": ["Yes", "No"]}]
                 if expected_status == TaskStatus.WAITING_FOR_USER

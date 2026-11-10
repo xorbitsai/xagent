@@ -316,6 +316,40 @@ describe("useWebSocket message delivery", () => {
     expect(resume.command_id).not.toBe(pause.command_id)
   })
 
+  it.each(["input_review_blocked", "input_review_unavailable"])(
+    "surfaces %s after a durable send acknowledgement",
+    async (errorCode) => {
+      const onMessage = vi.fn()
+      const { result } = renderHook(() => useWebSocket({
+        url: "ws://localhost",
+        taskId: 1,
+        onMessage,
+      }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      const delivery = result.current.sendChatMessage("Draft", undefined, false, "reviewed-turn")
+      act(() => socket.receive({
+        type: "message_accepted", client_message_id: "reviewed-turn", turn_id: "reviewed-turn",
+      }))
+      await expect(delivery).resolves.toMatchObject({ turn_id: "reviewed-turn" })
+
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "reviewed-turn",
+        turn_id: "reviewed-turn",
+        rejection_outcome: "not_accepted",
+        error_code: errorCode,
+        retry_with_new_id: errorCode === "input_review_unavailable",
+      }))
+      expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+        type: "error",
+        data: expect.objectContaining({ error_code: errorCode, turn_id: "reviewed-turn" }),
+      }))
+    },
+  )
+
   it("allows an unacknowledged draft to retry with the same id", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",

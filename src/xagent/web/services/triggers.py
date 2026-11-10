@@ -45,6 +45,7 @@ from .connector_runtime import (
     prepare_create_connector_runtime,
     reject_ephemeral_connector_runtime_payload,
 )
+from .conversation_storage_rollout import new_task_conversation_storage_version
 from .routine_history_provenance import (
     TRIGGER_TURN_ID_CONFIG_KEY,
 )
@@ -1645,6 +1646,9 @@ def _attach_task_to_trigger_run(
             trigger=trigger,
             run=run,
             test=test,
+        ),
+        conversation_storage_version=new_task_conversation_storage_version(
+            entry="trigger", owner_user_id=task_owner_user_id
         ),
     )
     bind_create_connector_runtime_plan(task=task, plan=runtime_plan)

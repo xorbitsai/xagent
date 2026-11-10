@@ -303,13 +303,80 @@ async def test_reply_waits_for_previous_execution_to_release_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_input_review_rejection_restores_waiting_reply(
+    reply, monkeypatch, source, unavailable
+):
+    from types import SimpleNamespace
+
+    from xagent.core.agent import Agent as RuntimeAgent
+    from xagent.core.agent import ExecutionContext
+    from xagent.core.agent.runner import AgentRunner
+    from xagent.core.guardrails import input as input_review
+    from xagent.web.services import task_event_bridge
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = source
+        db.commit()
+    runner = AgentRunner(agent=RuntimeAgent(name="reviewed", patterns=[], llm=None))
+    context = ExecutionContext(execution_id=str(reply.task_id))
+    runner.context_manager.set_context(context)
+    hook = AsyncMock(
+        return_value=input_review.InputReviewResult(
+            refusal="Custom refusal.", unavailable=unavailable
+        )
+    )
+    monkeypatch.setattr(input_review, "_review", hook)
+    manager = SimpleNamespace(get_agent_for_task=AsyncMock(return_value=runner))
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+    message_id = "message" if source == "a2a" else ""
+    command_id = module._admit_reply(reply, source, message_id, "original")
+    with get_session_local()() as db:
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
+    await execute_durable_task_command(command)
+    result = module._read_reply_outcome(command_id)
+    assert result["outcome"] == (
+        "input_review_unavailable" if unavailable else "input_blocked"
+    )
+    assert result["refusal"] == "Custom refusal."
+    retry_id = module._admit_reply(reply, source, message_id, "original")
+    assert (retry_id != command_id) is (unavailable and source == "a2a")
+    if retry_id == command_id:
+        monkeypatch.setattr(
+            task_event_bridge, "_bridge", SimpleNamespace(require_ready=lambda: None)
+        )
+        monkeypatch.setattr(module, "notify_task_command_dispatcher", lambda: None)
+        with pytest.raises(
+            input_review.InputReviewRejected, match="Custom refusal"
+        ) as exc:
+            await module.enqueue_resume_input(
+                reply, source=source, message_id=message_id, command_id="original"
+            )
+        assert exc.value.unavailable is unavailable
+    with get_session_local()() as db:
+        assert db.get(Task, reply.task_id).status == TaskStatus.WAITING_FOR_USER
+    assert context.messages == []
+    hook.assert_awaited_once()
+    request = hook.await_args.args[0]
+    assert request.user_id == reply.task_owner_user_id
+    assert request.source == "reply"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("review_failure", [False, True])
 async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
-    reply, monkeypatch
+    reply, monkeypatch, review_failure
 ):
     from types import SimpleNamespace
 
     from xagent.core.agent.checkpoint import CheckpointUnavailableError
     from xagent.core.agent.runner import UserMessageInjectionOutcome
+    from xagent.core.guardrails.input import InputReviewRejected
     from xagent.web.services.task_lease_service import stop_task_lease_heartbeat
 
     with get_session_local()() as db:
@@ -317,7 +384,9 @@ async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
         db.commit()
     post = AsyncMock(
         side_effect=[
-            CheckpointUnavailableError("temporary read outage"),
+            InputReviewRejected("Try later.", unavailable=True)
+            if review_failure
+            else CheckpointUnavailableError("temporary read outage"),
             UserMessageInjectionOutcome.POSTED_FRESH,
         ]
     )
@@ -346,7 +415,9 @@ async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
             TaskExecutionCommand, original_id
         ).target_state_version
     await execute_durable_task_command(first)
-    assert module._read_reply_outcome(original_id)["outcome"] == "retryable_unavailable"
+    assert module._read_reply_outcome(original_id)["outcome"] == (
+        "input_review_unavailable" if review_failure else "retryable_unavailable"
+    )
     with get_session_local()() as db:
         task = db.get(Task, reply.task_id)
         assert task.runner_id == "worker-1"

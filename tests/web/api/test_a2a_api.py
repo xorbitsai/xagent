@@ -29,6 +29,7 @@ from xagent.core.agent.checkpoint import (
     UnknownToolEffectError,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
+from xagent.core.guardrails.input import InputReviewRejected
 from xagent.web.api import a2a as a2a_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.agent_api_key import AgentApiKey
@@ -630,7 +631,8 @@ def test_get_and_list_tasks_use_rest_binding_shapes() -> None:
     ]
 
 
-def test_follow_up_infers_context_for_input_required_task() -> None:
+@pytest.mark.parametrize("review_status", [None, 400, 503])
+def test_follow_up_infers_context_for_input_required_task(review_status) -> None:
     agent_id, full_key = _create_published_agent_with_key()
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
@@ -680,6 +682,10 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
             assert leased.lease_expires_at is not None
         finally:
             lease_db.close()
+        if review_status is not None:
+            raise InputReviewRejected(
+                "Review refused this reply.", unavailable=review_status == 503
+            )
         return UserMessageInjectionOutcome.POSTED_FRESH
 
     agent_service = MagicMock()
@@ -714,6 +720,14 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
             },
         )
 
+    if review_status is not None:
+        assert response.status_code == review_status, response.text
+        assert response.json()["error"]["message"] == "Review refused this reply."
+        begin_turn.assert_not_awaited()
+        schedule_resume.assert_not_called()
+        with _direct_db_session() as db:
+            assert db.get(Task, int(task_id)).status == TaskStatus.WAITING_FOR_USER
+        return
     assert response.status_code == 200, response.text
     assert response.json()["task"]["contextId"] == "ctx-follow-up"
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"

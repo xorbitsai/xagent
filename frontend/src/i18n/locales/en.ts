@@ -53,6 +53,8 @@ const en = {
     messageRateLimited: "You're sending messages too quickly. Please wait a moment and try again.",
     messageIdConflict: "Message id was already used for different content or files.",
     messageDeliveryFailed: "The message could not be delivered. Please retry the draft.",
+    inputReviewBlocked: "I can't help with that request. Please rephrase it or ask about a supported topic.",
+    inputReviewUnavailable: "I couldn't complete the input safety check. Please try again.",
     messageContinuationUnsupported: "Task does not support message continuation.",
     taskPauseInProgress: "Task pause is still being applied; please retry shortly.",
     messageAcceptancePending: "Message acceptance is still being reconciled. Please retry shortly.",

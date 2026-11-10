@@ -31,6 +31,7 @@ from xagent.core.agent.checkpoint import (
     UnknownToolEffectError,
 )
 from xagent.core.agent.runner import UserMessageInjectionOutcome
+from xagent.core.guardrails.input import InputReviewRejected
 from xagent.web.api.v1 import task_reply as task_reply_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -1060,6 +1061,12 @@ def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_t
             503,
             "temporarily_unavailable",
         ),
+        (InputReviewRejected("Refused by policy."), 422, "invalid_input"),
+        (
+            InputReviewRejected("Reviewer is offline.", unavailable=True),
+            503,
+            "temporarily_unavailable",
+        ),
     ],
 )
 def test_reply_checkpoint_read_error_maps_to_distinct_code(
@@ -1086,6 +1093,13 @@ def test_reply_checkpoint_read_error_maps_to_distinct_code(
     assert resp.json()["error"]["code"] == expected_code
     if isinstance(error, AutoModelUnavailableError):
         assert resp.json()["error"]["message"] == CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
+    if isinstance(error, InputReviewRejected):
+        assert resp.json()["error"]["message"] == str(error)
+        if error.unavailable:
+            assert resp.json()["error"]["details"] == {
+                "accepted": False,
+                "retry_with_new_id": True,
+            }
 
     db = _direct_db_session()
     try:

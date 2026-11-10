@@ -4484,6 +4484,21 @@ wheels = [
 ]
 
 [[package]]
+name = "openshell"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "httpx" },
+    { name = "protobuf" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/f1/f0689ab3a8f7227df53d8f6532aceef6330993bb5ae1ff9faeb84323476a/openshell-0.1.7-py3-none-any.whl", hash = "sha256:21de1816fd3dc5627c625782c616816ddb8cf6d40ed2aaf568c8d941fffb65c1", size = 167663, upload-time = "2026-11-03T22:09:21.296Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.45.1"
 source = { registry = "https://pypi.org/simple" }
@@ -8472,7 +8487,9 @@ all = [
     { name = "greenlet" },
     { name = "numba" },
     { name = "openpyxl" },
+    { name = "openshell" },
     { name = "playwright" },
+    { name = "protobuf" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg2-binary" },
     { name = "pymilvus" },
@@ -8511,6 +8528,10 @@ duckdb = [
 ]
 milvus = [
     { name = "pymilvus" },
+]
+openshell = [
+    { name = "openshell" },
+    { name = "protobuf" },
 ]
 postgresql = [
     { name = "psycopg", extra = ["binary"] },
@@ -8691,6 +8712,8 @@ requires-dist = [
     { name = "openai", specifier = ">=2.26.0,<3" },
     { name = "openpyxl", marker = "extra == 'all'", specifier = ">=3.1.0" },
     { name = "openpyxl", marker = "extra == 'document-processing'", specifier = ">=3.1.0" },
+    { name = "openshell", marker = "extra == 'all'", specifier = ">=0.1.7,<0.2" },
+    { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.1.7,<0.2" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2.0.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.39.0,<2.0.0" },
     { name = "opentelemetry-sdk", specifier = ">=1.39.0,<2.0.0" },
@@ -8700,6 +8723,8 @@ requires-dist = [
     { name = "playwright", marker = "extra == 'all'", specifier = ">=1.40.0" },
     { name = "playwright", marker = "extra == 'browser'", specifier = ">=1.40.0" },
     { name = "prompt-toolkit", specifier = ">=3.0.0" },
+    { name = "protobuf", marker = "extra == 'all'", specifier = ">=6.31,<7" },
+    { name = "protobuf", marker = "extra == 'openshell'", specifier = ">=6.31,<7" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3.2.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgresql'", specifier = ">=3.2.0" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgresql-async'", specifier = ">=3.2.0" },
@@ -8752,7 +8777,7 @@ requires-dist = [
     { name = "yarl", specifier = ">=1.22.0,<2.0.0" },
     { name = "zai-sdk", specifier = ">=0.0.4" },
 ]
-provides-extras = ["ai-document", "all", "browser", "chromadb", "command-path-guard", "document-processing", "duckdb", "milvus", "postgresql", "postgresql-async", "router", "waf-crawl"]
+provides-extras = ["ai-document", "all", "browser", "chromadb", "command-path-guard", "document-processing", "duckdb", "milvus", "openshell", "postgresql", "postgresql-async", "router", "waf-crawl"]
 
 [package.metadata.requires-dev]
 backend-image = [

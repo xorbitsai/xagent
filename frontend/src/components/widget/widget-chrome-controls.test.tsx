@@ -22,12 +22,14 @@ describe("WidgetChromeControls", () => {
     vi.unstubAllGlobals()
   })
 
-  it("renders the close button and a collapsed menu trigger even with no new-conversation action", () => {
+  it("renders the minimize button and a collapsed menu trigger even with no new-conversation action", () => {
     // Expand/collapse is always offered regardless of newConversation, so
     // the "..." trigger has something to open onto even without it.
     render(<WidgetChromeControls />)
 
-    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    const minimizeButton = screen.getByRole("button", { name: "widgetChat.minimize" })
+    expect(minimizeButton).toBeInTheDocument()
+    expect(minimizeButton.querySelector('[data-icon="minimize"]')).not.toBeNull()
     const menuTrigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("menu")).toBeNull()
@@ -43,10 +45,10 @@ describe("WidgetChromeControls", () => {
     expect(items[0]).toHaveTextContent("widgetChat.expandWindow")
   })
 
-  it("posts widget_close to the parent window when the close button is clicked", () => {
+  it("posts widget_close to the parent window when the minimize button is clicked", () => {
     render(<WidgetChromeControls />)
 
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.close" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.minimize" }))
 
     expect(postMessageSpy).toHaveBeenCalledWith(
       { xagent: true, v: 1, type: "widget_close" },
@@ -95,7 +97,7 @@ describe("WidgetChromeControls", () => {
     const realPostMessageSpy = vi.spyOn(window, "postMessage")
 
     render(<WidgetChromeControls />)
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.close" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.minimize" }))
 
     expect(realPostMessageSpy).not.toHaveBeenCalled()
     realPostMessageSpy.mockRestore()

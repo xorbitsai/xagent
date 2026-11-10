@@ -711,7 +711,7 @@ Build when you need.`,
   widgetChat: {
     title: "AI Assistant",
     newConversation: "New conversation",
-    close: "Close",
+    minimize: "Minimize",
     moreOptions: "More options",
     expandWindow: "Expand window",
     collapseWindow: "Collapse window",

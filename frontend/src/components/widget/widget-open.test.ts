@@ -272,7 +272,7 @@ describe("XagentWidget.open", () => {
     open({ message: "hi" })
 
     expect(instance.panel).toHaveClass("open")
-    expect(instance.fab).toHaveAttribute("aria-label", "Close chat")
+    expect(instance.fab).toHaveAttribute("aria-label", "Minimize chat")
   })
 
   describe("open(message) voids data-initial-message", () => {

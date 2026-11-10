@@ -890,8 +890,8 @@
   fab.className = 'xagent-widget-fab';
   // Chat icon SVG
   var chatIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>';
-  // Close icon SVG
-  var closeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
+  // Minimize icon SVG (shown while the panel is open)
+  var minimizeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M16.59 8.59L12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>';
 
   fab.innerHTML = chatIcon;
   // In the no-ready mobile states, this is the only dismiss control the
@@ -992,8 +992,8 @@
     isOpen = true;
     hasOpened = true;
     panel.classList.add('open');
-    fab.innerHTML = closeIcon;
-    fab.setAttribute('aria-label', 'Close chat');
+    fab.innerHTML = minimizeIcon;
+    fab.setAttribute('aria-label', 'Minimize chat');
     applyScrollLock();
     deliverInitialMessage();
   }

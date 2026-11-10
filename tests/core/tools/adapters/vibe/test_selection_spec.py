@@ -2521,3 +2521,118 @@ def test_includes_category_agrees_with_the_other_two_gates_on_ssh() -> None:
         tool_categories=["basic_tools"]
     ).includes_category("ssh")
     assert not ToolSelectionSpec.from_raw(tool_categories=[]).includes_category("ssh")
+
+
+# ----- A caller withholding a binding-authorized category for one call ------
+
+
+def test_excluded_binding_authorized_category_withholds_ssh() -> None:
+    """``ssh`` rides along because a binding grants it, never because the list
+    names it -- so the exclusion set, not the category list, is what can
+    withhold it for one call. All three gates must agree, and the same input
+    without the exclusion must keep the binding's tools."""
+    tools = [_mock_tool("calculator", "basic_tools"), _mock_tool("ssh_execute", "ssh")]
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools"],
+        excluded_binding_authorized=frozenset({"ssh"}),
+    )
+    assert spec.is_by_categories()
+    assert spec.excluded_binding_authorized == frozenset({"ssh"})
+    assert spec.includes_binding_authorized() is False
+    assert spec.includes_category("ssh") is False
+    assert spec.compute_allowed_names(tools) == frozenset({"calculator"})
+    assert ToolRegistry._should_run_creator(frozenset({"ssh"}), spec, None) is False
+
+    # Negative control: nothing excluded, the binding's tools stay.
+    unexcluded = ToolSelectionSpec.from_raw(tool_categories=["basic_tools"])
+    assert unexcluded.excluded_binding_authorized == frozenset()
+    assert unexcluded.includes_binding_authorized() is True
+    assert unexcluded.includes_category("ssh") is True
+    assert unexcluded.compute_allowed_names(tools) == frozenset(
+        {"calculator", "ssh_execute"}
+    )
+    assert (
+        ToolRegistry._should_run_creator(frozenset({"ssh"}), unexcluded, None) is True
+    )
+
+
+def test_excluded_binding_authorized_ignores_categories_a_binding_cannot_grant():
+    """Only ``BINDING_AUTHORIZED_CATEGORIES`` members are read from the set:
+    an ordinary category there changes nothing, because the category list --
+    not this channel -- is what selects those."""
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools"],
+        excluded_binding_authorized=frozenset({"web_tools", "file", "mcp"}),
+    )
+    assert spec.includes_binding_authorized() is True
+    assert spec.includes_category("ssh") is True
+    assert spec.compute_allowed_names(
+        [_mock_tool("calculator", "basic_tools"), _mock_tool("ssh_execute", "ssh")]
+    ) == frozenset({"calculator", "ssh_execute"})
+
+
+def test_excluded_binding_authorized_survives_the_actor_selection_rewrites() -> None:
+    """Both post-normalization rewrites rebuild the spec with ``replace``: an
+    actor-marked task or a delegated worker must not regain the withheld
+    tools through either."""
+    from xagent.core.tools.adapters.vibe.selection_spec import (
+        with_mcp_tools,
+        without_published_agent_tools,
+    )
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools", "agent"],
+        published_agent_ids=[7],
+        excluded_binding_authorized=frozenset({"ssh"}),
+    )
+    for rewritten in (with_mcp_tools(spec), without_published_agent_tools(spec)):
+        assert rewritten.includes_binding_authorized() is False, rewritten
+        assert rewritten.includes_category("ssh") is False
+
+
+def test_excluded_binding_authorized_leaves_all_and_none_modes_alone() -> None:
+    """ALL / NONE answer ``includes_binding_authorized`` from their mode;
+    only BY_CATEGORIES carries the set (an exclusion is not expressible
+    without an explicit category list either)."""
+    all_spec = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        excluded_binding_authorized=frozenset({"ssh"}),
+    )
+    assert all_spec.is_all()
+    assert all_spec.includes_binding_authorized() is True
+
+    none_spec = ToolSelectionSpec.from_raw(
+        tool_categories=[],
+        excluded_binding_authorized=frozenset({"ssh"}),
+    )
+    assert none_spec.is_none()
+    assert none_spec.includes_binding_authorized() is False
+
+
+async def test_registry_skips_the_ssh_creator_when_the_call_excludes_it(
+    isolated_registry,
+) -> None:
+    """The dispatch gate, not just the name filter: a caller withholding
+    ``ssh`` must not pay for the creator's binding lookup at all."""
+    ssh_creator = AsyncMock(return_value=[_mock_tool("ssh_execute", "ssh")])
+    ssh_creator.__name__ = "create_ssh_tools"
+    basic = AsyncMock(return_value=[_mock_tool("calculator", "basic_tools")])
+    basic.__name__ = "basic_creator"
+    isolated_registry.register(ssh_creator, categories={"ssh"})
+    isolated_registry.register(basic, categories={"basic_tools"})
+
+    excluded = ToolSelectionSpec.from_raw(
+        tool_categories=["basic_tools"],
+        excluded_binding_authorized=frozenset({"ssh"}),
+    )
+    tools = await isolated_registry.create_registered_tools(_FakeConfig(excluded))
+
+    assert ssh_creator.await_count == 0
+    assert [tool.name for tool in tools] == ["calculator"]
+
+    # Negative control: the same registration without the exclusion runs it.
+    unexcluded = ToolSelectionSpec.from_raw(tool_categories=["basic_tools"])
+    tools = await isolated_registry.create_registered_tools(_FakeConfig(unexcluded))
+
+    assert ssh_creator.await_count == 1
+    assert sorted(tool.name for tool in tools) == ["calculator", "ssh_execute"]

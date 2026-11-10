@@ -425,22 +425,76 @@ async def test_end_restart_drain_during_the_wait_sends_no_further_1012(manager):
 
 
 @pytest.mark.asyncio
-async def test_end_restart_drain_cancels_scheduled_closes(manager, monkeypatch):
+async def test_end_restart_drain_lets_a_started_close_finish(manager, monkeypatch):
     monkeypatch.setattr(ws_module, "RESTART_CLOSE_TIMEOUT_SECONDS", 0.1)
     await manager.close_for_restart()
     late = FakeSocket(hang_close=True)
     manager.register_connection(late, 1)
     await asyncio.sleep(0.02)  # the scheduled close is now inside close()
     manager.end_restart_drain()
-    await asyncio.sleep(0.3)  # past its timeout: an uncancelled close drops it
+    await asyncio.sleep(0.3)  # past its timeout: the started close unregisters
 
     assert manager._restart_closes == set()
-    assert manager.connection_count() == 1
+    assert manager.connection_count() == 0
 
     fresh = FakeSocket()
     manager.register_connection(fresh, 1)
     await asyncio.sleep(0.05)
     assert fresh.closed == []
+    assert manager.connection_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_end_restart_drain_stops_a_scheduled_close_that_has_not_started(
+    manager,
+):
+    await manager.close_for_restart()
+    late = FakeSocket()
+    manager.register_connection(late, 1)  # schedules the close, not yet run
+    manager.end_restart_drain()
+    await asyncio.sleep(0.05)
+
+    assert late.closed == []
+    assert manager._restart_closes == set()
+    assert manager.connection_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_close_is_never_invoked_after_the_drain_generation_moved(manager):
+    seen: list[int] = []
+
+    class GenerationSocket(FakeSocket):
+        async def close(self, code: int = 1000, reason: str | None = None) -> None:
+            seen.append(manager._restart_drain_generation)
+            await super().close(code, reason)
+
+    ws = GenerationSocket()
+    manager.register_connection(ws, 1)
+    generation = manager._restart_drain_generation
+    closing = asyncio.create_task(manager._close_for_restart(ws, 1.0, generation))
+    # Queued behind the close's first step: an abort that lands as soon as
+    # the close yields for the first time.
+    asyncio.get_running_loop().call_soon(manager.end_restart_drain)
+    await closing
+    await asyncio.sleep(0)
+
+    # Whether or not the close got in first, it was never invoked after the
+    # abort, and the socket is unregistered exactly when its close went out.
+    assert all(gen == generation for gen in seen)
+    assert (ws.closed == []) == (seen == [])
+    assert (manager.connection_count() == 1) == (seen == [])
+
+
+@pytest.mark.asyncio
+async def test_zero_close_timeout_still_closes_and_unregisters(manager):
+    ws = FakeSocket()
+    manager.register_connection(ws, 1)
+
+    handled = await manager.close_for_restart(close_timeout_seconds=0)
+
+    assert handled == 1
+    assert ws.closed == [(1012, "Service Restart")]
+    assert manager.connection_count() == 0
 
 
 @pytest.mark.asyncio

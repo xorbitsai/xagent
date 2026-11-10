@@ -40,6 +40,10 @@ from .runtime_telemetry import (
 )
 from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 from .services.chrome_mcp_runtime import shutdown_chrome_execution_session_pool
+from .services.conversation_storage_rollout import (
+    report_unobserved_execution_events,
+    validate_conversation_storage_rollout_at_startup,
+)
 from .services.execution_scope_snapshot import register_execution_scope_snapshot_loader
 from .services.interaction_rollout import validate_interaction_rollout_at_startup
 from .services.local_browser_runtime import (
@@ -110,6 +114,7 @@ async def run_worker(
 
     await asyncio.to_thread(validate_stored_encryption_keys)
     validate_interaction_rollout_at_startup()
+    validate_conversation_storage_rollout_at_startup()
     await asyncio.to_thread(lock_deployment_kb_engine)
     recovery = None
     auto_resume = None
@@ -125,6 +130,7 @@ async def run_worker(
         register_execution_scope_snapshot_loader()
         initialize_langfuse()
         telemetry = start_process_runtime_telemetry()
+        report_unobserved_execution_events(telemetry_started=telemetry is not None)
         await create_skill_manager().initialize()
         await create_template_manager().initialize()
         # Admit persistent memory before this worker starts accepting tasks.

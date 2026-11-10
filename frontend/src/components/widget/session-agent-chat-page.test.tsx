@@ -1273,6 +1273,33 @@ describe("SessionAgentChatPage", () => {
         expect(historyItem()).not.toBeInTheDocument()
       })
 
+      it("stays withdrawn from when a host page message is taken until its send has ended", async () => {
+        let finishReset!: () => void
+        app.startNewConversation.mockImplementationOnce(() => new Promise<void>((resolve) => {
+          finishReset = () => {
+            app.state.taskId = null
+            app.sessionConversationState = "replacement_ready"
+            resolve()
+          }
+        }))
+        let finishSend!: () => void
+        app.sendMessage.mockImplementationOnce(() => new Promise<void>((resolve) => { finishSend = resolve }))
+        app.state.taskId = 61
+        mountWithHistory({ sessionConversationState: "bound" })
+
+        deliverOpenMessage()
+        expect(app.startNewConversation).toHaveBeenCalledTimes(1)
+        openMenu()
+        expect(historyItem()).not.toBeInTheDocument()
+
+        await act(async () => finishReset())
+        expect(app.sendMessage).toHaveBeenCalledTimes(1)
+        expect(historyItem()).not.toBeInTheDocument()
+
+        await act(async () => finishSend())
+        expect(historyItem()).toBeInTheDocument()
+      })
+
       it("is shown again once the pending work has finished", () => {
         const { rerender } = mountWithHistory({ isMessageDeliveryPending: true })
 
@@ -1491,11 +1518,7 @@ describe("SessionAgentChatPage", () => {
         expect(screen.queryByTestId("history-view")).not.toBeInTheDocument()
       })
 
-      it("closes a list opened just before the host page message starts sending", () => {
-        // Between the host message's reset and its send there is one render in
-        // which nothing is pending, so the entry is still offered. The send
-        // starts in that render's own effect, and the next render closes the
-        // list again: nothing can be handed over from it in between.
+      it("closes a list that is open when a message starts being delivered", () => {
         const { rerender } = mountWithHistory()
         goToList()
         expect(screen.getByTestId("history-list")).toBeInTheDocument()

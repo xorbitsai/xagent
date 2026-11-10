@@ -1662,3 +1662,68 @@ def test_registered_file_id_rejects_parent_directory_symlink_swap(tmp_path):
     assert workspace.resolve_file_id("file-id") is None
     with pytest.raises(FileNotFoundError, match="File not found"):
         workspace.stage_file_for_external_upload("file-id")
+
+
+def test_write_file_overwrite_registers_new_generation_under_hidden_root(
+    monkeypatch, tmp_path, mock_workspace_db
+):
+    """A dot-directory above the workspace must not hide outputs from the scan.
+
+    Registration of an overwrite relies on ``auto_register_files`` seeing the
+    path; when the scan judged the absolute path, every file under a hidden
+    root was skipped and the first durable generation stayed current.
+    """
+    from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+
+    del mock_workspace_db
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="hidden-root-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        db.add(Task(id=656, user_id=user.id, title="Workspace task"))
+        db.commit()
+
+        workspace = TaskWorkspace(
+            id="web_task_656",
+            base_dir=str(tmp_path / ".hidden-root" / "workspaces"),
+        )
+        workspace.db_session = db
+        operations = WorkspaceFileOperations(workspace)
+        for version in ("one", "version two", "the third and final version"):
+            operations.write_file("github-release/SKILL.md", version)
+        db.commit()
+
+        record = db.query(UploadedFile).one()
+        latest = (workspace.output_dir / "github-release" / "SKILL.md").read_bytes()
+        assert latest == b"the third and final version"
+        assert record.file_size == len(latest)
+        assert (object_root / str(record.storage_key)).read_bytes() == latest
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_scan_all_files_ignores_hidden_dirs_inside_workspace_only(tmp_path):
+    workspace = TaskWorkspace(
+        id="scan_hidden", base_dir=str(tmp_path / ".hidden-root" / "workspaces")
+    )
+    (workspace.output_dir / "kept.txt").write_text("x", encoding="utf-8")
+    (workspace.output_dir / ".cache").mkdir()
+    (workspace.output_dir / ".cache" / "skipped.txt").write_text("x", encoding="utf-8")
+    (workspace.output_dir / "node_modules").mkdir()
+    (workspace.output_dir / "node_modules" / "skipped.js").write_text(
+        "x", encoding="utf-8"
+    )
+
+    names = {path.name for path in workspace._scan_all_files()}
+
+    assert names == {"kept.txt"}

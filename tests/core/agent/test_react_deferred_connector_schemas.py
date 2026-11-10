@@ -1053,3 +1053,68 @@ async def test_a_misspelling_of_an_already_sent_tool_gets_no_load_hint() -> None
     error = context.get_messages_by_role("tool")[0].metadata["raw_result"]["error"]
     assert "notion_search" in error
     assert LOAD_TOOLS_NAME not in error
+
+
+def _jira_tools() -> list[Any]:
+    return [
+        ConnectorTool("mcp_Jira_jira_search_issues", "jira"),
+        ConnectorTool("mcp_Jira_jira_get_current_user", "jira"),
+        ConnectorTool("mcp_notion_notion_search", "notion"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_tools_matches_names_case_insensitively() -> None:
+    llm = ScriptedLLM(
+        [
+            _call(
+                LOAD_TOOLS_NAME,
+                {"names": ["mcp_jira_jira_search_issues", "mcp_notion_notion_search"]},
+            ),
+            {"content": "ok"},
+        ]
+    )
+    context = _ctx()
+    await _pattern().run(context=context, tools=_jira_tools(), llm=llm)
+
+    assert context.get_component(LOADED_TOOLS_COMPONENT).names == [
+        "mcp_Jira_jira_search_issues",
+        "mcp_notion_notion_search",
+    ]
+    # The reply names the exact tool, so the model calls it by that name.
+    reply = context.get_messages_by_role("tool")[0].content
+    assert "Loaded: mcp_Jira_jira_search_issues" in reply
+    assert "mcp_Jira_jira_search_issues" in _names(llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_load_tools_prefers_the_exact_name_over_a_case_variant() -> None:
+    tools = [
+        ConnectorTool("mcp_Jira_search", "jira"),
+        ConnectorTool("mcp_jira_search", "jira2"),
+    ]
+    llm = ScriptedLLM(
+        [_call(LOAD_TOOLS_NAME, {"names": ["mcp_jira_search"]}), {"content": "ok"}]
+    )
+    context = _ctx()
+    await _pattern().run(context=context, tools=tools, llm=llm)
+
+    assert context.get_component(LOADED_TOOLS_COMPONENT).names == ["mcp_jira_search"]
+
+
+@pytest.mark.asyncio
+async def test_load_tools_refuses_an_ambiguous_case_insensitive_name() -> None:
+    tools = [
+        ConnectorTool("mcp_Jira_search", "jira"),
+        ConnectorTool("mcp_JIRA_search", "jira2"),
+    ]
+    llm = ScriptedLLM(
+        [_call(LOAD_TOOLS_NAME, {"names": ["mcp_jira_search"]}), {"content": "ok"}]
+    )
+    context = _ctx()
+    await _pattern().run(context=context, tools=tools, llm=llm)
+
+    assert context.get_component(LOADED_TOOLS_COMPONENT).names == []
+    reply = context.get_messages_by_role("tool")[0].content
+    assert "Unknown tool 'mcp_jira_search'" in reply
+    assert "mcp_Jira_search" in reply and "mcp_JIRA_search" in reply

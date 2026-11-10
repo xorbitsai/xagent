@@ -9,7 +9,6 @@ Environment Variable Naming Convention:
     Most config variables use the XAGENT_* prefix for consistency.
     Exceptions (without XAGENT_ prefix) are kept for backward compatibility:
     - SANDBOX_*: Sandbox container configuration (predates this module)
-    - BOXLITE_HOME_DIR: Boxlite sandbox home directory
     - DATABASE_URL: Standard database connection URL
     - LANCEDB_PATH: LanceDB database path
 
@@ -51,6 +50,8 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+EXECUTION_EVENT_STORAGE_ENTRIES = "XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES"
+EXECUTION_EVENT_STORAGE_USER_IDS = "XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 STANDBY = "XAGENT_STANDBY"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
@@ -216,7 +217,6 @@ SANDBOX_WORKSPACE_VOLUME = "XAGENT_SANDBOX_WORKSPACE_VOLUME"
 SANDBOX_WORKSPACE_VOLUME_ROOT = "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
-BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
@@ -410,6 +410,40 @@ def get_interaction_native_sources() -> list[str]:
         if token:
             result.append(token)
     return result
+
+
+def _split_csv_tokens(raw: str, *, lower: bool) -> list[str]:
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if lower:
+            token = token.lower()
+        if token:
+            result.append(token)
+    return result
+
+
+def get_execution_event_storage_entries() -> list[str]:
+    """Raw XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES reading: a token list.
+
+    Comma-splits the env value, strips and lowercases each token, and skips
+    blank tokens. Duplicates are preserved and tokens are not checked against
+    the entry vocabulary here; validation belongs to
+    ``web/services/conversation_storage_rollout.py``.
+    """
+    return _split_csv_tokens(os.getenv(EXECUTION_EVENT_STORAGE_ENTRIES, ""), lower=True)
+
+
+def get_execution_event_storage_user_ids() -> list[str]:
+    """Raw XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS reading: a token list.
+
+    Comma-splits the env value, strips each token, and skips blank tokens.
+    Tokens are not parsed as integers here; that validation belongs to
+    ``web/services/conversation_storage_rollout.py``.
+    """
+    return _split_csv_tokens(
+        os.getenv(EXECUTION_EVENT_STORAGE_USER_IDS, ""), lower=False
+    )
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
@@ -4459,21 +4493,6 @@ def get_sandbox_worker_namespace() -> str | None:
 
     suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
     return f"{namespace}-{suffix}"
-
-
-def get_boxlite_home_dir() -> Path | None:
-    """Get the BoxLite home, isolated by stable worker ID in shared mode.
-
-    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
-    Shared execution uses a worker subdirectory under the configured home or
-    the unified storage root's boxlite directory.
-    """
-    env_str = os.getenv(BOXLITE_HOME_DIR)
-    home_dir = Path(env_str) if env_str else None
-    worker_id = get_sandbox_worker_id()
-    if worker_id is not None:
-        return (home_dir or get_storage_root() / "boxlite") / worker_id
-    return home_dir
 
 
 def get_tool_max_output_length() -> int:

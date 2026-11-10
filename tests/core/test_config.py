@@ -18,7 +18,6 @@ from xagent.config import (
     BACKGROUND_JOB_STALE_SECONDS,
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
-    BOXLITE_HOME_DIR,
     BROWSER_CUA_DRIVER_COMMAND,
     BROWSER_CUA_DRIVER_MAX_ELEMENTS,
     BROWSER_CUA_DRIVER_SOCKET,
@@ -134,7 +133,6 @@ from xagent.config import (
     get_background_job_stale_seconds,
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
-    get_boxlite_home_dir,
     get_browser_cua_driver_command,
     get_browser_cua_driver_max_elements,
     get_browser_cua_driver_socket,
@@ -2220,22 +2218,6 @@ class TestSandboxWorkspaceMountConfig:
             get_sandbox_workspace_volume_root()
 
 
-class TestGetBoxliteHomeDir:
-    """Test get_boxlite_home_dir() function."""
-
-    def test_no_env_var_returns_none(self, monkeypatch):
-        """Test that missing env var returns None."""
-        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
-        result = get_boxlite_home_dir()
-        assert result is None
-
-    def test_boxlite_home_dir_with_env_var(self, monkeypatch):
-        """Test BoxLite home directory with environment variable."""
-        monkeypatch.setenv(BOXLITE_HOME_DIR, "/custom/boxlite")
-        result = get_boxlite_home_dir()
-        assert result == Path("/custom/boxlite")
-
-
 class TestGetMaxTracePayloadBytes:
     """Test get_max_trace_payload_bytes() function."""
 
@@ -3747,21 +3729,6 @@ def test_unknown_task_execution_role_rejected(monkeypatch):
         config.validate_task_execution_host_config()
 
 
-@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
-def test_shared_boxlite_home_is_scoped_to_worker(
-    monkeypatch, tmp_path, configured_home
-):
-    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
-    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
-    if configured_home is None:
-        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
-    else:
-        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
-    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
-    assert get_boxlite_home_dir() == expected_root / "worker-1"
-
-
 @pytest.mark.parametrize(
     "value,expected", [(None, None), ("", None), ("1", 1), ("4", 4)]
 )
@@ -4947,3 +4914,35 @@ class TestComposioCallbackUrlConfig:
         monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, value)
         with pytest.raises(ValueError, match="XAGENT_COMPOSIO_CALLBACK_URL"):
             config.get_composio_callback_url()
+
+
+@pytest.mark.parametrize(
+    ("getter", "env", "lower"),
+    [
+        (
+            config.get_execution_event_storage_entries,
+            config.EXECUTION_EVENT_STORAGE_ENTRIES,
+            True,
+        ),
+        (
+            config.get_execution_event_storage_user_ids,
+            config.EXECUTION_EVENT_STORAGE_USER_IDS,
+            False,
+        ),
+    ],
+)
+def test_execution_event_storage_getters_raw_parsing(monkeypatch, getter, env, lower):
+    monkeypatch.delenv(env, raising=False)
+    assert getter() == []
+    monkeypatch.setenv(env, "")
+    assert getter() == []
+    monkeypatch.setenv(env, "   ")
+    assert getter() == []
+    monkeypatch.setenv(env, " Sdk ,, A2A , sdk,")
+    expected = ["sdk", "a2a", "sdk"] if lower else ["Sdk", "A2A", "sdk"]
+    assert getter() == expected
+
+
+def test_execution_event_storage_getters_do_not_validate(monkeypatch):
+    monkeypatch.setenv(config.EXECUTION_EVENT_STORAGE_USER_IDS, "1, abc, -2")
+    assert config.get_execution_event_storage_user_ids() == ["1", "abc", "-2"]

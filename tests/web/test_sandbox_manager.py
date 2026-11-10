@@ -20,7 +20,6 @@ from xagent.sandbox.base import (
 )
 from xagent.web.sandbox_manager import (
     SandboxManager,
-    _create_boxlite_service,
     _create_docker_service,
     _create_sandbox_service,
     get_sandbox_manager,
@@ -69,12 +68,16 @@ class TestCreateSandboxService:
         assert result is not None
         mock_create.assert_called_once()
 
-    def test_unknown_implementation_fails_closed(self):
-        """A typo must not silently select a different sandbox runtime."""
+    @pytest.mark.parametrize("implementation", ["unknown", "boxlite"])
+    def test_unsupported_implementation_fails_closed(self, implementation):
+        """A typo or removed runtime must not silently select Docker."""
         with (
             patch.dict(
                 "os.environ",
-                {"SANDBOX_ENABLED": "true", "SANDBOX_IMPLEMENTATION": "unknown"},
+                {
+                    "SANDBOX_ENABLED": "true",
+                    "SANDBOX_IMPLEMENTATION": implementation,
+                },
                 clear=False,
             ),
             patch("xagent.web.sandbox_manager._create_docker_service") as mock_create,
@@ -164,49 +167,6 @@ class TestGetSandboxManager:
 
         # All results should be the same instance
         assert all(r is results[0] for r in results)
-
-
-try:
-    from xagent.sandbox import BoxliteSandboxService  # noqa: F401
-
-    _has_boxlite = True
-except ImportError:
-    _has_boxlite = False
-
-
-@pytest.mark.skipif(not _has_boxlite, reason="boxlite not installed")
-class TestCreateBoxliteService:
-    """Test _create_boxlite_service function."""
-
-    def test_custom_home_dir(self):
-        """Test creating service with custom home directory."""
-        with (
-            patch.dict(
-                "os.environ",
-                {"BOXLITE_HOME_DIR": "/tmp/sandbox"},
-                clear=False,
-            ),
-            patch(
-                "xagent.sandbox.BoxliteSandboxService",
-                return_value=FakeSandboxService(),
-            ) as mock_cls,
-            patch("xagent.sandbox.MemBoxliteStore", return_value=MagicMock()),
-        ):
-            _create_boxlite_service()
-
-        assert mock_cls.call_args[1]["home_dir"] == "/tmp/sandbox"
-
-    def test_creation_failure_is_fatal(self):
-        """An enabled BoxLite runtime must not degrade to local execution."""
-        with (
-            patch(
-                "xagent.sandbox.BoxliteSandboxService",
-                side_effect=RuntimeError("docker not available"),
-            ),
-            patch("xagent.sandbox.MemBoxliteStore", return_value=MagicMock()),
-        ):
-            with pytest.raises(RuntimeError, match="initialize the BoxLite"):
-                _create_boxlite_service()
 
 
 class TestCreateDockerService:

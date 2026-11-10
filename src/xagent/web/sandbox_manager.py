@@ -16,7 +16,6 @@ from typing import Literal, Optional
 
 from ..config import (
     SANDBOX_VOLUMES,
-    get_boxlite_home_dir,
     get_external_upload_dirs,
     get_legacy_source_uploads_dir,
     get_platform_source_roots,
@@ -1149,7 +1148,7 @@ class SandboxManager:
                     if should_create or target.exists():
                         os.makedirs(target, exist_ok=True)
                 except OSError:
-                    # Legacy/BoxLite preparation was historically best effort.
+                    # Backends without a host-access contract remain best effort.
                     # Docker takes the explicit grant path above and still
                     # fails closed when its ownership contract cannot be met.
                     logger.warning(
@@ -1483,8 +1482,8 @@ class SandboxManager:
     ) -> Sandbox:
         """Untouched legacy path: adopts any existing container silently via
         ``service.get_or_create()``. Used only when
-        ``service.supports_runtime_spec()`` is False (Boxlite today) — #296's
-        reconciliation guarantee does not extend to this backend.
+        ``service.supports_runtime_spec()`` is False — #296's reconciliation
+        guarantee does not extend to this backend.
 
         Caller (``_get_or_create_sandbox_locked``) already holds
         ``_lifecycle_locked(base_name)`` and has already checked the spec
@@ -2321,8 +2320,8 @@ class SandboxManager:
         """Probe one generation without collapsing backend failures to absence.
 
         The lifecycle digest is embedded in every primary/worker sandbox name,
-        so a successful backend listing is exact-generation evidence.  Docker,
-        Boxlite, and test services all use this same seam; any listing or
+        so a successful backend listing is exact-generation evidence. Docker
+        and test services use this same seam; any listing or
         decoding failure is UNKNOWN and therefore cannot settle ownership.
         """
         if re.fullmatch(r"[0-9a-f]{64}", lifecycle_id) is None:
@@ -2591,11 +2590,10 @@ class SandboxManager:
         """Stop all running sandboxes and reset process-local caches.
 
         Routes on the cached backend-capability probe: backends that
-        support spec reconciliation (Docker today) get ``_quiesce`` — no
+        support spec reconciliation get ``_quiesce`` — no
         config-diff guessing, since first-use reconciliation now owns that
         decision entirely (running both would be two competing judges of
-        the same question). Backends that do not (Boxlite today) keep
-        ``_legacy_cleanup``, unchanged.
+        the same question). Backends that do not keep ``_legacy_cleanup``.
         """
         if await self._resolve_backend_probe():
             await self._quiesce()
@@ -2690,8 +2688,8 @@ class SandboxManager:
         differs from the current environment so they get recreated
         with the correct settings next time.
 
-        Used only when the backend does not support spec reconciliation
-        (Boxlite today): config-diff delete-guessing, as opposed to
+        Used only when the backend does not support spec reconciliation:
+        config-diff delete-guessing, as opposed to
         ``_quiesce``'s stop-only behavior for backends that do.
 
         Note:
@@ -3100,9 +3098,9 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     effect (via ``_resolve_backend_probe()``), so the cleanup step that runs
     right after reads the cached value instead of resolving it again.
 
-    Only meaningful for backends that support spec reconciliation (Docker
-    today): the legacy Boxlite route never reconciles a desired spec against
-    a live container, so there is nothing here for it to protect. In
+    Only meaningful for backends that support spec reconciliation: a legacy
+    backend never reconciles a desired spec against a live container, so there
+    is nothing here for it to protect. In
     ``volume_subpath`` mode, the named-volume configuration and its physical
     root are validated before serving traffic. The later bind-mount conflict
     scan is skipped when neither ``SANDBOX_VOLUMES`` nor
@@ -3213,10 +3211,9 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
     Environment variables:
     - SANDBOX_ENABLED: Enable/disable sandbox (default: true)
-    - SANDBOX_IMPLEMENTATION: Implementation type (default: docker)
-      - docker: Use Docker sandbox
-      - boxlite: Use Boxlite sandbox
-    - BOXLITE_HOME_DIR: Boxlite home directory (optional)
+    - SANDBOX_IMPLEMENTATION: Implementation type. Only ``docker`` is
+      supported; the variable is retained so stale deployment configuration
+      fails closed instead of silently selecting a different runtime.
 
     Returns:
         SandboxService instance or None if disabled
@@ -3230,43 +3227,18 @@ def _create_sandbox_service() -> Optional[SandboxService]:
     # Get implementation type
     implementation = os.getenv("SANDBOX_IMPLEMENTATION", "docker")
 
-    if implementation == "boxlite":
-        return _create_boxlite_service()
-    elif implementation == "docker":
+    if implementation == "docker":
         return _create_docker_service()
-    else:
+    if implementation == "boxlite":
         raise ValueError(
-            "Unknown SANDBOX_IMPLEMENTATION "
-            f"{implementation!r}; expected 'docker' or 'boxlite'"
+            "BoxLite sandbox runtime has been removed; set "
+            "SANDBOX_IMPLEMENTATION='docker' and use "
+            "docker/docker-compose.sandbox.docker.yml. See docker/README.md "
+            "'Migrating from BoxLite'."
         )
-
-
-def _create_boxlite_service() -> Optional[SandboxService]:
-    """Create Boxlite sandbox service."""
-    try:
-        from ..sandbox import BoxliteSandboxService
-    except ImportError as exc:
-        raise RuntimeError(
-            "SANDBOX_IMPLEMENTATION=boxlite requires the BoxLite dependency"
-        ) from exc
-
-    from .sandbox_store import DBBoxliteStore
-
-    worker_id = get_sandbox_worker_id()
-    store = DBBoxliteStore(namespace=worker_id)
-    home_dir = get_boxlite_home_dir()
-
-    try:
-        service = BoxliteSandboxService(
-            store=store, home_dir=None if home_dir is None else str(home_dir)
-        )
-        logger.info(
-            f"Created Boxlite sandbox service (home_dir={home_dir or 'default'})"
-        )
-    except Exception as e:
-        raise RuntimeError("Failed to initialize the BoxLite sandbox runtime") from e
-
-    return service
+    raise ValueError(
+        f"Unknown SANDBOX_IMPLEMENTATION {implementation!r}; only 'docker' is supported"
+    )
 
 
 def _create_docker_service() -> Optional[SandboxService]:
@@ -3283,7 +3255,7 @@ def _create_docker_service() -> Optional[SandboxService]:
             "deployment identifier. Under Docker Compose use the Compose "
             "project name (COMPOSE_PROJECT_NAME); other deployment modes "
             "(pip/systemd) must pick their own stable value (see "
-            "docker/README.md 'Sandbox Runtime Overlays' and example.env)"
+            "docker/README.md 'Sandbox Runtime Overlay' and example.env)"
         )
     network = get_sandbox_network()
     if network is None:

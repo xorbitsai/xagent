@@ -20,7 +20,10 @@ checked this way today (see ``MCP_UNVERIFIABLE``).
 
 A builtin provider's request is built by ``build_oauth_refresh_request``, the
 same function a refresh uses, so the command checks exactly what a refresh
-sends. Each credential is resolved the way a refresh resolves it (the
+sends. Microsoft is the exception: its token endpoint checks a refresh
+token's format before the client, so its secret is checked with a
+client-credentials request against the app's home tenant, named by
+``MICROSOFT_TENANT_ID``; without it Microsoft is ``unverifiable``. Each credential is resolved the way a refresh resolves it (the
 ``oauth_providers`` row first, then the environment variable). One request per
 credential per run, no retries, no user data, no consent screen.
 
@@ -33,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -139,8 +143,6 @@ _TOKEN_FIRST = (
 UNVERIFIABLE: dict[str, str] = {
     "linkedin": _TOKEN_FIRST,
     "slack": _TOKEN_FIRST,
-    "microsoft": "refresh tokens are format-checked before the client; needs "
-    "a client-credentials request against the app's home tenant",
     "zendesk": "the token endpoint is on the customer's own subdomain",
     "deputy": "the token endpoint is on the customer's own install",
 }
@@ -148,6 +150,24 @@ UNVERIFIABLE: dict[str, str] = {
 # made-up client with 400 invalid_request "missing or invalid refresh token"
 # (BAD_REFRESH_TOKEN), so it checks the token first too (measured 2026-11-09).
 MCP_UNVERIFIABLE: dict[str, str] = {"hubspot": _TOKEN_FIRST}
+
+# Microsoft checks a refresh token's format before the client (AADSTS9002313,
+# measured 2026-11-09), so its secret is checked with a client-credentials
+# request against the app's home tenant instead. The provider rows sign in
+# through ``common``; only this request needs the tenant, which comes from
+# the deployment's configuration next to MICROSOFT_CLIENT_ID, per region.
+MICROSOFT_TENANT_ENV = "MICROSOFT_TENANT_ID"
+MICROSOFT_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+# Asks for an app-only token with whatever application permissions the app
+# already has; the token is never kept.
+MICROSOFT_SCOPE = "https://graph.microsoft.com/.default"
+# The app registration's Directory (tenant) ID. ``common`` or a domain name is
+# not the app's own tenant, and anything else must not reach the URL.
+_TENANT_ID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+_MICROSOFT_NO_TENANT = (
+    "refresh tokens are format-checked before the client; set "
+    f"{MICROSOFT_TENANT_ENV} to check the secret against the app's home tenant"
+)
 
 # A real refresh carries a refresh token the vendor issued, so an answer that
 # rejects the client means the client, also for providers the verification
@@ -264,6 +284,78 @@ async def _ask_vendor(send: Callable[[], Any]) -> VendorAnswer | str:
     return vendor_answer(response.status_code, payload)
 
 
+def _microsoft_tenant() -> str:
+    return (os.environ.get(MICROSOFT_TENANT_ENV) or "").strip()
+
+
+_AADSTS = re.compile(r"aadsts(\d{1,9})")
+
+
+def _microsoft(answer: VendorAnswer) -> Verdict:
+    """Classify a client-credentials answer from the app's home tenant."""
+    if answer.status == 200 and answer.error is None:
+        return "client_ok"  # an app-only token, never kept
+    if answer.status >= 500:
+        return "inconclusive"
+    # AADSTS7000215 (wrong secret), 7000222 (expired secret) and the like.
+    if answer.error == "invalid_client":
+        return "client_rejected"
+    # AADSTS700016 (no such app in the tenant), 90002 (no such tenant) and the
+    # rest more likely mean the tenant setting is wrong than that Microsoft
+    # rejected the platform's client.
+    return "inconclusive"
+
+
+def _microsoft_detail(answer: VendorAnswer) -> str:
+    if answer.status == 200 and answer.error is None:
+        return "vendor issued an app-only token (discarded)"
+    detail = _answer_detail(answer)
+    code = _AADSTS.match(answer.description)
+    return f"{detail} (AADSTS{code.group(1)})" if code else detail
+
+
+async def _verify_microsoft(
+    provider: str, row: Any | None, sources: str
+) -> VerificationResult:
+    tenant = _microsoft_tenant()
+    if not _TENANT_ID.fullmatch(tenant):
+        return VerificationResult(
+            "oauth-client",
+            provider,
+            "inconclusive",
+            f"{sources}; {MICROSOFT_TENANT_ENV} is not a directory (tenant) ID",
+        )
+
+    from .api.auth import _resolve_oauth_client_per_field
+    from .tools.config import _oauth_refresh_http_client
+
+    async def ask() -> Any:
+        client_id, client_secret = _resolve_oauth_client_per_field(provider, row)
+        async with _oauth_refresh_http_client() as client:
+            return await client.post(
+                MICROSOFT_TOKEN_URL.format(tenant=tenant),
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "scope": MICROSOFT_SCOPE,
+                },
+                headers={"Accept": "application/json"},
+            )
+
+    answer = await _ask_vendor(ask)
+    if isinstance(answer, str):
+        return VerificationResult(
+            "oauth-client", provider, "inconclusive", f"{sources}; {answer}"
+        )
+    return VerificationResult(
+        "oauth-client",
+        provider,
+        _microsoft(answer),
+        f"{sources}; {_microsoft_detail(answer)}",
+    )
+
+
 async def verify_builtin_provider(provider: str, row: Any | None) -> VerificationResult:
     """Verify one builtin provider's client with an invalid refresh token."""
     from .oauth_readiness import check_provider
@@ -276,8 +368,12 @@ async def verify_builtin_provider(provider: str, row: Any | None) -> Verificatio
         return VerificationResult(
             "oauth-client", provider, "unverifiable", UNVERIFIABLE[name]
         )
+    if name == "microsoft" and not _microsoft_tenant():
+        return VerificationResult(
+            "oauth-client", provider, "unverifiable", _MICROSOFT_NO_TENANT
+        )
     rule = RULES.get(name)
-    if rule is None:
+    if rule is None and name != "microsoft":
         return VerificationResult(
             "oauth-client", provider, "unverifiable", "no verification rule"
         )
@@ -288,6 +384,8 @@ async def verify_builtin_provider(provider: str, row: Any | None) -> Verificatio
             "inconclusive",
             f"{sources}; not configured, see oauth_readiness",
         )
+    if rule is None:
+        return await _verify_microsoft(provider, row, sources)
 
     from .api.auth import _resolve_oauth_client_per_field
     from .tools.config import (

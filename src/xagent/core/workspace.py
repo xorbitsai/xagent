@@ -3157,13 +3157,15 @@ class TaskWorkspace:
 
         for file_path in self.workspace_dir.rglob("*"):
             if file_path.is_file():
-                # Skip hidden files and cache directories
-                if any(part.startswith(".") for part in file_path.parts):
+                # Judge hidden and cache directories by the path inside the
+                # workspace only. The absolute path includes wherever the
+                # deployment mounts the workspace root, and a dot-directory
+                # there would otherwise hide every file from registration,
+                # so overwritten outputs kept their first durable generation.
+                relative_parts = file_path.relative_to(self.workspace_dir).parts
+                if any(part.startswith(".") for part in relative_parts):
                     continue
-                if (
-                    "__pycache__" in file_path.parts
-                    or "node_modules" in file_path.parts
-                ):
+                if "__pycache__" in relative_parts or "node_modules" in relative_parts:
                     continue
                 if self._is_internal_workspace_path(file_path):
                     continue

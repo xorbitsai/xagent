@@ -2,7 +2,7 @@
 Unit tests for the sandbox runtime spec types, matcher, and lifecycle
 contract additions in ``xagent.sandbox.base``.
 
-These are pure unit tests with no Docker/Boxlite dependency: SandboxInspection
+These are pure unit tests with no Docker dependency: SandboxInspection
 instances are hand-constructed to drive the matcher through every verdict
 path.
 """

@@ -188,7 +188,6 @@ def composio_env(monkeypatch):
         composio_auth.COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV, AUTH_CONFIG_ID
     )
     monkeypatch.setenv(composio_auth.COMPOSIO_USER_ID_SECRET_ENV, USER_ID_SECRET)
-    monkeypatch.delenv(composio_auth.CONNECTOR_OAUTH_ROUTE_ENV, raising=False)
     # The Meta callback, unless a test points the shared callback elsewhere.
     monkeypatch.delenv("XAGENT_COMPOSIO_CALLBACK_URL", raising=False)
     # Instagram stays off unless a test switches it on.
@@ -415,18 +414,21 @@ def test_start_meets_the_xagent_saas_contract(db_session, composio_env, composio
     assert db.query(ActorOAuthFlowState).count() == 1
 
 
-def test_start_refuses_while_connector_oauth_routing_is_on(
+def test_start_proceeds_while_connector_oauth_routing_is_on(
     db_session, composio_env, composio, monkeypatch
 ):
-    monkeypatch.setenv(composio_auth.CONNECTOR_OAUTH_ROUTE_ENV, " True ")
+    """The start no longer refuses while xagent-saas's switch is on: routing
+    Composio's trips per connection is left to xagent-saas and the edge
+    (xagent-saas#2461), and a trip that reaches the wrong region binds
+    nothing (test_composio_cross_region.py)."""
+    monkeypatch.setenv("XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED", "true")
     db, user = db_session
 
     response = _start(db, user, Browser())
 
-    assert response.status_code == 503
-    assert "set-cookie" not in response.headers
-    assert db.query(ActorOAuthFlowState).count() == 0
-    assert composio.calls == []
+    assert response.status_code in (302, 307)
+    assert len(response.headers.getlist("set-cookie")) == 1
+    assert db.query(ActorOAuthFlowState).count() == 1
 
 
 def test_start_refuses_without_composio_configuration(

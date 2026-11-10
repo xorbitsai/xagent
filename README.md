@@ -4,9 +4,9 @@
 
 **The enterprise platform for building and deploying AI teammates.**
 
-Open Xagent, describe a task in the workspace, and run it right away. For repeatable work, start from a teammate template or build your own. Publish the teammate when you want other people to use it.
+Open Xagent, describe a task in the workspace, and run it right away. For repeatable work, add a preconfigured teammate or build your own. Publish the teammate when you want other people to use it.
 
-[Get started](#quick-start) · [Run a task](#run-a-task) · [Build a teammate](#build-a-teammate) · [Documentation](https://docs.xagent.co/)
+[Try TobyBot Cloud](https://tobybot.ai/) · [Self-host Xagent](#run-with-docker-compose) · [Run a task](#run-a-task) · [Build a teammate](#build-a-teammate) · [Documentation](https://docs.xagent.co/)
 
 ## Why choose Xagent?
 
@@ -22,11 +22,15 @@ Xagent is a self-hostable platform for **AI teammates**. A teammate is a reusabl
 
 Use a teammate directly in Xagent, or publish it for end users through a shareable link, an embedded widget, or an application connected via API.
 
+### What is TobyBot?
+
+TobyBot is the commercial agent platform built on Xagent. Business teams use it to run tasks, build AI teammates for recurring work, and publish them for colleagues or customers. [TobyBot Cloud](#run-xagent-with-tobybot-cloud) is the hosted version of TobyBot.
+
 ## How does Xagent work?
 
 1. **Configure and test.** Select the models and resources a teammate needs, connect your tools and knowledge, and test a sample request in the Builder.
 2. **Publish and deliver.** Choose where people will use the teammate. Enable a share link, embed it on an allowed domain, or call it from your application with an agent API key.
-3. **Run and inspect.** Deploy Xagent on your infrastructure and use conversation logs and monitoring to see how teammates handle requests.
+3. **Run and inspect.** Use conversation logs and monitoring to see how teammates handle requests after you publish them.
 
 ## Run a task
 
@@ -36,7 +40,7 @@ Enter a request in the workspace and send it. In this example, Xagent turns a fe
 
 ## Build a teammate
 
-Open **Add a teammate** to start from a template or create your own. In the Builder, describe the job, choose a model, and attach the skills, tools, and knowledge the job calls for.
+Open **Add a teammate** to choose a preconfigured teammate or build your own. In the Builder, describe the job, choose a model, and attach the skills, tools, and knowledge the job calls for.
 
 For a **Product Support** teammate, connect the product documentation and set instructions for answering setup, account, and billing questions. Try a question in **Preview** before publishing.
 
@@ -70,6 +74,15 @@ Use **Conversation Logs** to find a conversation by teammate or entry point. Ope
 
 See the [deployment guide](docker/README.md), [release-specific deployment notes](docs/deployment.md), and [sandbox guide](docker/README.sandbox.md).
 
+## Run Xagent with TobyBot Cloud
+
+Give TobyBot a goal. It plans the work, uses the tools you connect, and delivers the result. For work that repeats, build a teammate and run it on a schedule.
+
+- **Team workspaces.** Invite colleagues, manage member roles, and share teammates, knowledge bases, and supported apps.
+- **Model choice.** Use models hosted by Xinference or bring your own key for a supported provider or OpenAI-compatible endpoint.
+- **Guardrails and security auditing.** Set team and teammate rules for reply review and use tool allowlists for client applications. Inspect run logs and traces. TobyBot records administrative access to task traces.
+- **Usage and retention.** Track actions and AI credits against your plan limits. Set retention periods for conversations and execution records.
+
 ## Quick start
 
 ### Evaluate locally
@@ -100,6 +113,10 @@ docker compose up -d
 Open [localhost](http://localhost/) and complete setup. Review the deployment settings in `.env` before running on a shared host. For production, serve Xagent over HTTPS and follow the [deployment guide](docker/README.md).
 
 Forgot the administrator password? See [how to reset it from the Docker host](docker/README.md#reset-the-administrator-password).
+
+### Try TobyBot Cloud
+
+[Sign in to TobyBot Cloud](https://cloud.tobybot.ai/login) and give it your first task or add a teammate for a recurring job.
 
 ## Documentation and community
 

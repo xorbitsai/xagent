@@ -1077,11 +1077,13 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         interruption: Any = None,
         report: SettlementReport | None = None,
         turn_id: str | None = None,
+        classify_unknown_tool_effect: bool = False,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
         assert report == SettlementReport()
         assert interruption is None
+        assert classify_unknown_tool_effect is False
         assert turn_id is None
         worker_events.append(("release", threading.get_ident()))
 

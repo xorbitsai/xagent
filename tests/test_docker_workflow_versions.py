@@ -182,29 +182,6 @@ def test_pytorch_cpu_index_is_project_configured_for_uv_sync() -> None:
     assert "explicit = true" in pyproject
 
 
-def test_boxlite_is_not_declared_for_linux_aarch64() -> None:
-    project = tomllib.loads(read_repo_file("pyproject.toml"))
-    requirements = [Requirement(item) for item in project["project"]["dependencies"]]
-    boxlite = [req for req in requirements if canonicalize_name(req.name) == "boxlite"]
-    assert boxlite
-    for platform, machine, available in [
-        ("linux", "x86_64", True),
-        ("darwin", "arm64", True),
-        ("linux", "aarch64", False),
-        ("win32", "AMD64", False),
-    ]:
-        assert (
-            any(
-                req.marker is None
-                or req.marker.evaluate(
-                    {"sys_platform": platform, "platform_machine": machine}
-                )
-                for req in boxlite
-            )
-            is available
-        )
-
-
 def test_publish_script_derives_package_version_from_valid_tags() -> None:
     publish_script = read_repo_file("docker/publish.sh")
 
@@ -509,7 +486,7 @@ def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> No
     )
 
 
-def test_sandbox_npm_cache_is_owned_by_the_boxlite_runtime_user() -> None:
+def test_sandbox_npm_cache_is_owned_by_the_non_root_runtime_user() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.sandbox")
 
     assert "ENV NPM_CONFIG_CACHE=/opt/npm-cache" in dockerfile

@@ -59,6 +59,16 @@ nothing about the workers. A worker's active degradations appear, names only,
 at the end of its per-minute `runtime diagnostics` line (`degradations=`, `-`
 when none).
 
+`execution_events_unobserved` is set at startup, in the web process and in each
+worker, when `XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES` enables at least one entry
+(independent of `XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS`) but that process is
+not exporting runtime telemetry; the process also logs a WARNING naming the
+entries. V2 tasks would then run without the metrics in this document. It is
+never cleared at runtime. To resolve it, enable runtime telemetry export on that
+process, or remove the entries and restart. Limitation: after the entries are
+removed the signal disappears, although existing V2 tasks may still be
+continued, so keep telemetry enabled for as long as V2 tasks can be resumed.
+
 ## 2. Existing signals by problem class
 
 Metric names below are OpenTelemetry instrument names. Log messages are the
@@ -103,13 +113,14 @@ literal format strings.
     later).
   - `turn_commit`, `command_commit`: a turn or command acceptance whose
     COMMIT outcome could not be reconciled; `ref` is the turn id.
-  - `finalize_ack_unresolved`: a finalize COMMIT lost its acknowledgement
-    (dropped connection) and the read-back could not decide.
+  - `finalize_ack_unresolved`: a finalize COMMIT (a new or a resumed run's
+    result) lost its acknowledgement (dropped connection) and the read-back
+    could not decide, or there was no inserted row to read back (a legacy
+    wait or pause with no answer, a legacy completion with an empty answer,
+    an ownerless legacy task, a replayed result fact).
   - `settlement_ack_unresolved`: the same for a V2 settlement (a run that
     raised, an interruption pause, or a managed inline-transport result).
     The lease is retained for TTL recovery.
-  - `resume_finalize_unreconciled`: the same for a resumed run's finalize,
-    which has no read-back yet.
   - `settlement_deferred`: settlement could not decide from the checkpoint
     and left the lease to TTL recovery.
   - `finalize_ack_reconciled`, `settlement_ack_reconciled` (INFO): a lost

@@ -1,6 +1,6 @@
 """Regression tests for list_tools_in_sandbox's SandboxLeaseProvider handling.
 
-Uses plain mocks instead of boxlite: these exercise only the
+Uses plain mocks instead of a native sandbox runtime: these exercise only the
 Sandbox-vs-SandboxLeaseProvider unwrap logic, not real sandbox execution.
 """
 

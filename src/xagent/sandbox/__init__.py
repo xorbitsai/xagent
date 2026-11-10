@@ -65,23 +65,6 @@ __all__ = [
 ]
 
 try:
-    from .boxlite_sandbox import (
-        BoxliteSandbox,
-        BoxliteSandboxService,
-        BoxliteStore,
-        MemBoxliteStore,
-    )
-
-    __all__ += [
-        "BoxliteSandbox",
-        "BoxliteStore",
-        "MemBoxliteStore",
-        "BoxliteSandboxService",
-    ]
-except ImportError:
-    pass
-
-try:
     from .docker_sandbox import (
         DockerSandbox,
         DockerSandboxService,

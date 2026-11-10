@@ -17,8 +17,6 @@ clean vulnerability scan or certification of a deployed image.
   Updating that pin requires the malformed/streamed tool-argument regressions,
   not just a successful dependency resolution.
 - OpenAI 2.x, Xinference 2.x and SQLAlchemy 2.0 contracts remain supported.
-- Resolution requires wheels on Linux x86_64 and macOS ARM. BoxLite is bounded
-  to `>=0.10.7,<0.11`; 0.10.6 lacks a Linux/Python 3.12 wheel.
 
 ### Larger version transitions
 
@@ -56,21 +54,6 @@ runtime/image test. Frontend dependencies need their own audit; Python scans
 do not cover them.
 
 ## Runtime acceptance and follow-ups
-
-BoxLite 0.10 metadata APIs are asynchronous. Isolated guests use `NetworkSpec`
-with inbound and outbound disabled, not host-side `SecurityOptions`.
-Published ports plus isolated guest networking fail before VM creation.
-Creation, reuse and metadata recovery have SDK contract tests, but those do
-not prove native VM execution, file transfer or network isolation. Compare
-the base and upgraded SDK with the same image digests on a working VM host;
-registry/network failures are not compatibility evidence. Deployment requires
-the native suite and an actual isolated-guest egress check to pass.
-
-BoxLite honors the sandbox image's non-root `USER`. Guest file operations must
-target an authorized writable directory or workspace mount, not `/root`.
-Standalone callers overriding the image working directory (including the
-shared `SandboxConfig` default `/home`) must provide a writable mount/directory
-for relative writes. Do not add a root-user fallback to restore root-only paths.
 
 MCP's `streamablehttp_client` remains a supported deprecated compatibility API
 in 1.30. Its migration to `streamable_http_client` is a tracked follow-up:

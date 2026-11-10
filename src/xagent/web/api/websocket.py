@@ -1610,14 +1610,13 @@ class ConnectionManager:
     def end_restart_drain(self) -> None:
         """Stop closing: the release was aborted.
 
-        New registrations are kept again, and closes already scheduled or
-        waiting inside ``close_for_restart`` send no further 1012.
+        New registrations are kept again, and closes that have not yet called
+        ``close()``, scheduled or waiting inside ``close_for_restart``, send
+        no 1012: each re-checks the generation at that moment. A close that
+        already started finishes and unregisters its socket.
         """
         self._restart_draining = False
         self._restart_drain_generation += 1
-        for task in list(self._restart_closes):
-            task.cancel()
-        self._restart_closes.clear()
 
     async def close_for_restart(
         self,
@@ -1705,18 +1704,16 @@ class ConnectionManager:
     async def _close_for_restart(
         self, websocket: WebSocket, timeout: float, generation: int
     ) -> None:
+        # No await sits between this check and ``close()`` starting, so an
+        # abort cannot land in between on any supported Python. A close that
+        # has started finishes and unregisters; an aborted one never starts.
         if self._restart_drain_generation != generation:
             return
         try:
-            await asyncio.wait_for(
-                websocket.close(
+            async with asyncio.timeout(timeout):
+                await websocket.close(
                     code=WS_CLOSE_SERVICE_RESTART, reason="Service Restart"
-                ),
-                timeout=timeout,
-            )
-        except asyncio.CancelledError:
-            # The drain was aborted mid-close: the socket stays registered.
-            raise
+                )
         except Exception:
             # Already closed, or the peer is gone; either way it is leaving.
             pass

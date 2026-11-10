@@ -2791,6 +2791,8 @@ class AgentServiceManager:
                             description="Auto-created task",
                             status=TaskStatus.PENDING,
                             connector_runtime_selected_refs=[],
+                            # Legacy missing-row fallback: always V1, never rolled out.
+                            conversation_storage_version=1,
                         )
                         db.add(new_task)
                         db.commit()

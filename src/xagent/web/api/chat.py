@@ -64,6 +64,9 @@ from ..services.connector_runtime import (
     build_task_runtime_requirements,
     resolve_agent_runtime_requirements,
 )
+from ..services.conversation_storage_rollout import (
+    new_task_conversation_storage_version,
+)
 from ..services.expired_tasks import find_expired_task
 from ..services.hot_path_cache import (
     cache_get,
@@ -540,6 +543,16 @@ async def create_task(
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided
             is_visible=False if request.is_preview else request.is_visible,
+            conversation_storage_version=new_task_conversation_storage_version(
+                # The Builder preview (REST and WebSocket) shares this site
+                # with web chat; ``is_preview`` must be exactly True.
+                entry=(
+                    "agent_preview"
+                    if (task_agent_config or {}).get("is_preview") is True
+                    else "web_chat"
+                ),
+                owner_user_id=authenticated_user_id,
+            ),
         )
         selected_refs, connector_runtime_requirements = (
             resolve_agent_runtime_requirements(

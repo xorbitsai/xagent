@@ -1215,6 +1215,8 @@ def _prepare_task_message_sync(
                 status=TaskStatus.PENDING,
                 execution_mode=get_default_task_execution_mode(),
                 connector_runtime_selected_refs=[],
+                # Legacy replacement for a deleted task: always V1, never rolled out.
+                conversation_storage_version=1,
             )
             db.add(task)
             db.flush()

@@ -23,6 +23,7 @@ from .connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from .conversation_storage_rollout import new_task_conversation_storage_version
 from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
@@ -161,6 +162,27 @@ def _normalize_run_source(value: str | None) -> str:
     return normalized
 
 
+_RUN_SOURCE_STORAGE_VIA = {
+    "internal": "web_chat",
+    "sdk": "sdk",
+    "widget": "widget",
+    "shared_link": "shared_link",
+    "trigger": "trigger",
+}
+
+
+def _workforce_storage_via(request: _NormalizedWorkforceRunRequest) -> str | None:
+    """Initiating storage entry of a run, or None when it cannot be mapped.
+
+    A run is V2 only when both ``workforce`` and its initiating entry are
+    enabled. Builder previews count as ``agent_preview``. An unmapped source
+    (``_normalize_run_source`` accepts any string) gets version 1.
+    """
+    if request.is_preview:
+        return "agent_preview"
+    return _RUN_SOURCE_STORAGE_VIA.get(request.source)
+
+
 def _normalize_idempotency_key(value: str | None) -> str | None:
     if value is None:
         return None
@@ -288,6 +310,7 @@ def _create_run_and_task_no_commit(
         request.execution_mode or cast(str, manager_agent.execution_mode)
     )
 
+    storage_via = _workforce_storage_via(request)
     task = Task(
         user_id=int(user.id),
         title=task_title,
@@ -304,6 +327,13 @@ def _create_run_and_task_no_commit(
         execution_mode=manager_execution_mode,
         source=request.source,
         is_visible=request.is_visible,
+        conversation_storage_version=(
+            new_task_conversation_storage_version(
+                entry="workforce", owner_user_id=int(user.id), via=storage_via
+            )
+            if storage_via is not None
+            else 1
+        ),
     )
     selected_refs = prepare_connector_runtime_selection_snapshot(
         db=db,

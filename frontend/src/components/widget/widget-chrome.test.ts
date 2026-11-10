@@ -523,6 +523,90 @@ describe("widget chrome", () => {
     expect(postToIframe).not.toHaveBeenCalled()
   })
 
+  describe("data-expanded", () => {
+    const W_BAD_DATA_EXPANDED = 'Xagent Widget: data-expanded must be "true" or "false"; ignoring it.'
+    const expandState = (expanded: boolean) => ({ xagent: true, v: 1, type: "widget_expand_state", expanded })
+
+    function runExpanded(value: string | null) {
+      runWidget(value === null
+        ? { "data-widget-key": "widget-secret" }
+        : { "data-widget-key": "widget-secret", "data-expanded": value })
+      return vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+    }
+
+    it.each([
+      { name: "\"true\"", value: "true", expanded: true, warns: false },
+      { name: "\" TRUE \"", value: " TRUE ", expanded: true, warns: false },
+      { name: "\"false\"", value: "false", expanded: false, warns: false },
+      { name: "an empty value", value: "", expanded: false, warns: false },
+      { name: "no attribute", value: null, expanded: false, warns: false },
+      { name: "\"yes\"", value: "yes", expanded: false, warns: true },
+    ])("sizes the first FAB open for $name", ({ value, expanded, warns }) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+      const postToIframe = runExpanded(value)
+
+      fabEl()?.click()
+
+      expect(panelEl()).toHaveClass("open")
+      expect(panelEl()!.classList.contains("expanded")).toBe(expanded)
+      expect(postToIframe.mock.calls).toEqual(expanded ? [[expandState(true), HOST]] : [])
+      // Later opens do not read the attribute again, so it warns at most once.
+      fabEl()?.click()
+      fabEl()?.click()
+      expect(warn.mock.calls).toEqual(warns ? [[W_BAD_DATA_EXPANDED]] : [])
+    })
+
+    it("applies only to the first open of the page view", () => {
+      runExpanded("true")
+      fabEl()?.click()
+      expect(panelEl()).toHaveClass("expanded")
+
+      fromIframe("widget_collapse")
+      fabEl()?.click()
+      fabEl()?.click()
+
+      expect(panelEl()).toHaveClass("open")
+      expect(panelEl()).not.toHaveClass("expanded")
+    })
+
+    it("reads the attribute at the first open, not at load", () => {
+      runExpanded(null)
+
+      document.currentScript!.setAttribute("data-expanded", "true")
+      fabEl()?.click()
+
+      expect(panelEl()).toHaveClass("expanded")
+    })
+
+    it("does not expand a first open on a mobile viewport, and says so", () => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 })
+      const postToIframe = runExpanded("true")
+
+      fabEl()?.click()
+
+      expect(panelEl()).toHaveClass("open")
+      expect(panelEl()).not.toHaveClass("expanded")
+      expect(postToIframe.mock.calls).toEqual([[expandState(false), HOST]])
+    })
+  })
+
+  it.each([
+    { name: "expanded", expanded: true },
+    { name: "normal", expanded: false },
+  ])("answers widget_chrome_ready with the current size ($name)", ({ expanded }) => {
+    runWidget()
+    fabEl()?.click()
+    if (expanded) fromIframe("widget_expand")
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("widget_chrome_ready")
+
+    expect(panelEl()).toHaveClass("xagent-widget-chrome-ready")
+    expect(postToIframe.mock.calls).toEqual([
+      [{ xagent: true, v: 1, type: "widget_expand_state", expanded }, HOST],
+    ])
+  })
+
   it("keeps the .expanded rule (and its resize-handle override) scoped above the mobile breakpoint", () => {
     // jsdom never evaluates @media against getComputedStyle (confirmed
     // empirically), so this asserts against the generated CSS text instead --

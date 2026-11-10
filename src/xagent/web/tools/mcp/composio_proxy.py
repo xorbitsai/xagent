@@ -136,8 +136,9 @@ class ProxyResponse:
 
 class ComposioProxyError(RuntimeError):
     """Composio itself refused or failed the call; the provider may never
-    have seen it. ``status`` is Composio's HTTP status, None when Composio
-    could not be reached."""
+    have seen it. ``status`` is Composio's HTTP status; None means the
+    failure is not one of those statuses, either because Composio could not
+    be reached or because it answered and the answer was refused here."""
 
     def __init__(
         self, message: str, *, status: int | None = None, slug: str | None = None
@@ -206,53 +207,136 @@ def _redact_echoed_body(message: str, body: Any) -> str:
     message = redact(message)
     # The decoded content is replaced before the error text is cut: a fragment
     # that crosses the cut would otherwise keep its visible prefix, and one
-    # whose token ``redact`` rewrote would no longer match at all. Only the
-    # part that can still reach the kept text is scanned, so the pass over a
-    # 4.5 MB message (tens of thousands of decoded lines) stays bounded.
+    # whose token ``redact`` rewrote would no longer match at all. The pass
+    # walks the original text in order and stops once it has produced the
+    # text that will be kept, so a replacement cannot shorten the text in
+    # front of a fragment and pull it into the kept text.
     return _redacted_decoded_fragments(message, _decoded_mime_fragments(body))
 
 
+# A decoded fragment is looked up by its first characters, so a pass over the
+# start of the text costs one lookup per character instead of one search per
+# fragment: a 4.5 MB message decodes to tens of thousands of lines.
+_FRAGMENT_KEY_CHARS = 32
+
+
 def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
-    """``message`` with every decoded fragment that reaches its kept text
+    """``message`` with every decoded fragment that can reach its kept text
     removed.
 
     ``ComposioProxyError`` cuts the text to ``MAX_ERROR_TEXT_CHARS`` after
-    this, so only an occurrence that starts before that cut can show. Such a
-    fragment can still cross the cut, so the search runs to the cut plus the
-    fragment's own length. Each fragment is also matched in the form
-    ``redact`` leaves it in, because the text has already been redacted.
+    this pass, so the kept text is the first characters of the result. The
+    pass copies the original text in order, replaces a fragment where it
+    starts with one marker, and stops once it has produced that many
+    characters: a character or fragment after that point can never reach the
+    kept text, however much an earlier replacement shortens the text. A
+    fragment that crosses the cut is still met whole, because the scan sees
+    its start.
+
+    Each fragment is also matched in the form ``redact`` leaves it in,
+    because the text has already been redacted. Overlapping fragments are
+    replaced as one region, so a shorter match cannot leave the tail of a
+    longer one visible.
     """
-    spans: list[tuple[int, int]] = []
-    for fragment in fragments:
+    variants = _decoded_fragment_variants(fragments)
+    if not variants:
+        return message
+    prefix_index, length_index = _fragment_index(variants)
+    pieces: list[str] = []
+    kept = 0
+    position = 0
+    size = len(message)
+    while position < size and kept < MAX_ERROR_TEXT_CHARS:
+        value = _fragment_at(message, position, prefix_index, length_index)
+        if value is None:
+            pieces.append(message[position])
+            kept += 1
+            position += 1
+            continue
+        end = _fragment_region_end(
+            message, position, position + len(value), prefix_index, length_index
+        )
+        pieces.append(_REDACTED)
+        kept += len(_REDACTED)
+        position = end
+    if position < size:
+        # The error cuts here anyway; the rest only keeps the cut visible.
+        pieces.append(message[position:])
+    return "".join(pieces)
+
+
+def _decoded_fragment_variants(fragments: list[str]) -> set[str]:
+    """The distinct fragments to look for, including the form ``redact``
+    leaves them in."""
+    variants: set[str] = set()
+    for fragment in set(fragments):
         if not fragment:
             continue
-        variants = {fragment, str(redact(fragment))}
-        for value in variants:
-            start = 0
-            limit = MAX_ERROR_TEXT_CHARS + len(value)
-            while True:
-                found = message.find(value, start, limit)
-                if found < 0:
-                    break
-                spans.append((found, found + len(value)))
-                start = found + len(value)
-    if not spans:
-        return message
-    spans.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in spans:
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        variants.add(fragment)
+        variants.add(str(redact(fragment)))
+    return variants
+
+
+def _fragment_index(
+    variants: set[str],
+) -> tuple[dict[str, list[str]], dict[int, set[str]]]:
+    """Index the fragments by their first characters, and short ones by
+    length; both are read by ``_fragment_at``."""
+    prefix_index: dict[str, list[str]] = {}
+    length_index: dict[int, set[str]] = {}
+    for value in variants:
+        if len(value) >= _FRAGMENT_KEY_CHARS:
+            prefix_index.setdefault(value[:_FRAGMENT_KEY_CHARS], []).append(value)
         else:
-            merged.append((start, end))
-    pieces: list[str] = []
-    position = 0
-    for start, end in merged:
-        pieces.append(message[position:start])
-        pieces.append(_REDACTED)
-        position = end
-    pieces.append(message[position:])
-    return "".join(pieces)
+            length_index.setdefault(len(value), set()).add(value)
+    return prefix_index, length_index
+
+
+def _fragment_at(
+    message: str,
+    position: int,
+    prefix_index: dict[str, list[str]],
+    length_index: dict[int, set[str]],
+) -> str | None:
+    """The longest fragment starting at ``position``, or None."""
+    remaining = len(message) - position
+    best = ""
+    if remaining >= _FRAGMENT_KEY_CHARS:
+        key = message[position : position + _FRAGMENT_KEY_CHARS]
+        for value in prefix_index.get(key, ()):
+            if len(value) > len(best) and message.startswith(value, position):
+                best = value
+    for length, values in length_index.items():
+        if length <= remaining and length > len(best):
+            candidate = message[position : position + length]
+            if candidate in values:
+                best = candidate
+    return best or None
+
+
+def _fragment_region_end(
+    message: str,
+    start: int,
+    end: int,
+    prefix_index: dict[str, list[str]],
+    length_index: dict[int, set[str]],
+) -> int:
+    """``end`` extended over fragments that start inside the match and reach
+    past it, so one region is replaced once and no tail is left behind.
+
+    A match longer than the kept text is the body or one of its own lines;
+    scanning inside it would cost as much as the message, and a decoded
+    message yields no fragment that crosses out of its own line.
+    """
+    if end - start > MAX_ERROR_TEXT_CHARS:
+        return end
+    position = start + 1
+    while position < end:
+        value = _fragment_at(message, position, prefix_index, length_index)
+        if value is not None and position + len(value) > end:
+            end = position + len(value)
+        position += 1
+    return end
 
 
 def _long_strings(value: Any) -> list[str]:

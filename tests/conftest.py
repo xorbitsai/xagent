@@ -988,3 +988,27 @@ def clear_langfuse_traces(request):
 #     set_yaml_migration_manager(manager)
 #
 #     yield manager
+
+
+@pytest.fixture(autouse=True)
+def _isolate_retire_writers_state():
+    """A direct ``shutdown_event()`` call retires the writers for good.
+
+    Without a startup in between, the next test's retire would return early and
+    skip the stop calls it asserts, so every test starts and ends with the
+    process-local retirement state cleared.
+    """
+    import sys
+
+    def reset() -> None:
+        app_module = sys.modules.get("xagent.web.app")
+        if app_module is None:
+            return
+        app_module._writers_retired = False
+        app_module._retire_writers_lock = None
+        app_module._uploaded_file_reconcile_task = None
+        app_module.release_hold.reset_writers_retired()
+
+    reset()
+    yield
+    reset()

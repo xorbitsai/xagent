@@ -6,7 +6,7 @@ import logging
 import uuid
 import weakref
 from collections import OrderedDict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -140,7 +140,11 @@ from ..services.public_trace_events import (
     public_audience_frame,
     public_task_trace_filter,
 )
-from ..services.release_hold import release_hold
+from ..services.release_hold import (
+    SocketWriteToken,
+    WritersRetired,
+    release_hold,
+)
 from ..services.task_auto_recovery import (
     current_auto_recovery_view,
     is_auto_resume_command_id,
@@ -2238,21 +2242,42 @@ def _enqueue_websocket_task_command_sync(
         return result
 
 
-def _refuse_write_after_retire() -> None:
-    """Refuse a socket write once the host retired this process's writers.
+def _admit_socket_write(
+    interrupt: Callable[[], None] | None = None,
+) -> SocketWriteToken:
+    """Admit one socket-owned write, or refuse it once the writers are retired.
 
     The old process then only waits to be replaced, so a command it enqueued
     would write while the successor's migrations run. The client gets the
-    retryable "execution paused" error and lands on the new process.
+    retryable "execution paused" error and lands on the new process. The
+    token is held until the write has settled: the host's retire waits for
+    every admitted token before it reports success.
     """
-    if release_hold.writers_retired:
+    try:
+        return release_hold.acquire_socket_write(interrupt)
+    except WritersRetired:
         raise ClientVisibleValidationError(
             client_error_message(ClientErrorCode.EXECUTION_PAUSED),
             error_code=ClientErrorCode.EXECUTION_PAUSED,
-        )
+        ) from None
 
 
 async def _enqueue_websocket_task_command(
+    **kwargs: Any,
+) -> EnqueuedTaskCommand | None:
+    """Enqueue a durable command from a socket, counted for the retire barrier."""
+    if kwargs.get("message_data", {}).get("user") is not None:
+        token = _admit_socket_write()
+    else:
+        token = None
+    try:
+        return await _enqueue_websocket_task_command_unguarded(**kwargs)
+    finally:
+        if token is not None:
+            token.release()
+
+
+async def _enqueue_websocket_task_command_unguarded(
     *,
     websocket: WebSocket | None = None,
     task_id: int,
@@ -2267,7 +2292,6 @@ async def _enqueue_websocket_task_command(
             "User authentication required for task command",
             error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
         )
-    _refuse_write_after_retire()
     resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
     # User ORM instances and server-only authentication fields are never put
     # into the JSON inbox. The consumer re-resolves the actor by id.
@@ -2482,6 +2506,7 @@ async def handle_execute_task(
     hold leaves it pending for the successor instead of refusing it, and no
     execution starts inside this socket's handler. No DB Session is retained.
     """
+    write_token: SocketWriteToken | None = None
     try:
         user = message_data.get("user")
         authorized_task_id: int | None = None
@@ -2490,7 +2515,9 @@ async def handle_execute_task(
                 "User authentication required for task execution",
                 error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
-        _refuse_write_after_retire()
+        # A socket-owned write: refused once the host retired the writers, and
+        # counted until it settles so the retire can wait for it.
+        write_token = _admit_socket_write()
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
 
@@ -2661,6 +2688,9 @@ async def handle_execute_task(
         # logs without exc_info and the public endpoints swallow entirely.
         logger.error("Unexpected error in task execution: %s", e, exc_info=True)
         raise
+    finally:
+        if write_token is not None:
+            write_token.release()
 
 
 @dataclass(frozen=True)
@@ -4017,19 +4047,27 @@ async def websocket_builder_chat_endpoint(
 
             message_data = json.loads(data)
 
-            if release_hold.writers_retired:
-                # A builder turn creates agents and knowledge bases; the old
-                # process may no longer write.
-                await send_execution_paused(websocket)
-                continue
-
             # Run in background to not block receiving
             if active_chat_task is not None:
                 await cancel_and_drain_async_task(active_chat_task)
 
-            active_chat_task = asyncio.create_task(
+            # A builder turn creates agents and knowledge bases; the old
+            # process may no longer write once the host retired its writers.
+            # An admitted turn is a socket write the retire waits for, and is
+            # cancelled when the fence goes up.
+            turn_task: asyncio.Task[None] | None = None
+            try:
+                write_token = release_hold.acquire_socket_write(
+                    lambda: turn_task.cancel() if turn_task is not None else None
+                )
+            except WritersRetired:
+                await send_execution_paused(websocket)
+                continue
+            turn_task = asyncio.create_task(
                 handle_builder_chat(websocket, message_data, user)
             )
+            turn_task.add_done_callback(lambda _t, tok=write_token: tok.release())
+            active_chat_task = turn_task
             websocket.state.chat_task = active_chat_task
 
     except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):

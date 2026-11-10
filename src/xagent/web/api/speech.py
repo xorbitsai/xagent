@@ -34,7 +34,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.user import User
 from ..schemas.speech import ASRStreamStart, TTSStreamRequest
-from ..services.release_hold import release_hold
+from ..services.release_hold import WritersRetired, release_hold
 from ..services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
@@ -249,12 +249,19 @@ async def stream_asr(
     if user is None:
         await _close_asr_socket(websocket, 4001, "Authentication required")
         return
-    if release_hold.writers_retired:
-        # Transcription meters usage when it ends; the old process may no
-        # longer write, so the client reconnects to the new one.
+    await accept_authenticated_websocket(websocket)
+    # Transcription meters usage when it ends, so a session is a socket write
+    # the host's retire waits for (and winds down when the fence goes up). A
+    # retired process cannot write, so the client reconnects to the new one;
+    # the close frame needs the handshake accepted first.
+    session_task = asyncio.current_task()
+    try:
+        write_token = release_hold.acquire_socket_write(
+            session_task.cancel if session_task is not None else None
+        )
+    except WritersRetired:
         await _close_asr_socket(websocket, 1012, "Service restart")
         return
-    await accept_authenticated_websocket(websocket)
     model: BaseASR | None = None
     config: SimpleNamespace | None = None
     model_closed = False
@@ -334,9 +341,12 @@ async def stream_asr(
         _log_provider_error(model or config, exc)
         await _send_asr_error(websocket, "stream_failed", "Speech stream failed", 1011)
     finally:
-        if model is not None and not model_closed:
-            await _close_model(model)
-        await _close_asr_socket(websocket)
+        try:
+            if model is not None and not model_closed:
+                await _close_model(model)
+            await _close_asr_socket(websocket)
+        finally:
+            write_token.release()
 
 
 class _TTSAudioResponse(StreamingResponse):

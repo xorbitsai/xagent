@@ -62,7 +62,7 @@ import itertools
 import logging
 import time
 from collections import Counter, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -108,6 +108,33 @@ class HoldToken:
         self.release()
 
 
+class WritersRetired(Exception):
+    """A socket write was refused because the host retired this process's writers."""
+
+
+class SocketWriteToken:
+    """One admitted socket-owned write; hold it until its writes have settled."""
+
+    def __init__(
+        self,
+        hold: ReleaseHold,
+        key: int,
+    ) -> None:
+        self._hold = hold
+        self._key: int | None = key
+
+    def release(self) -> None:
+        key, self._key = self._key, None
+        if key is not None:
+            self._hold._socket_writes.pop(key, None)
+
+    def __enter__(self) -> SocketWriteToken:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
+
+
 class ReleaseHold:
     """Process-wide execution admission switch plus hand-off ledger."""
 
@@ -123,6 +150,10 @@ class ReleaseHold:
         # process's writers (``app.retire_writers``). Entries that would write
         # while the old process only waits to be replaced refuse on it.
         self._writers_retired = False
+        # Socket-owned writers (command enqueue, builder turns, ASR sessions)
+        # admitted before the retire fence, each with an optional callback that
+        # asks a long-running one to wind down once the fence is up.
+        self._socket_writes: dict[int, Callable[[], None] | None] = {}
         # Sticky for the life of the process: the blocking evidence.
         self._unsettled_total = 0
         self._unsettled: deque[dict[str, str]] = deque(
@@ -142,12 +173,53 @@ class ReleaseHold:
         return self._writers_retired
 
     def mark_writers_retired(self) -> None:
-        """The host stopped this process's writers; refuse writes that remain."""
+        """Raise the retire fence: no new socket write is admitted from now on.
+
+        One-way until :meth:`reset_writers_retired`. Writers already admitted
+        are asked to wind down and are waited for by
+        :meth:`drain_socket_writes`; the retire is not complete before that.
+        Synchronous on the event-loop thread, so a write either registered
+        before this call or is refused after it.
+        """
         self._writers_retired = True
+        for interrupt in list(self._socket_writes.values()):
+            if interrupt is not None:
+                try:
+                    interrupt()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Socket write wind-down failed", exc_info=True)
 
     def reset_writers_retired(self) -> None:
         """A new lifespan starts new writers."""
         self._writers_retired = False
+        self._socket_writes.clear()
+
+    def acquire_socket_write(
+        self, interrupt: Callable[[], None] | None = None
+    ) -> SocketWriteToken:
+        """Admit one socket-owned write or raise :class:`WritersRetired`.
+
+        Hold the token across the whole write, through any usage hook that
+        settles after it. ``interrupt`` is called once if the fence goes up
+        while the token is held, for writers that may run for minutes.
+        """
+        if self._writers_retired:
+            raise WritersRetired()
+        key = next(self._keys)
+        self._socket_writes[key] = interrupt
+        return SocketWriteToken(self, key)
+
+    async def drain_socket_writes(self, timeout: float) -> bool:
+        """Wait until every admitted socket write has settled.
+
+        ``False`` if some are still running after ``timeout`` seconds.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self._socket_writes:
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+        return True
 
     @property
     def unsettled_total(self) -> int:

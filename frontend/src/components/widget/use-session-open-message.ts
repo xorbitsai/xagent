@@ -47,13 +47,16 @@ export interface UseSessionOpenMessageInput
 // unbound and the message is sent as a first message, exactly as one typed on
 // the start screen would be. A message that is not sent ends with its console
 // warning, unless its reset or send settles after unmount.
+//
+// `busy` is true from the render a message reaches the slot until it has
+// ended, whether it was sent, failed or dropped.
 export function useSessionOpenMessage({
   sendStartMessage,
   ...input
-}: UseSessionOpenMessageInput): void {
+}: UseSessionOpenMessageInput): { busy: boolean } {
   const send = useCallback(
     (request: WidgetOpenRequest) => sendStartMessage(request.message),
     [sendStartMessage],
   )
-  useFirstMessageDriver({ ...input, send, onOutcome: warnOutcome })
+  return useFirstMessageDriver({ ...input, send, onOutcome: warnOutcome })
 }

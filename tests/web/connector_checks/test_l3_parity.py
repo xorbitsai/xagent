@@ -232,6 +232,14 @@ def test_the_default_declarations_run_each_probe_as_its_l3_check(app_id: str) ->
     assert connector_checks_for(app_id) == ConnectorChecks(app_id, reads=(check,))
 
 
+@pytest.mark.parametrize("app_id", ["zendesk", "zoom"])
+def test_an_adopted_connector_keeps_the_probe_derived_l3_check(app_id: str) -> None:
+    check = l3_read_check(app_id)
+    assert check is not None
+
+    assert check in CONNECTOR_CHECKS[app_id].reads
+
+
 async def test_the_engine_runs_the_registry_by_default() -> None:
     tool = FakeTool("gmail_search_messages")
     adapter = FakeAdapter([ConnectorTarget("gmail")], {"gmail": listed(tool)})

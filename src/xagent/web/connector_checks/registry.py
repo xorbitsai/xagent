@@ -12,12 +12,16 @@ adopts V2 and still wants its L3 call declares it again through
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import cast
 
 from ..connector_probes import get_connector_probe, get_unprobeable_reason
 from .declarations import (
     ConnectorChecks,
+    EachHasKeys,
     HasKeys,
+    IsType,
     L3Envelope,
+    Length,
     ReadCheck,
     StatusSuccess,
     ToolExemption,
@@ -30,6 +34,8 @@ from .fixtures import FixtureRef
 # it; a write whose object no tool can delete is a reason of its own.
 _GOOGLE_TIER_1 = "#3567"
 _MICROSOFT_365_TIER_1 = "#3569"
+# Tier 2 runs structural reads only: no seeded objects and no write checks.
+_TIER_2 = "#3573"
 WRITE_WITHOUT_CLEANUP = (
     "write that creates an object no tool of this server deletes, so a write "
     "check has nothing to clean up with"
@@ -62,6 +68,26 @@ def _exemptions(
             ToolExemption(tool, WRITE_WITHOUT_CLEANUP)
             for tool in writes_without_cleanup
         ),
+    )
+
+
+def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:
+    """``app_id``'s L3 probe as a V2 read check, or None without one.
+
+    An unprobeable reason wins over a probe, as in the probe route.
+    """
+    check_id = f"{app_id}.l3_probe"
+    reason = get_unprobeable_reason(app_id)
+    if reason is not None:
+        return UnprobeableCheck(check_id, reason)
+    probe = get_connector_probe(app_id)
+    if probe is None:
+        return None
+    return ReadCheck(
+        check_id,
+        probe.tool,
+        probe.arguments,
+        assertions=(L3Envelope(probe.expect_keys),),
     )
 
 
@@ -282,6 +308,118 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("word_create_document",),
         ),
     ),
+    "zendesk": ConnectorChecks(
+        "zendesk",
+        reads=(
+            cast(ReadCheck, l3_read_check("zendesk")),
+            ReadCheck(
+                "zendesk.list_tickets",
+                "zendesk_list_tickets",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("tickets", "has_more", "after_cursor", "truncated")),
+                    EachHasKeys(
+                        ("tickets",),
+                        (
+                            "id",
+                            "subject",
+                            "status",
+                            "priority",
+                            "requester_id",
+                            "assignee_id",
+                            "group_id",
+                            "tags",
+                            "created_at",
+                            "updated_at",
+                        ),
+                    ),
+                    Length(("tickets",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "zendesk.list_organizations",
+                "zendesk_list_organizations",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        (), ("organizations", "has_more", "after_cursor", "truncated")
+                    ),
+                    EachHasKeys(
+                        ("organizations",),
+                        ("id", "name", "domain_names", "created_at"),
+                    ),
+                    Length(("organizations",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "zendesk.list_macros",
+                "zendesk_list_macros",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("macros", "has_more", "after_cursor", "truncated")),
+                    EachHasKeys(
+                        ("macros",), ("id", "title", "description", "updated_at")
+                    ),
+                    Length(("macros",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "zendesk_search",
+                "zendesk_get_ticket",
+                "zendesk_list_ticket_comments",
+                "zendesk_get_user",
+                "zendesk_search_users",
+                "zendesk_get_organization",
+                "zendesk_search_articles",
+                "zendesk_get_article",
+                "zendesk_search_macros",
+                "zendesk_get_macro",
+                "zendesk_list_side_conversations",
+                "zendesk_get_side_conversation",
+            ),
+            writes=(
+                "zendesk_create_ticket",
+                "zendesk_update_ticket",
+                "zendesk_delete_ticket",
+                "zendesk_reply_to_ticket",
+                "zendesk_add_internal_note",
+                "zendesk_create_side_conversation",
+                "zendesk_reply_to_side_conversation",
+                "zendesk_update_side_conversation",
+                "zendesk_apply_macro",
+            ),
+        ),
+    ),
+    "zoom": ConnectorChecks(
+        "zoom",
+        reads=(
+            cast(ReadCheck, l3_read_check("zoom")),
+            ReadCheck(
+                "zoom.list_meetings",
+                "zoom_list_meetings",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("meetings", "next_page_token")),
+                    IsType(("meetings",), "array"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "zoom_get_meeting",
+                "zoom_list_recordings",
+                "zoom_get_meeting_transcript",
+            ),
+            writes=("zoom_create_meeting",),
+        ),
+    ),
 }
 
 
@@ -332,30 +470,8 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "teams",
         "whatsapp",
         "xero",
-        "zendesk",
-        "zoom",
     }
 )
-
-
-def l3_read_check(app_id: str) -> ReadCheck | UnprobeableCheck | None:
-    """``app_id``'s L3 probe as a V2 read check, or None without one.
-
-    An unprobeable reason wins over a probe, as in the probe route.
-    """
-    check_id = f"{app_id}.l3_probe"
-    reason = get_unprobeable_reason(app_id)
-    if reason is not None:
-        return UnprobeableCheck(check_id, reason)
-    probe = get_connector_probe(app_id)
-    if probe is None:
-        return None
-    return ReadCheck(
-        check_id,
-        probe.tool,
-        probe.arguments,
-        assertions=(L3Envelope(probe.expect_keys),),
-    )
 
 
 def connector_checks_for(app_id: str) -> ConnectorChecks | None:

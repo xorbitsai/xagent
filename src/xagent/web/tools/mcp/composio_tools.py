@@ -2,9 +2,10 @@
 
 The proxy transport carries JSON calls and relays a binary answer, but it
 cannot carry a multipart or resumable upload: a Drive create or content
-update sends metadata and bytes in one request. Those three Drive tools use
-Composio's own tools instead, with the bytes staged through Composio's Files
-API: the file is uploaded once, then named by the key the tool receives.
+update sends metadata and bytes in one request. A toolkit's own tool takes
+the bytes instead (``google_drive_composio`` is Drive's), staged through
+Composio's Files API: the file is uploaded once, then named by the key the
+tool receives.
 
 A staged object is not read again here, so the bytes that were sent are the
 bytes the tool sees. The upload request carries the file's MD5, which is what
@@ -45,15 +46,6 @@ from .composio_proxy import (
 )
 
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
-GOOGLEDRIVE_TOOLKIT_SLUG = "googledrive"
-# What the tool execution error calls the toolkit. The slug above is what the
-# Files API takes; this is only for a message a caller reads.
-GOOGLEDRIVE_TOOLKIT_NAME = "Google Drive"
-# The two Drive tools that move bytes. A create carries metadata and content
-# in one request; an update is a media-only upload. Neither fits Proxy
-# Execute, which takes one JSON body and no multipart or resumable session.
-GOOGLEDRIVE_CREATE_FILE = "GOOGLEDRIVE_CREATE_FILE"
-GOOGLEDRIVE_UPLOAD_UPDATE_FILE = "GOOGLEDRIVE_UPLOAD_UPDATE_FILE"
 
 # Composio's Azure-backed storage requires this header on a block-blob PUT.
 _AZURE_BLOB_BACKEND = "azure_blob_storage"
@@ -75,13 +67,10 @@ class ComposioToolError(RuntimeError):
     """Composio itself refused or failed the call, so the tool may never have
     run. ``status`` is Composio's HTTP status, None when it was unreachable."""
 
-    def __init__(
-        self, message: str, *, status: int | None = None, slug: str | None = None
-    ) -> None:
+    def __init__(self, message: str, *, status: int | None = None) -> None:
         # Redact before truncating, so a secret cut in half cannot survive.
         super().__init__(_safe_text(message))
         self.status = status
-        self.slug = slug
 
 
 @dataclass(frozen=True)
@@ -161,12 +150,9 @@ def _upload_url(answer: Mapping[str, Any]) -> str | None:
     bytes would silently never be uploaded, so it is refused rather than
     treated as "no URL".
     """
-    if "new_presigned_url" in answer:
-        url = answer["new_presigned_url"]
-    elif "newPresignedUrl" in answer:
-        url = answer["newPresignedUrl"]
-    else:
+    if "new_presigned_url" not in answer:
         return None
+    url = answer["new_presigned_url"]
     if url is None or url == "":
         return None
     if not isinstance(url, str):
@@ -244,10 +230,15 @@ def _put_file(
             timeout=DEFAULT_TIMEOUT_SECONDS,
             allow_redirects=False,
         )
-    except PrivateNetworkHostError:
-        # The public-only client refused a destination before opening a
-        # socket. Keep the same ComposioToolError contract as any other
-        # unusable upload URL; the message names neither the host nor the URL.
+    except (PrivateNetworkHostError, requests.exceptions.InvalidURL):
+        # The public-only client refuses a non-public destination before a
+        # socket is opened, in one of two shapes: a private host literal is
+        # refused while the request is prepared, so PrivateNetworkHostError
+        # itself arrives here, and a host that resolves to a private address
+        # is refused in the adapter's send, which reports it as an
+        # InvalidURL (public_requests.py). Keep the same ComposioToolError
+        # contract as any other unusable upload URL; the message names
+        # neither the host nor the URL.
         raise ComposioToolError("Composio returned an unusable upload URL") from None
     except (requests.RequestException, OSError) as exc:
         # Type only: an exception's text can name the presigned URL. A
@@ -278,6 +269,12 @@ def _call(path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
             },
             json=dict(payload),
             timeout=DEFAULT_TIMEOUT_SECONDS,
+            # A redirect is not followed: a 307/308 replays the JSON body to
+            # another origin, which the public-only client refuses after the
+            # POST has been sent. The 3xx is reported instead, so a caller can
+            # see that the request went out and the result is unknown rather
+            # than that nothing was sent.
+            allow_redirects=False,
         )
     except (requests.RequestException, OSError) as exc:
         # Type only: a connection error's text can name the request. A
@@ -289,6 +286,13 @@ def _call(path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
             type(exc).__name__,
         )
         raise ComposioToolError("Composio could not be reached") from None
+    if 300 <= response.status_code < 400:
+        raise ComposioToolError(
+            f"Composio answered with a redirect (HTTP {response.status_code}) "
+            "that was not followed: the request was sent, and its result is "
+            "not known",
+            status=int(response.status_code),
+        )
     try:
         answer = response.json()
     except Exception:
@@ -312,7 +316,7 @@ def _api_error(prefix: str, status: int, answer: Any) -> ComposioToolError:
         message = f"{message} ({slug})"
     if detail:
         message = f"{message}: {detail}"
-    return ComposioToolError(message, status=status, slug=slug)
+    return ComposioToolError(message, status=status)
 
 
 # A presigned storage URL is a bearer credential for a staged object, and it

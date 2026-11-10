@@ -103,18 +103,10 @@ def _declared_size(value: Any) -> int | None:
     """
     if value is None:
         return None
-    if isinstance(value, bool):
-        raise ComposioProxyError(
-            "the proxied binary response declared an unusable size"
-        )
-    if isinstance(value, int):
-        if value < 0:
-            raise ComposioProxyError(
-                "the proxied binary response declared an unusable size"
-            )
-        return value
     if isinstance(value, str) and value.isdigit():
         return int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
     raise ComposioProxyError("the proxied binary response declared an unusable size")
 
 

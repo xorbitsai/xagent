@@ -14,6 +14,12 @@ from typing import Any
 import pytest
 
 from xagent.web.tools.mcp import composio_proxy, composio_tools
+from xagent.web.tools.mcp.google_drive_composio import (
+    GOOGLEDRIVE_CREATE_FILE,
+    GOOGLEDRIVE_TOOLKIT_NAME,
+    GOOGLEDRIVE_TOOLKIT_SLUG,
+    GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+)
 
 API_KEY = "test-composio-api-key-value"
 ACCOUNT_ID = "ca_drive_account_1"
@@ -94,7 +100,7 @@ _BYTES = b"%PDF-1.4 bytes"
 def _execute(slug: str, arguments: Any) -> composio_tools.ToolResult:
     """Run a Drive tool the way google_drive.py does."""
     return composio_tools.execute_tool(
-        slug, arguments, toolkit=composio_tools.GOOGLEDRIVE_TOOLKIT_NAME
+        slug, arguments, toolkit=GOOGLEDRIVE_TOOLKIT_NAME
     )
 
 
@@ -108,8 +114,8 @@ def _stage(
     http.answer("/files/upload/request", 200, answer or _upload_answer())
     http.answer(UPLOAD_URL, put_status, None, method="PUT")
     return composio_tools.stage_file(
-        toolkit_slug=composio_tools.GOOGLEDRIVE_TOOLKIT_SLUG,
-        tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        toolkit_slug=GOOGLEDRIVE_TOOLKIT_SLUG,
+        tool_slug=GOOGLEDRIVE_CREATE_FILE,
         filename="report.pdf",
         mimetype="application/pdf",
         md5="0" * 32,
@@ -191,8 +197,8 @@ def test_stage_file_refuses_a_bool_as_a_length(http):
     """``bool`` is an ``int`` in Python, but ``True`` is not a byte count."""
     with pytest.raises(ValueError, match="byte count"):
         composio_tools.stage_file(
-            toolkit_slug=composio_tools.GOOGLEDRIVE_TOOLKIT_SLUG,
-            tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+            toolkit_slug=GOOGLEDRIVE_TOOLKIT_SLUG,
+            tool_slug=GOOGLEDRIVE_CREATE_FILE,
             filename="report.pdf",
             mimetype="application/pdf",
             md5="0" * 32,
@@ -201,15 +207,36 @@ def test_stage_file_refuses_a_bool_as_a_length(http):
         )
 
 
-def test_a_private_upload_destination_keeps_the_composio_error_contract(monkeypatch):
-    from xagent.core.utils.security import PrivateNetworkHostError
+def test_a_private_upload_destination_keeps_the_composio_error_contract():
+    """The real public-only client refuses a private host while the request is
+    prepared, before any socket is opened, so this is the shape that refusal
+    arrives in. The answer keeps the ComposioToolError contract and does not
+    name the host."""
+    with pytest.raises(composio_tools.ComposioToolError, match="unusable upload URL"):
+        composio_tools._put_file(
+            "https://127.0.0.1/report.pdf",
+            data=b"x",
+            length=1,
+            mimetype="text/plain",
+            backend=None,
+        )
+
+
+def test_a_destination_refused_at_resolution_keeps_the_same_contract(monkeypatch):
+    """A host that resolves to a private address is refused later, in the
+    adapter's send, and the session reports that as an InvalidURL
+    (public_requests.py). Same contract, and still no host or URL named."""
 
     def refuse(method: str, url: str, **kwargs: Any) -> Any:
-        raise PrivateNetworkHostError("destination is not public")
+        raise composio_proxy.requests.exceptions.InvalidURL(
+            "Host must not resolve to a private network."
+        )
 
     monkeypatch.setattr(composio_proxy.requests, "request", refuse)
 
-    with pytest.raises(composio_tools.ComposioToolError, match="unusable upload URL"):
+    with pytest.raises(
+        composio_tools.ComposioToolError, match="unusable upload URL"
+    ) as raised:
         composio_tools._put_file(
             UPLOAD_URL,
             data=b"x",
@@ -217,6 +244,8 @@ def test_a_private_upload_destination_keeps_the_composio_error_contract(monkeypa
             mimetype="text/plain",
             backend=None,
         )
+
+    assert UPLOAD_URL not in str(raised.value)
 
 
 def test_a_programming_error_in_the_http_client_is_not_hidden(http, monkeypatch):
@@ -231,7 +260,7 @@ def test_a_programming_error_in_the_http_client_is_not_hidden(http, monkeypatch)
     monkeypatch.setattr(composio_proxy.requests, "request", boom)
 
     with pytest.raises(ValueError, match="not serializable"):
-        _execute(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
+        _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
 
 def test_stage_file_refuses_an_answer_without_a_key(http):
@@ -250,8 +279,8 @@ def test_stage_file_refuses_an_upload_url_that_is_not_https(http):
 
     with pytest.raises(composio_tools.ComposioToolError, match="unusable upload URL"):
         composio_tools.stage_file(
-            toolkit_slug=composio_tools.GOOGLEDRIVE_TOOLKIT_SLUG,
-            tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+            toolkit_slug=GOOGLEDRIVE_TOOLKIT_SLUG,
+            tool_slug=GOOGLEDRIVE_CREATE_FILE,
             filename="report.pdf",
             mimetype="application/pdf",
             md5="0" * 32,
@@ -279,8 +308,8 @@ def test_an_unreachable_upload_names_only_its_type(http, monkeypatch):
 
     with pytest.raises(composio_tools.ComposioToolError) as raised:
         composio_tools.stage_file(
-            toolkit_slug=composio_tools.GOOGLEDRIVE_TOOLKIT_SLUG,
-            tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+            toolkit_slug=GOOGLEDRIVE_TOOLKIT_SLUG,
+            tool_slug=GOOGLEDRIVE_CREATE_FILE,
             filename="report.pdf",
             mimetype="application/pdf",
             md5="0" * 32,
@@ -331,7 +360,7 @@ def test_execute_tool_sends_the_account_the_user_and_the_arguments(http):
     )
 
     result = _execute(
-        composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        GOOGLEDRIVE_CREATE_FILE,
         {"name": "notes.txt", "file_to_upload": {"s3key": "k"}},
     )
 
@@ -345,6 +374,28 @@ def test_execute_tool_sends_the_account_the_user_and_the_arguments(http):
         "arguments": {"name": "notes.txt", "file_to_upload": {"s3key": "k"}},
     }
     assert call["headers"]["x-api-key"] == API_KEY
+    # A redirect is not followed: replaying the JSON body to another origin
+    # fails after the POST was sent (see the redirect test below).
+    assert call["allow_redirects"] is False
+
+
+def test_a_redirect_on_the_tool_post_is_reported_as_an_unknown_result(http):
+    """A cross-origin 307/308 cannot be replayed, and the client's own
+    refusal arrives after the POST was sent. The 3xx status is reported
+    instead, so a caller never reads it as "nothing was sent"."""
+    http.answer(
+        "/tools/execute/GOOGLEDRIVE_CREATE_FILE",
+        307,
+        {"error": {"message": "moved"}},
+    )
+
+    with pytest.raises(composio_tools.ComposioToolError) as raised:
+        _execute(GOOGLEDRIVE_CREATE_FILE, {})
+
+    assert raised.value.status == 307
+    assert "redirect (HTTP 307)" in str(raised.value)
+    assert "the request was sent" in str(raised.value)
+    assert "nothing was sent" not in str(raised.value)
 
 
 def test_execute_tool_returns_a_tool_failure_without_raising(http):
@@ -358,7 +409,7 @@ def test_execute_tool_returns_a_tool_failure_without_raising(http):
         },
     )
 
-    result = _execute(composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, {"fileId": "f1"})
+    result = _execute(GOOGLEDRIVE_UPLOAD_UPDATE_FILE, {"fileId": "f1"})
 
     assert result.successful is False
     assert result.error == "Google Drive refused the upload"
@@ -378,14 +429,13 @@ def test_execute_tool_redacts_a_secret_composio_echoes_back(http):
     )
 
     with pytest.raises(composio_tools.ComposioToolError) as raised:
-        _execute(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
+        _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
     message = str(raised.value)
     assert "InvalidApiKey" in message
     assert API_KEY not in message
     assert ACCOUNT_ID not in message
     assert raised.value.status == 400
-    assert raised.value.slug == "InvalidApiKey"
 
 
 def test_an_error_text_redacts_a_token_assignment_and_a_signed_url():
@@ -418,21 +468,21 @@ def test_execute_tool_refuses_an_answer_without_a_result(http):
     )
 
     with pytest.raises(composio_tools.ComposioToolError, match="without a result"):
-        _execute(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
+        _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
 
 def test_execute_tool_refuses_an_answer_that_is_not_an_object(http):
     http.answer("/tools/execute/GOOGLEDRIVE_CREATE_FILE", 200, ["not", "an", "object"])
 
     with pytest.raises(composio_tools.ComposioToolError, match="unusable tool answer"):
-        _execute(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
+        _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
 
 def test_execute_tool_names_a_missing_launch_variable(http, monkeypatch):
     monkeypatch.delenv(composio_proxy.COMPOSIO_API_KEY_ENV)
 
     with pytest.raises(ValueError, match="COMPOSIO_API_KEY"):
-        _execute(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
+        _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
 
 def test_a_staged_body_is_read_as_a_stream(http):
@@ -453,8 +503,8 @@ def test_a_staged_body_is_read_as_a_stream(http):
     http.answer(UPLOAD_URL, 200, None, method="PUT")
 
     composio_tools.stage_file(
-        toolkit_slug=composio_tools.GOOGLEDRIVE_TOOLKIT_SLUG,
-        tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        toolkit_slug=GOOGLEDRIVE_TOOLKIT_SLUG,
+        tool_slug=GOOGLEDRIVE_CREATE_FILE,
         filename="report.pdf",
         mimetype="application/pdf",
         md5="0" * 32,
@@ -473,7 +523,7 @@ def test_the_tool_failure_error_is_kept_to_its_text(http):
         {"data": None, "error": "x" * 5000, "successful": False},
     )
 
-    result = _execute(composio_tools.GOOGLEDRIVE_CREATE_FILE, {})
+    result = _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
     assert result.error is not None
     assert result.error.endswith("...[truncated]")
@@ -487,8 +537,8 @@ def test_the_upload_request_is_not_sent_without_the_api_key(monkeypatch):
 
     with pytest.raises(ValueError, match="COMPOSIO_API_KEY"):
         composio_tools.stage_file(
-            toolkit_slug=composio_tools.GOOGLEDRIVE_TOOLKIT_SLUG,
-            tool_slug=composio_tools.GOOGLEDRIVE_CREATE_FILE,
+            toolkit_slug=GOOGLEDRIVE_TOOLKIT_SLUG,
+            tool_slug=GOOGLEDRIVE_CREATE_FILE,
             filename="report.pdf",
             mimetype="application/pdf",
             md5="0" * 32,

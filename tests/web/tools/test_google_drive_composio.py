@@ -26,6 +26,7 @@ from xagent.web.tools.mcp import (
     composio_tools,
     google_api_proxy,
     google_drive,
+    google_drive_composio,
 )
 
 API_KEY = "test-composio-api-key-value"
@@ -87,6 +88,7 @@ class FakeHttp:
         self.downloads: dict[str, bytes] = {}
         self._proxy_answers: dict[str, deque[dict[str, Any]]] = {}
         self._tool_answers: dict[str, dict[str, Any]] = {}
+        self._tool_status: dict[str, int] = {}
         self.upload_answer: dict[str, Any] = {
             "id": "req_file_1",
             "key": "projects/pr_1/requests/googledrive/report.pdf",
@@ -117,6 +119,7 @@ class FakeHttp:
         self,
         slug: str,
         *,
+        status: int = 200,
         successful: bool = True,
         data: Any = None,
         error: str | None = None,
@@ -126,6 +129,7 @@ class FakeHttp:
             "data": data if data is not None else {},
             "error": error,
         }
+        self._tool_status[slug] = status
 
     def download(self, url: str, content: bytes) -> None:
         self.downloads[url] = content
@@ -154,7 +158,7 @@ class FakeHttp:
         if "/tools/execute/" in url:
             slug = url.rsplit("/", 1)[-1]
             self.tool_calls.append((slug, kwargs["json"]["arguments"]))
-            return _Response(200, self._tool_answers[slug])
+            return _Response(self._tool_status.get(slug, 200), self._tool_answers[slug])
         if method == "PUT":
             self.puts.append(call)
             return _Response(self.put_status)
@@ -781,8 +785,14 @@ def test_upload_file_stages_the_bytes_and_normalizes_the_tool_answer(
 ):
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
-    http.proxy("webViewLink", 200, _created_metadata())
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
+    # Drive's read-back reports the uploaded checksum and size, so the
+    # integrity check compares them rather than having nothing to check.
+    http.proxy(
+        "webViewLink",
+        200,
+        _created_metadata(md5Checksum=_md5(NEW_CONTENT), size=str(len(NEW_CONTENT))),
+    )
 
     result = json.loads(
         google_drive.google_drive_upload_file(
@@ -791,13 +801,16 @@ def test_upload_file_stages_the_bytes_and_normalizes_the_tool_answer(
     )
 
     assert result == {"status": "success", "file": _created_metadata()}
+    # The two check-only fields settle the upload and stay out of the result.
+    assert "md5Checksum" not in result["file"]
+    assert "size" not in result["file"]
     staged_request = _staged(http)
     assert staged_request["filename"] == "Report.pdf"
     assert staged_request["mimetype"] == "application/pdf"
     assert staged_request["md5"] == _md5(NEW_CONTENT)
     assert http.puts[0]["data"] == NEW_CONTENT
     slug, arguments = http.tool_calls[0]
-    assert slug == composio_tools.GOOGLEDRIVE_CREATE_FILE
+    assert slug == google_drive_composio.GOOGLEDRIVE_CREATE_FILE
     assert arguments == {
         "name": "Report.pdf",
         "mimeType": "application/pdf",
@@ -816,10 +829,10 @@ def test_upload_file_stages_the_bytes_and_normalizes_the_tool_answer(
 def test_upload_file_streams_a_file_above_the_in_memory_threshold(
     http, monkeypatch, _isolate_environment
 ):
-    monkeypatch.setattr(google_drive, "_STAGED_UPLOAD_IN_MEMORY_BYTES", 4)
+    monkeypatch.setattr(google_drive_composio, "_STAGED_UPLOAD_IN_MEMORY_BYTES", 4)
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
     http.proxy("webViewLink", 200, _created_metadata())
 
     result = json.loads(
@@ -853,7 +866,7 @@ def test_upload_file_keeps_a_failed_tool_answer_an_unknown_outcome(
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
     http.tool(
-        composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_CREATE_FILE,
         successful=False,
         error="insufficient permissions",
     )
@@ -875,7 +888,7 @@ def test_upload_file_does_not_claim_success_without_the_new_file_id(
 ):
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={})
     http.proxy("name = ", 200, {"files": []})
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
@@ -1095,7 +1108,7 @@ def test_a_composio_rejection_is_definite_only_for_a_4xx_other_than_408(
 ):
     error = composio_tools.ComposioToolError("Composio refused the call", status=status)
 
-    assert google_drive._composio_rejection_is_definite(error) is definite
+    assert google_drive_composio._composio_rejection_is_definite(error) is definite
 
 
 def test_upload_file_says_the_outcome_is_unknown_when_drive_cannot_be_checked(
@@ -1186,7 +1199,7 @@ def test_upload_file_does_not_report_success_when_drive_stored_other_bytes(
 ):
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
     http.proxy(
         "webViewLink",
         200,
@@ -1209,7 +1222,7 @@ def test_upload_file_looks_the_file_up_when_the_read_back_is_a_404(
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
     candidate = _same_name_file()
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
     # The read-back is a files.get of the id the tool answered with; the
     # lookup that follows is a files.list, so the id names only the read-back.
     http.proxy(_NEW_ID, 404, {"error": {"code": 404, "message": "not found"}})
@@ -1233,7 +1246,7 @@ def test_upload_file_keeps_the_tool_answer_when_the_read_back_fails(
     upload."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data=_created_metadata())
     http.proxy(_NEW_ID, 500, {"error": {"code": 500, "message": "backend error"}})
 
     result = json.loads(google_drive.google_drive_upload_file(str(local)))
@@ -1251,7 +1264,7 @@ def test_upload_file_sends_a_type_outside_the_tool_enum_as_octet_stream(
     object keeps the file's real type."""
     local = _isolate_environment / "Notes.doc"
     local.write_bytes(NEW_CONTENT)
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": _NEW_ID})
     http.proxy(
         "webViewLink",
         200,
@@ -1331,13 +1344,39 @@ def test_upload_file_says_nothing_was_sent_when_the_call_never_started(
     assert http.proxy_calls == []
 
 
+def test_upload_file_does_not_say_nothing_was_sent_after_a_redirect(
+    http, _isolate_environment
+):
+    """An answer of 307/308 means the POST went out and its result is not
+    known: the redirect is not followed, so this is not a pre-send failure
+    and must not be reported as one."""
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, status=307, data={})
+    http.proxy("name = ", 200, {"files": []})
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+
+    assert result["status"] == "error"
+    assert "nothing was sent to Google Drive" not in result["message"]
+    assert "not known whether it was uploaded" in result["message"]
+    # The tool's own words say the request was sent.
+    assert "redirect (HTTP 307)" in result["message"]
+    assert "the request was sent" in result["message"]
+    tool_call = [call for call in http.calls if "/tools/execute/" in call["url"]][0]
+    assert tool_call["allow_redirects"] is False
+    # One tool call, one lookup: a retry could create a duplicate.
+    assert len(http.tool_calls) == 1
+    assert len([call for call in http.proxy_calls if "name = " in str(call)]) == 1
+
+
 def test_upload_file_never_puts_the_api_key_or_upload_url_in_an_error(
     http, _isolate_environment
 ):
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
     http.tool(
-        composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_CREATE_FILE,
         successful=False,
         error="the drive account is not connected",
     )
@@ -1378,7 +1417,7 @@ def test_upload_file_on_a_native_grant_still_uses_the_media_upload(
 def test_create_file_converts_text_to_a_google_doc(http):
     name = "Meeting notes"
     content = "hello from the meeting"
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "doc1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "doc1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1403,7 +1442,7 @@ def test_create_file_converts_text_to_a_google_doc(http):
     assert staged["md5"] == _md5(content.encode("utf-8"))
     assert http.puts[0]["data"] == content.encode("utf-8")
     slug, arguments = http.tool_calls[0]
-    assert slug == composio_tools.GOOGLEDRIVE_CREATE_FILE
+    assert slug == google_drive_composio.GOOGLEDRIVE_CREATE_FILE
     assert arguments["mimeType"] == GOOGLE_DOC_MIME
     assert arguments["parents"] == ["folder1"]
     assert (
@@ -1413,7 +1452,7 @@ def test_create_file_converts_text_to_a_google_doc(http):
 
 
 def test_create_file_keeps_a_plain_text_type(http):
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1432,7 +1471,7 @@ def test_create_file_keeps_a_plain_text_type(http):
 
 
 def test_create_file_stages_empty_content(http):
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1461,7 +1500,7 @@ def test_create_file_keeps_the_binary_name_guard_before_any_composio_call(http):
 
 
 def test_create_file_does_not_claim_success_without_the_new_file_id(http):
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={})
     http.proxy("name = ", 200, {"files": []})
 
     result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello"))
@@ -1507,7 +1546,7 @@ def test_create_file_keeps_a_recent_same_name_doc_an_unknown_outcome(http, monke
 def test_create_file_keeps_a_verified_read_back_a_success(http):
     """The negative control for the rule above: when the tool's own answer is
     confirmed by Drive's read-back, the create is still a success."""
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "doc1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "doc1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1573,7 +1612,7 @@ def test_create_file_says_the_outcome_is_unknown_when_the_lookup_finds_nothing(
 
 
 def test_create_file_does_not_report_success_when_drive_stored_other_bytes(http):
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1598,7 +1637,7 @@ def test_create_file_keeps_a_failed_tool_answer_an_unknown_outcome(http):
     """Composio can fail the create tool after Drive created the file, so a
     failed answer is no proof it does not exist."""
     http.tool(
-        composio_tools.GOOGLEDRIVE_CREATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_CREATE_FILE,
         successful=False,
         error="the drive account is not connected",
     )
@@ -1617,7 +1656,7 @@ def test_create_file_keeps_a_failed_tool_answer_an_unknown_outcome(http):
 def test_create_file_sends_a_type_outside_the_tool_enum_as_octet_stream(http):
     """text/x-python is a valid text type natively but not one of the create
     tool's mimeType values, so the tool is asked for octet-stream."""
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1646,7 +1685,7 @@ def test_create_file_accepts_a_non_conversion_type_drive_stored_as_sent(http):
     create that is not a conversion must not be reported as a failed one."""
     content = "print(1)"
     data = content.encode("utf-8")
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1676,7 +1715,7 @@ def test_create_file_reports_a_conversion_that_did_not_happen(http):
     Google Docs conversion did not happen, so this is not a success."""
     content = "hello from the meeting"
     data = content.encode("utf-8")
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy(
         "webViewLink",
         200,
@@ -1743,7 +1782,7 @@ def test_create_file_reports_an_unverified_conversion_when_the_type_is_unreadabl
     """The tool answered with an id, but the read-back failed, so the stored
     type is unknown: an id proves the file exists, not that Drive converted
     it, so this is an unverified outcome rather than a success."""
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data=tool_data)
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data=tool_data)
     http.proxy("webViewLink", 500, {"error": {"code": 500, "message": "backend"}})
 
     result = json.loads(
@@ -1768,7 +1807,7 @@ def test_create_file_keeps_a_non_conversion_success_when_the_type_is_unreadable(
 ):
     """The negative control for the rule above: a create that asked for no
     conversion is not held to a type the read-back could not establish."""
-    http.tool(composio_tools.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
+    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, data={"id": "file1"})
     http.proxy("webViewLink", 500, {"error": {"code": 500, "message": "backend"}})
 
     result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello"))
@@ -1783,7 +1822,7 @@ def test_create_file_keeps_a_non_conversion_success_when_the_type_is_unreadable(
 def test_update_content_stages_and_runs_a_media_update(http, _isolate_environment):
     local = _replacement(_isolate_environment)
     _update(http, _current(), _updated())
-    http.tool(composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
+    http.tool(google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
 
     result = _call_update(local, expected_head_revision_id="rev-1")
 
@@ -1797,7 +1836,7 @@ def test_update_content_stages_and_runs_a_media_update(http, _isolate_environmen
     assert staged["mimetype"] == DECK_MIME
     assert http.puts[0]["data"] == NEW_CONTENT
     slug, arguments = http.tool_calls[0]
-    assert slug == composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE
+    assert slug == google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE
     assert arguments == {
         "fileId": "deck1",
         "file_to_upload": {
@@ -1882,7 +1921,7 @@ def test_update_content_is_unknown_when_another_writer_changed_the_file(
     local = _replacement(_isolate_environment)
     _update(http, _current(), _updated(b"another writer's bytes"))
     http.tool(
-        composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
         successful=False,
         error="the upload failed",
     )
@@ -1900,7 +1939,7 @@ def test_update_content_reports_a_definite_failure_when_the_file_is_unchanged(
     local = _replacement(_isolate_environment)
     _update(http, _current(), _current())
     http.tool(
-        composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
         successful=False,
         error="Google Drive refused the upload",
     )
@@ -1960,6 +1999,59 @@ def test_update_content_keeps_a_composio_rejection_as_a_definite_failure(
     assert result["file"]["headRevisionId"] == "rev-1"
 
 
+def test_update_content_says_nothing_changed_when_composio_refuses_and_the_re_read_fails(
+    http, monkeypatch, _isolate_environment
+):
+    """A 4xx other than 408 is a definite refusal: nothing was applied, so
+    that answer does not depend on the read-back that failed."""
+    local = _replacement(_isolate_environment)
+    http.proxy("capabilities", 200, _current())
+    http.proxy("md5Checksum", 500, {"error": {"code": 500, "message": "backend error"}})
+
+    def reject(*args: Any, **kwargs: Any) -> Any:
+        raise composio_tools.ComposioToolError(
+            "Composio could not run the Google Drive tool (HTTP 422)",
+            status=422,
+        )
+
+    monkeypatch.setattr(composio_tools, "execute_tool", reject)
+
+    result = _call_update(local, expected_head_revision_id="rev-1")
+
+    assert result["status"] == "error"
+    assert "did not accept the new content" in result["message"]
+    assert "Nothing was changed in Google Drive." in result["message"]
+    assert "HTTP 422" in result["message"]
+    assert "not known" not in result["message"]
+    # The file was not read again, so the pre-read state is what is reported.
+    assert "file" not in result
+    assert result["previous"]["headRevisionId"] == "rev-1"
+
+
+def test_update_content_keeps_an_unclear_refusal_unknown_when_the_re_read_fails(
+    http, monkeypatch, _isolate_environment
+):
+    """The negative control for the rule above: a 5xx may arrive after the
+    write landed, so a read-back that fails leaves that one unknown."""
+    local = _replacement(_isolate_environment)
+    http.proxy("capabilities", 200, _current())
+    http.proxy("md5Checksum", 500, {"error": {"code": 500, "message": "backend error"}})
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise composio_tools.ComposioToolError(
+            "Composio could not run the Google Drive tool (HTTP 503)",
+            status=503,
+        )
+
+    monkeypatch.setattr(composio_tools, "execute_tool", fail)
+
+    result = _call_update(local, expected_head_revision_id="rev-1")
+
+    assert result["status"] == "error"
+    assert "not known whether 'Quarterly Deck.pptx' changed" in result["message"]
+    assert "Nothing was changed" not in result["message"]
+
+
 def test_update_content_is_verified_by_drive_when_the_tool_reports_failure(
     http, _isolate_environment
 ):
@@ -1968,7 +2060,7 @@ def test_update_content_is_verified_by_drive_when_the_tool_reports_failure(
     local = _replacement(_isolate_environment)
     _update(http, _current(), _updated())
     http.tool(
-        composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
         successful=False,
         error="the upload timed out",
     )
@@ -1985,7 +2077,7 @@ def test_update_content_is_not_reported_as_done_when_the_checksum_disagrees(
 ):
     local = _replacement(_isolate_environment)
     _update(http, _current(), _updated(b"someone else's bytes"))
-    http.tool(composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
+    http.tool(google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
 
     result = _call_update(local, expected_head_revision_id="rev-1")
 
@@ -2000,7 +2092,7 @@ def test_update_content_is_not_reported_as_done_when_the_read_back_fails(
     local = _replacement(_isolate_environment)
     http.proxy("capabilities", 200, _current())
     http.proxy("md5Checksum", 500, {"error": {"code": 500, "message": "backend error"}})
-    http.tool(composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
+    http.tool(google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
 
     result = _call_update(local, expected_head_revision_id="rev-1")
 
@@ -2019,7 +2111,7 @@ def test_update_content_says_the_outcome_is_unknown_when_the_re_read_is_a_404(
         "md5Checksum", 404, {"error": {"code": 404, "message": "File not found."}}
     )
     http.tool(
-        composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
         successful=False,
         error="the upload failed",
     )
@@ -2044,7 +2136,7 @@ def test_update_content_says_the_outcome_is_unknown_when_the_re_read_is_a_403(
         {"error": {"code": 403, "message": "The user has not granted access."}},
     )
     http.tool(
-        composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
         successful=False,
         error="the upload failed",
     )
@@ -2084,7 +2176,7 @@ def test_a_large_replacement_is_staged_as_a_verified_stream(
     monkeypatch.setattr(google_drive, "_SIMPLE_UPLOAD_MAX_BYTES", 4)
     local = _replacement(_isolate_environment)
     _update(http, _current(), _updated())
-    http.tool(composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
+    http.tool(google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE, data={})
 
     result = _call_update(local)
 
@@ -2101,7 +2193,7 @@ def test_update_content_does_not_leak_the_api_key_or_the_upload_url(
     local = _replacement(_isolate_environment)
     _update(http, _current(), _current())
     http.tool(
-        composio_tools.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
+        google_drive_composio.GOOGLEDRIVE_UPLOAD_UPDATE_FILE,
         successful=False,
         error=f"bad key {API_KEY}",
     )
@@ -2189,7 +2281,7 @@ def test_the_staged_reader_reads_each_block_once():
             return chunk
 
     counted = CountingFile(payload)
-    reader = google_drive._VerifiedStagedReader(
+    reader = google_drive_composio._VerifiedStagedReader(
         counted, size=size, block_digests=digests
     )
     chunks: list[bytes] = []
@@ -2214,7 +2306,9 @@ def test_the_staged_reader_still_refuses_a_block_changed_after_the_first_read():
         for offset in range(0, size, google_drive._HASH_BLOCK_BYTES)
     ]
     fh = io.BytesIO(payload)
-    reader = google_drive._VerifiedStagedReader(fh, size=size, block_digests=digests)
+    reader = google_drive_composio._VerifiedStagedReader(
+        fh, size=size, block_digests=digests
+    )
 
     assert reader.read(16 * 1024) == b"a" * (16 * 1024)
     # Change the second block after the first one has been cached.
@@ -2228,20 +2322,20 @@ def test_the_staged_reader_still_refuses_a_block_changed_after_the_first_read():
 
 def test_a_tool_answer_prefers_a_nested_file_and_requires_a_drive_id():
     assert (
-        google_drive._tool_file_object({"id": "execution-1", "file": {"id": "file-1"}})[
-            "id"
-        ]
+        google_drive_composio._tool_file_object(
+            {"id": "execution-1", "file": {"id": "file-1"}}
+        )["id"]
         == "file-1"
     )
     assert (
-        google_drive._tool_file_object({"id": "execution-1", "data": {"id": "file-1"}})[
-            "id"
-        ]
+        google_drive_composio._tool_file_object(
+            {"id": "execution-1", "data": {"id": "file-1"}}
+        )["id"]
         == "file-1"
     )
     # A blank or execution-shaped id is not a Drive file id.
-    assert google_drive._tool_file_object({"id": " "}) == {}
-    assert google_drive._tool_file_object({"id": "not a drive id"}) == {}
+    assert google_drive_composio._tool_file_object({"id": " "}) == {}
+    assert google_drive_composio._tool_file_object({"id": "not a drive id"}) == {}
 
 
 def test_tool_docstrings_do_not_describe_the_per_file_limit():

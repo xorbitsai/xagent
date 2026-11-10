@@ -2,14 +2,15 @@
 
 While our own app approvals are pending, a connector can use Composio's app
 instead: Facebook and Instagram (``meta`` provider), Gmail and Google Drive
-(``google`` provider). Each app in
+(``google`` provider), and Salesforce. Each app in
 ``COMPOSIO_APPS`` names its own provider and has its own switch (for example
 ``XAGENT_FACEBOOK_AUTH_BACKEND``; set to ``composio``) and selects this flow
 for its new connects only; Meta Ads and WhatsApp share the ``meta`` provider
 and stay native, as do the other Google apps. Each app reads its identity its
 own way; Composio's Instagram toolkit uses Instagram Login, so its identity
-comes from ``graph.instagram.com``, and Gmail and Drive read Google's OIDC
-``sub``.
+comes from ``graph.instagram.com``, Gmail and Drive read Google's OIDC
+``sub``, and Salesforce reads the userinfo on the org's own host, taken from
+the connected account.
 
 The browser makes three trips, all to one shared callback URL whatever the
 app's provider (``shared_callback_url``: ``XAGENT_COMPOSIO_CALLBACK_URL``, or
@@ -126,6 +127,13 @@ COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID_ENV = "COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID
 # Google's OIDC userinfo endpoint (its discovery document's
 # ``userinfo_endpoint``); ``sub`` never changes and is never reused.
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+SALESFORCE_APP_ID = "salesforce"
+SALESFORCE_AUTH_BACKEND_ENV = "XAGENT_SALESFORCE_AUTH_BACKEND"
+COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV = "COMPOSIO_SALESFORCE_AUTH_CONFIG_ID"
+SALESFORCE_TOOLKIT_SLUG = "salesforce"
+# On the org's own host: login.salesforce.com's userinfo does not serve
+# sandbox orgs.
+SALESFORCE_USERINFO_PATH = "/services/oauth2/userinfo"
 # Every Composio app's trips (begin, verification, denial) land on one shared
 # callback URL, whatever the app's own provider: Composio's OAuth user
 # verification is a single URL per project, and the flow and actor proof
@@ -168,6 +176,41 @@ class ComposioApp(NamedTuple):
 _GRAPH_ID_RE = re.compile(r"[0-9]{1,32}")
 # Google subjects are numeric in practice; the OIDC limit is 255 characters.
 _GOOGLE_SUBJECT_RE = re.compile(r"[0-9]{1,255}")
+# A Salesforce User id in its 18-character form (key prefix 005), as OIDC
+# userinfo's ``user_id`` gives it.
+_SALESFORCE_USER_ID_RE = re.compile(r"005[0-9A-Za-z]{15}")
+_SALESFORCE_HOST_RE = re.compile(r"(?:[a-z0-9-]+\.)+salesforce\.com")
+
+
+def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
+    """The userinfo URL on the org host of the account's ``data.base_url``.
+
+    Composio finds the org at sign-in and keeps its host plus
+    ``/services/data/vNN.0`` there (#3646 live test). The check is the one
+    the Salesforce runtime applies to the same value (#3669): https, no
+    credentials or port, a subdomain of salesforce.com. The value comes from
+    what the member typed on Composio's page, so it is refused, never
+    trimmed, and never logged.
+    """
+    data = account.get("data")
+    base_url = data.get("base_url") if isinstance(data, dict) else None
+    if not isinstance(base_url, str):
+        return None
+    parts = urlsplit(base_url)
+    hostname = (parts.hostname or "").rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or port is not None
+        or not _SALESFORCE_HOST_RE.fullmatch(hostname)
+    ):
+        return None
+    return f"https://{hostname}{SALESFORCE_USERINFO_PATH}"
 
 
 COMPOSIO_APPS: dict[str, ComposioApp] = {
@@ -222,6 +265,20 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_field="sub",
         identity_params=(),
         identity_id_pattern=_GOOGLE_SUBJECT_RE,
+    ),
+    # Composio's connected app, so an org admin has to install it before the
+    # org's other users can connect (#3646).
+    SALESFORCE_APP_ID: ComposioApp(
+        app_id=SALESFORCE_APP_ID,
+        provider=SALESFORCE_APP_ID,
+        label="Salesforce",
+        backend_env=SALESFORCE_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV,
+        toolkit_slug=SALESFORCE_TOOLKIT_SLUG,
+        identity_url=_salesforce_userinfo_url,
+        identity_field="user_id",
+        identity_params=(),
+        identity_id_pattern=_SALESFORCE_USER_ID_RE,
     ),
 }
 

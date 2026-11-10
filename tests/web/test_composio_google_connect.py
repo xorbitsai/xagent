@@ -20,7 +20,10 @@ from sqlalchemy.orm import Session
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import composio_auth, mcp_apps
 from xagent.web.api import auth as auth_api
-from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+from xagent.web.builtin_mcp_registry import (
+    GOOGLE_RESTRICTED_SCOPES,
+    get_builtin_public_mcp_app,
+)
 from xagent.web.mcp_apps import ensure_builtin_oauth_server_definition
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import (
@@ -188,7 +191,13 @@ def _google_provider() -> SimpleNamespace:
     )
 
 
-def _start_google(db: Session, user: User, browser: Browser, app_id: str) -> Any:
+def _start_google(
+    db: Session,
+    user: User,
+    browser: Browser,
+    app_id: str,
+    provider: SimpleNamespace | None = None,
+) -> Any:
     response = auth_api.start_builtin_oauth_for_resource_owner(
         provider="google",
         app_id=app_id,
@@ -196,16 +205,22 @@ def _start_google(db: Session, user: User, browser: Browser, app_id: str) -> Any
         resource_owner_key=OWNER,
         redirect="https://toby.example.com/settings",
         db=db,
-        db_provider=_google_provider(),
+        db_provider=provider or _google_provider(),
     )
     db.commit()
     browser.receive(response)
     return response
 
 
-def _connect(db: Session, user: User, composio: GoogleComposio, app_id: str) -> Any:
+def _connect(
+    db: Session,
+    user: User,
+    composio: GoogleComposio,
+    app_id: str,
+    provider: SimpleNamespace | None = None,
+) -> Any:
     browser = Browser()
-    start = _start_google(db, user, browser, app_id)
+    start = _start_google(db, user, browser, app_id, provider)
     assert start.status_code in (302, 307), start.body
     begin = browser.get(db, start.headers["location"])
     assert begin.status_code == 302, begin.body
@@ -308,6 +323,75 @@ def test_a_composio_google_app_connects_while_the_gate_is_closed(
     assert response.status_code == 200, response.body
     (grant,) = _grants(db)
     assert (grant.provider, grant.token_type) == (app_id, "composio")
+
+
+def _restricted_defaults_provider() -> SimpleNamespace:
+    """A Google provider whose administrator-edited default scopes carry
+    every restricted scope (``OAuthProvider.default_scopes``)."""
+    provider = _google_provider()
+    provider.default_scopes = [
+        *provider.default_scopes,
+        *sorted(GOOGLE_RESTRICTED_SCOPES),
+    ]
+    return provider
+
+
+@pytest.mark.parametrize("app_id", GOOGLE_APPS)
+def test_restricted_provider_defaults_leave_a_composio_start_alone(
+    google, monkeypatch, app_id
+):
+    """Native provider defaults are never sent in a Composio flow, so they do
+    not meet the review gate there."""
+    db, user, composio = google
+    _switch_on(monkeypatch, app_id)
+    _install(db, user, app_id)
+
+    response = _connect(db, user, composio, app_id, _restricted_defaults_provider())
+
+    assert response.status_code == 200, response.body
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.token_type) == (app_id, "composio")
+
+
+def test_restricted_provider_defaults_still_refuse_a_native_start(google, monkeypatch):
+    db, user, composio = google
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+
+    response = auth_api.generic_oauth_login(
+        "google",
+        token=auth_api.create_access_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "session_epoch": user.session_epoch,
+            }
+        ),
+        app_id="google-drive",
+        db=db,
+        db_provider=_restricted_defaults_provider(),
+    )
+
+    assert response.status_code == 403
+    assert "location" not in response.headers
+    assert composio.calls == []
+
+
+def test_restricted_provider_defaults_still_refuse_a_native_actor_start(
+    google, monkeypatch
+):
+    """Toby's own start is native while the app's switch is off, and keeps
+    meeting the restricted-scope check."""
+    db, user, composio = google
+    _install(db, user, "google-drive")
+
+    response = _start_google(
+        db, user, Browser(), "google-drive", provider=_restricted_defaults_provider()
+    )
+
+    assert response.status_code == 403
+    assert "location" not in response.headers
+    assert composio.calls == []
 
 
 def test_gmail_stays_refused_while_only_drive_goes_through_composio(

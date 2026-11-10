@@ -4240,9 +4240,13 @@ def _generic_oauth_login(
     )
     if provider.lower() == "google":
         google_restricted_scopes = get_google_restricted_scopes()
-        # Provider defaults and custom apps must obey the same review gate.
-        if not google_restricted_scopes and GOOGLE_RESTRICTED_SCOPES.intersection(
-            scopes + app_optional_scopes
+        # Provider defaults and custom apps must obey the same review gate on
+        # a native start. A Composio start sends none of these scopes: it
+        # authorizes with Composio's Google app and its own scopes (#3649).
+        if (
+            auth_backend is None
+            and not google_restricted_scopes
+            and GOOGLE_RESTRICTED_SCOPES.intersection(scopes + app_optional_scopes)
         ):
             logger.warning("Rejected Google restricted scopes: app_id=%s", app_id)
             return HTMLResponse(

@@ -713,3 +713,56 @@ def test_an_error_that_echoes_the_message_hides_its_body_and_attachment(
     assert b"BODY-SECRET" in decoded
     # The attachment body is base64 inside the MIME message.
     assert base64.b64encode(b"ATTACHMENT-SECRET") in decoded
+
+
+def test_an_error_that_echoes_the_decoded_message_hides_a_long_recipient_list(
+    proxy, monkeypatch, tmp_path, caplog
+):
+    """A group send keeps the recipients on one long ``To:`` line. When the
+    vendor echoes the decoded message instead of the request body, redacting
+    that line used to shorten the text in front of the mail body and the
+    attached file, which then reached the tool result and the server log."""
+    monkeypatch.setenv("XAGENT_GMAIL_FILE_ALLOWED_DIRS", str(tmp_path))
+    attachment_bytes = b"ATTACHMENT-SECRET-" + bytes(range(256)) * 20
+    attachment = tmp_path / "secret.bin"
+    attachment.write_bytes(attachment_bytes)
+    recipients = ",".join(f"user{index:03d}@example.com" for index in range(70))
+    body = "TOOL-BODY-MARKER this is the mail body"
+    encoded_attachment = base64.b64encode(attachment_bytes).decode()
+    attachment_lines = [
+        encoded_attachment[index : index + 76]
+        for index in range(0, len(encoded_attachment), 76)
+    ]
+
+    def request(**kwargs: Any) -> _Response:
+        raw = kwargs["json"]["body"]["raw"]
+        decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+        return _Response(400, {"error": {"message": f"invalid body {decoded}"}})
+
+    monkeypatch.setattr(composio_proxy.requests, "request", request)
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    with caplog.at_level(logging.ERROR, logger="gmail-mcp"):
+        result = json.loads(
+            gmail.gmail_send_messages(
+                [
+                    {
+                        "to": recipients,
+                        "subject": "Group send",
+                        "body": body,
+                        "attachments": [str(attachment)],
+                    }
+                ],
+                action="send",
+            )
+        )
+
+    assert result["status"] == "error"
+    seen = (
+        result["message"]
+        + "\n"
+        + "\n".join(record.getMessage() for record in caplog.records)
+    )
+    assert body not in seen
+    assert "user000@example.com" not in seen
+    assert not [line for line in attachment_lines if line[:24] in seen]

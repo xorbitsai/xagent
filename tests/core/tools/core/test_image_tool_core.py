@@ -2,6 +2,7 @@
 Tests for ImageGenerationToolCore class
 """
 
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -149,6 +150,27 @@ class TestImageGenerationToolCore:
         # the skill closed: #942 deleted logo_overlay as brittle.
         assert "composite deterministically" not in description
         assert "ask the user to arrange" in description
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION,
+            ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION,
+        ],
+        ids=["generate", "edit"],
+    )
+    def test_documented_size_examples_are_multiples_of_16(
+        self, description: str
+    ) -> None:
+        """A size example is what the model copies, so every one has to be a
+        request the strict providers accept. 1080-wide social presets were the
+        examples, and they were rejected for not being multiples of 16."""
+        examples = re.findall(r'"(\d{2,5})[*x](\d{2,5})"', description)
+
+        assert examples
+        for width, height in examples:
+            assert int(width) % 16 == 0, (width, height)
+            assert int(height) % 16 == 0, (width, height)
 
     def test_init_with_models(self, mock_image_models, mock_workspace):
         """Test ImageGenerationToolCore initialization with models"""

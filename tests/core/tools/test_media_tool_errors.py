@@ -30,11 +30,14 @@ import aiohttp
 import pytest
 from aiohttp.client_reqrep import ConnectionKey
 
+from xagent.core.model import ImageModelConfig
 from xagent.core.model.asr.base import ASRResult, BaseASR
 from xagent.core.model.asr.elevenlabs import ElevenLabsASR
 from xagent.core.model.asr.xinference import XinferenceASR
 from xagent.core.model.image import dashscope as dashscope_image
-from xagent.core.model.image.dashscope import DashScopeImageModel
+from xagent.core.model.image.adapter import create_image_model
+from xagent.core.model.image.base import retry_image_call
+from xagent.core.model.image.dashscope import DashScopeAPIError, DashScopeImageModel
 from xagent.core.model.image.xinference import XinferenceImageModel
 from xagent.core.model.music.elevenlabs import ElevenLabsMusicModel
 from xagent.core.model.sound_effect.elevenlabs import ElevenLabsSoundEffectModel
@@ -45,6 +48,7 @@ from xagent.core.model.video import xinference as xinference_video
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BilledVideoTaskTimeout
 from xagent.core.model.video.xinference import XinferenceVideoModel
+from xagent.core.retry.strategy import ExponentialBackoff
 from xagent.core.tools.core.audio_tool import AudioToolCore
 from xagent.core.tools.core.image_tool import ImageGenerationToolCore
 from xagent.core.tools.core.media_errors import (
@@ -54,6 +58,7 @@ from xagent.core.tools.core.media_errors import (
     UNKNOWN,
     MediaParameterError,
     classify_media_failure,
+    media_failure_fields,
     redact_provider_detail,
 )
 from xagent.core.tools.core.music_tool import MusicToolCore
@@ -1042,6 +1047,198 @@ class TestDashScopeStatusCodes:
         assert result["success"] is False
         assert result["error_category"] == PROVIDER_UNAVAILABLE
         assert "upstream temporarily busy" not in json.dumps(result, default=str)
+
+
+class _CountingFakeSession(_FakeSession):
+    """A session that records how many requests actually left the tool."""
+
+    def __init__(self, response: _FakeHTTPResponse) -> None:
+        super().__init__(response)
+        self.calls = 0
+
+    def post(self, *args: Any, **kwargs: Any) -> _FakePost:
+        self.calls += 1
+        return super().post(*args, **kwargs)
+
+
+def _dashscope_tool(
+    monkeypatch: pytest.MonkeyPatch, response: _FakeHTTPResponse
+) -> tuple[ImageGenerationToolCore, _CountingFakeSession]:
+    """The production path: a DashScope model behind the image retry wrapper."""
+    session = _CountingFakeSession(response)
+    monkeypatch.setattr(
+        dashscope_image,
+        "create_public_model_aiohttp_session",
+        lambda **kwargs: session,
+    )
+    model = create_image_model(
+        ImageModelConfig(
+            id="dashscope-image",
+            model_name="qwen-image",
+            model_provider="dashscope",
+            api_key="test-key",
+            base_url=None,
+            timeout=5.0,
+            abilities=["generate", "edit"],
+            max_retries=3,
+        )
+    )
+    tool = ImageGenerationToolCore(
+        {"dashscope-image": model}, default_generate_model=model
+    )
+    return tool, session
+
+
+@pytest.fixture
+def instant_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Zero the backoff so a retry-count assertion does not sleep."""
+    monkeypatch.setattr(ExponentialBackoff, "get_delay", lambda self, attempt: 0.0)
+
+
+class TestRejectedSizeCarriesItsRule:
+    """A size the provider refuses comes back with the rule, in our words."""
+
+    SIZE_REJECTION_BODY = (
+        '{"error": {"code": "invalid_value", "type": "image_generation_user_error",'
+        ' "param": "size", "message": "Invalid size \'1080x1350\'. Width and height'
+        " must both be divisible by 16. Request id: 021760000000000f8, account:"
+        ' 2100123456784339."}}'
+    )
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_size_states_the_multiple_and_a_legal_size(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tool, session = _dashscope_tool(
+            monkeypatch, _FakeHTTPResponse(400, self.SIZE_REJECTION_BODY)
+        )
+
+        result = await tool.generate_image("A product shot", size="1080*1350")
+
+        assert result["success"] is False
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["allowed_values"] == {
+            "size": {
+                "width_multiple_of": 16,
+                "height_multiple_of": 16,
+                "suggested_size": "1088*1360",
+            }
+        }
+        assert result["error"] == (
+            "The request was rejected because a parameter is outside what this "
+            "model supports."
+        )
+        readable = json.dumps(result, default=str)
+        for provider_wording in (
+            "Invalid size",
+            "divisible by",
+            "021760000000000f8",
+            "2100123456784339",
+        ):
+            assert provider_wording not in readable
+        # A rejected parameter is not retried: one request, not three.
+        assert session.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_size_lists_the_sizes_the_provider_accepts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A provider that enumerates its sizes gets that list, with the
+        refused size and its non-size values left out."""
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "invalid_value",
+                    "param": "size",
+                    "message": (
+                        "Invalid value: '1080x1350'. Supported values are: "
+                        "'1024x1024', '1536x1024', '1024x1536', 'auto'."
+                    ),
+                }
+            }
+        )
+        tool, session = _dashscope_tool(monkeypatch, _FakeHTTPResponse(400, body))
+
+        result = await tool.generate_image("A product shot", size="1080*1350")
+
+        assert result["error_category"] == INVALID_REQUEST
+        assert result["allowed_values"] == {
+            "size": ["1024*1024", "1536*1024", "1024*1536"]
+        }
+        readable = json.dumps(result, default=str)
+        assert "1080" not in readable
+        assert "Supported values" not in readable
+        assert "auto" not in readable
+        assert session.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_an_unrecognized_rejection_keeps_the_generic_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a rule we can restate becomes a constraint; a rejection that
+        names no rule must not invent one."""
+        body = (
+            '{"error": {"code": "invalid_value", "param": "size",'
+            ' "message": "Invalid size \'999x999\'."}}'
+        )
+        tool, session = _dashscope_tool(monkeypatch, _FakeHTTPResponse(400, body))
+
+        result = await tool.generate_image("A product shot", size="999*999")
+
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+        assert "999x999" not in json.dumps(result, default=str)
+        assert session.calls == 1
+
+    def test_a_size_rule_without_the_requested_size_is_not_offered(self) -> None:
+        """Tools that do not pass the size they asked for keep the old result:
+        the rule is meaningful only next to a suggestion this tool computed."""
+        error = ProviderStatusError(
+            status_code=400,
+            code="InvalidParameter",
+            message="Width and height must both be divisible by 16",
+            param="size",
+        )
+
+        fields = media_failure_fields(
+            error,
+            logger=logging.getLogger(__name__),
+            action="Video generation failed",
+        )
+
+        assert fields["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in fields
+
+
+class TestParameterRejectionsAreTerminal:
+    """A request the provider refused as invalid is never sent again."""
+
+    @pytest.mark.parametrize("status", [400, 409, 413, 415, 422])
+    def test_a_parameter_status_is_not_retried(self, status: int) -> None:
+        assert (
+            retry_image_call(DashScopeAPIError("rejected", status_code=status)) is False
+        )
+
+    @pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
+    def test_a_transient_status_still_retries(self, status: int) -> None:
+        assert retry_image_call(DashScopeAPIError("busy", status_code=status)) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 503])
+    async def test_an_outage_is_attempted_the_configured_number_of_times(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        instant_retries: None,
+        status: int,
+    ) -> None:
+        tool, session = _dashscope_tool(
+            monkeypatch, _FakeHTTPResponse(status, "upstream temporarily busy")
+        )
+
+        result = await tool.generate_image("A product shot")
+
+        assert result["error_category"] == PROVIDER_UNAVAILABLE
+        assert session.calls == 3
 
 
 def _connection_key() -> ConnectionKey:

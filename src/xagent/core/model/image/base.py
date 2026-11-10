@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Awaitable, Callable, List, Optional
 
+from ...tools.core.media_errors import is_parameter_rejection
 from ..public_http import is_model_network_policy_error
 
 # NOT a claim that these providers edit across their lineup -- xinference defaults
@@ -85,7 +86,7 @@ def invalid_response_from(
 
 
 def retry_image_call(e: Exception) -> bool:
-    """Do not retry a policy refusal or an already-billed invalid response.
+    """Do not retry a policy refusal, a billed invalid response or a bad parameter.
 
     Deliberately as permissive as ``create_retry_wrapper``'s own
     ``lambda _: True`` default, except for those terminal failures. Providers flatten
@@ -105,12 +106,21 @@ def retry_image_call(e: Exception) -> bool:
     Network-policy denials (including wrapped SDK errors) are terminal and
     happen before sending a billable request. Retrying cannot make them valid.
 
+    A parameter rejection -- an adapter's typed error, or the 4xx statuses
+    ``is_parameter_rejection`` names -- is terminal for the same reason and one
+    more: the provider re-reads and refuses the same request on every attempt,
+    so a retry only multiplies how long the caller waits for an answer that
+    cannot change. The caller fixes the parameter from the constraint the tool
+    result carries, not from a second identical call.
+
     Every retryable failure here is a genuinely separate billed call, so the
     per-attempt accounting the providers do stays correct.
     """
-    return not isinstance(
-        e, InvalidImageResponseError
-    ) and not is_model_network_policy_error(e)
+    return not (
+        isinstance(e, InvalidImageResponseError)
+        or is_model_network_policy_error(e)
+        or is_parameter_rejection(e)
+    )
 
 
 def decode_billed_body(decode: Callable[[], Any], context: str) -> Any:

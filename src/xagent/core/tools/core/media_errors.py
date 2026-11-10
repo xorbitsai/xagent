@@ -609,6 +609,24 @@ def classify_media_failure(exc: BaseException) -> str:
     return UNKNOWN
 
 
+def is_parameter_rejection(exc: BaseException) -> bool:
+    """Whether ``exc`` says the caller's own parameters were refused.
+
+    The same rule :func:`classify_media_failure` uses for
+    :data:`INVALID_REQUEST`: an adapter's typed parameter error, or an HTTP
+    status that means the request has to change. A retry policy asks this
+    before sending the identical request again -- no attempt can turn a
+    refused parameter into an accepted one, and each attempt is a separate
+    provider call.
+    """
+    for link in _exception_chain(exc):
+        if isinstance(link, MediaParameterError):
+            return True
+        if _status_code(link) in _INVALID_REQUEST_STATUSES:
+            return True
+    return False
+
+
 def media_error_fields(
     category: str,
     *,
@@ -646,6 +664,110 @@ def _parameter_error(exc: BaseException) -> Optional[MediaParameterError]:
     return None
 
 
+# A provider that rejects a size for a rule it states in words this module can
+# restate without quoting it: a dimension must be a multiple of some number.
+# Deliberately narrow -- the dimension word has to sit in the same sentence as
+# the rule, so a divisor that belongs to another parameter cannot become a
+# size range. A value outside a preset list is handled only when the provider
+# enumerates the list (below); every other size rejection keeps the generic
+# sentence rather than a guessed constraint.
+_SIZE_MULTIPLE_PATTERN = re.compile(
+    r"(?i)\b(?:width|height|sizes?|dimensions?)\b[^.;!?]{0,80}?"
+    r"\b(?:divisible\s+by|multiple\s+of)\s+(\d{1,4})\b"
+)
+
+# The requested size as the tool receives it: "1080*1350" or "1080x1350", the
+# two separators the adapters accept.
+_SIZE_VALUE_PATTERN = re.compile(r"^\s*(\d{1,5})\s*[*xX×]\s*(\d{1,5})\s*$")
+
+# A provider that enumerates the sizes it accepts, e.g. "Supported values are:
+# '1024x1024', '1536x1024', 'auto'." Only the sentence that introduces the
+# list is read, so a dimension mentioned anywhere else in the message cannot
+# become an accepted value, and only digit pairs are kept, so a non-size value
+# such as "auto" is dropped rather than presented as a dimension.
+_SIZE_LIST_PATTERN = re.compile(
+    r"(?i)\b(?:supported|allowed)\s+(?:sizes?|values?)\s*(?:are|include|:)\s*"
+    r"(?P<values>[^}\n]{1,400})"
+)
+_SIZE_TOKEN_PATTERN = re.compile(r"(?<!\d)(\d{2,5})\s*[*xX×]\s*(\d{2,5})(?!\d)")
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """The nearest multiple of ``multiple`` at or above ``value``."""
+    return (value + multiple - 1) // multiple * multiple
+
+
+def _requested_size_pair(size: Optional[str]) -> Optional[tuple[int, int]]:
+    """``(width, height)`` from the size the tool asked for, if it parses."""
+    match = _SIZE_VALUE_PATTERN.match(size or "")
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _names_size(text: str, pair: tuple[int, int]) -> bool:
+    """Whether ``text`` repeats the requested size, in either separator."""
+    return re.search(rf"(?<!\d){pair[0]}\s*[*xX×]\s*{pair[1]}(?!\d)", text) is not None
+
+
+def _size_constraint_allowed_values(
+    exc: BaseException, requested_size: Optional[str]
+) -> Optional[dict[str, Any]]:
+    """The rule behind a rejected size, in this module's own words.
+
+    A provider answers a bad size in its own phrasing -- ``Invalid size
+    '1080x1350'. Width and height must both be divisible by 16.`` -- which
+    the tool must not repeat. Where the rule is one this module can restate
+    without quoting it, the result offers either the multiple the dimensions
+    must satisfy (and, when the request carried a parseable size, the nearest
+    larger size that satisfies it) or the exact sizes the provider says it
+    accepts. Anything else is left to the generic sentence: a guessed rule
+    sends the caller to change a parameter that was never the problem. A
+    caller that does not know the size it asked for passes no
+    ``requested_size``, and no rule is offered either: the hint is only
+    meaningful next to the size this module was given.
+    """
+    if not requested_size:
+        return None
+    text = " ".join(str(link) for link in _exception_chain(exc))
+    requested_pair = _requested_size_pair(requested_size)
+
+    match = _SIZE_MULTIPLE_PATTERN.search(text)
+    if match is not None:
+        multiple = int(match.group(1))
+        if multiple < 2:
+            return None
+        constraint: dict[str, Any] = {
+            "width_multiple_of": multiple,
+            "height_multiple_of": multiple,
+        }
+        if requested_pair is not None:
+            width, height = requested_pair
+            if width > 0 and height > 0:
+                constraint["suggested_size"] = (
+                    f"{_round_up_to_multiple(width, multiple)}"
+                    f"*{_round_up_to_multiple(height, multiple)}"
+                )
+        return {"size": constraint}
+
+    # The list is only read when the message names the size that was refused:
+    # an enumeration on its own may belong to another parameter. The refused
+    # size is dropped even if the provider echoes it in the list.
+    list_match = _SIZE_LIST_PATTERN.search(text)
+    if list_match is None or requested_pair is None:
+        return None
+    if not _names_size(text, requested_pair):
+        return None
+    sizes: list[str] = []
+    for width, height in _SIZE_TOKEN_PATTERN.findall(list_match.group("values")):
+        if (int(width), int(height)) == requested_pair:
+            continue
+        token = f"{width}*{height}"
+        if token not in sizes:
+            sizes.append(token)
+    return {"size": sizes} if sizes else None
+
+
 def _model_identity(model: Any) -> tuple[str, str]:
     """``(provider, model name)`` for the not-enabled log marker."""
     for attribute in ("model_provider", "provider_name", "provider"):
@@ -671,6 +793,7 @@ def media_failure_fields(
     logger: logging.Logger,
     action: str,
     model: Any = None,
+    requested_size: Optional[str] = None,
 ) -> dict[str, Any]:
     """Log ``exc`` and return the failure fields that replace ``str(exc)``.
 
@@ -684,6 +807,13 @@ def media_failure_fields(
     one: the body may name a field, a different field, or none at all, and a
     list for a field it never blamed sends the caller to change the wrong
     thing. Such a failure carries no ``allowed_values``.
+
+    ``requested_size`` is the one exception, and only for the image tools that
+    know it: a provider that refuses a size for a rule this module can restate
+    (a dimension multiple, or the exact sizes it enumerates) gets that rule,
+    plus the nearest legal size where one can be computed, alongside the
+    generic sentence. The rule is written here from the requested size; the
+    provider's own wording stays in the log and is never quoted in the result.
     """
     category = classify_media_failure(exc)
     logger.error(
@@ -697,7 +827,8 @@ def media_failure_fields(
         provider, name = _model_identity(model)
         logger.error("media model not enabled: provider=%s model=%s", provider, name)
     rejected = _parameter_error(exc)
-    return media_error_fields(
-        category,
-        allowed_values=rejected.allowed_values if rejected is not None else None,
-    )
+    if rejected is not None:
+        allowed_values = rejected.allowed_values
+    else:
+        allowed_values = _size_constraint_allowed_values(exc, requested_size)
+    return media_error_fields(category, allowed_values=allowed_values)

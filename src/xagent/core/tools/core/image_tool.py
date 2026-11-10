@@ -17,7 +17,7 @@ from urllib import parse
 
 from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, parse_file_id_ref
-from ...model.image.base import BaseImageModel
+from ...model.image.base import BaseImageModel, resolve_requested_size
 from ...utils.media_download import (
     describe_media_download_error,
     download_public_media,
@@ -98,10 +98,10 @@ transparent-background support):
 
 Parameters:
 - prompt (required): optimized image description with visual details
-- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024"). Defaults to a square when omitted, so for ads, posters, and social graphics always pass the placement's real dimensions or aspect_ratio explicitly instead of relying on the default.
+- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1088*1360"). Prefer a width and height that are both multiples of 16; some models reject other values. Defaults to a square when omitted, so for ads, posters, and social graphics pass the placement's dimensions rounded up to multiples of 16, or aspect_ratio, instead of relying on the default.
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
-- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1088x1360"), with the same multiple-of-16 guidance as size
 - aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
 - negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
@@ -110,6 +110,7 @@ Parameters:
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
 - Different models have different size capabilities and constraints
+- **Size alignment**: several models accept only a size whose width and height are both multiples of 16. If the user names a pixel size, round each dimension up to the nearest multiple of 16 before passing it; when unsure, use aspect_ratio instead.
 - **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
 - **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
 - **DashScope models**: Support limited size options
@@ -164,15 +165,16 @@ Parameters:
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
 - transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene. Only models marked ◻ support it; the call fails on any other model. Asking for it in the prompt text does NOT work.
-- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
+- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1088*1360"). Prefer a width and height that are both multiples of 16; some models reject other values.
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
-- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1088x1360"), with the same multiple-of-16 guidance as size
 - aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
 - Different models have different size capabilities and constraints
+- **Size alignment**: several models accept only a size whose width and height are both multiples of 16. If the user names a pixel size, round each dimension up to the nearest multiple of 16 before passing it; when unsure, use aspect_ratio instead.
 - **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
 - **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
 - **DashScope models**: Support limited size options
@@ -722,7 +724,7 @@ Images are automatically saved to workspace.
             model_id: Specific model ID to use (optional, uses default if not provided)
             width: Image width in pixels (alternative to size)
             height: Image height in pixels (alternative to size)
-            resolution: Image resolution (e.g., "1920x1080")
+            resolution: Image resolution (e.g., "1088x1360")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
             images: Optional source/reference image(s). When provided, delegate to edit_image.
             transparent_background: Return a PNG with a real alpha channel.
@@ -806,6 +808,9 @@ Images are automatically saved to workspace.
                         logger=logger,
                         action="Image generation failed",
                         model=image_model,
+                        requested_size=resolve_requested_size(
+                            size, resolution=resolution, width=width, height=height
+                        ),
                     ),
                     "image_path": None,
                     "model_used": self._resolve_model_label(image_model, model_id),
@@ -902,7 +907,7 @@ Images are automatically saved to workspace.
             size: Image size in format "width*height" (e.g., "1024*1024")
             width: Image width in pixels (alternative to size)
             height: Image height in pixels (alternative to size)
-            resolution: Image resolution (e.g., "1920x1080")
+            resolution: Image resolution (e.g., "1088x1360")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
             transparent_background: Return a PNG with a real alpha channel, e.g.
                 to cut the subject out of its scene. Only models whose provider
@@ -982,6 +987,9 @@ Images are automatically saved to workspace.
                         logger=logger,
                         action="Image editing failed",
                         model=image_model,
+                        requested_size=resolve_requested_size(
+                            size, resolution=resolution, width=width, height=height
+                        ),
                     ),
                     "image_path": None,
                     "model_used": self._resolve_model_label(image_model, model_id),

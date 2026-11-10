@@ -44,6 +44,7 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
+from ...core.guardrails.input import InputReviewRejected
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -2400,6 +2401,19 @@ async def handle_task_message(
                                         disposition
                                         is InjectionDisposition.FAILED_BEFORE_WRITE
                                     )
+                                    if before_write and isinstance(
+                                        injection_error, InputReviewRejected
+                                    ):
+                                        task_execution_service.background_task_manager.release_resume_reservation(
+                                            task_id
+                                        )
+                                        reservation_released = True
+                                        await finish_delivery_failure(
+                                            str(injection_error),
+                                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
+                                            retry_with_new_id=True,
+                                        )
+                                        return
                                     if before_write and isinstance(
                                         injection_error, CheckpointUnavailableError
                                     ):

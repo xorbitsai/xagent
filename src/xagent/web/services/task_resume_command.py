@@ -18,6 +18,11 @@ from ...core.agent.checkpoint import (
     CheckpointReadError,
     UnknownToolEffectError,
 )
+from ...core.guardrails.input import (
+    BLOCKED_INPUT,
+    UNAVAILABLE_INPUT,
+    InputReviewRejected,
+)
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
@@ -310,6 +315,10 @@ async def enqueue_resume_input(
         raise TaskResumeBusyError
     if result["outcome"] == "not_resumable":
         raise TaskResumeNotResumableError
+    if result["outcome"] == "input_blocked":
+        raise InputReviewRejected(BLOCKED_INPUT)
+    if result["outcome"] == "input_review_unavailable":
+        raise InputReviewRejected(UNAVAILABLE_INPUT)
     if result["outcome"] == "auto_model_unavailable":
         raise AutoModelUnavailableError("Configured Auto model is unavailable")
     if result["outcome"] == "retryable_unavailable":
@@ -510,6 +519,8 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             outcome = "accepted"
         except TaskResumeOutcomeUnknownError:
             outcome = "unknown"
+        except InputReviewRejected as exc:
+            outcome = "input_review_unavailable" if exc.unavailable else "input_blocked"
         except TaskResumeNotAcceptedError:
             # Nothing was written. The stored result is the answer for every
             # retry of this command: "busy" with the resend-with-a-new-id

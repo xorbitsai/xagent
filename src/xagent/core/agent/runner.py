@@ -24,6 +24,7 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
+from ..guardrails.input import InputReviewRejected, filter_input_history, review_input
 from ..guardrails.output import (
     BLOCKED_OUTPUT,
     UNAVAILABLE_OUTPUT,
@@ -399,6 +400,23 @@ class AgentRunner:
                 task=task,
                 checkpoint=checkpoint,
                 execution_id=execution_id,
+            )
+        if checkpoint is None and task:
+            request_context = (metadata or {}).get("request_context")
+            display_message = (
+                request_context.get("display_message")
+                if isinstance(request_context, dict)
+                else None
+            )
+            decision = await review_input(
+                execution_id,
+                display_message if isinstance(display_message, str) else task,
+                execution_text=task,
+            )
+            if decision.refusal:
+                return {"success": True, "output": decision.refusal}
+            initial_messages = filter_input_history(
+                initial_messages or [], decision.excluded_inputs
             )
         # The context is cached from here on. A failure before the run's own
         # ``try`` below would otherwise leave a cached context that looks
@@ -1276,6 +1294,15 @@ class AgentRunner:
                             request_interrupt=request_interrupt,
                             reason=reason,
                         )
+
+                if resolved_execution_message:
+                    decision = await review_input(
+                        execution_id,
+                        resolved_display_message or resolved_execution_message,
+                        execution_text=resolved_execution_message,
+                    )
+                    if decision.refusal:
+                        raise InputReviewRejected(decision.refusal)
 
                 # Resolve the checkpoint-merge baseline before any context mutation
                 # below (add_user_message, pending marker) so a failed read leaves

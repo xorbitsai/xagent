@@ -92,6 +92,7 @@ from ...core.execution_scope import (
     resolve_execution_scope,
 )
 from ...core.file_ref import build_file_ref
+from ...core.guardrails.input import InputReviewRejected
 from ...core.workspace import _is_sandbox_prepared
 from ..models.database import (
     get_db,
@@ -4871,7 +4872,12 @@ async def execute_resume_background(
             return
         elif delivery_outcome_unknown:
             await fail_deferred_delivery()
-        elif isinstance(e, _DeferredInjectionRejectedRetryableError):
+        elif isinstance(
+            e, (_DeferredInjectionRejectedRetryableError, InputReviewRejected)
+        ):
+            fenced = (
+                isinstance(e, _DeferredInjectionRejectedRetryableError) and e.fenced
+            )
             # Nothing was written for this message, so it is never failed or
             # resumed for. A fence left by an earlier uncertain input keeps the
             # task paused for the user. Without one (a read-back proved this
@@ -4879,7 +4885,7 @@ async def execute_resume_background(
             # prior status that cannot be restored without re-running or
             # re-announcing a result is paused instead.
             if (
-                not e.fenced
+                not fenced
                 and lease is not None
                 and not lease_released
                 and resume_prior_status
@@ -4891,11 +4897,13 @@ async def execute_resume_background(
             logger.warning(
                 "Task %s deferred message was not accepted (fenced=%s)",
                 task_id,
-                e.fenced,
+                fenced,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
                 await fail_deferred_delivery(
-                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    str(e)
+                    if isinstance(e, InputReviewRejected)
+                    else client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
                     error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                     retry_with_new_id=True,
                     rejection_outcome="not_accepted",

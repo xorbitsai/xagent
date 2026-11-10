@@ -303,6 +303,41 @@ async def test_reply_waits_for_previous_execution_to_release_lease(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a"])
+async def test_input_review_rejection_restores_waiting_reply(
+    reply, monkeypatch, source
+):
+    from types import SimpleNamespace
+
+    from xagent.core.guardrails.input import BLOCKED_INPUT, InputReviewRejected
+
+    with get_session_local()() as db:
+        db.get(Task, reply.task_id).source = source
+        db.commit()
+    post = AsyncMock(side_effect=InputReviewRejected(BLOCKED_INPUT))
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(
+            return_value=SimpleNamespace(post_user_message=post)
+        )
+    )
+    monkeypatch.setattr(
+        task_resume.agent_runtime_service, "get_agent_manager", lambda: manager
+    )
+    message_id = "message" if source == "a2a" else ""
+    command_id = module._admit_reply(reply, source, message_id, "original")
+    with get_session_local()() as db:
+        command = await claim_task_command(
+            db, runner_id="worker-1", command_db_id=command_id
+        )
+    await execute_durable_task_command(command)
+    assert module._read_reply_outcome(command_id)["outcome"] == "input_blocked"
+    assert module._admit_reply(reply, source, message_id, "original") == command_id
+    with get_session_local()() as db:
+        assert db.get(Task, reply.task_id).status == TaskStatus.WAITING_FOR_USER
+    post.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_a2a_retries_checkpoint_read_failure_with_same_message_id(
     reply, monkeypatch
 ):

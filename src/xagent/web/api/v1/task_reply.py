@@ -10,6 +10,7 @@ from ....core.agent.checkpoint import (
     CheckpointReadError,
     UnknownToolEffectError,
 )
+from ....core.guardrails.input import InputReviewRejected
 from ...models.database import get_session_local
 from ...schemas.v1 import (
     REPLY_STATUS_QUEUED,
@@ -127,6 +128,12 @@ async def reply_to_task(
 
     try:
         result = await task_resume_service.resume_task_reply(ctx)
+    except InputReviewRejected as exc:
+        if exc.unavailable:
+            raise V1ApiError(
+                V1ErrorCode.TEMPORARILY_UNAVAILABLE, 503, message=str(exc)
+            ) from exc
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
     except task_resume_service.TaskResumeOutcomeUnknownError as exc:
         raise V1ApiError(
             V1ErrorCode.REPLY_OUTCOME_UNKNOWN,

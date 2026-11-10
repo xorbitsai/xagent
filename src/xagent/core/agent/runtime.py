@@ -261,6 +261,37 @@ class ToolCallInterrupted(ExecutionInterrupted):
     """Raised when an active tool call is cancelled by an execution interrupt."""
 
 
+async def resolve_virtual_llm(
+    *,
+    llm: Any,
+    messages: list[dict[str, Any]],
+    context: Any,
+) -> Any:
+    """Resolve a virtual model (Auto) to the concrete model one call runs on.
+
+    Returns ``llm`` itself when it has no per-call preparation hook. Unlike
+    :func:`prepare_llm_for_context` this never touches the compaction
+    threshold, so a caller resolving a *secondary* model (the compact model)
+    cannot overwrite the threshold derived from the main model's window.
+    """
+    prepare = getattr(llm, "prepare_for_call", None)
+    if not callable(prepare):
+        return llm
+    metadata = getattr(context, "metadata", None)
+    preferred_modalities = normalize_input_modalities(
+        ()
+        if not metadata or not isinstance(metadata, Mapping)
+        else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
+    )
+    prepared = prepare(
+        messages,
+        preferred_input_modalities=preferred_modalities,
+    )
+    if inspect.isawaitable(prepared):
+        prepared = await prepared
+    return prepared
+
+
 async def prepare_llm_for_context(
     *,
     llm: Any,
@@ -274,21 +305,7 @@ async def prepare_llm_for_context(
     concrete xrouter selection, ensuring the selected model is reused after
     compaction instead of routing twice.
     """
-    prepared = llm
-    prepare = getattr(llm, "prepare_for_call", None)
-    if callable(prepare):
-        metadata = getattr(context, "metadata", None)
-        preferred_modalities = normalize_input_modalities(
-            ()
-            if not metadata or not isinstance(metadata, Mapping)
-            else metadata.get(PREFERRED_INPUT_MODALITIES_METADATA_KEY)
-        )
-        prepared = prepare(
-            messages,
-            preferred_input_modalities=preferred_modalities,
-        )
-        if inspect.isawaitable(prepared):
-            prepared = await prepared
+    prepared = await resolve_virtual_llm(llm=llm, messages=messages, context=context)
 
     context_window = getattr(prepared, "context_window", None)
     compact_config = getattr(context, "compact_config", None)
@@ -319,6 +336,14 @@ async def prepare_llm_for_context(
         )
 
     return prepared
+
+
+def _messages_for_compact_routing(context: Any) -> list[dict[str, Any]]:
+    getter = getattr(context, "get_messages_for_llm", None)
+    if not callable(getter):
+        return []
+    messages = getter()
+    return list(messages) if isinstance(messages, list) else []
 
 
 def resolved_llm_metadata(llm: Any) -> dict[str, Any]:
@@ -2184,6 +2209,33 @@ class PatternRuntime:
         # degrade markers.
         compact_outcome: dict[str, Any] = {}
         compaction_blocked = False
+        # A virtual compact model (Auto) carries no context window of its own;
+        # only the concrete model it selects does. Callers hand over the main
+        # model already resolved, but an explicitly configured compact model
+        # arrives unresolved, which would read as "no context_window" and
+        # switch compaction off. Resolve it here, for every pattern, without
+        # touching the threshold the main model's window set.
+        if llm is not None and callable(getattr(llm, "prepare_for_call", None)):
+            try:
+                llm = await resolve_virtual_llm(
+                    llm=llm,
+                    messages=_messages_for_compact_routing(context),
+                    context=context,
+                )
+            except (LLMCallInterrupted, ExecutionEventPersistenceError):
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # No concrete summarizer could be chosen: degrade to the
+                # message-dropping fallback instead of failing the turn.
+                logger.warning(
+                    "Could not resolve the compact model for context "
+                    "compaction (%s: %s); falling back to dropping messages. "
+                    "execution_id=%s",
+                    type(exc).__name__,
+                    exc,
+                    getattr(context, "execution_id", None),
+                )
+                llm = None
         if (
             llm is not None
             and callable(getattr(llm, "chat", None))

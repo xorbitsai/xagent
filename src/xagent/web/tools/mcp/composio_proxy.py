@@ -318,7 +318,7 @@ _FRAGMENT_REDACT_CHARS = 24
 #
 # It is sized from both ends: every shape this repository's tests and the
 # reference cases used to take a few hundred milliseconds stay exact (the most
-# expensive spends 3.7M of it), and the shapes that took seconds are cut. The
+# expensive spends 8.8M of it), and the shapes that took seconds are cut. The
 # largest term this bound has is the preparation of a fragment-dense body:
 # 366,666 short lines spend 9.2M on it and 3.3M on the scan of their whole
 # echo, and the pass takes 0.16-0.21 s here. The report records the

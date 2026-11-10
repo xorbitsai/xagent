@@ -890,14 +890,20 @@ def test_upload_file_does_not_claim_success_without_the_new_file_id(
 
 
 def _same_name_file(**overrides: Any) -> dict[str, Any]:
-    """A file the same-name lookup finds: the lookup's only diagnostic fields.
+    """A file the same-name lookup can find.
 
-    Its id, name and creation time are what a person checks by hand; none of
-    them, and no checksum, proves this call created it.
+    It carries the checksum, size and type the old matching rules looked at as
+    well as the id, name and creation time the lookup now asks for, so a test
+    that feeds one of these to a create would fail if a match on any of them
+    were ever reported as this call's result again.
     """
     entry = {
         "id": _NEW_ID,
         "name": "Report.pdf",
+        "mimeType": "application/pdf",
+        "size": str(len(NEW_CONTENT)),
+        "md5Checksum": _md5(NEW_CONTENT),
+        "webViewLink": f"https://drive.google.com/file/d/{_NEW_ID}/view",
         "createdTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     entry.update(overrides)
@@ -909,10 +915,17 @@ def _same_name_folder(**overrides: Any) -> dict[str, Any]:
     entry = {
         "id": "folder1",
         "name": "Report.pdf",
+        "mimeType": "application/vnd.google-apps.folder",
+        "webViewLink": "https://drive.google.com/drive/folders/folder1",
         "createdTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     entry.update(overrides)
     return entry
+
+
+def _candidate(file: dict[str, Any]) -> dict[str, str]:
+    """The diagnostics an unknown create's answer reports for ``file``."""
+    return {key: file[key] for key in ("id", "name", "createdTime") if key in file}
 
 
 def _seconds_ago(seconds: int) -> str:
@@ -974,7 +987,7 @@ def test_upload_file_does_not_take_a_same_bytes_file_for_the_upload(
     assert f"id '{_NEW_ID}'" in result["message"]
     assert "may be the file this call was making" in result["message"]
     assert "It is not known whether this call uploaded a file" in result["message"]
-    assert result["candidates"] == [candidate]
+    assert result["candidates"] == [_candidate(candidate)]
     # One tool call, no retry: a retry could create a duplicate.
     assert len(calls) == 1
     lookup = [call for call in http.proxy_calls if "name = " in str(call)]
@@ -1037,7 +1050,7 @@ def test_upload_file_does_not_take_a_same_name_folder_for_the_upload(
     assert "file" not in result
     assert f"id '{folder['id']}'" in result["message"]
     assert "It is not known whether this call uploaded a file" in result["message"]
-    assert result["candidates"] == [folder]
+    assert result["candidates"] == [_candidate(folder)]
 
 
 def test_upload_file_treats_a_408_as_unknown_and_looks_the_file_up(
@@ -1207,7 +1220,7 @@ def test_upload_file_looks_the_file_up_when_the_read_back_is_a_404(
     assert result["status"] == "error"
     assert "file" not in result
     assert f"id '{candidate['id']}'" in result["message"]
-    assert result["candidates"] == [candidate]
+    assert result["candidates"] == [_candidate(candidate)]
     lookup = [call for call in http.proxy_calls if "name = " in str(call)]
     assert len(lookup) == 1
 
@@ -1274,7 +1287,7 @@ def test_upload_file_does_not_take_an_older_same_name_file_for_the_upload(
     assert f"id '{_NEW_ID}'" in result["message"]
     assert "It is not known whether this call uploaded a file" in result["message"]
     assert "the upload may still be finishing in Composio" not in result["message"]
-    assert result["candidates"] == [older]
+    assert result["candidates"] == [_candidate(older)]
 
 
 def test_the_create_lookup_searches_every_drive(
@@ -1467,6 +1480,9 @@ def test_create_file_keeps_a_recent_same_name_doc_an_unknown_outcome(http, monke
     earlier_doc = {
         "id": "doc1",
         "name": "Meeting notes",
+        # The type the lookup used to compare. A Workspace file has no
+        # checksum, which is exactly why the old no-checksum branch took it.
+        "mimeType": GOOGLE_DOC_MIME,
         "createdTime": _seconds_ago(20),
     }
     http.proxy("name = ", 200, {"files": [earlier_doc]})
@@ -1484,7 +1500,7 @@ def test_create_file_keeps_a_recent_same_name_doc_an_unknown_outcome(http, monke
     assert earlier_doc["createdTime"] in result["message"]
     assert "may be the file this call was making" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
-    assert result["candidates"] == [earlier_doc]
+    assert result["candidates"] == [_candidate(earlier_doc)]
     assert len(calls) == 1
 
 
@@ -1535,7 +1551,7 @@ def test_create_file_does_not_take_a_same_name_folder_for_the_created_doc(
     assert "file" not in result
     assert f"id '{folder['id']}'" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
-    assert result["candidates"] == [folder]
+    assert result["candidates"] == [_candidate(folder)]
 
 
 def test_create_file_says_the_outcome_is_unknown_when_the_lookup_finds_nothing(
@@ -1708,7 +1724,7 @@ def test_create_file_does_not_take_an_unconverted_same_bytes_file_for_the_doc(
     assert "file" not in result
     assert f"id '{_NEW_ID}'" in result["message"]
     assert "It is not known whether this call created a file" in result["message"]
-    assert result["candidates"] == [file]
+    assert result["candidates"] == [_candidate(file)]
 
 
 @pytest.mark.parametrize(

@@ -265,7 +265,7 @@ NGINX_PORT="8080"
 docker compose up -d
 ```
 
-### Sandbox Runtime Overlays
+### Sandbox Runtime Overlay
 
 Sandbox deployment is an advanced option. Docker is the supported runtime.
 Apply the sibling-Docker overlay from the project root.
@@ -286,6 +286,24 @@ docker compose \
   -f docker/docker-compose.sandbox.docker.yml \
   up -d
 ```
+
+#### Migrating from BoxLite
+
+BoxLite is no longer a supported runtime. Before upgrading, drain the old
+sandboxes, replace `SANDBOX_IMPLEMENTATION=boxlite` and the BoxLite Compose
+overlay with the Docker overlay above, and satisfy its Docker daemon, namespace,
+worker identity, storage-path, and dedicated-network prerequisites. The Docker
+overlay does not reproduce BoxLite's VM network boundary: enforce the required
+private-address and metadata-service egress policy on the dedicated sandbox
+bridge with a persistent host firewall.
+
+After the Docker deployment is healthy, back up the database and BoxLite home
+directory before deleting stale data. BoxLite metadata is identified by
+`sandbox_type = 'boxlite'` in `sandbox_info` and `sandbox_snapshot`; its Compose
+home was `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}/boxlite` unless
+`BOXLITE_HOME_DIR` was overridden. These records and files are not consumed by
+the Docker runtime, so remove them only after confirming that rollback to
+BoxLite is no longer required.
 
 This mounts the host Docker socket into the backend container so Xagent can
 create sibling sandbox containers through the host Docker daemon. Treat this as
@@ -854,7 +872,7 @@ The steps below are the standard major-version path — dump under v16, initiali
 
 > **Data loss warning:** `docker compose down -v` and removing the live `<project>_postgres_data` volume destroy the database irreversibly. Neither is an upgrade step. Removing the separate `_pg16_backup` copy created in step 4 is expected.
 
-> **Sandbox overlays:** keep the `-f docker/docker-compose.sandbox.*.yml` arguments on every Compose command below, or `backend`, `worker`, and `scheduler` come back without the overlay.
+> **Sandbox overlay:** keep the `-f docker/docker-compose.sandbox.docker.yml` argument on every Compose command below, or `backend`, `worker`, and `scheduler` come back without the overlay.
 
 Set up. `PGVOL` is the Compose-prefixed volume name — find it with `docker volume ls | grep postgres_data`. Keep `BACKUP` outside the checkout; the dump carries password hashes, OAuth tokens, and encrypted provider credentials.
 

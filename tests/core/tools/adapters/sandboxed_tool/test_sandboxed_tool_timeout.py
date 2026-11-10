@@ -202,10 +202,9 @@ async def test_cancellation_drains_request_upload_before_payload_cleanup():
     assert sandbox.files == {}
 
 
-# `timeout -s KILL` also kills itself with the process group, so the exec
-# reports a SIGKILL death as 137 from Docker.
+# Docker reports SIGKILL as 137; subprocess-compatible adapters return -9.
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exit_code", [137])
+@pytest.mark.parametrize("exit_code", [137, -9])
 async def test_sigkill_after_limit_is_reported_as_timeout(exit_code):
     sandbox = RecordingSandbox(tool_exit_code=exit_code, tool_delay=1.1)
     wrapper = SandboxedToolWrapper(ShortBoundedTool(), sandbox)

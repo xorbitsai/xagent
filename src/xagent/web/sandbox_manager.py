@@ -3229,6 +3229,13 @@ def _create_sandbox_service() -> Optional[SandboxService]:
 
     if implementation == "docker":
         return _create_docker_service()
+    if implementation == "boxlite":
+        raise ValueError(
+            "BoxLite sandbox runtime has been removed; set "
+            "SANDBOX_IMPLEMENTATION='docker' and use "
+            "docker/docker-compose.sandbox.docker.yml. See docker/README.md "
+            "'Migrating from BoxLite'."
+        )
     raise ValueError(
         f"Unknown SANDBOX_IMPLEMENTATION {implementation!r}; only 'docker' is supported"
     )
@@ -3248,7 +3255,7 @@ def _create_docker_service() -> Optional[SandboxService]:
             "deployment identifier. Under Docker Compose use the Compose "
             "project name (COMPOSE_PROJECT_NAME); other deployment modes "
             "(pip/systemd) must pick their own stable value (see "
-            "docker/README.md 'Sandbox Runtime Overlays' and example.env)"
+            "docker/README.md 'Sandbox Runtime Overlay' and example.env)"
         )
     network = get_sandbox_network()
     if network is None:

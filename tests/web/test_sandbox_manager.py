@@ -68,12 +68,16 @@ class TestCreateSandboxService:
         assert result is not None
         mock_create.assert_called_once()
 
-    def test_unknown_implementation_fails_closed(self):
-        """A typo must not silently select a different sandbox runtime."""
+    @pytest.mark.parametrize("implementation", ["unknown", "boxlite"])
+    def test_unsupported_implementation_fails_closed(self, implementation):
+        """A typo or removed runtime must not silently select Docker."""
         with (
             patch.dict(
                 "os.environ",
-                {"SANDBOX_ENABLED": "true", "SANDBOX_IMPLEMENTATION": "unknown"},
+                {
+                    "SANDBOX_ENABLED": "true",
+                    "SANDBOX_IMPLEMENTATION": implementation,
+                },
                 clear=False,
             ),
             patch("xagent.web.sandbox_manager._create_docker_service") as mock_create,

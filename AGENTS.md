@@ -314,7 +314,7 @@ When bumping Docker release image tags, update all fixed Xagent images together:
 - All fixed Xagent service images present in `docker-compose.yml`
 - `docker/docker-compose.sandbox.docker.yml` `SANDBOX_IMAGE`
 
-Validate both the base compose file and sandbox overlays:
+Validate both the base Compose file and the Docker sandbox overlay:
 ```bash
 docker compose config --quiet
 docker compose -f docker-compose.yml -f docker/docker-compose.sandbox.docker.yml config --quiet

@@ -284,8 +284,9 @@ letters are rejected, so validate generated host/pod identities before using the
 
 Docker also requires a stable deployment `XAGENT_SANDBOX_NAMESPACE`. Container
 names, ownership labels, and SQL metadata use a scope derived from both values.
-The Compose sandbox overlays supply role-specific identities for their fixed
-single instances. Additional execution replicas must supply distinct identities.
+The Compose Docker sandbox overlay supplies role-specific identities for its
+fixed single instances. Additional execution replicas must supply distinct
+identities.
 
 A replacement worker creates its own sandbox resources; it does not adopt or
 clean up another worker's resources. Workspace files remain shared. Existing

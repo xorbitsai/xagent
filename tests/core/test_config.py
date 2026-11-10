@@ -3674,12 +3674,17 @@ def test_task_runtime_secrets_use_explicit_key(monkeypatch):
     "value,expected", [(None, 30), ("12", 12), ("0", 30), ("-1", 30), ("bad", 30)]
 )
 def test_task_reply_wait_timeout(value, expected, monkeypatch):
-    from xagent.config import get_task_reply_wait_timeout_seconds
+    from xagent.config import (
+        get_input_review_timeout_seconds,
+        get_task_reply_wait_timeout_seconds,
+    )
 
     monkeypatch.delenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", raising=False)
     if value is not None:
         monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
     assert get_task_reply_wait_timeout_seconds() == expected
+    assert get_input_review_timeout_seconds() == pytest.approx(min(20, expected * 0.8))
+    assert get_input_review_timeout_seconds() < expected
 
 
 @pytest.mark.parametrize(

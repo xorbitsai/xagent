@@ -16,10 +16,12 @@ from xagent.web.services.agent_management import (
 )
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
+from ...core.guardrails.input import InputReviewRejected
 from ..models.workforce import Workforce, WorkforceBuilderMessage
 from ..user_isolated_memory import UserContext
 from .agent_access import list_accessible_published_agents
 from .agent_store import AgentStore
+from .client_error_messages import input_review_error_code
 from .execution_budget import budget_policy_provider
 from .hot_path_cache import invalidate_agent_cache
 from .workforce_access import (
@@ -117,6 +119,14 @@ async def generate_workforce_creation_plan(
                 voice=voice,
                 budget_policy_provider=budget_provider,
             )
+    except InputReviewRejected as exc:
+        raise HTTPException(
+            status_code=503 if exc.unavailable else 422,
+            detail={
+                "code": input_review_error_code(exc.unavailable).value,
+                "message": str(exc),
+            },
+        ) from exc
     except WorkforcePromptBuilderUnavailableError as exc:
         logger.exception("ReAct Workforce builder runtime is unavailable")
         raise HTTPException(

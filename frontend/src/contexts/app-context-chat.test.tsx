@@ -3,6 +3,8 @@ import { flushSync } from "react-dom"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+
 type TestWebSocketMessage = {
   type: string
   timestamp: string
@@ -9914,6 +9916,32 @@ describe("terminal error frames", () => {
     // The turn is untouched: still running, still processing.
     expect(screen.getByTestId("task-status").textContent).toBe("running")
     expect(screen.getByTestId("processing").textContent).toBe("true")
+  })
+
+  it.each([
+    ["input_review_blocked", "clientErrors.inputReviewBlocked"],
+    ["input_review_unavailable", "clientErrors.inputReviewUnavailable"],
+  ])("renders each %s notice in the conversation panel", async (code, translation) => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <TaskConversationPanel mode="embedded-preview" showProcessView={false} />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    act(() => {
+      for (const turnId of ["refusal-1", "refusal-1", "refusal-2"]) {
+        onMessage?.({
+          type: "error",
+          timestamp: "2026-05-27T05:00:02Z",
+          task_id: 1,
+          data: { error_code: code, turn_id: turnId },
+        })
+      }
+    })
+    await waitFor(() => expect(screen.getAllByText(translation)).toHaveLength(2))
   })
 
   // The waiting half. A refused resume arrives on the root "error" type

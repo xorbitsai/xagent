@@ -4,9 +4,10 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
+from ...config import get_input_review_timeout_seconds
 from ..user_context import current_user_id
 from .output import get_delegated_review_agent_id
 
@@ -14,8 +15,8 @@ BLOCKED_INPUT = (
     "I can't help with that request. Please rephrase it or ask about a supported topic."
 )
 UNAVAILABLE_INPUT = "I couldn't complete the input safety check. Please try again."
-# Keep a hung reviewer inside the default 30s durable reply wait budget.
-INPUT_REVIEW_TIMEOUT_SECONDS = 20
+INPUT_REVIEW_BLOCKED_CODE = "input_review_blocked"
+INPUT_REVIEW_UNAVAILABLE_CODE = "input_review_unavailable"
 logger = logging.getLogger(__name__)
 InputReviewSource = Literal[
     "new_run", "reply", "delegated", "builtin", "workforce_builder"
@@ -87,8 +88,13 @@ async def review_input(
         delegated_agent_id=get_delegated_review_agent_id(),
     )
     try:
-        async with asyncio.timeout(INPUT_REVIEW_TIMEOUT_SECONDS):
-            return await hook(request)
+        async with asyncio.timeout(get_input_review_timeout_seconds()):
+            decision = await hook(request)
+        if not isinstance(decision, InputReviewResult):
+            raise TypeError("Host returned an invalid input review result")
+        if decision.unavailable and not (decision.refusal or "").strip():
+            return replace(decision, refusal=UNAVAILABLE_INPUT)
+        return decision
     except Exception as exc:
         # Host errors can contain the prompt. Keep exception text out of logs.
         logger.warning("Host input review failed (%s)", type(exc).__name__)

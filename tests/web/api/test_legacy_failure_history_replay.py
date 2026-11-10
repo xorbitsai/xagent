@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -17,13 +18,15 @@ from xagent.web.models.user import User
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+    client_safe_assistant_history_content,
 )
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
-    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
     load_task_transcript_window,
     persist_assistant_message_no_commit,
+    persist_user_message_no_commit,
 )
 from xagent.web.services.hot_path_cache import (
     cache_version_token,
@@ -618,35 +621,42 @@ async def test_new_plain_assistant_response_replays_unchanged(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verdict", ["blocked", "exception", "timeout"])
-async def test_input_review_refusal_excludes_only_the_rejected_legacy_turn(
+@pytest.mark.parametrize("storage_version", [1, 2])
+async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
     _test_db,
     monkeypatch,
     verdict,
+    storage_version,
 ) -> None:
     unavailable = verdict != "blocked"
-    task_id, user_id = _running_task(username="review-history", title="Review history")
+    run_id = "review-run"
+    task_id, user_id = _running_task(
+        username="review-history", title="Review history", run_id=run_id
+    )
+    candidate_text = "This turn is under review"
+    turn_id = "review-turn" if storage_version == 2 else None
     with _direct_db_session() as db:
         task = db.get(Task, task_id)
-        task.conversation_storage_version = 1
-        messages = [
-            TaskChatMessage(
-                task_id=task_id,
-                user_id=user_id,
-                role="user",
-                content=content,
-                message_type="user_message",
-                delivery_status=DELIVERY_DISPATCHED,
-            )
-            for content in (
-                "Approved earlier",
+        task.conversation_storage_version = storage_version
+        if storage_version == 1:
+            persist_user_message_no_commit(db, task_id, user_id, "Approved earlier")
+            persist_user_message_no_commit(
+                db,
+                task_id,
+                user_id,
                 "Failed to deliver",
-                "This turn is under review",
+                delivery_status=DELIVERY_FAILED,
             )
-        ]
-        messages[1].delivery_status = DELIVERY_FAILED
-        db.add_all(messages)
+        candidate = persist_user_message_no_commit(
+            db,
+            task_id,
+            user_id,
+            candidate_text,
+            turn_id=turn_id,
+            delivery_status=DELIVERY_DISPATCHED,
+        )
         db.flush()
-        candidate_id = int(messages[-1].id)
+        candidate_id = int(candidate.id)
         db.commit()
 
     async def review(_request):
@@ -657,7 +667,7 @@ async def test_input_review_refusal_excludes_only_the_rejected_legacy_turn(
         return input_review.InputReviewResult(refusal=input_review.BLOCKED_INPUT)
 
     monkeypatch.setattr(input_review, "_review", review)
-    monkeypatch.setattr(input_review, "INPUT_REVIEW_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(input_review, "get_input_review_timeout_seconds", lambda: 0)
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
             name="review-history",
@@ -666,22 +676,59 @@ async def test_input_review_refusal_excludes_only_the_rejected_legacy_turn(
             workspace_enabled=False,
         )
     )
-    result = await adapter.execute(
-        task="This turn is under review", task_id=str(task_id)
+
+    async def execute(*, task, context, task_id, **_kwargs):
+        return await adapter.execute(task=task, context=context, task_id=task_id)
+
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(return_value=MagicMock()),
+        execute_task=execute,
     )
-    assert result["input_review_rejected"] is True
-    finalized = task_execution_service._finalize_task_execution_result_isolated(
+    snapshot = SimpleNamespace(
+        task=SimpleNamespace(
+            user_id=user_id,
+            run_id=run_id,
+            source="internal",
+            status=TaskStatus.RUNNING,
+            agent_id=None,
+            agent_config={},
+        ),
+        runtime_user=None,
+        agent=None,
+        conversation_history=(),
+        conversation_watermark=None,
+        conversation_event_watermark=None,
+        execution_recovery=None,
+    )
+    from xagent.web.services import task_event_display, task_execution_context_service
+
+    monkeypatch.setattr(
+        task_execution_context_service,
+        "materialize_task_execution_recovery_state",
+        AsyncMock(return_value={}),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(task_event_display, "publish_task_result", publish)
+    await task_execution_service.execute_task_background(
         task_id=task_id,
-        task_user_id=user_id,
-        pre_run_status=TaskStatus.RUNNING,
-        result=result,
-        expected_run_id=None,
-        task_lease=None,
-        resolved_scope_segments=(),
-        prepared_outputs=task_execution_service._PreparedTaskFileOutputs((), (), ()),
-        input_message_id=candidate_id,
+        user_message=candidate_text,
+        context={"turn_id": turn_id} if turn_id else None,
+        agent_manager=manager,
+        task_owner_user_id=user_id,
+        before_message_id=candidate_id,
+        expected_run_id=run_id,
+        task_setup_snapshot=snapshot,
+        resolved_execution_scope=None,
     )
-    assert not finalized.late_result
+    publish.assert_awaited_once()
+    response = publish.await_args.args[0]
+    expected_text = (
+        input_review.UNAVAILABLE_INPUT if unavailable else input_review.BLOCKED_INPUT
+    )
+    assert response["output"] == expected_text
+    assert response["error_code"] == (
+        input_review.INPUT_REVIEW_UNAVAILABLE_CODE if unavailable else None
+    )
     with _direct_db_session() as db:
         task = db.get(Task, task_id)
         assert task.status == (
@@ -689,15 +736,24 @@ async def test_input_review_refusal_excludes_only_the_rejected_legacy_turn(
         )
         assert task.completion_outcome == (None if unavailable else "blocked")
         candidate = db.get(TaskChatMessage, candidate_id)
-        assert candidate.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
-        assert candidate.content == "This turn is under review"
+        if storage_version == 1:
+            assert candidate.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        assert candidate.content == candidate_text
         assert candidate.delivery_status == DELIVERY_DISPATCHED
+        notice = (
+            db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
+        )
+        assert notice.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        assert (
+            client_safe_assistant_history_content(
+                content=notice.content, message_type=notice.message_type
+            )
+            == expected_text
+        )
         replay = load_task_transcript_window(db, task_id)
-        assert [
-            message["content"]
-            for message in replay.messages
-            if message["role"] == "user"
-        ] == ["Approved earlier"]
+        assert [message["content"] for message in replay.messages] == (
+            ["Approved earlier"] if storage_version == 1 else []
+        )
 
 
 def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(

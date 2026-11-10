@@ -617,12 +617,47 @@ async def test_input_review_contains_host_failure(monkeypatch, caplog, timeout) 
         raise RuntimeError("Private prompt content")
 
     monkeypatch.setattr(input_review, "_review", hook)
-    monkeypatch.setattr(input_review, "INPUT_REVIEW_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(input_review, "get_input_review_timeout_seconds", lambda: 0)
     result = await input_review.review_input(
         "run", "Candidate", execution_text="Candidate"
     )
     assert result.unavailable and result.refusal == input_review.UNAVAILABLE_INPUT
     assert "Private prompt content" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict", [None, input_review.InputReviewResult(unavailable=True)]
+)
+async def test_input_review_rejects_invalid_or_incomplete_verdict(
+    monkeypatch, verdict
+) -> None:
+    monkeypatch.setattr(input_review, "_review", AsyncMock(return_value=verdict))
+    result = await input_review.review_input(
+        "run", "Candidate", execution_text="Candidate"
+    )
+    assert result.unavailable and result.refusal == input_review.UNAVAILABLE_INPUT
+
+
+@pytest.mark.asyncio
+async def test_reply_review_refusal_survives_live_run_finishing(monkeypatch) -> None:
+    tracer = TracerCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="reviewed", patterns=[], llm=None), tracer=tracer
+    )
+    context = ExecutionContext(execution_id="reviewed")
+    runner.context_manager.set_context(context)
+
+    async def refuse(_request):
+        context_checkpoint_gate(context).run_finishing = True
+        return input_review.InputReviewResult(refusal="Reply refused.")
+
+    hook = AsyncMock(side_effect=refuse)
+    monkeypatch.setattr(input_review, "_review", hook)
+    with pytest.raises(input_review.InputReviewRejected, match="Reply refused"):
+        await runner.inject_user_message("reviewed", "Reply", turn_id="turn")
+    hook.assert_awaited_once()
+    assert context.messages == [] and tracer.by_execution_id == {}
 
 
 def test_input_history_filters_both_prompt_representations() -> None:

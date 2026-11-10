@@ -497,6 +497,9 @@ class AgentExecutionAdapter:
             normalized["output_missing"] = True
         if result.get("input_review_rejected") is True:
             normalized["input_review_rejected"] = True
+            error_code = result.get("error_code")
+            if isinstance(error_code, str):
+                normalized["error_code"] = error_code
         completion_outcome = result.get("completion_outcome")
         if completion_outcome in {"completed", "partial", "blocked"}:
             normalized["completion_outcome"] = completion_outcome

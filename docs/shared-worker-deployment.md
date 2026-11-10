@@ -378,6 +378,13 @@ replays as `409 task_busy` with `retry_with_new_id`, where it previously
 replayed as `504 reply_outcome_unknown`. Only failures without a recorded
 rejection reason remain unknown outcomes.
 
+Input review refusals also settle before injection. The durable
+`input_blocked` outcome maps to SDK `422 invalid_input` and A2A `400`.
+The `input_review_unavailable` outcome maps to SDK `503 temporarily_unavailable`
+with `retry_with_new_id`, and to A2A `503`, where the same message ID can be
+retried. Input review uses at most 20 seconds or 80% of the configured reply
+wait, whichever is shorter.
+
 Waiting consumes no attempt or defer budget. Replies that are not governed by an
 admission policy, and governed replies whose worker is merely slow, keep the
 existing wait and `reply_outcome_unknown` semantics. Only SDK replies receive the

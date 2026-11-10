@@ -25,6 +25,8 @@ from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
 from ..guardrails.input import (
+    INPUT_REVIEW_BLOCKED_CODE,
+    INPUT_REVIEW_UNAVAILABLE_CODE,
     InputReviewRejected,
     InputReviewResult,
     InputReviewSource,
@@ -440,6 +442,11 @@ class AgentRunner:
                     return {
                         "success": False,
                         "input_review_rejected": True,
+                        "error_code": (
+                            INPUT_REVIEW_UNAVAILABLE_CODE
+                            if decision.unavailable
+                            else INPUT_REVIEW_BLOCKED_CODE
+                        ),
                         "error": decision.refusal,
                         "output": decision.refusal,
                     }
@@ -1299,7 +1306,11 @@ class AgentRunner:
                         context=context,
                         outcome=UserMessageInjectionOutcome.REJECTED_RETRYABLE,
                     )
-                if request_interrupt and gate.run_finishing:
+                if (
+                    request_interrupt
+                    and gate.run_finishing
+                    and not (decision and decision.refusal)
+                ):
                     return UserMessageInjectionResult(
                         context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
                     )
@@ -1319,7 +1330,8 @@ class AgentRunner:
                         return self._replay_accepted_turn(
                             execution_id,
                             context,
-                            request_interrupt=request_interrupt,
+                            request_interrupt=request_interrupt
+                            and not gate.run_finishing,
                             reason=reason,
                         )
                     # Compaction may have dropped the message itself; the
@@ -1335,7 +1347,8 @@ class AgentRunner:
                         return self._replay_accepted_turn(
                             execution_id,
                             context,
-                            request_interrupt=request_interrupt,
+                            request_interrupt=request_interrupt
+                            and not gate.run_finishing,
                             reason=reason,
                         )
 

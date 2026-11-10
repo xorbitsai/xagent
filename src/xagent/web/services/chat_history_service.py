@@ -27,6 +27,7 @@ from ..models.chat_message import TaskChatMessage
 from ..models.task import TraceEvent
 from ..models.task_execution_event import TaskExecutionEvent
 from .assistant_history_safety import (
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
     LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
@@ -52,7 +53,6 @@ DELIVERY_DISPATCHED = "dispatched"
 DELIVERY_COMPLETED = "completed"
 DELIVERY_FAILED = "failed"
 DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
-INPUT_REVIEW_REJECTED_MESSAGE_TYPE = "input_review_rejected"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
@@ -993,10 +993,10 @@ def load_task_transcript_window(
 
     query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
+        TaskChatMessage.message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
         or_(
             TaskChatMessage.role != "user",
-            (TaskChatMessage.message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE)
-            & TaskChatMessage.delivery_status.is_distinct_from(DELIVERY_FAILED),
+            TaskChatMessage.delivery_status.is_distinct_from(DELIVERY_FAILED),
         ),
     )
     if before_message_id is not None:

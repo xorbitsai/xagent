@@ -75,6 +75,10 @@ export const CLIENT_ERROR_CODES = [
 
 export type ClientErrorCode = (typeof CLIENT_ERROR_CODES)[number]
 
+export function isInputReviewErrorCode(code: unknown): boolean {
+  return code === "input_review_blocked" || code === "input_review_unavailable"
+}
+
 const CLIENT_ERROR_TRANSLATION_KEYS: Record<ClientErrorCode, TranslationKey> = {
   execution_queue_full: "clientErrors.executionQueueFull",
   message_processing_failed: "clientErrors.messageProcessingFailed",

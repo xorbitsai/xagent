@@ -44,7 +44,7 @@ from ...core.execution_scope import (
     resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
-from ...core.guardrails.input import InputReviewRejected
+from ...core.guardrails.input import InputReviewRejected, input_review_configured
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -106,7 +106,7 @@ from .client_error_messages import (
     INPUT_REVIEW_CLIENT_ERROR_CODES,
     ClientErrorCode,
     client_error_message,
-    input_review_error_code,
+    input_review_delivery_failure,
 )
 from .db_runtime import (
     drain_async_task_cancellation_safe,
@@ -2506,18 +2506,16 @@ async def handle_task_message(
                             task_id
                         )
                         reservation_released = True
-                        error_code = (
-                            input_review_error_code(review_rejection.unavailable)
-                            if review_rejection is not None
-                            else ClientErrorCode.MESSAGE_DELIVERY_FAILED
+                        error_code, retry_with_new_id = input_review_delivery_failure(
+                            review_rejection
                         )
                         await finish_delivery_failure(
-                            client_safe_error_message(review_rejection)
-                            if review_rejection is not None
-                            else client_error_message(error_code),
+                            client_safe_error_message(
+                                review_rejection,
+                                fallback=client_error_message(error_code),
+                            ),
                             error_code=error_code.value,
-                            retry_with_new_id=review_rejection is None
-                            or review_rejection.unavailable,
+                            retry_with_new_id=retry_with_new_id,
                         )
                         return
                     if disposition is InjectionDisposition.UNKNOWN:
@@ -2809,6 +2807,10 @@ async def handle_task_message(
                             delivery_notifier=(
                                 None
                                 if posted
+                                or (
+                                    suppress_delivery_ack
+                                    and not input_review_configured()
+                                )
                                 else make_delivery_notifier(
                                     reply,
                                     client_message_id,

@@ -6215,6 +6215,18 @@ def generic_oauth_callback(
                             provider,
                         )
                         continue
+                    # While the review gate is closed Gmail stays gated here
+                    # even when its Composio switch shows it for Toby's
+                    # Composio connect (#3649): this bare grant carries no
+                    # Gmail scope, so linking Gmail would show it connected on
+                    # a grant its tools cannot use.
+                    if _google_gmail_error(provider, app_info.get("id")):
+                        logger.info(
+                            "Skipping gated app %s during bare %s OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+                        continue
                     # This bare app_id-less login only ever requests
                     # db_provider.default_scopes (see the app_scopes=None
                     # branch above), never an app's own oauth_scopes. Creating

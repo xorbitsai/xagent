@@ -32,7 +32,7 @@ from xagent.web.models.database import (
     get_engine,
     init_db,
 )
-from xagent.web.models.mcp import UserMCPServer
+from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
@@ -856,3 +856,63 @@ def test_a_native_reconnect_replaces_the_composio_grant_and_deletes_its_account(
     assert [row.token_type for row in drive] == ["Bearer"]
     assert [row.access_token for row in drive] == ["native-access"]
     assert composio.paths("DELETE") == [f"/connected_accounts/{account_id}"]
+
+
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+def test_a_bare_google_login_links_gmail_only_while_the_gate_is_open(
+    google, monkeypatch, gate_open
+):
+    """A bare Google login requests only the provider's default scopes, never
+    Gmail's. The Gmail switch shows Gmail while the gate is closed, but the
+    batch must still skip it there, as it did while Gmail was hidden;
+    otherwise Gmail reads as connected on an openid/email/profile grant."""
+    from tests.shared.oauth_browser_fixture import (
+        create_access_token,
+        generic_oauth_callback,
+    )
+
+    db, user, _ = google
+    if gate_open:
+        monkeypatch.setenv(RESTRICTED_FLAG, "true")
+    _switch_on(monkeypatch, "gmail")
+    for app_id in GOOGLE_APPS:
+        row = get_builtin_public_mcp_app(app_id)
+        assert row is not None
+        db.add(PublicMCPApp(**{**row, "is_visible_in_connector": True}))
+    db.commit()
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "google"},
+        expires_delta=timedelta(minutes=10),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=_Response(
+                200,
+                {
+                    "access_token": "bare-access",
+                    "token_type": "Bearer",
+                    "scope": "openid email profile",
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=_Response(200, {"id": GOOGLE_SUBJECT})),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200, response.body
+    linked = {
+        server.name
+        for server in db.query(MCPServer)
+        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(UserMCPServer.user_id == int(user.id))
+    } & {"Gmail", "Google Drive"}
+    expected = {"Google Drive", "Gmail"} if gate_open else {"Google Drive"}
+    assert linked == expected

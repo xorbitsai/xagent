@@ -36,7 +36,11 @@ from weakref import WeakValueDictionary
 import httpx
 from sqlalchemy import text
 
-from ...config import get_google_shared_oauth_grants_enabled, get_uploads_dir
+from ...config import (
+    get_google_restricted_scopes,
+    get_google_shared_oauth_grants_enabled,
+    get_uploads_dir,
+)
 from ...core.agent.result import (
     ClassifiedToolFailure,
     is_oauth_token_required_code,
@@ -389,6 +393,28 @@ class _OAuthInstanceUrlRequired(Exception):
 # Another app's Composio grant is reported unavailable until its subprocess
 # can proxy it.
 _COMPOSIO_PROXY_APPS = frozenset({"facebook", "instagram"})
+
+
+def _native_gmail_grant_gated(*, app_id: object, token_type: object) -> bool:
+    """Whether a Toby (actor) Gmail grant made through our own Google app must
+    not run, because the restricted-scope review gate is closed (#3649).
+
+    Asked for actor grants only, before any refresh, so a held-back grant
+    never reaches Google through our app at all.
+
+    The gate used to keep these out by hiding Gmail, which is also the actor
+    admission check. The Gmail Composio switch shows Gmail, so the gate is
+    applied to the grant instead: a grant from Composio's approved Google app
+    passes, a native one is reported as needing a connection, which a
+    reconnect through Composio fixes.
+    """
+    from ..models.user_oauth import COMPOSIO_TOKEN_TYPE
+
+    return (
+        app_id == "gmail"
+        and token_type != COMPOSIO_TOKEN_TYPE
+        and not get_google_restricted_scopes()
+    )
 
 
 def _composio_grant_env(
@@ -4301,12 +4327,29 @@ class WebToolConfig(BaseToolConfig):
         provider_name: object,
         user_id: int,
         resource_owner_key: str | None,
+        actor_app_id: object = None,
     ) -> _LegacyOAuthTokenResolution:
+        """``actor_app_id`` is the app an actor grant is resolved for; ordinary
+        resolutions leave it unset."""
         from ...web.models.user_oauth import UserOAuth
 
         if not oauth_account:
             return _LegacyOAuthTokenResolution(access_token=None)
         if not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
+        if actor_app_id is not None and _native_gmail_grant_gated(
+            app_id=actor_app_id,
+            token_type=getattr(oauth_account, "token_type", None),
+        ):
+            # Reported as needing a connection; a reconnect through Composio
+            # fixes it.
+            logger.info(
+                "OAUTH CONFIG: Holding back a native Gmail grant while Google "
+                "restricted scopes are disabled; reconnecting through Composio "
+                "replaces it"
+            )
             return _LegacyOAuthTokenResolution(
                 access_token=None, credential_present=True
             )
@@ -4741,6 +4784,7 @@ class WebToolConfig(BaseToolConfig):
                     provider_name=provider_name,
                     user_id=user_id,
                     resource_owner_key=resource_owner_key,
+                    actor_app_id=app_id,
                 )
             # Lock the current namespace, not a stale row id. Actor callbacks
             # replace credentials with delete-and-insert, so the primary key
@@ -4785,6 +4829,7 @@ class WebToolConfig(BaseToolConfig):
                 provider_name=provider_name,
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
+                actor_app_id=app_id,
             )
         except Exception:
             oauth_db.rollback()

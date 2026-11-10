@@ -93,8 +93,9 @@ def test_a_call_is_sent_as_one_proxy_execute_request(proxy):
     }
 
 
-def test_a_path_is_left_for_composio_to_resolve_against_the_account(proxy):
-    """Salesforce sends org-relative paths; Composio knows the org's host."""
+def test_a_path_is_passed_on_for_composio_to_append_to_the_base_url(proxy):
+    """A path goes to Composio as is; Composio appends it to the account's
+    base_url."""
     composio_proxy.proxy_request(
         "GET",
         "/services/data/v62.0/query",

@@ -319,17 +319,23 @@ def test_a_3xx_requests_would_not_follow_is_not_turned_into_a_redirect_error(pro
     assert salesforce._request("GET", f"{API}/sobjects") == {}
 
 
-def test_the_orgs_host_is_read_from_composio_once(proxy):
+def test_the_orgs_host_is_read_from_composio_once_for_every_request(proxy):
     proxy.answer(200, {"totalSize": 0, "done": True, "records": []})
-    proxy.answer(200, {"totalSize": 0, "done": True, "records": []})
+    proxy.answer(200, {"user_id": "005xx"})
+    proxy.answer(201, {"id": "001xx", "success": True})
 
     salesforce.salesforce_query("SELECT Id FROM Account")
-    salesforce.salesforce_query("SELECT Id FROM Contact")
+    salesforce.salesforce_get_current_user()
+    salesforce.salesforce_create_record("Account", {"Name": "Acme"})
 
     (lookup,) = proxy.lookups
     assert lookup["method"] == "GET"
     assert lookup["headers"]["x-api-key"] == API_KEY
-    assert [call["endpoint"] for call in proxy.calls] == [f"{ORG}{API}/query"] * 2
+    assert [call["endpoint"] for call in proxy.calls] == [
+        f"{ORG}{API}/query",
+        f"{ORG}/services/oauth2/userinfo",
+        f"{ORG}{API}/sobjects/Account",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -338,16 +344,31 @@ def test_the_orgs_host_is_read_from_composio_once(proxy):
         "https://evil.example.com/services/data/v67.0",
         "http://acme.my.salesforce.com/services/data/v67.0",
         "https://acme.my.salesforce.com.evil.example/services/data/v67.0",
+        "https://salesforce.com/services/data/v67.0",
+        "https://user:s3cret@acme.my.salesforce.com/services/data/v67.0",
+        "https://acme.my.salesforce.com:443/services/data/v67.0",
+        "https://acme.my.salesforce.com:s3cret/services/data/v67.0",
     ],
 )
-def test_a_base_url_that_is_not_a_salesforce_host_sends_nothing(proxy, base_url):
+def test_a_base_url_that_is_not_a_plain_salesforce_host_sends_nothing(
+    proxy, base_url, caplog
+):
+    """https, a *.salesforce.com host, no credentials, no port -- and the
+    refused value is never echoed: it comes from Composio's account record."""
     proxy.account = _Response(200, {"id": ACCOUNT_ID, "data": {"base_url": base_url}})
 
     result = json.loads(salesforce.salesforce_query("SELECT Id FROM Account"))
 
     assert result["status"] == "error"
-    assert "not a valid Salesforce host" in result["message"]
+    assert result["message"] == (
+        "the Composio connection's base_url is not an https URL on a "
+        "*.salesforce.com host without credentials or a port"
+    )
     assert proxy.calls == []
+    assert salesforce._COMPOSIO_ORG_ORIGINS == {}
+    for text in (result["message"], caplog.text):
+        assert "s3cret" not in text
+        assert "evil" not in text
 
 
 def test_a_failed_lookup_is_an_error_without_secrets(proxy):

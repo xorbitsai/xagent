@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from typing import Any, NoReturn
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -239,13 +239,6 @@ def _instance_url() -> str:
     instance_url = os.environ.get("SALESFORCE_INSTANCE_URL")
     if not instance_url:
         raise ValueError("SALESFORCE_INSTANCE_URL environment variable is missing")
-    return _salesforce_origin(instance_url, "SALESFORCE_INSTANCE_URL")
-
-
-def _salesforce_origin(instance_url: str, source: str) -> str:
-    """``instance_url`` cut to ``https://host[:port]`` once its host is
-    checked to be Salesforce's (see ``_instance_url``); ``source`` names the
-    value in the error."""
     parsed = urlparse(instance_url.rstrip("/"))
     # rstrip: a trailing-dot FQDN (e.g. "acme.my.salesforce.com.") is a
     # valid, equivalent hostname that just wouldn't satisfy endswith below
@@ -269,7 +262,9 @@ def _salesforce_origin(instance_url: str, source: str) -> str:
             for suffix in _INSTANCE_URL_HOST_SUFFIXES
         )
     ):
-        raise ValueError(f"{source} is not a valid Salesforce host: {instance_url!r}")
+        raise ValueError(
+            f"SALESFORCE_INSTANCE_URL is not a valid Salesforce host: {instance_url!r}"
+        )
     return f"{parsed.scheme}://{hostname}{port}"
 
 
@@ -368,9 +363,38 @@ def _composio_org_origin() -> str:
         base_url = composio_proxy.connected_account_base_url()
         if base_url is None:
             raise ValueError("the Composio connection has no base_url")
-        origin = _salesforce_origin(base_url, "the Composio connection's base_url")
+        origin = _composio_base_url_origin(base_url)
         _COMPOSIO_ORG_ORIGINS[account_id] = origin
     return origin
+
+
+def _composio_base_url_origin(base_url: str) -> str:
+    """``https://host`` of a Composio connection's ``base_url``.
+
+    Stricter than ``_instance_url``: the value comes from the
+    connected account's record, built from what the user typed when
+    connecting, so credentials or a port refuse it instead of being cut off,
+    the host must be a subdomain of salesforce.com, and the error never
+    echoes the value.
+    """
+    parts = urlsplit(base_url)
+    hostname = (parts.hostname or "").rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or port is not None
+        or not hostname.endswith(".salesforce.com")
+    ):
+        raise ValueError(
+            "the Composio connection's base_url is not an https URL on a "
+            "*.salesforce.com host without credentials or a port"
+        )
+    return f"https://{hostname}"
 
 
 def _request_via_composio(
@@ -386,7 +410,7 @@ def _request_via_composio(
     response = composio_proxy.proxy_request(
         method,
         f"{origin}{path}",
-        allowed_hosts=(urlparse(origin).hostname or "",),
+        allowed_hosts=(urlsplit(origin).hostname or "",),
         query=params or {},
         body=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,

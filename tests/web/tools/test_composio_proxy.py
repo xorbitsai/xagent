@@ -1232,3 +1232,72 @@ def test_random_bodies_of_distinct_lengths_stay_bounded(proxy, rewrite):
         text = str(raised.value)
         assert not [line for line in lines if line in text]
         assert elapsed < 1.0, f"{rewrite} case {case} took {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("line_count", [100, 200])
+def test_a_hand_written_body_of_long_lines_echoed_with_lf_is_bounded(proxy, line_count):
+    """A hand-written MIME body whose lines are all just over the kept text
+    (5,001..5,600 characters) and all a different length, echoed with LF
+    endings. Every line matches near its start, so the scan walks its whole
+    window at each one and the lookup tries every distinct length that shares
+    the opening: 100 and 200 of them cost 12.2 s and 25.0 s here. The counted
+    allowance has to cut both, and no line may stay visible."""
+    lines = ["A" * (length - 1) + "z" for length in range(5001, 5001 + line_count)]
+    decoded = (
+        "To: a@example.com\r\nSubject: bench\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: text/plain; charset="utf-8"\r\n'
+        "Content-Transfer-Encoding: 7bit\r\n\r\n" + "\r\n".join(lines)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + decoded.replace("\r\n", "\n")}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "distinct long lengths must not multiply the work"
+
+
+def test_a_long_run_echoed_over_long_lines_stays_bounded(proxy):
+    """The same hand-written body at 600 lines, a 5,000-character ``To`` value
+    and an echo that is one 4 MB run of ``A``. The run keeps growing the
+    region over the ``To`` match while every line length shares the opening,
+    which cost 8.6 s here. The allowance has to cut it, and neither the run
+    nor a line of the body may stay visible."""
+    lines = ["A" * (length - 1) + "z" for length in range(5001, 5601)]
+    decoded = (
+        "To: " + "A" * 5000 + "\r\nSubject: bench\r\nMIME-Version: 1.0\r\n"
+        'Content-Type: text/plain; charset="utf-8"\r\n'
+        "Content-Transfer-Encoding: 7bit\r\n\r\n" + "\r\n".join(lines)
+    )
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "A" * 4_000_000}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "A" * 100 not in text
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "a growing run must not multiply the work"

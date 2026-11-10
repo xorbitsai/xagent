@@ -180,6 +180,21 @@ class TestTransparencyCapability:
 
 class TestGenerateRequestShape:
     @pytest.mark.asyncio
+    async def test_generate_keeps_size_when_aspect_ratio_is_set(self):
+        """The adapter ignores resolution/width+height when a ratio is given,
+        so size is the pixel size the provider receives."""
+        model, client = _model("gpt-image-2.5-flare")
+
+        await model.generate_image(
+            prompt="a logo",
+            size="1080*1350",
+            resolution="999x999",
+            aspect_ratio="4:5",
+        )
+
+        assert client.images.generate.call_args.kwargs["size"] == "1080x1350"
+
+    @pytest.mark.asyncio
     async def test_transparency_asks_for_alpha_and_png(self):
         model, client = _model("gpt-image-1")
 

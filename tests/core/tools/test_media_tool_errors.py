@@ -1055,17 +1055,20 @@ class _CountingFakeSession(_FakeSession):
     def __init__(self, response: _FakeHTTPResponse) -> None:
         super().__init__(response)
         self.calls = 0
+        self.payloads: list[dict[str, Any]] = []
 
     def post(self, *args: Any, **kwargs: Any) -> _FakePost:
         self.calls += 1
+        payload = kwargs.get("json")
+        if isinstance(payload, dict):
+            self.payloads.append(payload)
         return super().post(*args, **kwargs)
 
 
-def _dashscope_tool(
-    monkeypatch: pytest.MonkeyPatch, response: _FakeHTTPResponse
-) -> tuple[ImageGenerationToolCore, _CountingFakeSession]:
+def _dashscope_tool_with_session(
+    monkeypatch: pytest.MonkeyPatch, session: Any
+) -> ImageGenerationToolCore:
     """The production path: a DashScope model behind the image retry wrapper."""
-    session = _CountingFakeSession(response)
     monkeypatch.setattr(
         dashscope_image,
         "create_public_model_aiohttp_session",
@@ -1083,10 +1086,16 @@ def _dashscope_tool(
             max_retries=3,
         )
     )
-    tool = ImageGenerationToolCore(
+    return ImageGenerationToolCore(
         {"dashscope-image": model}, default_generate_model=model
     )
-    return tool, session
+
+
+def _dashscope_tool(
+    monkeypatch: pytest.MonkeyPatch, response: _FakeHTTPResponse
+) -> tuple[ImageGenerationToolCore, _CountingFakeSession]:
+    session = _CountingFakeSession(response)
+    return _dashscope_tool_with_session(monkeypatch, session), session
 
 
 @pytest.fixture
@@ -1106,7 +1115,7 @@ class TestRejectedSizeCarriesItsRule:
     )
 
     @pytest.mark.asyncio
-    async def test_a_rejected_size_states_the_multiple_and_a_legal_size(
+    async def test_a_rejected_size_states_the_multiple_and_a_size_that_satisfies_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         tool, session = _dashscope_tool(
@@ -1138,6 +1147,27 @@ class TestRejectedSizeCarriesItsRule:
             assert provider_wording not in readable
         # A rejected parameter is not retried: one request, not three.
         assert session.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_the_suggestion_is_computed_from_the_size_that_was_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With aspect_ratio set, the generate adapters keep size and ignore
+        resolution/width+height. A suggestion from those fields would name a
+        size the provider never received."""
+        tool, session = _dashscope_tool(
+            monkeypatch, _FakeHTTPResponse(400, self.SIZE_REJECTION_BODY)
+        )
+
+        result = await tool.generate_image(
+            "A product shot",
+            size="1080*1350",
+            resolution="999x999",
+            aspect_ratio="4:5",
+        )
+
+        assert session.payloads[0]["parameters"]["size"] == "1080*1350"
+        assert result["allowed_values"]["size"]["suggested_size"] == "1088*1360"
 
     @pytest.mark.asyncio
     async def test_a_rejected_size_lists_the_sizes_the_provider_accepts(
@@ -1210,6 +1240,132 @@ class TestRejectedSizeCarriesItsRule:
         assert "allowed_values" not in fields
 
 
+class TestNonSizeRejectionsStayGeneric:
+    """A rule about another parameter must not become a size suggestion."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Invalid value for 'n'. The batch size must be a multiple of 4.",
+            "Invalid input image. Width and height must both be divisible by 16.",
+            "Invalid value for the upload. File size must be a multiple of 1024.",
+            "Invalid value '1080x1350' for tile size. Supported values are: "
+            "'256x256', '512x512'.",
+            "Invalid value for 'quality'. The prompt said 'width must be a "
+            "multiple of 16', which is not a parameter.",
+        ],
+        ids=[
+            "batch-size",
+            "input-image",
+            "file-size",
+            "tile-size-list",
+            "quoted-prompt",
+        ],
+    )
+    async def test_a_rule_about_another_parameter_stays_generic(
+        self, monkeypatch: pytest.MonkeyPatch, message: str
+    ) -> None:
+        body = json.dumps({"error": {"code": "invalid_value", "message": message}})
+        tool, session = _dashscope_tool(monkeypatch, _FakeHTTPResponse(400, body))
+
+        result = await tool.generate_image("A product shot", size="1080*1350")
+
+        assert result["error_category"] == INVALID_REQUEST
+        assert "allowed_values" not in result
+        assert result["error"] == (
+            "The request was rejected because a parameter is outside what this "
+            "model supports."
+        )
+        assert session.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_a_provider_field_that_is_not_a_size_stays_generic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A named field settles the question: a rule on ``n`` is not a rule
+        on the output size, even when the wording mentions width and height."""
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "invalid_value",
+                    "param": "n",
+                    "message": "Width and height must both be divisible by 16.",
+                }
+            }
+        )
+        tool, session = _dashscope_tool(monkeypatch, _FakeHTTPResponse(400, body))
+
+        result = await tool.generate_image("A product shot", size="1080*1350")
+
+        assert "allowed_values" not in result
+        assert session.calls == 1
+
+
+class TestSizeRuleShapes:
+    """The multiple rule is read per dimension, not collapsed into one."""
+
+    def _fields(self, message: str) -> dict[str, Any]:
+        return media_failure_fields(
+            ProviderStatusError(
+                status_code=400,
+                code="InvalidParameter",
+                message=message,
+                param="size",
+            ),
+            logger=logging.getLogger(__name__),
+            action="Image generation failed",
+            requested_size="1080*1350",
+        )
+
+    def test_each_dimension_keeps_its_own_multiple(self) -> None:
+        fields = self._fields(
+            "Width must be a multiple of 16 and height must be a multiple of 32."
+        )
+
+        assert fields["allowed_values"] == {
+            "size": {
+                "width_multiple_of": 16,
+                "height_multiple_of": 32,
+                "suggested_size": "1088*1376",
+            }
+        }
+
+    def test_a_single_dimension_rule_does_not_constrain_the_other(self) -> None:
+        fields = self._fields("Width must be a multiple of 16.")
+
+        assert fields["allowed_values"] == {"size": {"width_multiple_of": 16}}
+        assert "suggested_size" not in fields["allowed_values"]["size"]
+
+    def test_a_plural_multiple_is_understood(self) -> None:
+        fields = self._fields("Width and height must both be multiples of 16.")
+
+        assert fields["allowed_values"] == {
+            "size": {
+                "width_multiple_of": 16,
+                "height_multiple_of": 16,
+                "suggested_size": "1088*1360",
+            }
+        }
+
+    def test_an_unparseable_requested_size_gets_no_rule(self) -> None:
+        """The rule is only offered next to a size this module can parse; a
+        non-size value such as "auto" cannot anchor a suggestion."""
+        fields = media_failure_fields(
+            ProviderStatusError(
+                status_code=400,
+                code="InvalidParameter",
+                message="Width and height must both be divisible by 16.",
+                param="size",
+            ),
+            logger=logging.getLogger(__name__),
+            action="Image generation failed",
+            requested_size="auto",
+        )
+
+        assert "allowed_values" not in fields
+
+
 class TestParameterRejectionsAreTerminal:
     """A request the provider refused as invalid is never sent again."""
 
@@ -1222,6 +1378,44 @@ class TestParameterRejectionsAreTerminal:
     @pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
     def test_a_transient_status_still_retries(self, status: int) -> None:
         assert retry_image_call(DashScopeAPIError("busy", status_code=status)) is True
+
+    def test_a_typed_parameter_rejection_is_not_retried(self) -> None:
+        error = MediaParameterError("size is not supported", field="size")
+
+        assert retry_image_call(error) is False
+
+    def test_a_text_only_rejection_is_still_retried(self) -> None:
+        """The retry predicate is narrower than the classifier on purpose: it
+        reads typed errors and statuses, never message text. A transport
+        failure can carry text that looks like a bad request, so a marker
+        alone must not cancel an attempt that may still succeed."""
+        error = RuntimeError("InvalidParameter: size is not supported")
+
+        assert classify_media_failure(error) == INVALID_REQUEST
+        assert retry_image_call(error) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ServerTimeoutError("Timeout on reading data from socket"),
+            aiohttp.ClientConnectionError("Connection reset by peer"),
+        ],
+        ids=["server-timeout", "connection-reset"],
+    )
+    async def test_a_transport_failure_is_still_attempted_three_times(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        instant_retries: None,
+        error: Exception,
+    ) -> None:
+        session = _RaisingSession(error)
+        tool = _dashscope_tool_with_session(monkeypatch, session)
+
+        result = await tool.generate_image("A product shot")
+
+        assert result["error_category"] == PROVIDER_UNAVAILABLE
+        assert session.calls == 3
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [429, 503])
@@ -1262,11 +1456,14 @@ def _connection_refused_error() -> aiohttp.ClientConnectorError:
 class _RaisingSession:
     def __init__(self, error: Exception) -> None:
         self._error = error
+        self.calls = 0
 
     def post(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
         raise self._error
 
     def request(self, *args: Any, **kwargs: Any) -> Any:
+        self.calls += 1
         raise self._error
 
     async def __aenter__(self) -> _RaisingSession:

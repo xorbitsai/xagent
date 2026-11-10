@@ -9,8 +9,13 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from xagent.core.model.image.base import BaseImageModel
-from xagent.core.tools.core.image_tool import ImageGenerationToolCore
+from xagent.core.model.image.base import BaseImageModel, resolve_requested_size
+from xagent.core.model.image.dashscope import DashScopeImageModel
+from xagent.core.model.image.gemini import GeminiImageModel
+from xagent.core.tools.core.image_tool import (
+    ImageGenerationToolCore,
+    _requested_size_for_generate,
+)
 from xagent.core.workspace import ExternalUploadStagingError, TaskWorkspace
 
 
@@ -171,6 +176,76 @@ class TestImageGenerationToolCore:
         for width, height in examples:
             assert int(width) % 16 == 0, (width, height)
             assert int(height) % 16 == 0, (width, height)
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION,
+            ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION,
+        ],
+        ids=["generate", "edit"],
+    )
+    def test_size_guidance_matches_the_providers(self, description: str) -> None:
+        """The old notes said OpenAI supports preset sizes only (untrue for
+        gpt-image-2/2.5) and told the model to fall back to aspect_ratio,
+        which DashScope, OpenAI and Xinference ignore in favour of size."""
+        assert "Support only specific preset sizes" not in description
+        assert "when unsure, use aspect_ratio instead" not in description
+        assert "gpt-image-2" in description
+        assert "Older OpenAI models accept only preset sizes" in description
+
+    def test_a_ratio_keeps_size_on_the_adapters_that_send_it(self) -> None:
+        model = DashScopeImageModel(model_name="qwen-image", api_key="test-key")
+
+        assert (
+            _requested_size_for_generate(
+                model,
+                "1080*1350",
+                resolution="999x999",
+                width=None,
+                height=None,
+                aspect_ratio="4:5",
+            )
+            == "1080*1350"
+        )
+
+    def test_gemini_keeps_the_resolution_for_its_bucket(self) -> None:
+        model = GeminiImageModel(
+            model_name="gemini-3-pro-image-preview-2k", api_key="test-key"
+        )
+
+        assert (
+            _requested_size_for_generate(
+                model,
+                "1080*1350",
+                resolution="999x999",
+                width=None,
+                height=None,
+                aspect_ratio="4:5",
+            )
+            == "999x999"
+        )
+
+    def test_without_a_ratio_the_resolution_precedence_holds(self) -> None:
+        model = DashScopeImageModel(model_name="qwen-image", api_key="test-key")
+
+        assert (
+            _requested_size_for_generate(
+                model,
+                "1080*1350",
+                resolution="999x999",
+                width=None,
+                height=None,
+                aspect_ratio=None,
+            )
+            == "999x999"
+        )
+        assert (
+            resolve_requested_size(
+                "1080*1350", resolution="999x999", aspect_ratio="4:5"
+            )
+            == "1080*1350"
+        )
 
     def test_init_with_models(self, mock_image_models, mock_workspace):
         """Test ImageGenerationToolCore initialization with models"""

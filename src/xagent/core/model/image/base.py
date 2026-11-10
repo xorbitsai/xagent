@@ -111,7 +111,10 @@ def retry_image_call(e: Exception) -> bool:
     more: the provider re-reads and refuses the same request on every attempt,
     so a retry only multiplies how long the caller waits for an answer that
     cannot change. The caller fixes the parameter from the constraint the tool
-    result carries, not from a second identical call.
+    result carries, not from a second identical call. That predicate is
+    deliberately narrower than ``classify_media_failure``: it never stops a
+    retry on message text alone, because a transport failure can carry text
+    that reads like a bad request.
 
     Every retryable failure here is a genuinely separate billed call, so the
     per-attempt accounting the providers do stays correct.
@@ -247,6 +250,7 @@ def resolve_requested_size(
     resolution: Any = None,
     width: Any = None,
     height: Any = None,
+    aspect_ratio: Any = None,
     default: str = "1024*1024",
 ) -> str:
     """The size a request actually asked for, as "WxH".
@@ -257,10 +261,21 @@ def resolve_requested_size(
     default. Shared here rather than repeated, because that divergence is
     exactly what happens when three providers each implement it separately.
 
+    ``aspect_ratio`` changes that precedence for the generate path where the
+    adapter keeps ``size`` when a ratio is present: DashScope, OpenAI and
+    Xinference send ``size`` as the pixel size and ignore
+    ``resolution``/``width``+``height``. Reporting a suggestion from those
+    fields would name dimensions the provider never received. Gemini builds a
+    ratio plus a resolution bucket instead, so its caller does not pass this
+    argument. Edit calls do not pass it either: those adapters fold the size
+    fields into ``size`` and drop the ratio.
+
     Callers normalise the separator afterwards: the vocabularies differ
     (``WxH`` for openai/dashscope, ``W*H`` for xinference) and the recorded
     resolution has to match what that provider's price table is keyed on.
     """
+    if aspect_ratio and isinstance(size, str) and size:
+        return size
     if isinstance(resolution, str) and resolution:
         return resolution
     if width and height:
@@ -278,6 +293,15 @@ class BaseImageModel(ABC):
     """
     Abstract base class for image generation models.
     """
+
+    #: Whether ``generate_image`` sends ``size`` verbatim when the caller also
+    #: passes ``aspect_ratio``. DashScope, OpenAI and Xinference ignore the
+    #: ratio (they log that it is unsupported) and keep ``size`` as the pixel
+    #: size they send. Gemini builds a ratio plus a 1K/2K/4K bucket from
+    #: ``resolution``/``width``+``height`` and applies the ratio on top, so the
+    #: other size fields still decide its bucket. The image tool reads this to
+    #: report the size the provider was actually asked for.
+    keeps_size_with_aspect_ratio: bool = True
 
     @property
     @abstractmethod

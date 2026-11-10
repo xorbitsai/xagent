@@ -1,8 +1,9 @@
 import json
 import logging
 import os
+import re
 from typing import Any, NoReturn
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -30,6 +31,13 @@ USERINFO_URL = "https://login.salesforce.com/services/oauth2/userinfo"
 # own host, through the proxy: login.salesforce.com does not serve sandbox
 # orgs, and the org's host is known to Composio only.
 ORG_USERINFO_PATH = "/services/oauth2/userinfo"
+# A host a Composio connection's base_url may name: DNS labels of letters,
+# digits and inner hyphens under salesforce.com. Nothing else -- urlsplit
+# keeps a backslash or a space in a hostname, and a parser downstream could
+# read the host before it as the target.
+_SALESFORCE_HOST_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+salesforce\.com"
+)
 # The redirects requests follows on the direct path (requests' REDIRECT_STATI).
 _FOLLOWED_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
@@ -345,6 +353,51 @@ def _raise_api_error(status: int, detail: str) -> NoReturn:
     raise RuntimeError(f"Salesforce API error (status {status}): {detail}")
 
 
+def _composio_org_host() -> str:
+    """The connected org's host, read from the ``base_url`` Composio keeps
+    for the connected account.
+
+    That ``base_url`` is the org's host plus ``/services/data/vNN.0`` (#3646
+    live test), and Composio appends a relative path to it, so the tools send
+    absolute URLs on the host instead, at this module's pinned API_VERSION,
+    as on the direct path. It is read on every call: each MCP tool call runs
+    in a fresh subprocess, so a per-process cache would never be hit.
+    """
+    base_url = composio_proxy.connected_account_base_url()
+    if base_url is None:
+        raise ValueError("the Composio connection has no base_url")
+    return _composio_base_url_host(base_url)
+
+
+def _composio_base_url_host(base_url: str) -> str:
+    """The host of a Composio connection's ``base_url``.
+
+    Stricter than ``_instance_url``: the value comes from the
+    connected account's record, built from what the user typed when
+    connecting, so credentials or a port refuse it instead of being cut off,
+    the host must be a subdomain of salesforce.com, and the error never
+    echoes the value.
+    """
+    parts = urlsplit(base_url)
+    hostname = (parts.hostname or "").rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or port is not None
+        or not _SALESFORCE_HOST_RE.fullmatch(hostname)
+    ):
+        raise ValueError(
+            "the Composio connection's base_url is not an https URL on a "
+            "*.salesforce.com host without credentials or a port"
+        )
+    return hostname
+
+
 def _request_via_composio(
     method: str,
     path: str,
@@ -352,14 +405,13 @@ def _request_via_composio(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
-    """Send an org-relative ``path`` through Composio, which adds the token
-    and, per Composio's Proxy Execute, resolves the path against the
-    connected org's own host (to be confirmed live, #3646)."""
+    """Send ``path`` on the connected org's host through Composio, which adds
+    the token."""
+    host = _composio_org_host()
     response = composio_proxy.proxy_request(
         method,
-        path,
-        # Paths only: the org's host is Composio's to fill in.
-        allowed_hosts=(),
+        f"https://{host}{path}",
+        allowed_hosts=(host,),
         query=params or {},
         body=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -383,7 +435,8 @@ def _request_via_composio(
         # Redacted before it is cut, so a Composio id echoed in the provider's
         # answer cannot reach the model, half or whole.
         _raise_api_error(response.status, composio_proxy.redact(detail))
-    return response.data if response.data is not None else {}
+    # Composio relays a 204's empty body as "" -- {} as on the direct path.
+    return {} if response.data is None or response.data == "" else response.data
 
 
 def _request(

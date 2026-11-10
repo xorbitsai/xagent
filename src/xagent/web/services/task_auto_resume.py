@@ -1681,8 +1681,8 @@ def promote_handover_pauses(
     ``HANDOVER_PROMOTE_WINDOW`` and that have no recovery row at their current
     ``state_version``, at most ``limit`` per tick. The recording is the
     settle step's own routine, so a person's pause or cancel still wins.
-    A pause that stays unrecordable (no resumable checkpoint) is looked at
-    again each tick until the window ends.
+    A pause with no resumable checkpoint gets its ``manual`` row too, so it
+    is not looked at again; one whose checkpoint cannot be read now is.
     """
 
     from ..models.database import get_session_local
@@ -1738,7 +1738,10 @@ def promote_handover_pauses(
                     if task is not None
                     else None
                 )
-                if result is None or result.outcome is not RecordOutcome.RECORDED:
+                if result is None or result.outcome not in (
+                    RecordOutcome.RECORDED,
+                    RecordOutcome.NOT_RECOVERABLE,
+                ):
                     db.rollback()
                     continue
                 db.commit()
@@ -1753,7 +1756,8 @@ def promote_handover_pauses(
                     task_id,
                 )
                 continue
-        report.handed_over += 1
+        if result.outcome is RecordOutcome.RECORDED:
+            report.handed_over += 1
         if result.notice is not None:
             report.notices.append(result.notice)
 

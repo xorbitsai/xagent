@@ -515,7 +515,13 @@ def test_a_checkpoint_that_cannot_be_read_yet_is_pending_and_a_missing_one_is_le
     checkpoint["verdict"] = CheckpointRecoveryVerdict.NOT_RECOVERABLE
     report = settle_handover_sync(RELEASE)
     assert (report.recorded, report.unsettled) == (0, 0)
-    assert _row(factory, task_id) is None
+    # Never resumed, but visible: a manual row says why, so the sweeper does not
+    # look at the run again on every tick.
+    row = _row(factory, task_id)
+    assert row is not None
+    assert (row.reason, row.state) == ("not_recoverable", "manual")
+    assert run_auto_resume_tick(now=utc_now() + timedelta(seconds=30)).handed_over == 0
+    assert _commands(factory, task_id)[-1].kind == "pause"
 
 
 # -- the successor ----------------------------------------------------------

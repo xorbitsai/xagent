@@ -64,6 +64,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from typing import cast
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
@@ -82,6 +83,7 @@ from .task_auto_recovery import (
     resolution_progress_marker,
     resolution_tool_call_in_flight,
     shutdown_handoff_eligible,
+    verdict_interruption_reason,
 )
 from .task_auto_resume import RecoveryNotice, recorded_notice
 from .task_command_transport import (
@@ -132,7 +134,8 @@ class RecordOutcome(Enum):
     RECORDED = "recorded"
     # The checkpoint cannot be read this round (or recording failed): retry.
     PENDING = "pending"
-    # No resumable checkpoint: the run stays paused for its user.
+    # No resumable checkpoint (or an unknown tool effect): the run stays paused
+    # for its user, with a ``manual`` row saying why. Committed like RECORDED.
     NOT_RECOVERABLE = "not_recoverable"
     # Not (or no longer) a handed-over pause, or already recorded.
     SKIPPED = "skipped"
@@ -330,22 +333,30 @@ def record_handover_pause_no_commit(
         resolution = resolve_checkpoint_recovery_with_data(
             db, _settlement_candidate(task)
         )
-        if resolution.verdict is not CheckpointRecoveryVerdict.RECOVERABLE:
-            # No checkpoint to resume from this round (or ever): leave it
-            # paused for its user rather than schedule a resume that fails.
+        if resolution.verdict is CheckpointRecoveryVerdict.INDETERMINATE:
+            # The checkpoint cannot be read this round: retry.
             savepoint.rollback()
-            if resolution.verdict is CheckpointRecoveryVerdict.INDETERMINATE:
-                return RecordResult(RecordOutcome.PENDING)
-            logger.warning(
-                "Handover pause of task %s has no resumable checkpoint (%s)",
-                task.id,
-                resolution.verdict.value,
+            return RecordResult(RecordOutcome.PENDING)
+        if resolution.verdict is CheckpointRecoveryVerdict.RECOVERABLE:
+            reason = InterruptionReason.SHUTDOWN
+        else:
+            # No checkpoint to resume from (or a tool whose effect is unknown):
+            # the run stays paused for its user, and the row says so, as after
+            # a crash. Without a row the sweeper would look at it again on
+            # every tick.
+            maybe_reason = verdict_interruption_reason(
+                resolution.verdict,
+                control_state=cast(str | None, task.control_state),
+                recoverable_reason=InterruptionReason.SHUTDOWN,
             )
-            return RecordResult(RecordOutcome.NOT_RECOVERABLE)
+            if maybe_reason is None:
+                savepoint.rollback()
+                return RecordResult(RecordOutcome.PENDING)
+            reason = maybe_reason
         recorded_row = record_interruption_no_commit(
             db,
             task=task,
-            reason=InterruptionReason.SHUTDOWN,
+            reason=reason,
             task_status=TaskStatus.PAUSED,
             interrupted_at=now,
             now=now,
@@ -359,7 +370,11 @@ def record_handover_pause_no_commit(
         return RecordResult(RecordOutcome.PENDING)
     savepoint.commit()
     return RecordResult(
-        RecordOutcome.RECORDED,
+        (
+            RecordOutcome.RECORDED
+            if reason is InterruptionReason.SHUTDOWN
+            else RecordOutcome.NOT_RECOVERABLE
+        ),
         recorded_notice(
             RecordedInterruption.from_row(recorded_row)
             if recorded_row is not None
@@ -385,6 +400,7 @@ def settle_handover_sync(release_id: str) -> HandoverReport:
     unsettled = 0
     failed = 0
     notices: list[RecoveryNotice] = []
+    wrote = False
     with get_session_local()() as db:
         for command in _release_commands(db, release_id):
             if command.status not in COMMAND_TERMINAL:
@@ -412,9 +428,12 @@ def settle_handover_sync(release_id: str) -> HandoverReport:
                 unsettled += 1
             elif result.outcome is RecordOutcome.RECORDED:
                 recorded += 1
+                wrote = True
                 if result.notice is not None:
                     notices.append(result.notice)
-        if recorded:
+            elif result.outcome is RecordOutcome.NOT_RECOVERABLE:
+                wrote = True
+        if wrote:
             db.commit()
         else:
             db.rollback()

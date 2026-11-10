@@ -3055,22 +3055,33 @@ async def execute_task_background(
 
             # Rejected inputs never reach the agent pattern that emits the
             # live answer. V2 publishes its committed transcript row below.
-            refusal_message_id = finalized.legacy_input_refusal_message_id
-            if refusal_message_id is not None:
-                await publish_task_event(
-                    create_stream_event(
-                        "agent_message",
+            if (
+                result.get("input_review_rejected") is True
+                and (refusal_message_id := finalized.legacy_input_refusal_message_id)
+                is not None
+            ):
+                try:
+                    await publish_task_event(
+                        create_stream_event(
+                            "agent_message",
+                            task_id,
+                            {
+                                "message": safe_str(ai_response),
+                                "message_type": INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+                                "display": "chat",
+                                "role": "assistant",
+                                "status": "completed",
+                            },
+                            event_id=f"chat_message_{refusal_message_id}",
+                        ),
                         task_id,
-                        {
-                            "message": safe_str(ai_response),
-                            "message_type": INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
-                            "display": "chat",
-                            "role": "assistant",
-                        },
-                        event_id=f"chat_message_{refusal_message_id}",
-                    ),
-                    task_id,
-                )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to publish input review refusal for task %s",
+                        task_id,
+                        exc_info=True,
+                    )
 
             # Send task completion event (includes agent response info)
             from .task_event_display import publish_task_result

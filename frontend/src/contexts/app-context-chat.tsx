@@ -4577,7 +4577,7 @@ export function AppProvider({
                 // Legacy chat_history replay rows carry no canonical id, so
                 // the failure provenance must win over the id-based status.
                 status: eventData.message_type === "task_failure" ? "failed"
-                  : canonicalMessageId || identifiedRefusal ? "completed"
+                  : canonicalMessageId ? "completed"
                   : eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
                 streamMessageId,
@@ -4586,7 +4586,9 @@ export function AppProvider({
                 interactionRequestId,
               }
             })
-            if (eventData.status === "completed") {
+            // The refusal bubble is settled. The task's terminal frame owns
+            // the overall status and blocked outcome.
+            if (eventData.status === "completed" && !identifiedRefusal) {
               dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
               dispatch({ type: "SET_PROCESSING", payload: false })
             }

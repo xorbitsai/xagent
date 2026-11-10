@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from email import policy
 from email.parser import BytesParser
 from typing import Any
@@ -765,4 +766,84 @@ def test_an_error_that_echoes_the_decoded_message_hides_a_long_recipient_list(
     )
     assert body not in seen
     assert "user000@example.com" not in seen
+    assert "user069@example.com" not in seen
     assert not [line for line in attachment_lines if line[:24] in seen]
+
+
+def test_an_attachment_of_same_prefix_base64_lines_stays_bounded(
+    monkeypatch, composio_env
+):
+    """The lookup's worst shape reached through the real message builder: a
+    2.4 MB attachment (inside the documented passing boundary) whose base64
+    lines all open with the same 32 characters, and a vendor that echoes only
+    the first 100 decoded lines. Each matched line used to try all 42k
+    fragments that shared its opening; the index must cost one lookup per
+    distinct length instead."""
+    attachment = b"".join(
+        b"\x00" * 45 + number.to_bytes(12, "big") for number in range(42000)
+    )
+    create, _ = gmail._build_message(
+        {"to": "a@example.com", "subject": "Many", "body": "hi"},
+        [("blob.bin", attachment)],
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    lines = decoded.split("\n")
+    base64_lines = [line for line in lines if len(line) == 76 and line[:32] == "A" * 32]
+    assert len(base64_lines) > 40000
+    echo = "invalid body " + "\n".join(lines[: len(lines) - len(base64_lines) + 100])
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    assert base64_lines[0][:24] not in str(raised.value)
+    assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
+
+
+def test_a_text_body_of_same_prefix_lines_stays_bounded(monkeypatch, composio_env):
+    """The same shape as a plain 7bit text body through the real builder:
+    30k lines of 76 characters that all open with the same 70, and a vendor
+    that echoes the first 100 of them."""
+    lines = ["X" * 70 + f"{number:06d}" for number in range(30000)]
+    create, _ = gmail._build_message(
+        {"to": "a@example.com", "subject": "Many", "body": "\r\n".join(lines)}, []
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded_lines = (
+        base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode().split("\n")
+    )
+    echo = "invalid body " + "\n".join(
+        decoded_lines[: len(decoded_lines) - len(lines) + 100]
+    )
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    assert lines[0][:20] not in str(raised.value)
+    assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"

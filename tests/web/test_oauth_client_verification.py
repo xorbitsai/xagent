@@ -157,7 +157,10 @@ def test_a_server_error_is_inconclusive_whatever_it_says(provider):
 
 
 def test_every_builtin_provider_is_covered():
-    assert set(BUILTIN) == set(verification.RULES) | set(verification.UNVERIFIABLE)
+    # Microsoft is checked with a client-credentials request instead.
+    assert set(BUILTIN) == set(verification.RULES) | set(verification.UNVERIFIABLE) | {
+        "microsoft"
+    }
 
 
 def _row(provider: str, *, secret: str = CLIENT_SECRET) -> SimpleNamespace:
@@ -508,3 +511,169 @@ def test_none_is_not_a_name_to_exclude(monkeypatch):
 
     with pytest.raises(SystemExit):
         verification.main(["--exclude", "None"], out=io.StringIO())
+
+
+# ---------------------------------------------------------------------------
+# Microsoft: a client-credentials request against the app's home tenant
+
+TENANT = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+# Answers shaped as Microsoft documents them, trimmed of trace ids.
+MICROSOFT_ANSWERS = {
+    "wrong-secret": (
+        401,
+        {
+            "error": "invalid_client",
+            "error_description": "AADSTS7000215: Invalid client secret provided. "
+            "Ensure the secret being sent in the request is the client secret value.",
+            "error_codes": [7000215],
+        },
+        "client_rejected",
+    ),
+    "expired-secret": (
+        401,
+        {
+            "error": "invalid_client",
+            "error_description": "AADSTS7000222: The provided client secret keys "
+            "for app 'x' are expired.",
+            "error_codes": [7000222],
+        },
+        "client_rejected",
+    ),
+    "app-not-in-tenant": (
+        400,
+        {
+            "error": "unauthorized_client",
+            "error_description": "AADSTS700016: Application with identifier 'x' "
+            "was not found in the directory 'y'.",
+            "error_codes": [700016],
+        },
+        "inconclusive",
+    ),
+    "no-such-tenant": (
+        400,
+        {
+            "error": "invalid_request",
+            "error_description": "AADSTS90002: Tenant 'y' not found.",
+            "error_codes": [90002],
+        },
+        "inconclusive",
+    ),
+    "server-error": (503, {"error": "invalid_client"}, "inconclusive"),
+    "token-issued": (
+        200,
+        {"token_type": "Bearer", "expires_in": 3599, "access_token": "app-only-token"},
+        "client_ok",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MICROSOFT_ANSWERS))
+def test_microsoft_is_checked_against_its_home_tenant(monkeypatch, case):
+    status, payload, expected = MICROSOFT_ANSWERS[case]
+    monkeypatch.setenv(verification.MICROSOFT_TENANT_ENV, TENANT)
+    sent = _vendor(monkeypatch, status, payload)
+
+    result = asyncio.run(
+        verification.verify_builtin_provider("microsoft", _row("microsoft"))
+    )
+
+    assert result.verdict == expected
+    (request,) = sent
+    assert request.method == "POST"
+    assert str(request.url) == (
+        f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+    )
+    body = {
+        key: values[0] for key, values in parse_qs(request.content.decode()).items()
+    }
+    assert body == {
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope": "https://graph.microsoft.com/.default",
+    }
+    line = verification.format_result(result)
+    for value in (CLIENT_ID, CLIENT_SECRET, "app-only-token"):
+        assert value not in line
+    codes = payload.get("error_codes")
+    if codes and status < 500:
+        assert f"(AADSTS{codes[0]})" in line
+
+
+def test_a_rejected_microsoft_secret_fails_the_command(monkeypatch):
+    monkeypatch.setenv(verification.MICROSOFT_TENANT_ENV, TENANT)
+    status, payload, _ = MICROSOFT_ANSWERS["expired-secret"]
+    _vendor(monkeypatch, status, payload)
+
+    result = asyncio.run(
+        verification.verify_builtin_provider("microsoft", _row("microsoft"))
+    )
+
+    assert verification.format_result(result).startswith(
+        "CLIENT_REJECTED oauth-client:microsoft: "
+    )
+
+
+@pytest.mark.parametrize("tenant", ["", "  "])
+def test_microsoft_without_a_tenant_is_unverifiable_and_sends_nothing(
+    monkeypatch, tenant
+):
+    monkeypatch.setenv(verification.MICROSOFT_TENANT_ENV, tenant)
+    sent = _vendor(monkeypatch, 401, {"error": "invalid_client"})
+
+    result = asyncio.run(
+        verification.verify_builtin_provider("microsoft", _row("microsoft"))
+    )
+
+    assert result.verdict == "unverifiable"
+    assert verification.MICROSOFT_TENANT_ENV in result.detail
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    "tenant",
+    [
+        "common",
+        "organizations",
+        "contoso.onmicrosoft.com",
+        f"{TENANT}/../x",
+        f"{TENANT}?a=b",
+    ],
+)
+def test_a_value_that_is_not_a_tenant_id_is_never_sent(monkeypatch, tenant):
+    monkeypatch.setenv(verification.MICROSOFT_TENANT_ENV, tenant)
+    sent = _vendor(monkeypatch, 401, {"error": "invalid_client"})
+
+    result = asyncio.run(
+        verification.verify_builtin_provider("microsoft", _row("microsoft"))
+    )
+
+    assert result.verdict == "inconclusive"
+    assert "not a directory (tenant) ID" in result.detail
+    assert tenant not in result.detail
+    assert sent == []
+
+
+def test_microsoft_without_a_credential_is_left_to_oauth_readiness(monkeypatch):
+    monkeypatch.setenv(verification.MICROSOFT_TENANT_ENV, TENANT)
+    sent = _vendor(monkeypatch, 200, {"access_token": "x"})
+    row = _row("microsoft")
+    row.client_secret = ""
+    monkeypatch.delenv("MICROSOFT_CLIENT_SECRET", raising=False)
+
+    result = asyncio.run(verification.verify_builtin_provider("microsoft", row))
+
+    assert result.verdict == "inconclusive"
+    assert "oauth_readiness" in result.detail
+    assert sent == []
+
+
+def test_a_microsoft_refresh_still_counts_only_invalid_client():
+    # The refresh path is unchanged: a real refresh answered invalid_client
+    # is the client; unauthorized_client is not.
+    assert verification.is_client_rejected(
+        "microsoft", *MICROSOFT_ANSWERS["expired-secret"][:2]
+    )
+    assert not verification.is_client_rejected(
+        "microsoft", *MICROSOFT_ANSWERS["app-not-in-tenant"][:2]
+    )

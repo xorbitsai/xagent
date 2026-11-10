@@ -121,6 +121,8 @@ NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
 BROWSER_TOOL_DEFAULT_LOCALE = "XAGENT_BROWSER_TOOL_DEFAULT_LOCALE"
 BROWSER_TOOL_DEFAULT_TIMEZONE = "XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE"
 BROWSER_ALLOW_UNSANDBOXED = "XAGENT_BROWSER_ALLOW_UNSANDBOXED"
+BROWSER_RUN_AS_UID = "XAGENT_BROWSER_RUN_AS_UID"
+BROWSER_RUN_AS_GID = "XAGENT_BROWSER_RUN_AS_GID"
 BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
 BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
 BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
@@ -1528,6 +1530,33 @@ def get_browser_allow_unsandboxed() -> bool:
     """Whether Playwright may launch Chromium without its sandbox."""
 
     return _get_bool_env(BROWSER_ALLOW_UNSANDBOXED, False)
+
+
+def get_browser_run_as() -> tuple[int, int] | None:
+    """Return the dedicated uid/gid Chromium should run as, if configured.
+
+    Both variables must be set together to a positive integer; uid/gid 0 is
+    rejected because it would keep the browser privileged.
+    """
+
+    raw_uid = os.getenv(BROWSER_RUN_AS_UID)
+    raw_gid = os.getenv(BROWSER_RUN_AS_GID)
+    if raw_uid is None and raw_gid is None:
+        return None
+    if raw_uid is None or raw_gid is None:
+        raise ValueError(
+            f"{BROWSER_RUN_AS_UID} and {BROWSER_RUN_AS_GID} must be set together"
+        )
+    values: list[int] = []
+    for name, raw in ((BROWSER_RUN_AS_UID, raw_uid), (BROWSER_RUN_AS_GID, raw_gid)):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+        if value < 1:
+            raise ValueError(f"{name} must be at least 1, got {value}")
+        values.append(value)
+    return values[0], values[1]
 
 
 _BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")

@@ -2387,6 +2387,46 @@ class TestBrowserSandboxConfig:
         assert config.get_browser_allow_unsandboxed() is True
 
 
+class TestBrowserRunAsConfig:
+    def test_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_RUN_AS_UID, raising=False)
+        monkeypatch.delenv(config.BROWSER_RUN_AS_GID, raising=False)
+
+        assert config.get_browser_run_as() is None
+
+    def test_both_set_returns_tuple(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_RUN_AS_UID, "1000")
+        monkeypatch.setenv(config.BROWSER_RUN_AS_GID, "1001")
+
+        assert config.get_browser_run_as() == (1000, 1001)
+
+    @pytest.mark.parametrize(
+        ("uid", "gid"),
+        [
+            ("1000", None),
+            (None, "1000"),
+            ("not-a-number", "1000"),
+            ("1000", "not-a-number"),
+            ("0", "1000"),
+            ("1000", "0"),
+            ("-1", "1000"),
+            ("1000", "-2"),
+        ],
+    )
+    def test_invalid_settings_raise(self, monkeypatch, uid, gid):
+        for name, value in (
+            (config.BROWSER_RUN_AS_UID, uid),
+            (config.BROWSER_RUN_AS_GID, gid),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+
+        with pytest.raises(ValueError):
+            config.get_browser_run_as()
+
+
 class TestCheckpointStorageConfig:
     """Config for checkpoint trace-event storage encoding and retention."""
 

@@ -9,7 +9,14 @@ automatically cleaned up after a timeout period.
 import asyncio
 import json
 import logging
+import mimetypes
+import os
 import re
+import shlex
+import shutil
+import stat
+import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Sequence, cast
@@ -17,6 +24,7 @@ from urllib.parse import unquote, urlsplit
 
 from ....config import (
     get_browser_allow_unsandboxed,
+    get_browser_run_as,
     get_browser_tool_default_locale,
     get_browser_tool_default_timezone,
 )
@@ -154,6 +162,57 @@ _HTTP_FETCH_PATTERNS = [
     {"urlPattern": "wss://*", "requestStage": "Request"},
 ]
 
+_MAX_LOCAL_FILE_BYTES = 64 * 1024 * 1024
+_LOCAL_FILE_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _read_fd(fd: int, limit: int) -> bytes:
+    """Read at most ``limit`` bytes from an already-open file descriptor."""
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1 << 20))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _create_browser_launcher(uid: int, gid: int, real_chrome: str) -> tuple[Path, Path]:
+    """Create a private launcher that runs Chromium through the privdrop module."""
+    launcher_dir = Path(tempfile.mkdtemp(prefix="xagent-browser-launcher-"))
+    try:
+        launcher_dir.chmod(0o700)
+        privdrop_copy = launcher_dir / "browser_privdrop.py"
+        privdrop_copy.write_text(
+            Path(__file__).with_name("browser_privdrop.py").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        launcher = launcher_dir / "launcher"
+        command = " ".join(
+            shlex.quote(part)
+            for part in (
+                sys.executable,
+                "-I",
+                str(privdrop_copy),
+                str(uid),
+                str(gid),
+                real_chrome,
+            )
+        )
+        launcher.write_text(f'#!/bin/sh\nexec {command} "$@"\n', encoding="utf-8")
+        launcher.chmod(0o700)
+    except BaseException:
+        shutil.rmtree(launcher_dir, ignore_errors=True)
+        raise
+    return launcher_dir, launcher
+
 
 class BrowserSession:
     """Browser session with lazy initialization."""
@@ -210,9 +269,11 @@ class BrowserSession:
         self._page_guard_futures: dict[int, asyncio.Future[None]] = {}
         self._cdp_sessions_by_page: dict[int, Any] = {}
         self._egress_proxy: PublicNetworkEgressProxy | None = None
+        self._launcher_dir: Path | None = None
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def _guard_page_requests(self, page: Page) -> None:
         """Validate network requests, including HTTP redirect hops.
@@ -378,9 +439,100 @@ class BrowserSession:
             )
         except Exception:
             logger.info("Blocked browser local-file request: %s", request_url)
-            await route.abort("blockedbyclient")
+            await self._abort_route(route)
             return
-        await route.fallback()
+        await self._serve_workspace_file(route, request_url)
+
+    async def _abort_route(self, route: Any) -> None:
+        try:
+            await route.abort("blockedbyclient")
+        except Exception:
+            pass
+
+    async def _serve_workspace_file(self, route: Any, request_url: str) -> None:
+        """Serve one validated file:// request from an already-open descriptor."""
+        fd: int | None = None
+        try:
+            resolved = _workspace_file_path(
+                request_url,
+                workspace_root=self.workspace_root,
+                workspace_roots=self.workspace_roots,
+                workspace_file_paths=self.workspace_file_paths,
+            )
+            if resolved is None:
+                logger.info("Blocked browser local-file request: %s", request_url)
+                await self._abort_route(route)
+                return
+            fd = os.open(str(resolved), _LOCAL_FILE_OPEN_FLAGS)
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                logger.info(
+                    "Blocked browser local-file request: %s (not a regular file)",
+                    request_url,
+                )
+                await self._abort_route(route)
+                return
+            if file_stat.st_size > _MAX_LOCAL_FILE_BYTES:
+                logger.info(
+                    "Blocked browser local-file request: %s (too large)",
+                    request_url,
+                )
+                await self._abort_route(route)
+                return
+            current = os.stat(resolved)
+            if (current.st_dev, current.st_ino) != (
+                file_stat.st_dev,
+                file_stat.st_ino,
+            ):
+                logger.info(
+                    "Blocked browser local-file request: %s (identity mismatch)",
+                    request_url,
+                )
+                await self._abort_route(route)
+                return
+            again = _workspace_file_path(
+                request_url,
+                workspace_root=self.workspace_root,
+                workspace_roots=self.workspace_roots,
+                workspace_file_paths=self.workspace_file_paths,
+            )
+            if again is None or again != resolved:
+                logger.info(
+                    "Blocked browser local-file request: %s (identity mismatch)",
+                    request_url,
+                )
+                await self._abort_route(route)
+                return
+            body = await asyncio.to_thread(_read_fd, fd, file_stat.st_size + 1)
+            if len(body) > file_stat.st_size:
+                logger.info(
+                    "Blocked browser local-file request: %s (too large)",
+                    request_url,
+                )
+                await self._abort_route(route)
+                return
+            content_type = (
+                mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+            )
+        except Exception as exc:
+            logger.info("Blocked browser local-file request: %s (%s)", request_url, exc)
+            await self._abort_route(route)
+            return
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        try:
+            await route.fulfill(body=body, content_type=content_type, status=200)
+        except Exception:
+            logger.info(
+                "Blocked browser local-file request: %s (fulfill failed)",
+                request_url,
+            )
+            await self._abort_route(route)
 
     def _schedule_page_guard(self, page: Page) -> None:
         task = asyncio.create_task(self._guard_page_requests(page))
@@ -410,12 +562,31 @@ class BrowserSession:
 
     async def _ensure_initialized(self) -> None:
         """Lazy initialization: create browser on first use."""
+        async with self._init_lock:
+            await self._initialize_unlocked()
+
+    async def _initialize_unlocked(self) -> None:
+        """Create the Playwright browser, context and guarded page."""
         if not self._initialized:
             if not PLAYWRIGHT_AVAILABLE:
                 raise RuntimeError(
                     "Playwright is not installed or browsers not downloaded. "
                     "Install with: pip install playwright. "
                     "Then download browsers: playwright install chromium"
+                )
+
+            run_as = get_browser_run_as()
+            if run_as is not None and (
+                os.name != "posix" or not hasattr(os, "geteuid")
+            ):
+                raise RuntimeError(
+                    "Browser run-as requires a POSIX host with os.geteuid"
+                )
+            current_euid = os.geteuid() if run_as is not None else None
+            if run_as is not None and current_euid not in (0, run_as[0]):
+                raise RuntimeError(
+                    "Switching the browser identity requires the parent process "
+                    f"to run as root (current euid {current_euid}, target uid {run_as[0]})"
                 )
 
             self._playwright = await async_playwright().start()
@@ -435,19 +606,30 @@ class BrowserSession:
             if allow_unsandboxed:
                 browser_args.append("--no-sandbox")
             try:
+                executable_path: str | None = None
+                if run_as is not None and current_euid == 0:
+                    self._launcher_dir, launcher = _create_browser_launcher(
+                        run_as[0],
+                        run_as[1],
+                        self._playwright.chromium.executable_path,
+                    )
+                    executable_path = str(launcher)
                 self._egress_proxy = PublicNetworkEgressProxy()
                 proxy_server = await self._egress_proxy.start()
-                self._browser = await self._playwright.chromium.launch(
-                    headless=self.headless,
-                    args=browser_args,
-                    chromium_sandbox=not allow_unsandboxed,
+                launch_kwargs: dict[str, Any] = {
+                    "headless": self.headless,
+                    "args": browser_args,
+                    "chromium_sandbox": not allow_unsandboxed,
                     # Chromium otherwise has an implicit loopback bypass on
                     # some versions.  Make the proxy boundary explicit so
                     # loopback/private destinations cannot skip validation.
-                    proxy={"server": proxy_server, "bypass": "<-loopback>"},
-                )
-            except Exception:
-                await self.close()
+                    "proxy": {"server": proxy_server, "bypass": "<-loopback>"},
+                }
+                if executable_path is not None:
+                    launch_kwargs["executable_path"] = executable_path
+                self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+            except BaseException:
+                await asyncio.shield(self.close())
                 raise
 
             # Create context with realistic settings. locale comes from the
@@ -468,8 +650,8 @@ class BrowserSession:
                     # page request, so keep them disabled for this context.
                     service_workers="block",
                 )
-            except Exception:
-                await self.close()
+            except BaseException:
+                await asyncio.shield(self.close())
                 raise
 
             try:
@@ -479,8 +661,8 @@ class BrowserSession:
                 self._context.on("page", self._schedule_page_guard)
                 self._page = await self._context.new_page()
                 await self._guard_page_requests(self._page)
-            except Exception:
-                await self.close()
+            except BaseException:
+                await asyncio.shield(self.close())
                 raise
 
             # Languages mirror the context's own locale instead of a fixed
@@ -614,7 +796,15 @@ class BrowserSession:
                 pass
             self._egress_proxy = None
 
+        self._remove_launcher_dir()
         self._initialized = False
+
+    def _remove_launcher_dir(self) -> None:
+        """Remove the per-launch launcher directory; safe to call repeatedly."""
+        launcher_dir = self._launcher_dir
+        self._launcher_dir = None
+        if launcher_dir is not None:
+            shutil.rmtree(launcher_dir, ignore_errors=True)
 
 
 class BrowserSessionManager:

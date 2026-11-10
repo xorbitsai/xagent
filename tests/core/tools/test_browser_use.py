@@ -6,6 +6,9 @@ Run with: pytest tests/core/tools/test_browser_use.py
 """
 
 import asyncio
+import os
+import stat
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,6 +37,40 @@ def reset_manager():
     browser_use._manager = None
     yield
     browser_use._manager = None
+
+
+def _mock_browser_playwright(monkeypatch):
+    """Install a fully mocked Playwright stack and return its browser handle."""
+    monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(
+        browser_use.PublicNetworkEgressProxy,
+        "start",
+        AsyncMock(return_value="http://127.0.0.1:43123"),
+    )
+    monkeypatch.setattr(browser_use.PublicNetworkEgressProxy, "close", AsyncMock())
+    playwright = MagicMock()
+    browser = MagicMock()
+    context = MagicMock()
+    page = MagicMock()
+    cdp = MagicMock()
+
+    playwright.chromium.executable_path = "/opt/playwright/chromium"
+    playwright.chromium.launch = AsyncMock(return_value=browser)
+    browser.new_context = AsyncMock(return_value=context)
+    browser.close = AsyncMock()
+    context.new_page = AsyncMock(return_value=page)
+    context.route = AsyncMock()
+    context.new_cdp_session = AsyncMock(return_value=cdp)
+    context.add_init_script = AsyncMock()
+    context.close = AsyncMock()
+    page.close = AsyncMock()
+    cdp.send = AsyncMock()
+    cdp.detach = AsyncMock()
+    playwright_api = MagicMock()
+    playwright_api.start = AsyncMock(return_value=playwright)
+    monkeypatch.setattr(browser_use, "async_playwright", lambda: playwright_api)
+    playwright.api = playwright_api
+    return playwright
 
 
 class TestBrowserNavigate:
@@ -318,7 +355,7 @@ class TestBrowserRequestGuard:
         route.fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_context_route_allows_authorized_file_and_falls_back_for_http(
+    async def test_context_route_fulfills_authorized_file_and_falls_back_for_http(
         self, tmp_path
     ):
         session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
@@ -329,8 +366,14 @@ class TestBrowserRequestGuard:
         local_route.request.url = local_file.as_uri()
         local_route.abort = AsyncMock()
         local_route.fallback = AsyncMock()
+        local_route.fulfill = AsyncMock()
         await session._guard_context_route(local_route)
-        local_route.fallback.assert_awaited_once_with()
+        local_route.fulfill.assert_awaited_once_with(
+            body=b"<html></html>",
+            content_type="text/html",
+            status=200,
+        )
+        local_route.fallback.assert_not_awaited()
         local_route.abort.assert_not_awaited()
 
         http_route = MagicMock()
@@ -338,6 +381,115 @@ class TestBrowserRequestGuard:
         http_route.fallback = AsyncMock()
         await session._guard_context_route(http_route)
         http_route.fallback.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="mkfifo unavailable")
+    async def test_context_route_aborts_fifo_without_blocking(
+        self, tmp_path, monkeypatch
+    ):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+        monkeypatch.setattr(
+            browser_use, "_workspace_file_path", lambda *args, **kwargs: fifo
+        )
+        route = MagicMock()
+        route.request.url = fifo.as_uri()
+        route.abort = AsyncMock()
+        route.fulfill = AsyncMock()
+
+        await asyncio.wait_for(session._guard_context_route(route), timeout=1)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
+        route.fulfill.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_route_aborts_oversized_file(self, tmp_path):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        huge = tmp_path / "huge.bin"
+        with huge.open("wb") as handle:
+            handle.truncate(browser_use._MAX_LOCAL_FILE_BYTES + 1)
+        route = MagicMock()
+        route.request.url = huge.as_uri()
+        route.abort = AsyncMock()
+        route.fulfill = AsyncMock()
+
+        await session._guard_context_route(route)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
+        route.fulfill.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_route_aborts_identity_swap(self, tmp_path, monkeypatch):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        local_file = tmp_path / "page.html"
+        local_file.write_text("<html></html>", encoding="utf-8")
+        other_file = tmp_path / "other.html"
+        other_file.write_text("<html>other</html>", encoding="utf-8")
+        calls = {"count": 0}
+
+        def changing_path(*args, **kwargs):
+            calls["count"] += 1
+            return local_file if calls["count"] < 3 else other_file
+
+        monkeypatch.setattr(browser_use, "_workspace_file_path", changing_path)
+        route = MagicMock()
+        route.request.url = local_file.as_uri()
+        route.abort = AsyncMock()
+        route.fulfill = AsyncMock()
+
+        await session._guard_context_route(route)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
+        route.fulfill.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_route_aborts_when_read_fails(self, tmp_path, monkeypatch):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        local_file = tmp_path / "page.html"
+        local_file.write_text("<html></html>", encoding="utf-8")
+
+        def failing_read(fd, limit):
+            raise OSError("read failed")
+
+        monkeypatch.setattr(browser_use, "_read_fd", failing_read)
+        route = MagicMock()
+        route.request.url = local_file.as_uri()
+        route.abort = AsyncMock()
+        route.fulfill = AsyncMock()
+
+        await session._guard_context_route(route)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
+        route.fulfill.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_route_aborts_when_fulfill_raises(self, tmp_path):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        local_file = tmp_path / "page.html"
+        local_file.write_text("<html></html>", encoding="utf-8")
+        route = MagicMock()
+        route.request.url = local_file.as_uri()
+        route.abort = AsyncMock()
+        route.fulfill = AsyncMock(side_effect=RuntimeError("fulfill failed"))
+
+        await session._guard_context_route(route)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
+
+    @pytest.mark.asyncio
+    async def test_context_route_swallows_abort_failure(self, tmp_path):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        local_file = tmp_path / "page.html"
+        local_file.write_text("<html></html>", encoding="utf-8")
+        route = MagicMock()
+        route.request.url = local_file.as_uri()
+        route.abort = AsyncMock(side_effect=RuntimeError("page gone"))
+        route.fulfill = AsyncMock(side_effect=RuntimeError("fulfill failed"))
+
+        await session._guard_context_route(route)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
 
     @pytest.mark.asyncio
     async def test_page_guard_failure_is_propagated(self):
@@ -684,6 +836,7 @@ class TestBrowserSession:
 
         session = browser_use.BrowserSession("sandbox-test", headless=True)
         monkeypatch.setattr(browser_use, "get_browser_allow_unsandboxed", lambda: False)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: None)
         await session.get_page()
 
         launch_kwargs = playwright.chromium.launch.await_args.kwargs
@@ -697,3 +850,150 @@ class TestBrowserSession:
         assert context.route.await_args.args[0].pattern == r"^file:"
 
         await session.close()
+
+    @pytest.mark.asyncio
+    async def test_run_as_unset_launches_without_executable_path(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: None)
+
+        session = browser_use.BrowserSession("no-run-as", headless=True)
+        await session.get_page()
+
+        launch_kwargs = playwright.chromium.launch.await_args.kwargs
+        assert "executable_path" not in launch_kwargs
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_root_parent_launches_through_private_launcher(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "geteuid", lambda: 0)
+
+        session = browser_use.BrowserSession("run-as-root", headless=True)
+        await session.get_page()
+
+        launch_kwargs = playwright.chromium.launch.await_args.kwargs
+        launcher = Path(launch_kwargs["executable_path"])
+        launcher_dir = launcher.parent
+        assert launcher_dir.name.startswith("xagent-browser-launcher-")
+        assert stat.S_IMODE(launcher_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(launcher.stat().st_mode) == 0o700
+        script = launcher.read_text(encoding="utf-8")
+        assert "/opt/playwright/chromium" in script
+        assert " 1234 4321 " in script
+        assert launch_kwargs["chromium_sandbox"] is True
+        assert "--no-sandbox" not in launch_kwargs["args"]
+
+        await session.close()
+        assert not launcher_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_parent_already_target_uid_launches_without_wrapper(
+        self, monkeypatch
+    ):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "geteuid", lambda: 1234)
+
+        session = browser_use.BrowserSession("already-target", headless=True)
+        await session.get_page()
+
+        launch_kwargs = playwright.chromium.launch.await_args.kwargs
+        assert "executable_path" not in launch_kwargs
+        await session.close()
+
+    @pytest.mark.asyncio
+    async def test_other_non_root_parent_rejects_identity_switch(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "geteuid", lambda: 1000)
+
+        session = browser_use.BrowserSession("non-root-parent", headless=True)
+        with pytest.raises(
+            RuntimeError, match="requires the parent process to run as root"
+        ):
+            await session.get_page()
+
+        playwright.chromium.launch.assert_not_awaited()
+        playwright.api.start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_launcher_dir_removed_when_launch_fails(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "geteuid", lambda: 0)
+        playwright.chromium.launch.side_effect = RuntimeError("launch failed")
+
+        session = browser_use.BrowserSession("launch-failure", headless=True)
+        with pytest.raises(RuntimeError, match="launch failed"):
+            await session.get_page()
+
+        launcher = Path(playwright.chromium.launch.await_args.kwargs["executable_path"])
+        assert not launcher.parent.exists()
+
+    @pytest.mark.asyncio
+    async def test_invalid_run_as_config_never_starts_playwright(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+
+        def invalid_config():
+            raise ValueError("invalid run-as config")
+
+        monkeypatch.setattr(browser_use, "get_browser_run_as", invalid_config)
+        session = browser_use.BrowserSession("invalid-config", headless=True)
+        with pytest.raises(ValueError, match="invalid run-as config"):
+            await session.get_page()
+
+        playwright.api.start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_posix_run_as_rejected_before_playwright(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "name", "nt")
+        session = browser_use.BrowserSession("non-posix", headless=True)
+
+        with pytest.raises(RuntimeError, match="POSIX host"):
+            await session.get_page()
+
+        playwright.api.start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_get_page_launches_once(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "geteuid", lambda: 0)
+        session = browser_use.BrowserSession("concurrent-init", headless=True)
+
+        await asyncio.gather(session.get_page(), session.get_page())
+
+        playwright.chromium.launch.assert_awaited_once()
+        launcher = Path(playwright.chromium.launch.await_args.kwargs["executable_path"])
+        assert launcher.parent.exists()
+        await session.close()
+        assert not launcher.parent.exists()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_launch_removes_launcher_dir(self, monkeypatch):
+        playwright = _mock_browser_playwright(monkeypatch)
+        monkeypatch.setattr(browser_use, "get_browser_run_as", lambda: (1234, 4321))
+        monkeypatch.setattr(browser_use.os, "geteuid", lambda: 0)
+        started = asyncio.Event()
+
+        async def hanging_launch(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        playwright.chromium.launch = AsyncMock(side_effect=hanging_launch)
+        session = browser_use.BrowserSession("cancel-init", headless=True)
+        task = asyncio.create_task(session.get_page())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        launcher = Path(playwright.chromium.launch.await_args.kwargs["executable_path"])
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        for _ in range(100):
+            if not launcher.parent.exists():
+                break
+            await asyncio.sleep(0)
+        assert not launcher.parent.exists()

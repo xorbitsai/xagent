@@ -1535,15 +1535,16 @@ def get_browser_allow_unsandboxed() -> bool:
 def get_browser_run_as() -> tuple[int, int] | None:
     """Return the dedicated uid/gid Chromium should run as, if configured.
 
-    Both variables must be set together to a positive integer; uid/gid 0 is
-    rejected because it would keep the browser privileged.
+    Both variables must be set together to a positive integer; blank values
+    count as unset. uid/gid 0 is rejected because it would keep the browser
+    privileged.
     """
 
-    raw_uid = os.getenv(BROWSER_RUN_AS_UID)
-    raw_gid = os.getenv(BROWSER_RUN_AS_GID)
-    if raw_uid is None and raw_gid is None:
+    raw_uid = (os.getenv(BROWSER_RUN_AS_UID) or "").strip()
+    raw_gid = (os.getenv(BROWSER_RUN_AS_GID) or "").strip()
+    if not raw_uid and not raw_gid:
         return None
-    if raw_uid is None or raw_gid is None:
+    if not raw_uid or not raw_gid:
         raise ValueError(
             f"{BROWSER_RUN_AS_UID} and {BROWSER_RUN_AS_GID} must be set together"
         )
@@ -1553,8 +1554,8 @@ def get_browser_run_as() -> tuple[int, int] | None:
             value = int(raw)
         except (TypeError, ValueError):
             raise ValueError(f"{name} must be an integer, got {raw!r}") from None
-        if value < 1:
-            raise ValueError(f"{name} must be at least 1, got {value}")
+        if not 1 <= value <= 2**32 - 2:
+            raise ValueError(f"{name} must be between 1 and {2**32 - 2}, got {value}")
         values.append(value)
     return values[0], values[1]
 

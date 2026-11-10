@@ -2394,6 +2394,21 @@ class TestBrowserRunAsConfig:
 
         assert config.get_browser_run_as() is None
 
+    @pytest.mark.parametrize(("uid", "gid"), [("", ""), ("   ", "\t")])
+    def test_blank_values_return_none(self, monkeypatch, uid, gid):
+        monkeypatch.setenv(config.BROWSER_RUN_AS_UID, uid)
+        monkeypatch.setenv(config.BROWSER_RUN_AS_GID, gid)
+
+        assert config.get_browser_run_as() is None
+
+    @pytest.mark.parametrize(("uid", "gid"), [("", "1000"), ("1000", "   ")])
+    def test_one_blank_value_requires_both(self, monkeypatch, uid, gid):
+        monkeypatch.setenv(config.BROWSER_RUN_AS_UID, uid)
+        monkeypatch.setenv(config.BROWSER_RUN_AS_GID, gid)
+
+        with pytest.raises(ValueError, match="must be set together"):
+            config.get_browser_run_as()
+
     def test_both_set_returns_tuple(self, monkeypatch):
         monkeypatch.setenv(config.BROWSER_RUN_AS_UID, "1000")
         monkeypatch.setenv(config.BROWSER_RUN_AS_GID, "1001")
@@ -2411,6 +2426,7 @@ class TestBrowserRunAsConfig:
             ("1000", "0"),
             ("-1", "1000"),
             ("1000", "-2"),
+            ("4294967295", "1000"),
         ],
     )
     def test_invalid_settings_raise(self, monkeypatch, uid, gid):

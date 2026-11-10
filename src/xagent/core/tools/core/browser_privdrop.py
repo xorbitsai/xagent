@@ -7,12 +7,36 @@ Playwright driver stays root; only the browser process drops privileges.
 import os
 import stat as stat_module
 import sys
-from collections.abc import Callable, MutableMapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+_MAX_ID = 2**32 - 2
 _USER_DATA_DIR_ARG = "--user-data-dir="
 _USER_DATA_DIR_PREFIX = "playwright_chromiumdev_profile-"
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "TMPDIR",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+    }
+)
+_ENV_PREFIXES = ("LC_", "XDG_", "FONTCONFIG_")
+
+
+def _exec_environment(environ: Mapping[str, str], home: str) -> dict[str, str]:
+    """Select only the variables Chromium needs from the parent environment."""
+    selected = {
+        key: value
+        for key, value in environ.items()
+        if key in _ENV_ALLOWLIST or key.startswith(_ENV_PREFIXES)
+    }
+    selected["HOME"] = home
+    return selected
 
 
 class LaunchError(RuntimeError):
@@ -21,7 +45,7 @@ class LaunchError(RuntimeError):
 
 @dataclass(frozen=True)
 class LaunchSpec:
-    """Validated launcher inputs."""
+    """Launcher inputs with a validated identity and profile directory."""
 
     uid: int
     gid: int
@@ -45,8 +69,8 @@ def parse_launch_argv(
         gid = int(argv[1])
     except ValueError:
         raise LaunchError("uid and gid must be integers") from None
-    if uid < 1 or gid < 1:
-        raise LaunchError("uid and gid must be positive")
+    if not (1 <= uid <= _MAX_ID and 1 <= gid <= _MAX_ID):
+        raise LaunchError(f"uid and gid must be between 1 and {_MAX_ID}")
     chrome_args = tuple(argv[3:])
     flag_values = [arg for arg in chrome_args if arg.startswith(_USER_DATA_DIR_ARG)]
     if len(flag_values) != 1:
@@ -68,6 +92,7 @@ def chown_tree(
     uid: int,
     gid: int,
     *,
+    expected_owner: int = 0,
     open_fn: Callable[..., int] = os.open,
     fstat: Callable[[int], os.stat_result] = os.fstat,
     stat: Callable[..., os.stat_result] = os.stat,
@@ -81,8 +106,9 @@ def chown_tree(
     root_fd = open_fn(root, _DIRECTORY_OPEN_FLAGS)
     try:
         root_stat = fstat(root_fd)
-        if not is_dir(root_stat.st_mode) or root_stat.st_uid != 0:
-            raise LaunchError("--user-data-dir must be a directory owned by root")
+        if not is_dir(root_stat.st_mode) or root_stat.st_uid != expected_owner:
+            owner = "root" if expected_owner == 0 else f"uid {expected_owner}"
+            raise LaunchError(f"--user-data-dir must be a directory owned by {owner}")
         _chown_children(
             root_fd,
             uid,
@@ -169,7 +195,7 @@ def launch(
     isabs: Callable[[str], bool] = os.path.isabs,
     isdir: Callable[[str], bool] = os.path.isdir,
     islink: Callable[[str], bool] = os.path.islink,
-    chown_profile: Callable[[str, int, int], None] = chown_tree,
+    chown_profile: Callable[..., None] = chown_tree,
     setgroups: Callable[[Sequence[int]], None] = os.setgroups,
     setgid: Callable[[int], None] = os.setgid,
     setuid: Callable[[int], None] = os.setuid,
@@ -177,12 +203,17 @@ def launch(
     geteuid: Callable[[], int] = os.geteuid,
     getgid: Callable[[], int] = os.getgid,
     getegid: Callable[[], int] = os.getegid,
-    execv: Callable[[str, list[str]], object] = os.execv,
-    environ: MutableMapping[str, str] | None = None,
+    execve: Callable[[str, list[str], Mapping[str, str]], object] = os.execve,
+    environ: Mapping[str, str] | None = None,
 ) -> None:
     """Validate, chown the profile, drop privileges and exec Chromium."""
     spec = parse_launch_argv(argv, isabs=isabs, isdir=isdir, islink=islink)
-    chown_profile(spec.user_data_dir, spec.uid, spec.gid)
+    chown_profile(
+        spec.user_data_dir,
+        spec.uid,
+        spec.gid,
+        expected_owner=geteuid(),
+    )
     drop_privileges(
         spec.uid,
         spec.gid,
@@ -194,8 +225,9 @@ def launch(
         getgid=getgid,
         getegid=getegid,
     )
-    (os.environ if environ is None else environ)["HOME"] = spec.user_data_dir
-    execv(spec.real_chrome, [spec.real_chrome, *spec.chrome_args])
+    parent_env = os.environ if environ is None else environ
+    exec_env = _exec_environment(parent_env, spec.user_data_dir)
+    execve(spec.real_chrome, [spec.real_chrome, *spec.chrome_args], exec_env)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

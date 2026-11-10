@@ -68,7 +68,13 @@ class _Finder(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
     def visit_Call(self, node: ast.Call) -> None:
-        if isinstance(node.func, ast.Name) and node.func.id in self.task_names:
+        func = node.func
+        # A bare imported name, or any ``<module>.Task(...)``: ``src/xagent``
+        # constructs no other ``Task`` through an attribute (``asyncio.Task``
+        # is created via ``create_task``), so this has no false positives.
+        if (isinstance(func, ast.Name) and func.id in self.task_names) or (
+            isinstance(func, ast.Attribute) and func.attr == "Task"
+        ):
             self.sites.append((self.stack[-1] if self.stack else "<module>", node))
         self.generic_visit(node)
 
@@ -97,11 +103,8 @@ def _scan() -> list[tuple[str, str, ast.Call]]:
     found: list[tuple[str, str, ast.Call]] = []
     for path in sorted(_SRC_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        names = _resolve_task_imports(tree, path)
-        if not names:
-            continue
         finder = _Finder()
-        finder.task_names = names
+        finder.task_names = _resolve_task_imports(tree, path)
         finder.visit(tree)
         rel = path.relative_to(_SRC_ROOT).as_posix()
         found.extend((rel, func, call) for func, call in finder.sites)

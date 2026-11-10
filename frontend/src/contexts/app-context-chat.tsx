@@ -4549,19 +4549,23 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!canonicalMessageId && !streamMessageId && isDuplicateMessageForViewedTask(
+            const agentMessageId = isAgentMessage
+              ? stableAssistantMessageId(
+                message.event_id || traceEventData.event_id || eventData.event_id,
+              )
+              : null
+            // Identical refusals can belong to different turns. The persisted
+            // message ID also pairs the live refusal with its history replay.
+            const identifiedRefusal = eventData.message_type === "input_review_rejected"
+              && agentMessageId !== null
+            if (!canonicalMessageId && !streamMessageId && !identifiedRefusal && isDuplicateMessageForViewedTask(
               messageContent,
               'agent-message',
               isAgentMessage ? interactionRequestId : undefined,
             )) {
               return
             }
-            const msgId = canonicalMessageId ??
-              (isAgentMessage
-                ? stableAssistantMessageId(
-                  message.event_id || traceEventData.event_id || eventData.event_id,
-                )
-                : null) ?? generateMessageId("msg-agent")
+            const msgId = canonicalMessageId ?? agentMessageId ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -4582,7 +4586,9 @@ export function AppProvider({
                 interactionRequestId,
               }
             })
-            if (eventData.status === "completed") {
+            // The refusal bubble is settled. The task's terminal frame owns
+            // the overall status and blocked outcome.
+            if (eventData.status === "completed" && !identifiedRefusal) {
               dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
               dispatch({ type: "SET_PROCESSING", payload: false })
             }

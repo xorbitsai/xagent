@@ -1980,6 +1980,7 @@ class _TaskExecutionFinalization:
     final_task_status: str
     broadcast_meta: dict[str, Any]
     late_result: bool = False
+    legacy_input_refusal_message_id: int | None = None
     # The committed control identity, plus the recorded reason when an
     # interruption paused the run.
     report: SettlementReport = field(default_factory=SettlementReport)
@@ -2209,6 +2210,7 @@ def _finalize_task_execution_result_isolated(
     SessionLocal = get_session_local()
     finalize_db = SessionLocal()
     metadata_committed = False
+    legacy_input_refusal_message_id: int | None = None
     cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
     try:
         default_response = "Task completed" if result.get("success", False) else ""
@@ -2565,6 +2567,8 @@ def _finalize_task_execution_result_isolated(
                         message_type=str(assistant_message.message_type),
                         content=str(assistant_message.content),
                     )
+                    if input_review_rejected and result.get("success") is True:
+                        legacy_input_refusal_message_id = legacy_witness.message_id
                 result_commit_pending = True
 
             if result_commit_pending:
@@ -2626,6 +2630,7 @@ def _finalize_task_execution_result_isolated(
             terminal_state_committed=terminal_state_committed,
             final_task_status=final_task_status,
             broadcast_meta=broadcast_meta,
+            legacy_input_refusal_message_id=legacy_input_refusal_message_id,
             report=SettlementReport(
                 control_state=(
                     final_control_snapshot.as_dict()
@@ -3047,6 +3052,36 @@ async def execute_task_background(
                     final_task_status,
                 )
                 return
+
+            # Rejected inputs never reach the agent pattern that emits the
+            # live answer. V2 publishes its committed transcript row below.
+            if (
+                result.get("input_review_rejected") is True
+                and (refusal_message_id := finalized.legacy_input_refusal_message_id)
+                is not None
+            ):
+                try:
+                    await publish_task_event(
+                        create_stream_event(
+                            "agent_message",
+                            task_id,
+                            {
+                                "message": safe_str(ai_response),
+                                "message_type": INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+                                "display": "chat",
+                                "role": "assistant",
+                                "status": "completed",
+                            },
+                            event_id=f"chat_message_{refusal_message_id}",
+                        ),
+                        task_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to publish input review refusal for task %s",
+                        task_id,
+                        exc_info=True,
+                    )
 
             # Send task completion event (includes agent response info)
             from .task_event_display import publish_task_result

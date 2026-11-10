@@ -12,7 +12,8 @@ from ..user_context import current_user_id
 from .output import get_delegated_review_agent_id
 
 BLOCKED_INPUT = (
-    "I can't help with that request. Please rephrase it or ask about a supported topic."
+    "This request didn't pass input review. "
+    "Please rephrase it or ask about a topic this agent supports."
 )
 UNAVAILABLE_INPUT = "I couldn't complete the input safety check. Please try again."
 INPUT_REVIEW_BLOCKED_CODE = "input_review_blocked"

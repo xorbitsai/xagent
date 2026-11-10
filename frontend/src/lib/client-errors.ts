@@ -128,7 +128,7 @@ const CLIENT_ERROR_FALLBACKS: Record<ClientErrorCode, string> = {
   message_rate_limited: "You're sending messages too quickly. Please wait a moment and try again.",
   message_id_conflict: "Message id was already used for different content or files.",
   message_delivery_failed: "The message could not be delivered. Please retry the draft.",
-  input_review_blocked: "I can't help with that request. Please rephrase it or ask about a supported topic.",
+  input_review_blocked: "This request didn't pass input review. Please rephrase it or ask about a topic this agent supports.",
   input_review_unavailable: "I couldn't complete the input safety check. Please try again.",
   message_continuation_unsupported: "Task does not support message continuation.",
   task_pause_in_progress: "Task pause is still being applied; please retry shortly.",

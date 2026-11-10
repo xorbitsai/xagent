@@ -71,7 +71,8 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "The message could not be delivered. Please retry the draft."
         ),
         "input_review_blocked": (
-            "I can't help with that request. Please rephrase it or ask about a supported topic."
+            "This request didn't pass input review. "
+            "Please rephrase it or ask about a topic this agent supports."
         ),
         "input_review_unavailable": (
             "I couldn't complete the input safety check. Please try again."

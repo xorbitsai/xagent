@@ -347,6 +347,7 @@ async def test_unsafe_legacy_assistant_ancillary_payload_is_not_replayed(
     ("message_type", "expected_message_type"),
     [
         ("task_failure", "task_failure"),
+        ("input_review_rejected", "input_review_rejected"),
         # Fail-closed legacy rows may be legitimate answers, so they are not
         # marked failed on the client.
         ("chat_response", None),
@@ -355,7 +356,7 @@ async def test_unsafe_legacy_assistant_ancillary_payload_is_not_replayed(
         ("question", None),
     ],
 )
-async def test_legacy_history_exposes_only_task_failure_provenance(
+async def test_legacy_history_exposes_failure_and_refusal_provenance(
     _test_db,
     monkeypatch: pytest.MonkeyPatch,
     message_type: str,
@@ -373,13 +374,19 @@ async def test_legacy_history_exposes_only_task_failure_provenance(
     )
 
     agent_messages = [
-        event.get("data", {})
+        event
         for event in events
         if event.get("event_type") == "agent_message"
         and event.get("data", {}).get("source") == "chat_history"
     ]
     assert len(agent_messages) == 1
-    assert agent_messages[0].get("message_type") == expected_message_type
+    message = agent_messages[0]
+    assert message["data"].get("message_type") == expected_message_type
+    with _direct_db_session() as db:
+        row = (
+            db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
+        )
+        assert message["event_id"] == f"chat_message_{row.id}"
 
 
 @pytest.mark.asyncio
@@ -620,7 +627,9 @@ async def test_new_plain_assistant_response_replays_unchanged(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verdict", ["blocked", "exception", "timeout"])
+@pytest.mark.parametrize(
+    "verdict", ["blocked", "blocked_publish_failure", "exception", "timeout"]
+)
 @pytest.mark.parametrize("storage_version", [1, 2])
 async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
     _test_db,
@@ -628,7 +637,7 @@ async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
     verdict,
     storage_version,
 ) -> None:
-    unavailable = verdict != "blocked"
+    unavailable = verdict in {"exception", "timeout"}
     run_id = "review-run"
     task_id, user_id = _running_task(
         username="review-history", title="Review history", run_id=run_id
@@ -709,6 +718,16 @@ async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
     )
     publish = AsyncMock()
     monkeypatch.setattr(task_event_display, "publish_task_result", publish)
+
+    async def publish_live_event(message, _task_id):
+        if (
+            verdict == "blocked_publish_failure"
+            and message.get("event_type") == "agent_message"
+        ):
+            raise RuntimeError("Chat transport unavailable")
+
+    publish_event = AsyncMock(side_effect=publish_live_event)
+    monkeypatch.setattr(task_execution_service, "publish_task_event", publish_event)
     await task_execution_service.execute_task_background(
         task_id=task_id,
         user_message=candidate_text,
@@ -744,6 +763,20 @@ async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
             db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
         )
         assert notice.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        replies = [
+            call.args[0]
+            for call in publish_event.await_args_list
+            if call.args[0].get("event_type") == "agent_message"
+        ]
+        if storage_version == 1 and not unavailable:
+            assert len(replies) == 1
+            assert replies[0]["event_id"] == f"chat_message_{notice.id}"
+            assert replies[0]["data"]["message"] == expected_text
+            assert (
+                replies[0]["data"]["message_type"] == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+            )
+        else:
+            assert replies == []
         assert (
             client_safe_assistant_history_content(
                 content=notice.content, message_type=notice.message_type

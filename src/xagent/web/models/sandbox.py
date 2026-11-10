@@ -26,9 +26,7 @@ class SandboxInfo(Base):  # type: ignore[no-any-unimported]
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    sandbox_type = Column(
-        String(50), nullable=False, index=True
-    )  # boxlite, docker, etc.
+    sandbox_type = Column(String(50), nullable=False, index=True)  # docker, etc.
     name = Column(String(255), nullable=False, index=True)
     state = Column(String(50), nullable=False)
 

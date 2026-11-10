@@ -1,8 +1,6 @@
 """Test Docker sandbox store"""
 
 import json
-import subprocess
-import sys
 from datetime import datetime
 
 import pytest
@@ -16,6 +14,7 @@ from xagent.sandbox import (
     SandboxSnapshot,
     SandboxTemplate,
 )
+from xagent.web import sandbox_store as sandbox_store_module
 from xagent.web.models.database import Base
 from xagent.web.models.sandbox import SandboxInfo as SandboxInfoModel
 from xagent.web.models.sandbox import SandboxSnapshot as SandboxSnapshotModel
@@ -139,6 +138,30 @@ class TestDBDockerStore:
         config_data = json.loads(model.config)
         assert config_data["cpus"] == 4
 
+    def test_get_info_round_trips_all_fields(self, store, sample_sandbox_info):
+        """The shared DB store base reconstructs the complete sandbox contract."""
+        store.add_info("test-sandbox", sample_sandbox_info)
+
+        info = store.get_info("test-sandbox")
+
+        assert isinstance(info, SandboxInfo)
+        assert isinstance(info.template, SandboxTemplate)
+        assert isinstance(info.config, SandboxConfig)
+        assert info.name == "test-sandbox"
+        assert info.state == "running"
+        assert info.template.type == "image"
+        assert info.template.image == DEFAULT_SANDBOX_IMAGE
+        assert info.config.working_dir == "/workspace"
+        assert info.config.cpus == 2
+        assert info.config.memory == 1024
+        assert info.config.env == {"PYTHONPATH": "/app", "DEBUG": "true"}
+        assert info.config.volumes == [("/host/data", "/container/data", "rw")]
+        assert info.config.network_isolated is True
+        assert info.config.ports == [(8080, 80), (8443, 443)]
+
+    def test_get_info_not_exists(self, store):
+        assert store.get_info("non-existent") is None
+
     def test_update_info_state(self, db_session, store, sample_sandbox_info):
         """Test updating sandbox state"""
         # Add first
@@ -158,6 +181,10 @@ class TestDBDockerStore:
         )
         assert model.state == "stopped"
 
+    def test_update_info_state_not_exists(self, store):
+        """Updating a missing sandbox remains an idempotent no-op."""
+        store.update_info_state("non-existent", "stopped")
+
     def test_delete_info(self, db_session, store, sample_sandbox_info):
         """Test deleting sandbox info"""
         # Add first
@@ -176,6 +203,10 @@ class TestDBDockerStore:
             .first()
         )
         assert model is None
+
+    def test_delete_info_not_exists(self, store):
+        """Deleting a missing sandbox remains an idempotent no-op."""
+        store.delete_info("non-existent")
 
     def test_get_snapshot(self, db_session, store, sample_snapshot):
         """Test getting persisted snapshot info."""
@@ -255,14 +286,6 @@ class TestDBDockerStore:
         assert model is None
 
 
-def test_sandbox_store_imports_without_boxlite():
-    code = (
-        "import sys; sys.modules['boxlite'] = None\n"
-        "import xagent.web.sandbox_store as m\n"
-        "assert m.DBDockerStore\n"
-        "assert not hasattr(m, 'DBBoxliteStore')\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True
-    )
-    assert result.returncode == 0, result.stderr
+def test_sandbox_store_exposes_only_docker_store():
+    assert sandbox_store_module.DBDockerStore is DBDockerStore
+    assert not hasattr(sandbox_store_module, "DBBoxliteStore")

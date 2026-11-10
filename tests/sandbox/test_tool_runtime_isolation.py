@@ -333,49 +333,6 @@ def test_uploads_root_cannot_exempt_a_mount_of_backend_source(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stored", [True, False])
-async def test_old_boxlite_guest_is_not_resumed_with_legacy_or_unknown_mounts(stored):
-    pytest.importorskip("boxlite")
-    import asyncio
-    from unittest.mock import MagicMock
-
-    from xagent.sandbox.base import SandboxConfig as GuestConfig
-    from xagent.sandbox.base import (
-        SandboxInfo,
-        SandboxTemplate,
-    )
-    from xagent.sandbox.boxlite_sandbox import BoxliteSandboxService, MemBoxliteStore
-
-    service = object.__new__(BoxliteSandboxService)
-    service._locks = {}
-    service._locks_lock = asyncio.Lock()
-    service._runtime = MagicMock()
-    service._runtime.get = AsyncMock(return_value=object())
-    service._runtime.remove = AsyncMock()
-    service._store = MemBoxliteStore()
-    if stored:
-        service._store.add_info(
-            "legacy",
-            SandboxInfo(
-                name="legacy",
-                state="stopped",
-                template=SandboxTemplate(),
-                config=GuestConfig(volumes=[("/backend/src", "/app/src", "ro")]),
-            ),
-        )
-    with (
-        patch(
-            "xagent.sandbox.boxlite_sandbox._create_or_reuse_box",
-            new=AsyncMock(side_effect=RuntimeError("fresh creation")),
-        ) as resume,
-        pytest.raises(RuntimeError, match="fresh creation"),
-    ):
-        await service.get_or_create("legacy", config=GuestConfig())
-    service._runtime.remove.assert_awaited_once_with("legacy", force=True)
-    assert not resume.await_args.args[2].volumes
-
-
-@pytest.mark.asyncio
 async def test_configured_sandbox_missing_fails_before_tool_creation(monkeypatch):
     from xagent.core.tools.adapters.vibe.config import ToolConfig
 

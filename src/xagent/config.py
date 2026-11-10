@@ -9,7 +9,6 @@ Environment Variable Naming Convention:
     Most config variables use the XAGENT_* prefix for consistency.
     Exceptions (without XAGENT_ prefix) are kept for backward compatibility:
     - SANDBOX_*: Sandbox container configuration (predates this module)
-    - BOXLITE_HOME_DIR: Boxlite sandbox home directory
     - DATABASE_URL: Standard database connection URL
     - LANCEDB_PATH: LanceDB database path
 
@@ -216,7 +215,6 @@ SANDBOX_WORKSPACE_VOLUME = "XAGENT_SANDBOX_WORKSPACE_VOLUME"
 SANDBOX_WORKSPACE_VOLUME_ROOT = "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
-BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
@@ -4459,21 +4457,6 @@ def get_sandbox_worker_namespace() -> str | None:
 
     suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
     return f"{namespace}-{suffix}"
-
-
-def get_boxlite_home_dir() -> Path | None:
-    """Get the BoxLite home, isolated by stable worker ID in shared mode.
-
-    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
-    Shared execution uses a worker subdirectory under the configured home or
-    the unified storage root's boxlite directory.
-    """
-    env_str = os.getenv(BOXLITE_HOME_DIR)
-    home_dir = Path(env_str) if env_str else None
-    worker_id = get_sandbox_worker_id()
-    if worker_id is not None:
-        return (home_dir or get_storage_root() / "boxlite") / worker_id
-    return home_dir
 
 
 def get_tool_max_output_length() -> int:

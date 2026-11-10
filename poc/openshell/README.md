@@ -1,10 +1,11 @@
 # OpenShell sandbox backend POC
 
 Goal: find out whether NVIDIA OpenShell (v0.1.7) can back xagent's
-tool-execution sandbox in place of the Docker / Boxlite backends, and what
+tool-execution sandbox in place of the Docker backend, and what
 it buys us (egress allowlists, credential placeholders) versus what breaks.
 
-Scope: a third `SandboxService` implementation at the Boxlite level
+Scope: a second `SandboxService` implementation on SandboxManager's legacy
+(non-reconciling) route
 (`get_or_create` / exec / file transfer / stop / delete). No snapshots and
 no spec reconciliation (`supports_runtime_spec() == False`).
 
@@ -61,7 +62,7 @@ real tools, and the `SandboxManager` lease-provider route that agent tasks use.
 4. **No SDK file-transfer API.** Done over exec stdin/stdout. Each stdin chunk
    is one gRPC message capped at 1 MiB (the documented 4 MiB is the total),
    so chunks are 768 KiB. Output is buffered fully by the SDK, so
-   `max_output_bytes` only trims after the fact (same as Boxlite).
+   `max_output_bytes` only trims after the fact.
 5. **No snapshots.** `supports_snapshots() == False`; snapshot templates are
    rejected. The Docker backend's commit-to-template flow has no equivalent.
 6. **No spec reconciliation.** The SandboxManager reconcile/fingerprint path

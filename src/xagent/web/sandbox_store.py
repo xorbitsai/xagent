@@ -22,8 +22,6 @@ from .models.sandbox import SandboxSnapshot as SandboxSnapshotModel
 
 logger = logging.getLogger(__name__)
 
-# Sandbox type constant
-SANDBOX_TYPE_BOXLITE = "boxlite"
 SANDBOX_TYPE_DOCKER = "docker"
 SANDBOX_TYPE_OPENSHELL = "openshell"
 
@@ -209,18 +207,6 @@ class _DBSandboxStoreBase:
         # Convert Pydantic model to dict, then to JSON
         model.template = json.dumps(info.template.model_dump())  # type: ignore[assignment]
         model.config = json.dumps(info.config.model_dump())  # type: ignore[assignment]
-
-
-try:
-    from ..sandbox import BoxliteStore
-except ImportError:  # boxlite is not installed on linux/arm64
-    pass
-else:
-
-    class DBBoxliteStore(_DBSandboxStoreBase, BoxliteStore):
-        """Database-backed implementation of BoxliteStore."""
-
-        sandbox_type = SANDBOX_TYPE_BOXLITE
 
 
 class DBOpenShellStore(_DBSandboxStoreBase):

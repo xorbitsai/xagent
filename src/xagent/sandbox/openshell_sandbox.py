@@ -1,10 +1,10 @@
 """
-OpenShell sandbox implementation (POC).
+OpenShell sandbox implementation (experimental).
 
 Backs xagent's tool-execution sandbox with an NVIDIA OpenShell gateway
-instead of a Docker daemon or Boxlite. The backend keeps the Boxlite-level
+instead of a Docker daemon. The backend implements the basic, non-reconciling
 contract: get_or_create / exec / file transfer / stop / delete, no snapshots
-and no spec reconciliation.
+and no spec reconciliation (SandboxManager's legacy route).
 
 What OpenShell adds over the Docker backend:
 
@@ -379,7 +379,7 @@ class OpenShellSandbox(Sandbox):
         stdout, stderr, truncated = res.stdout, res.stderr, False
         if max_output_bytes is not None:
             # The SDK buffers the whole output before returning, so this trims
-            # after the fact like the Boxlite backend does.
+            # after the fact.
             stdout, out_t = _truncate_utf8(stdout, max_output_bytes)
             stderr, err_t = _truncate_utf8(stderr, max_output_bytes)
             truncated = out_t or err_t

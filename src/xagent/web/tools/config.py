@@ -106,6 +106,27 @@ from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 logger = logging.getLogger(__name__)
 
 
+def _is_builtin_jira_ticket_server(server: Any) -> bool:
+    """Whether ``server`` is the built-in Jira Ticket server, not a lookalike.
+
+    The catalog connect flow names the row after the app id and stamps it with
+    the app's provenance marker, and refuses to reuse a same-named row that
+    lacks it, so a custom server cannot carry both.
+    """
+    from ...builtin_identity import (
+        builtin_provenance_identity,
+        canonicalize_builtin_identity,
+    )
+
+    auth = getattr(server, "auth", None)
+    return (
+        canonicalize_builtin_identity(getattr(server, "name", None)) == "jira-ticket"
+        and isinstance(auth, Mapping)
+        and builtin_provenance_identity(auth.get("builtin_provenance"))
+        == ("xagent", "jira-ticket")
+    )
+
+
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
 OAUTH_TOKEN_GENERATION_MAX_LENGTH = 1024
 OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
@@ -5323,6 +5344,13 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id.get(server.id),
             )
             combined_env = {**(merged_env or {}), **caller_id_env(self._user_id)}
+            if _is_builtin_jira_ticket_server(server):
+                # Key-based servers get no file allowlist elsewhere, and the
+                # Jira attachment guard would fall back to its working
+                # directory. "[]" (no workspace) denies every upload.
+                combined_env["XAGENT_JIRA_FILE_ALLOWED_DIRS"] = json.dumps(
+                    self._mcp_file_allowed_dir_paths()
+                )
             if combined_env:
                 transport_config["env"] = combined_env
             if server.cwd:

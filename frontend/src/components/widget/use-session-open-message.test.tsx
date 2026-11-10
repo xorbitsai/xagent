@@ -42,7 +42,8 @@ function useDriver(controls: Controls) {
     take(seq)
     setRequest((current) => (current?.seq === seq ? null : current))
   }, [])
-  useSessionOpenMessage({ ...controls, request, take: takeRequest })
+  const { busy } = useSessionOpenMessage({ ...controls, request, take: takeRequest })
+  return { busy }
 }
 
 let startNewConversation = vi.fn<() => Promise<void>>()
@@ -428,6 +429,50 @@ describe("useSessionOpenMessage", () => {
 
       expect(startNewConversation).toHaveBeenCalledTimes(1)
       expect(sent()).toEqual([["C"]])
+    })
+  })
+
+  describe("busy", () => {
+    it("is true from the render the message arrives in, before it is taken", () => {
+      const { result, update } = mount({ sessionConversationAttachment: "pending" })
+      expect(result.current.busy).toBe(false)
+
+      open("A")
+      expect(result.current.busy).toBe(true)
+      expect(take).not.toHaveBeenCalled()
+
+      update({ sessionConversationAttachment: "attached" })
+      expect(take.mock.calls).toEqual([[1]])
+      expect(result.current.busy).toBe(true)
+    })
+
+    it("stays true between a confirmed reset and the send, and turns false once the send settles", async () => {
+      const send = deferred()
+      sendStartMessage.mockReturnValueOnce(send.promise)
+      const { result, update, reset } = startResetFromBound()
+      expect(result.current.busy).toBe(true)
+
+      update({ sessionConversationState: "replacement_ready" })
+      await settle(() => reset.resolve())
+      expect(sent()).toEqual([["A"]])
+      expect(result.current.busy).toBe(true)
+
+      await settle(() => send.resolve())
+      expect(result.current.busy).toBe(false)
+    })
+
+    it("turns false when a message in hand is dropped", async () => {
+      const { result, update, reset } = startResetFromBound()
+      // The new conversation is not open for a first message yet, so the
+      // message waits after its reset.
+      update({ sessionConversationState: "replacement_sending" })
+      await settle(() => reset.resolve())
+      expect(sent()).toEqual([])
+      expect(result.current.busy).toBe(true)
+
+      update({ status: "terminal" })
+
+      expect(result.current.busy).toBe(false)
     })
   })
 

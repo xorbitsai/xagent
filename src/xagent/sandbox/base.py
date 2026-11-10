@@ -1066,7 +1066,7 @@ class SandboxService(abc.ABC):
 
     Typical usage:
 
-        service = BoxliteService()
+        service = DockerSandboxService(...)
 
         # Get or create sandbox
         async with await service.get_or_create("my-box") as sandbox:
@@ -1188,7 +1188,7 @@ class SandboxService(abc.ABC):
     def host_workspace_gid(self) -> int | None:
         """Host gid required for writable bind mounts, if any.
 
-        Backends such as BoxLite do not need host ownership changes.  Docker
+        Backends that do not use host bind mounts return ``None``. Docker
         overrides this so the web layer prepares only the bind roots that
         actually need the fixed in-container runtime group.
         """

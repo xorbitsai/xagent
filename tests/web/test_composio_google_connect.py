@@ -9,6 +9,7 @@ leaves the process.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -16,11 +17,16 @@ import pytest
 from sqlalchemy.orm import Session
 
 from xagent.core.utils.encryption import encrypt_value
-from xagent.web import composio_auth
+from xagent.web import composio_auth, mcp_apps
 from xagent.web.api import auth as auth_api
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.mcp_apps import ensure_builtin_oauth_server_definition
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
+from xagent.web.models.database import (
+    _initialize_database_schema,
+    get_engine,
+    init_db,
+)
 from xagent.web.models.mcp import UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -137,10 +143,14 @@ def google(db_session, composio_env, composio, monkeypatch):
 
 def _install(db: Session, user: User, *app_ids: str) -> None:
     """Install the apps' catalog rows as the current environment seeds them,
-    and link them to ``user``."""
+    and link them to ``user``. Drive is visible, as in production: while the
+    gate is closed the startup sync leaves its visibility alone, and the Picker
+    migration turned it on."""
     for app_id in app_ids:
         row = get_builtin_public_mcp_app(app_id)
         assert row is not None
+        if app_id == "google-drive":
+            row = {**row, "is_visible_in_connector": True}
         db.add(PublicMCPApp(**row))
     db.commit()
     for app_id in app_ids:
@@ -273,3 +283,243 @@ def test_a_google_flow_uses_the_shared_callback_not_googles(google, monkeypatch)
     )
     assert composio.calls == []
     assert _flow_cookies(browser) == []
+
+
+# --- The review gate binds native starts only -------------------------------------
+
+
+@pytest.mark.parametrize("app_id", GOOGLE_APPS)
+def test_a_composio_google_app_connects_while_the_gate_is_closed(
+    google, monkeypatch, app_id
+):
+    db, user, composio = google
+    _switch_on(monkeypatch, app_id)
+    _install(db, user, app_id)
+
+    response = _connect(db, user, composio, app_id)
+
+    assert response.status_code == 200, response.body
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.token_type) == (app_id, "composio")
+
+
+def test_gmail_stays_refused_while_only_drive_goes_through_composio(
+    google, monkeypatch
+):
+    db, user, composio = google
+    _switch_on(monkeypatch, "google-drive")
+
+    response = _start_google(db, user, Browser(), "gmail")
+
+    assert response.status_code == 404
+    assert "location" not in response.headers
+    assert composio.calls == []
+
+
+def test_a_native_gmail_start_is_refused_while_the_composio_switch_is_on(
+    google, monkeypatch
+):
+    db, user, composio = google
+    _switch_on(monkeypatch, "gmail")
+    _install(db, user, "gmail")
+
+    # The ordinary (non-actor) start never goes through Composio.
+    response = auth_api.generic_oauth_login(
+        "google",
+        token=auth_api.create_access_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "session_epoch": user.session_epoch,
+            }
+        ),
+        app_id="gmail",
+        db=db,
+        db_provider=_google_provider(),
+    )
+
+    assert response.status_code == 404
+    assert "location" not in response.headers
+
+
+def test_a_native_gmail_callback_is_refused_while_the_composio_switch_is_on(
+    google, monkeypatch
+):
+    """A native Gmail state that reaches Google's callback, however it was
+    minted, still meets the gate there."""
+    from tests.shared.oauth_browser_fixture import (
+        create_access_token,
+        generic_oauth_callback,
+    )
+
+    db, user, _ = google
+    _switch_on(monkeypatch, "gmail")
+    _install(db, user, "gmail")
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "gmail",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 404
+    assert _grants(db) == []
+
+
+def test_a_web_drive_connect_stays_native_while_the_composio_switch_is_on(
+    google, monkeypatch
+):
+    """Drive on the web is a working drive.file connect with the Picker; the
+    switch moves only Toby's connect to Composio."""
+    db, user, composio = google
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+
+    response = auth_api.generic_oauth_login(
+        "google",
+        token=auth_api.create_access_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "session_epoch": user.session_epoch,
+            }
+        ),
+        app_id="google-drive",
+        db=db,
+        db_provider=_google_provider(),
+    )
+
+    assert response.status_code in (302, 307)
+    location = urlsplit(response.headers["location"])
+    assert location.netloc == "accounts.google.com"
+    scopes = parse_qs(location.query)["scope"][0].split()
+    assert "https://www.googleapis.com/auth/drive.file" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
+    assert composio.calls == []
+
+
+# --- The catalog -------------------------------------------------------------------
+
+
+def _catalog(app_id: str) -> dict[str, Any]:
+    row = get_builtin_public_mcp_app(app_id)
+    assert row is not None
+    return row
+
+
+def test_the_drive_switch_changes_only_drives_description(monkeypatch):
+    for backend_env, _ in SWITCHES.values():
+        monkeypatch.delenv(backend_env, raising=False)
+    monkeypatch.delenv(RESTRICTED_FLAG, raising=False)
+    native_gmail, native_drive = _catalog("gmail"), _catalog("google-drive")
+    assert native_gmail["is_visible_in_connector"] is False
+    assert "file picker" in native_drive["description"]
+
+    _switch_on(monkeypatch, "gmail")
+    _switch_on(monkeypatch, "google-drive")
+
+    gmail, drive = _catalog("gmail"), _catalog("google-drive")
+    assert gmail["is_visible_in_connector"] is True
+    # Web Drive stays a native drive.file connect with the Picker, so the
+    # switch leaves the row alone except for a description true of both.
+    assert {k: v for k, v in drive.items() if k != "description"} == {
+        k: v for k, v in native_drive.items() if k != "description"
+    }
+    assert drive["description"] != native_drive["description"]
+    assert "file picker" in drive["description"]
+    # Scopes are the native ones: a Composio start never sends them.
+    assert gmail["oauth_scopes"] == native_gmail["oauth_scopes"] == []
+
+
+def test_a_stale_gmail_row_is_shown_only_while_gmail_goes_through_composio(
+    google, monkeypatch
+):
+    db, _user, _ = google
+    db.add(PublicMCPApp(**{**_catalog("gmail"), "is_visible_in_connector": True}))
+    db.commit()
+
+    assert mcp_apps.get_app_by_id(db, "gmail")["is_visible_in_connector"] is False
+    _switch_on(monkeypatch, "gmail")
+    assert mcp_apps.get_app_by_id(db, "gmail")["is_visible_in_connector"] is True
+
+
+def test_a_gmail_row_an_administrator_hid_stays_hidden(google, monkeypatch):
+    """The switch lifts the gate's override; it does not override the row."""
+    db, _user, _ = google
+    db.add(PublicMCPApp(**{**_catalog("gmail"), "is_visible_in_connector": False}))
+    db.commit()
+    _switch_on(monkeypatch, "gmail")
+
+    assert mcp_apps.get_app_by_id(db, "gmail")["is_visible_in_connector"] is False
+
+
+@pytest.mark.parametrize("drive_visible", [True, False])
+def test_startup_converges_the_google_rows_with_the_switches(
+    tmp_path, monkeypatch, drive_visible
+):
+    for backend_env, _ in SWITCHES.values():
+        monkeypatch.delenv(backend_env, raising=False)
+    monkeypatch.delenv(RESTRICTED_FLAG, raising=False)
+    init_db(db_url=f"sqlite:///{tmp_path / 'startup.db'}")
+    engine = get_engine()
+    with Session(engine) as db:
+        db.query(PublicMCPApp).filter_by(
+            app_id="google-drive"
+        ).one().is_visible_in_connector = drive_visible
+        db.commit()
+
+    def rows() -> tuple[PublicMCPApp, PublicMCPApp]:
+        with Session(engine) as db:
+            return (
+                db.query(PublicMCPApp).filter_by(app_id="gmail").one(),
+                db.query(PublicMCPApp).filter_by(app_id="google-drive").one(),
+            )
+
+    gmail, drive = rows()
+    assert gmail.is_visible_in_connector is False
+    picker_description, drive_scopes = drive.description, drive.oauth_scopes
+
+    _switch_on(monkeypatch, "gmail")
+    _switch_on(monkeypatch, "google-drive")
+    assert _initialize_database_schema(engine) == []
+    gmail, drive = rows()
+    assert gmail.is_visible_in_connector is True
+    assert drive.description == _catalog("google-drive")["description"]
+    assert drive.description != picker_description
+    # Drive's visibility and scopes are the web's, and the switch leaves them.
+    assert drive.is_visible_in_connector is drive_visible
+    assert drive.oauth_scopes == drive_scopes
+
+    for backend_env, _ in SWITCHES.values():
+        monkeypatch.delenv(backend_env)
+    assert _initialize_database_schema(engine) == []
+    gmail, drive = rows()
+    assert gmail.is_visible_in_connector is False
+    assert drive.description == picker_description
+    assert drive.is_visible_in_connector is drive_visible
+    assert drive.oauth_scopes == drive_scopes
+
+
+def test_startup_keeps_an_administrators_drive_description(tmp_path, monkeypatch):
+    for backend_env, _ in SWITCHES.values():
+        monkeypatch.delenv(backend_env, raising=False)
+    monkeypatch.delenv(RESTRICTED_FLAG, raising=False)
+    init_db(db_url=f"sqlite:///{tmp_path / 'startup.db'}")
+    engine = get_engine()
+    with Session(engine) as db:
+        drive = db.query(PublicMCPApp).filter_by(app_id="google-drive").one()
+        drive.description = "Our own words"
+        db.commit()
+
+    _switch_on(monkeypatch, "google-drive")
+    assert _initialize_database_schema(engine) == []
+
+    with Session(engine) as db:
+        drive = db.query(PublicMCPApp).filter_by(app_id="google-drive").one()
+        assert drive.description == "Our own words"

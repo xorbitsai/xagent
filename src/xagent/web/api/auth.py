@@ -3547,7 +3547,13 @@ def start_builtin_oauth_for_resource_owner(
     if owner_key is None:  # pragma: no cover - normalization preserves only None
         raise ValueError("resource_owner_key must not be null")
     app_id = app_id.strip()
-    if error_response := _google_gmail_error(provider, app_id):
+    from .. import composio_auth
+
+    composio_app = composio_auth.composio_app(provider, app_id)
+    via_composio = composio_app is not None
+    # Composio's Google app holds Google's restricted-scope approval; only a
+    # native Gmail start obeys our review gate (#3649).
+    if not via_composio and (error_response := _google_gmail_error(provider, app_id)):
         return error_response
 
     _require_actor_oauth_personal_link(
@@ -3557,10 +3563,6 @@ def start_builtin_oauth_for_resource_owner(
         app_id=app_id,
     )
 
-    from .. import composio_auth
-
-    composio_app = composio_auth.composio_app(provider, app_id)
-    via_composio = composio_app is not None
     if composio_app is not None and (
         refusal := composio_auth.start_preflight(composio_app.app_id)
     ):
@@ -4026,7 +4028,11 @@ def _generic_oauth_login(
             status_code=401,
         )
 
-    if error_response := _google_gmail_error(provider, app_id):
+    # Only the actor start passes ``auth_backend``, and only for an app that
+    # goes through Composio, whose start never reaches Google (see above).
+    if auth_backend is None and (
+        error_response := _google_gmail_error(provider, app_id)
+    ):
         return error_response
 
     if not app_id:

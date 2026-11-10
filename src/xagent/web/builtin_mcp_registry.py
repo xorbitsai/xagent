@@ -519,8 +519,35 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
     ]
 
 
+GOOGLE_DRIVE_PICKER_DESCRIPTION = (
+    "Access Google Drive files selected through Google's file picker or "
+    "created by Xagent, including reading documents and managing those files."
+)
+# While Drive goes through Composio, one card covers two connects: Toby's goes
+# through Composio's Google app with full Drive access, while a web connect
+# stays native, limited to the files picked in Google's Picker (#3649). This
+# description has to be true of both.
+GOOGLE_DRIVE_COMPOSIO_DESCRIPTION = (
+    "Access Google Drive files, including reading documents and managing files. "
+    "On the web, you choose the files Xagent can use with Google's file picker."
+)
+
+
+def _google_app_via_composio(app_id: str) -> bool:
+    """Whether this Google app's new connects go through Composio's Google
+    app, which holds Google's restricted-scope approval (#3649)."""
+    from .composio_auth import composio_app
+
+    return composio_app("google", app_id) is not None
+
+
 def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
     restricted_scopes = get_google_restricted_scopes()
+    # Only the actor (Toby) start goes through Composio. Gmail is hidden while
+    # the gate is closed, so its switch shows it; Drive's web connect is a
+    # working native path, so its switch changes only the description.
+    gmail_via_composio = _google_app_via_composio("gmail")
+    drive_via_composio = _google_app_via_composio("google-drive")
     zoom_meeting_write = get_zoom_meeting_write_enabled()
     return [
         {
@@ -548,8 +575,9 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": "google",
             "category": "Communication",
             # Keep the narrowed production row unless the review gate is open.
+            # A Composio start never sends these scopes.
             "oauth_scopes": [GOOGLE_GMAIL_SCOPE] if restricted_scopes else [],
-            "is_visible_in_connector": restricted_scopes,
+            "is_visible_in_connector": restricted_scopes or gmail_via_composio,
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.gmail"],
@@ -559,7 +587,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "google-drive",
             "name": "Google Drive",
-            "description": "Access Google Drive files selected through Google's file picker or created by Xagent, including reading documents and managing those files.",
+            "description": (
+                GOOGLE_DRIVE_COMPOSIO_DESCRIPTION
+                if drive_via_composio
+                else GOOGLE_DRIVE_PICKER_DESCRIPTION
+            ),
             "icon": "https://www.google.com/s2/favicons?domain=drive.google.com&sz=128",
             "transport": "oauth",
             "provider_name": "google",
@@ -2298,14 +2330,30 @@ def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
 
 
 def sync_google_scope_policy(bind: Connection) -> None:
-    """Sync only environment-owned fields on existing Google catalog rows."""
+    """Sync only environment-owned fields on existing Google catalog rows.
+
+    The review gate owns scopes and visibility, and the Gmail Composio switch
+    Gmail's visibility. The Drive switch owns only Drive's default
+    description, which is admin-editable, so only the other switch value's
+    default is replaced, re-checked inside the UPDATE itself.
+    """
     app_ids = {"google-drive", "gmail"}
     fields = ("oauth_scopes", "is_visible_in_connector")
-    policies = {
-        row["app_id"]: {field: row[field] for field in fields}
+    expected_rows = {
+        row["app_id"]: row
         for row in get_builtin_public_mcp_app_rows()
         if row["app_id"] in app_ids
     }
+    policies: dict[str, dict[str, Any]] = {
+        app_id: {field: row[field] for field in fields}
+        for app_id, row in expected_rows.items()
+    }
+    drive_description = expected_rows["google-drive"]["description"]
+    other_drive_description = (
+        GOOGLE_DRIVE_PICKER_DESCRIPTION
+        if drive_description == GOOGLE_DRIVE_COMPOSIO_DESCRIPTION
+        else GOOGLE_DRIVE_COMPOSIO_DESCRIPTION
+    )
     if not get_google_restricted_scopes():
         # Narrow scopes without hiding an existing production Drive connector.
         policies["google-drive"].pop("is_visible_in_connector")
@@ -2315,15 +2363,27 @@ def sync_google_scope_policy(bind: Connection) -> None:
             PUBLIC_MCP_APPS_TABLE.c.app_id,
             PUBLIC_MCP_APPS_TABLE.c.oauth_scopes,
             PUBLIC_MCP_APPS_TABLE.c.is_visible_in_connector,
+            PUBLIC_MCP_APPS_TABLE.c.description,
         ).where(PUBLIC_MCP_APPS_TABLE.c.app_id.in_(policies))
     ).mappings()
 
     for row in rows:
-        changes = {
+        changes: dict[str, Any] = {
             field: expected
             for field, expected in policies[row["app_id"]].items()
             if row[field] != expected
         }
+        if (
+            row["app_id"] == "google-drive"
+            and row["description"] == other_drive_description
+        ):
+            changes["description"] = sa.case(
+                (
+                    PUBLIC_MCP_APPS_TABLE.c.description == other_drive_description,
+                    drive_description,
+                ),
+                else_=PUBLIC_MCP_APPS_TABLE.c.description,
+            )
         if not changes:
             continue
 

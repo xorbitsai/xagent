@@ -53,7 +53,7 @@ const zh = {
     messageRateLimited: "消息发送过于频繁，请稍候重试。",
     messageIdConflict: "此消息 ID 已用于其他内容或文件，请使用新的消息 ID 重试。",
     messageDeliveryFailed: "消息未能送达，请重试该草稿。",
-    inputReviewBlocked: "无法处理这条请求。请换个问法，或询问支持的话题。",
+    inputReviewBlocked: "这条请求未通过输入审核。请换个问法，或询问这个 Agent 支持的内容。",
     inputReviewUnavailable: "暂时无法完成输入安全检查，请重试。",
     messageContinuationUnsupported: "当前任务不支持继续发送消息。",
     taskPauseInProgress: "任务暂停仍在处理中，请稍后重试。",

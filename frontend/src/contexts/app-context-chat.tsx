@@ -4549,19 +4549,23 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!canonicalMessageId && !streamMessageId && isDuplicateMessageForViewedTask(
+            const agentMessageId = isAgentMessage
+              ? stableAssistantMessageId(
+                message.event_id || traceEventData.event_id || eventData.event_id,
+              )
+              : null
+            // Identical refusals can belong to different turns. The persisted
+            // message ID also pairs the live refusal with its history replay.
+            const identifiedRefusal = eventData.message_type === "input_review_rejected"
+              && agentMessageId !== null
+            if (!canonicalMessageId && !streamMessageId && !identifiedRefusal && isDuplicateMessageForViewedTask(
               messageContent,
               'agent-message',
               isAgentMessage ? interactionRequestId : undefined,
             )) {
               return
             }
-            const msgId = canonicalMessageId ??
-              (isAgentMessage
-                ? stableAssistantMessageId(
-                  message.event_id || traceEventData.event_id || eventData.event_id,
-                )
-                : null) ?? generateMessageId("msg-agent")
+            const msgId = canonicalMessageId ?? agentMessageId ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -4573,7 +4577,7 @@ export function AppProvider({
                 // Legacy chat_history replay rows carry no canonical id, so
                 // the failure provenance must win over the id-based status.
                 status: eventData.message_type === "task_failure" ? "failed"
-                  : canonicalMessageId ? "completed"
+                  : canonicalMessageId || identifiedRefusal ? "completed"
                   : eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
                 streamMessageId,

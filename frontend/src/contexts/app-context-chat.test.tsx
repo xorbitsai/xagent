@@ -9944,6 +9944,39 @@ describe("terminal error frames", () => {
     await waitFor(() => expect(screen.getAllByText(translation)).toHaveLength(2))
   })
 
+  it("shows one input refusal per turn, including repeated text and history replay", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <TaskConversationPanel mode="embedded-preview" showProcessView={false} />
+      </AppProvider>
+    )
+
+    const refusal = "This request didn't pass input review. Please rephrase it."
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    act(() => {
+      for (const eventId of ["chat_message_21", "chat_message_21", "chat_message_24"]) {
+        onMessage?.({
+          type: "trace_event",
+          task_id: 1,
+          timestamp: "2026-05-27T05:00:02Z",
+          data: {
+            event_type: "agent_message",
+            event_id: eventId,
+            data: {
+              message: refusal,
+              message_type: "input_review_rejected",
+              role: "assistant",
+              display: "chat",
+            },
+          },
+        })
+      }
+    })
+    await waitFor(() => expect(screen.getAllByText(refusal)).toHaveLength(2))
+  })
+
   // The waiting half. A refused resume arrives on the root "error" type
   // carrying the task's real current status (built from TaskControlSnapshot
   // in websocket.py's _handle_resume_task_unserialized, near where

@@ -709,6 +709,8 @@ async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
     )
     publish = AsyncMock()
     monkeypatch.setattr(task_event_display, "publish_task_result", publish)
+    publish_event = AsyncMock()
+    monkeypatch.setattr(task_execution_service, "publish_task_event", publish_event)
     await task_execution_service.execute_task_background(
         task_id=task_id,
         user_message=candidate_text,
@@ -744,6 +746,20 @@ async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
             db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
         )
         assert notice.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        replies = [
+            call.args[0]
+            for call in publish_event.await_args_list
+            if call.args[0].get("event_type") == "agent_message"
+        ]
+        if storage_version == 1 and not unavailable:
+            assert len(replies) == 1
+            assert replies[0]["event_id"] == f"chat_message_{notice.id}"
+            assert replies[0]["data"]["message"] == expected_text
+            assert (
+                replies[0]["data"]["message_type"] == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+            )
+        else:
+            assert replies == []
         assert (
             client_safe_assistant_history_content(
                 content=notice.content, message_type=notice.message_type

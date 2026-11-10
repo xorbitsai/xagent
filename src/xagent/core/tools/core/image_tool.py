@@ -130,7 +130,7 @@ Parameters:
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
 - resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1088x1360"), with the same multiple-of-16 guidance as size
-- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - honoured by Gemini; DashScope, OpenAI and Xinference ignore it and keep size as the pixel size.
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - honoured by Gemini; DashScope, OpenAI and Xinference send size only and ignore aspect_ratio, resolution and width/height when aspect_ratio is passed.
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
 - negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
 - transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background. Only models marked ◻ support it; the call fails on any other model. Asking for a transparent background in the prompt text does NOT work -- without this parameter the image always comes back opaque.
@@ -148,7 +148,7 @@ Size parameter priority (highest to lowest):
 1. resolution (alternative dimension format)
 2. width + height (desired dimensions, will be approximated to closest supported values)
 3. size (simple format)
-On Gemini, aspect_ratio replaces the ratio these dimensions imply; DashScope, OpenAI and Xinference keep size as the pixel size and ignore aspect_ratio.
+On Gemini, aspect_ratio replaces the ratio these dimensions imply; DashScope, OpenAI and Xinference send size only and ignore aspect_ratio, resolution and width/height when aspect_ratio is passed.
 
 Images are automatically saved to workspace.
     """.strip()

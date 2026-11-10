@@ -624,10 +624,11 @@ def is_parameter_rejection(exc: BaseException) -> bool:
     markers (``bad request``, ``invalid parameter``), and a transport library
     or a provider wrapper can put those words in an error that is still a
     transient failure; refusing to retry an outage is worse than one extra
-    attempt. Every image adapter keeps the status on the provider error
-    (OpenAI's SDK error, Gemini's ``httpx.HTTPStatusError``, DashScope's
-    ``status_code``, Xinference's client error), so a rejected parameter
-    reaches this predicate with a status in the paths the image tools use.
+    attempt. OpenAI's SDK error, Gemini's ``httpx.HTTPStatusError`` and
+    DashScope's ``status_code`` reach this predicate with that status in the
+    chains the image tools see. Xinference's client raises a plain
+    ``RuntimeError`` built from the response text, with no status on the
+    chain, so its rejected parameters still retry like any other failure.
 
     A retry policy asks this before sending the identical request again -- no
     attempt can turn a refused parameter into an accepted one, and each
@@ -1003,14 +1004,16 @@ def media_failure_fields(
 
     ``requested_size`` is the one exception, and only for the image tools that
     know it: a provider that refuses the output size for a rule this module
-    can restate (a dimension multiple, or the exact sizes it enumerates) gets
-    that rule, plus the nearest larger size that satisfies it where both
-    dimensions are constrained, alongside the generic sentence. The rule is
-    written here from the requested size; the provider's own wording stays in
-    the log and is never quoted in the result. A rule is only read when the
-    provider blames the size (its ``param``/``field``/``target``) or, without
-    one, repeats the requested size without mentioning another size;
-    otherwise the rejection keeps the generic sentence.
+    can restate gets that rule alongside the generic sentence. A dimension
+    multiple carries the multiple each constrained dimension must satisfy and,
+    where both dimensions are constrained, the nearest larger size computed
+    from the requested size. A provider that enumerates the sizes it accepts
+    contributes those size tokens instead, with the refused size dropped.
+    Either way the provider's own wording stays in the log and is never quoted
+    in the result. A rule is only read when the provider blames the size (its
+    ``param``/``field``/``target``) or, without one, repeats the requested size
+    without mentioning another size; otherwise the rejection keeps the generic
+    sentence.
     """
     category = classify_media_failure(exc)
     logger.error(

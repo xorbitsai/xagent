@@ -80,8 +80,8 @@ def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
 
 
 def test_a_long_get_keeps_its_repeated_parameters(proxy):
-    """The form body googleapiclient moves a long GET's query into keeps a
-    repeated parameter as its pairs; restoring the GET must not collapse them
+    """The form body googleapiclient moves the query of a long GET into keeps
+    a repeated parameter as its pairs; restoring the GET must not collapse them
     into one."""
     _gmail_service().users().messages().list(
         userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]

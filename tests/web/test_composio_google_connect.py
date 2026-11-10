@@ -439,7 +439,10 @@ def test_the_drive_switch_changes_only_drives_description(monkeypatch):
         k: v for k, v in native_drive.items() if k != "description"
     }
     assert drive["description"] != native_drive["description"]
-    assert "file picker" in drive["description"]
+    # True of a full-Drive Composio grant, a Picker-limited web one and an
+    # existing native drive.file grant alike.
+    assert "picker" not in drive["description"].lower()
+    assert "allowed to use" in drive["description"]
     # Scopes are the native ones: a Composio start never sends them.
     assert gmail["oauth_scopes"] == native_gmail["oauth_scopes"] == []
 

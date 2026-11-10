@@ -523,13 +523,14 @@ GOOGLE_DRIVE_PICKER_DESCRIPTION = (
     "Access Google Drive files selected through Google's file picker or "
     "created by Xagent, including reading documents and managing those files."
 )
-# While Drive goes through Composio, one card covers two connects: Toby's goes
-# through Composio's Google app with full Drive access, while a web connect
-# stays native, limited to the files picked in Google's Picker (#3649). This
-# description has to be true of both.
+# While Drive goes through Composio, one card covers several connects: Toby's
+# new ones go through Composio's Google app with full Drive access, a web
+# connect stays native with the files picked in Google's Picker, and existing
+# native Toby grants keep drive.file, the files Xagent created (#3649). This
+# description has to be true of all of them.
 GOOGLE_DRIVE_COMPOSIO_DESCRIPTION = (
-    "Access Google Drive files, including reading documents and managing files. "
-    "On the web, you choose the files Xagent can use with Google's file picker."
+    "Access the Google Drive files Xagent is allowed to use, including reading "
+    "documents and managing those files."
 )
 
 
@@ -2333,7 +2334,9 @@ def sync_google_scope_policy(bind: Connection) -> None:
     """Sync only environment-owned fields on existing Google catalog rows.
 
     The review gate owns scopes and visibility, and the Gmail Composio switch
-    Gmail's visibility. The Drive switch owns only Drive's default
+    Gmail's visibility; a boolean has no default to tell apart from an
+    administrator's choice, so while the switch is on Gmail is shown again at
+    each startup (as it is while the gate is open). The Drive switch owns only Drive's default
     description, which is admin-editable, so only the other switch value's
     default is replaced, re-checked inside the UPDATE itself.
     """

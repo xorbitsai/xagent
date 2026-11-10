@@ -548,7 +548,9 @@ def _fragment_region_end(
     only be the body or one of its own long lines, and a decoded message does
     not make one of those start inside another: the body is matched whole
     where it begins. Walking a multi-megabyte body from its start would cost
-    as much as the text itself.
+    as much as the text itself. That is a property of a decoded message, not
+    of an arbitrary echo: an echo that puts a long fragment's start further
+    back is not walked, and the tail it leaves is a known limit.
 
     The walk has a fixed budget and spends the pass's work allowance too. If a
     text ever keeps growing the region past either one, the rest of the text

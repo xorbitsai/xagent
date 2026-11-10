@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from ..guardrails.input import INPUT_WITHHELD_METADATA_KEY
 from .attachments import project_file_info_to_chip
 from .result import extract_assistant_message
 from .trace import (
@@ -74,12 +75,14 @@ class TraceEventCallback:
             display = get_display_user_message(context, task or "")
             if not display and not files:
                 return
+            latest_user_message = self._latest_user_message(context)
             await self._emit_user_message_trace(
                 tracer=tracer,
                 context=context,
                 message=display,
                 files=files,
-                turn_id=self._message_turn_id(self._latest_user_message(context)),
+                turn_id=self._message_turn_id(latest_user_message),
+                input_withheld=self._input_withheld_from(latest_user_message),
             )
             # Mark the latest user message (if the runner added one) as
             # traced so a subsequent resume does not re-emit it.
@@ -147,6 +150,7 @@ class TraceEventCallback:
             message=bubble_text,
             files=resolved_files,
             turn_id=self._message_turn_id(message),
+            input_withheld=self._input_withheld_from(message),
         )
         self._mark_traced(context, message)
 
@@ -233,8 +237,13 @@ class TraceEventCallback:
         message: str,
         files: list[dict[str, Any]],
         turn_id: str | None = None,
+        input_withheld: str | None = None,
     ) -> None:
         """Emit a user-message trace event with a browser-safe payload.
+
+        ``input_withheld`` carries the input review's withhold reason. The web
+        trace handler uses it, with ``turn_id``, to mark the host's own
+        transcript row so later replays substitute the placeholder too.
 
         Browser-safety contract (rogercloud review): a user-message trace
         event reaches the chat UI / historical-replay client and must not
@@ -259,6 +268,8 @@ class TraceEventCallback:
         trace_data: dict[str, Any] = {}
         if turn_id:
             trace_data[TURN_ID_KEY] = turn_id
+        if input_withheld:
+            trace_data[INPUT_WITHHELD_METADATA_KEY] = input_withheld
         if safe_files:
             # Surface uploaded files at the top level of trace_data so the
             # frontend user-message renderer (which reads ``eventData.files``)
@@ -336,6 +347,7 @@ class TraceEventCallback:
                 message=bubble_text,
                 files=files,
                 turn_id=turn_id,
+                input_withheld=self._input_withheld_from(message),
             )
             self._mark_traced(context, message)
 
@@ -436,6 +448,14 @@ class TraceEventCallback:
         if not isinstance(metadata, dict):
             return []
         return project_file_info_to_chip(metadata.get("files"))
+
+    @staticmethod
+    def _input_withheld_from(message: Any | None) -> str | None:
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(INPUT_WITHHELD_METADATA_KEY)
+        return value if isinstance(value, str) and value else None
 
     @staticmethod
     def _display_message_from(message: Any) -> str | None:

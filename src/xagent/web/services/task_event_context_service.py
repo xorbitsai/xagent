@@ -25,6 +25,12 @@ from ...core.context_ref import (
     normalize_context_references,
     split_tool_result_context_references,
 )
+from ...core.guardrails.input import (
+    INPUT_WITHHELD_METADATA_KEY,
+    InputWithholdReason,
+    parse_withhold_reason,
+    withheld_input_placeholder,
+)
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task
 from ..models.task_execution_event import TaskExecutionEvent
@@ -546,6 +552,7 @@ def _project(
     anchors = _load_context_anchors(db, task_id, horizon, events)
     accepted: dict[str, TaskExecutionEvent] = {}
     applied: dict[str, int] = {}
+    withheld: dict[str, InputWithholdReason] = {}
     skill_name = None
     summary: dict[str, Any] | None = None
     transcript_floor = model_floor = 0
@@ -577,6 +584,9 @@ def _project(
             # Application alone must not invent a transcript message for them.
             if event.turn_id in accepted:
                 applied[str(event.turn_id)] = int(event.sequence)
+                reason = parse_withhold_reason(data.get(INPUT_WITHHELD_METADATA_KEY))
+                if reason is not None:
+                    withheld[str(event.turn_id)] = reason
         elif event.kind == "skill_select_end":
             skill_name = _selected_skill_name(event)
         elif event.kind == "action_end_compact":
@@ -597,11 +607,20 @@ def _project(
         if covered:
             continue
         data = _data(event)
+        reason = withheld.get(turn_id)
         entries.append(
             (
                 position,
                 [
+                    # A withheld turn replays the placeholder the runner
+                    # applied, without its attachments.
                     {
+                        "role": "user",
+                        "content": withheld_input_placeholder(reason),
+                        CONTEXT_REFS_KEY: [],
+                    }
+                    if reason is not None
+                    else {
                         "role": "user",
                         "content": data["content"],
                         CONTEXT_REFS_KEY: [

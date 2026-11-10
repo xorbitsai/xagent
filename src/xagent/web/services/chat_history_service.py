@@ -23,6 +23,11 @@ from ...core.agent.transcript import (
     normalize_transcript_messages,
 )
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
+from ...core.guardrails.input import (
+    InputWithholdReason,
+    parse_withhold_reason,
+    withheld_input_placeholder,
+)
 from ..models.chat_message import TaskChatMessage
 from ..models.task import TraceEvent
 from ..models.task_execution_event import TaskExecutionEvent
@@ -55,6 +60,12 @@ DELIVERY_OUTCOME_UNKNOWN = "outcome_unknown"
 
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
+
+# A user row whose input review withheld it is retyped to this prefix plus the
+# reason. Its ``content`` keeps the original text: the user still sees what they
+# sent, and delivery retries compare against it. Replay substitutes the
+# placeholder, so the original never re-enters a model context.
+WITHHELD_USER_MESSAGE_TYPE_PREFIX = "user_message_withheld:"
 
 # Historical attachments are replayed context rather than the current upload
 # batch. Keep a bounded recent window as a secondary replay limit; the shared
@@ -370,6 +381,43 @@ def mark_user_message_delivery_sync(
         )
         db.commit()
         return transition
+
+
+def mark_user_message_withheld_no_commit(
+    db: Session,
+    *,
+    task_id: int,
+    turn_id: str,
+    reason: InputWithholdReason,
+) -> bool:
+    """Flag a legacy user row as withheld without committing ``db``.
+
+    Event-backed tasks record this on their ``input_applied`` fact instead.
+    Returns whether the turn's row exists.
+    """
+
+    updated = (
+        db.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task_id,
+            TaskChatMessage.role == "user",
+            TaskChatMessage.turn_id == turn_id,
+        )
+        .update(
+            {TaskChatMessage.message_type: WITHHELD_USER_MESSAGE_TYPE_PREFIX + reason},
+            synchronize_session=False,
+        )
+    )
+    return bool(updated)
+
+
+def withheld_user_message_reason(message_type: Any) -> InputWithholdReason | None:
+    """Return the withhold reason a user row's ``message_type`` records."""
+
+    value = safe_str(message_type)
+    if not value.startswith(WITHHELD_USER_MESSAGE_TYPE_PREFIX):
+        return None
+    return parse_withhold_reason(value.removeprefix(WITHHELD_USER_MESSAGE_TYPE_PREFIX))
 
 
 def withdraw_pending_user_message_delivery_sync(task_id: int, turn_id: str) -> bool:
@@ -1027,6 +1075,12 @@ def load_task_transcript_window(
                 content=content,
                 message_type=safe_str(message.message_type),
             )
+        elif role == "user" and (
+            withheld := withheld_user_message_reason(message.message_type)
+        ):
+            # The runner only ever showed the model this placeholder.
+            content = withheld_input_placeholder(withheld)
+            references = ()
         item: Dict[str, Any] = {
             "role": role,
             "content": content,

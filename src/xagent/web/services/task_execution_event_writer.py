@@ -21,6 +21,7 @@ from ...core.agent.context.execution import (
     COMPACT_WATERMARK_METADATA_KEY,
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
 )
+from ...core.guardrails.input import INPUT_WITHHELD_METADATA_KEY, parse_withhold_reason
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus
 from ..models.task_execution_event import TaskExecutionEvent
@@ -349,7 +350,8 @@ def stage_applied_inputs_no_commit(db: Session, state: TaskExecutionEvent) -> No
     for message in context.get("messages", []):
         if message.get("role") != "user":
             continue
-        turn_id = (message.get("metadata") or {}).get("turn_id")
+        metadata = message.get("metadata") or {}
+        turn_id = metadata.get("turn_id")
         if not turn_id:
             continue
         key = f"input-applied:{turn_id}"
@@ -361,6 +363,12 @@ def stage_applied_inputs_no_commit(db: Session, state: TaskExecutionEvent) -> No
             )
         )
         if existing is None:
+            payload: dict[str, Any] = {"recovery_event_id": state.event_id}
+            # The accepted fact keeps the original text; replay substitutes
+            # the placeholder the runner applied in its place.
+            withheld = parse_withhold_reason(metadata.get(INPUT_WITHHELD_METADATA_KEY))
+            if withheld is not None:
+                payload[INPUT_WITHHELD_METADATA_KEY] = withheld
             append_fact_no_commit(
                 db,
                 task_id=int(state.task_id),
@@ -369,7 +377,7 @@ def stage_applied_inputs_no_commit(db: Session, state: TaskExecutionEvent) -> No
                 turn_id=turn_id,
                 kind="input_applied",
                 key=key,
-                payload={"recovery_event_id": state.event_id},
+                payload=payload,
             )
 
 

@@ -31,6 +31,10 @@ from ...core.agent.trace import TraceEvent as CoreTraceEvent
 from ...core.agent.trace import (
     normalize_llm_trace_payload,
 )
+from ...core.guardrails.input import (
+    INPUT_WITHHELD_METADATA_KEY,
+    parse_withhold_reason,
+)
 from ...core.runtime_performance import (
     increment_counter as increment_performance_counter,
 )
@@ -1312,6 +1316,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     db.commit()
                 return
             if (
+                not self.authoritative
+                and self.build_id is None
+                and event_type_str == "user_message"
+            ):
+                self._mark_withheld_user_turn(db, data)
+            if (
                 event_type_str == "system_update_general"
                 and isinstance(data, dict)
                 and data.get("checkpoint_type") == CHECKPOINT_TYPE
@@ -1634,6 +1644,31 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 "Failed to prune checkpoint history for task %s",
                 self.task_id,
                 exc_info=True,
+            )
+
+    def _mark_withheld_user_turn(self, db: Session, data: Any) -> None:
+        """Flag the legacy transcript row of a turn input review withheld.
+
+        Committed with the trace row, so the user-message event and the flag
+        land together; a duplicate event finds the flag already staged by the
+        first. Event-backed tasks carry it on their input_applied fact.
+        """
+        from .chat_history_service import mark_user_message_withheld_no_commit
+
+        if not isinstance(data, dict):
+            return
+        reason = parse_withhold_reason(data.get(INPUT_WITHHELD_METADATA_KEY))
+        turn_id = data.get("turn_id")
+        if reason is None or not isinstance(turn_id, str) or not turn_id:
+            return
+        if not mark_user_message_withheld_no_commit(
+            db, task_id=self.task_id, turn_id=turn_id, reason=reason
+        ):
+            # No host row for this turn: nothing a later replay could read.
+            logger.warning(
+                "Withheld user turn %s has no transcript row on task %s",
+                turn_id,
+                self.task_id,
             )
 
     def _is_duplicate_user_message_turn(

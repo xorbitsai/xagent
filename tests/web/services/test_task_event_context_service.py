@@ -1017,3 +1017,54 @@ def test_question_metadata_may_be_absent_null_or_an_object(canonical, fields):
         assert load_task_event_context(db, task_id).messages == [
             {"role": "assistant", "content": "Which city?"}
         ]
+
+
+def test_withheld_input_replays_its_placeholder(canonical):
+    from xagent.core.guardrails.input import withheld_input_placeholder
+
+    factory, task_id = canonical
+    with factory() as db:
+        accept(
+            db,
+            task_id,
+            "t1",
+            "jailbreak",
+            attachments=[{"file_id": "image-id", "name": "a.png", "type": "image/png"}],
+        )
+        placeholder = withheld_input_placeholder("platform_policy")
+        state = fact(
+            db,
+            task_id,
+            "recovery_state",
+            "state:t1",
+            {
+                "protocol_event_id": "state:t1",
+                "data": {
+                    "checkpoint_type": "agent_execution_checkpoint",
+                    "snapshot_schema_version": 1,
+                    "snapshot": {
+                        "execution_id": "root-execution",
+                        "context": {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": placeholder,
+                                    "metadata": {
+                                        "turn_id": "t1",
+                                        "input_withheld": "platform_policy",
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                },
+            },
+        )
+        stage_applied_inputs_no_commit(db, state)
+        accept(db, task_id, "t2")
+        apply(db, task_id, "t2")
+        db.commit()
+        assert load_task_event_context(db, task_id).messages == [
+            {"role": "user", "content": placeholder},
+            {"role": "user", "content": "same"},
+        ]

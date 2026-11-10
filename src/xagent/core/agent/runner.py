@@ -24,6 +24,13 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
+from ..guardrails.input import (
+    INPUT_WITHHELD_METADATA_KEY,
+    InputWithholdReason,
+    bind_agent_generated_input,
+    review_user_input,
+    withheld_input_placeholder,
+)
 from ..guardrails.output import (
     BLOCKED_OUTPUT,
     UNAVAILABLE_OUTPUT,
@@ -314,6 +321,50 @@ def classify_injection(
     return InjectionDisposition.DEFER
 
 
+# Caller-supplied request metadata that repeats the user's text. The runner
+# copies these keys into the context, and language detection and waiting-reply
+# prompts read them, so a withheld request must not leave the original there.
+_REQUEST_TEXT_KEYS = ("task", "display_message", "display_user_message")
+
+
+def _request_display_text(metadata: dict[str, Any] | None) -> str | None:
+    """Return the user-authored text a request carries beside its task.
+
+    Mirrors ``AgentRunner._initial_user_message_metadata``: request_context
+    wins over top-level metadata, and ``display_message`` over the legacy
+    ``display_user_message``. ``None`` means the task itself is the user text.
+    """
+    if metadata is None:
+        return None
+    candidates = [metadata.get("request_context"), metadata]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("display_message", "display_user_message"):
+            if key in candidate:
+                value = candidate[key]
+                return value if isinstance(value, str) else ""
+    return None
+
+
+def _withhold_request_text(
+    metadata: dict[str, Any] | None, placeholder: str
+) -> dict[str, Any] | None:
+    """Return ``metadata`` with every copy of the request text replaced."""
+    if metadata is None:
+        return None
+    scrubbed = {
+        key: placeholder if key in _REQUEST_TEXT_KEYS else value
+        for key, value in metadata.items()
+    }
+    request_context = scrubbed.get("request_context")
+    if isinstance(request_context, dict):
+        scrubbed["request_context"] = _withhold_request_text(
+            request_context, placeholder
+        )
+    return scrubbed
+
+
 def _session_routing_key(context: ExecutionContext, execution_id: str) -> str:
     scope = get_execution_scope()
     owner = current_user_id.get()
@@ -400,6 +451,22 @@ class AgentRunner:
                 checkpoint=checkpoint,
                 execution_id=execution_id,
             )
+        withheld: InputWithholdReason | None = None
+        if task and not (checkpoint and isinstance(checkpoint.get("context"), dict)):
+            # Review what the user wrote: the task may also carry host-added
+            # enrichment (file context, prompt blocks, channel history) that
+            # is outside input review's scope. Replace a withheld task before
+            # anything below copies it into the context metadata, the goal or
+            # the pattern, and drop its attachments, so no model call ever
+            # sees the original request.
+            display = _request_display_text(metadata)
+            withheld = await review_user_input(
+                execution_id, task if display is None else display
+            )
+            if withheld is not None:
+                task = withheld_input_placeholder(withheld)
+                metadata = _withhold_request_text(metadata, task)
+                task_context_refs = ()
         # The context is cached from here on. A failure before the run's own
         # ``try`` below would otherwise leave a cached context that looks
         # live (``run_finishing`` false) although no run will ever consume it.
@@ -490,9 +557,12 @@ class AgentRunner:
                             tool_call_id=message.get("tool_call_id"),
                         )
                 if task:
+                    initial_metadata = self._initial_user_message_metadata(context)
+                    if withheld is not None:
+                        initial_metadata[INPUT_WITHHELD_METADATA_KEY] = withheld
                     initial = context.add_user_message(
                         task,
-                        metadata=self._initial_user_message_metadata(context),
+                        metadata=initial_metadata,
                         context_refs=task_context_refs,
                     )
                     self._record_accepted_turn(context, initial)
@@ -642,7 +712,10 @@ class AgentRunner:
                     )
                     teardown_status = "failed"
                     try:
-                        with bind_output_guardrail(runtime.output_guardrail):
+                        with (
+                            bind_output_guardrail(runtime.output_guardrail),
+                            bind_agent_generated_input(),
+                        ):
                             result = await pattern.run(
                                 **self._build_pattern_kwargs(
                                     pattern=pattern,
@@ -1081,6 +1154,23 @@ class AgentRunner:
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> UserMessageInjectionResult:
+        # Review before taking any lock or reading state: nothing is written
+        # yet, so a resolver failure leaves the attempt FAILED_BEFORE_WRITE.
+        # Only the user-authored display text is reviewed, not host-added
+        # enrichment in the execution text. A withheld message is still
+        # accepted, as its placeholder; a retry under the same turn_id is
+        # reviewed again and replays that placeholder.
+        withheld: InputWithholdReason | None = None
+        reviewed: str | None = display_message
+        if reviewed is None:
+            reviewed = execution_message if execution_message is not None else message
+        if reviewed:
+            withheld = await review_user_input(execution_id, reviewed)
+            if withheld is not None:
+                message = None
+                execution_message = display_message = withheld_input_placeholder(
+                    withheld
+                )
         # The context this call currently uses stays cached until the call
         # returns, callback and watermark re-persist included; the last
         # holder of an idle context evicts it.
@@ -1095,6 +1185,7 @@ class AgentRunner:
                 turn_id=turn_id,
                 request_interrupt=request_interrupt,
                 reason=reason,
+                withheld=withheld,
                 held=held,
             )
         finally:
@@ -1160,6 +1251,7 @@ class AgentRunner:
         turn_id: str | None,
         request_interrupt: bool,
         reason: str | None,
+        withheld: InputWithholdReason | None,
         held: list[ExecutionContext],
     ) -> UserMessageInjectionResult:
         while True:
@@ -1304,6 +1396,8 @@ class AgentRunner:
                 metadata: dict[str, Any] = {"display_message": resolved_display_message}
                 if files is not None:
                     metadata["files"] = files
+                if withheld is not None:
+                    metadata[INPUT_WITHHELD_METADATA_KEY] = withheld
                 metadata["turn_id"] = requested_turn_id or str(uuid4())
 
                 # Only messages and top-level metadata are mutated below; components
@@ -1316,7 +1410,13 @@ class AgentRunner:
                 added = candidate.add_user_message(
                     resolved_execution_message,
                     metadata=metadata,
-                    context_refs=build_image_context_references(files),
+                    # A withheld message keeps its file chips for the UI, but
+                    # its images never reach the model.
+                    context_refs=(
+                        build_image_context_references(files)
+                        if withheld is None
+                        else ()
+                    ),
                 )
                 # Set a "this turn is waiting to be traced" pending marker before
                 # we persist. The resume catch-up logic uses this to disambiguate

@@ -6181,3 +6181,54 @@ def test_database_trace_handler_flush_without_primary_key_refuses_to_write_the_a
         assert db.query(DatabaseTraceEvent).filter_by(task_id=task_id).count() == 0
     finally:
         db.close()
+
+
+def test_database_trace_handler_marks_withheld_user_turn() -> None:
+    from xagent.core.guardrails.input import withheld_input_placeholder
+    from xagent.web.services.chat_history_service import (
+        load_task_transcript,
+        persist_user_message,
+    )
+
+    _, db, task = _create_trace_handler_test_task("withheld-tester")
+    try:
+        persist_user_message(
+            db, int(task.id), int(task.user_id), "jailbreak", turn_id="turn-1"
+        )
+        persist_user_message(
+            db, int(task.id), int(task.user_id), "hello", turn_id="turn-2"
+        )
+        handler = DatabaseTraceHandler(int(task.id))
+        event_type = TraceEventType(
+            TraceScope.TASK,
+            TraceAction.START,
+            TraceCategory.MESSAGE,
+        )
+        placeholder = withheld_input_placeholder("platform_policy")
+        handler._save_trace_event(
+            db,
+            TraceEvent(
+                event_type,
+                task_id=str(task.id),
+                data={
+                    "message": placeholder,
+                    "turn_id": "turn-1",
+                    "input_withheld": "platform_policy",
+                },
+            ),
+        )
+        handler._save_trace_event(
+            db,
+            TraceEvent(
+                event_type,
+                task_id=str(task.id),
+                data={"message": "hello", "turn_id": "turn-2"},
+            ),
+        )
+
+        assert load_task_transcript(db, int(task.id)) == [
+            {"role": "user", "content": placeholder},
+            {"role": "user", "content": "hello"},
+        ]
+    finally:
+        db.close()

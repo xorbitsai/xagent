@@ -1,1 +1,1 @@
-"""Host-provided output review contracts."""
+"""Host-provided input and output review contracts."""

@@ -71,6 +71,14 @@ field resolved from, never a value. It exits 1 when any client is rejected;
 `INCONCLUSIVE` lines do not fail it. A pre-registered remote MCP client is
 listed as `UNVERIFIABLE`. `--exclude` takes the same provider names.
 
+Microsoft checks a refresh token's format before the client, so its secret is
+checked instead with one client-credentials request against the app's home
+tenant: set `MICROSOFT_TENANT_ID` to the app registration's Directory (tenant)
+ID, per environment, next to `MICROSOFT_CLIENT_ID`. A token Microsoft issues
+is discarded. Without the variable Microsoft is `UNVERIFIABLE`; a value that is
+not a tenant ID, or an answer that more likely means a wrong tenant
+(`AADSTS700016`, `AADSTS90002`), is `INCONCLUSIVE`.
+
 ### Side effects
 
 - Starting a launch writes nothing.

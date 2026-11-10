@@ -117,11 +117,9 @@ def _admit_reply(
                 or existing.payload.get("message_id") != message_id
             ):
                 raise TaskResumeBusyError
-            if (
-                source == "a2a"
-                and cast(dict[str, Any], existing.result or {}).get("outcome")
-                == "retryable_unavailable"
-            ):
+            if source == "a2a" and cast(dict[str, Any], existing.result or {}).get(
+                "outcome"
+            ) in {"retryable_unavailable", "input_review_unavailable"}:
                 # Keep each command's acceptance snapshot immutable. A
                 # retry gets one deterministic successor, while injection
                 # still uses the original A2A message ID.
@@ -316,9 +314,11 @@ async def enqueue_resume_input(
     if result["outcome"] == "not_resumable":
         raise TaskResumeNotResumableError
     if result["outcome"] == "input_blocked":
-        raise InputReviewRejected(BLOCKED_INPUT)
+        raise InputReviewRejected(result.get("refusal") or BLOCKED_INPUT)
     if result["outcome"] == "input_review_unavailable":
-        raise InputReviewRejected(UNAVAILABLE_INPUT)
+        raise InputReviewRejected(
+            result.get("refusal") or UNAVAILABLE_INPUT, unavailable=True
+        )
     if result["outcome"] == "auto_model_unavailable":
         raise AutoModelUnavailableError("Configured Auto model is unavailable")
     if result["outcome"] == "retryable_unavailable":
@@ -430,11 +430,16 @@ def _handoff(
         return payload, lease, owner_id, state
 
 
-def _outcome_fields(outcome: str, retry_with_new_id: bool) -> dict[str, Any]:
-    """The stored reply outcome; the marker only accompanies a rejection."""
+def _outcome_fields(
+    outcome: str, retry_with_new_id: bool, refusal: str | None = None
+) -> dict[str, Any]:
+    """Serialize a reply outcome for both the durable row and the worker."""
+    fields: dict[str, Any] = {"outcome": outcome}
     if retry_with_new_id:
-        return {"outcome": outcome, "retry_with_new_id": True}
-    return {"outcome": outcome}
+        fields["retry_with_new_id"] = True
+    if refusal:
+        fields["refusal"] = refusal
+    return fields
 
 
 def _record_outcome(
@@ -444,6 +449,7 @@ def _record_outcome(
     owner_lease: TaskOwnerLease,
     *,
     retry_with_new_id: bool = False,
+    refusal: str | None = None,
 ) -> None:
     with get_session_local()() as db:
         # Preparation remains part of the owner-managed command lifecycle even
@@ -458,7 +464,9 @@ def _record_outcome(
             and row.result == state
         ):
             setattr(
-                row, "result", {**state, **_outcome_fields(outcome, retry_with_new_id)}
+                row,
+                "result",
+                {**state, **_outcome_fields(outcome, retry_with_new_id, refusal)},
             )
             db.commit()
 
@@ -488,6 +496,7 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
         )
         outcome = "unavailable"
         retry_with_new_id = False
+        refusal: str | None = None
         try:
             if payload.source == "sdk":
                 assert command.actor_user_id is not None
@@ -521,6 +530,7 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
             outcome = "unknown"
         except InputReviewRejected as exc:
             outcome = "input_review_unavailable" if exc.unavailable else "input_blocked"
+            refusal = str(exc)
         except TaskResumeNotAcceptedError:
             # Nothing was written. The stored result is the answer for every
             # retry of this command: "busy" with the resend-with-a-new-id
@@ -555,8 +565,9 @@ async def _execute_resume_input(command: ClaimedTaskCommand) -> SettledTaskComma
                     outcome,
                     owner_lease,
                     retry_with_new_id=retry_with_new_id,
+                    refusal=refusal,
                 )
             )
         return SettledTaskCommand(
-            {**state, **_outcome_fields(outcome, retry_with_new_id)}
+            {**state, **_outcome_fields(outcome, retry_with_new_id, refusal)}
         )

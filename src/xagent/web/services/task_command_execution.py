@@ -51,6 +51,7 @@ from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..user_isolated_memory import UserContext
 from . import task_execution as task_execution_service
 from .task_admission_execution import (
     AdmissionWaiting,
@@ -2380,8 +2381,12 @@ async def handle_task_message(
 
                     posted = UserMessageInjectionOutcome.NOT_POSTED
                     disposition = InjectionDisposition.DEFER
+                    review_rejection: InputReviewRejected | None = None
                     if live_task_lease is not None:
-                        with bind_task_lease_context(live_task_lease):
+                        with (
+                            bind_task_lease_context(live_task_lease),
+                            UserContext(task_owner_user_id),
+                        ):
                             with track_user_message_injection() as attempt:
                                 try:
                                     posted = await agent_service.post_user_message(
@@ -2404,17 +2409,11 @@ async def handle_task_message(
                                     if before_write and isinstance(
                                         injection_error, InputReviewRejected
                                     ):
-                                        task_execution_service.background_task_manager.release_resume_reservation(
-                                            task_id
+                                        review_rejection = injection_error
+                                        disposition = (
+                                            InjectionDisposition.NOT_ACCEPTED_RETRYABLE
                                         )
-                                        reservation_released = True
-                                        await finish_delivery_failure(
-                                            str(injection_error),
-                                            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
-                                            retry_with_new_id=True,
-                                        )
-                                        return
-                                    if before_write and isinstance(
+                                    elif before_write and isinstance(
                                         injection_error, CheckpointUnavailableError
                                     ):
                                         # Fold into the existing not-posted
@@ -2498,7 +2497,9 @@ async def handle_task_message(
                         )
                         reservation_released = True
                         await finish_delivery_failure(
-                            client_error_message(
+                            client_safe_error_message(review_rejection)
+                            if review_rejection is not None
+                            else client_error_message(
                                 ClientErrorCode.MESSAGE_DELIVERY_FAILED
                             ),
                             error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,

@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import openai
@@ -49,6 +49,8 @@ from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.execution_scope import ExecutionScope, ExecutionScopeContext
+from xagent.core.guardrails import input as input_review
+from xagent.core.guardrails.output import bind_output_review_agent
 from xagent.core.model.chat.basic.xinference import XinferenceLLM
 from xagent.core.model.chat.exceptions import (
     LLMEmptyContentError,
@@ -538,6 +540,102 @@ async def test_inject_rejection_leaves_no_dedupe_residue() -> None:
     assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     assert len(context.messages) == 1
     assert tracer.by_execution_id["exec-residue"]["context"]["messages"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["blocked", "unavailable", "delegated", "builtin", "workforce_builder"]
+)
+async def test_runner_reviews_input_before_building_context(monkeypatch, case) -> None:
+    unavailable = case == "unavailable"
+    hook = AsyncMock(
+        return_value=input_review.InputReviewResult(
+            refusal="Review refused.", unavailable=unavailable
+        )
+    )
+    monkeypatch.setattr(input_review, "_review", hook)
+    runner = AgentRunner(
+        agent=Agent(
+            name="reviewed", patterns=[], llm=None, metadata={"agent_type": case}
+        )
+    )
+    if case == "delegated":
+        with bind_output_review_agent(42):
+            result = await runner.run("Candidate", execution_id="reviewed")
+    else:
+        result = await runner.run("Candidate", execution_id="reviewed")
+    assert result["success"] is (case == "blocked")
+    assert result["output"] == "Review refused."
+    assert runner.context_manager.get_context("reviewed") is None
+    request = hook.await_args.args[0]
+    assert request.source == ("new_run" if case in {"blocked", "unavailable"} else case)
+    assert request.delegated_agent_id == (42 if case == "delegated" else None)
+
+
+@pytest.mark.asyncio
+async def test_rejected_reply_leaves_context_and_checkpoint_untouched(
+    monkeypatch,
+) -> None:
+    tracer = FlakyOnceCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="reviewed", patterns=[], llm=None), tracer=tracer
+    )
+    context = ExecutionContext(execution_id="reviewed")
+    runner.context_manager.set_context(context)
+    hook = AsyncMock(
+        return_value=input_review.InputReviewResult(
+            refusal="Try later.", unavailable=True
+        )
+    )
+    monkeypatch.setattr(input_review, "_review", hook)
+    with pytest.raises(input_review.InputReviewRejected, match="Try later") as exc:
+        await runner.inject_user_message(
+            "reviewed",
+            display_message="Candidate",
+            execution_message="Candidate with context",
+            turn_id="reply",
+        )
+    assert exc.value.unavailable
+    assert context.messages == []
+    assert tracer.load_calls == 0 and tracer.by_execution_id == {}
+    request = hook.await_args.args[0]
+    assert (request.source, request.text, request.execution_text) == (
+        "reply",
+        "Candidate",
+        "Candidate with context",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [False, True])
+async def test_input_review_contains_host_failure(monkeypatch, caplog, timeout) -> None:
+    import asyncio
+
+    async def hook(_request):
+        if timeout:
+            await asyncio.Event().wait()
+        raise RuntimeError("Private prompt content")
+
+    monkeypatch.setattr(input_review, "_review", hook)
+    monkeypatch.setattr(input_review, "INPUT_REVIEW_TIMEOUT_SECONDS", 0)
+    result = await input_review.review_input(
+        "run", "Candidate", execution_text="Candidate"
+    )
+    assert result.unavailable and result.refusal == input_review.UNAVAILABLE_INPUT
+    assert "Private prompt content" not in caplog.text
+
+
+def test_input_history_filters_both_prompt_representations() -> None:
+    messages = [
+        {"role": "user", "content": " Candidate "},
+        {"role": "user", "content": "Candidate with context"},
+        {"role": "assistant", "content": "Candidate"},
+        {"role": "user", "content": "Other question"},
+    ]
+    excluded = frozenset(
+        map(input_review.input_fingerprint, ("Candidate", "Candidate with context"))
+    )
+    assert input_review.filter_input_history(messages, excluded) == messages[2:]
 
 
 @pytest.mark.asyncio

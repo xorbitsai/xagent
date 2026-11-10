@@ -25,6 +25,7 @@ from ...core.agent.runner import (
 )
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from ..user_isolated_memory import UserContext
 from . import agent_service_manager as agent_runtime_service
 from . import task_execution as task_execution_service
 from .db_runtime import (
@@ -632,6 +633,7 @@ async def resume_a2a_task(
         posted = UserMessageInjectionOutcome.NOT_POSTED
         with (
             bind_task_lease_context(task_lease),
+            UserContext(task_owner_user_id),
             track_user_message_injection() as attempt,
         ):
             try:
@@ -1224,6 +1226,7 @@ async def resume_task_reply(
         posted = UserMessageInjectionOutcome.NOT_POSTED
         with (
             bind_task_lease_context(task_lease),
+            UserContext(ctx.task_owner_user_id),
             track_user_message_injection() as attempt,
         ):
             try:

@@ -1,30 +1,51 @@
 """Host input policy at the boundary where a user turn enters the agent."""
 
+import asyncio
 import hashlib
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from ..user_context import current_user_id
+from .output import get_delegated_review_agent_id
 
 BLOCKED_INPUT = (
-    "I can’t help with that request. Please rephrase it or ask about a supported topic."
+    "I can't help with that request. Please rephrase it or ask about a supported topic."
 )
 UNAVAILABLE_INPUT = "I couldn't complete the input safety check. Please try again."
+# Keep a hung reviewer inside the default 30s durable reply wait budget.
+INPUT_REVIEW_TIMEOUT_SECONDS = 20
+logger = logging.getLogger(__name__)
+InputReviewSource = Literal[
+    "new_run", "reply", "delegated", "builtin", "workforce_builder"
+]
 
 
 @dataclass(frozen=True)
 class InputReviewRequest:
+    """User text at the agent boundary. Hosts review attachment bytes separately."""
+
     execution_id: str
     user_id: int | None
     text: str = field(repr=False)
     execution_text: str = field(repr=False)
+    source: InputReviewSource = "new_run"
+    delegated_agent_id: int | None = None
 
 
 @dataclass(frozen=True)
 class InputReviewResult:
+    """Verdict and prior user-message fingerprints to omit from history replay.
+
+    Fingerprint the text persisted in the transcript (normally request.text).
+    Include request.execution_text as well if either representation can be replayed.
+    Refusal text is safe to display to the user.
+    """
+
     refusal: str | None = None
     excluded_inputs: frozenset[str] = frozenset()
+    unavailable: bool = False
 
 
 InputReviewHook = Callable[[InputReviewRequest], Awaitable[InputReviewResult]]
@@ -32,6 +53,7 @@ _review: InputReviewHook | None = None
 
 
 def set_input_review_hook(review: InputReviewHook | None) -> None:
+    """Install the host text reviewer, or clear it for standalone runs."""
     global _review
     _review = review
 
@@ -41,20 +63,34 @@ async def review_input(
     text: str,
     *,
     execution_text: str,
+    source: InputReviewSource = "new_run",
 ) -> InputReviewResult:
-    if _review is None:
+    hook = _review
+    if hook is None:
         return InputReviewResult()
-    return await _review(
-        InputReviewRequest(execution_id, current_user_id.get(), text, execution_text)
+    request = InputReviewRequest(
+        execution_id,
+        current_user_id.get(),
+        text,
+        execution_text,
+        source=source,
+        delegated_agent_id=get_delegated_review_agent_id(),
     )
+    try:
+        async with asyncio.timeout(INPUT_REVIEW_TIMEOUT_SECONDS):
+            return await hook(request)
+    except Exception as exc:
+        # Host errors can contain the prompt. Keep exception text out of logs.
+        logger.warning("Host input review failed (%s)", type(exc).__name__)
+        return InputReviewResult(refusal=UNAVAILABLE_INPUT, unavailable=True)
 
 
 class InputReviewRejected(ValueError):
     """A user message was denied before it was inserted into the runner."""
 
-    @property
-    def unavailable(self) -> bool:
-        return str(self) == UNAVAILABLE_INPUT
+    def __init__(self, refusal: str, *, unavailable: bool = False) -> None:
+        super().__init__(refusal)
+        self.unavailable = unavailable
 
 
 def input_fingerprint(text: str) -> str:

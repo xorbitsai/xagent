@@ -573,7 +573,7 @@ def client_safe_error_message(
     """
     if isinstance(error, AutoModelUnavailableError):
         return client_error_message(ClientErrorCode.AUTO_MODEL_UNAVAILABLE)
-    if not isinstance(error, ClientVisibleError):
+    if not isinstance(error, (ClientVisibleError, InputReviewRejected)):
         return fallback
     message = str(error)
     return message if message.strip() else fallback
@@ -4332,7 +4332,10 @@ async def execute_resume_background(
             assert lease_heartbeat_task is not None
             with track_user_message_injection() as attempt:
                 try:
-                    with bind_task_lease_context(lease):
+                    with (
+                        bind_task_lease_context(lease),
+                        UserContext(task_owner_user_id),
+                    ):
                         posted = await run_while_task_lease_owned(
                             agent_service.post_user_message(
                                 str(task_id),
@@ -4901,7 +4904,7 @@ async def execute_resume_background(
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
                 await fail_deferred_delivery(
-                    str(e)
+                    client_safe_error_message(e)
                     if isinstance(e, InputReviewRejected)
                     else client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
                     error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,

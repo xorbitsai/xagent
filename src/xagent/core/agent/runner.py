@@ -24,12 +24,18 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
-from ..guardrails.input import InputReviewRejected, filter_input_history, review_input
+from ..guardrails.input import (
+    InputReviewRejected,
+    InputReviewSource,
+    filter_input_history,
+    review_input,
+)
 from ..guardrails.output import (
     BLOCKED_OUTPUT,
     UNAVAILABLE_OUTPUT,
     ProtectedInteractionError,
     bind_output_guardrail,
+    get_delegated_review_agent_id,
     resolve_output_guardrail,
 )
 from ..inline_file_delivery import InlineFileDelivery
@@ -402,6 +408,13 @@ class AgentRunner:
                 execution_id=execution_id,
             )
         if checkpoint is None and task:
+            source: InputReviewSource = "new_run"
+            if self.agent.metadata.get("agent_type") == "builtin":
+                source = "builtin"
+            elif self.agent.metadata.get("agent_type") == "workforce_builder":
+                source = "workforce_builder"
+            elif get_delegated_review_agent_id() is not None:
+                source = "delegated"
             request_context = (metadata or {}).get("request_context")
             display_message = (
                 request_context.get("display_message")
@@ -412,9 +425,20 @@ class AgentRunner:
                 execution_id,
                 display_message if isinstance(display_message, str) else task,
                 execution_text=task,
+                source=source,
             )
             if decision.refusal:
-                return {"success": True, "output": decision.refusal}
+                if decision.unavailable or source != "new_run":
+                    return {
+                        "success": False,
+                        "error": decision.refusal,
+                        "output": decision.refusal,
+                    }
+                return {
+                    "success": True,
+                    "completion_outcome": "blocked",
+                    "output": decision.refusal,
+                }
             initial_messages = filter_input_history(
                 initial_messages or [], decision.excluded_inputs
             )
@@ -1300,9 +1324,12 @@ class AgentRunner:
                         execution_id,
                         resolved_display_message or resolved_execution_message,
                         execution_text=resolved_execution_message,
+                        source="reply",
                     )
                     if decision.refusal:
-                        raise InputReviewRejected(decision.refusal)
+                        raise InputReviewRejected(
+                            decision.refusal, unavailable=decision.unavailable
+                        )
 
                 # Resolve the checkpoint-merge baseline before any context mutation
                 # below (add_user_message, pending marker) so a failed read leaves

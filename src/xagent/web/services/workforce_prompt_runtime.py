@@ -615,6 +615,7 @@ async def build_workforce_prompt_plan(
     service = AgentService(
         budget_policy_provider=budget_policy_provider,
         name="Workforce Prompt Builder",
+        execution_metadata={"agent_type": "workforce_builder"},
         id=execution_id,
         task_id=execution_id,
         pattern="react",

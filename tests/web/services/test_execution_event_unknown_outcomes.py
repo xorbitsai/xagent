@@ -1222,42 +1222,84 @@ def test_a_finalize_commit_the_read_back_proves_absent_is_not_unknown(
     assert_none(caplog, metric_reader)
 
 
-# ------------------------------------------------- resume_finalize_unreconciled
+# ------------------------------------------------- resumed finalize ack
 
 
-@pytest.mark.parametrize("apply", [True, False], ids=["applied", "not_applied"])
-def test_resumed_finalize_commit_failure_is_reported(
-    canonical, commit_fate, caplog, metric_reader, apply
-):
-    """No reconciliation exists for this commit: whether or not it applied,
-    a failing COMMIT is an unreconciled outcome."""
-    factory, tid = canonical
-    lease = _start_run(factory, tid)
-    commit_fate["apply"] = apply
+def _finalize_resumed_success(factory, tid, lease):
     with factory() as db:
         user_id = int(db.get(Task, tid).user_id)
+    return _finalize_resumed_task(
+        tid,
+        status="completed",
+        success=True,
+        output="done",
+        task_owner_user_id=user_id,
+        result=dict(SUCCESS),
+        task_lease=lease,
+        prepared_outputs=NO_OUTPUTS,
+    )
+
+
+def test_a_lost_resumed_finalize_ack_the_read_back_confirms_is_reconciled(
+    canonical, commit_fate, caplog, metric_reader
+):
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+
+    finalized = _finalize_resumed_success(factory, tid, lease)
+
+    assert finalized["lease_released"] is True
+    assert_one(
+        caplog,
+        metric_reader,
+        kind="finalize_ack_reconciled",
+        task=tid,
+        run_id=lease.run_id,
+        ref=None,
+        storage="v2",
+        level=logging.INFO,
+    )
+
+
+def test_a_lost_resumed_finalize_ack_with_no_read_back_is_unresolved(
+    canonical, commit_fate, monkeypatch, caplog, metric_reader
+):
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+    commit_fate["apply"] = False
+
+    def read_back_fails(_witness):
+        raise CheckpointUnavailableError(f"read-back unavailable {SENTINEL}")
+
+    monkeypatch.setattr(
+        task_execution, "_finalization_witness_committed", read_back_fails
+    )
 
     with pytest.raises(OperationalError):
-        _finalize_resumed_task(
-            tid,
-            status="completed",
-            success=True,
-            output="done",
-            task_owner_user_id=user_id,
-            result=dict(SUCCESS),
-            task_lease=lease,
-            prepared_outputs=NO_OUTPUTS,
-        )
+        _finalize_resumed_success(factory, tid, lease)
 
     assert_one(
         caplog,
         metric_reader,
-        kind="resume_finalize_unreconciled",
+        kind="finalize_ack_unresolved",
         task=tid,
         run_id=lease.run_id,
         ref=None,
         storage="v2",
     )
+
+
+def test_a_resumed_finalize_commit_the_read_back_proves_absent_is_not_unknown(
+    canonical, commit_fate, caplog, metric_reader
+):
+    factory, tid = canonical
+    lease = _start_run(factory, tid)
+    commit_fate["apply"] = False
+
+    with pytest.raises(OperationalError):
+        _finalize_resumed_success(factory, tid, lease)
+
+    assert_none(caplog, metric_reader)
 
 
 @pytest.mark.parametrize("refused", REFUSED_COMMITS)

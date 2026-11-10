@@ -3369,6 +3369,7 @@ def _finalize_resumed_task(
 ) -> dict[str, Any]:
     """Persist one fenced resumed result in a single worker transaction."""
     from ..models.agent import Agent
+    from ..models.chat_message import TaskChatMessage
     from .chat_history_service import persist_assistant_message_no_commit
     from .task_orchestrator import sync_trigger_run_status
 
@@ -3527,8 +3528,11 @@ def _finalize_resumed_task(
                 ),
             )
 
+        # A legacy row inserted by this transaction; V2 uses its result fact
+        # instead. Only a successful answer or a failure inserts one.
+        assistant_message: TaskChatMessage | None = None
         if success and output.strip() and task_owner_user_id is not None:
-            persist_assistant_message_no_commit(
+            assistant_message = persist_assistant_message_no_commit(
                 db,
                 task_id=task_id,
                 user_id=task_owner_user_id,
@@ -3543,7 +3547,7 @@ def _finalize_resumed_task(
         elif final_task_status == TaskStatus.FAILED:
             presentation = present_failed_result(result)
             if task_owner_user_id is not None:
-                persist_assistant_message_no_commit(
+                assistant_message = persist_assistant_message_no_commit(
                     db,
                     task_id=task_id,
                     user_id=task_owner_user_id,
@@ -3589,7 +3593,7 @@ def _finalize_resumed_task(
             db.rollback()
             finalized["late_result"] = True
             return finalized
-        stage_result_fact_no_commit(
+        fact_witness = stage_result_fact_no_commit(
             db,
             task,
             interruption_pause_result()
@@ -3597,6 +3601,16 @@ def _finalize_resumed_task(
             else _settlement_result(result),
             turn_id=result_turn_id,
         )
+        legacy_witness: _ChatMessageWitness | None = None
+        if assistant_message is not None and task.conversation_storage_version != 2:
+            db.flush()
+            legacy_witness = _ChatMessageWitness(
+                task_id=task_id,
+                message_id=int(assistant_message.id),
+                role=str(assistant_message.role),
+                message_type=str(assistant_message.message_type),
+                content=str(assistant_message.content),
+            )
         if task.channel_id is not None and final_task_status in {
             TaskStatus.COMPLETED,
             TaskStatus.FAILED,
@@ -3638,25 +3652,22 @@ def _finalize_resumed_task(
                     "its channel reads the task row instead",
                     task_id,
                 )
-        # A lost acknowledgement here is not reconciled yet: the lease is
-        # released in this transaction, so only the result fact's witness
-        # (returned above) can prove the commit. That belongs with the
-        # same-identity retry work. Until then a COMMIT that fails on a
-        # dropped connection may have applied, so it is reported as an
-        # unreconciled outcome; any other commit error did not apply.
+        # The lease is released in this transaction, so a lost acknowledgement
+        # can only be proven applied by a row it inserted: the result fact
+        # (V2) or the legacy transcript row. Without one (a legacy wait or
+        # pause with no answer, a legacy completion with an empty answer, an
+        # ownerless legacy task, a replayed fact)
+        # the commit error is re-raised, reported as unresolved when the
+        # connection dropped.
         # Read before COMMIT: the row's attributes expire on a failed one.
         resume_storage = "v2" if task.conversation_storage_version == 2 else "v1"
-        try:
-            db.commit()
-        except Exception as commit_error:
-            if connection_was_lost(commit_error):
-                report_unknown_outcome(
-                    "resume_finalize_unreconciled",
-                    task_id=task_id,
-                    run_id=task_lease.run_id,
-                    storage=resume_storage,
-                )
-            raise
+        _commit_finalization_or_reconcile(
+            db,
+            task_id=task_id,
+            witness=fact_witness or legacy_witness,
+            run_id=task_lease.run_id,
+            storage=resume_storage,
+        )
         metadata_committed = True
         if (
             interruption is not None
@@ -3692,8 +3703,13 @@ def _settle_resumed_task_lease(
     turn_id: str | None = None,
     interruption: InterruptionReason | None = None,
     report: SettlementReport | None = None,
+    classify_unknown_tool_effect: bool = False,
 ) -> bool:
-    """Delegate resume cleanup to the shared run/runner-fenced lifecycle."""
+    """Delegate resume cleanup to the shared run/runner-fenced lifecycle.
+
+    ``classify_unknown_tool_effect`` is for a resumed run that raised, as
+    for a new run (see ``settle_task_lease_isolated``).
+    """
     from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
     from .external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
     from .task_orchestrator import settle_task_lease_isolated
@@ -3712,6 +3728,7 @@ def _settle_resumed_task_lease(
         lease,
         error_message=error_message,
         turn_id=turn_id,
+        classify_unknown_tool_effect=classify_unknown_tool_effect,
         interruption=interruption,
         report=report,
     )
@@ -3832,6 +3849,9 @@ async def execute_resume_background(
     lease_released = False
     settlement_error: str | None = None
     settlement_interruption: InterruptionReason | None = None
+    # As for a new run that raised: a started tool attempt with no committed
+    # outcome settles as an unknown tool effect, automatic resume on or off.
+    settlement_classifies_unknown_tool_effect = False
     broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
     # A fenced rejection keeps the uncertain run paused instead of failing it.
@@ -4927,6 +4947,9 @@ async def execute_resume_background(
             # non-LLM transport error escaping setup code (say an HTTP
             # timeout) can also match the LLM classifier here.
             settlement_interruption = settlement_interruption_for_failure(e)
+            # E.g. a tool ran but its result commit failed: the settlement
+            # must say the effect is unknown, not only when it pauses.
+            settlement_classifies_unknown_tool_effect = True
             broadcast_error_message = client_safe_error_message(
                 e,
                 fallback=CLIENT_SAFE_TASK_FAILURE,
@@ -5169,6 +5192,11 @@ async def execute_resume_background(
                                         None
                                         if explicit_cancel
                                         else settlement_interruption
+                                    ),
+                                    # A cancel does not undo a tool that
+                                    # ran: classified as for a new run.
+                                    classify_unknown_tool_effect=(
+                                        settlement_classifies_unknown_tool_effect
                                     ),
                                     report=settlement_report,
                                 )

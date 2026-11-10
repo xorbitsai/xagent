@@ -1,12 +1,15 @@
 """Connect apps through Composio-hosted auth (#3532, #3533, #3645).
 
 While our own app approvals are pending, a connector can use Composio's app
-instead: Facebook and Instagram (``meta`` provider) today. Each app in
+instead: Facebook and Instagram (``meta`` provider), Gmail and Google Drive
+(``google`` provider). Each app in
 ``COMPOSIO_APPS`` names its own provider and has its own switch (for example
 ``XAGENT_FACEBOOK_AUTH_BACKEND``; set to ``composio``) and selects this flow
 for its new connects only; Meta Ads and WhatsApp share the ``meta`` provider
-and stay native. Each app reads its identity its own way; Composio's Instagram
-toolkit uses Instagram Login, so its identity comes from ``graph.instagram.com``.
+and stay native, as do the other Google apps. Each app reads its identity its
+own way; Composio's Instagram toolkit uses Instagram Login, so its identity
+comes from ``graph.instagram.com``, and Gmail and Drive read Google's OIDC
+``sub``.
 
 The browser makes three trips, all to one shared callback URL whatever the
 app's provider (``shared_callback_url``: ``XAGENT_COMPOSIO_CALLBACK_URL``, or
@@ -116,6 +119,16 @@ INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v25.0/me"
 INSTAGRAM_APP_ID = "instagram"
 INSTAGRAM_TOOLKIT_SLUG = "instagram"
 META_PROVIDER = "meta"
+GOOGLE_PROVIDER = "google"
+GMAIL_APP_ID = "gmail"
+GMAIL_AUTH_BACKEND_ENV = "XAGENT_GMAIL_AUTH_BACKEND"
+COMPOSIO_GMAIL_AUTH_CONFIG_ID_ENV = "COMPOSIO_GMAIL_AUTH_CONFIG_ID"
+GOOGLE_DRIVE_APP_ID = "google-drive"
+GOOGLE_DRIVE_AUTH_BACKEND_ENV = "XAGENT_GOOGLE_DRIVE_AUTH_BACKEND"
+COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID_ENV = "COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID"
+# Google's OIDC userinfo endpoint (its discovery document's
+# ``userinfo_endpoint``); ``sub`` never changes and is never reused.
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 # Every Composio app's trips (begin, verification, denial) land on one shared
 # callback URL, whatever the app's own provider: Composio's OAuth user
 # verification is a single URL per project, and the flow and actor proof
@@ -152,6 +165,8 @@ class ComposioApp(NamedTuple):
 
 # Graph ids, Facebook user ids and Instagram professional account ids alike.
 _GRAPH_ID_RE = re.compile(r"[0-9]{1,32}")
+# Google subjects are numeric in practice; the OIDC limit is 255 characters.
+_GOOGLE_SUBJECT_RE = re.compile(r"[0-9]{1,255}")
 
 
 COMPOSIO_APPS: dict[str, ComposioApp] = {
@@ -179,6 +194,33 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_field="user_id",
         identity_params=(("fields", "user_id"),),
         identity_id_pattern=_GRAPH_ID_RE,
+    ),
+    # Composio's Google app holds Google's restricted-scope approval, so these
+    # connect with full Gmail and Drive access while our own review gate
+    # (XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED) stays closed (#3649).
+    GMAIL_APP_ID: ComposioApp(
+        app_id=GMAIL_APP_ID,
+        provider=GOOGLE_PROVIDER,
+        label="Gmail",
+        backend_env=GMAIL_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_GMAIL_AUTH_CONFIG_ID_ENV,
+        toolkit_slug="gmail",
+        identity_url=GOOGLE_USERINFO_URL,
+        identity_field="sub",
+        identity_params=(),
+        identity_id_pattern=_GOOGLE_SUBJECT_RE,
+    ),
+    GOOGLE_DRIVE_APP_ID: ComposioApp(
+        app_id=GOOGLE_DRIVE_APP_ID,
+        provider=GOOGLE_PROVIDER,
+        label="Google Drive",
+        backend_env=GOOGLE_DRIVE_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID_ENV,
+        toolkit_slug="googledrive",
+        identity_url=GOOGLE_USERINFO_URL,
+        identity_field="sub",
+        identity_params=(),
+        identity_id_pattern=_GOOGLE_SUBJECT_RE,
     ),
 }
 

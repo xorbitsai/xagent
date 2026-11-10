@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import time
 from typing import Any
 
@@ -1059,3 +1060,175 @@ def test_a_fragment_that_starts_inside_a_long_match_keeps_no_tail(proxy, header_
     text = str(raised.value)
     assert "EDGE-TAIL-SECRET-" not in text
     assert "z" * 100 not in text
+
+
+def test_a_body_of_distinct_lengths_echoed_from_its_tail_is_bounded(proxy):
+    """A body whose lines share one opening *and* have 1000 different lengths,
+    echoed from its end: every match is just over the kept text, so the scan
+    walks the full window at every one of them. The same body echoed from its
+    start cost 0.8 s here and its end cost 12.7 s; the work the pass may
+    spend is counted, so the tail echo is bounded like the others."""
+    lines = ["A" * 32 + "A" * index + "z" for index in range(1000)]
+    decoded = "Subject: w\r\n\r\n" + "\r\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\r\n".join(lines[-100:])}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines if line in text]
+    assert elapsed < 1.0, "distinct lengths must not multiply the work per match"
+
+
+@pytest.mark.parametrize("line_count", [1000, 1600])
+def test_a_body_of_long_lines_with_distinct_lengths_is_bounded(proxy, line_count):
+    """The same shape with lines just over the kept text (1000..2599
+    characters, 2.0/3.8 MB of raw), so every match costs the full scan window
+    rather than its own length. It took 41 s and 77 s here; the counted work
+    has to cut it short with the rest of the text hidden, and no line may
+    stay visible."""
+    lines = ["A" * (1000 + index - 12) + f"{index:012d}" for index in range(line_count)]
+    decoded = "Subject: w\r\n\r\n" + "\r\n".join(lines)
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    proxy.response = _Response(
+        400, {"error": {"message": "invalid body " + "\r\n".join(lines[:100])}}
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert not [line for line in lines[:100] if line in text]
+    assert elapsed < 1.0, (
+        "a long match must not turn distinct lengths into unbounded work"
+    )
+
+
+def test_a_pass_that_runs_out_of_its_work_hides_the_rest(proxy, monkeypatch):
+    """The work allowance is a counted bound, not a clock: when the next
+    comparison does not fit, everything after it is dropped behind one
+    marker. The marker after a 3000-character match is what a growing region
+    would otherwise leave in view."""
+    monkeypatch.setattr(composio_proxy, "_MAX_REDACTION_WORK", 2000, raising=False)
+    message = "invalid body " + "A" * 3000 + "AFTER-THE-MATCH-SECRET"
+    decoded = "Subject: w\r\n\r\n" + "A" * 3000
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": message}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "AFTER-THE-MATCH-SECRET" not in text
+    assert "A" * 100 not in text
+
+
+def test_a_pass_with_enough_work_keeps_the_text_after_a_long_match(proxy):
+    """The control for the allowance above: with the shipped budget the same
+    message is scanned, the match is replaced, and the text after it stays."""
+    message = "invalid body " + "A" * 3000 + "AFTER-THE-MATCH-KEPT"
+    decoded = "Subject: w\r\n\r\n" + "A" * 3000
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": message}})
+
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+
+    text = str(raised.value)
+    assert "AFTER-THE-MATCH-KEPT" in text
+    assert "A" * 100 not in text
+
+
+def test_a_growing_region_that_spends_the_work_hides_the_rest(proxy, monkeypatch):
+    """A run that a fragment keeps extending walks its region until the work
+    allowance is gone, then takes the rest of the text as one region. The
+    later marker must not survive; the shorter allowance only makes the bound
+    deterministic, it must never leave fragment text in view."""
+    monkeypatch.setattr(composio_proxy, "_MAX_REDACTION_WORK", 1_000_000, raising=False)
+    message = "invalid body " + "A" * 40_000 + "\r\nLATE-BODY-SECRET-0123456789"
+    decoded = "Subject: w\r\n\r\n" + "A" * 2000 + "\r\n" + "A" * 1001
+    raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+    proxy.response = _Response(400, {"error": {"message": message}})
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=GMAIL_HOSTS,
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "LATE-BODY-SECRET-0123456789" not in text
+    assert "A" * 100 not in text
+    assert elapsed < 1.0
+
+
+@pytest.mark.parametrize("rewrite", ["lf", "crlf", "double-blank", "indent"])
+def test_random_bodies_of_distinct_lengths_stay_bounded(proxy, rewrite):
+    """A fixed-seed sweep over the shapes the pass used to be slow on: bodies
+    whose lines share a 40-character opening and have random lengths, echoed
+    with the line endings and indentation a vendor may add. None of the
+    lines may stay visible, and each pass has to stay inside the bound."""
+    rng = random.Random(20261110)
+    for case, (low, high, count) in enumerate(
+        ((200, 4000, 120), (900, 1100, 300), (64, 5000, 200))
+    ):
+        widths = [rng.randint(low, high) for _ in range(count)]
+        lines = [
+            "Q" * 40 + f"{case}{index:04d}" + "d" * (width - 46)
+            for index, width in enumerate(widths)
+        ]
+        decoded = "Subject: random\r\n\r\n" + "\r\n".join(lines)
+        raw = base64.urlsafe_b64encode(decoded.encode()).decode()
+        echo = {
+            "lf": decoded.replace("\r\n", "\n"),
+            "crlf": decoded.replace("\n", "\r\n"),
+            "double-blank": decoded.replace("\n", "\n\n"),
+            "indent": "\n".join("  " + line for line in decoded.split("\n")),
+        }[rewrite]
+        proxy.response = _Response(400, {"error": {"message": "invalid body " + echo}})
+
+        started = time.monotonic()
+        with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+            composio_proxy.proxy_request(
+                "POST",
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                allowed_hosts=GMAIL_HOSTS,
+                body={"raw": raw},
+            )
+        elapsed = time.monotonic() - started
+
+        text = str(raised.value)
+        assert not [line for line in lines if line in text]
+        assert elapsed < 1.0, f"{rewrite} case {case} took {elapsed:.2f}s"

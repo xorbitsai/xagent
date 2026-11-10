@@ -809,7 +809,9 @@ def test_an_attachment_of_same_prefix_base64_lines_stays_bounded(
         )
     elapsed = time.monotonic() - started
 
-    assert base64_lines[0][:24] not in str(raised.value)
+    text = str(raised.value)
+    assert base64_lines[0][:24] not in text
+    assert not [line for line in base64_lines if line in text]
     assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
 
 
@@ -845,5 +847,96 @@ def test_a_text_body_of_same_prefix_lines_stays_bounded(monkeypatch, composio_en
         )
     elapsed = time.monotonic() - started
 
-    assert lines[0][:20] not in str(raised.value)
+    text = str(raised.value)
+    assert lines[0][:20] not in text
+    assert not [line for line in lines if line in text]
     assert elapsed < 1.0, "a same-prefix bucket must be looked up by length"
+
+
+def test_a_builder_body_echoed_with_crlf_stays_bounded(monkeypatch, composio_env):
+    """The shape a real send can reach: one recipient and a 3.24 MB 7-bit body
+    of 41k 78-character lines, whose whole decoded echo the vendor rewrites
+    with CRLF line endings. The body fragment fits at every position near its
+    start, so the pass hashed the whole body at each of them (3.5 s here,
+    while the previous lookup took 0.05 s on the same output). The tail probe
+    has to make the mismatch cost one slice, and no line of the body or the
+    recipient may survive."""
+    create, _ = gmail._build_message(
+        {
+            "to": "a@example.com",
+            "subject": "s",
+            "body": "\n".join(["A" * 78] * 41000),
+        },
+        [],
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    echo = decoded.replace("\n", "\r\n")
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": "invalid body " + echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "A" * 78 not in text
+    assert "a@example.com" not in text
+    assert elapsed < 1.0, "a body fragment must not be hashed at every position"
+
+
+@pytest.mark.parametrize("rewrite", ["double-blank", "indent"])
+def test_a_group_send_echoed_with_rewritten_whitespace_stays_bounded(
+    monkeypatch, composio_env, rewrite
+):
+    """The same message with 500 recipients (a 40 kB ``To`` header) and an echo
+    that doubles every blank line or indents every line. Both rewrites add a
+    character per line to the echo, which keeps the 3.24 MB body fragment a
+    candidate for the first lines after its start; the pass then paid for the
+    whole body at each of them. Neither the body nor the recipient list may
+    survive, and the pass stays bounded."""
+    recipients = ",".join(
+        "A" * 64 + f"{number:04d}@example.com" for number in range(500)
+    )
+    create, _ = gmail._build_message(
+        {"to": recipients, "subject": "s", "body": "\n".join(["A" * 78] * 41000)},
+        [],
+    )
+    raw = create["raw"]
+    assert len(raw) < composio_proxy.MAX_JSON_BODY_BYTES
+    decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    echo = {
+        "double-blank": decoded.replace("\n", "\n\n"),
+        "indent": "\n".join("  " + line for line in decoded.split("\n")),
+    }[rewrite]
+    monkeypatch.setattr(
+        composio_proxy.requests,
+        "request",
+        lambda **kwargs: _Response(400, {"error": {"message": "invalid body " + echo}}),
+    )
+
+    started = time.monotonic()
+    with pytest.raises(composio_proxy.ComposioProxyError) as raised:
+        composio_proxy.proxy_request(
+            "POST",
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            allowed_hosts=("gmail.googleapis.com",),
+            body={"raw": raw},
+        )
+    elapsed = time.monotonic() - started
+
+    text = str(raised.value)
+    assert "A" * 78 not in text
+    assert "A" * 64 not in text
+    assert "@example.com" not in text
+    assert elapsed < 1.0, "a rewritten echo must not multiply the body's cost"

@@ -756,11 +756,57 @@ async def test_composio_facebook_grant_launches_with_composio_env(
     assert env["COMPOSIO_USER_ID"] == "actor-hmac"
 
 
+_SALESFORCE_LAUNCH_CONFIG = {
+    "command": "python",
+    "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+    "env_mapping": {
+        "SALESFORCE_ACCESS_TOKEN": "access_token",
+        "SALESFORCE_INSTANCE_URL": "instance_url",
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_composio_salesforce_grant_launches_without_an_instance_url(
+    db_session, monkeypatch
+):
+    """A Composio grant's instance_url holds the Composio user id, not an org
+    host: it must never reach SALESFORCE_INSTANCE_URL (#3646)."""
+    db, user = db_session
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    _add_oauth_server(
+        db,
+        user,
+        name="Salesforce",
+        app_id="salesforce",
+        provider="salesforce",
+        launch_config=dict(_SALESFORCE_LAUNCH_CONFIG),
+    )
+    _add_user_oauth(
+        db,
+        user,
+        provider="salesforce",
+        access_token="ca_sf_1",
+        instance_url="actor-hmac",
+        token_type="composio",
+    )
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert config["transport"] == "stdio"
+    env = config["config"]["env"]
+    assert "SALESFORCE_ACCESS_TOKEN" not in env
+    assert "SALESFORCE_INSTANCE_URL" not in env
+    assert env["COMPOSIO_API_KEY"] == "composio-key"
+    assert env["COMPOSIO_CONNECTED_ACCOUNT_ID"] == "ca_sf_1"
+    assert env["COMPOSIO_USER_ID"] == "actor-hmac"
+
+
 @pytest.mark.asyncio
 async def test_composio_grant_for_an_app_that_cannot_proxy_is_unavailable(
     db_session, monkeypatch
 ):
-    """Only Facebook's and Instagram's subprocesses can proxy a Composio
+    """Only the subprocesses in _COMPOSIO_PROXY_APPS can proxy a Composio
     grant. Any other app's Composio grant (here WhatsApp, which stays native)
     is reported unavailable instead of being misrouted."""
     db, user = db_session

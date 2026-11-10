@@ -160,8 +160,21 @@ def serves_composio_grant() -> bool:
 def redact(value: Any) -> Any:
     """``value`` with every launch secret and provider token replaced, in
     nested values too."""
-    secrets = [os.environ.get(name) for name in _LAUNCH_SECRET_ENVS]
-    return _redact(value, [secret for secret in secrets if secret])
+    return _redact(value, _launch_secrets())
+
+
+def _launch_secrets() -> list[str]:
+    """The launch variables that are set, read once per use.
+
+    A pass that redacts a value per fragment reads them once and hands the
+    list down: reading three environment variables per fragment is what a
+    decoded body of hundreds of thousands of short lines paid for.
+    """
+    return [
+        secret
+        for secret in (os.environ.get(name) for name in _LAUNCH_SECRET_ENVS)
+        if secret
+    ]
 
 
 def _redact(value: Any, secrets: list[str]) -> Any:
@@ -220,14 +233,28 @@ def _redact_echoed_body(message: str, body: Any) -> str:
     # while the text is still whole. ``ComposioProxyError`` redacts again
     # before its own cut; this one keeps the fragments below matching the text
     # the error will show.
-    message = redact(message)
+    redacted = redact(message)
+    # A fragment the pass can meet is a piece of this text, so its redacted
+    # form differs from itself only if the text carried a secret or a token.
+    # ``redact`` hands the same string back when it replaced nothing, so the
+    # identity test says whether any fragment has to be looked at twice too;
+    # a replacement that happens to leave the text unchanged also counts,
+    # which is the conservative side. Reading the launch variables and
+    # redacting per fragment is what a body of hundreds of thousands of short
+    # lines paid for, and this is what keeps it to the fragments that can
+    # carry one.
+    redact_fragments = redacted is not message
     # The decoded content is replaced before the error text is cut: a fragment
     # that crosses the cut would otherwise keep its visible prefix, and one
     # whose token ``redact`` rewrote would no longer match at all. The pass
     # walks the original text in order and stops once it has produced the
     # text that will be kept, so a replacement cannot shorten the text in
     # front of a fragment and pull it into the kept text.
-    return _redacted_decoded_fragments(message, _decoded_mime_fragments(body))
+    return _redacted_decoded_fragments(
+        redacted,
+        _decoded_mime_fragments(body),
+        redact_fragments=redact_fragments,
+    )
 
 
 # A decoded fragment is looked up by the characters it opens with and the
@@ -256,22 +283,46 @@ _MAX_REGION_SCAN_CHARS = 4 * MAX_ERROR_TEXT_CHARS
 # differs from the echo at its first newline costs one 32-character slice,
 # not the whole fragment.
 _MAX_COMPARE_CHARS = 4096
+# The preparation the scan needs spends the same allowance: every distinct
+# fragment is deduplicated, hashed into the index and, if the text still
+# carried a secret, redacted. The first two cost a fixed amount per fragment
+# whatever its length, so each fragment is charged this many characters on top
+# of its own length.
+_FRAGMENT_PREP_CHARS = 8
+# A fragment that has to be looked at for a secret costs one more scan of its
+# own text (a ``replace`` per launch secret, a ``lower`` and the token
+# pattern), which the charge above does not cover; it is charged this many
+# characters on top of its length again.
+_FRAGMENT_REDACT_CHARS = 24
 # What one redaction pass may look at, counted in characters rather than
-# seconds so the same message always costs the same on any machine. A
-# position pays ``_FRAGMENT_KEY_CHARS`` for its opening; a long candidate pays
-# ``_FRAGMENT_TAIL_CHARS`` for its tail and every slice it compares; a
-# fragment of at most ``_EXACT_LOOKUP_CHARS`` pays its own length once. The
-# pass is therefore O(positions + candidates + characters compared), and each
-# of the three is itself bounded: a region walks at most
+# seconds so the same message always costs the same on any machine.
+#
+# The scan pays ``_FRAGMENT_KEY_CHARS`` for the opening of every position it
+# looks at, ``_FRAGMENT_TAIL_CHARS`` for the tail of every long candidate, its
+# own length for every fragment of at most ``_EXACT_LOOKUP_CHARS``, and the
+# characters of every slice it compares. The preparation pays
+# ``_FRAGMENT_PREP_CHARS`` and the fragment's length for every distinct
+# fragment, plus ``_FRAGMENT_REDACT_CHARS`` and its length again for the
+# fragments that have to be redacted.
+#
+# Each term is bounded on its own as well: a region walks at most
 # ``_MAX_REGION_SCAN_CHARS`` positions, a position tries one candidate per
-# distinct length that shares its opening, and a comparison stops at the first
-# slice that differs (or at the fragment's length for a real match). Once the
-# allowance is gone the rest of the text is hidden as one region -- more
-# redaction, never less. It is sized from both ends: every shape in this
-# repository's tests and the reference cases that used to take a few hundred
-# milliseconds stay exact (the most expensive spends 3.7M of it), while the
-# shapes that took seconds are cut; the largest body the 4.5 MB limit admits
-# spends all of it in about 0.25 s here. The report records the measurements.
+# distinct length that shares its opening, a comparison stops at the first
+# slice that differs (or at the fragment's length for a real match), and the
+# number of fragments follows from the decoded size: the 4.5 MB payload limit
+# decodes to 3.375 MB, so a body cut into the 8-character lines the pass still
+# treats as content carries at most about 375k fragments. Once the allowance
+# is gone the rest of the text is hidden as one region -- more redaction,
+# never less; in the preparation that means the whole text, because nothing
+# has been looked for yet.
+#
+# It is sized from both ends: every shape this repository's tests and the
+# reference cases used to take a few hundred milliseconds stay exact (the most
+# expensive spends 3.7M of it), and the shapes that took seconds are cut. The
+# largest term this bound has is the preparation of a fragment-dense body:
+# 366,666 short lines spend 9.2M on it and 3.3M on the scan of their whole
+# echo, and the pass takes 0.16-0.21 s here. The report records the
+# measurements.
 _MAX_REDACTION_WORK = 15_000_000
 
 
@@ -290,7 +341,9 @@ class _Work:
         self.left = left
 
 
-def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
+def _redacted_decoded_fragments(
+    message: str, fragments: list[str], *, redact_fragments: bool = True
+) -> str:
     """``message`` with every decoded fragment that can reach its kept text
     removed.
 
@@ -303,19 +356,31 @@ def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
     fragment that crosses the cut is still met whole, because the scan sees
     its start.
 
-    Each fragment is also matched in the form ``redact`` leaves it in,
-    because the text has already been redacted. Overlapping fragments are
+    ``redact_fragments`` says whether a fragment can also be met in the form
+    ``redact`` leaves it in, because the text has already been redacted. It is
+    True by default: a caller that does not know spends the extra work rather
+    than risk leaving a rewritten fragment in view. Overlapping fragments are
     replaced as one region, so a shorter match cannot leave the tail of a
     longer one visible.
 
-    The scan spends the index's work allowance. When it is gone the rest of
-    the text is dropped behind one marker: a caller's error text may lose
-    context, but no fragment can stay in view.
+    Both the preparation of the fragments and the scan spend the same work
+    allowance (``_MAX_REDACTION_WORK``). When it is gone the rest of the text
+    is dropped behind one marker: a caller's error text may lose context, but
+    no fragment can stay in view. The preparation runs first, so an allowance
+    that runs out there hides the whole text, which is the conservative side:
+    none of the fragments has been looked for yet.
     """
-    variants = _decoded_fragment_variants(fragments)
+    variants, preparation = _decoded_fragment_variants(
+        fragments, redact_fragments=redact_fragments
+    )
+    if preparation > _MAX_REDACTION_WORK:
+        return _REDACTED
     if not variants:
         return message
     index = _fragment_index(variants)
+    # The preparation and the scan share one allowance: what preparing the
+    # fragments cost is taken off the index's before the first lookup.
+    index.work.left -= preparation
     pieces: list[str] = []
     kept = 0
     position = 0
@@ -340,16 +405,43 @@ def _redacted_decoded_fragments(message: str, fragments: list[str]) -> str:
     return "".join(pieces)
 
 
-def _decoded_fragment_variants(fragments: list[str]) -> set[str]:
+def _decoded_fragment_variants(
+    fragments: list[str], *, redact_fragments: bool = True
+) -> tuple[set[str], int]:
     """The distinct fragments to look for, including the form ``redact``
-    leaves them in."""
-    variants: set[str] = set()
-    for fragment in set(fragments):
-        if not fragment:
-            continue
-        variants.add(fragment)
-        variants.add(str(redact(fragment)))
-    return variants
+    leaves them in when a fragment can carry a secret, and what preparing them
+    charged the pass's allowance.
+
+    The preparation is part of the pass, so it pays from the same allowance:
+    every distinct fragment is charged its own length and
+    ``_FRAGMENT_PREP_CHARS`` for the deduplication, the hash and its index
+    entry, and one that has to be redacted pays ``_FRAGMENT_REDACT_CHARS`` and
+    its length again. A decoded body of hundreds of thousands of short lines
+    used to run ``redact`` -- three environment reads and three ``replace`` --
+    once per fragment, which the allowance did not cover at all.
+
+    The fixed charge is taken for the whole set at once: taking it per
+    fragment in Python is itself a loop over every fragment, which is the cost
+    this is meant to bound. A charge above the allowance stops the walk and
+    goes back to the caller, which hides the whole text: nothing has been
+    looked for yet.
+    """
+    variants = set(fragments)
+    variants.discard("")
+    if not variants:
+        return variants, 0
+    charged = sum(map(len, variants)) + len(variants) * _FRAGMENT_PREP_CHARS
+    if charged > _MAX_REDACTION_WORK or not redact_fragments:
+        return variants, charged
+    secrets = _launch_secrets()
+    for fragment in list(variants):
+        charged += len(fragment) + _FRAGMENT_REDACT_CHARS
+        if charged > _MAX_REDACTION_WORK:
+            return variants, charged
+        redacted = _redacted_text(fragment, secrets)
+        if redacted != fragment:
+            variants.add(redacted)
+    return variants, charged
 
 
 @dataclass(frozen=True)
@@ -385,8 +477,9 @@ class _FragmentIndex:
     whole comparison only for a candidate whose opening, length and tail all
     matched -- never one per fragment.
 
-    ``work`` belongs to the pass: it is created with the index and every
-    lookup spends from it.
+    ``work`` belongs to the pass: it starts with the whole allowance, the
+    preparation takes its share off before the first lookup, and every lookup
+    spends from it.
     """
 
     by_length: dict[int, set[str]]

@@ -51,7 +51,9 @@ def test_duplicate_entry_cites_original_spelling(monkeypatch):
         csr.load_conversation_storage_policy()
 
 
-@pytest.mark.parametrize("value", ["abc", "0", "-1", "1,x", "1.5"])
+@pytest.mark.parametrize(
+    "value", ["abc", "0", "-1", "1,x", "1.5", "1_000", "+5", "\u0663"]
+)
 def test_invalid_user_ids_rejected(monkeypatch, value):
     monkeypatch.setenv(ENTRIES, "sdk")
     monkeypatch.setenv(USER_IDS, value)

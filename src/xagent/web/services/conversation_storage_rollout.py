@@ -91,13 +91,14 @@ def load_conversation_storage_policy() -> ConversationStoragePolicy:
     if raw_ids:
         parsed: set[int] = set()
         for raw in raw_ids:
-            try:
-                value = int(raw)
-            except ValueError:
+            # ``int`` also accepts "1_000", "+5" and non-ASCII digits; only
+            # plain ASCII digits are a valid id.
+            if not (raw.isascii() and raw.isdigit()):
                 raise ConversationStorageConfigError(
                     f"Invalid execution event storage user id {raw!r}: "
                     "must be a positive integer"
-                ) from None
+                )
+            value = int(raw)
             if value <= 0:
                 raise ConversationStorageConfigError(
                     f"Invalid execution event storage user id {raw!r}: "

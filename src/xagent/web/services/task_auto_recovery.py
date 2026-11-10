@@ -147,6 +147,22 @@ def interruption_pause_result() -> dict[str, Any]:
 # ``task_auto_resume.status_only_terminal_view``), so that wait returns.
 _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 
+# ``Task.agent_config`` key a host sets (to ``True``) on a channel task whose
+# reply it can deliver after the run is resumed by the successor.
+HANDOVER_DELIVERY_AGENT_CONFIG_KEY = "release_handover_delivery"
+
+
+def host_marked_channel_reply(task: Task) -> bool:
+    """Whether ``task`` is a channel task whose host promised to deliver its resumed reply."""
+
+    config = task.agent_config
+    return (
+        task.channel_id is not None
+        and isinstance(config, dict)
+        and config.get(HANDOVER_DELIVERY_AGENT_CONFIG_KEY) is True
+    )
+
+
 # Callers that only ever read a task's status. A settlement interruption of
 # one of their runs is paused only while automatic resume is on: pausing is
 # worth it only when something will resume the run, and when automatic resume
@@ -196,7 +212,10 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
 
     Rules apply in order and the first match wins:
 
-    1. A2A, external, widget and shared-link tasks are ineligible.
+    1. A2A, external, widget and shared-link tasks are ineligible, except an
+       external channel task whose host marked its reply for delivery
+       (:func:`host_marked_channel_reply`): the host owns the reply protocol
+       and keeps its target, so it falls through to the channel rule below.
     2. Workforce tasks are eligible unless their run is a preview (or the
        run row is gone, so it cannot be shown not to be one).
     3. Trigger tasks are eligible.
@@ -208,7 +227,9 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
     """
 
     source = str(task.source or "internal")
-    if source in _INELIGIBLE_SOURCES:
+    if source in _INELIGIBLE_SOURCES and not (
+        source == "external" and host_marked_channel_reply(task)
+    ):
         return _ineligible(f"source_{source}")
 
     workforce_run_id = extract_workforce_run_id(task)
@@ -255,8 +276,10 @@ def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
     Tasks of a status-only source (:func:`is_status_only_source`) still fail
     now as well, as their settlement interruptions do: their caller reads
     nothing but the status, and a deploy should not keep it waiting on a
-    lease TTL. Channel tasks are excluded too until their resumed reply is
-    proven, and nothing is handed off while automatic resume is off.
+    lease TTL. Channel tasks are excluded too, unless their host marked the
+    reply for delivery (``Task.agent_config["release_handover_delivery"]``,
+    its promise to hold the reply target and post the resumed run's result),
+    and nothing is handed off while automatic resume is off.
 
     This is the one place that decides which RUNNING runs a host hands over
     instead of draining; ``release_handover`` calls it rather than keep its
@@ -268,7 +291,9 @@ def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
     task = db.get(Task, task_id)
     if task is None or task.status != TaskStatus.RUNNING:
         return False
-    if is_status_only_source(task.source) or task.channel_id is not None:
+    if is_status_only_source(task.source):
+        return False
+    if task.channel_id is not None and not host_marked_channel_reply(task):
         return False
     return auto_recovery_eligibility(db, task).eligible
 

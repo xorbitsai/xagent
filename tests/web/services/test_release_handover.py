@@ -35,6 +35,7 @@ from xagent.web.services.release_handover import (
 )
 from xagent.web.services.release_hold import release_hold
 from xagent.web.services.task_auto_recovery import (
+    HANDOVER_DELIVERY_AGENT_CONFIG_KEY,
     _user_command_since_dispatch,
     handover_pause_owns_run,
     record_lease_expiry_interruption_no_commit,
@@ -309,6 +310,122 @@ def test_begin_leaves_runs_the_successor_would_not_resume_to_the_drain(
 
     assert (report.staged, report.kept) == (0, 1)
     assert _commands(factory, task_id) == []
+
+
+@pytest.mark.parametrize(
+    ("agent_config", "staged"),
+    [
+        ({HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True}, 1),
+        ({HANDOVER_DELIVERY_AGENT_CONFIG_KEY: False}, 0),
+        ({HANDOVER_DELIVERY_AGENT_CONFIG_KEY: "true"}, 0),
+        ({}, 0),
+    ],
+    ids=["marked", "false", "not-a-bool", "unmarked"],
+)
+def test_begin_hands_over_a_channel_task_only_when_its_host_marked_the_reply(
+    factory, monkeypatch, agent_config, staged
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, channel=True, agent_config=agent_config)
+        db.commit()
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (staged, 1 - staged)
+    assert len(_commands(factory, task_id)) == staged
+
+
+_MARK = {HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True}
+
+
+@pytest.mark.parametrize(
+    ("fields", "staged"),
+    [
+        ({"channel": True, "source": "external", "agent_config": _MARK}, 1),
+        ({"channel": True, "source": "external"}, 0),
+        (
+            {
+                "channel": True,
+                "source": "external",
+                "agent_config": {HANDOVER_DELIVERY_AGENT_CONFIG_KEY: "true"},
+            },
+            0,
+        ),
+        # The mark lifts only the external source, and only for a channel task.
+        ({"source": "external", "agent_config": _MARK}, 0),
+        ({"channel": True, "source": "a2a", "agent_config": _MARK}, 0),
+        (
+            {
+                "channel": True,
+                "source": "external",
+                "agent_config": _MARK,
+                "control_state": "pause_requested",
+            },
+            0,
+        ),
+    ],
+    ids=[
+        "marked-external-channel",
+        "unmarked-external-channel",
+        "not-a-bool",
+        "marked-external-without-channel",
+        "marked-a2a-channel",
+        "marked-external-user-paused",
+    ],
+)
+def test_a_marked_external_channel_task_is_handed_over_and_nothing_else_changes(
+    factory, monkeypatch, fields, staged
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, **fields)
+        db.commit()
+
+    assert begin_handover_sync(RELEASE, {RUNNER}).staged == staged
+    assert len(_commands(factory, task_id)) == staged
+
+
+def test_a_marked_external_channel_task_needs_shared_execution(factory, monkeypatch):
+    monkeypatch.delenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", raising=False)
+    with factory() as db:
+        task_id = _task(db, channel=True, source="external", agent_config=_MARK)
+        db.commit()
+
+    assert begin_handover_sync(RELEASE, {RUNNER}).staged == 0
+    assert _commands(factory, task_id) == []
+
+
+def test_the_successor_resumes_a_marked_external_channel_run_exactly_once(
+    factory, checkpoint, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, channel=True, source="external", agent_config=_MARK)
+        db.commit()
+    _handed_over(factory, task_id)
+    assert settle_handover_sync(RELEASE).recorded == 1
+
+    now = utc_now() + timedelta(seconds=30)
+    assert run_auto_resume_tick(now=now).staged_commands == 1
+    assert run_auto_resume_tick(now=now).staged_commands == 0
+    resumes = [c for c in _commands(factory, task_id) if c.kind == "resume"]
+    assert len(resumes) == 1
+
+
+def test_an_unmarked_external_channel_run_is_never_resumed(
+    factory, checkpoint, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    with factory() as db:
+        task_id = _task(db, channel=True, source="external")
+        db.commit()
+    _handed_over(factory, task_id)
+    settle_handover_sync(RELEASE)
+
+    now = utc_now() + timedelta(seconds=30)
+    assert run_auto_resume_tick(now=now).staged_commands == 0
+    assert [c for c in _commands(factory, task_id) if c.kind == "resume"] == []
 
 
 def test_begin_stages_nothing_when_automatic_resume_is_off(factory, monkeypatch):

@@ -826,7 +826,7 @@ def test_upload_file_does_not_claim_success_without_the_new_file_id(
     assert result["status"] == "error"
     assert "did not confirm" in result["message"]
     assert "found no file named 'Report.pdf'" in result["message"]
-    assert "not created under that name" in result["message"]
+    assert "not known whether it was uploaded" in result["message"]
     # The lookup was made once; the upload itself is not retried.
     assert len(http.tool_calls) == 1
     assert [call for call in http.proxy_calls if "name = " in str(call)] != []
@@ -840,6 +840,19 @@ def _created_lookup(**overrides: Any) -> dict[str, Any]:
         "size": str(len(NEW_CONTENT)),
         "md5Checksum": _md5(NEW_CONTENT),
         "webViewLink": f"https://drive.google.com/file/d/{_NEW_ID}/view",
+        "createdTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _recent_folder(**overrides: Any) -> dict[str, Any]:
+    """A same-name folder created during the call: no checksum either."""
+    entry = {
+        "id": "folder1",
+        "name": "Report.pdf",
+        "mimeType": "application/vnd.google-apps.folder",
+        "webViewLink": "https://drive.google.com/drive/folders/folder1",
         "createdTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     entry.update(overrides)
@@ -914,9 +927,11 @@ def test_upload_file_looks_in_the_parent_a_lost_answer_may_have_used(
     assert "'folder1' in parents" in _query(lookup)["q"]
 
 
-def test_upload_file_says_it_was_not_created_when_the_lookup_finds_nothing(
+def test_upload_file_says_the_outcome_is_unknown_when_the_lookup_finds_nothing(
     http, monkeypatch, _isolate_environment
 ):
+    """A timed-out tool may still be running in Composio, so a lookup that
+    finds nothing is "not yet", not "not created"."""
     local = _isolate_environment / "Report.pdf"
     local.write_bytes(NEW_CONTENT)
     http.proxy("name = ", 200, {"files": []})
@@ -926,8 +941,73 @@ def test_upload_file_says_it_was_not_created_when_the_lookup_finds_nothing(
 
     assert result["status"] == "error"
     assert "found no file named 'Report.pdf'" in result["message"]
-    assert "not created under that name" in result["message"]
+    assert "the upload may still be finishing in Composio" in result["message"]
+    assert "not known whether it was uploaded" in result["message"]
     assert "was not uploaded" not in result["message"]
+    assert "not created" not in result["message"]
+
+
+def test_upload_file_does_not_take_a_same_name_folder_for_the_upload(
+    http, monkeypatch, _isolate_environment
+):
+    """A folder has no checksum either. It is never this upload's result."""
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+    http.proxy("name = ", 200, {"files": [_recent_folder()]})
+    _timeout_on_execute(monkeypatch)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert "'folder1'" in result["message"]
+    assert "It is not known whether this call created a file" in result["message"]
+    assert "success" not in result
+
+
+def test_upload_file_treats_a_408_as_unknown_and_looks_the_file_up(
+    http, monkeypatch, _isolate_environment
+):
+    local = _isolate_environment / "Report.pdf"
+    local.write_bytes(NEW_CONTENT)
+    http.proxy("name = ", 200, {"files": []})
+
+    def timed_out(*args: Any, **kwargs: Any) -> Any:
+        raise composio_tools.ComposioToolError(
+            "Composio timed out waiting for the tool", status=408
+        )
+
+    monkeypatch.setattr(composio_tools, "execute_tool", timed_out)
+
+    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+
+    # A 408 can arrive after the tool ran, so it is not a definite rejection.
+    assert result["status"] == "error"
+    assert "rejected the request" not in result["message"]
+    assert "not known whether it was uploaded" in result["message"]
+    lookup = [call for call in http.proxy_calls if "name = " in str(call)]
+    assert len(lookup) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "definite"),
+    [
+        (400, True),
+        (404, True),
+        (422, True),
+        (429, True),
+        (408, False),
+        (500, False),
+        (503, False),
+        (None, False),
+    ],
+)
+def test_a_composio_rejection_is_definite_only_for_a_4xx_other_than_408(
+    status: int | None, definite: bool
+):
+    error = composio_tools.ComposioToolError("Composio refused the call", status=status)
+
+    assert google_drive._composio_rejection_is_definite(error) is definite
 
 
 def test_upload_file_says_the_outcome_is_unknown_when_drive_cannot_be_checked(
@@ -1182,6 +1262,7 @@ def test_create_file_does_not_claim_success_without_the_new_file_id(http):
     assert result["status"] == "error"
     assert "did not confirm" in result["message"]
     assert "found no file named 'notes.txt'" in result["message"]
+    assert "not known whether it was created" in result["message"]
     assert result["status"] != "success"
 
 
@@ -1205,24 +1286,54 @@ def test_create_file_returns_a_google_doc_a_lost_answer_created(http, monkeypatc
     )
     calls = _timeout_on_execute(monkeypatch)
 
-    result = json.loads(google_drive.google_drive_create_file("Meeting notes", "hi"))
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "Meeting notes", "hi", mime_type=GOOGLE_DOC_MIME
+        )
+    )
 
     assert result["status"] == "success"
     assert result["file"]["id"] == "doc1"
     assert len(calls) == 1
 
 
-def test_create_file_says_it_was_not_created_when_the_lookup_finds_nothing(
+def test_create_file_does_not_take_a_same_name_folder_for_the_created_doc(
     http, monkeypatch
 ):
+    """The lookup's no-checksum branch must match the requested type, so a
+    folder a user made with that name during the call is not the result."""
+    http.proxy("name = ", 200, {"files": [_recent_folder(name="Meeting notes")]})
+    _timeout_on_execute(monkeypatch)
+
+    result = json.loads(
+        google_drive.google_drive_create_file(
+            "Meeting notes", "hi", mime_type=GOOGLE_DOC_MIME
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "file" not in result
+    assert "success" not in result
+    assert "'folder1'" in result["message"]
+    assert "It is not known whether this call created a file" in result["message"]
+
+
+def test_create_file_says_the_outcome_is_unknown_when_the_lookup_finds_nothing(
+    http, monkeypatch
+):
+    """A timed-out create may still be running in Composio, so a lookup that
+    finds nothing is "not yet", not "not created"."""
     http.proxy("name = ", 200, {"files": []})
     _timeout_on_execute(monkeypatch)
 
     result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello"))
 
     assert result["status"] == "error"
-    assert "not created under that name" in result["message"]
+    assert "found no file named 'notes.txt'" in result["message"]
+    assert "the create may still be finishing in Composio" in result["message"]
+    assert "not known whether it was created" in result["message"]
     assert "was not created in Google Drive" not in result["message"]
+    assert "not created under" not in result["message"]
 
 
 def test_create_file_does_not_report_success_when_drive_stored_other_bytes(http):
@@ -1381,6 +1492,53 @@ def test_update_content_reports_a_definite_failure_when_the_file_is_unchanged(
     assert "did not accept the new content" in result["message"]
     assert "Nothing was changed in Google Drive." in result["message"]
     assert "Google Drive refused the upload" in result["message"]
+
+
+def test_update_content_says_the_outcome_is_unknown_after_a_timed_out_upload(
+    http, monkeypatch, _isolate_environment
+):
+    """Our client-side timeout can arrive while Composio's tool is still
+    running, so an unchanged read-back is "not yet", not "nothing changed"."""
+    local = _replacement(_isolate_environment)
+    _update(http, _current(), _current())
+    calls = _timeout_on_execute(monkeypatch)
+
+    result = _call_update(local, expected_head_revision_id="rev-1")
+
+    assert result["status"] == "error"
+    assert "did not finish normally" in result["message"]
+    assert "not known whether 'Quarterly Deck.pptx' changed" in result["message"]
+    assert "Do not report it as updated or as unchanged" in result["message"]
+    assert "version history" in result["message"]
+    assert "Nothing was changed" not in result["message"]
+    assert result["previous"]["headRevisionId"] == "rev-1"
+    # One read-back settles the answer; the tool itself is not retried.
+    assert len(calls) == 1
+
+
+def test_update_content_keeps_a_composio_rejection_as_a_definite_failure(
+    http, monkeypatch, _isolate_environment
+):
+    """A 4xx other than 408 is Composio refusing the call before the tool
+    ran, so nothing changed."""
+    local = _replacement(_isolate_environment)
+    _update(http, _current(), _current())
+
+    def reject(*args: Any, **kwargs: Any) -> Any:
+        raise composio_tools.ComposioToolError(
+            "Composio could not run the Google Drive tool (HTTP 422)",
+            status=422,
+        )
+
+    monkeypatch.setattr(composio_tools, "execute_tool", reject)
+
+    result = _call_update(local, expected_head_revision_id="rev-1")
+
+    assert result["status"] == "error"
+    assert "did not accept the new content" in result["message"]
+    assert "Nothing was changed in Google Drive." in result["message"]
+    assert "not known" not in result["message"]
+    assert result["file"]["headRevisionId"] == "rev-1"
 
 
 def test_update_content_is_verified_by_drive_when_the_tool_reports_failure(

@@ -2457,6 +2457,7 @@ def _find_created_file(
     parent_id: str | None,
     md5: str,
     size: int,
+    target_mime_type: str | None,
     started_at: datetime,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], Exception | None]:
     """Look for the file a create tool may have made before its answer was
@@ -2465,8 +2466,12 @@ def _find_created_file(
     A Composio timeout can arrive after the tool created the file. The lookup
     narrows the unknown: a same-name file whose checksum and size match the
     bytes just uploaded is that file; with no checksum (a Google Workspace
-    conversion) a single file created during this call is the best evidence
-    available. Anything else stays a candidate for the caller to describe.
+    conversion) a single file created during this call *of the target type*
+    is the best evidence available. The type matters there: a folder has no
+    checksum either, and a folder a user happened to create with that name
+    during the call is not the upload. ``target_mime_type`` is ``None`` for
+    a caller that can never convert (an upload never does), which turns that
+    branch off. Anything else stays a candidate for the caller to describe.
     """
     query = f"name = '{_drive_query_literal(name)}' and trashed = false"
     if parent_id is None:
@@ -2514,10 +2519,14 @@ def _find_created_file(
         candidate
         for candidate in candidates
         if _created_during_call(candidate, started_at)
+        and target_mime_type is not None
+        and _normalize_mime_type(str(candidate.get("mimeType") or ""))
+        == target_mime_type
     ]
     if len(recent) == 1 and not isinstance(recent[0].get("md5Checksum"), str):
         # A Google Workspace file has no checksum; a single file created
-        # during this call is the only evidence this lookup can offer.
+        # during this call with the requested type is the only evidence this
+        # lookup can offer.
         return recent[0], candidates, None
     return None, candidates, None
 
@@ -2533,7 +2542,10 @@ def _unconfirmed_create_message(
 
     ``action`` is "uploaded" or "created". The wording never claims a
     definite failure while the file may exist, and never invites a blind
-    retry that would make a duplicate.
+    retry that would make a duplicate. In particular, a lookup that finds
+    nothing is not proof: the tool may still be running in Composio, and a
+    write can land after this read, so the result of this call stays
+    unknown.
     """
     if lookup_error is not None:
         return (
@@ -2554,12 +2566,13 @@ def _unconfirmed_create_message(
             "not retry blindly: check Google Drive first; a retry could create "
             "a duplicate."
         )
+    noun = "upload" if action == "uploaded" else "create"
     return (
         f"Composio did not confirm that the file was {action}. A check of "
-        f"Google Drive found no file named '{name}' in that folder, so it was "
-        "not created under that name. If it could have been created under "
-        "another name, check Google Drive before retrying; a retry could "
-        "create a duplicate."
+        f"Google Drive found no file named '{name}' in that folder yet; the "
+        f"{noun} may still be finishing in Composio, so it is not known "
+        f"whether it was {action}. Check Google Drive again before retrying; "
+        "a retry could create a duplicate."
     )
 
 
@@ -2618,6 +2631,7 @@ def _unconfirmed_create_result(
     parent_id: str | None,
     md5: str,
     size: int,
+    target_mime_type: str | None,
     started_at: datetime,
 ) -> str:
     """Look for a file a create may have made, then report what is known.
@@ -2632,6 +2646,7 @@ def _unconfirmed_create_result(
         parent_id=parent_id,
         md5=md5,
         size=size,
+        target_mime_type=target_mime_type,
         started_at=started_at,
     )
     if match is not None:
@@ -2758,6 +2773,7 @@ def _upload_file_via_composio(
                 parent_id=parent_id,
                 md5=local_md5,
                 size=size,
+                target_mime_type=None,
                 started_at=started_at,
             )
         except Exception as exc:
@@ -2769,6 +2785,7 @@ def _upload_file_via_composio(
                 parent_id=parent_id,
                 md5=local_md5,
                 size=size,
+                target_mime_type=None,
                 started_at=started_at,
             )
         if not result.successful:
@@ -2785,6 +2802,7 @@ def _upload_file_via_composio(
                 parent_id=parent_id,
                 md5=local_md5,
                 size=size,
+                target_mime_type=None,
                 started_at=started_at,
             )
         return _created_file_result(
@@ -2868,6 +2886,7 @@ def _create_file_via_composio(
             parent_id=parent_id,
             md5=md5,
             size=len(data),
+            target_mime_type=mime_type,
             started_at=started_at,
         )
     except Exception as exc:
@@ -2879,6 +2898,7 @@ def _create_file_via_composio(
             parent_id=parent_id,
             md5=md5,
             size=len(data),
+            target_mime_type=mime_type,
             started_at=started_at,
         )
     if not result.successful:
@@ -2893,6 +2913,7 @@ def _create_file_via_composio(
             parent_id=parent_id,
             md5=md5,
             size=len(data),
+            target_mime_type=mime_type,
             started_at=started_at,
         )
     return _created_file_result(
@@ -2994,14 +3015,21 @@ def _composio_update_failure(
     local_size: int,
     stored_mime_type: str,
     reason: str,
+    outcome_unclear: bool = False,
 ) -> str:
     """The result for an upload Composio reported as failed.
 
     A failed tool answer does not by itself say whether Drive stored the
     content: a timeout can arrive after it did. The file is read again
     through the proxy. Its checksum being the uploaded one means the upload
-    landed; the previous checksum and head revision means it did not;
-    anything else leaves the outcome unknown.
+    landed. An unchanged file means it did not, but what that proves depends
+    on ``outcome_unclear``: a definite refusal (Composio answering 4xx, or
+    the tool reporting that Drive refused the upload) did not store anything,
+    so nothing changed; a timeout, a 5xx or an unreachable Composio may
+    arrive before the write lands, so an unchanged file only means "not
+    yet" and the outcome is reported as unknown, as the native path does for
+    an unfinished upload. A file that changed without holding the new
+    content leaves the outcome unknown as well.
     """
     now, read_error = _read_content_update_file(service, file_id, resource_key)
     if now is None:
@@ -3034,6 +3062,16 @@ def _composio_update_failure(
             "the file has changed since it was read before this call, so it "
             "is not known whether this call changed it. Do not report it as "
             f"updated; ask the user to check the file's version history. {reason}",
+            previous=current_summary,
+        )
+    if outcome_unclear:
+        return _content_update_error(
+            "The upload to Google Drive did not finish normally, and the file "
+            "still has the same content and head revision it had before this "
+            f"call, so it is not known whether '{name}' changed: the upload "
+            "may still be finishing in Composio. Do not report it as updated "
+            "or as unchanged; ask the user to check the file's version "
+            f"history in Google Drive before trying again. {reason}",
             previous=current_summary,
         )
     return _content_update_error(
@@ -3117,6 +3155,14 @@ def _replace_content_via_composio(
         )
     except Exception as exc:
         logger.error(f"Error updating file content: {exc}")
+        # A 4xx other than 408 is Composio refusing the call before the tool
+        # ran, so an unchanged file is a definite "nothing changed". A
+        # timeout, a 5xx, an unreachable Composio or anything else may arrive
+        # after the write landed or before it does, so an unchanged file is
+        # only "not yet" and the outcome stays unknown.
+        definite = isinstance(exc, composio_tools.ComposioToolError) and (
+            _composio_rejection_is_definite(exc)
+        )
         return _composio_update_failure(
             service=service,
             file_id=file_id,
@@ -3128,6 +3174,7 @@ def _replace_content_via_composio(
             local_size=local_size,
             stored_mime_type=stored_mime_type,
             reason=f"Composio reported: {exc}",
+            outcome_unclear=not definite,
         )
     if not result.successful:
         reason = (

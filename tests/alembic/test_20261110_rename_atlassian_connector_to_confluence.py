@@ -81,6 +81,103 @@ def test_upgrade_leaves_unexpected_name_and_other_apps_alone(tmp_path):
         assert _name(connection, "other-app") == migration.PREVIOUS_NAME
 
 
+def test_downgrade_leaves_unexpected_name_and_other_apps_alone(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _insert(connection, migration.APP_ID, "Our Atlassian")
+        _insert(connection, "other-app", migration.CURRENT_NAME)
+
+        _run(connection, migration, "downgrade")
+        assert _name(connection) == "Our Atlassian"
+        assert _name(connection, "other-app") == migration.CURRENT_NAME
+
+
+def _create_servers_table(connection):
+    connection.execute(
+        text(
+            "CREATE TABLE mcp_servers "
+            "(id INTEGER PRIMARY KEY, name VARCHAR(100) NOT NULL UNIQUE)"
+        )
+    )
+
+
+def _server_names(connection):
+    return dict(connection.execute(text("SELECT id, name FROM mcp_servers")).fetchall())
+
+
+def test_upgrade_renames_custom_server_that_collides_with_new_name(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_servers_table(connection)
+        _insert(connection, migration.APP_ID, migration.PREVIOUS_NAME)
+        for server_id, name in [
+            (1, "Confluence"),
+            (2, "atlassian"),
+            (3, "my-confluence"),
+        ]:
+            connection.execute(
+                text("INSERT INTO mcp_servers (id, name) VALUES (:i, :n)"),
+                {"i": server_id, "n": name},
+            )
+
+        _run(connection, migration, "upgrade", "upgrade")
+
+        assert _server_names(connection) == {
+            1: "Confluence (custom)",
+            2: "atlassian",
+            3: "my-confluence",
+        }
+        assert _name(connection) == migration.CURRENT_NAME
+
+
+def test_collision_rename_uses_canonical_match_and_a_free_suffix(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_servers_table(connection)
+        # The listing canonicalizes names (case/whitespace), and the preferred
+        # replacement name is already taken.
+        for server_id, name in [
+            (1, " CONFLUENCE "),
+            (2, "Confluence (custom)"),
+        ]:
+            connection.execute(
+                text("INSERT INTO mcp_servers (id, name) VALUES (:i, :n)"),
+                {"i": server_id, "n": name},
+            )
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_names(connection) == {
+            1: "Confluence (custom) 2",
+            2: "Confluence (custom)",
+        }
+
+
+def test_collision_rename_runs_even_without_a_catalog_row(tmp_path):
+    """The runtime name comes from the registry, so the collision exists even
+    when the public_mcp_apps row was never seeded or was customized."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        _create_servers_table(connection)
+        _insert(connection, migration.APP_ID, "Our Atlassian")
+        connection.execute(
+            text("INSERT INTO mcp_servers (id, name) VALUES (1, 'Confluence')")
+        )
+
+        _run(connection, migration, "upgrade")
+
+        assert _server_names(connection) == {1: "Confluence (custom)"}
+        assert _name(connection) == "Our Atlassian"
+
+
 def test_upgrade_without_required_schema_is_a_noop(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

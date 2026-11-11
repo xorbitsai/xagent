@@ -22,7 +22,6 @@ from ..core.config import (
     DEFAULT_TIKTOKEN_ENCODING,
 )
 from ..core.exceptions import (
-    CollectionMigratingError,
     DatabaseOperationError,
     DocumentValidationError,
     EmbeddingAdapterError,
@@ -635,14 +634,6 @@ def process_document(
     )
 
 
-def _run_commit_gate(
-    collection: str, commit_gate: Optional[Callable[[], None]]
-) -> None:
-    ensure_collection_writable(collection)
-    if commit_gate is not None:
-        commit_gate()
-
-
 def _process_document_impl(
     collection: str,
     source_path: str,
@@ -842,7 +833,8 @@ def _process_document_impl(
         )
         register_start = time.time()
         with progress_tracker.track_step("register_document"):
-            _run_commit_gate(collection, commit_gate)
+            if commit_gate is not None:
+                commit_gate()
             register_result = register_document(
                 collection=collection,
                 source_path=source_path,
@@ -910,7 +902,8 @@ def _process_document_impl(
             },
         )
         parse_start = time.time()
-        _run_commit_gate(collection, commit_gate)
+        if commit_gate is not None:
+            commit_gate()
         deepdoc_env: Dict[str, Optional[str]] = {}
         if cfg.deepdoc_processing_mode:
             deepdoc_env["DEEPDOC_PROCESSING_MODE"] = cfg.deepdoc_processing_mode
@@ -1125,7 +1118,6 @@ def _process_document_impl(
                 extra={"collection": collection, "doc_id": doc_id},
             )
             current_step = "write_vectors_to_db"
-            ensure_collection_writable(collection)
             commit_vectors_to_db(
                 collection=collection,
                 doc_id=doc_id,
@@ -1231,7 +1223,8 @@ def _process_document_impl(
                         write_batch_start = time.time()
                         current_step = "write_vectors_to_db"
                         try:
-                            _run_commit_gate(collection, commit_gate)
+                            if commit_gate is not None:
+                                commit_gate()
                             write_response = write_vectors_to_db(
                                 collection=collection,
                                 embeddings=embeddings_batch_async,
@@ -1395,7 +1388,8 @@ def _process_document_impl(
                         write_batch_start = time.time()
                         current_step = "write_vectors_to_db"
                         try:
-                            _run_commit_gate(collection, commit_gate)
+                            if commit_gate is not None:
+                                commit_gate()
                             write_response = write_vectors_to_db(
                                 collection=collection,
                                 embeddings=embeddings_batch,
@@ -1476,7 +1470,6 @@ def _process_document_impl(
         vector_count = total_vector_count
         write_elapsed_ms = int(write_elapsed_total * 1000)
         current_step = "write_vectors_to_db"
-        ensure_collection_writable(collection)
         commit_vectors_to_db(
             collection=collection,
             doc_id=doc_id,
@@ -1571,8 +1564,6 @@ def _process_document_impl(
             warnings=warnings,
         )
 
-    except CollectionMigratingError:
-        raise
     except (RagCoreException, Exception) as exc:
         progress_manager.complete_task(task_id, success=False)
         return _handle_ingestion_error(

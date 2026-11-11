@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
-from xagent.core.tools.core.RAG_tools.core.schemas import CrawlResult, WebCrawlConfig
+from xagent.core.tools.core.RAG_tools.core.schemas import WebCrawlConfig
 from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
 from xagent.core.tools.core.RAG_tools.management import (
     collections as collections_module,
@@ -19,7 +19,9 @@ from xagent.core.tools.core.RAG_tools.management.migration_state import (
     IDLE,
     MIGRATION_TABLE,
     CollectionMigrationState,
+    clear_migration_state,
     ensure_collection_writable,
+    move_migration_state,
     read_migration_state,
     write_migration_state,
 )
@@ -151,60 +153,6 @@ def test_background_job_execution_refuses_frozen_collection() -> None:
         run_document_ingestion(collection="kb", source_path="/tmp/doc.pdf")
 
 
-def test_commit_gate_rechecks_freeze_mid_ingest(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gate_calls: list[int] = []
-
-    def _gate() -> None:
-        gate_calls.append(1)
-        if len(gate_calls) == 1:
-            _freeze()
-
-    monkeypatch.setattr(
-        document_ingestion, "validate_document_processing_sync", lambda **_: None
-    )
-    monkeypatch.setattr(
-        document_ingestion,
-        "resolve_effective_embedding_model_sync",
-        lambda *_: "embedding-default",
-    )
-    config = SimpleNamespace(
-        id="embedding-default", model_name="stub", model_provider="stub", dimension=2
-    )
-    monkeypatch.setattr(
-        document_ingestion,
-        "_resolve_embedding_adapter",
-        lambda _cfg: (config, object()),
-    )
-    monkeypatch.setattr(
-        document_ingestion, "initialize_collection_embedding_sync", lambda **_: None
-    )
-    monkeypatch.setattr(
-        document_ingestion,
-        "register_document",
-        lambda **_: {"doc_id": "doc-1", "created": True},
-    )
-    monkeypatch.setattr(
-        document_ingestion, "update_collection_stats_sync", lambda **_: None
-    )
-    monkeypatch.setattr(
-        document_ingestion, "_record_ingestion_status", lambda *a, **k: None
-    )
-
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise AssertionError("write after the freeze was reached")
-
-    monkeypatch.setattr(document_ingestion, "parse_document", _boom)
-
-    with pytest.raises(CollectionMigratingError):
-        document_ingestion._process_document_impl(
-            "kb", "/tmp/doc.pdf", commit_gate=_gate
-        )
-
-    assert len(gate_calls) == 1
-
-
 @pytest.mark.asyncio
 async def test_frozen_collection_blocks_web_ingestion_before_crawl(
     monkeypatch: pytest.MonkeyPatch,
@@ -220,44 +168,6 @@ async def test_frozen_collection_blocks_web_ingestion_before_crawl(
         await web_ingestion._run_web_ingestion_impl(
             "kb", WebCrawlConfig(start_url="https://example.com")
         )
-
-
-@pytest.mark.asyncio
-async def test_web_ingestion_stops_before_page_write_after_mid_crawl_freeze(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _FreezingCrawler:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self.failed_urls: dict[str, str] = {}
-
-        async def crawl(self) -> list[CrawlResult]:
-            _freeze()
-            return [
-                CrawlResult(
-                    url="https://example.com/page",
-                    title="Page",
-                    content_markdown="content",
-                    status="success",
-                    depth=0,
-                    content_length=7,
-                )
-            ]
-
-    monkeypatch.setattr(web_ingestion, "WebCrawler", _FreezingCrawler)
-    file_handler_calls: list[int] = []
-
-    def _file_handler(*args: object, **kwargs: object) -> dict:
-        file_handler_calls.append(1)
-        return {}
-
-    with pytest.raises(CollectionMigratingError):
-        await web_ingestion._run_web_ingestion_impl(
-            "kb",
-            WebCrawlConfig(start_url="https://example.com"),
-            file_handler=_file_handler,
-        )
-
-    assert file_handler_calls == []
 
 
 def test_frozen_collection_blocks_document_delete_before_storage(
@@ -331,3 +241,133 @@ def test_unfrozen_collection_proceeds_past_guards(
             collection="kb", doc_id="doc-1", user_id=1, coordinator=None
         )
     assert reached_store["called"]
+
+
+def _migration_names() -> list[str]:
+    conn = get_metadata_store().get_raw_connection()
+    if MIGRATION_TABLE not in state_module.list_table_names(conn):
+        return []
+    table = conn.open_table(MIGRATION_TABLE)
+    try:
+        return [row["name"] for row in table.search().to_arrow().to_pylist()]
+    finally:
+        from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+            _safe_close_table,
+        )
+
+        _safe_close_table(table)
+
+
+def test_write_migration_state_retries_commit_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_conn = get_metadata_store().get_raw_connection()
+    state_module._ensure_table(real_conn)
+    open_calls = {"n": 0}
+
+    class _FlakyConn:
+        def __getattr__(self, name: str) -> object:
+            if name == "open_table":
+
+                def _open(table_name: str) -> object:
+                    open_calls["n"] += 1
+                    if open_calls["n"] == 1:
+                        raise RuntimeError("commit conflict")
+                    return real_conn.open_table(table_name)
+
+                return _open
+            return getattr(real_conn, name)
+
+    monkeypatch.setattr(
+        state_module,
+        "get_metadata_store",
+        lambda: SimpleNamespace(get_raw_connection=lambda: _FlakyConn()),
+    )
+
+    stamped = write_migration_state("kb", CollectionMigrationState(state=FROZEN))
+
+    assert stamped.updated_at is not None
+    assert open_calls["n"] >= 2
+    assert read_migration_state("kb").state == FROZEN
+
+
+def test_clear_migration_state_removes_row() -> None:
+    _freeze("kb")
+    assert "kb" in _migration_names()
+
+    clear_migration_state("kb")
+
+    assert "kb" not in _migration_names()
+    assert read_migration_state("kb").state == IDLE
+
+
+def test_move_migration_state_rekeys_row() -> None:
+    _freeze("old-kb")
+
+    move_migration_state("old-kb", "new-kb")
+
+    assert "old-kb" not in _migration_names()
+    assert "new-kb" in _migration_names()
+    assert read_migration_state("new-kb").state == FROZEN
+
+
+def test_move_migration_state_noop_when_row_absent() -> None:
+    move_migration_state("absent-kb", "other-kb")
+
+    assert "other-kb" not in _migration_names()
+
+
+class _FakeCollectionHandle:
+    def list_collection_documents(self, **kwargs: object) -> list[str]:
+        return []
+
+    def delete_collection_data(self, **kwargs: object) -> dict[str, int]:
+        return {"documents": 0}
+
+    def count_documents(self, **kwargs: object) -> int:
+        return 0
+
+    async def delete_collection_config(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def rename_collection_data(self, *args: object, **kwargs: object) -> list[str]:
+        return []
+
+    def rename_collection_status(self, *args: object, **kwargs: object) -> list[str]:
+        return []
+
+    async def rename_collection_metadata(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_clears_migration_row() -> None:
+    write_migration_state("kb", CollectionMigrationState(state=IDLE))
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(return_value=_FakeCollectionHandle()),
+    ):
+        await coordinator.delete_collection("kb", user_id=None, is_admin=True)
+
+    assert "kb" not in _migration_names()
+
+
+@pytest.mark.asyncio
+async def test_rename_collection_moves_migration_row() -> None:
+    write_migration_state("old-kb", CollectionMigrationState(state=IDLE))
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(return_value=_FakeCollectionHandle()),
+    ):
+        await coordinator.rename_collection(
+            "old-kb", "new-kb", user_id=None, is_admin=True
+        )
+
+    assert "old-kb" not in _migration_names()
+    assert "new-kb" in _migration_names()

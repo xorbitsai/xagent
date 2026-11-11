@@ -30,7 +30,11 @@ from ..core.schemas import (
     RegisterDocumentResponse,
     SparseSearchResponse,
 )
-from ..management.migration_state import ensure_collection_writable_async
+from ..management.migration_state import (
+    clear_migration_state,
+    ensure_collection_writable_async,
+    move_migration_state,
+)
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
@@ -1182,6 +1186,11 @@ class KBCoordinator:
         # such warnings accompany an actual deletion, report ``partial_success`` so
         # the caller is not told the operation fully succeeded — mirroring the
         # legacy ``_delete_collection_impl`` status semantics.
+        try:
+            await run_blocking(clear_migration_state, collection)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(f"clear_migration_state for {collection!r} failed: {exc}")
+
         something_deleted = bool(deleted_counts) or bool(affected_doc_ids)
         status = "partial_success" if warnings and something_deleted else "success"
         message = (
@@ -1271,6 +1280,13 @@ class KBCoordinator:
         except Exception as exc:  # noqa: BLE001 - best-effort
             warnings.append(
                 f"rename_collection_metadata for {old_name!r} → {new_name!r} failed: {exc}"
+            )
+
+        try:
+            await run_blocking(move_migration_state, old_name, new_name)
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            warnings.append(
+                f"move_migration_state for {old_name!r} → {new_name!r} failed: {exc}"
             )
 
         return warnings

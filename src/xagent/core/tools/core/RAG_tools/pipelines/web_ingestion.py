@@ -447,7 +447,6 @@ async def _run_web_ingestion_impl(
     )
 
     # Step 2: Ingest each crawled page
-    await ensure_collection_writable_async(collection)
     logger.info("Step 2: Ingesting crawled pages")
 
     # Create temporary directory for markdown files

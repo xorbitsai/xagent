@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -18,6 +20,9 @@ from ..utils.string_utils import escape_lancedb_string
 MIGRATION_TABLE = "collection_migration_state"
 IDLE = "idle"
 FROZEN = "frozen"
+WRITE_MAX_RETRIES = 3
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = pa.schema(
     [
@@ -66,20 +71,24 @@ def _ensure_table(conn: Any) -> None:
             raise
 
 
-def read_migration_state(collection_name: str) -> CollectionMigrationState:
-    """Read the collection's state; missing table or row means idle."""
+def _read_row(collection_name: str) -> Optional[Dict[str, Any]]:
     conn = get_metadata_store().get_raw_connection()
     if MIGRATION_TABLE not in list_table_names(conn):
-        return CollectionMigrationState()
+        return None
     table = conn.open_table(MIGRATION_TABLE)
     try:
         where = f"name = '{escape_lancedb_string(collection_name)}'"
         rows = table.search().where(where).to_arrow().to_pylist()
     finally:
         _safe_close_table(table)
-    if not rows:
+    return rows[0] if rows else None
+
+
+def read_migration_state(collection_name: str) -> CollectionMigrationState:
+    """Read the collection's state; missing table or row means idle."""
+    row = _read_row(collection_name)
+    if row is None:
         return CollectionMigrationState()
-    row = rows[0]
     return CollectionMigrationState(
         state=_row_state(row),
         source_model_id=row.get("source_model_id"),
@@ -100,16 +109,60 @@ def write_migration_state(
         updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     conn = get_metadata_store().get_raw_connection()
-    _ensure_table(conn)
     row = {"name": collection_name, **stamped.to_row()}
+    for attempt in range(WRITE_MAX_RETRIES):
+        try:
+            _ensure_table(conn)
+            table = conn.open_table(MIGRATION_TABLE)
+            try:
+                table.merge_insert(
+                    ["name"]
+                ).when_matched_update_all().when_not_matched_insert_all().execute([row])
+            finally:
+                _safe_close_table(table)
+            return stamped
+        except Exception as exc:
+            if attempt == WRITE_MAX_RETRIES - 1:
+                logger.error(
+                    "Failed to write migration state for %s after %s attempts: %s",
+                    collection_name,
+                    WRITE_MAX_RETRIES,
+                    exc,
+                )
+                raise
+            # Concurrent index builds can raise CommitConflict; back off and retry.
+            time.sleep(0.1 * (2**attempt))
+    raise AssertionError("unreachable")
+
+
+def clear_migration_state(collection_name: str) -> None:
+    """Remove the collection's row; a missing table or row is a no-op."""
+    conn = get_metadata_store().get_raw_connection()
+    if MIGRATION_TABLE not in list_table_names(conn):
+        return
     table = conn.open_table(MIGRATION_TABLE)
     try:
-        table.merge_insert(
-            ["name"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute([row])
+        table.delete(f"name = '{escape_lancedb_string(collection_name)}'")
     finally:
         _safe_close_table(table)
-    return stamped
+
+
+def move_migration_state(old_name: str, new_name: str) -> None:
+    """Re-key an existing row from ``old_name`` to ``new_name``."""
+    if old_name == new_name:
+        return
+    row = _read_row(old_name)
+    if row is None:
+        return
+    write_migration_state(
+        new_name,
+        CollectionMigrationState(
+            state=_row_state(row),
+            source_model_id=row.get("source_model_id"),
+            target_model_id=row.get("target_model_id"),
+        ),
+    )
+    clear_migration_state(old_name)
 
 
 def _raise_if_frozen(collection_name: str, state: CollectionMigrationState) -> None:

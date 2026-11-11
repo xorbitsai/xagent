@@ -22,9 +22,8 @@ from .models.sandbox import SandboxSnapshot as SandboxSnapshotModel
 
 logger = logging.getLogger(__name__)
 
-# Sandbox type constant
-SANDBOX_TYPE_BOXLITE = "boxlite"
 SANDBOX_TYPE_DOCKER = "docker"
+SANDBOX_TYPE_OPENSHELL = "openshell"
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -210,16 +209,14 @@ class _DBSandboxStoreBase:
         model.config = json.dumps(info.config.model_dump())  # type: ignore[assignment]
 
 
-try:
-    from ..sandbox import BoxliteStore
-except ImportError:  # boxlite is not installed on linux/arm64
-    pass
-else:
+class DBOpenShellStore(_DBSandboxStoreBase):
+    """Database-backed store for the OpenShell backend.
 
-    class DBBoxliteStore(_DBSandboxStoreBase, BoxliteStore):
-        """Database-backed implementation of BoxliteStore."""
+    Duck-typed against ``OpenShellStore`` so this module does not import the
+    openshell SDK when that backend is not in use.
+    """
 
-        sandbox_type = SANDBOX_TYPE_BOXLITE
+    sandbox_type = SANDBOX_TYPE_OPENSHELL
 
 
 class DBDockerStore(_DBSandboxStoreBase, DockerStore):

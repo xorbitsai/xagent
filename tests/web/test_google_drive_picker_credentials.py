@@ -39,7 +39,7 @@ from xagent.web.api.cloud_storage import (
 from xagent.web.models.database import Base
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.user import User
-from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
 from xagent.web.services import google_picker
 
 OWNER = "delegated:7:member-3"
@@ -59,6 +59,10 @@ RECONNECT_DETAIL = "Google Drive session expired. Please reconnect."
 SCOPE_DETAIL = (
     "This Google Drive connection uses an outdated permission. "
     "Reconnect it before opening Google Drive Picker."
+)
+COMPOSIO_DETAIL = (
+    "This Google Drive connection goes through Composio and has no Google "
+    "access token to issue."
 )
 PICKER_NOT_CONFIGURED_DETAIL = (
     "Google Drive Picker is not configured. Set the dedicated, "
@@ -107,6 +111,7 @@ class _Store:
         scope: str | None = f"{USERINFO} {DRIVE_FILE}",
         refresh_token: str | None = "refresh-token",
         expires_at: datetime | None = None,
+        token_type: str | None = None,
     ) -> int:
         row = UserOAuth(
             user_id=self.user_id,
@@ -117,6 +122,7 @@ class _Store:
             refresh_token=refresh_token,
             scope=scope,
             expires_at=expires_at if expires_at is not None else _future(60),
+            token_type=token_type,
         )
         self.db.add(row)
         self.db.commit()
@@ -212,6 +218,7 @@ def test_credential_reasons_are_stable() -> None:
         "scope_full_drive",
         "scope_mismatch",
         "scope_drive_missing",
+        "composio_backed",
     }
 
 
@@ -367,6 +374,44 @@ def test_owner_token_cleared_row_requires_reauth(store) -> None:
     )
     assert exc_info.value.reason == "reauth_required"
     assert exc_info.value.oauth_account_id == row_id
+
+
+@pytest.mark.parametrize(
+    "read_token", [_credentials_token, _issued_token], ids=["credentials", "issue"]
+)
+@pytest.mark.parametrize("expires_at", [None, "due"], ids=["no-expiry", "due"])
+def test_a_composio_backed_row_is_refused_without_its_account_id(
+    store, picker_key, read_token, expires_at
+) -> None:
+    """A Composio Drive grant stores its connected account id where a native
+    row stores the Google access token; it is no Google token to hand out."""
+    row_id = store.add_drive(
+        owner=OWNER,
+        token="ca_composio_account",
+        refresh_token=None,
+        scope=None,
+        token_type=COMPOSIO_TOKEN_TYPE,
+        expires_at=_future(1) if expires_at == "due" else None,
+    )
+    if expires_at is None:
+        store.db.execute(
+            text("UPDATE user_oauth SET expires_at = NULL WHERE id = :id"),
+            {"id": row_id},
+        )
+        store.db.commit()
+    patcher, calls = _refreshing()
+
+    with patcher, pytest.raises(GoogleDriveCredentialError) as exc_info:
+        read_token(store)
+
+    assert (exc_info.value.status_code, exc_info.value.detail) == (
+        409,
+        COMPOSIO_DETAIL,
+    )
+    assert exc_info.value.reason == "composio_backed"
+    assert exc_info.value.oauth_account_id == row_id
+    assert "ca_composio_account" not in str(exc_info.value.detail)
+    assert calls == []
 
 
 @pytest.mark.parametrize("owner", [None, OWNER])

@@ -525,7 +525,7 @@ import { ResendWaiters, mayResend, sendWithResend, type ResendOwnership } from "
 import { deriveConnectionNotice, type ConnectionNotice } from "./connection-notice"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
-import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
+import { clientErrorTranslationKey, isInputReviewErrorCode, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import type { SessionUploadedFile } from "@/lib/widget-session-upload"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
@@ -1448,6 +1448,7 @@ export const projectErrorFrameForDisplay = (
   // all arrive on it while the viewed task is still RUNNING or
   // WAITING_FOR_USER, and a rejection is not this turn's answer.
   const isTerminal = message.type === "task_error"
+  const isInputReviewNotice = !isTerminal && isInputReviewErrorCode(websocketErrorCode)
   const projection = isTerminal ? getTaskErrorProjection(message) : null
   // The frame's own code decides the wording, and one code has one sentence
   // for every audience. This is the same table the root error channel already
@@ -1464,7 +1465,7 @@ export const projectErrorFrameForDisplay = (
   const projectedCode = projection ? readClientErrorCode(projection.code) : null
   const codedBubble = projectedCode
     ? translate(clientErrorTranslationKey(projectedCode))
-    : null
+    : isInputReviewNotice ? dedupText : null
   // The dedup identity has to name WHICH occurrence this frame reports, not
   // which class of failure it belongs to. broadcast_to_task stamps every frame
   // of this type with the row's (run_id, state_version) pair before it goes
@@ -1484,8 +1485,11 @@ export const projectErrorFrameForDisplay = (
   // same text and the second still collapses -- the behaviour that predates
   // this change. Withholding the identity is the honest answer there;
   // attaching a state tuple needs the row, and a settled FAILED task has one.
+  const turnId = (message.data as { turn_id?: unknown } | undefined)?.turn_id
   const occurrenceIdentity =
-    isTerminal && controlEnvelope.stateVersion !== undefined
+    isInputReviewNotice && typeof turnId === "string" && turnId
+      ? `input-review:${turnId}`
+      : isTerminal && controlEnvelope.stateVersion !== undefined
       ? `${controlEnvelope.runId ?? ""}:${controlEnvelope.stateVersion}`
       : undefined
   // A stop intent ends with this task's TERMINAL frame only. isTerminal is
@@ -4545,19 +4549,23 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!canonicalMessageId && !streamMessageId && isDuplicateMessageForViewedTask(
+            const agentMessageId = isAgentMessage
+              ? stableAssistantMessageId(
+                message.event_id || traceEventData.event_id || eventData.event_id,
+              )
+              : null
+            // Identical refusals can belong to different turns. The persisted
+            // message ID also pairs the live refusal with its history replay.
+            const identifiedRefusal = eventData.message_type === "input_review_rejected"
+              && agentMessageId !== null
+            if (!canonicalMessageId && !streamMessageId && !identifiedRefusal && isDuplicateMessageForViewedTask(
               messageContent,
               'agent-message',
               isAgentMessage ? interactionRequestId : undefined,
             )) {
               return
             }
-            const msgId = canonicalMessageId ??
-              (isAgentMessage
-                ? stableAssistantMessageId(
-                  message.event_id || traceEventData.event_id || eventData.event_id,
-                )
-                : null) ?? generateMessageId("msg-agent")
+            const msgId = canonicalMessageId ?? agentMessageId ?? generateMessageId("msg-agent")
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -4578,7 +4586,9 @@ export function AppProvider({
                 interactionRequestId,
               }
             })
-            if (eventData.status === "completed") {
+            // The refusal bubble is settled. The task's terminal frame owns
+            // the overall status and blocked outcome.
+            if (eventData.status === "completed" && !identifiedRefusal) {
               dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
               dispatch({ type: "SET_PROCESSING", payload: false })
             }
@@ -7208,6 +7218,7 @@ export function AppProvider({
         }
 
         const { endsStopIntent, isVisitorStoppedTurn } = errorFrame
+        const errorCode = getWebSocketErrorCode(message)
         // The stopped mark is recorded before, and independent of, the bubble
         // check below: a frame that names a message_id adds no bubble, yet its
         // turn is still the stopped one. The turn is identified by the user
@@ -7260,8 +7271,8 @@ export function AppProvider({
                   timestamp: message.timestamp,
                   status: "failed",
                   isResult: errorFrame.isResult,
-                  // Delivery uncertainty is informational, not the task's result.
-                  isSystemNotice: getWebSocketErrorCode(message) === "message_outcome_unknown",
+                  isSystemNotice: errorCode === "message_outcome_unknown"
+                    || (!errorFrame.isTerminal && isInputReviewErrorCode(errorCode)),
                 },
           })
         }

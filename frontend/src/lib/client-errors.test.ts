@@ -33,6 +33,8 @@ describe("client error wire contract", () => {
     ["message_rate_limited", "clientErrors.messageRateLimited", "You're sending messages too quickly. Please wait a moment and try again."],
     ["message_id_conflict", "clientErrors.messageIdConflict", "Message id was already used for different content or files."],
     ["message_delivery_failed", "clientErrors.messageDeliveryFailed", "The message could not be delivered. Please retry the draft."],
+    ["input_review_blocked", "clientErrors.inputReviewBlocked", "This request didn't pass input review. Please rephrase it or ask about a topic this agent supports."],
+    ["input_review_unavailable", "clientErrors.inputReviewUnavailable", "I couldn't complete the input safety check. Please try again."],
     ["message_continuation_unsupported", "clientErrors.messageContinuationUnsupported", "Task does not support message continuation."],
     ["task_pause_in_progress", "clientErrors.taskPauseInProgress", "Task pause is still being applied; please retry shortly."],
     ["message_acceptance_pending", "clientErrors.messageAcceptancePending", "Message acceptance is still being reconciled. Please retry shortly."],

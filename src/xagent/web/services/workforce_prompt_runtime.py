@@ -16,6 +16,12 @@ from ...core.agent.language import (
 from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
 from ...core.agent.voice_policy import apply_output_voice
+from ...core.guardrails.input import (
+    BLOCKED_INPUT,
+    INPUT_REVIEW_UNAVAILABLE_CODE,
+    UNAVAILABLE_INPUT,
+    InputReviewRejected,
+)
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.tools.adapters.vibe.agent_tool import (
     ListAvailableSkillsTool,
@@ -615,6 +621,7 @@ async def build_workforce_prompt_plan(
     service = AgentService(
         budget_policy_provider=budget_policy_provider,
         name="Workforce Prompt Builder",
+        execution_metadata={"agent_type": "workforce_builder"},
         id=execution_id,
         task_id=execution_id,
         pattern="react",
@@ -642,6 +649,12 @@ async def build_workforce_prompt_plan(
         raise WorkforcePromptBuilderUnavailableError(
             "The ReAct Workforce builder runtime is unavailable."
         ) from exc
+    if result.get("input_review_rejected") is True:
+        unavailable = result.get("error_code") == INPUT_REVIEW_UNAVAILABLE_CODE
+        fallback = UNAVAILABLE_INPUT if unavailable else BLOCKED_INPUT
+        raise InputReviewRejected(
+            str(result.get("output") or fallback), unavailable=unavailable
+        )
     if result.get("termination_reason") == "token_budget":
         raise WorkforcePromptBuilderError(
             "The Workforce builder reached its execution token budget. "

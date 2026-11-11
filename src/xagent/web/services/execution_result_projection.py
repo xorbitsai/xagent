@@ -8,7 +8,10 @@ from typing import Any, Mapping
 from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from ...core.agent.result import normalize_tool_failure_code
 from ..models.task import TaskStatus
-from .assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
+from .assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+)
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
     ClientErrorCode,
@@ -221,14 +224,17 @@ def project_execution_result_for_channel(
         transcript_content = base_text
 
     visible_text = _append_interactions(base_text, interactions)
+    message_type = ASSISTANT_RESPONSE_MESSAGE_TYPE
+    if result.get("input_review_rejected") is True:
+        message_type = INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+    elif status == "waiting_for_user" or interactions:
+        message_type = "question"
 
     return ChannelExecutionProjection(
         task_status=task_status,
         visible_text=visible_text,
         transcript_content=transcript_content,
-        message_type="question"
-        if status == "waiting_for_user" or interactions
-        else ASSISTANT_RESPONSE_MESSAGE_TYPE,
+        message_type=message_type,
         interactions=interactions,
         diagnostic_error=diagnostic_error,
         completion_outcome=completion_outcome_for_status(result, task_status),

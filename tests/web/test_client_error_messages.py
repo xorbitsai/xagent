@@ -70,6 +70,13 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
         "message_delivery_failed": (
             "The message could not be delivered. Please retry the draft."
         ),
+        "input_review_blocked": (
+            "This request didn't pass input review. "
+            "Please rephrase it or ask about a topic this agent supports."
+        ),
+        "input_review_unavailable": (
+            "I couldn't complete the input safety check. Please try again."
+        ),
         "message_continuation_unsupported": (
             "Task does not support message continuation."
         ),

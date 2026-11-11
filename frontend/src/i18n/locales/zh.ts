@@ -53,6 +53,8 @@ const zh = {
     messageRateLimited: "消息发送过于频繁，请稍候重试。",
     messageIdConflict: "此消息 ID 已用于其他内容或文件，请使用新的消息 ID 重试。",
     messageDeliveryFailed: "消息未能送达，请重试该草稿。",
+    inputReviewBlocked: "这条请求未通过输入审核。请换个问法，或询问这个 Agent 支持的内容。",
+    inputReviewUnavailable: "暂时无法完成输入安全检查，请重试。",
     messageContinuationUnsupported: "当前任务不支持继续发送消息。",
     taskPauseInProgress: "任务暂停仍在处理中，请稍后重试。",
     messageAcceptancePending: "消息接收状态仍在确认中，请稍后重试。",
@@ -1393,6 +1395,9 @@ const zh = {
         willBeCleared: "上传设置将被清空。",
         invalidBadge: "上传设置无效",
         invalidBadgeDescription: "上传设置无效，该连接器当前不可用。",
+      },
+      memberOAuth: {
+        destination: "登录后，你的账号令牌会发往 {host}",
       },
       // Account identifier step before a builtin OAuth popup, for providers
       // hosted on the customer's own account (oauth-account-dialog.tsx).

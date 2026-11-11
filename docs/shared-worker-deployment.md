@@ -274,7 +274,7 @@ new processes and restore a consistent pre-upgrade backup instead.
 
 ## Sandbox ownership
 
-Every concurrent execution process using Docker or BoxLite must have its own
+Every concurrent execution process using Docker must have its own
 stable `XAGENT_SANDBOX_WORKER_ID`, such as `worker-1` and `worker-2`. Reuse an ID
 when restarting its process, and stop the old process before reusing that ID.
 Do not copy one ID across replicas or derive it from a new random process ID.
@@ -284,9 +284,9 @@ letters are rejected, so validate generated host/pod identities before using the
 
 Docker also requires a stable deployment `XAGENT_SANDBOX_NAMESPACE`. Container
 names, ownership labels, and SQL metadata use a scope derived from both values.
-BoxLite uses a separate home directory and SQL metadata scope per worker ID.
-The Compose sandbox overlays supply role-specific identities for their fixed
-single instances. Additional execution replicas must supply distinct identities.
+The Compose Docker sandbox overlay supplies role-specific identities for its
+fixed single instances. Additional execution replicas must supply distinct
+identities.
 
 A replacement worker creates its own sandbox resources; it does not adopt or
 clean up another worker's resources. Workspace files remain shared. Existing
@@ -377,6 +377,13 @@ or not: a reply the worker's handoff rejected before injection (`state_changed`,
 replays as `409 task_busy` with `retry_with_new_id`, where it previously
 replayed as `504 reply_outcome_unknown`. Only failures without a recorded
 rejection reason remain unknown outcomes.
+
+Input review refusals also settle before injection. The durable
+`input_blocked` outcome maps to SDK `422 invalid_input` and A2A `400`.
+The `input_review_unavailable` outcome maps to SDK `503 temporarily_unavailable`
+with `retry_with_new_id`, and to A2A `503`, where the same message ID can be
+retried. Input review uses at most 20 seconds or 80% of the configured reply
+wait, whichever is shorter.
 
 Waiting consumes no attempt or defer budget. Replies that are not governed by an
 admission policy, and governed replies whose worker is merely slow, keep the

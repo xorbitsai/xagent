@@ -1,12 +1,16 @@
 """Connect apps through Composio-hosted auth (#3532, #3533, #3645).
 
 While our own app approvals are pending, a connector can use Composio's app
-instead: Facebook and Instagram (``meta`` provider) today. Each app in
+instead: Facebook and Instagram (``meta`` provider), Gmail and Google Drive
+(``google`` provider), and Salesforce. Each app in
 ``COMPOSIO_APPS`` names its own provider and has its own switch (for example
 ``XAGENT_FACEBOOK_AUTH_BACKEND``; set to ``composio``) and selects this flow
 for its new connects only; Meta Ads and WhatsApp share the ``meta`` provider
-and stay native. Each app reads its identity its own way; Composio's Instagram
-toolkit uses Instagram Login, so its identity comes from ``graph.instagram.com``.
+and stay native, as do the other Google apps. Each app reads its identity its
+own way; Composio's Instagram toolkit uses Instagram Login, so its identity
+comes from ``graph.instagram.com``, Gmail and Drive read Google's OIDC
+``sub``, and Salesforce reads the userinfo on the org's own host, taken from
+the connected account.
 
 The browser makes three trips, all to one shared callback URL whatever the
 app's provider (``shared_callback_url``: ``XAGENT_COMPOSIO_CALLBACK_URL``, or
@@ -32,8 +36,9 @@ for, and only accepted under, its app's own provider:
    Composio user id, derived from *our* session. The account it activates
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
    of its app's auth config and toolkit. The app's own identity read through
-   the proxy (``identity_url`` with ``identity_params``) gives the provider
-   user id, which must match ``identity_id_pattern``, and the grant is stored
+   the proxy (``identity_url``, fixed or built from that account, with
+   ``identity_params``) gives the provider user id, which must match
+   ``identity_id_pattern``, and the grant is stored
    for the app's runtime to execute. A refused completion spends nothing.
 
 A begin needs a state carrying the Composio marker, a verification carries a
@@ -101,10 +106,6 @@ FACEBOOK_AUTH_BACKEND_ENV = "XAGENT_FACEBOOK_AUTH_BACKEND"
 COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
 COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV = "COMPOSIO_FACEBOOK_AUTH_CONFIG_ID"
 COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
-# xagent-saas's switch for per-connection region routing of OAuth callbacks.
-# The verification trip carries no ``state``, so it cannot be routed that way
-# (tracked in xorbitsai/xagent-saas#2461); the start refuses while it is on.
-CONNECTOR_OAUTH_ROUTE_ENV = "XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED"
 
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 GRAPH_ME_URL = "https://graph.facebook.com/v25.0/me"
@@ -116,6 +117,23 @@ INSTAGRAM_GRAPH_ME_URL = "https://graph.instagram.com/v25.0/me"
 INSTAGRAM_APP_ID = "instagram"
 INSTAGRAM_TOOLKIT_SLUG = "instagram"
 META_PROVIDER = "meta"
+GOOGLE_PROVIDER = "google"
+GMAIL_APP_ID = "gmail"
+GMAIL_AUTH_BACKEND_ENV = "XAGENT_GMAIL_AUTH_BACKEND"
+COMPOSIO_GMAIL_AUTH_CONFIG_ID_ENV = "COMPOSIO_GMAIL_AUTH_CONFIG_ID"
+GOOGLE_DRIVE_APP_ID = "google-drive"
+GOOGLE_DRIVE_AUTH_BACKEND_ENV = "XAGENT_GOOGLE_DRIVE_AUTH_BACKEND"
+COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID_ENV = "COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID"
+# Google's OIDC userinfo endpoint (its discovery document's
+# ``userinfo_endpoint``); ``sub`` never changes and is never reused.
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+SALESFORCE_APP_ID = "salesforce"
+SALESFORCE_AUTH_BACKEND_ENV = "XAGENT_SALESFORCE_AUTH_BACKEND"
+COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV = "COMPOSIO_SALESFORCE_AUTH_CONFIG_ID"
+SALESFORCE_TOOLKIT_SLUG = "salesforce"
+# On the org's own host: login.salesforce.com's userinfo does not serve
+# sandbox orgs.
+SALESFORCE_USERINFO_PATH = "/services/oauth2/userinfo"
 # Every Composio app's trips (begin, verification, denial) land on one shared
 # callback URL, whatever the app's own provider: Composio's OAuth user
 # verification is a single URL per project, and the flow and actor proof
@@ -144,14 +162,126 @@ class ComposioApp(NamedTuple):
     # GET this through the proxy with ``identity_params`` as its query;
     # ``identity_field`` of the reply, which must fully match
     # ``identity_id_pattern``, is stored as the grant's provider_user_id.
-    identity_url: str
+    # Either a fixed URL, or, for an app whose identity lives on the
+    # account's own host, a function of the connected account that
+    # ``verify_account`` read, returning None when the account names no
+    # usable host.
+    identity_url: str | Callable[[Mapping[str, Any]], str | None]
     identity_field: str
     identity_params: tuple[tuple[str, str], ...]
     identity_id_pattern: re.Pattern[str]
+    # Shown by the connect UI while the app goes through Composio:
+    # ``before_connect`` before the sign-in window opens, ``not_connected``
+    # when it closes without a connection. None for an app that needs none.
+    connect_guidance: Mapping[str, str] | None = None
+    # For an app whose identity URL is a function of the account: what to
+    # change on Composio's page when the account names no usable host. Ends
+    # the sentence "Close this window, select Connect again, and ...".
+    identity_host_help: str | None = None
 
 
 # Graph ids, Facebook user ids and Instagram professional account ids alike.
 _GRAPH_ID_RE = re.compile(r"[0-9]{1,32}")
+# Google subjects are numeric in practice; the OIDC limit is 255 characters.
+_GOOGLE_SUBJECT_RE = re.compile(r"[0-9]{1,255}")
+# A Salesforce User id in its 18-character form (key prefix 005), as OIDC
+# userinfo's ``user_id`` gives it.
+_SALESFORCE_USER_ID_RE = re.compile(r"005[0-9A-Za-z]{15}")
+# DNS labels of letters, digits and inner hyphens under salesforce.com: the
+# Salesforce runtime's pattern for the same value (#3708), so every host
+# accepted here is one the runtime calls.
+_SALESFORCE_HOST_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+salesforce\.com"
+)
+# Printable ASCII without the space: what a base_url may consist of, checked
+# before urlsplit, which would silently drop tabs and newlines.
+_VISIBLE_ASCII_RE = re.compile(r"[!-~]+")
+
+
+def _salesforce_userinfo_url(account: Mapping[str, Any]) -> str | None:
+    """The userinfo URL on the org host of the account's ``data.base_url``.
+
+    Composio finds the org at sign-in and keeps its host plus
+    ``/services/data/vNN.0`` there (#3646 live test). The value comes from
+    what the member typed on Composio's page, so it is never logged, and is
+    refused unless it is made only of printable ASCII without spaces (checked
+    before parsing, since ``urlsplit`` drops tabs and newlines), is https,
+    has no credentials and no port (an empty one included), and its host,
+    lowercased by ``urlsplit`` and with at most one trailing dot removed, is
+    a subdomain of salesforce.com whose labels are letters, digits and inner
+    hyphens, at most 63 characters each. Only the host is kept. This is at
+    least as strict as the Salesforce runtime's check on the same value
+    (#3708), so every host accepted here is accepted there.
+    """
+    data = account.get("data")
+    base_url = data.get("base_url") if isinstance(data, dict) else None
+    if not isinstance(base_url, str) or not _VISIBLE_ASCII_RE.fullmatch(base_url):
+        return None
+    try:
+        parts = urlsplit(base_url)
+        hostname = (parts.hostname or "").removesuffix(".")
+        port = parts.port
+    except ValueError:
+        # Unparsable (an unclosed "[" bracket) or an invalid port.
+        return None
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or port is not None
+        or parts.netloc.endswith(":")
+        or not _SALESFORCE_HOST_RE.fullmatch(hostname)
+    ):
+        return None
+    return f"https://{hostname}{SALESFORCE_USERINFO_PATH}"
+
+
+_SALESFORCE_INSTALL = (
+    "A Salesforce admin has to install Composio's app in your org first: in "
+    "Setup, open Connected Apps OAuth Usage, click Install next to Composio's "
+    'app, then set Permitted Users to "All users may self-authorize". If '
+    "Composio's app isn't listed there yet, connect once as an admin first, "
+    "then install it."
+)
+_SALESFORCE_LOGIN_POLICY = (
+    "change the Salesforce subdomain on Composio's page to your My Domain "
+    "prefix (for example acme.my, or acme.develop.my for a Developer Edition "
+    'org), or choose "Use Custom Domain" on the Salesforce login page.'
+)
+# A sandbox org signs in through test.salesforce.com, not the default
+# subdomain "login". Not tested live (no sandbox at hand, #3646); this
+# follows Salesforce's own login rules.
+_SALESFORCE_SANDBOX = (
+    "For a sandbox org, change the subdomain on Composio's page to test, or "
+    "to your sandbox's My Domain prefix (for example acme--uat.sandbox.my)."
+)
+# Shown when the connected account names no usable org host: connecting
+# again the same way can't fix that.
+_SALESFORCE_IDENTITY_HOST_HELP = (
+    "on Composio's page change the Salesforce subdomain to your My Domain "
+    "prefix (for example acme.my, or acme.develop.my for a Developer Edition "
+    f"org). {_SALESFORCE_SANDBOX}"
+)
+# Salesforce stops on its own page when the app is not installed, the
+# subdomain is mistyped, or the org refuses logins from login.salesforce.com;
+# nothing comes back to Composio or to us, so the only help is this text.
+SALESFORCE_CONNECT_GUIDANCE: Mapping[str, str] = {
+    "before_connect": (
+        f"{_SALESFORCE_INSTALL} Admins can connect without installing it, but "
+        "nobody else in the org can until it is installed, so admins should "
+        "install it too. If your org doesn't allow logins from "
+        f"login.salesforce.com, {_SALESFORCE_LOGIN_POLICY} {_SALESFORCE_SANDBOX}"
+    ),
+    "not_connected": (
+        "Salesforce wasn't connected. If Salesforce showed "
+        'OAUTH_APPROVAL_ERROR_GENERIC or "app must be installed into org": '
+        f"{_SALESFORCE_INSTALL} If the page couldn't be reached, the subdomain "
+        "on Composio's page may be mistyped. If Salesforce said \"Please check "
+        'your username and password" although they are right, your org may '
+        f"not allow logins from login.salesforce.com: {_SALESFORCE_LOGIN_POLICY} "
+        f"{_SALESFORCE_SANDBOX}"
+    ),
+}
 
 
 COMPOSIO_APPS: dict[str, ComposioApp] = {
@@ -179,6 +309,49 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_field="user_id",
         identity_params=(("fields", "user_id"),),
         identity_id_pattern=_GRAPH_ID_RE,
+    ),
+    # Composio's Google app holds Google's restricted-scope approval, so these
+    # connect with full Gmail and Drive access while our own review gate
+    # (XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED) stays closed (#3649).
+    GMAIL_APP_ID: ComposioApp(
+        app_id=GMAIL_APP_ID,
+        provider=GOOGLE_PROVIDER,
+        label="Gmail",
+        backend_env=GMAIL_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_GMAIL_AUTH_CONFIG_ID_ENV,
+        toolkit_slug="gmail",
+        identity_url=GOOGLE_USERINFO_URL,
+        identity_field="sub",
+        identity_params=(),
+        identity_id_pattern=_GOOGLE_SUBJECT_RE,
+    ),
+    GOOGLE_DRIVE_APP_ID: ComposioApp(
+        app_id=GOOGLE_DRIVE_APP_ID,
+        provider=GOOGLE_PROVIDER,
+        label="Google Drive",
+        backend_env=GOOGLE_DRIVE_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID_ENV,
+        toolkit_slug="googledrive",
+        identity_url=GOOGLE_USERINFO_URL,
+        identity_field="sub",
+        identity_params=(),
+        identity_id_pattern=_GOOGLE_SUBJECT_RE,
+    ),
+    # Composio's connected app, so an org admin has to install it before the
+    # org's other users can connect (#3646).
+    SALESFORCE_APP_ID: ComposioApp(
+        app_id=SALESFORCE_APP_ID,
+        provider=SALESFORCE_APP_ID,
+        label="Salesforce",
+        backend_env=SALESFORCE_AUTH_BACKEND_ENV,
+        auth_config_env=COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV,
+        toolkit_slug=SALESFORCE_TOOLKIT_SLUG,
+        identity_url=_salesforce_userinfo_url,
+        identity_field="user_id",
+        identity_params=(),
+        identity_id_pattern=_SALESFORCE_USER_ID_RE,
+        connect_guidance=SALESFORCE_CONNECT_GUIDANCE,
+        identity_host_help=_SALESFORCE_IDENTITY_HOST_HELP,
     ),
 }
 
@@ -211,7 +384,13 @@ class ComposioConfig(NamedTuple):
 
 
 class ComposioError(Exception):
-    """A Composio call failed. ``rejected`` means Composio refused it."""
+    """A Composio call failed or returned an unusable account.
+
+    ``rejected`` means repeating the same request won't help: Composio
+    refused it, or the account it returned can't be bound (not ours, not
+    active, or, for ``identity_host_invalid``, on no usable host, which the
+    member fixes on Composio's page). Otherwise the failure may be temporary.
+    """
 
     def __init__(self, reason: str, *, rejected: bool = False) -> None:
         super().__init__(reason)
@@ -244,6 +423,15 @@ def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
     return app
 
 
+def connect_guidance(provider: str, app_id: str | None) -> dict[str, str] | None:
+    """The app's connect guidance while its new connects go through
+    Composio; None otherwise, so a catalog entry can leave the field out."""
+    app = composio_app(provider, app_id)
+    if app is None or app.connect_guidance is None:
+        return None
+    return dict(app.connect_guidance)
+
+
 def _uses_composio(app: ComposioApp) -> bool:
     backend = (_env(app.backend_env) or "native").lower()
     if (
@@ -266,12 +454,6 @@ def _uses_composio(app: ComposioApp) -> bool:
 
 
 _WARNED_BACKENDS: set[tuple[str, str]] = set()
-
-
-def connector_oauth_route_enabled() -> bool:
-    """Read xagent-saas's switch the same way xagent-saas does."""
-    value = _env(CONNECTOR_OAUTH_ROUTE_ENV)
-    return value is not None and value.lower() == "true"
 
 
 def load_config(app_id: str) -> ComposioConfig | None:
@@ -339,26 +521,33 @@ def _unavailable_page(*app_ids: str) -> HTMLResponse:
     )
 
 
+def _identity_host_invalid_page(app_id: str) -> HTMLResponse:
+    """The account names no usable host for its identity.
+
+    The host comes from what the member typed on Composio's page, so this
+    says what to change there; the value itself is never shown.
+    """
+    app = COMPOSIO_APPS[app_id]
+    if app.identity_host_help is None:  # pragma: no cover - fixed URL apps
+        return _reject("composio_rejected").response
+    return _page(
+        f"{app.label} wasn't connected",
+        f"The {app.label} account Composio returned doesn't name an address "
+        f"this app can use, so {app.label} wasn't connected.",
+        f"Close this window, select Connect again, and {app.identity_host_help}",
+        status_code=400,
+    )
+
+
 def start_preflight(app_id: str) -> HTMLResponse | None:
     """Refuse a Composio start this deployment cannot finish."""
     label = COMPOSIO_APPS[app_id].label
-    if connector_oauth_route_enabled():
-        # Fail closed instead of letting the verification trip be routed by
-        # region preference (xorbitsai/xagent-saas#2461).
-        logger.warning(
-            "Composio %s connect refused: %s is on, and the verification "
-            "step cannot be routed per connection",
-            label,
-            CONNECTOR_OAUTH_ROUTE_ENV,
-        )
-        return HTMLResponse(
-            content=(
-                f"<h1>{label} connection is unavailable</h1>"
-                f"<p>{label} connections through Composio are not supported "
-                "while per-connection OAuth routing is enabled.</p>"
-            ),
-            status_code=503,
-        )
+    # With xagent-saas's per-connection region routing on
+    # (XAGENT_TOBY_CONNECTOR_OAUTH_ROUTE_ENABLED), the verification and denial
+    # trips, which carry no ``state``, are meant to be routed by a fixed-name
+    # route cookie that xagent-saas mints and the edge reads
+    # (xorbitsai/xagent-saas#2461). A trip that reaches another region binds
+    # nothing there: see tests/web/test_composio_cross_region.py.
     try:
         _configured_callback_url()
     except _CallbackUrlInvalid as problem:
@@ -612,8 +801,12 @@ def verify_account(
     account_id: str,
     user_id: str,
     toolkit_slug: str,
-) -> None:
-    """Require the account to be ACTIVE, ours, of our auth config and toolkit."""
+) -> dict[str, Any]:
+    """Require the account to be ACTIVE, ours, of our auth config and toolkit.
+
+    Returns the account as Composio reported it, for an identity read that
+    depends on it; it is never logged or stored.
+    """
     payload = _get_account(config, account_id)
     if payload is None:
         raise ComposioError("account_lookup_failed")
@@ -636,6 +829,7 @@ def verify_account(
             "Composio account failed verification (checks=%s)", ",".join(failed)
         )
         raise ComposioError("account_invalid", rejected=True)
+    return payload
 
 
 def fetch_provider_user_id(
@@ -644,15 +838,30 @@ def fetch_provider_user_id(
     account_id: str,
     user_id: str,
     app_id: str,
+    account: Mapping[str, Any],
 ) -> str:
-    """Read the account's own id once through Composio's proxy."""
+    """Read the account's own id once through Composio's proxy.
+
+    ``account`` is the connected account ``verify_account`` returned.
+    """
     app = COMPOSIO_APPS[app_id]
+    if isinstance(app.identity_url, str):
+        identity_url: str | None = app.identity_url
+    else:
+        identity_url = app.identity_url(account)
+    if identity_url is None:
+        # The account's own values are never logged: they come from what the
+        # member typed on Composio's page.
+        logger.warning(
+            "Composio account names no usable %s host for its identity", app.label
+        )
+        raise ComposioError("identity_host_invalid", rejected=True)
     status, payload = _call(
         config.api_key,
         "POST",
         "/tools/execute/proxy",
         body={
-            "endpoint": app.identity_url,
+            "endpoint": identity_url,
             "method": "GET",
             "connected_account_id": account_id,
             "user_id": user_id,
@@ -1508,14 +1717,18 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
         delete_account(shared.api_key, account_id)
         return _clear_flow_cookies(_unavailable_page(app_id), callback, dead)
     try:
-        verify_account(
+        account = verify_account(
             config,
             account_id=account_id,
             user_id=composio_user,
             toolkit_slug=COMPOSIO_APPS[app_id].toolkit_slug,
         )
         provider_user_id = fetch_provider_user_id(
-            config, account_id=account_id, user_id=composio_user, app_id=app_id
+            config,
+            account_id=account_id,
+            user_id=composio_user,
+            app_id=app_id,
+            account=account,
         )
         stored = _store_grant(
             db,
@@ -1527,11 +1740,12 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     except ComposioError as exc:
         _log_rejection(exc.reason, app_id)
         delete_account(config.api_key, account_id)
-        response = (
-            _reject("composio_rejected").response
-            if exc.rejected
-            else _unavailable_page(app_id)
-        )
+        if exc.reason == "identity_host_invalid":
+            response = _identity_host_invalid_page(app_id)
+        elif exc.rejected:
+            response = _reject("composio_rejected").response
+        else:
+            response = _unavailable_page(app_id)
         return _clear_flow_cookies(response, callback, dead)
     except _Rejected as rejected:
         _log_rejection(rejected.reason, app_id)

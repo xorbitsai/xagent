@@ -42,7 +42,6 @@ from xagent.sandbox.base import (
     SpecVerdict,
     spec_matches_inspection,
 )
-from xagent.sandbox.boxlite_sandbox import BoxliteSandboxService
 from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
@@ -270,13 +269,6 @@ class TestSupportsRuntimeSpec:
             MemDockerStore(), namespace="test", client=_FakeDockerClient()
         )
         assert await service.supports_runtime_spec() is True
-
-    @pytest.mark.asyncio
-    async def test_boxlite_does_not_support_runtime_spec(self):
-        # BoxliteSandboxService.__init__ talks to a real boxlite runtime;
-        # the probe itself needs no runtime access, so we bypass __init__.
-        service = object.__new__(BoxliteSandboxService)
-        assert await service.supports_runtime_spec() is False
 
 
 class TestRuntimeNetworkPolicy:

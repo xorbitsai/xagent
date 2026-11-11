@@ -9,7 +9,6 @@ Environment Variable Naming Convention:
     Most config variables use the XAGENT_* prefix for consistency.
     Exceptions (without XAGENT_ prefix) are kept for backward compatibility:
     - SANDBOX_*: Sandbox container configuration (predates this module)
-    - BOXLITE_HOME_DIR: Boxlite sandbox home directory
     - DATABASE_URL: Standard database connection URL
     - LANCEDB_PATH: LanceDB database path
 
@@ -51,6 +50,8 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
+EXECUTION_EVENT_STORAGE_ENTRIES = "XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES"
+EXECUTION_EVENT_STORAGE_USER_IDS = "XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 STANDBY = "XAGENT_STANDBY"
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
@@ -122,6 +123,8 @@ NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
 BROWSER_TOOL_DEFAULT_LOCALE = "XAGENT_BROWSER_TOOL_DEFAULT_LOCALE"
 BROWSER_TOOL_DEFAULT_TIMEZONE = "XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE"
 BROWSER_ALLOW_UNSANDBOXED = "XAGENT_BROWSER_ALLOW_UNSANDBOXED"
+BROWSER_RUN_AS_UID = "XAGENT_BROWSER_RUN_AS_UID"
+BROWSER_RUN_AS_GID = "XAGENT_BROWSER_RUN_AS_GID"
 BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
 BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
 BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
@@ -216,7 +219,6 @@ SANDBOX_WORKSPACE_VOLUME = "XAGENT_SANDBOX_WORKSPACE_VOLUME"
 SANDBOX_WORKSPACE_VOLUME_ROOT = "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
-BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
@@ -412,6 +414,40 @@ def get_interaction_native_sources() -> list[str]:
     return result
 
 
+def _split_csv_tokens(raw: str, *, lower: bool) -> list[str]:
+    result: list[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if lower:
+            token = token.lower()
+        if token:
+            result.append(token)
+    return result
+
+
+def get_execution_event_storage_entries() -> list[str]:
+    """Raw XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES reading: a token list.
+
+    Comma-splits the env value, strips and lowercases each token, and skips
+    blank tokens. Duplicates are preserved and tokens are not checked against
+    the entry vocabulary here; validation belongs to
+    ``web/services/conversation_storage_rollout.py``.
+    """
+    return _split_csv_tokens(os.getenv(EXECUTION_EVENT_STORAGE_ENTRIES, ""), lower=True)
+
+
+def get_execution_event_storage_user_ids() -> list[str]:
+    """Raw XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS reading: a token list.
+
+    Comma-splits the env value, strips each token, and skips blank tokens.
+    Tokens are not parsed as integers here; that validation belongs to
+    ``web/services/conversation_storage_rollout.py``.
+    """
+    return _split_csv_tokens(
+        os.getenv(EXECUTION_EVENT_STORAGE_USER_IDS, ""), lower=False
+    )
+
+
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
     """Map UI execution mode to agent pattern name.
 
@@ -470,6 +506,11 @@ def get_task_reply_wait_timeout_seconds() -> int:
         "Invalid %s=%r; falling back to 30", TASK_REPLY_WAIT_TIMEOUT_SECONDS, value
     )
     return 30
+
+
+def get_input_review_timeout_seconds() -> float:
+    """Leave part of the durable reply wait for command handoff and settlement."""
+    return min(20.0, get_task_reply_wait_timeout_seconds() * 0.8)
 
 
 def get_task_lease_ttl_seconds() -> int:
@@ -1530,6 +1571,34 @@ def get_browser_allow_unsandboxed() -> bool:
     """Whether Playwright may launch Chromium without its sandbox."""
 
     return _get_bool_env(BROWSER_ALLOW_UNSANDBOXED, False)
+
+
+def get_browser_run_as() -> tuple[int, int] | None:
+    """Return the dedicated uid/gid Chromium should run as, if configured.
+
+    Both variables must be set together to a positive integer; blank values
+    count as unset. uid/gid 0 is rejected because it would keep the browser
+    privileged.
+    """
+
+    raw_uid = (os.getenv(BROWSER_RUN_AS_UID) or "").strip()
+    raw_gid = (os.getenv(BROWSER_RUN_AS_GID) or "").strip()
+    if not raw_uid and not raw_gid:
+        return None
+    if not raw_uid or not raw_gid:
+        raise ValueError(
+            f"{BROWSER_RUN_AS_UID} and {BROWSER_RUN_AS_GID} must be set together"
+        )
+    values: list[int] = []
+    for name, raw in ((BROWSER_RUN_AS_UID, raw_uid), (BROWSER_RUN_AS_GID, raw_gid)):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from None
+        if not 1 <= value <= 2**32 - 2:
+            raise ValueError(f"{name} must be between 1 and {2**32 - 2}, got {value}")
+        values.append(value)
+    return values[0], values[1]
 
 
 _BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")
@@ -4459,21 +4528,6 @@ def get_sandbox_worker_namespace() -> str | None:
 
     suffix = hashlib.sha256(f"{namespace}\0{worker_id}".encode()).hexdigest()[:16]
     return f"{namespace}-{suffix}"
-
-
-def get_boxlite_home_dir() -> Path | None:
-    """Get the BoxLite home, isolated by stable worker ID in shared mode.
-
-    Local execution preserves BoxLite's default when BOXLITE_HOME_DIR is unset.
-    Shared execution uses a worker subdirectory under the configured home or
-    the unified storage root's boxlite directory.
-    """
-    env_str = os.getenv(BOXLITE_HOME_DIR)
-    home_dir = Path(env_str) if env_str else None
-    worker_id = get_sandbox_worker_id()
-    if worker_id is not None:
-        return (home_dir or get_storage_root() / "boxlite") / worker_id
-    return home_dir
 
 
 def get_tool_max_output_length() -> int:

@@ -285,6 +285,62 @@ def test_a_non_meta_identity_must_match_its_apps_own_format(linear, identity):
     assert _grants(db) == []
 
 
+def _identity_url_from_account(account: Any) -> str | None:
+    data = account.get("data")
+    url = data.get("identity_url") if isinstance(data, dict) else None
+    return url if isinstance(url, str) else None
+
+
+@pytest.fixture
+def linear_on_its_own_host(linear, monkeypatch):
+    """Linear whose identity URL comes from the connected account."""
+    monkeypatch.setitem(
+        composio_auth.COMPOSIO_APPS,
+        "linear",
+        LINEAR_APP._replace(identity_url=_identity_url_from_account),
+    )
+    return linear
+
+
+def test_an_identity_url_can_come_from_the_verified_account(linear_on_its_own_host):
+    db, user, composio = linear_on_its_own_host
+    composio.account_overrides = {"data": {"identity_url": LINEAR_IDENTITY_URL}}
+    browser = Browser()
+    browser.get(db, _start_linear(db, user, browser).headers["location"])
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 200, response.body
+    (identity,) = [
+        body for _, path, body in composio.calls if path == "/tools/execute/proxy"
+    ]
+    assert identity["endpoint"] == LINEAR_IDENTITY_URL
+    # The account verification read is the one the URL came from.
+    account_reads = [
+        path
+        for verb, path, _ in composio.calls
+        if verb == "GET" and path.startswith("/connected_accounts/")
+    ]
+    assert account_reads == [f"/connected_accounts/{composio.created[-1]}"]
+    (grant,) = _grants(db)
+    assert grant.provider_user_id == LINEAR_USER_ID
+
+
+def test_an_account_naming_no_identity_url_is_refused_without_a_proxy_call(
+    linear_on_its_own_host,
+):
+    db, user, composio = linear_on_its_own_host
+    browser = Browser()
+    browser.get(db, _start_linear(db, user, browser).headers["location"])
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 400
+    assert "/tools/execute/proxy" not in composio.paths()
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[-1]}"]
+    assert _grants(db) == []
+
+
 def test_a_meta_identity_keeps_its_numeric_format(db_session, composio_env, composio):
     db, user = db_session
     composio.me_response = (200, {"data": {"id": LINEAR_USER_ID}, "status": 200})

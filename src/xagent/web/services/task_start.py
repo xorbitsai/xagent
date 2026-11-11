@@ -38,6 +38,7 @@ from .connector_runtime import (
     prepare_create_connector_runtime,
     store_ephemeral_runtime_values,
 )
+from .conversation_storage_rollout import new_task_conversation_storage_version
 from .db_runtime import drain_async_task_cancellation_safe, run_db_io_cancellation_safe
 from .expired_tasks import find_expired_task
 from .file_turn import (
@@ -367,6 +368,9 @@ def _prepare_created_task_isolated(
             is_visible=False,
             requested_dispatch_class=requested_dispatch_class,
             dispatch_priority=requested_priority,
+            conversation_storage_version=new_task_conversation_storage_version(
+                entry="sdk", owner_user_id=task_owner_user_id
+            ),
         )
         new_task_agent_config = store_response_format(
             (
@@ -1091,6 +1095,9 @@ def _prepare_a2a_turn_sync(
                 is_visible=False,
                 execution_mode=agent_execution_mode,
                 agent_config={"a2a_context_id": context_id},
+                conversation_storage_version=new_task_conversation_storage_version(
+                    entry="a2a", owner_user_id=task_owner_user_id
+                ),
             )
             db.add(task)
             db.flush()

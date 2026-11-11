@@ -1363,7 +1363,11 @@ def test_file_changing_while_read_fails_before_any_request(
         patch.setattr(
             google_drive.os,
             "fstat",
-            lambda fd: SimpleNamespace(st_size=real_fstat(fd).st_size + size_delta),
+            lambda fd: SimpleNamespace(
+                # The size is what moves here; a real stat has both fields.
+                st_size=real_fstat(fd).st_size + size_delta,
+                st_mtime_ns=1,
+            ),
         )
         result = _call("deck1", local)
 

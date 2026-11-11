@@ -40,8 +40,8 @@ from .sandbox_config import (
 logger = logging.getLogger(__name__)
 
 # `timeout -s KILL` SIGKILLs its whole process group at the deadline, itself
-# included, so the exec reports a SIGKILL death: 128+9 from docker, -9 from
-# boxlite (negative exit codes mean "terminated by signal").
+# included. Docker reports 128+9, while subprocess-compatible adapters preserve
+# the negative signal return code. Both representations can occur without BoxLite.
 _SIGKILL_EXIT_CODES = (137, -9)
 
 SANDBOX_BASE_DEPENDENCIES = [

@@ -36,7 +36,11 @@ from weakref import WeakValueDictionary
 import httpx
 from sqlalchemy import text
 
-from ...config import get_google_shared_oauth_grants_enabled, get_uploads_dir
+from ...config import (
+    get_google_restricted_scopes,
+    get_google_shared_oauth_grants_enabled,
+    get_uploads_dir,
+)
 from ...core.agent.result import (
     ClassifiedToolFailure,
     is_oauth_token_required_code,
@@ -104,6 +108,27 @@ from ..services.tool_credentials import (
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 
 logger = logging.getLogger(__name__)
+
+
+def _is_builtin_jira_ticket_server(server: Any) -> bool:
+    """Whether ``server`` is the built-in Jira Ticket server, not a lookalike.
+
+    The catalog connect flow names the row after the app id and stamps it with
+    the app's provenance marker, and refuses to reuse a same-named row that
+    lacks it, so a custom server cannot carry both.
+    """
+    from ...builtin_identity import (
+        builtin_provenance_identity,
+        canonicalize_builtin_identity,
+    )
+
+    auth = getattr(server, "auth", None)
+    return (
+        canonicalize_builtin_identity(getattr(server, "name", None)) == "jira-ticket"
+        and isinstance(auth, Mapping)
+        and builtin_provenance_identity(auth.get("builtin_provenance"))
+        == ("xagent", "jira-ticket")
+    )
 
 
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
@@ -385,10 +410,35 @@ class _OAuthInstanceUrlRequired(Exception):
 
 
 # Apps whose MCP subprocess can run a Composio-backed grant through Proxy
-# Execute: Facebook (#3531) and Instagram in Instagram Login mode (#3533).
-# Another app's Composio grant is reported unavailable until its subprocess
-# can proxy it.
-_COMPOSIO_PROXY_APPS = frozenset({"facebook", "instagram"})
+# Execute: Facebook (#3531), Instagram in Instagram Login mode (#3533) and
+# Gmail (#3647), whose googleapiclient calls go through a proxy transport,
+# Google Drive, and Salesforce (#3646). Another app's Composio grant is
+# reported unavailable until its subprocess can proxy it.
+_COMPOSIO_PROXY_APPS = frozenset(
+    {"facebook", "instagram", "gmail", "google-drive", "salesforce"}
+)
+
+
+def _native_gmail_grant_gated(*, app_id: object, token_type: object) -> bool:
+    """Whether a Toby (actor) Gmail grant made through our own Google app must
+    not run, because the restricted-scope review gate is closed (#3649).
+
+    Asked for actor grants only, before any refresh, so a held-back grant
+    never reaches Google through our app at all.
+
+    The gate used to keep these out by hiding Gmail, which is also the actor
+    admission check. The Gmail Composio switch shows Gmail, so the gate is
+    applied to the grant instead: a grant from Composio's approved Google app
+    passes, a native one is reported as needing a connection, which a
+    reconnect through Composio fixes.
+    """
+    from ..models.user_oauth import COMPOSIO_TOKEN_TYPE
+
+    return (
+        app_id == "gmail"
+        and token_type != COMPOSIO_TOKEN_TYPE
+        and not get_google_restricted_scopes()
+    )
 
 
 def _composio_grant_env(
@@ -4301,12 +4351,29 @@ class WebToolConfig(BaseToolConfig):
         provider_name: object,
         user_id: int,
         resource_owner_key: str | None,
+        actor_app_id: object = None,
     ) -> _LegacyOAuthTokenResolution:
+        """``actor_app_id`` is the app an actor grant is resolved for; ordinary
+        resolutions leave it unset."""
         from ...web.models.user_oauth import UserOAuth
 
         if not oauth_account:
             return _LegacyOAuthTokenResolution(access_token=None)
         if not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
+        if actor_app_id is not None and _native_gmail_grant_gated(
+            app_id=actor_app_id,
+            token_type=getattr(oauth_account, "token_type", None),
+        ):
+            # Reported as needing a connection; a reconnect through Composio
+            # fixes it.
+            logger.info(
+                "OAUTH CONFIG: Holding back a native Gmail grant while Google "
+                "restricted scopes are disabled; reconnecting through Composio "
+                "replaces it"
+            )
             return _LegacyOAuthTokenResolution(
                 access_token=None, credential_present=True
             )
@@ -4741,6 +4808,7 @@ class WebToolConfig(BaseToolConfig):
                     provider_name=provider_name,
                     user_id=user_id,
                     resource_owner_key=resource_owner_key,
+                    actor_app_id=app_id,
                 )
             # Lock the current namespace, not a stale row id. Actor callbacks
             # replace credentials with delete-and-insert, so the primary key
@@ -4785,6 +4853,7 @@ class WebToolConfig(BaseToolConfig):
                 provider_name=provider_name,
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
+                actor_app_id=app_id,
             )
         except Exception:
             oauth_db.rollback()
@@ -5323,6 +5392,13 @@ class WebToolConfig(BaseToolConfig):
                 user_env_by_id.get(server.id),
             )
             combined_env = {**(merged_env or {}), **caller_id_env(self._user_id)}
+            if _is_builtin_jira_ticket_server(server):
+                # Key-based servers get no file allowlist elsewhere, and the
+                # Jira attachment guard would fall back to its working
+                # directory. "[]" (no workspace) denies every upload.
+                combined_env["XAGENT_JIRA_FILE_ALLOWED_DIRS"] = json.dumps(
+                    self._mcp_file_allowed_dir_paths()
+                )
             if combined_env:
                 transport_config["env"] = combined_env
             if server.cwd:

@@ -117,6 +117,10 @@ from .services.connector_team_scope import (
     ConnectorHookSessionBoundaryError,
     connector_hook_session_boundary_error_handler,
 )
+from .services.conversation_storage_rollout import (
+    report_unobserved_execution_events,
+    validate_conversation_storage_rollout_at_startup,
+)
 from .services.interaction_rollout import (
     get_interaction_rollout_policy,
     is_native_schema_ready,
@@ -2632,6 +2636,7 @@ async def startup_event() -> None:
         raise ValueError("Use python -m xagent.web.worker for the worker role")
     logger.info("Agent runtime configured: %s", get_agent_runtime())
     validate_interaction_rollout_at_startup()
+    validate_conversation_storage_rollout_at_startup()
     from ..core.tools.core.RAG_tools.storage.vector_backend import (
         lock_deployment_kb_engine,
     )
@@ -2732,6 +2737,10 @@ async def startup_event() -> None:
 
     await _run_or_defer("temp-file cleanup and Composio reconcile", _start_late_tasks)
     start_runtime_performance_monitor(app)
+    report_unobserved_execution_events(
+        telemetry_started=getattr(app.state, "runtime_performance_task", None)
+        is not None
+    )
     start_app_process_diagnostics(app)
 
 

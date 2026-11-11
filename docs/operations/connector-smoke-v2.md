@@ -190,6 +190,8 @@ A connector adopts V2 by adding an entry to `CONNECTOR_CHECKS`. To keep its L3 c
 
 The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `powerpoint`, `word` and `excel`) declare a `read_fixture` read check that reads the object named by its fixture key: `google-docs.document_id`, `google-sheets.spreadsheet_id`, `google-slides.presentation_id`, `powerpoint.file_path`, `word.file_path` and `excel.file_path`. Each object must be a document or file the identity's account can read, and a `file_path` is relative to that account's drive root, not a local task-workspace path. Without a value the check reports `skip` with `fixture_missing`, and the probe route, which does not take fixtures yet (#3284), still records these connectors as `needs_fixture`. Use a small document as each fixture, since `google_docs_get_document` returns the whole document; `word` also needs a tool output cap (`XAGENT_TOOL_MAX_OUTPUT_LENGTH`) of at least 16,384 characters.
 
+`zendesk` and `zoom` have adopted V2: each keeps its L3 call through `l3_read_check` and adds structural read checks on list tools that take no object id, and exempts every other tool, because Tier 2 seeds no objects and runs no write checks (#3573).
+
 ## Identity adapters
 
 The engine runs as an identity through an `IdentityAdapter` (`identity.py`):

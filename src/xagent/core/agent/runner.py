@@ -24,11 +24,22 @@ from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..execution_scope import get_execution_scope
 from ..file_ref import build_file_id_ref
+from ..guardrails.input import (
+    INPUT_REVIEW_BLOCKED_CODE,
+    INPUT_REVIEW_UNAVAILABLE_CODE,
+    InputReviewRejected,
+    InputReviewResult,
+    InputReviewSource,
+    filter_input_history,
+    input_review_configured,
+    review_input,
+)
 from ..guardrails.output import (
     BLOCKED_OUTPUT,
     UNAVAILABLE_OUTPUT,
     ProtectedInteractionError,
     bind_output_guardrail,
+    get_delegated_review_agent_id,
     resolve_output_guardrail,
 )
 from ..inline_file_delivery import InlineFileDelivery
@@ -399,6 +410,54 @@ class AgentRunner:
                 task=task,
                 checkpoint=checkpoint,
                 execution_id=execution_id,
+            )
+        if checkpoint is None and task and input_review_configured():
+            review_source: InputReviewSource = "new_run"
+            agent_metadata = getattr(self.agent, "metadata", None)
+            agent_type = (
+                agent_metadata.get("agent_type")
+                if isinstance(agent_metadata, dict)
+                else None
+            )
+            if agent_type == "builtin":
+                review_source = "builtin"
+            elif agent_type == "workforce_builder":
+                review_source = "workforce_builder"
+            elif get_delegated_review_agent_id() is not None:
+                review_source = "delegated"
+            request_context = (metadata or {}).get("request_context")
+            display_message = (
+                request_context.get("display_message")
+                if isinstance(request_context, dict)
+                else None
+            )
+            decision = await review_input(
+                execution_id,
+                display_message if isinstance(display_message, str) else task,
+                execution_text=task,
+                review_source=review_source,
+            )
+            if decision.refusal:
+                if decision.unavailable or review_source != "new_run":
+                    return {
+                        "success": False,
+                        "input_review_rejected": True,
+                        "error_code": (
+                            INPUT_REVIEW_UNAVAILABLE_CODE
+                            if decision.unavailable
+                            else INPUT_REVIEW_BLOCKED_CODE
+                        ),
+                        "error": decision.refusal,
+                        "output": decision.refusal,
+                    }
+                return {
+                    "success": True,
+                    "completion_outcome": "blocked",
+                    "input_review_rejected": True,
+                    "output": decision.refusal,
+                }
+            initial_messages = filter_input_history(
+                initial_messages or [], decision.excluded_inputs
             )
         # The context is cached from here on. A failure before the run's own
         # ``try`` below would otherwise leave a cached context that looks
@@ -1162,6 +1221,8 @@ class AgentRunner:
         reason: str | None,
         held: list[ExecutionContext],
     ) -> UserMessageInjectionResult:
+        review_pending = False
+        decision: InputReviewResult | None = None
         while True:
             context = self.context_manager.get_context(execution_id)
             cold_start_checkpoint: dict[str, Any] | None = None
@@ -1215,6 +1276,14 @@ class AgentRunner:
                 display_message if display_message is not None else message
             )
             requested_turn_id = turn_id.strip() if turn_id and turn_id.strip() else None
+            if review_pending:
+                decision = await review_input(
+                    execution_id,
+                    resolved_display_message or resolved_execution_message,
+                    execution_text=resolved_execution_message,
+                    review_source="reply",
+                )
+                review_pending = False
             gate = context_checkpoint_gate(context)
             async with gate.exclusive(execution_id):
                 if self.context_manager.get_context(execution_id) is not context:
@@ -1237,7 +1306,11 @@ class AgentRunner:
                         context=context,
                         outcome=UserMessageInjectionOutcome.REJECTED_RETRYABLE,
                     )
-                if request_interrupt and gate.run_finishing:
+                if (
+                    request_interrupt
+                    and gate.run_finishing
+                    and not (decision and decision.refusal)
+                ):
                     return UserMessageInjectionResult(
                         context=context, outcome=UserMessageInjectionOutcome.NOT_POSTED
                     )
@@ -1257,7 +1330,8 @@ class AgentRunner:
                         return self._replay_accepted_turn(
                             execution_id,
                             context,
-                            request_interrupt=request_interrupt,
+                            request_interrupt=request_interrupt
+                            and not gate.run_finishing,
                             reason=reason,
                         )
                     # Compaction may have dropped the message itself; the
@@ -1273,9 +1347,24 @@ class AgentRunner:
                         return self._replay_accepted_turn(
                             execution_id,
                             context,
-                            request_interrupt=request_interrupt,
+                            request_interrupt=request_interrupt
+                            and not gate.run_finishing,
                             reason=reason,
                         )
+
+                if (
+                    decision is None
+                    and resolved_execution_message
+                    and input_review_configured()
+                ):
+                    # Check idempotency before invoking the reviewer, release
+                    # the gate during review, then recheck before any write.
+                    review_pending = True
+                    continue
+                if decision is not None and decision.refusal:
+                    raise InputReviewRejected(
+                        decision.refusal, unavailable=decision.unavailable
+                    )
 
                 # Resolve the checkpoint-merge baseline before any context mutation
                 # below (add_user_message, pending marker) so a failed read leaves

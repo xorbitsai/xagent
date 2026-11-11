@@ -18,7 +18,6 @@ from xagent.config import (
     BACKGROUND_JOB_STALE_SECONDS,
     BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
     BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
-    BOXLITE_HOME_DIR,
     BROWSER_CUA_DRIVER_COMMAND,
     BROWSER_CUA_DRIVER_MAX_ELEMENTS,
     BROWSER_CUA_DRIVER_SOCKET,
@@ -134,7 +133,6 @@ from xagent.config import (
     get_background_job_stale_seconds,
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
-    get_boxlite_home_dir,
     get_browser_cua_driver_command,
     get_browser_cua_driver_max_elements,
     get_browser_cua_driver_socket,
@@ -2220,22 +2218,6 @@ class TestSandboxWorkspaceMountConfig:
             get_sandbox_workspace_volume_root()
 
 
-class TestGetBoxliteHomeDir:
-    """Test get_boxlite_home_dir() function."""
-
-    def test_no_env_var_returns_none(self, monkeypatch):
-        """Test that missing env var returns None."""
-        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
-        result = get_boxlite_home_dir()
-        assert result is None
-
-    def test_boxlite_home_dir_with_env_var(self, monkeypatch):
-        """Test BoxLite home directory with environment variable."""
-        monkeypatch.setenv(BOXLITE_HOME_DIR, "/custom/boxlite")
-        result = get_boxlite_home_dir()
-        assert result == Path("/custom/boxlite")
-
-
 class TestGetMaxTracePayloadBytes:
     """Test get_max_trace_payload_bytes() function."""
 
@@ -2403,6 +2385,62 @@ class TestBrowserSandboxConfig:
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv(config.BROWSER_ALLOW_UNSANDBOXED, "true")
         assert config.get_browser_allow_unsandboxed() is True
+
+
+class TestBrowserRunAsConfig:
+    def test_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_RUN_AS_UID, raising=False)
+        monkeypatch.delenv(config.BROWSER_RUN_AS_GID, raising=False)
+
+        assert config.get_browser_run_as() is None
+
+    @pytest.mark.parametrize(("uid", "gid"), [("", ""), ("   ", "\t")])
+    def test_blank_values_return_none(self, monkeypatch, uid, gid):
+        monkeypatch.setenv(config.BROWSER_RUN_AS_UID, uid)
+        monkeypatch.setenv(config.BROWSER_RUN_AS_GID, gid)
+
+        assert config.get_browser_run_as() is None
+
+    @pytest.mark.parametrize(("uid", "gid"), [("", "1000"), ("1000", "   ")])
+    def test_one_blank_value_requires_both(self, monkeypatch, uid, gid):
+        monkeypatch.setenv(config.BROWSER_RUN_AS_UID, uid)
+        monkeypatch.setenv(config.BROWSER_RUN_AS_GID, gid)
+
+        with pytest.raises(ValueError, match="must be set together"):
+            config.get_browser_run_as()
+
+    def test_both_set_returns_tuple(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_RUN_AS_UID, "1000")
+        monkeypatch.setenv(config.BROWSER_RUN_AS_GID, "1001")
+
+        assert config.get_browser_run_as() == (1000, 1001)
+
+    @pytest.mark.parametrize(
+        ("uid", "gid"),
+        [
+            ("1000", None),
+            (None, "1000"),
+            ("not-a-number", "1000"),
+            ("1000", "not-a-number"),
+            ("0", "1000"),
+            ("1000", "0"),
+            ("-1", "1000"),
+            ("1000", "-2"),
+            ("4294967295", "1000"),
+        ],
+    )
+    def test_invalid_settings_raise(self, monkeypatch, uid, gid):
+        for name, value in (
+            (config.BROWSER_RUN_AS_UID, uid),
+            (config.BROWSER_RUN_AS_GID, gid),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+
+        with pytest.raises(ValueError):
+            config.get_browser_run_as()
 
 
 class TestCheckpointStorageConfig:
@@ -3692,12 +3730,17 @@ def test_task_runtime_secrets_use_explicit_key(monkeypatch):
     "value,expected", [(None, 30), ("12", 12), ("0", 30), ("-1", 30), ("bad", 30)]
 )
 def test_task_reply_wait_timeout(value, expected, monkeypatch):
-    from xagent.config import get_task_reply_wait_timeout_seconds
+    from xagent.config import (
+        get_input_review_timeout_seconds,
+        get_task_reply_wait_timeout_seconds,
+    )
 
     monkeypatch.delenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", raising=False)
     if value is not None:
         monkeypatch.setenv("XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS", value)
     assert get_task_reply_wait_timeout_seconds() == expected
+    assert get_input_review_timeout_seconds() == pytest.approx(min(20, expected * 0.8))
+    assert get_input_review_timeout_seconds() < expected
 
 
 @pytest.mark.parametrize(
@@ -3745,21 +3788,6 @@ def test_unknown_task_execution_role_rejected(monkeypatch):
     monkeypatch.setenv(config.TASK_EXECUTION_ROLE, "other")
     with pytest.raises(ValueError, match="combined, web or worker"):
         config.validate_task_execution_host_config()
-
-
-@pytest.mark.parametrize("configured_home", [None, "/custom/boxlite"])
-def test_shared_boxlite_home_is_scoped_to_worker(
-    monkeypatch, tmp_path, configured_home
-):
-    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    monkeypatch.setenv("XAGENT_SANDBOX_WORKER_ID", "worker-1")
-    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
-    if configured_home is None:
-        monkeypatch.delenv(BOXLITE_HOME_DIR, raising=False)
-    else:
-        monkeypatch.setenv(BOXLITE_HOME_DIR, configured_home)
-    expected_root = Path(configured_home) if configured_home else tmp_path / "boxlite"
-    assert get_boxlite_home_dir() == expected_root / "worker-1"
 
 
 @pytest.mark.parametrize(
@@ -4947,3 +4975,35 @@ class TestComposioCallbackUrlConfig:
         monkeypatch.setenv(config.COMPOSIO_CALLBACK_URL, value)
         with pytest.raises(ValueError, match="XAGENT_COMPOSIO_CALLBACK_URL"):
             config.get_composio_callback_url()
+
+
+@pytest.mark.parametrize(
+    ("getter", "env", "lower"),
+    [
+        (
+            config.get_execution_event_storage_entries,
+            config.EXECUTION_EVENT_STORAGE_ENTRIES,
+            True,
+        ),
+        (
+            config.get_execution_event_storage_user_ids,
+            config.EXECUTION_EVENT_STORAGE_USER_IDS,
+            False,
+        ),
+    ],
+)
+def test_execution_event_storage_getters_raw_parsing(monkeypatch, getter, env, lower):
+    monkeypatch.delenv(env, raising=False)
+    assert getter() == []
+    monkeypatch.setenv(env, "")
+    assert getter() == []
+    monkeypatch.setenv(env, "   ")
+    assert getter() == []
+    monkeypatch.setenv(env, " Sdk ,, A2A , sdk,")
+    expected = ["sdk", "a2a", "sdk"] if lower else ["Sdk", "A2A", "sdk"]
+    assert getter() == expected
+
+
+def test_execution_event_storage_getters_do_not_validate(monkeypatch):
+    monkeypatch.setenv(config.EXECUTION_EVENT_STORAGE_USER_IDS, "1, abc, -2")
+    assert config.get_execution_event_storage_user_ids() == ["1", "abc", "-2"]

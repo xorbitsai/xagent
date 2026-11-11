@@ -41,6 +41,7 @@ from ...runtime import (
     LLMCallInterrupted,
     PatternRuntime,
     prepare_llm_for_context,
+    resolve_compact_llm,
     resolved_llm_metadata,
 )
 from ..base import (
@@ -825,7 +826,11 @@ class AutoPattern(AgentPattern):
         compact_result = await runtime.compact_context_if_needed(
             context=context,
             # See ReActPattern for why the fallback lives at the call site.
-            llm=compact_llm if compact_llm is not None else route_llm,
+            llm=(
+                await resolve_compact_llm(llm=compact_llm, context=context)
+                if compact_llm is not None
+                else route_llm
+            ),
             metadata={"phase": "auto_decision"},
         )
         note_compaction_evidence_loss(context, compact_result)

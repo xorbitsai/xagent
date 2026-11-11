@@ -1,13 +1,15 @@
 import json
 import logging
 import os
-from typing import Any
-from urllib.parse import urlparse
+import re
+from typing import Any, NoReturn
+from urllib.parse import urlparse, urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
+from . import composio_proxy
 from .utils import (
     clamp_limit,
     clamp_offset,
@@ -25,6 +27,19 @@ mcp = FastMCP("salesforce-mcp")
 # per-org instance_url used by every other endpoint here -- Salesforce
 # routes the request to the correct org internally based on the token.
 USERINFO_URL = "https://login.salesforce.com/services/oauth2/userinfo"
+# On a Composio-backed grant (#3646) the same document is read from the org's
+# own host, through the proxy: login.salesforce.com does not serve sandbox
+# orgs, and the org's host is known to Composio only.
+ORG_USERINFO_PATH = "/services/oauth2/userinfo"
+# A host a Composio connection's base_url may name: DNS labels of letters,
+# digits and inner hyphens under salesforce.com. Nothing else -- urlsplit
+# keeps a backslash or a space in a hostname, and a parser downstream could
+# read the host before it as the target.
+_SALESFORCE_HOST_RE = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+salesforce\.com"
+)
+# The redirects requests follows on the direct path (requests' REDIRECT_STATI).
+_FOLLOWED_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 # Pinned to a long-supported version rather than the latest release --
 # Salesforce supports past API versions for many years (not indefinitely;
@@ -271,16 +286,24 @@ def _headers() -> dict[str, str]:
 def _extract_error_detail(response: requests.Response) -> str | None:
     """Pull the human-readable message out of a Salesforce error body.
 
-    Salesforce REST API errors are a top-level JSON *array* of
-    {"message", "errorCode", ...} objects (unlike most APIs here, which wrap
-    errors in a dict) -- joining every message is more useful to the LLM
-    than the raw envelope. Returns None if the body isn't in the expected
-    shape, so the caller can fall back to the raw response text.
+    Returns None if the body isn't JSON or isn't in the expected shape, so
+    the caller can fall back to the raw response text.
     """
     try:
         payload = response.json()
     except ValueError:
         return None
+    return _error_detail_from_payload(payload)
+
+
+def _error_detail_from_payload(payload: Any) -> str | None:
+    """Join the messages of a Salesforce error array.
+
+    Salesforce REST API errors are a top-level JSON *array* of
+    {"message", "errorCode", ...} objects (unlike most APIs here, which wrap
+    errors in a dict) -- joining every message is more useful to the LLM
+    than the raw envelope. None when ``payload`` is not such an array.
+    """
     if not isinstance(payload, list) or not payload:
         return None
 
@@ -315,18 +338,105 @@ def _request_absolute(
         detail = _extract_error_detail(response)
         if detail is None:
             detail = response.text.strip()
-        # Applies to both branches -- a long or numerous structured error
-        # array (_extract_error_detail's case) is just as unbounded as raw
-        # response text, and was previously only capped in the latter.
-        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
-        raise RuntimeError(
-            f"Salesforce API error (status {response.status_code}): {detail}"
-        )
+        _raise_api_error(response.status_code, detail)
 
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _raise_api_error(status: int, detail: str) -> NoReturn:
+    # Applies to every source of ``detail`` -- a long or numerous structured
+    # error array is just as unbounded as raw response text.
+    if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+        detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    raise RuntimeError(f"Salesforce API error (status {status}): {detail}")
+
+
+def _composio_org_host() -> str:
+    """The connected org's host, read from the ``base_url`` Composio keeps
+    for the connected account.
+
+    That ``base_url`` is the org's host plus ``/services/data/vNN.0`` (#3646
+    live test), and Composio appends a relative path to it, so the tools send
+    absolute URLs on the host instead, at this module's pinned API_VERSION,
+    as on the direct path. It is read on every call: each MCP tool call runs
+    in a fresh subprocess, so a per-process cache would never be hit.
+    """
+    base_url = composio_proxy.connected_account_base_url()
+    if base_url is None:
+        raise ValueError("the Composio connection has no base_url")
+    return _composio_base_url_host(base_url)
+
+
+def _composio_base_url_host(base_url: str) -> str:
+    """The host of a Composio connection's ``base_url``.
+
+    Stricter than ``_instance_url``: the value comes from the
+    connected account's record, built from what the user typed when
+    connecting, so credentials or a port refuse it instead of being cut off,
+    the host must be a subdomain of salesforce.com, and the error never
+    echoes the value.
+    """
+    parts = urlsplit(base_url)
+    hostname = (parts.hostname or "").rstrip(".")
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if (
+        parts.scheme != "https"
+        or parts.username is not None
+        or parts.password is not None
+        or port is not None
+        or not _SALESFORCE_HOST_RE.fullmatch(hostname)
+    ):
+        raise ValueError(
+            "the Composio connection's base_url is not an https URL on a "
+            "*.salesforce.com host without credentials or a port"
+        )
+    return hostname
+
+
+def _request_via_composio(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
+) -> Any:
+    """Send ``path`` on the connected org's host through Composio, which adds
+    the token."""
+    host = _composio_org_host()
+    response = composio_proxy.proxy_request(
+        method,
+        f"https://{host}{path}",
+        allowed_hosts=(host,),
+        query=params or {},
+        body=json_data,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
+    # The direct path never sees these: requests follows them. One that comes
+    # back through Composio was not followed, and its empty body would read as
+    # an empty result. Any other 3xx (300 included) is returned as data, as on
+    # the direct path.
+    if response.status in _FOLLOWED_REDIRECT_STATUSES:
+        _raise_api_error(
+            response.status, "the request was redirected and the redirect not followed"
+        )
+    if response.status >= 400:
+        detail = _error_detail_from_payload(response.data)
+        if detail is None:
+            detail = (
+                json.dumps(response.data, ensure_ascii=False)
+                if response.data is not None
+                else ""
+            )
+        # Redacted before it is cut, so a Composio id echoed in the provider's
+        # answer cannot reach the model, half or whole.
+        _raise_api_error(response.status, composio_proxy.redact(detail))
+    # Composio relays a 204's empty body as "" -- {} as on the direct path.
+    return {} if response.data is None or response.data == "" else response.data
 
 
 def _request(
@@ -336,6 +446,8 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    if composio_proxy.serves_composio_grant():
+        return _request_via_composio(method, path, params=params, json_data=json_data)
     return _request_absolute(
         method, f"{_instance_url()}{path}", params=params, json_data=json_data
     )
@@ -350,7 +462,11 @@ def salesforce_get_current_user() -> str:
     user id.
     """
     try:
-        result = _request_absolute("GET", USERINFO_URL)
+        result = (
+            _request_via_composio("GET", ORG_USERINFO_PATH)
+            if composio_proxy.serves_composio_grant()
+            else _request_absolute("GET", USERINFO_URL)
+        )
         return _success(
             user={
                 "user_id": result.get("user_id"),

@@ -20,7 +20,7 @@ from ..auth_dependencies import get_current_user
 from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
 from ..models.user import User
-from ..models.user_oauth import UserOAuth
+from ..models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
 from ..services.google_picker import (
     classify_google_drive_picker_scopes,
     get_google_picker_config,
@@ -64,6 +64,10 @@ _PICKER_NOT_CONFIGURED_DETAIL = (
     "GOOGLE_PICKER_APP_ID or a numeric Google OAuth client_id. "
     "The access token and Picker key are sent to the browser."
 )
+_DRIVE_COMPOSIO_DETAIL = (
+    "This Google Drive connection goes through Composio and has no Google "
+    "access token to issue."
+)
 _PICKER_SCOPE_DETAIL = (
     "This Google Drive connection uses an outdated permission. "
     "Reconnect it before opening Google Drive Picker."
@@ -95,6 +99,10 @@ GoogleDriveCredentialReason = Literal[
     "scope_mismatch",
     # The grant carries no Drive scope at all.
     "scope_drive_missing",
+    # The connection goes through Composio (#3649): the stored row holds a
+    # Composio connected account id, not a Google token, and its Drive tools
+    # run through Composio instead.
+    "composio_backed",
 ]
 
 
@@ -236,6 +244,15 @@ def _require_usable_google_drive_row(
             reason="account_not_connected",
         )
     oauth_account_id = _oauth_account_row_id(oauth_account)
+    if getattr(oauth_account, "token_type", None) == COMPOSIO_TOKEN_TYPE:
+        # Its access_token column holds the Composio connected account id,
+        # which must never be handed out as a Google token.
+        raise GoogleDriveCredentialError(
+            status_code=409,
+            detail=_DRIVE_COMPOSIO_DETAIL,
+            reason="composio_backed",
+            oauth_account_id=oauth_account_id,
+        )
     if not oauth_account.access_token:
         raise GoogleDriveCredentialError(
             status_code=401,

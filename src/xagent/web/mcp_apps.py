@@ -364,10 +364,14 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
 
     transport = execution_fields["transport"]
     launch_config = deepcopy(execution_fields["launch_config"])
-    # A stale or admin-edited row cannot expose Gmail while the gate is closed.
+    # A stale or admin-edited row cannot expose Gmail while the gate is closed,
+    # unless Gmail goes through Composio's Google app, which holds Google's
+    # restricted-scope approval (#3649).
     visible = bool(app.is_visible_in_connector)
     if app.app_id == "gmail" and not get_google_restricted_scopes():
-        visible = False
+        from .composio_auth import composio_app
+
+        visible = visible and composio_app("google", "gmail") is not None
 
     app_dict: Dict[str, Any] = {
         "id": app.app_id,
@@ -391,6 +395,15 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     account_host = get_oauth_account_host(execution_fields["provider_name"])
     if account_host is not None and app_dict["auth_type"] == "builtin_oauth":
         app_dict["oauth_account_input"] = account_host.input_metadata()
+    # Only while the app's actor connect goes through Composio (Salesforce:
+    # an org admin must install Composio's app first), so every other entry,
+    # and Salesforce's while native, is unchanged.
+    if app_dict["auth_type"] == "builtin_oauth":
+        from .composio_auth import connect_guidance
+
+        guidance = connect_guidance(execution_fields["provider_name"] or "", app.app_id)
+        if guidance is not None:
+            app_dict["connect_guidance"] = guidance
     return app_dict
 
 

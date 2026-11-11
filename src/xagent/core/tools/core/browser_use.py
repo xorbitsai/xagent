@@ -7,16 +7,34 @@ automatically cleaned up after a timeout period.
 """
 
 import asyncio
+import codecs
 import json
 import logging
+import mimetypes
+import os
 import re
+import shlex
+import shutil
+import stat
+import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Sequence, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    Optional,
+    Sequence,
+    cast,
+)
 from urllib.parse import unquote, urlsplit
 
 from ....config import (
     get_browser_allow_unsandboxed,
+    get_browser_run_as,
     get_browser_tool_default_locale,
     get_browser_tool_default_timezone,
 )
@@ -154,6 +172,130 @@ _HTTP_FETCH_PATTERNS = [
     {"urlPattern": "wss://*", "requestStage": "Request"},
 ]
 
+_MAX_LOCAL_FILE_BYTES = 64 * 1024 * 1024
+_SNIFF_BYTES = 8 * 1024
+_LOCAL_FILE_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+class _LocalFileRejected(Exception):
+    """A local-file request failed a serving check."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _read_fd(fd: int, limit: int) -> bytes:
+    """Read at most ``limit`` bytes from an already-open file descriptor."""
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1 << 20))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _local_file_content_type(resolved: Path, body: bytes) -> str:
+    """Guess the type, sniffing unknown extensions to keep text renderable."""
+    guessed, _ = mimetypes.guess_type(str(resolved))
+    if guessed is not None:
+        return guessed
+    sample = body[:_SNIFF_BYTES]
+    if b"\x00" not in sample:
+        try:
+            # The sample may end mid-character; only a complete bad sequence rejects it.
+            codecs.getincrementaldecoder("utf-8")().decode(sample, final=False)
+        except UnicodeDecodeError:
+            pass
+        else:
+            return "text/plain; charset=utf-8"
+    return "application/octet-stream"
+
+
+def _verify_open_file(
+    fd: int,
+    resolved: Path,
+    file_stat: os.stat_result,
+    authorize: Callable[[str], Path | None],
+) -> None:
+    """Pin the opened file to ``resolved``: its /proc fd path, else its inode."""
+    try:
+        target = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        current = os.stat(resolved)
+        if (current.st_dev, current.st_ino) != (
+            file_stat.st_dev,
+            file_stat.st_ino,
+        ):
+            raise _LocalFileRejected("identity mismatch") from None
+        if authorize(resolved.as_uri()) != resolved:
+            raise _LocalFileRejected("identity mismatch") from None
+        return
+    target_path = Path(target)
+    if target_path != resolved:
+        raise _LocalFileRejected("identity mismatch") from None
+    if authorize(target_path.as_uri()) != resolved:
+        raise _LocalFileRejected("identity mismatch") from None
+
+
+def _read_authorized_file(
+    request_url: str,
+    authorize: Callable[[str], Path | None],
+) -> tuple[bytes, str]:
+    """Open, validate, and read one authorized file entirely in this thread."""
+    resolved = authorize(request_url)
+    if resolved is None:
+        raise _LocalFileRejected("not authorized")
+    fd = os.open(str(resolved), _LOCAL_FILE_OPEN_FLAGS)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise _LocalFileRejected("not a regular file")
+        if file_stat.st_size > _MAX_LOCAL_FILE_BYTES:
+            raise _LocalFileRejected("too large")
+        _verify_open_file(fd, resolved, file_stat, authorize)
+        body = _read_fd(fd, file_stat.st_size + 1)
+        if len(body) > file_stat.st_size:
+            raise _LocalFileRejected("too large")
+    finally:
+        os.close(fd)
+    return body, _local_file_content_type(resolved, body)
+
+
+def _create_browser_launcher(uid: int, gid: int, real_chrome: str) -> tuple[Path, Path]:
+    """Create a private launcher that runs Chromium through the privdrop module."""
+    launcher_dir = Path(tempfile.mkdtemp(prefix="xagent-browser-launcher-"))
+    try:
+        launcher_dir.chmod(0o700)
+        privdrop_copy = launcher_dir / "browser_privdrop.py"
+        shutil.copyfile(Path(__file__).with_name("browser_privdrop.py"), privdrop_copy)
+        launcher = launcher_dir / "launcher"
+        command = " ".join(
+            shlex.quote(part)
+            for part in (
+                sys.executable,
+                "-I",
+                str(privdrop_copy),
+                str(uid),
+                str(gid),
+                real_chrome,
+            )
+        )
+        launcher.write_text(f'#!/bin/sh\nexec {command} "$@"\n', encoding="utf-8")
+        launcher.chmod(0o700)
+    except BaseException:
+        shutil.rmtree(launcher_dir, ignore_errors=True)
+        raise
+    return launcher_dir, launcher
+
 
 class BrowserSession:
     """Browser session with lazy initialization."""
@@ -210,9 +352,11 @@ class BrowserSession:
         self._page_guard_futures: dict[int, asyncio.Future[None]] = {}
         self._cdp_sessions_by_page: dict[int, Any] = {}
         self._egress_proxy: PublicNetworkEgressProxy | None = None
+        self._launcher_dir: Path | None = None
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
+        self._init_lock = asyncio.Lock()
 
     async def _guard_page_requests(self, page: Page) -> None:
         """Validate network requests, including HTTP redirect hops.
@@ -378,9 +522,39 @@ class BrowserSession:
             )
         except Exception:
             logger.info("Blocked browser local-file request: %s", request_url)
-            await route.abort("blockedbyclient")
+            await self._abort_route(route)
             return
-        await route.fallback()
+        await self._serve_workspace_file(route, request_url)
+
+    async def _abort_route(self, route: Any) -> None:
+        try:
+            await route.abort("blockedbyclient")
+        except Exception:
+            pass
+
+    def _authorize_local_file(self, url: str) -> Path | None:
+        return _workspace_file_path(
+            url,
+            workspace_root=self.workspace_root,
+            workspace_roots=self.workspace_roots,
+            workspace_file_paths=self.workspace_file_paths,
+        )
+
+    async def _serve_workspace_file(self, route: Any, request_url: str) -> None:
+        """Serve one validated file:// request from a descriptor opened in-thread."""
+        try:
+            body, content_type = await asyncio.to_thread(
+                _read_authorized_file, request_url, self._authorize_local_file
+            )
+            await route.fulfill(body=body, content_type=content_type, status=200)
+        except BaseException as exc:
+            reason = exc.reason if isinstance(exc, _LocalFileRejected) else str(exc)
+            logger.info(
+                "Blocked browser local-file request: %s (%s)", request_url, reason
+            )
+            await self._abort_route(route)
+            if not isinstance(exc, Exception):
+                raise
 
     def _schedule_page_guard(self, page: Page) -> None:
         task = asyncio.create_task(self._guard_page_requests(page))
@@ -418,6 +592,25 @@ class BrowserSession:
                     "Then download browsers: playwright install chromium"
                 )
 
+            run_as = get_browser_run_as()
+            if run_as is not None and not hasattr(os, "geteuid"):
+                raise RuntimeError(
+                    "Browser run-as requires a POSIX host with os.geteuid"
+                )
+            current_euid = os.geteuid() if run_as is not None else None
+            if run_as is not None and current_euid not in (0, run_as[0]):
+                raise RuntimeError(
+                    "Switching the browser identity requires the parent process "
+                    f"to run as root (current euid {current_euid}, target uid {run_as[0]})"
+                )
+            if run_as is not None and current_euid == run_as[0]:
+                current_egid = os.getegid()
+                if current_egid != run_as[1]:
+                    raise RuntimeError(
+                        f"Browser run-as requires egid {run_as[1]} when the parent "
+                        f"already runs as uid {run_as[0]} (current egid {current_egid})"
+                    )
+
             self._playwright = await async_playwright().start()
 
             # Launch browser with anti-detection settings
@@ -435,6 +628,14 @@ class BrowserSession:
             if allow_unsandboxed:
                 browser_args.append("--no-sandbox")
             try:
+                executable_path: str | None = None
+                if run_as is not None and current_euid == 0:
+                    self._launcher_dir, launcher = _create_browser_launcher(
+                        run_as[0],
+                        run_as[1],
+                        self._playwright.chromium.executable_path,
+                    )
+                    executable_path = str(launcher)
                 self._egress_proxy = PublicNetworkEgressProxy()
                 proxy_server = await self._egress_proxy.start()
                 self._browser = await self._playwright.chromium.launch(
@@ -445,9 +646,10 @@ class BrowserSession:
                     # some versions.  Make the proxy boundary explicit so
                     # loopback/private destinations cannot skip validation.
                     proxy={"server": proxy_server, "bypass": "<-loopback>"},
+                    executable_path=executable_path,
                 )
-            except Exception:
-                await self.close()
+            except BaseException:
+                await asyncio.shield(self.close())
                 raise
 
             # Create context with realistic settings. locale comes from the
@@ -468,8 +670,8 @@ class BrowserSession:
                     # page request, so keep them disabled for this context.
                     service_workers="block",
                 )
-            except Exception:
-                await self.close()
+            except BaseException:
+                await asyncio.shield(self.close())
                 raise
 
             try:
@@ -479,8 +681,8 @@ class BrowserSession:
                 self._context.on("page", self._schedule_page_guard)
                 self._page = await self._context.new_page()
                 await self._guard_page_requests(self._page)
-            except Exception:
-                await self.close()
+            except BaseException:
+                await asyncio.shield(self.close())
                 raise
 
             # Languages mirror the context's own locale instead of a fixed
@@ -548,12 +750,20 @@ class BrowserSession:
         Returns:
             The Playwright Page instance
         """
-        await self._ensure_initialized()
+        async with self._init_lock:
+            await self._ensure_initialized()
         assert self._page is not None
         return self._page
 
     async def close(self) -> None:
         """Close the browser and cleanup resources."""
+        try:
+            await self._close_resources()
+        finally:
+            self._remove_launcher_dir()
+            self._initialized = False
+
+    async def _close_resources(self) -> None:
         while self._cdp_tasks:
             tasks = list(self._cdp_tasks)
             for task in tasks:
@@ -614,7 +824,12 @@ class BrowserSession:
                 pass
             self._egress_proxy = None
 
-        self._initialized = False
+    def _remove_launcher_dir(self) -> None:
+        """Remove the per-launch launcher directory; safe to call repeatedly."""
+        launcher_dir = self._launcher_dir
+        self._launcher_dir = None
+        if launcher_dir is not None:
+            shutil.rmtree(launcher_dir, ignore_errors=True)
 
 
 class BrowserSessionManager:

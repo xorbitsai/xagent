@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException
 
 from xagent.core.agent.budget import ExecutionBudgetPolicy
+from xagent.core.guardrails import input as input_review
 from xagent.core.model.chat.token_context import add_token_usage
 from xagent.web.services import workforce_creator, workforce_prompt_runtime
 from xagent.web.services.workforce_creator import (
@@ -710,6 +711,9 @@ async def test_generation_resolves_voice_from_the_user_row(
 
     async def fake_build_workforce_prompt_plan(**kwargs: Any) -> dict[str, Any]:
         captured_voice.append(kwargs["voice"])
+        from xagent.core.user_context import current_user_id
+
+        assert current_user_id.get() == 7
         return {"name": "Research Workforce"}
 
     monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)
@@ -737,8 +741,19 @@ async def test_generation_resolves_voice_from_the_user_row(
 
 
 @pytest.mark.asyncio
-async def test_generation_maps_runtime_boundary_failure_to_stable_503(
+@pytest.mark.parametrize(
+    ("case", "expected_status", "expected_code"),
+    [
+        ("runtime", 503, "workforce_prompt_builder_unavailable"),
+        ("blocked", 422, "input_review_blocked"),
+        ("unavailable", 503, "input_review_unavailable"),
+    ],
+)
+async def test_generation_maps_runtime_and_input_review_failures(
     monkeypatch: pytest.MonkeyPatch,
+    case,
+    expected_status,
+    expected_code,
 ) -> None:
     llm = FakeLLM([])
 
@@ -763,11 +778,20 @@ async def test_generation_maps_runtime_boundary_failure_to_stable_503(
         "release_db_connection_if_clean",
         lambda _db: True,
     )
-    monkeypatch.setattr(
-        workforce_creator,
-        "build_workforce_prompt_plan",
-        unavailable_builder,
-    )
+    if case == "runtime":
+        monkeypatch.setattr(
+            workforce_creator, "build_workforce_prompt_plan", unavailable_builder
+        )
+    else:
+
+        async def review(request):
+            assert request.user_id == 7
+            assert request.source == "workforce_builder"
+            return input_review.InputReviewResult(
+                refusal="Review refused the prompt.", unavailable=case == "unavailable"
+            )
+
+        monkeypatch.setattr(input_review, "_review", review)
 
     with pytest.raises(HTTPException) as exc_info:
         await generate_workforce_creation_plan(
@@ -776,8 +800,10 @@ async def test_generation_maps_runtime_boundary_failure_to_stable_503(
             "Create a research Workforce.",
         )
 
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.detail["code"] == "workforce_prompt_builder_unavailable"
+    assert exc_info.value.status_code == expected_status
+    assert exc_info.value.detail["code"] == expected_code
+    if case != "runtime":
+        assert exc_info.value.detail["message"] == "Review refused the prompt."
 
 
 def test_get_localized_description_prefers_english() -> None:

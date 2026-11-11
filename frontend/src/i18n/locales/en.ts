@@ -53,6 +53,8 @@ const en = {
     messageRateLimited: "You're sending messages too quickly. Please wait a moment and try again.",
     messageIdConflict: "Message id was already used for different content or files.",
     messageDeliveryFailed: "The message could not be delivered. Please retry the draft.",
+    inputReviewBlocked: "This request didn't pass input review. Please rephrase it or ask about a topic this agent supports.",
+    inputReviewUnavailable: "I couldn't complete the input safety check. Please try again.",
     messageContinuationUnsupported: "Task does not support message continuation.",
     taskPauseInProgress: "Task pause is still being applied; please retry shortly.",
     messageAcceptancePending: "Message acceptance is still being reconciled. Please retry shortly.",
@@ -1393,6 +1395,9 @@ Build when you need.`,
         willBeCleared: "Upload settings will be cleared.",
         invalidBadge: "Upload settings invalid",
         invalidBadgeDescription: "Upload settings are invalid, so this connector is unavailable.",
+      },
+      memberOAuth: {
+        destination: "After you sign in, your account token is sent to {host}",
       },
       // Account identifier step before a builtin OAuth popup, for providers
       // hosted on the customer's own account (oauth-account-dialog.tsx).

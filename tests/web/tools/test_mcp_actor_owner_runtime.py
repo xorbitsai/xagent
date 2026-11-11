@@ -2000,3 +2000,228 @@ async def test_actor_remote_oauth_row_storing_signed_uploads_is_unavailable(
     assert configs[0]["config"]["reason"] == "invalid_configuration"
     assert configs[0]["config"]["message"] == "MCP server upload settings are invalid."
     assert "actor-token" not in str(configs)
+
+
+def _add_gmail_server_and_native_grant(db: Session, user: User) -> None:
+    """Toby's Gmail connector with a native (non-Composio) actor grant, the
+    catalog row seeded as the current environment seeds it."""
+    app = get_builtin_public_mcp_app("gmail")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Gmail",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "gmail", "provider": "google"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id, mcpserver_id=server.id, is_owner=False, is_active=True
+        )
+    )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="gmail",
+            resource_owner_key=OWNER_A,
+            provider_user_id="google-subject",
+            access_token="native-gmail-token",
+            token_type="Bearer",
+        )
+    )
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_native_actor_gmail_grant_stays_unavailable_while_the_gate_is_closed(
+    db_session, monkeypatch
+) -> None:
+    """#3649: the Gmail Composio switch shows Gmail in the catalog, which is
+    also Toby's runtime admission check. A native Gmail grant must still not
+    run while our Google app has no restricted-scope approval; it is reported
+    as needing a connection, so the member reconnects through Composio."""
+    monkeypatch.delenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", "composio")
+    _add_gmail_server_and_native_grant(db_session.db, db_session.user)
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "oauth_token_required"
+    assert "native-gmail-token" not in str(configs)
+
+
+@pytest.mark.asyncio
+async def test_a_native_actor_gmail_grant_runs_while_the_gate_is_open(
+    db_session, monkeypatch
+) -> None:
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", "composio")
+    _add_gmail_server_and_native_grant(db_session.db, db_session.user)
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["config"]["env"]["GOOGLE_ACCESS_TOKEN"] == "native-gmail-token"
+
+
+@pytest.mark.asyncio
+async def test_a_composio_actor_gmail_grant_is_not_held_back_by_the_gate(
+    db_session, monkeypatch
+) -> None:
+    """The gate holds back only native grants: once the Gmail tools run on a
+    Composio grant (#3647, simulated here), a Composio Gmail grant launches
+    with the Composio values while the gate stays closed."""
+    from xagent.web.tools import config as tools_config
+
+    monkeypatch.delenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    monkeypatch.setattr(
+        tools_config,
+        "_COMPOSIO_PROXY_APPS",
+        tools_config._COMPOSIO_PROXY_APPS | {"gmail"},
+    )
+    _add_gmail_server_and_native_grant(db_session.db, db_session.user)
+    grant = db_session.db.query(UserOAuth).filter_by(provider="gmail").one()
+    grant.access_token = "ca_gmail"
+    grant.token_type = "composio"
+    grant.instance_url = "actor-hmac"
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    env = configs[0]["config"]["env"]
+    assert env["COMPOSIO_CONNECTED_ACCOUNT_ID"] == "ca_gmail"
+    assert "GOOGLE_ACCESS_TOKEN" not in env
+
+
+@pytest.mark.asyncio
+async def test_a_held_back_native_actor_gmail_grant_is_never_refreshed(
+    db_session, monkeypatch
+) -> None:
+    """Holding the grant back after refreshing it would still call Google
+    through our unapproved app and store the new token; it is held back first."""
+    from xagent.web.tools import config as tools_config
+
+    monkeypatch.delenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", "composio")
+    _add_gmail_server_and_native_grant(db_session.db, db_session.user)
+    grant = db_session.db.query(UserOAuth).filter_by(provider="gmail").one()
+    grant.refresh_token = "native-refresh"
+    grant.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    db_session.db.commit()
+
+    async def no_refresh(*args, **kwargs):
+        raise AssertionError("a held-back Gmail grant must not be refreshed")
+
+    monkeypatch.setattr(tools_config, "refresh_oauth_token_if_needed", no_refresh)
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "oauth_token_required"
+    db_session.db.expire_all()
+    grant = db_session.db.query(UserOAuth).filter_by(provider="gmail").one()
+    assert (grant.access_token, grant.refresh_token) == (
+        "native-gmail-token",
+        "native-refresh",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("switch", ["composio", None], ids=["switch-on", "switch-off"])
+async def test_a_web_gmail_grant_is_left_as_on_main(db_session, monkeypatch, switch):
+    """Only Toby's grants are held back; an ordinary (web) Gmail grant
+    resolves as it does on main, whatever the switch."""
+    monkeypatch.delenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", raising=False)
+    if switch:
+        monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", switch)
+    else:
+        monkeypatch.delenv("XAGENT_GMAIL_AUTH_BACKEND", raising=False)
+    _add_gmail_server_and_native_grant(db_session.db, db_session.user)
+    grant = db_session.db.query(UserOAuth).filter_by(provider="gmail").one()
+    grant.resource_owner_key = None
+    db_session.db.commit()
+
+    configs = await _config(db_session, policy=None).get_mcp_server_configs()
+
+    assert len(configs) == 1
+    assert configs[0]["config"]["env"]["GOOGLE_ACCESS_TOKEN"] == "native-gmail-token"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gate_open", [False, True], ids=["gate-closed", "gate-open"])
+async def test_a_shared_native_actor_gmail_grant_is_held_back_too(
+    db_session, monkeypatch, gate_open
+) -> None:
+    """Toby's Gmail token can also come from a native shared Google grant;
+    that path is held back the same way, before any refresh."""
+    from xagent.web.models.oauth_provider import OAuthProvider
+    from xagent.web.services.google_oauth_grants import (
+        write_google_shared_oauth_callback,
+    )
+    from xagent.web.tools import config as tools_config
+
+    if gate_open:
+        monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "true")
+    else:
+        monkeypatch.delenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", raising=False)
+    monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session.db, db_session.user
+    _add_gmail_server_and_native_grant(db, user)
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id="google-client-id",
+            client_secret="secret",
+            auth_url="https://accounts.google.com/o/oauth2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            default_scopes=[],
+        )
+    )
+    db.flush()
+    scopes = get_builtin_public_mcp_app("gmail")["oauth_scopes"]
+    write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=OWNER_A,
+        oauth_client_id="google-client-id",
+        app_id="gmail",
+        google_subject="google-subject",
+        access_token="shared-native-token",
+        refresh_token="shared-refresh",
+        granted_scopes=" ".join(scopes),
+        requested_scopes=list(scopes),
+        email="a@example.com",
+        token_type="Bearer",
+        expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        legacy_oauth_account=db.query(UserOAuth).filter_by(provider="gmail").one(),
+    )
+    db.commit()
+    refreshed: list[str] = []
+
+    async def refresh(db, account, provider, **kwargs):
+        refreshed.append(str(account.provider))
+        return True
+
+    monkeypatch.setattr(tools_config, "refresh_oauth_token_if_needed", refresh)
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    if gate_open:
+        # The shared grant is the one that resolves when the gate allows it.
+        assert configs[0]["config"]["env"]["GOOGLE_ACCESS_TOKEN"] == (
+            "shared-native-token"
+        )
+        assert refreshed == ["google"]
+    else:
+        assert configs[0]["transport"] == "unavailable"
+        assert configs[0]["config"]["reason"] == "oauth_token_required"
+        assert refreshed == []

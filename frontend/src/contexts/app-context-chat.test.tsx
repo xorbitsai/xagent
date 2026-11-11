@@ -3,6 +3,8 @@ import { flushSync } from "react-dom"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+
 type TestWebSocketMessage = {
   type: string
   timestamp: string
@@ -9914,6 +9916,112 @@ describe("terminal error frames", () => {
     // The turn is untouched: still running, still processing.
     expect(screen.getByTestId("task-status").textContent).toBe("running")
     expect(screen.getByTestId("processing").textContent).toBe("true")
+  })
+
+  it.each([
+    ["input_review_blocked", "clientErrors.inputReviewBlocked"],
+    ["input_review_unavailable", "clientErrors.inputReviewUnavailable"],
+  ])("renders each %s notice in the conversation panel", async (code, translation) => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <TaskConversationPanel mode="embedded-preview" showProcessView={false} />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    act(() => {
+      for (const turnId of ["refusal-1", "refusal-1", "refusal-2"]) {
+        onMessage?.({
+          type: "error",
+          timestamp: "2026-05-27T05:00:02Z",
+          task_id: 1,
+          data: { error_code: code, turn_id: turnId },
+        })
+      }
+    })
+    await waitFor(() => expect(screen.getAllByText(translation)).toHaveLength(2))
+  })
+
+  it("keeps one completed input refusal across live delivery and history replay", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <TaskConversationPanel mode="embedded-preview" showProcessView={false} />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const refusal = "This request didn't pass input review. Please rephrase it."
+    const payload = {
+      message: refusal,
+      message_type: "input_review_rejected",
+      role: "assistant",
+      display: "chat",
+    }
+    const frame = {
+      type: "trace_event",
+      task_id: 1,
+      timestamp: "2026-05-27T05:00:02Z",
+    }
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+    const sendLive = (id: string) => onMessage?.({
+      ...frame,
+      event_type: "agent_message",
+      event_id: id,
+      data: { ...payload, status: "completed" },
+    } as TestWebSocketMessage)
+    const sendReplay = (id: string) => onMessage?.({
+      ...frame,
+      data: {
+        event_type: "agent_message",
+        event_id: id,
+        data: { ...payload, source: "chat_history" },
+      },
+    })
+    const expectRefusalCount = (count: number) => {
+      expect(screen.getAllByText(refusal)).toHaveLength(count)
+      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+      expect(messages.filter((m: { content: string }) => m.content === refusal)).toEqual(
+        Array.from({ length: count }, () => expect.objectContaining({ status: "completed" }))
+      )
+    }
+
+    act(() => sendLive("chat_message_21"))
+    await waitFor(() => expectRefusalCount(1))
+    expect(screen.getByTestId("task-status")).toHaveTextContent("running")
+    act(() => sendReplay("chat_message_21"))
+    expectRefusalCount(1)
+    act(() => sendLive("chat_message_24"))
+    expectRefusalCount(2)
+  })
+
+  it("does not infer completion from an input refusal replay without a status", async () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+
+    act(() => webSocketOptions.current?.onMessage?.({
+      type: "trace_event",
+      task_id: 1,
+      timestamp: "2026-05-27T05:00:02Z",
+      data: {
+        event_type: "agent_message",
+        event_id: "chat_message_21",
+        data: {
+          message: "Input review temporarily unavailable.",
+          message_type: "input_review_rejected",
+          role: "assistant",
+          display: "chat",
+          source: "chat_history",
+        },
+      },
+    }))
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages).toContainEqual(expect.objectContaining({
+      content: "Input review temporarily unavailable.",
+      status: "running",
+    }))
   })
 
   // The waiting half. A refused resume arrives on the root "error" type

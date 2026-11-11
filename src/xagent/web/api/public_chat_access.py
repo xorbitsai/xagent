@@ -42,6 +42,9 @@ from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from ..services.conversation_storage_rollout import (
+    new_task_conversation_storage_version,
+)
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.orphan_upload_gc import TASKLESS_SHARE_UPLOAD_SOURCE
@@ -1385,6 +1388,9 @@ async def create_public_chat_task(
         agent_config=agent_config,
         source="widget",
         is_visible=False,
+        conversation_storage_version=new_task_conversation_storage_version(
+            entry="widget", owner_user_id=int(access_context.user.id)
+        ),
     )
     selected_refs = prepare_connector_runtime_selection_snapshot(
         db=db,
@@ -1544,6 +1550,9 @@ async def create_share_chat_task(
         agent_config=agent_config,
         source="shared_link",
         is_visible=False,
+        conversation_storage_version=new_task_conversation_storage_version(
+            entry="shared_link", owner_user_id=int(access_context.user.id)
+        ),
     )
     selected_refs = prepare_connector_runtime_selection_snapshot(
         db=db,

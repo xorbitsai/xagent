@@ -21,6 +21,16 @@ from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.services.assistant_history_safety import (
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+)
+from xagent.web.services.chat_history_service import (
+    load_task_transcript_window,
+    persist_user_message_no_commit,
+)
+from xagent.web.services.execution_result_projection import (
+    project_execution_result_for_channel,
+)
 from xagent.web.services.managed_task_lease import (
     ManagedTaskLease,
     claim_managed_task_lease,
@@ -99,6 +109,56 @@ def test_finalize_managed_result_commits_exact_status_and_transcript(
     )
     assert "completed inline" in stored.content
     assert stored.turn_id == "accepted-turn"
+
+
+@pytest.mark.parametrize("storage_version", [1, 2])
+def test_finalize_managed_review_refusal_excludes_turn_from_model_history(
+    db_session, storage_version
+) -> None:
+    task = _create_task(db_session)
+    task.conversation_storage_version = storage_version
+    task_id, user_id = int(task.id), int(task.user_id)
+    persist_user_message_no_commit(
+        db_session, task_id, user_id, "Keep earlier turn", turn_id="earlier"
+    )
+    persist_user_message_no_commit(
+        db_session, task_id, user_id, "Declined prompt", turn_id="declined"
+    )
+    db_session.commit()
+    lease = acquire_task_lease(db_session, task_id, new_run=True)
+    assert lease is not None
+    result = {
+        "success": True,
+        "completion_outcome": "blocked",
+        "input_review_rejected": True,
+        "output": "Declined",
+    }
+    projection = project_execution_result_for_channel(result)
+
+    assert finalize_managed_task_lease_result(
+        db_session,
+        lease,
+        status=projection.task_status,
+        assistant_content=projection.transcript_content,
+        message_type=projection.message_type,
+        turn_id="declined",
+        execution_result=result,
+    )
+
+    messages = db_session.query(TaskChatMessage).filter_by(task_id=task_id)
+    assert messages.filter_by(turn_id="earlier").one().message_type == "user_message"
+    if storage_version == 1:
+        assert (
+            messages.filter_by(turn_id="declined", role="user").one().message_type
+            == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        )
+    notice = messages.filter_by(turn_id="declined", role="assistant").one()
+    assert notice.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+    assert notice.content == projection.visible_text == "Declined"
+    assert [
+        message["content"]
+        for message in load_task_transcript_window(db_session, task_id).messages
+    ] == (["Keep earlier turn"] if storage_version == 1 else [])
 
 
 def test_finalize_managed_result_rejects_replacement_owner(db_session) -> None:

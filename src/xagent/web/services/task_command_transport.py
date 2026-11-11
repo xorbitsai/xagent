@@ -327,6 +327,10 @@ def _canonical_payload(payload: dict[str, Any]) -> str:
 # ``reserved=True`` is the sweeper's door into the namespace; it has no
 # production caller until the sweeper lands, and tests exercise it.
 AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
+# Command ids of a planned release's hand-over pauses (``release_handover``).
+# Reserved like the auto-resume namespace, but staged with ``handover=True``,
+# not ``reserved``: they are ordinary pause commands, not background ones.
+HANDOVER_COMMAND_PREFIX = "release-handover:"
 
 
 def _normalize_command_id(command_id: str, *, reserved: bool = False) -> str:
@@ -481,11 +485,14 @@ def stage_task_command(
     reply_origin: str | None = None,
     target_run_id: str | None = None,
     reserved: bool = False,
+    handover: bool = False,
 ) -> StagedTaskCommand:
     """Add an idempotent command row to the session without ending its transaction.
 
     ``reserved`` admits the auto-resume sweeper's command id namespace;
     every other caller leaves it False, so no ingress can stage one.
+    ``handover`` does the same for a release hand-over's pause ids
+    (``release_handover``).
 
     Never calls ``db.commit()``, ``db.rollback()``, or the dispatcher notify --
     the caller owns the transaction boundary and decides what durability means
@@ -544,6 +551,8 @@ def stage_task_command(
     """
 
     normalized_id = _normalize_command_id(command_id, reserved=reserved)
+    if not handover and normalized_id.startswith(HANDOVER_COMMAND_PREFIX):
+        raise ValueError(f"command_id prefix {HANDOVER_COMMAND_PREFIX!r} is reserved")
     resolved_task_id = int(task_id)
 
     try:

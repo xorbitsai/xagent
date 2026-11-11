@@ -13,6 +13,13 @@ import unicodedata
 from enum import StrEnum
 from typing import Any
 
+from ...core.guardrails.input import (
+    BLOCKED_INPUT,
+    INPUT_REVIEW_BLOCKED_CODE,
+    INPUT_REVIEW_UNAVAILABLE_CODE,
+    UNAVAILABLE_INPUT,
+    InputReviewRejected,
+)
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_NOT_FOUND,
@@ -85,6 +92,8 @@ class ClientErrorCode(StrEnum):
     MESSAGE_RATE_LIMITED = "message_rate_limited"
     MESSAGE_ID_CONFLICT = "message_id_conflict"
     MESSAGE_DELIVERY_FAILED = "message_delivery_failed"
+    INPUT_REVIEW_BLOCKED = INPUT_REVIEW_BLOCKED_CODE
+    INPUT_REVIEW_UNAVAILABLE = INPUT_REVIEW_UNAVAILABLE_CODE
     MESSAGE_CONTINUATION_UNSUPPORTED = "message_continuation_unsupported"
     TASK_PAUSE_IN_PROGRESS = "task_pause_in_progress"
     MESSAGE_ACCEPTANCE_PENDING = "message_acceptance_pending"
@@ -131,6 +140,28 @@ class ClientErrorCode(StrEnum):
     AUTO_RESUME_CANCEL_RACED = "auto_resume_cancel_raced"
 
 
+INPUT_REVIEW_CLIENT_ERROR_CODES = frozenset(
+    {ClientErrorCode.INPUT_REVIEW_BLOCKED, ClientErrorCode.INPUT_REVIEW_UNAVAILABLE}
+)
+
+
+def input_review_error_code(unavailable: bool) -> ClientErrorCode:
+    return (
+        ClientErrorCode.INPUT_REVIEW_UNAVAILABLE
+        if unavailable
+        else ClientErrorCode.INPUT_REVIEW_BLOCKED
+    )
+
+
+def input_review_delivery_failure(
+    rejection: InputReviewRejected | None,
+) -> tuple[ClientErrorCode, bool]:
+    """Return the delivery code and whether a new ID is safe to retry."""
+    if rejection is None:
+        return ClientErrorCode.MESSAGE_DELIVERY_FAILED, True
+    return input_review_error_code(rejection.unavailable), rejection.unavailable
+
+
 def client_error_message(code: ClientErrorCode) -> str:
     """Return the fixed safe fallback for a stable client error code."""
 
@@ -148,6 +179,8 @@ def client_error_message(code: ClientErrorCode) -> str:
         ClientErrorCode.MESSAGE_DELIVERY_FAILED: (
             "The message could not be delivered. Please retry the draft."
         ),
+        ClientErrorCode.INPUT_REVIEW_BLOCKED: BLOCKED_INPUT,
+        ClientErrorCode.INPUT_REVIEW_UNAVAILABLE: UNAVAILABLE_INPUT,
         ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED: (
             "Task does not support message continuation."
         ),

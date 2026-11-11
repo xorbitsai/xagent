@@ -558,6 +558,49 @@ async def test_handle_builder_chat_hides_connectors_from_current_config() -> Non
 
 
 @pytest.mark.asyncio
+async def test_builder_review_refusal_is_visible_but_not_replayed() -> None:
+    approved_history = [{"role": "assistant", "content": "An earlier answer"}]
+    service = MagicMock()
+    service.execute_task = AsyncMock(
+        side_effect=[
+            {"success": True, "input_review_rejected": True, "output": "Declined"},
+            {"success": True, "output": "Next answer"},
+        ]
+    )
+    websocket = AsyncMock()
+    websocket.state = SimpleNamespace(
+        builder_task_id="builder-review",
+        builder_agent_service=service,
+        builder_chat_history=approved_history.copy(),
+    )
+    user = SimpleNamespace(id=1, is_admin=False, voice=None)
+    with (
+        patch(
+            "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+            new_callable=AsyncMock,
+            return_value=BuilderChatRuntimeInputs(
+                authorized_file_ids=(), llm=AsyncMock(), compact_llm=None
+            ),
+        ),
+        patch("xagent.web.user_isolated_memory.UserContext"),
+    ):
+        await handle_builder_chat(websocket, {"message": "Declined prompt"}, user)
+        assert websocket.state.builder_chat_history == approved_history
+        assert any(
+            json.loads(call.args[0]).get("result", {}).get("content") == "Declined"
+            for call in websocket.send_text.await_args_list
+        )
+        await handle_builder_chat(websocket, {"message": "Next question"}, user)
+
+    assert service.execute_task.await_count == 2
+    assert websocket.state.builder_chat_history == [
+        *approved_history,
+        {"role": "user", "content": "Next question"},
+        {"role": "assistant", "content": "Next answer"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_handle_builder_chat_no_llm() -> None:
     """
     Test that handle_builder_chat handles missing LLM gracefully.

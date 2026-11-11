@@ -29,6 +29,7 @@ from ..models.chat_message import TaskChatMessage
 from ..models.task import Task
 from ..models.task_execution_event import TaskExecutionEvent
 from .assistant_history_safety import (
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
     TASK_FAILURE_MESSAGE_TYPE,
     assistant_history_has_safe_ancillary_payload,
     client_safe_assistant_history_content,
@@ -621,9 +622,9 @@ def _project(
     for event in events:
         if event.kind == "assistant_message":
             data = _data(event)
-            if (
-                event.sequence <= transcript_floor
-                or data.get("message_type") == TASK_FAILURE_MESSAGE_TYPE
+            if event.sequence <= transcript_floor or data.get("message_type") in (
+                TASK_FAILURE_MESSAGE_TYPE,
+                INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
             ):
                 continue
             if not isinstance(data.get("content"), str):
@@ -692,7 +693,11 @@ def _project(
                     f"Invalid execution settlement (task_id={event.task_id}, event_id={event.event_id})"
                 )
             status = result.get("status", data.get("status"))
-            if status in {"waiting_for_user", "interrupted", "paused"}:
+            if result.get("input_review_rejected") is True or status in {
+                "waiting_for_user",
+                "interrupted",
+                "paused",
+            }:
                 continue
             if status == "cancelled":
                 failure = cast(str | None, "- Previous execution was cancelled.")

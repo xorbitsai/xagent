@@ -1,9 +1,16 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from tests.web.api.conftest import _direct_db_session
+from xagent.core.agent.execution_adapter import (
+    AgentExecutionAdapter,
+    AgentExecutionConfig,
+)
+from xagent.core.guardrails import input as input_review
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
@@ -11,8 +18,16 @@ from xagent.web.models.user import User
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.assistant_history_safety import (
     CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+    client_safe_assistant_history_content,
 )
-from xagent.web.services.chat_history_service import persist_assistant_message_no_commit
+from xagent.web.services.chat_history_service import (
+    DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
+    load_task_transcript_window,
+    persist_assistant_message_no_commit,
+    persist_user_message_no_commit,
+)
 from xagent.web.services.hot_path_cache import (
     cache_version_token,
     web_task_history_key,
@@ -332,6 +347,7 @@ async def test_unsafe_legacy_assistant_ancillary_payload_is_not_replayed(
     ("message_type", "expected_message_type"),
     [
         ("task_failure", "task_failure"),
+        ("input_review_rejected", "input_review_rejected"),
         # Fail-closed legacy rows may be legitimate answers, so they are not
         # marked failed on the client.
         ("chat_response", None),
@@ -340,7 +356,7 @@ async def test_unsafe_legacy_assistant_ancillary_payload_is_not_replayed(
         ("question", None),
     ],
 )
-async def test_legacy_history_exposes_only_task_failure_provenance(
+async def test_legacy_history_exposes_failure_and_refusal_provenance(
     _test_db,
     monkeypatch: pytest.MonkeyPatch,
     message_type: str,
@@ -358,13 +374,19 @@ async def test_legacy_history_exposes_only_task_failure_provenance(
     )
 
     agent_messages = [
-        event.get("data", {})
+        event
         for event in events
         if event.get("event_type") == "agent_message"
         and event.get("data", {}).get("source") == "chat_history"
     ]
     assert len(agent_messages) == 1
-    assert agent_messages[0].get("message_type") == expected_message_type
+    message = agent_messages[0]
+    assert message["data"].get("message_type") == expected_message_type
+    with _direct_db_session() as db:
+        row = (
+            db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
+        )
+        assert message["event_id"] == f"chat_message_{row.id}"
 
 
 @pytest.mark.asyncio
@@ -602,6 +624,169 @@ async def test_new_plain_assistant_response_replays_unchanged(
         for event in events
     )
     assert CLIENT_SAFE_TASK_FAILURE not in repr(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict", ["blocked", "blocked_publish_failure", "exception", "timeout"]
+)
+@pytest.mark.parametrize("storage_version", [1, 2])
+async def test_input_review_refusal_excludes_turn_and_notice_from_model_history(
+    _test_db,
+    monkeypatch,
+    verdict,
+    storage_version,
+) -> None:
+    unavailable = verdict in {"exception", "timeout"}
+    run_id = "review-run"
+    task_id, user_id = _running_task(
+        username="review-history", title="Review history", run_id=run_id
+    )
+    candidate_text = "This turn is under review"
+    turn_id = "review-turn" if storage_version == 2 else None
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        task.conversation_storage_version = storage_version
+        if storage_version == 1:
+            persist_user_message_no_commit(db, task_id, user_id, "Approved earlier")
+            persist_user_message_no_commit(
+                db,
+                task_id,
+                user_id,
+                "Failed to deliver",
+                delivery_status=DELIVERY_FAILED,
+            )
+        candidate = persist_user_message_no_commit(
+            db,
+            task_id,
+            user_id,
+            candidate_text,
+            turn_id=turn_id,
+            delivery_status=DELIVERY_DISPATCHED,
+        )
+        db.flush()
+        candidate_id = int(candidate.id)
+        db.commit()
+
+    async def review(_request):
+        if verdict == "timeout":
+            await asyncio.Event().wait()
+        if verdict == "exception":
+            raise RuntimeError("Reviewer offline")
+        return input_review.InputReviewResult(refusal=input_review.BLOCKED_INPUT)
+
+    monkeypatch.setattr(input_review, "_review", review)
+    monkeypatch.setattr(input_review, "get_input_review_timeout_seconds", lambda: 0)
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="review-history",
+            pattern="react",
+            llm=object(),
+            workspace_enabled=False,
+        )
+    )
+
+    async def execute(*, task, context, task_id, **_kwargs):
+        return await adapter.execute(task=task, context=context, task_id=task_id)
+
+    manager = SimpleNamespace(
+        get_agent_for_task=AsyncMock(return_value=MagicMock()),
+        execute_task=execute,
+    )
+    snapshot = SimpleNamespace(
+        task=SimpleNamespace(
+            user_id=user_id,
+            run_id=run_id,
+            source="internal",
+            status=TaskStatus.RUNNING,
+            agent_id=None,
+            agent_config={},
+        ),
+        runtime_user=None,
+        agent=None,
+        conversation_history=(),
+        conversation_watermark=None,
+        conversation_event_watermark=None,
+        execution_recovery=None,
+    )
+    from xagent.web.services import task_event_display, task_execution_context_service
+
+    monkeypatch.setattr(
+        task_execution_context_service,
+        "materialize_task_execution_recovery_state",
+        AsyncMock(return_value={}),
+    )
+    publish = AsyncMock()
+    monkeypatch.setattr(task_event_display, "publish_task_result", publish)
+
+    async def publish_live_event(message, _task_id):
+        if (
+            verdict == "blocked_publish_failure"
+            and message.get("event_type") == "agent_message"
+        ):
+            raise RuntimeError("Chat transport unavailable")
+
+    publish_event = AsyncMock(side_effect=publish_live_event)
+    monkeypatch.setattr(task_execution_service, "publish_task_event", publish_event)
+    await task_execution_service.execute_task_background(
+        task_id=task_id,
+        user_message=candidate_text,
+        context={"turn_id": turn_id} if turn_id else None,
+        agent_manager=manager,
+        task_owner_user_id=user_id,
+        before_message_id=candidate_id,
+        expected_run_id=run_id,
+        task_setup_snapshot=snapshot,
+        resolved_execution_scope=None,
+    )
+    publish.assert_awaited_once()
+    response = publish.await_args.args[0]
+    expected_text = (
+        input_review.UNAVAILABLE_INPUT if unavailable else input_review.BLOCKED_INPUT
+    )
+    assert response["output"] == expected_text
+    assert response["error_code"] == (
+        input_review.INPUT_REVIEW_UNAVAILABLE_CODE if unavailable else None
+    )
+    with _direct_db_session() as db:
+        task = db.get(Task, task_id)
+        assert task.status == (
+            TaskStatus.FAILED if unavailable else TaskStatus.COMPLETED
+        )
+        assert task.completion_outcome == (None if unavailable else "blocked")
+        candidate = db.get(TaskChatMessage, candidate_id)
+        if storage_version == 1:
+            assert candidate.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        assert candidate.content == candidate_text
+        assert candidate.delivery_status == DELIVERY_DISPATCHED
+        notice = (
+            db.query(TaskChatMessage).filter_by(task_id=task_id, role="assistant").one()
+        )
+        assert notice.message_type == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+        replies = [
+            call.args[0]
+            for call in publish_event.await_args_list
+            if call.args[0].get("event_type") == "agent_message"
+        ]
+        if storage_version == 1 and not unavailable:
+            assert len(replies) == 1
+            assert replies[0]["event_id"] == f"chat_message_{notice.id}"
+            assert replies[0]["data"]["message"] == expected_text
+            assert (
+                replies[0]["data"]["message_type"] == INPUT_REVIEW_REJECTED_MESSAGE_TYPE
+            )
+        else:
+            assert replies == []
+        assert (
+            client_safe_assistant_history_content(
+                content=notice.content, message_type=notice.message_type
+            )
+            == expected_text
+        )
+        replay = load_task_transcript_window(db, task_id)
+        assert [message["content"] for message in replay.messages] == (
+            ["Approved earlier"] if storage_version == 1 else []
+        )
 
 
 def test_failed_websocket_result_with_null_diagnostics_uses_safe_fallback(

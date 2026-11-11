@@ -1932,3 +1932,55 @@ def test_run_rejects_a_foreign_generated_manager_agent_used_as_worker(
     with pytest.raises(HTTPException) as exc_info:
         validate_workforce_for_run(db_session, user, workforce)
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "via"),
+    [
+        ({}, "web_chat"),
+        ({"source": "sdk"}, "sdk"),
+        ({"source": "widget"}, "widget"),
+        ({"source": "shared_link"}, "shared_link"),
+        ({"source": "trigger"}, "trigger"),
+        ({"is_preview": True}, "agent_preview"),
+        ({"source": "sdk", "is_preview": True}, "agent_preview"),
+        ({"source": "something_new"}, None),
+    ],
+)
+def test_workforce_run_storage_version_follows_workforce_and_initiating_entry(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict[str, Any],
+    via: str | None,
+) -> None:
+    from xagent.web.services.workforce_runs import create_workforce_run_record
+
+    user = _create_user(db_session, "owner")
+    manager = _create_agent(db_session, user, "Manager")
+    worker_agent = _create_agent(db_session, user, "Analyst")
+    workforce = _create_workforce(db_session, user, manager)
+    _add_worker(db_session, user, workforce, worker_agent)
+    db_session.commit()
+
+    def version(entries: str) -> int:
+        monkeypatch.setenv("XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES", entries)
+        record = create_workforce_run_record(
+            db_session, user, workforce, message="go", **kwargs
+        )
+        task = db_session.get(Task, int(record.task.id))
+        return int(task.conversation_storage_version)
+
+    assert version("") == 1
+    assert version("workforce") == 1
+    if via is None:
+        # Unmapped source: V1 even when every entry is enabled, no error.
+        assert version(",".join(sorted(_all_entries()))) == 1
+        return
+    assert version(via) == 1
+    assert version(f"workforce,{via}") == 2
+
+
+def _all_entries() -> frozenset[str]:
+    from xagent.web.services.conversation_storage_rollout import STORAGE_ENTRIES
+
+    return STORAGE_ENTRIES

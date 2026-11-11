@@ -58,6 +58,11 @@ _delegated_agent_id: ContextVar[int | None] = ContextVar(
 )
 
 
+def get_delegated_review_agent_id() -> int | None:
+    """Return the authorized delegated agent shared by host review hooks."""
+    return _delegated_agent_id.get()
+
+
 class ProtectedInteractionError(RuntimeError):
     """A rejected question must not park the run waiting for a reply."""
 
@@ -78,7 +83,7 @@ async def resolve_output_guardrail(execution_id: str) -> OutputGuardrail | None:
     request = OutputReviewRequest(
         execution_id=execution_id,
         user_id=current_user_id.get(),
-        delegated_agent_id=_delegated_agent_id.get(),
+        delegated_agent_id=get_delegated_review_agent_id(),
     )
     return await _resolver(request, inherited) or inherited
 

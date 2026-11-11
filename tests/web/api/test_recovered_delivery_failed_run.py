@@ -45,6 +45,9 @@ from tests.web.api.test_recovered_delivery_outcome_unknown import (
     _settled_task,
     _user_rows,
 )
+from xagent.core.agent import Agent, ExecutionContext
+from xagent.core.agent.runner import AgentRunner
+from xagent.core.guardrails import input as input_review
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.database import (
     Base,
@@ -60,6 +63,7 @@ from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_execution_controller as controller_module
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
+    DELIVERY_FAILED,
     DELIVERY_OUTCOME_UNKNOWN,
     DELIVERY_PENDING,
 )
@@ -71,6 +75,7 @@ from xagent.web.services.task_command_transport import (
     COMMAND_PROCESSING,
     TaskCommandDeferred,
     TaskCommandKind,
+    TaskCommandRejected,
     dispatch_one_task_command,
     enqueue_task_command,
     get_runner_id,
@@ -664,6 +669,80 @@ async def _wait_for_resume_to_finish(background_manager: Any, task_id: int) -> N
             return
         await asyncio.sleep(0.01)
     raise AssertionError("the resume coordinator never finished")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_input_review_rejects_websocket_delivery_without_resuming(
+    db_session, live_task_lease, recording_reply, monkeypatch, live, unavailable
+) -> None:
+    owner = _user(db_session, "review-owner")
+    task = _live_task(db_session, int(owner.id))
+    task_id = int(task.id)
+    prior_status = TaskStatus.RUNNING if live else TaskStatus.WAITING_FOR_USER
+    task.status = prior_status
+    task.control_state = prior_status.value
+    task.runner_id = get_runner_id() if live else None
+    task.lease_expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=1) if live else None
+    )
+    db_session.commit()
+    if live:
+        live_task_lease(db_session, task)
+
+    runner = AgentRunner(agent=Agent(name="reviewed", patterns=[], llm=None))
+    context = ExecutionContext(execution_id=str(task_id))
+    runner.context_manager.set_context(context)
+    hook = AsyncMock(
+        return_value=input_review.InputReviewResult(
+            refusal="Reply refused.", unavailable=unavailable
+        )
+    )
+    monkeypatch.setattr(input_review, "_review", hook)
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(wraps=runner.post_user_message)
+    background_manager = task_execution_service.BackgroundTaskManager()
+    agent_patch, manager_patch = _real_resume_environment(agent, background_manager)
+    with (
+        agent_patch,
+        manager_patch,
+        patch.object(task_execution_service, "publish_task_event", AsyncMock()),
+    ):
+        try:
+            await execute_durable_task_command(_message_command(task, owner, TURN_ID))
+        except TaskCommandDeferred:
+            assert not live
+        except TaskCommandRejected:
+            # A delivery that has already failed is rejected by the command
+            # dispatcher. A still-pending deferred delivery settles below.
+            pass
+        await _wait_for_resume_to_finish(background_manager, task_id)
+
+    hook.assert_awaited_once()
+    request = hook.await_args.args[0]
+    assert request.user_id == int(owner.id)
+    assert request.source == "reply"
+    assert agent.post_user_message.await_args.kwargs["request_interrupt"] is live
+    assert context.messages == []
+    agent.resume_task.assert_not_called()
+    assert _row_status(db_session, task_id) == DELIVERY_FAILED
+    notices = [
+        frame
+        for frame in recording_reply.frames
+        if frame.get("type") == "message_rejected"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["error_code"] == (
+        ClientErrorCode.INPUT_REVIEW_UNAVAILABLE.value
+        if unavailable
+        else ClientErrorCode.INPUT_REVIEW_BLOCKED.value
+    )
+    assert notices[0].get("retry_with_new_id", False) is unavailable
+    db_session.expire_all()
+    assert db_session.get(Task, task_id).status == prior_status
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/ui/markdown-renderer.tsx",
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
+        "src/components/widget/use-first-message-driver.ts",
         "src/components/widget/use-history-continue.ts",
         "src/components/widget/use-paged-history.ts",
         "src/components/widget/use-session-attachments.ts",
@@ -92,6 +93,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/widget/use-session-attachments.ts": {
           statements: 90, branches: 85, functions: 75, lines: 90,
+        },
+        "src/components/widget/use-first-message-driver.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/components/widget/use-history-continue.ts": {
           statements: 100, branches: 100, functions: 100, lines: 100,

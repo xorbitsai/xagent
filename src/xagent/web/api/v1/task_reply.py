@@ -10,6 +10,7 @@ from ....core.agent.checkpoint import (
     CheckpointReadError,
     UnknownToolEffectError,
 )
+from ....core.guardrails.input import InputReviewRejected
 from ...models.database import get_session_local
 from ...schemas.v1 import (
     REPLY_STATUS_QUEUED,
@@ -101,7 +102,8 @@ async def reply_to_task(
         V1ApiError 410: ``task_expired`` -- the retention policy expired
             a task this key could have seen.
         V1ApiError 422: body.message.files is non-empty, or
-            body.agent_id is missing for an agent-bound key.
+            body.agent_id is missing for an agent-bound key, or input review
+            rejected the reply.
         V1ApiError 409: ``task_busy`` (task is RUNNING, or the resume
             lease was lost to a concurrent reply -- retryable; with
             ``details.retry_with_new_id`` the reply was provably not
@@ -111,9 +113,9 @@ async def reply_to_task(
             saved progress cannot be resumed -- NOT retryable, the task
             stays in waiting_for_user and the caller must start a new
             task).
-        V1ApiError 503: ``temporarily_unavailable`` -- the saved
-            progress could not be read due to a transient failure;
-            retryable.
+        V1ApiError 503: ``temporarily_unavailable`` -- a transient failure
+            prevented reading saved progress or reviewing the reply. If
+            ``details.retry_with_new_id`` is set, retry with a new command ID.
         500: any other unexpected error (V1 envelope via the global
             handler), including a lease lost mid-resume.
     """
@@ -127,6 +129,15 @@ async def reply_to_task(
 
     try:
         result = await task_resume_service.resume_task_reply(ctx)
+    except InputReviewRejected as exc:
+        if exc.unavailable:
+            raise V1ApiError(
+                V1ErrorCode.TEMPORARILY_UNAVAILABLE,
+                503,
+                message=str(exc),
+                details={"accepted": False, "retry_with_new_id": True},
+            ) from exc
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
     except task_resume_service.TaskResumeOutcomeUnknownError as exc:
         raise V1ApiError(
             V1ErrorCode.REPLY_OUTCOME_UNKNOWN,

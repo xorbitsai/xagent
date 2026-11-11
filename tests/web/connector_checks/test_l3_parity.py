@@ -233,10 +233,10 @@ def test_the_default_declarations_run_each_probe_as_its_l3_check(app_id: str) ->
 
 
 async def test_the_engine_runs_the_registry_by_default() -> None:
-    tool = FakeTool("gmail_search_messages")
-    adapter = FakeAdapter([ConnectorTarget("gmail")], {"gmail": listed(tool)})
+    tool = FakeTool("slack_list_channels")
+    adapter = FakeAdapter([ConnectorTarget("slack")], {"slack": listed(tool)})
 
     result = await run_checks(adapter)
 
-    assert rows(result)[1] == ("gmail", "gmail.l3_probe", "pass", None, None)
-    assert tool.calls == [dict(CONNECTOR_PROBES["gmail"].arguments)]
+    assert rows(result)[1] == ("slack", "slack.l3_probe", "pass", None, None)
+    assert tool.calls == [dict(CONNECTOR_PROBES["slack"].arguments)]

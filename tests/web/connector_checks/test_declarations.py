@@ -10,6 +10,7 @@ import pytest
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import GateDecisionValue
 from xagent.web.connector_checks.declarations import (
     ConnectorChecks,
+    Contains,
     CreatedRef,
     DeclarationError,
     EachHasKeys,
@@ -209,6 +210,7 @@ def _read(**changes: Any) -> ReadCheck:
         (_checks(reads=(_read(assertions=(Length((), min=-1),)),)), "length"),
         (_checks(reads=(_read(assertions=(HasKeys((), ()),)),)), "keys"),
         (_checks(reads=(_read(assertions=(EachHasKeys(("a",), ()),)),)), "keys"),
+        (_checks(reads=(_read(assertions=(Contains(("a",), ""),)),)), "Contains"),
         (_checks(reads=(_read(assertions=(IsType((), "list"),)),)), "type"),  # type: ignore[arg-type]
         (
             _checks(reads=(_read(assertions=(HasKeys((-1,), ("a",)),)),)),

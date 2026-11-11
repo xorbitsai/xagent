@@ -162,6 +162,14 @@ class EachHasKeys:
 
 
 @dataclass(frozen=True)
+class Contains:
+    """The string at ``path`` contains ``value``."""
+
+    path: PayloadPath
+    value: str
+
+
+@dataclass(frozen=True)
 class IsType:
     """The value at ``path`` has JSON type ``type``."""
 
@@ -195,7 +203,14 @@ class L3Envelope:
 
 
 Assertion = (
-    StatusSuccess | HasKeys | EachHasKeys | IsType | Length | Equals | L3Envelope
+    StatusSuccess
+    | HasKeys
+    | EachHasKeys
+    | Contains
+    | IsType
+    | Length
+    | Equals
+    | L3Envelope
 )
 
 
@@ -784,6 +799,9 @@ def _validate_assertion(where: str, assertion: Assertion) -> None:
     _validate_path(where, assertion.path)
     if isinstance(assertion, (HasKeys, EachHasKeys)):
         _validate_keys(where, assertion.keys, allow_empty=False)
+    elif isinstance(assertion, Contains):
+        if not isinstance(assertion.value, str) or not assertion.value:
+            raise DeclarationError(f"{where}: Contains needs a non-empty string")
     elif isinstance(assertion, IsType):
         if assertion.type not in get_args(JsonType):
             raise DeclarationError(f"{where}: unknown JSON type {assertion.type!r}")

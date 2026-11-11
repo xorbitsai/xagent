@@ -80,13 +80,13 @@ def _document(out: str) -> dict[str, Any]:
     return document
 
 
-def _gmail(tool: FakeTool | None = None) -> FakeAdapter:
-    tool = tool or FakeTool("gmail_search_messages")
-    return FakeAdapter([ConnectorTarget("gmail")], {"gmail": listed(tool)})
+def _slack(tool: FakeTool | None = None) -> FakeAdapter:
+    tool = tool or FakeTool("slack_list_channels")
+    return FakeAdapter([ConnectorTarget("slack")], {"slack": listed(tool)})
 
 
 def test_a_passing_run_prints_its_document_and_exits_0(monkeypatch, capfd):
-    names = _install_adapter(monkeypatch, _gmail())
+    names = _install_adapter(monkeypatch, _slack())
 
     code = cli.main(["--user", "monitor"])
 
@@ -112,10 +112,10 @@ def test_stdout_carries_only_the_document(monkeypatch, capfd):
             [sys.executable, "-c", "print('child process output')"], check=True
         )
         logging.getLogger("xagent.test").warning("a log line")
-        return listed(FakeTool("gmail_search_messages"))
+        return listed(FakeTool("slack_list_channels"))
 
     _install_adapter(
-        monkeypatch, FakeAdapter([ConnectorTarget("gmail")], {"gmail": noisy_session})
+        monkeypatch, FakeAdapter([ConnectorTarget("slack")], {"slack": noisy_session})
     )
     # pytest's root logger has handlers, which would make basicConfig a no-op.
     root = logging.getLogger()
@@ -139,8 +139,8 @@ def test_stdout_carries_only_the_document(monkeypatch, capfd):
 
 def test_a_failed_row_exits_1(monkeypatch, capfd):
     adapter = FakeAdapter(
-        [ConnectorTarget("gmail")],
-        {"gmail": failed(ConnectorToolsOutcome.NOT_CONNECTED, "token_refresh_failed")},
+        [ConnectorTarget("slack")],
+        {"slack": failed(ConnectorToolsOutcome.NOT_CONNECTED, "token_refresh_failed")},
     )
     _install_adapter(monkeypatch, adapter)
 
@@ -152,7 +152,7 @@ def test_a_failed_row_exits_1(monkeypatch, capfd):
 
 
 def test_a_run_the_total_timeout_cut_exits_1(monkeypatch, capfd):
-    _install_adapter(monkeypatch, _gmail(FakeTool("gmail_search_messages", delay=1.0)))
+    _install_adapter(monkeypatch, _slack(FakeTool("slack_list_channels", delay=1.0)))
 
     code = cli.main(["--user", "monitor", "--total-timeout", "0.05"])
 
@@ -163,7 +163,7 @@ def test_a_run_the_total_timeout_cut_exits_1(monkeypatch, capfd):
 
 def test_skipped_rows_do_not_fail_the_run(monkeypatch, capfd):
     adapter = FakeAdapter(
-        [ConnectorTarget("gmail", skip_reason="not_catalog_identity")]
+        [ConnectorTarget("slack", skip_reason="not_catalog_identity")]
     )
     _install_adapter(monkeypatch, adapter)
 
@@ -175,7 +175,7 @@ def test_skipped_rows_do_not_fail_the_run(monkeypatch, capfd):
 
 
 def test_selectors_and_bounds_reach_the_engine(monkeypatch, capfd):
-    _install_adapter(monkeypatch, _gmail())
+    _install_adapter(monkeypatch, _slack())
     seen = _record_engine(monkeypatch)
 
     cli.main(
@@ -183,11 +183,11 @@ def test_selectors_and_bounds_reach_the_engine(monkeypatch, capfd):
             "--user",
             "monitor",
             "--connector",
-            "gmail, slack",
+            "slack, notion",
             "--connector",
             "notion",
             "--check",
-            "gmail.l3_probe",
+            "slack.l3_probe",
             "--environment",
             "stage",
             "--check-timeout",
@@ -199,15 +199,15 @@ def test_selectors_and_bounds_reach_the_engine(monkeypatch, capfd):
 
     assert seen == {
         "environment": "stage",
-        "connectors": frozenset({"gmail", "slack", "notion"}),
-        "checks": frozenset({"gmail.l3_probe"}),
+        "connectors": frozenset({"slack", "notion"}),
+        "checks": frozenset({"slack.l3_probe"}),
         "check_timeout": 5.0,
         "total_timeout": 60.0,
     }
 
 
 def test_without_selectors_every_connector_and_check_runs(monkeypatch, capfd):
-    _install_adapter(monkeypatch, _gmail())
+    _install_adapter(monkeypatch, _slack())
     seen = _record_engine(monkeypatch)
 
     cli.main(["--user", "monitor"])
@@ -241,7 +241,7 @@ def test_an_engine_that_raises_is_a_run_failure(monkeypatch, capfd, caplog):
     async def run_checks(adapter: Any, **kwargs: Any) -> RunResult:
         raise ValueError(SECRET)
 
-    _install_adapter(monkeypatch, _gmail())
+    _install_adapter(monkeypatch, _slack())
     monkeypatch.setattr(cli, "run_checks", run_checks)
 
     code = cli.main(["--user", "monitor"])
@@ -263,18 +263,18 @@ def test_an_engine_that_raises_is_a_run_failure(monkeypatch, capfd, caplog):
         ["--user", "monitor", "--check-timeout", "inf"],
         ["--user", "monitor", "--total-timeout", "soon"],
         # Selectors only: a tool name or an argument is not an option.
-        ["--user", "monitor", "--tool", "gmail_search_messages"],
+        ["--user", "monitor", "--tool", "slack_list_channels"],
         ["--user", "monitor", "--arguments", "{}"],
         # A selector must name something.
         ["--user", "monitor", "--connector", ""],
         ["--user", "monitor", "--connector", ","],
         ["--user", "monitor", "--check", ""],
         # A sweep has no checks to select.
-        ["--user", "monitor", "--sweep", "--check", "gmail.l3_probe"],
+        ["--user", "monitor", "--sweep", "--check", "slack.l3_probe"],
     ],
 )
 def test_invalid_arguments_exit_2_with_nothing_on_stdout(monkeypatch, capfd, argv):
-    names = _install_adapter(monkeypatch, _gmail())
+    names = _install_adapter(monkeypatch, _slack())
 
     with pytest.raises(SystemExit) as exited:
         cli.main(argv)
@@ -286,7 +286,7 @@ def test_invalid_arguments_exit_2_with_nothing_on_stdout(monkeypatch, capfd, arg
 
 
 def test_sweep_prints_the_sweep_document(monkeypatch, capfd):
-    adapter = _gmail()
+    adapter = _slack()
     names = _install_adapter(monkeypatch, adapter)
 
     code = cli.main(["--user", "monitor", "--sweep", "--environment", "stage"])
@@ -314,7 +314,7 @@ def test_sweep_prints_the_sweep_document(monkeypatch, capfd):
     ],
 )
 def test_sweep_options_reach_the_sweeper(monkeypatch, capfd, argv, expected):
-    _install_adapter(monkeypatch, _gmail())
+    _install_adapter(monkeypatch, _slack())
     seen: dict[str, Any] = {}
 
     async def record(adapter: Any, **kwargs: Any) -> Any:

@@ -14,12 +14,14 @@ from docx import Document
 from pptx import Presentation
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-from xagent.web.connector_checks.assertions import judge_result
+from xagent.web.connector_checks.assertions import judge_result, resolve_expected
 from xagent.web.connector_checks.declarations import (
     Assertion,
     ConnectorChecks,
+    Contains,
     DeclarationError,
     EachHasKeys,
+    Equals,
     FixtureRef,
     HasKeys,
     IsType,
@@ -37,9 +39,14 @@ from xagent.web.connector_checks.registry import (
     connector_checks_for,
     l3_read_check,
 )
+from xagent.web.connector_checks.results import FailureClass
+from xagent.web.tools.mcp import calendar as google_calendar
 from xagent.web.tools.mcp import (
     excel,
+    gmail,
+    google_analytics,
     google_docs,
+    google_drive,
     google_sheets,
     google_slides,
     powerpoint,
@@ -48,33 +55,15 @@ from xagent.web.tools.mcp import (
     zoom,
 )
 
-# The six document connectors, and the read each one declares: the tool, the
-# one required argument its fixture binds, the fixture key, and the keys only
-# a successful read of the object returns.
+# The three Microsoft document connectors, and the read each one declares: the
+# tool, the one required argument its fixture binds, the fixture key, and the
+# keys only a successful read of the object returns.
 _DOCUMENT_READS: Mapping[str, tuple[str, str, str, tuple[str, ...]]] = {
     "excel": (
         "excel_list_worksheets",
         "file_path",
         "excel.file_path",
         ("worksheets", "truncated"),
-    ),
-    "google-docs": (
-        "google_docs_get_document",
-        "document_id",
-        "google-docs.document_id",
-        ("document_id", "title"),
-    ),
-    "google-sheets": (
-        "google_sheets_get_spreadsheet",
-        "spreadsheet_id",
-        "google-sheets.spreadsheet_id",
-        ("spreadsheet_id", "title", "sheets"),
-    ),
-    "google-slides": (
-        "google_slides_get_presentation",
-        "presentation_id",
-        "google-slides.presentation_id",
-        ("presentation_id", "title", "slides"),
     ),
     "powerpoint": (
         "powerpoint_list_slides",
@@ -92,9 +81,6 @@ _DOCUMENT_READS: Mapping[str, tuple[str, str, str, tuple[str, ...]]] = {
 
 _APP_MODULES = {
     "excel": excel,
-    "google-docs": google_docs,
-    "google-sheets": google_sheets,
-    "google-slides": google_slides,
     "powerpoint": powerpoint,
     "word": word,
 }
@@ -203,13 +189,13 @@ def _pptx_bytes() -> bytes:
 
 
 def test_a_probed_connector_gets_its_l3_probe_as_one_read_check() -> None:
-    assert connector_checks_for("gmail") == ConnectorChecks(
-        "gmail",
+    assert connector_checks_for("slack") == ConnectorChecks(
+        "slack",
         reads=(
             ReadCheck(
-                "gmail.l3_probe",
-                "gmail_search_messages",
-                {"max_results": 1},
+                "slack.l3_probe",
+                "slack_list_channels",
+                {"limit": 1},
                 assertions=(L3Envelope(),),
             ),
         ),
@@ -381,56 +367,6 @@ def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
         assert required <= set(check.arguments), (check.tool, required)
 
 
-def test_google_docs_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = Mock()
-    service.documents.return_value.get.return_value.execute.return_value = {
-        "documentId": "doc-1",
-        "title": "Fixture doc",
-        "body": {"content": []},
-    }
-    monkeypatch.setattr(google_docs, "get_docs_service", lambda: service)
-
-    _assert_declared_output(
-        "google-docs", google_docs.google_docs_get_document("doc-1")
-    )
-
-
-def test_google_sheets_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = Mock()
-    service.spreadsheets.return_value.get.return_value.execute.return_value = {
-        "spreadsheetId": "sheet-1",
-        "properties": {"title": "Fixture workbook"},
-        "sheets": [{"properties": {"sheetId": 0, "title": "Sheet1"}}],
-    }
-    monkeypatch.setattr(google_sheets, "get_sheets_service", lambda: service)
-
-    _assert_declared_output(
-        "google-sheets",
-        google_sheets.google_sheets_get_spreadsheet("sheet-1"),
-    )
-
-
-def test_google_slides_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    service = Mock()
-    service.presentations.return_value.get.return_value.execute.return_value = {
-        "presentationId": "deck-1",
-        "title": "Fixture deck",
-        "slides": [{"objectId": "slide-1", "pageElements": []}],
-    }
-    monkeypatch.setattr(google_slides, "get_slides_service", lambda: service)
-
-    _assert_declared_output(
-        "google-slides",
-        google_slides.google_slides_get_presentation("deck-1"),
-    )
-
-
 def test_word_read_fixture_output_satisfies_its_declaration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -554,7 +490,22 @@ def _assert_check_output(check_id: str, result: str) -> None:
         "structured_content": None,
         "is_error": False,
     }
-    assert judge_result(raw, check.payload, check.assertions) == (None, None)
+    assertions = resolve_expected(check.assertions, _FIXTURES)
+    assert judge_result(raw, check.payload, assertions) == (None, None)
+
+
+def _assert_check_fails(check_id: str, result: str, reason: str) -> None:
+    check = _read_check(check_id)
+    raw = {
+        "content": [{"type": "text", "text": result}],
+        "structured_content": None,
+        "is_error": False,
+    }
+    assertions = resolve_expected(check.assertions, _FIXTURES)
+    assert judge_result(raw, check.payload, assertions) == (
+        FailureClass.ASSERTION_FAILED,
+        reason,
+    )
 
 
 @pytest.mark.parametrize(("check_id", "expected"), sorted(_TIER_2_READS.items()))
@@ -660,3 +611,873 @@ def test_zoom_list_meetings_output_satisfies_its_declaration(
     )
 
     _assert_check_output("zoom.list_meetings", zoom.zoom_list_meetings())
+
+
+# The Google family (issue #3567): the read checks of the tenant the seed
+# script (xorbitsai/xagent-saas#2533) fills, with the tool, its arguments and
+# every assertion, so dropping an argument, an assertion or an expected seed
+# value fails here. ``google-calendar`` and ``google-analytics`` keep their
+# probe-derived L3 call instead (``_declared_l3``).
+_GOOGLE_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "gmail.search_seed_message": (
+        "gmail_search_messages",
+        {"label_ids": [FixtureRef("gmail.seed_label_id")], "max_results": 10},
+        (
+            StatusSuccess(),
+            HasKeys((), ("messages",)),
+            Length(("messages",), 1, 1),
+            EachHasKeys(
+                ("messages",), ("id", "threadId", "snippet", "subject", "from")
+            ),
+            Equals(("messages", 0, "subject"), "xagent smoke seed message"),
+        ),
+    ),
+    "google-analytics.run_report": (
+        "google_analytics_run_report",
+        {
+            "property_id": FixtureRef("google-analytics.property_id"),
+            "metrics": ["sessions"],
+            "date_ranges": [{"start_date": "7daysAgo", "end_date": "yesterday"}],
+        },
+        (
+            StatusSuccess(),
+            HasKeys(
+                (),
+                (
+                    "query",
+                    "metric_headers",
+                    "totals",
+                    "rows",
+                    "row_count",
+                    "returned_count",
+                    "has_more",
+                    "truncated",
+                ),
+            ),
+            HasKeys(
+                ("query",),
+                ("property_id", "metrics", "date_ranges", "limit", "offset"),
+            ),
+            Equals(
+                ("query", "property_id"), FixtureRef("google-analytics.property_id")
+            ),
+            IsType(("rows",), "array"),
+        ),
+    ),
+    "google-docs.read_fixture": (
+        "google_docs_get_document",
+        {"document_id": FixtureRef("google-docs.document_id")},
+        (
+            StatusSuccess(),
+            HasKeys((), ("document_id", "title", "content")),
+            Equals(("document_id",), FixtureRef("google-docs.document_id")),
+            Equals(("title",), "xagent-smoke-seed-doc"),
+            Contains(("content",), "xagent smoke seed document"),
+        ),
+    ),
+    "google-drive.read_seed_file": (
+        "google_drive_get_file_content",
+        {"file_id": FixtureRef("google-docs.document_id")},
+        (
+            StatusSuccess(),
+            HasKeys((), ("file", "content", "encoding", "truncated")),
+            HasKeys(("file",), ("id", "name", "mimeType")),
+            Equals(("file", "id"), FixtureRef("google-docs.document_id")),
+            Equals(("file", "name"), "xagent-smoke-seed-doc"),
+            Equals(("encoding",), "utf-8"),
+            Contains(("content",), "xagent smoke seed document"),
+        ),
+    ),
+    "google-drive.search_seed_folder": (
+        "google_drive_search",
+        {
+            "query": (
+                "name = 'xagent-smoke-seed' and "
+                "mimeType = 'application/vnd.google-apps.folder' and "
+                "trashed = false"
+            ),
+            "max_results": 10,
+        },
+        (
+            StatusSuccess(),
+            HasKeys((), ("files", "truncated")),
+            Length(("files",), 1, 1),
+            EachHasKeys(("files",), ("id", "name", "mimeType", "modifiedTime")),
+            Equals(("files", 0, "id"), FixtureRef("google-drive.seed_folder_id")),
+        ),
+    ),
+    "google-sheets.read_fixture": (
+        "google_sheets_get_spreadsheet",
+        {"spreadsheet_id": FixtureRef("google-sheets.spreadsheet_id")},
+        (
+            StatusSuccess(),
+            HasKeys((), ("spreadsheet_id", "title", "url", "sheets")),
+            Equals(("spreadsheet_id",), FixtureRef("google-sheets.spreadsheet_id")),
+            Equals(("title",), "xagent-smoke-seed-sheet"),
+            Length(("sheets",), min=1),
+            EachHasKeys(
+                ("sheets",), ("sheet_id", "title", "row_count", "column_count")
+            ),
+        ),
+    ),
+    "google-sheets.read_seed_range": (
+        "google_sheets_read_range",
+        {
+            "spreadsheet_id": FixtureRef("google-sheets.spreadsheet_id"),
+            "range_name": "A1:B3",
+        },
+        (
+            StatusSuccess(),
+            HasKeys((), ("range", "values", "truncated")),
+            Length(("values",), 3, 3),
+            Equals(("values", 0, 0), "item"),
+            Equals(("values", 0, 1), "quantity"),
+            Equals(("values", 1, 0), "alpha"),
+            Equals(("values", 1, 1), "1"),
+            Equals(("values", 2, 0), "beta"),
+            Equals(("values", 2, 1), "2"),
+        ),
+    ),
+    "google-slides.read_fixture": (
+        "google_slides_get_presentation",
+        {"presentation_id": FixtureRef("google-slides.presentation_id")},
+        (
+            StatusSuccess(),
+            HasKeys((), ("presentation_id", "title", "slide_count", "slides")),
+            Equals(("presentation_id",), FixtureRef("google-slides.presentation_id")),
+            Equals(("title",), "xagent-smoke-seed-slides"),
+            IsType(("slide_count",), "number"),
+            EachHasKeys(("slides",), ("slide_number", "object_id", "text")),
+        ),
+    ),
+}
+
+_GOOGLE_APP_MODULES = {
+    "gmail": gmail,
+    "google-analytics": google_analytics,
+    "google-calendar": google_calendar,
+    "google-docs": google_docs,
+    "google-drive": google_drive,
+    "google-sheets": google_sheets,
+    "google-slides": google_slides,
+}
+
+# The fixture keys the tenant registry (xorbitsai/xagent-saas#2627) records for
+# the Google seed layout; every one a Google read check uses is here.
+_GOOGLE_FIXTURE_KEYS = frozenset(
+    {
+        "gmail.seed_label_id",
+        "google-analytics.property_id",
+        "google-docs.document_id",
+        "google-drive.seed_folder_id",
+        "google-sheets.spreadsheet_id",
+        "google-slides.presentation_id",
+    }
+)
+
+
+class _Fixtures:
+    """The Google seed's values, as the identity adapter would resolve them."""
+
+    _VALUES = {
+        "gmail.seed_label_id": "Label_1",
+        "google-analytics.property_id": "563334905",
+        "google-docs.document_id": "doc-1",
+        "google-drive.seed_folder_id": "folder-1",
+        "google-sheets.spreadsheet_id": "sheet-1",
+        "google-slides.presentation_id": "deck-1",
+    }
+
+    def resolve_fixture(self, key: str) -> str | None:
+        return self._VALUES.get(key)
+
+
+_FIXTURES = _Fixtures()
+
+
+def _google_fixture_keys(check: ReadCheck) -> Iterator[FixtureRef]:
+    yield from _fixture_refs(check.arguments)
+    for assertion in check.assertions:
+        if isinstance(assertion, Equals):
+            yield from _fixture_refs(assertion.value)
+
+
+@pytest.mark.parametrize(("check_id", "expected"), sorted(_GOOGLE_READS.items()))
+def test_a_google_read_check_is_declared_exactly(
+    check_id: str, expected: tuple[str, dict[str, Any], tuple[Assertion, ...]]
+) -> None:
+    tool, arguments, assertions = expected
+    check = _read_check(check_id)
+    assert (check.tool, dict(check.arguments), check.assertions) == (
+        tool,
+        arguments,
+        assertions,
+    )
+
+
+@pytest.mark.parametrize(
+    ("app_id", "check_ids"),
+    [
+        ("gmail", ["gmail.search_seed_message"]),
+        (
+            "google-analytics",
+            ["google-analytics.l3_probe", "google-analytics.run_report"],
+        ),
+        ("google-calendar", ["google-calendar.l3_probe"]),
+        ("google-docs", ["google-docs.read_fixture"]),
+        (
+            "google-drive",
+            ["google-drive.search_seed_folder", "google-drive.read_seed_file"],
+        ),
+        (
+            "google-sheets",
+            ["google-sheets.read_fixture", "google-sheets.read_seed_range"],
+        ),
+        ("google-slides", ["google-slides.read_fixture"]),
+    ],
+)
+def test_a_google_connector_declares_exactly_its_reads(
+    app_id: str, check_ids: list[str]
+) -> None:
+    assert [check.id for check in CONNECTOR_CHECKS[app_id].reads] == check_ids
+
+
+@pytest.mark.parametrize("app_id", ["google-analytics", "google-calendar"])
+def test_a_google_l3_check_is_the_probe_derived_one(app_id: str) -> None:
+    expected = l3_read_check(app_id)
+    assert expected is not None
+
+    l3_checks = [
+        check
+        for check in CONNECTOR_CHECKS[app_id].reads
+        if check.id == f"{app_id}.l3_probe"
+    ]
+    assert l3_checks == [expected]
+
+
+@pytest.mark.parametrize("app_id", ["google-docs", "google-sheets", "google-slides"])
+def test_a_google_document_probe_still_needs_a_fixture(app_id: str) -> None:
+    assert l3_read_check(app_id) == UnprobeableCheck(
+        f"{app_id}.l3_probe", "needs_fixture"
+    )
+
+
+def test_every_google_fixture_key_is_one_the_seed_records() -> None:
+    keys = {
+        ref.key
+        for app_id in _GOOGLE_APP_MODULES
+        for check in CONNECTOR_CHECKS[app_id].reads
+        if isinstance(check, ReadCheck)
+        for ref in _google_fixture_keys(check)
+    }
+
+    assert keys == _GOOGLE_FIXTURE_KEYS
+
+
+@pytest.mark.parametrize("app_id", sorted(_GOOGLE_APP_MODULES))
+def test_a_google_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
+    """The fixture names an argument the tool requires, and every required
+    argument is pinned: an omitted one would make the tool prompt for it."""
+    module = _GOOGLE_APP_MODULES[app_id]
+    for check in CONNECTOR_CHECKS[app_id].reads:
+        if not isinstance(check, ReadCheck):
+            continue
+        tool = getattr(module, check.tool)
+        parameters = inspect.signature(tool).parameters
+        bound = [
+            name
+            for name, value in check.arguments.items()
+            if isinstance(value, FixtureRef)
+        ]
+        for name in bound:
+            assert name in parameters
+            assert parameters[name].default is inspect.Parameter.empty
+        required = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.default is inspect.Parameter.empty
+            and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        }
+        assert required <= set(check.arguments), (check.tool, required)
+
+
+def test_a_cleanable_write_keeps_a_pending_exemption() -> None:
+    """The writes whose own cleanup tool can delete what they create wait for
+    round two (#3567); none carries the permanent no-cleanup reason."""
+    cleanable = (
+        "google_calendar_create_events",
+        "google_calendar_delete_events",
+        "google_drive_create_file",
+        "google_drive_create_folder",
+        "google_drive_delete_file",
+        "google_sheets_add_sheet",
+        "google_sheets_delete_sheet",
+        "google_slides_add_slide",
+        "google_slides_delete_slide",
+    )
+    exemptions = {
+        exemption.tool: exemption.reason
+        for app_id in (
+            "google-calendar",
+            "google-drive",
+            "google-sheets",
+            "google-slides",
+        )
+        for exemption in CONNECTOR_CHECKS[app_id].exemptions
+    }
+
+    for tool in cleanable:
+        assert exemptions[tool] != WRITE_WITHOUT_CLEANUP, tool
+        assert exemptions[tool].endswith("decided in #3567"), tool
+
+
+def test_only_the_writes_without_cleanup_carry_the_permanent_reason() -> None:
+    expected = {
+        "gmail": {"gmail_send_messages"},
+        "google-docs": {
+            "google_docs_append_text",
+            "google_docs_batch_update",
+            "google_docs_create_document",
+            "google_docs_replace_text",
+        },
+        "google-sheets": {"google_sheets_create_spreadsheet"},
+        "google-slides": {
+            "google_slides_create_presentation",
+            "google_slides_import_pptx",
+        },
+    }
+
+    for app_id, tools in expected.items():
+        actual = {
+            exemption.tool
+            for exemption in CONNECTOR_CHECKS[app_id].exemptions
+            if exemption.reason == WRITE_WITHOUT_CLEANUP
+        }
+        assert actual == tools, app_id
+
+
+def test_gmail_manage_labels_is_exempt_for_the_read_step_rule() -> None:
+    exemption = next(
+        exemption
+        for exemption in CONNECTOR_CHECKS["gmail"].exemptions
+        if exemption.tool == "gmail_manage_labels"
+    )
+
+    assert "separate label read" in exemption.reason
+    assert exemption.reason.endswith("decided in #3567")
+
+
+# Output samples for the Google read checks
+
+
+class _GmailBatch:
+    """The batch object ``gmail_search_messages`` drives: it calls back once
+    per request with the response its test gave it."""
+
+    def __init__(
+        self, callback: Callable[..., None], responses: list[dict[str, Any]]
+    ) -> None:
+        self._callback = callback
+        self._responses = responses
+
+    def add(self, request: Any) -> None:
+        return None
+
+    def execute(self) -> None:
+        for index, response in enumerate(self._responses):
+            self._callback(str(index), response, None)
+
+
+def _gmail_service(responses: list[dict[str, Any]]) -> Mock:
+    service = Mock()
+    service.users.return_value.messages.return_value.list.return_value.execute.return_value = {
+        "messages": [{"id": f"m{index}"} for index in range(len(responses))]
+    }
+    service.new_batch_http_request.side_effect = lambda callback: _GmailBatch(
+        callback, responses
+    )
+    return service
+
+
+def _gmail_message(subject: str = "xagent smoke seed message") -> dict[str, Any]:
+    return {
+        "id": "msg-1",
+        "threadId": "thread-1",
+        "snippet": "Seeded message for the Gmail read checks.",
+        "payload": {
+            "headers": [
+                {"name": "Subject", "value": subject},
+                {"name": "From", "value": "seed@xagent-smoke.invalid"},
+            ]
+        },
+    }
+
+
+def test_gmail_search_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gmail, "get_gmail_service", lambda: _gmail_service([_gmail_message()])
+    )
+
+    _assert_check_output(
+        "gmail.search_seed_message",
+        gmail.gmail_search_messages(label_ids=["Label_1"], max_results=10),
+    )
+
+
+@pytest.mark.parametrize(
+    ("messages", "reason"),
+    [
+        ([_gmail_message(), _gmail_message()], "length"),
+        ([_gmail_message("another subject")], "equals"),
+    ],
+)
+def test_gmail_search_output_fails_on_a_bad_result(
+    monkeypatch: pytest.MonkeyPatch, messages: list[dict[str, Any]], reason: str
+) -> None:
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _gmail_service(messages))
+
+    _assert_check_fails(
+        "gmail.search_seed_message",
+        gmail.gmail_search_messages(label_ids=["Label_1"], max_results=10),
+        reason,
+    )
+
+
+_DRIVE_FOLDER = {
+    "id": "folder-1",
+    "name": "xagent-smoke-seed",
+    "mimeType": "application/vnd.google-apps.folder",
+    "modifiedTime": "2026-11-01T00:00:00.000Z",
+}
+
+
+def _drive_list_service(files: list[dict[str, Any]]) -> Mock:
+    service = Mock()
+    service.files.return_value.list.return_value.execute.return_value = {"files": files}
+    return service
+
+
+def _drive_search() -> str:
+    return google_drive.google_drive_search(
+        query=(
+            "name = 'xagent-smoke-seed' and "
+            "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        ),
+        max_results=10,
+    )
+
+
+def test_google_drive_search_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_drive, "get_drive_service", lambda: _drive_list_service([_DRIVE_FOLDER])
+    )
+
+    _assert_check_output("google-drive.search_seed_folder", _drive_search())
+
+
+@pytest.mark.parametrize(
+    ("files", "reason"),
+    [
+        ([], "length"),
+        ([{**_DRIVE_FOLDER, "id": "other"}], "equals"),
+        (
+            [
+                {
+                    key: value
+                    for key, value in _DRIVE_FOLDER.items()
+                    if key != "modifiedTime"
+                }
+            ],
+            "each_has_keys",
+        ),
+    ],
+)
+def test_google_drive_search_output_fails_on_a_bad_result(
+    monkeypatch: pytest.MonkeyPatch, files: list[dict[str, Any]], reason: str
+) -> None:
+    monkeypatch.setattr(
+        google_drive, "get_drive_service", lambda: _drive_list_service(files)
+    )
+
+    _assert_check_fails("google-drive.search_seed_folder", _drive_search(), reason)
+
+
+def _drive_file_service() -> Mock:
+    service = Mock()
+    service.files.return_value.get.return_value.execute.return_value = {
+        "id": "doc-1",
+        "name": "xagent-smoke-seed-doc",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    return service
+
+
+def test_google_drive_file_content_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_drive,
+        "get_drive_service",
+        lambda: _drive_file_service(),
+    )
+    monkeypatch.setattr(
+        google_drive,
+        "_download_media",
+        lambda request: b"xagent smoke seed document\nSecond line: seeded content\n",
+    )
+
+    _assert_check_output(
+        "google-drive.read_seed_file",
+        google_drive.google_drive_get_file_content("doc-1"),
+    )
+
+
+def test_google_drive_file_content_output_fails_without_the_seed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_drive,
+        "get_drive_service",
+        lambda: _drive_file_service(),
+    )
+    monkeypatch.setattr(
+        google_drive, "_download_media", lambda request: b"another document"
+    )
+
+    _assert_check_fails(
+        "google-drive.read_seed_file",
+        google_drive.google_drive_get_file_content("doc-1"),
+        "contains",
+    )
+
+
+_DOCUMENT_TEXT = "xagent smoke seed document"
+
+
+def _document_body(text: str = _DOCUMENT_TEXT) -> dict[str, Any]:
+    return {
+        "content": [
+            {"paragraph": {"elements": [{"textRun": {"content": text + "\n"}}]}},
+            {
+                "paragraph": {
+                    "elements": [
+                        {"textRun": {"content": "Second line: seeded content\n"}}
+                    ]
+                }
+            },
+        ]
+    }
+
+
+def _docs_service(title: str, text: str = _DOCUMENT_TEXT) -> Mock:
+    service = Mock()
+    service.documents.return_value.get.return_value.execute.return_value = {
+        "documentId": "doc-1",
+        "title": title,
+        "body": _document_body(text),
+    }
+    return service
+
+
+def test_google_docs_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_docs, "get_docs_service", lambda: _docs_service("xagent-smoke-seed-doc")
+    )
+
+    _assert_check_output(
+        "google-docs.read_fixture", google_docs.google_docs_get_document("doc-1")
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "text", "reason"),
+    [
+        ("another doc", _DOCUMENT_TEXT, "equals"),
+        ("xagent-smoke-seed-doc", "another document", "contains"),
+    ],
+)
+def test_google_docs_output_fails_on_a_bad_result(
+    monkeypatch: pytest.MonkeyPatch, title: str, text: str, reason: str
+) -> None:
+    monkeypatch.setattr(
+        google_docs, "get_docs_service", lambda: _docs_service(title, text)
+    )
+
+    _assert_check_fails(
+        "google-docs.read_fixture",
+        google_docs.google_docs_get_document("doc-1"),
+        reason,
+    )
+
+
+def _seed_sheet() -> dict[str, Any]:
+    return {
+        "spreadsheetId": "sheet-1",
+        "properties": {"title": "xagent-smoke-seed-sheet"},
+        "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/sheet-1",
+        "sheets": [
+            {
+                "properties": {
+                    "sheetId": 0,
+                    "title": "Sheet1",
+                    "gridProperties": {"rowCount": 1000, "columnCount": 26},
+                }
+            }
+        ],
+    }
+
+
+def _spreadsheet_service(title: str) -> Mock:
+    service = Mock()
+    payload = {**_seed_sheet(), "properties": {"title": title}}
+    service.spreadsheets.return_value.get.return_value.execute.return_value = payload
+    return service
+
+
+def test_google_sheets_spreadsheet_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_sheets,
+        "get_sheets_service",
+        lambda: _spreadsheet_service("xagent-smoke-seed-sheet"),
+    )
+
+    _assert_check_output(
+        "google-sheets.read_fixture",
+        google_sheets.google_sheets_get_spreadsheet("sheet-1"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "reason"),
+    [
+        ("another book", "equals"),
+        ("xagent-smoke-seed-sheet", "length"),
+    ],
+)
+def test_google_sheets_spreadsheet_output_fails_on_a_bad_result(
+    monkeypatch: pytest.MonkeyPatch, title: str, reason: str
+) -> None:
+    service = _spreadsheet_service(title)
+    if reason == "length":
+        payload = (
+            service.spreadsheets.return_value.get.return_value.execute.return_value
+        )
+        payload["sheets"] = []
+    monkeypatch.setattr(google_sheets, "get_sheets_service", lambda: service)
+
+    _assert_check_fails(
+        "google-sheets.read_fixture",
+        google_sheets.google_sheets_get_spreadsheet("sheet-1"),
+        reason,
+    )
+
+
+def _values_service(values: list[list[str]]) -> Mock:
+    service = Mock()
+    service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+        "range": "Sheet1!A1:B3",
+        "values": values,
+    }
+    return service
+
+
+def _read_seed_range() -> str:
+    return google_sheets.google_sheets_read_range(
+        spreadsheet_id="sheet-1", range_name="A1:B3"
+    )
+
+
+def test_google_sheets_range_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = [["item", "quantity"], ["alpha", "1"], ["beta", "2"]]
+    monkeypatch.setattr(
+        google_sheets, "get_sheets_service", lambda: _values_service(values)
+    )
+
+    _assert_check_output("google-sheets.read_seed_range", _read_seed_range())
+
+
+@pytest.mark.parametrize(
+    ("values", "reason"),
+    [
+        ([["item", "quantity"], ["alpha", "1"]], "length"),
+        ([["item", "quantity"], ["alpha", "2"], ["beta", "2"]], "equals"),
+    ],
+)
+def test_google_sheets_range_output_fails_on_a_bad_result(
+    monkeypatch: pytest.MonkeyPatch, values: list[list[str]], reason: str
+) -> None:
+    monkeypatch.setattr(
+        google_sheets, "get_sheets_service", lambda: _values_service(values)
+    )
+
+    _assert_check_fails("google-sheets.read_seed_range", _read_seed_range(), reason)
+
+
+def _presentation_service(title: str) -> Mock:
+    service = Mock()
+    service.presentations.return_value.get.return_value.execute.return_value = {
+        "presentationId": "deck-1",
+        "title": title,
+        "slides": [{"objectId": "slide-1", "pageElements": []}],
+    }
+    return service
+
+
+def test_google_slides_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_slides,
+        "get_slides_service",
+        lambda: _presentation_service("xagent-smoke-seed-slides"),
+    )
+
+    _assert_check_output(
+        "google-slides.read_fixture",
+        google_slides.google_slides_get_presentation("deck-1"),
+    )
+
+
+def test_google_slides_output_fails_on_another_deck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_slides,
+        "get_slides_service",
+        lambda: _presentation_service("another deck"),
+    )
+
+    _assert_check_fails(
+        "google-slides.read_fixture",
+        google_slides.google_slides_get_presentation("deck-1"),
+        "equals",
+    )
+
+
+def _analytics_report() -> dict[str, Any]:
+    return {
+        "dimensionHeaders": [],
+        "metricHeaders": [{"name": "sessions", "type": "TYPE_INTEGER"}],
+        "rows": [],
+        "totals": [{"metricValues": [{"value": "0"}]}],
+        "rowCount": 0,
+    }
+
+
+def _run_report(property_id: str) -> str:
+    return google_analytics.google_analytics_run_report(
+        property_id=property_id,
+        metrics=["sessions"],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
+    )
+
+
+def test_google_analytics_report_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_analytics, "_request", lambda *args, **kwargs: _analytics_report()
+    )
+
+    _assert_check_output("google-analytics.run_report", _run_report("563334905"))
+
+
+def test_google_analytics_report_output_fails_on_another_property(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_analytics, "_request", lambda *args, **kwargs: _analytics_report()
+    )
+
+    _assert_check_fails(
+        "google-analytics.run_report", _run_report("999999999"), "equals"
+    )
+
+
+def test_google_analytics_list_properties_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_analytics,
+        "_request",
+        lambda *args, **kwargs: {
+            "accountSummaries": [
+                {
+                    "displayName": "Seed account",
+                    "propertySummaries": [
+                        {
+                            "property": "properties/563334905",
+                            "displayName": "xagent-smoke-seed",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    _assert_check_output(
+        "google-analytics.l3_probe", google_analytics.google_analytics_list_properties()
+    )
+
+
+def test_google_analytics_list_properties_output_fails_on_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("unauthorized")
+
+    monkeypatch.setattr(google_analytics, "_request", fail)
+
+    _assert_check_fails(
+        "google-analytics.l3_probe",
+        google_analytics.google_analytics_list_properties(),
+        "status_not_success",
+    )
+
+
+def _calendar_service(items: list[dict[str, Any]]) -> Mock:
+    service = Mock()
+    service.events.return_value.list.return_value.execute.return_value = {
+        "timeZone": "UTC",
+        "items": items,
+    }
+    return service
+
+
+def test_google_calendar_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        google_calendar, "get_calendar_service", lambda: _calendar_service([])
+    )
+
+    _assert_check_output(
+        "google-calendar.l3_probe",
+        google_calendar.google_calendar_search_events(max_results=1),
+    )
+
+
+def test_google_calendar_output_fails_on_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = Mock()
+    service.events.return_value.list.return_value.execute.side_effect = RuntimeError(
+        "unauthorized"
+    )
+    monkeypatch.setattr(google_calendar, "get_calendar_service", lambda: service)
+
+    _assert_check_fails(
+        "google-calendar.l3_probe",
+        google_calendar.google_calendar_search_events(max_results=1),
+        "status_not_success",
+    )

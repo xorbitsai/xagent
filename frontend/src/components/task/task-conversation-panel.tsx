@@ -32,6 +32,8 @@ import {
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
+import { useVoiceCallView } from "@/contexts/voice-call-store"
+import { VoiceOrb } from "@/components/chat/voice-call-ui"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -333,6 +335,10 @@ export function TaskConversationPanel({
   const [isDragging, setIsDragging] = useState(false)
   const [isCancellingAutoResume, setIsCancellingAutoResume] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // The orb belongs to this composer only when it can run a call itself.
+  const voiceCall = useVoiceCallView()
+  const voiceOrbCall = voiceCall && voiceConversationEnabled && taskControlsEnabled && !compactInput ? voiceCall : null
+  const voiceOrbShown = voiceOrbCall !== null
   const containerRef = useRef<HTMLDivElement>(null)
   const userMessageContextBadges = useMemo(() => {
     const hasBoundLocalBrowser = (
@@ -688,7 +694,7 @@ export function TaskConversationPanel({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView?.({ behavior: "smooth" })
-  }, [state.messages, state.steps])
+  }, [state.messages, state.steps, voiceOrbShown])
 
   useEffect(() => {
     if (isFilePreviewOpen) {
@@ -1135,12 +1141,14 @@ export function TaskConversationPanel({
                   {t(`taskCompletion.${state.currentTask.completionOutcome}`)}
                 </div>
               )}
+              {/* Room for the floating orb so the last message stays readable. */}
+              {voiceOrbShown && <div className="h-28" aria-hidden="true" />}
               <div ref={messagesEndRef} />
             </div>
           </main>
         </div>
 
-        <div className={cn("flex-shrink-0 z-10 glass", mode === "page" ? "pb-2 sm:pb-6" : "border-t bg-card/30 p-4")}>
+        <div className={cn("relative flex-shrink-0 z-10 glass", mode === "page" ? "pb-2 sm:pb-6" : "border-t bg-card/30 p-4")}>
           <div className={cn("mx-auto px-4", mode === "page" ? "container max-w-4xl" : "max-w-3xl px-0")}>
             {showTaskActions && (
               <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2 sm:mb-4 sm:gap-3">
@@ -1173,6 +1181,7 @@ export function TaskConversationPanel({
 
             {voiceConversationEnabled && voiceInputEnabled && taskControlsEnabled && (
               <VoiceConversation
+                preload
                 open={voiceOpen}
                 onOpenChange={setVoiceOpen}
                 taskId={state.taskId}
@@ -1192,6 +1201,13 @@ export function TaskConversationPanel({
                   }, [])
                 }}
               />
+            )}
+            {/* Floats over the message area above the actions row, so it takes
+                no space and pushes nothing up. */}
+            {voiceOrbCall && (
+              <div className="pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2">
+                <VoiceOrb call={voiceOrbCall} className="h-[88px] w-[88px]" />
+              </div>
             )}
             <ChatInput
               onSend={handleSend}

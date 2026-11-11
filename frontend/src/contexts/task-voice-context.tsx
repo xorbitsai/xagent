@@ -51,6 +51,7 @@ export function TaskVoiceProvider({ children }: { children: React.ReactNode }) {
   }}>
     {children}
     <VoiceConversation
+      preload={voiceInputEnabled && taskControlsEnabled}
       open={open} onOpenChange={value => { if (!value) close() }}
       allowTaskAdoption={creating && owner.current?.createdTaskId === state.taskId}
       taskId={state.taskId} messages={state.messages}

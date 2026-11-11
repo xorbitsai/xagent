@@ -4,6 +4,8 @@ import { escapeHtml } from "@/lib/html-escape";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
 import { VoiceModeButton } from "./voice-mode-button";
+import { VoiceCallBar } from "./voice-call-ui";
+import { useVoiceCallView } from "@/contexts/voice-call-store";
 import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -223,6 +225,7 @@ export function ChatInput({
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
   const voiceModels = useVoiceModels(Boolean(voiceInputEnabled && onVoiceConversation));
+  const voiceCall = useVoiceCallView();
 
   useEffect(() => {
     mountedRef.current = true;
@@ -910,6 +913,9 @@ export function ChatInput({
   // control, so each is gated on exactly the same condition; a hint with no
   // visible control on screen would have nothing to refer to.
   const showStopButton = offersStopControl && !hasDraft;
+  // With nothing typed, the composer's main action starts a voice call; once
+  // there is something to send it becomes the send button.
+  const showVoiceStart = Boolean(voiceInputEnabled && onVoiceConversation && !hasDraft && !isInputBusy && !showStopButton);
   // The stop control and the send control take turns in the same slot, so the
   // size and the box styling come from here instead of each of them carrying
   // its own copy: the slot keeps one shape whichever control is on screen.
@@ -1067,14 +1073,25 @@ export function ChatInput({
       <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
     </Tooltip></TooltipProvider>
   ) : null;
+  // A call cannot start while the agent is working, even when the composer
+  // still accepts live guidance for that run.
+  const voiceRunInProgress = Boolean(isLoading)
+    || ["running", "pending", "pause_requested", "resume_requested"].includes(String(normalizedTaskStatus));
   const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
     <VoiceModeButton iconOnly
       reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
-      disabled={voiceConversationDisabled || isInputBusy || voiceInput.status !== "idle"}
+      disabled={voiceConversationDisabled || isInputBusy || voiceRunInProgress || voiceInput.status !== "idle"}
       onClick={() => {
         onVoiceConversation(deliveryConfig());
       }} />
   ) : null;
+  // While a call is open the bar replaces the editor and toolbar entirely.
+  const voiceCallVisible = Boolean(voiceCall && voiceInputEnabled && onVoiceConversation);
+  // The editor is hidden for the call. Hiding a focused element does not
+  // reliably fire blur, which would leave the composer looking focused.
+  useEffect(() => {
+    if (voiceCallVisible) editorRef.current?.blur();
+  }, [voiceCallVisible]);
 
   const handleSubmit = async (e?: React.SyntheticEvent) => {
     e?.preventDefault();
@@ -1398,7 +1415,9 @@ export function ChatInput({
             </div>
           )}
 
-          <div className="relative flex-1">
+          {voiceCallVisible && voiceCall && <VoiceCallBar call={voiceCall} compact={compact} />}
+
+          <div className={cn("relative flex-1", voiceCallVisible && "hidden")}>
             <div
               ref={editorRef}
               contentEditable
@@ -1430,6 +1449,7 @@ export function ChatInput({
           </div>
 
           {/* Bottom toolbar or inline button */}
+          <div className={voiceCallVisible ? "hidden" : "contents"}>
           {compact ? (
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
               {!hideFileUpload && !filesBlocked && (
@@ -1456,7 +1476,6 @@ export function ChatInput({
                 </>
               )}
               {voiceInputButton}
-              {voiceConversationButton}
               {showStopButton ? (
                 <Button
                   type="button"
@@ -1476,6 +1495,8 @@ export function ChatInput({
                 >
                   <Square className="h-3.5 w-3.5 fill-current" />
                 </Button>
+              ) : showVoiceStart ? (
+                voiceConversationButton
               ) : (
                 <Button
                   type="submit"
@@ -1625,7 +1646,7 @@ export function ChatInput({
                   ⏎ {t("common.send")}
                 </span>
                 {voiceInputButton}
-                {voiceConversationButton}
+                {showVoiceStart ? voiceConversationButton : (
                 <Button
                   type="submit"
                   size="icon"
@@ -1634,6 +1655,7 @@ export function ChatInput({
                   title={sendButtonLabel}
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
+                    hasDraft && canSubmit() && "animate-voice-pop",
                     !canSubmit() && "bg-muted text-muted-foreground/50"
                   )}
                 >
@@ -1643,6 +1665,7 @@ export function ChatInput({
                     <ArrowUp className="h-4 w-4" />
                   )}
                 </Button>
+                )}
                 {normalizedTaskStatus === 'paused' && onResume && (
                   <Button
                     type="button"
@@ -1657,6 +1680,7 @@ export function ChatInput({
               </div>
             </div>
           )}
+          </div>
         </form>
       </div>
 

@@ -103,6 +103,7 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "running execution (load); writes nothing.",
     ),
     "web/tools/config.py": (1, NETWORK),
+    "web/tools/mcp/google_api_proxy.py": (1, NETWORK),
     "web/tools/mcp/google_slides.py": (3, NETWORK),
     "web/tracking/standalone_usage.py": (
         1,
@@ -222,6 +223,7 @@ ALLOWED: dict[str, tuple[int, str]] = {
     "core/tools/adapters/vibe/sandboxed_tool/sandboxed_tool_wrapper.py": (4, EXEC),
     "core/tools/adapters/vibe/vision_tool.py": (1, FILES),
     # -- core/tools/core: RAG storage, tools ------------------------------------
+    "core/tools/core/browser_use.py": (1, FILES),
     "core/tools/core/RAG_tools/kb/collection_handle.py": (
         1,
         "A pool that runs the dense query beside the sparse one and is joined "

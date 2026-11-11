@@ -2752,7 +2752,7 @@ async def retire_writers(
     *,
     settle_seconds: float | None = None,
     raise_on_stop_error: bool = True,
-) -> None:
+) -> bool:
     """Stop the background writers listed here; the web server keeps serving.
 
     The guarantee is exactly the lists below: the tracked set plus the
@@ -2813,6 +2813,10 @@ async def retire_writers(
     running: that retire owns the stops, the fence is up, and shutdown goes
     straight on to its own teardown.
 
+    Returns whether this call ran the stops itself (``False`` when it found
+    them already done or in progress), so shutdown runs them only when this
+    call did not.
+
     Idempotent and safe to call concurrently: the first caller does the work,
     later ones wait for it and return. A step that raises leaves the function
     unfinished (the caller sees the error) and every step is itself a no-op
@@ -2827,10 +2831,10 @@ async def retire_writers(
         _retire_writers_lock = asyncio.Lock()
     if settle_seconds <= 0 and _retire_writers_lock.locked():
         logger.info("Writer retire already in progress; shutdown does not wait for it")
-        return
+        return False
     async with _retire_writers_lock:
         if _writers_retired:
-            return
+            return False
         # Fence first: no socket write is admitted from here on, and the ones
         # already admitted are asked to wind down. They are waited for below.
         release_hold.mark_writers_retired()
@@ -2838,7 +2842,7 @@ async def retire_writers(
         # Chat channels stop before task finalizers drain.
         await _stop_chat_channels(raise_errors=raise_on_stop_error)
         if settle_seconds <= 0:
-            return
+            return True
 
         # Cancelling a task that awaits a worker thread does not stop the
         # thread, and an admitted socket write or a detached prompt dispatch
@@ -2852,6 +2856,7 @@ async def retire_writers(
         if not await release_hold.drain_socket_writes(settle_seconds):
             raise RuntimeError("socket writes did not settle")
         _writers_retired = True
+        return True
 
 
 def writers_retired() -> bool:
@@ -2895,8 +2900,9 @@ async def shutdown_event() -> None:
     # and it would only spend the grace period the coordinator drain and the
     # sandbox cleanup below need. A failed stop must not skip those either:
     # this is the last chance to run them.
+    stops_ran = False
     try:
-        await retire_writers(settle_seconds=0, raise_on_stop_error=False)
+        stops_ran = await retire_writers(settle_seconds=0, raise_on_stop_error=False)
     except Exception:
         logger.exception("Retiring the writers failed at shutdown; continuing teardown")
     # The retire above returns early after a completed host retire (channel
@@ -2904,8 +2910,9 @@ async def shutdown_event() -> None:
     # lock mid-stop (which may yet fail). Both stops are idempotent, so shutdown
     # always runs them: this is the last chance.
     try:
-        await _stop_runtime_loops()
-        await _stop_chat_channels(raise_errors=False)
+        if not stops_ran:
+            await _stop_runtime_loops()
+            await _stop_chat_channels(raise_errors=False)
     except Exception:
         logger.exception("Stopping loops and channels failed at shutdown")
 

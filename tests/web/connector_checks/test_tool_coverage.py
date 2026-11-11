@@ -41,7 +41,6 @@ _PINNED_LEGACY = frozenset(
         "freshdesk",
         "github",
         "gmail",
-        "google-ads",
         "google-analytics",
         "google-calendar",
         "google-drive",

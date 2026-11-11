@@ -37,8 +37,10 @@ from xagent.web.connector_checks.registry import (
     connector_checks_for,
     l3_read_check,
 )
+from xagent.web.connector_checks.results import FailureClass
 from xagent.web.tools.mcp import (
     excel,
+    google_ads,
     google_docs,
     google_sheets,
     google_slides,
@@ -482,6 +484,15 @@ def test_powerpoint_read_fixture_output_satisfies_its_declaration(
 # The Tier 2 read checks (issue #3573): the tool, its arguments, and every
 # assertion, so dropping an item key or a whole assertion fails here.
 _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "google-ads.list_accessible_customers": (
+        "google_ads_list_accessible_customers",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("customer_ids",)),
+            IsType(("customer_ids",), "array"),
+        ),
+    ),
     "zendesk.list_tickets": (
         "zendesk_list_tickets",
         {"limit": 1},
@@ -567,7 +578,7 @@ def test_a_tier_2_read_check_is_declared_exactly(
     assert check.assertions == assertions
 
 
-@pytest.mark.parametrize("app_id", ["zendesk", "zoom"])
+@pytest.mark.parametrize("app_id", ["google-ads", "zendesk", "zoom"])
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)
     assert expected is not None
@@ -660,3 +671,45 @@ def test_zoom_list_meetings_output_satisfies_its_declaration(
     )
 
     _assert_check_output("zoom.list_meetings", zoom.zoom_list_meetings())
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_google_ads_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    monkeypatch.setattr(
+        google_ads,
+        "_request",
+        lambda *args, **kwargs: {"resourceNames": ["customers/1112223333"] * count},
+    )
+
+    _assert_check_output(
+        "google-ads.list_accessible_customers",
+        google_ads.google_ads_list_accessible_customers(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        # A rejected token or a malformed request: the tool catches it and
+        # reports it in its own envelope, with the MCP error flag unset.
+        ({"status": "error", "message": "PERMISSION_DENIED"}, "status_success"),
+        ({"status": "success"}, "has_keys"),
+        ({"status": "success", "customer_ids": "1112223333"}, "is_type"),
+    ],
+)
+def test_google_ads_list_check_fails_on_another_shape(
+    payload: dict[str, Any], reason: str
+) -> None:
+    check = _read_check("google-ads.list_accessible_customers")
+    raw = {
+        "content": [{"type": "text", "text": json.dumps(payload)}],
+        "structured_content": None,
+        "is_error": False,
+    }
+
+    assert judge_result(raw, check.payload, check.assertions) == (
+        FailureClass.ASSERTION_FAILED,
+        reason,
+    )

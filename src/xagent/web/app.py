@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import importlib
 import json
 import logging
 import mimetypes
@@ -2373,6 +2374,43 @@ async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
         logger.info("Started sandbox idle sweep task")
 
 
+def _preload_channel_modules() -> None:
+    """Import the chat channel modules without constructing or starting anything.
+
+    The Feishu and Telegram modules pull in large SDKs (``lark_oapi``,
+    ``aiogram``) that cost several seconds to import, which would otherwise
+    block the event loop inside standby activation. Importing has no side
+    effect beyond ``sys.modules``; the managers are still built and started by
+    :func:`_start_commands_and_channels`.
+    """
+    for name in (
+        ".channels.feishu.bot",
+        ".channels.slack.bot",
+        ".channels.telegram.bot",
+    ):
+        importlib.import_module(name, package=__package__)
+
+
+async def _preload_channel_modules_in_standby() -> None:
+    """Warm the channel imports while still a standby; failures surface at activation.
+
+    WHY on the event loop thread, not ``asyncio.to_thread``: ``lark_oapi.ws.client``
+    binds a module-level ``loop`` from ``asyncio.get_event_loop()`` at import time
+    and later schedules the Feishu receive loop on it. Imported from a worker
+    thread it would bind a fresh loop that never runs, and Feishu would stop
+    receiving messages. A standby serves no traffic, so blocking its loop for
+    the few seconds of the import costs nothing; activation, which runs inside
+    the release's write pause, no longer pays it.
+    """
+    try:
+        with _startup_phase("channel module preload (standby)"):
+            _preload_channel_modules()
+    except Exception:
+        # WHY: activation imports the same modules inside its own try/except and
+        # logs the failure there; a warmup miss must not fail the standby.
+        logger.warning("Channel module preload failed in standby", exc_info=True)
+
+
 async def _start_commands_and_channels() -> None:
     """Command dispatch (and shared runtime) plus the configured chat channels."""
     # Recover accepted-but-unfinished task commands only after the runtime,
@@ -2691,6 +2729,8 @@ async def startup_event() -> None:
     else:
         logger.info("Sandbox manager not available (disabled or init failed)")
 
+    if standby.standby:
+        await _preload_channel_modules_in_standby()
     await _run_or_defer("command dispatch and channels", _start_commands_and_channels)
 
     await _run_or_defer("temp-file cleanup and Composio reconcile", _start_late_tasks)

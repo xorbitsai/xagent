@@ -21,6 +21,7 @@ from typing import (
 
 from xagent.core.utils.blocking import run_blocking
 
+from ..core.exceptions import CollectionMigratingError
 from ..core.schemas import (
     CrawlResult,
     IngestionConfig,
@@ -29,7 +30,7 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from ..kb.operation_compatibility import _close_awaitable_if_possible
-from ..management.migration_state import ensure_collection_writable
+from ..management.migration_state import ensure_collection_writable_async
 from ..progress import get_progress_manager
 from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
@@ -388,7 +389,7 @@ async def _run_web_ingestion_impl(
     user_id = scope.user_id
     is_admin = scope.is_admin
 
-    ensure_collection_writable(collection)
+    await ensure_collection_writable_async(collection)
 
     start_time = datetime.now(timezone.utc)
     warnings: list[str] = []
@@ -446,6 +447,7 @@ async def _run_web_ingestion_impl(
     )
 
     # Step 2: Ingest each crawled page
+    await ensure_collection_writable_async(collection)
     logger.info("Step 2: Ingesting crawled pages")
 
     # Create temporary directory for markdown files
@@ -569,6 +571,8 @@ async def _run_web_ingestion_impl(
                                 final_file_path,
                                 final_file_id,
                             )
+                        except CollectionMigratingError:
+                            raise
                         except Exception as e:
                             logger.exception(
                                 "File handler failed for %s", crawl_result.url
@@ -666,6 +670,8 @@ async def _run_web_ingestion_impl(
                                 message=ingest_result.message,
                             )
 
+                    except CollectionMigratingError:
+                        raise
                     except Exception as e:
                         logger.exception("Failed to ingest %s", crawl_result.url)
                         failed_urls[crawl_result.url] = str(e)
@@ -693,6 +699,8 @@ async def _run_web_ingestion_impl(
                             message=failure_message,
                         )
 
+                except CollectionMigratingError:
+                    raise
                 except Exception as e:
                     logger.exception("Failed to ingest %s", crawl_result.url)
                     failed_urls[crawl_result.url] = str(e)
@@ -718,6 +726,8 @@ async def _run_web_ingestion_impl(
             return_exceptions=True,
         )
         for (_, crawl_result), outcome in zip(pending_pages, page_outcomes):
+            if isinstance(outcome, CollectionMigratingError):
+                raise outcome
             if isinstance(outcome, Exception):
                 logger.error(
                     "Unexpected error ingesting %s: %s",

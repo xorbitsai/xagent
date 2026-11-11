@@ -325,10 +325,10 @@ The `user` adapter (`user_identity.py`):
   "complete": true,
   "failure": null,
   "rows": [
-    {"row": "session", "connector": "gmail", "check": null, "kind": null, "tool": null,
+    {"row": "session", "connector": "slack", "check": null, "kind": null, "tool": null,
      "outcome": "pass", "failure_class": null, "reason": null, "duration_ms": 1800},
-    {"row": "check", "connector": "gmail", "check": "gmail.l3_probe", "kind": "read",
-     "tool": "gmail_search_messages", "outcome": "pass", "failure_class": null,
+    {"row": "check", "connector": "slack", "check": "slack.l3_probe", "kind": "read",
+     "tool": "slack_list_channels", "outcome": "pass", "failure_class": null,
      "reason": null, "duration_ms": 900},
     {"row": "session", "connector": "jira", "check": null, "kind": null, "tool": null,
      "outcome": "fail", "failure_class": "client_rejected", "reason": "client_rejected",

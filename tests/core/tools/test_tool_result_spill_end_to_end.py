@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from xagent.core.agent.context import ExecutionContext
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools import tool_result_spill
 from xagent.core.tools.adapters.vibe.config import ToolConfig
@@ -572,7 +573,12 @@ async def test_compaction_through_the_runtime_lists_the_stored_file(
         f"- {relative_path}: a JSON array of {len(CLIENTS)} items"
         in (naming[0]["content"])
     )
-    assert sent[-1] == {"role": "user", "content": "Which of them are new?"}
+    # The request also carries the turn context after its own text.
+    assert sent[-1]["role"] == "user"
+    request_text, _turn_context = sent[-1]["content"].split(
+        f"\n\n{TURN_CONTEXT_HEADER}", 1
+    )
+    assert request_text == "Which of them are new?"
     (listed_path,) = STORED_PATH_RE.findall(naming[0]["content"])
     reply = await _only_tool_named(tools, SPILL_READ_TOOL_NAME).run_json_async(
         {"path": listed_path, "start": 1, "end": 2}

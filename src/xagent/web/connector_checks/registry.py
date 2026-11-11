@@ -17,17 +17,24 @@ from ..connector_probes import get_connector_probe, get_unprobeable_reason
 from .declarations import (
     ConnectorChecks,
     Contains,
+    CreatedRef,
     DeclarationError,
     EachHasKeys,
     Equals,
     HasKeys,
     IsType,
+    ItemRef,
     L3Envelope,
     Length,
     ReadCheck,
+    RunScopedName,
     StatusSuccess,
+    Sweep,
+    TenantPin,
     ToolExemption,
+    ToolStep,
     UnprobeableCheck,
+    WriteCheck,
 )
 from .fixtures import FixtureRef
 
@@ -35,6 +42,7 @@ from .fixtures import FixtureRef
 # work still to come names the issue of the connector's family that decides
 # it; a write whose object no tool can delete is a reason of its own.
 _GOOGLE_TIER_1 = "#3567"
+_JIRA_TIER_1 = "#3570"
 _MICROSOFT_365_TIER_1 = "#3569"
 # Tier 2 runs structural reads only: no seeded objects and no write checks.
 _TIER_2 = "#3573"
@@ -130,6 +138,168 @@ def _declared_l3(app_id: str) -> ReadCheck:
     return check
 
 
+def _jira_checks() -> ConnectorChecks:
+    """Jira's Tier 1 checks (#3570).
+
+    The reads cover the tools that carry most of Jira's calls, against the
+    test tenant's seeded read project; the write check creates an issue in its
+    write project, reads it back and deletes it. Each call that reads or
+    writes issues names the test site by ``cloud_id`` instead of relying on
+    the tool's single-site auto-detection; the tenant pin still refuses the
+    write when the grant reaches any other site.
+    """
+    tenant = FixtureRef("jira.tenant_id")
+    seeded_issue = FixtureRef("jira.seed.issue_key")
+    write_project = FixtureRef("jira.write_project_key")
+    name = RunScopedName("issue")
+    created = CreatedRef(("issue", "key"))
+    pin = TenantPin(
+        ToolStep("jira_list_accessible_sites", assertions=(Length(("sites",), 1, 1),)),
+        path=("sites", 0, "id"),
+        expected=tenant,
+    )
+    read_back = ToolStep(
+        "jira_get_issue",
+        {"cloud_id": tenant, "issue_key": created},
+        assertions=(StatusSuccess(), Equals(("issue", "summary"), name)),
+    )
+    return ConnectorChecks(
+        "jira",
+        reads=(
+            _declared_l3("jira"),
+            ReadCheck(
+                "jira.search_issues",
+                "jira_search_issues",
+                {
+                    "cloud_id": tenant,
+                    "jql": FixtureRef("jira.seed.search_jql"),
+                    "raw_fields": False,
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("issues", "returned_count", "truncated")),
+                    EachHasKeys(
+                        ("issues",),
+                        ("key", "summary", "status", "issue_type", "project_key"),
+                    ),
+                    Equals(("issues", 0, "key"), seeded_issue),
+                ),
+            ),
+            ReadCheck(
+                "jira.list_comments",
+                "jira_list_comments",
+                {"cloud_id": tenant, "issue_key": seeded_issue},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("comments", "total", "truncated")),
+                    EachHasKeys(("comments",), ("id", "author", "body", "created")),
+                    Equals(("comments", 0, "id"), FixtureRef("jira.seed.comment_id")),
+                    IsType(("comments", 0, "body"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "jira.get_issue",
+                "jira_get_issue",
+                {"cloud_id": tenant, "issue_key": seeded_issue},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("issue", "key"), seeded_issue),
+                    HasKeys(
+                        ("issue",),
+                        ("summary", "description", "status", "issue_type"),
+                    ),
+                    IsType(("issue", "summary"), "string"),
+                    IsType(("issue", "description"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "jira.current_user",
+                "jira_get_current_user",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("account_id", "email", "name")),
+                    IsType(("user", "account_id"), "string"),
+                ),
+            ),
+        ),
+        writes=(
+            WriteCheck(
+                "jira.issue_round_trip",
+                create=ToolStep(
+                    "jira_create_issue",
+                    {"cloud_id": tenant, "project_key": write_project, "summary": name},
+                    assertions=(StatusSuccess(), IsType(("issue", "key"), "string")),
+                ),
+                verify=read_back,
+                cleanup=ToolStep(
+                    "jira_delete_issue",
+                    {"cloud_id": tenant, "issue_key": created},
+                    assertions=(StatusSuccess(), Equals(("deleted",), True)),
+                ),
+                cleanup_guard=read_back,
+                tenant_pin=pin,
+                # Toby withholds both from a member who did not install it.
+                expected_verdicts={
+                    "jira_create_issue": "deny",
+                    "jira_delete_issue": "deny",
+                },
+            ),
+        ),
+        exemptions=(
+            *(
+                ToolExemption(
+                    tool,
+                    "read left unchecked: the checked tools carry over 80% of "
+                    f"Jira's calls, as decided in {_JIRA_TIER_1}",
+                )
+                for tool in (
+                    "jira_list_projects",
+                    "jira_search_users",
+                    "jira_list_transitions",
+                )
+            ),
+            *(
+                ToolExemption(
+                    tool,
+                    "write that edits an existing issue: a write check creates, "
+                    "verifies and deletes its own object and has no step for an "
+                    f"edit, as decided in {_JIRA_TIER_1}",
+                )
+                for tool in ("jira_update_issue", "jira_transition_issue")
+            ),
+            *(
+                ToolExemption(
+                    tool,
+                    "write that adds to an existing issue, which no tool of this "
+                    "server removes on its own: a write check can neither create "
+                    f"the issue first nor delete what it adds, as decided in "
+                    f"{_JIRA_TIER_1}",
+                )
+                for tool in ("jira_add_comment", "jira_add_attachment")
+            ),
+        ),
+        sweep=Sweep(
+            tenant_pin=pin,
+            find=ToolStep(
+                "jira_search_issues",
+                {
+                    "cloud_id": tenant,
+                    "jql": FixtureRef("jira.write_sweep_jql"),
+                    "raw_fields": False,
+                },
+                assertions=(StatusSuccess(), IsType(("issues",), "array")),
+            ),
+            items=("issues",),
+            name=("summary",),
+            delete=ToolStep(
+                "jira_delete_issue",
+                {"cloud_id": tenant, "issue_key": ItemRef(("key",))},
+                assertions=(StatusSuccess(),),
+            ),
+        ),
+    )
+
+
 # Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
 # connector has a check or an exemption (#3565, tests/web/connector_checks/
 # test_tool_coverage.py); a remote one declares the checks it has.
@@ -212,6 +382,25 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
             ToolExemption("gmail_manage_labels", _GMAIL_LABEL_WITHOUT_READ),
         ),
+    ),
+    # Tier 2 (#3573): the connector's only read that takes no object id or
+    # query is the tool its L3 probe calls, so that tool keeps the L3 row and
+    # carries the check.
+    "google-ads": ConnectorChecks(
+        "google-ads",
+        reads=(
+            _declared_l3("google-ads"),
+            ReadCheck(
+                "google-ads.list_accessible_customers",
+                "google_ads_list_accessible_customers",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("customer_ids",)),
+                    IsType(("customer_ids",), "array"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(issue=_TIER_2, reads=("google_ads_search",)),
     ),
     "google-analytics": ConnectorChecks(
         "google-analytics",
@@ -443,6 +632,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    "jira": _jira_checks(),
     # Create-only (#3655): its one tool files a ticket no tool of the server
     # can delete, and its L3 slot stays unprobeable for the same reason.
     "jira-ticket": ConnectorChecks(
@@ -662,14 +852,12 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "fireflies",
         "freshdesk",
         "github",
-        "google-ads",
         "google-maps",
         "google-search-console",
         "granola",
         "hubspot",
         "instagram",
         "intercom",
-        "jira",
         "linear",
         "linkedin",
         "magento",

@@ -8,6 +8,7 @@
   var W_NO_INSTANCE = 'Xagent Widget: XagentWidget.open() was called, but no chat widget is active on this page.';
   var W_BAD_OPTIONS = 'Xagent Widget: XagentWidget.open() expects an options object; opening the chat without sending a message.';
   var W_UNKNOWN_OPTIONS_PREFIX = 'Xagent Widget: XagentWidget.open() ignored unknown option(s): ';
+  var W_BAD_EXPANDED = 'Xagent Widget: XagentWidget.open() expanded must be true or false; ignoring it.';
 
   // Shared by every widget.js instance on the page: open() targets the newest
   // instance that is still live, and falls back to an older one once the newer
@@ -890,8 +891,8 @@
   fab.className = 'xagent-widget-fab';
   // Chat icon SVG
   var chatIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>';
-  // Close icon SVG
-  var closeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
+  // Minimize icon SVG (shown while the panel is open)
+  var minimizeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M16.59 8.59L12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>';
 
   fab.innerHTML = chatIcon;
   // In the no-ready mobile states, this is the only dismiss control the
@@ -902,6 +903,10 @@
 
   var isOpen = false;
   var hasOpened = false;
+  // Whether this page view's first-open size rule (data-expanded, or an
+  // explicit open({ expanded }) in its place) has been spent. Kept apart from
+  // hasOpened, which gates data-initial-message delivery instead.
+  var initialSizeApplied = false;
   var initialMessageRequested = false;
   var initialMessageDelivered = false;
 
@@ -910,7 +915,7 @@
   // least once (it stays set, so a reloaded iframe's next request gets the
   // pending message again); the per-instance id counter; and this instance's
   // entry in the shared target list, set once it registers.
-  var OPEN_OPTION_KEYS = ['message'];
+  var OPEN_OPTION_KEYS = ['message', 'expanded'];
   var openMessageSlot = null;
   var openMessageRequested = false;
   var openMessageSeq = 0;
@@ -988,14 +993,29 @@
     }
   }
 
+  // Every open goes through here (the FAB and XagentWidget.open() alike). The
+  // first open on this page view applies data-expanded here, unless an
+  // explicit XagentWidget.open({ expanded }) already spent it, and reports the
+  // resulting size to the iframe only when the attribute asked to expand.
+  // Later opens keep whatever size was last set.
   function openPanel() {
+    var expandedOnFirstOpen = false;
+    if (!initialSizeApplied) {
+      initialSizeApplied = true;
+      if (readDataExpanded()) {
+        expandedOnFirstOpen = true;
+        // Refused on a mobile viewport, where isExpanded stays false.
+        expandPanel();
+      }
+    }
     isOpen = true;
     hasOpened = true;
     panel.classList.add('open');
-    fab.innerHTML = closeIcon;
-    fab.setAttribute('aria-label', 'Close chat');
+    fab.innerHTML = minimizeIcon;
+    fab.setAttribute('aria-label', 'Minimize chat');
     applyScrollLock();
     deliverInitialMessage();
+    if (expandedOnFirstOpen) postExpandState();
   }
 
   function closePanel() {
@@ -1017,8 +1037,9 @@
     if (isMobileViewport()) return false;
     // Expanding invalidates a drag's frozen startX/startWidth anchors the
     // same way a viewport-width change does (see onWindowResize's own
-    // cancelDrag() call) -- a drag can only still be active here via a
-    // second, independent pointer (e.g. one finger holding the handle while
+    // cancelDrag() call) -- a drag can still be active here when the host
+    // page's XagentWidget.open({ expanded: true }) arrives mid-drag, or via
+    // a second, independent pointer (e.g. one finger holding the handle while
     // another taps this menu item on a touch-capable desktop-width device),
     // since isMobileViewport()/isExpanded already block a *new* drag from
     // starting once expanded. Without this, that drag's very next
@@ -1092,6 +1113,19 @@
     return parsed;
   }
 
+  // Read on the first open (not at load), so a host SPA can still set the
+  // attribute before the visitor first opens the chat. Only "true" (trimmed,
+  // any case) expands; a missing, empty or "false" value quietly does not.
+  // Called once, from the first open only, so it warns at most once.
+  function readDataExpanded() {
+    var raw = (scriptTag.getAttribute('data-expanded') || '').trim().toLowerCase();
+    if (raw === 'true') return true;
+    if (raw && raw !== 'false') {
+      console.warn('Xagent Widget: data-expanded must be "true" or "false"; ignoring it.');
+    }
+    return false;
+  }
+
   // Must stay in step with MAX_INITIAL_MESSAGE_LENGTH in widget-parent-message.ts.
   var MAX_INITIAL_MESSAGE_LENGTH = 2000;
   var initialMessageWarned = false;
@@ -1152,6 +1186,31 @@
     return value;
   }
 
+  // open()'s expanded option: true or false, or null when it is absent,
+  // undefined, or unusable. A non-boolean value warns with a fixed text; options
+  // that are not an object already got W_BAD_OPTIONS from readOpenMessage.
+  // Same rules as there: own properties only, and a throwing getter is not caught.
+  function readOpenExpanded(options) {
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) return null;
+    if (!Object.prototype.hasOwnProperty.call(options, 'expanded')) return null;
+    var raw = options.expanded;
+    if (raw === undefined) return null;
+    if (typeof raw === 'boolean') return raw;
+    console.warn(W_BAD_EXPANDED);
+    return null;
+  }
+
+  // Tells the iframe's menu the panel's actual size. Sent after every size
+  // request (the host page's and the menu's own widget_expand/widget_collapse)
+  // and in reply to every widget_chrome_ready. Messages to one window arrive
+  // in the order they were posted, so the iframe always ends on the panel's
+  // last actual size.
+  function postExpandState() {
+    if (!torndown && iframe.contentWindow) {
+      iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_state', expanded: isExpanded }, host);
+    }
+  }
+
   // Posted whether or not the panel is still open: the call asked for this
   // message to be sent. Before the iframe's first request there is no listener
   // to post to, so the slot waits for that request.
@@ -1166,18 +1225,28 @@
   // XagentWidget.open() for this instance. A usable message permanently spends
   // data-initial-message (marked before openPanel(), whose own delivery attempt
   // must already see it spent), replaces any message still waiting for its ack,
-  // and goes to the iframe once the iframe listens for open messages. The panel
+  // and goes to the iframe once the iframe listens for open messages. A boolean
+  // expanded sets the panel size before it opens (false only collapses it), on a
+  // first open takes the place of data-expanded, and is then reported to the
+  // iframe's menu. Both options are read before anything changes. The panel
   // only ever opens here, never closes. The message is host-authored in the
   // same way as data-initial-message: never pass visitor-controlled input.
   function openFromHost(options) {
     if (torndown || !panel.isConnected) return;
     var value = readOpenMessage(options);
+    var expandedOption = readOpenExpanded(options);
     if (value !== null) {
       initialMessageDelivered = true;
       openMessageSeq += 1;
       openMessageSlot = { id: String(openMessageSeq), value: value };
     }
+    if (expandedOption !== null) {
+      initialSizeApplied = true;
+      if (expandedOption) expandPanel();
+      else if (isExpanded) collapsePanel();
+    }
     openPanel();
+    if (expandedOption !== null) postExpandState();
     if (value !== null) deliverOpenMessage();
   }
 
@@ -1200,6 +1269,9 @@
       // parent-owned fallback so a stuck child state can never fully trap
       // the visitor behind a full-screen mobile panel with no dismiss action.
       panel.classList.add('xagent-widget-chrome-ready');
+      // Each newly mounted menu (first load, an iframe reload, a header
+      // remount) starts from its own default, so it gets the current size.
+      postExpandState();
     } else if (data.type === 'widget_chrome_not_ready') {
       panel.classList.remove('xagent-widget-chrome-ready');
     } else if (data.type === 'widget_expand') {
@@ -1211,8 +1283,10 @@
       if (!expandPanel()) {
         iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
       }
+      postExpandState();
     } else if (data.type === 'widget_collapse') {
       collapsePanel();
+      postExpandState();
     } else if (data.type === 'prompt_context_request') {
       // Only the guest channel filters unsigned values; the signed Session
       // path lands later, so Session mode stays silent.

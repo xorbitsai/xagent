@@ -9,7 +9,6 @@ vector index store.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import importlib
 import inspect
@@ -31,6 +30,8 @@ from datetime import timezone
 from functools import cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, NoReturn, Optional, TypeVar, cast
+
+from xagent.core.utils.blocking import run_blocking
 
 from ..storage.file_reference import guard_document_restore
 
@@ -6639,10 +6640,10 @@ class MilvusCollectionHandle(KBCollectionHandle):
         deleted = await self.ledger.delete_collection_config(tenant_only=tenant_only)
         scope = self.context.user_scope
         if tenant_only:
-            if await asyncio.to_thread(self._documents_of, scope.user_id):
+            if await run_blocking(self._documents_of, scope.user_id):
                 return deleted
         user_id, is_admin = (scope.user_id, False) if tenant_only else (None, True)
-        await asyncio.to_thread(
+        await run_blocking(
             delete_kb_ids,
             self.context.vector_index_store.get_raw_connection(),
             self.context.collection,

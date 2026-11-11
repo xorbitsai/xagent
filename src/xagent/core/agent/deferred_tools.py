@@ -42,6 +42,23 @@ MAX_AUTO_LOAD_RETRIES = 3
 DEFAULT_PRELOAD_TOKEN_BUDGET = 20_000
 
 
+# Words in a user message that pre-load a deferred built-in category, so
+# "make an image" needs no extra load_tools round trip. Matched as whole words,
+# case-insensitively, on top of the category name itself and exact tool names.
+BUILTIN_CATEGORY_MENTION_TERMS: dict[str, tuple[str, ...]] = {
+    "image": ("image", "images", "picture", "pictures", "photo", "photos"),
+    "video": ("video", "videos"),
+    "audio": ("audio", "speech", "voice", "transcribe", "transcription"),
+    "browser": ("browser", "browse"),
+    "ppt": ("ppt", "pptx", "powerpoint", "presentation", "slides", "slide deck"),
+}
+
+
+def builtin_source_label(category: str) -> str:
+    """How the catalog names a deferred built-in category."""
+    return f"built-in {category}"
+
+
 class LoadToolsArgs(BaseModel):
     names: list[str] = Field(
         description=(
@@ -69,8 +86,15 @@ class LoadToolsTool:
     )
     metadata = None
 
-    def __init__(self, handler: Callable[[Any], str]) -> None:
+    def __init__(
+        self, handler: Callable[[Any], str], *, builtin_categories: bool = False
+    ) -> None:
         self._handler = handler
+        if builtin_categories:
+            self.description = (
+                f"{type(self).description} A built-in category name from the "
+                "index (for example image) loads every tool in that category."
+            )
 
     def args_type(self) -> Any:
         return LoadToolsArgs
@@ -90,6 +114,11 @@ DEFERRED_RULE = (
     "included); they can be called from the next step. "
     "A tool that is not loaded cannot be called. Load only what the request "
     "needs."
+)
+
+BUILTIN_DEFERRED_RULE = (
+    "Entries labelled 'built-in <category>' are built-in tools deferred the "
+    f"same way: pass the tool names, or the category name, to {LOAD_TOOLS_NAME}."
 )
 
 # Appended to the "Available tool names" sentence so it stays true, and stays

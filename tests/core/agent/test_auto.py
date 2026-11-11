@@ -21,6 +21,7 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -38,6 +39,16 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
+
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
@@ -534,7 +545,10 @@ async def test_auto_decision_sees_memory_context() -> None:
         for message in decision_messages
         if message["role"] == "system"
     )
-    assert "Answer simple follow-ups using the project memory." in system_context
+    assert "Answer simple follow-ups using the project memory." not in system_context
+    assert "Answer simple follow-ups using the project memory." in _all_text(
+        decision_messages
+    )
     assert [tool["function"]["name"] for tool in llm.calls[0]["tools"]] == [
         DECISION_TOOL_NAME,
         "load_skill",
@@ -1889,8 +1903,10 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
         for message in resumed_llm.calls[0]["messages"]
         if message["role"] == "system"
     )
-    assert "memory for replacement question" in resumed_system_context
-    assert "memory for first question" not in resumed_system_context
+    resumed_prompt = _all_text(resumed_llm.calls[0]["messages"])
+    assert "memory for replacement question" in resumed_prompt
+    assert "memory for first question" not in resumed_prompt
+    assert "memory for replacement question" not in resumed_system_context
 
 
 @pytest.mark.asyncio
@@ -2492,11 +2508,21 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert result["success"] is True
     assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
     assert child.kwargs is not None
-    child_system = child.kwargs["context"].get_messages_for_llm()[0]["content"]
-    assert "请始终使用中文回答。" in child_system
+    child_messages = child.kwargs["context"].get_messages_for_llm()
+    child_system = child_messages[0]["content"]
+    # The stale memory reaches the child as recalled context in the turn
+    # context, never as the language policy in the system message.
+    assert "请始终使用中文回答。" not in child_system
+    assert "请始终使用中文回答。" in _all_text(child_messages)
     assert "Output language:" not in child_system
     assert "Output language policy:" not in child_system
-    assert "Summarize the quarterly revenue trend in one paragraph." in child_system
+    request_text = "Summarize the quarterly revenue trend in one paragraph."
+    assert (
+        "Current user request: the latest user message written by the user"
+        in child_system
+    )
+    assert request_text not in child_system
+    assert sum(str(m["content"]).count(request_text) for m in child_messages) == 1
     assert "Canonical request-language evidence" in child_system
 
 
@@ -2526,8 +2552,14 @@ async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
     target_rule = "explicit or implicit target-language intent"
     tool_schema = llm.calls[0]["tools"][0]["function"]
     assert "canonical language contract" in tool_schema["description"]
-    system_content = context.get_messages_for_llm()[0]["content"]
-    assert request in system_content
+    sent = context.get_messages_for_llm()
+    system_content = sent[0]["content"]
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_content
+    )
+    assert request not in system_content
+    assert sum(str(m["content"]).count(request) for m in sent) == 1
     assert target_rule in system_content
 
 

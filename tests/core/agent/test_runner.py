@@ -33,6 +33,7 @@ from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    TURN_CONTEXT_HEADER,
     context_checkpoint_gate,
     tool_evidence_state,
 )
@@ -63,6 +64,15 @@ from xagent.core.model.chat.exceptions import (
 from xagent.core.model.chat.routing_context import xinference_routing_key
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 from xagent.core.user_context import current_user_id
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
 
 
 @pytest.fixture(autouse=True)
@@ -3192,9 +3202,14 @@ async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> Non
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    sent = result["context"].get_messages_for_llm()
+    system_content = sent[0]["content"]
     assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    # The request is sent once, as the latest user message.
+    assert "Summarize the release notes in one paragraph." not in system_content
+    assert [
+        _without_turn_context(m["content"]) for m in sent if m["role"] == "user"
+    ] == ["Summarize the release notes in one paragraph."]
 
 
 @pytest.mark.asyncio
@@ -3234,9 +3249,14 @@ async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    sent = result["context"].get_messages_for_llm()
+    system_content = sent[0]["content"]
     assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    # The request is sent once, as the latest user message.
+    assert "Summarize the release notes in one paragraph." not in system_content
+    assert [
+        _without_turn_context(m["content"]) for m in sent if m["role"] == "user"
+    ] == ["Summarize the release notes in one paragraph."]
 
 
 @pytest.mark.asyncio

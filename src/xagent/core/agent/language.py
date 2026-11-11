@@ -238,6 +238,41 @@ def render_request_language_harness(
     request_reference: str = "",
 ) -> str:
     """Render the canonical policy and the minimum request-only evidence."""
+    system_text, _turn_text = split_request_language_harness(
+        request,
+        pending_response,
+        output_language=output_language,
+        request_reference=request_reference,
+        evidence_in_turn_context=False,
+    )
+    return system_text
+
+
+REQUEST_LANGUAGE_EVIDENCE_HEADING = "Canonical request-language evidence (JSON):"
+# Stands in the system context for evidence that quotes request or answer
+# text: that text changes every turn, so it is sent in the turn context block,
+# after the static system prompt and tool schemas.
+REQUEST_LANGUAGE_EVIDENCE_IN_TURN_CONTEXT = (
+    f"{REQUEST_LANGUAGE_EVIDENCE_HEADING} given in the turn context block."
+)
+
+
+def split_request_language_harness(
+    request: TopLevelUserRequest,
+    pending_response: PendingUserResponse | None = None,
+    *,
+    output_language: str | None = None,
+    request_reference: str = "",
+    evidence_in_turn_context: bool = True,
+) -> tuple[str, str]:
+    """Return ``(system_text, turn_text)`` for the language harness.
+
+    With ``evidence_in_turn_context``, evidence that quotes the request or a
+    pending answer goes to ``turn_text`` and the system text says where it is,
+    so the system text is the same on every turn. Evidence that names only a
+    pinned language or a pointer is already the same on every turn and stays
+    in the system text, and ``turn_text`` is empty.
+    """
     evidence: dict[str, Any] = {}
     language = normalize_response_language_label(output_language)
     if language:
@@ -253,27 +288,40 @@ def render_request_language_harness(
         if language
         else canonical_unpinned_request_language_policy()
     )
-    return (
-        "Canonical request-language evidence (JSON):\n"
-        f"{json.dumps(evidence, ensure_ascii=False)}\n\n"
-        f"{policy}"
+    evidence_text = (
+        f"{REQUEST_LANGUAGE_EVIDENCE_HEADING}\n"
+        f"{json.dumps(evidence, ensure_ascii=False)}"
     )
+    quotes_turn_text = (
+        "independent_user_request" in evidence or "pending_response" in evidence
+    )
+    if evidence_in_turn_context and quotes_turn_text:
+        return f"{REQUEST_LANGUAGE_EVIDENCE_IN_TURN_CONTEXT}\n\n{policy}", evidence_text
+    return f"{evidence_text}\n\n{policy}", ""
 
 
-def render_root_request_language_harness(
+def split_root_request_language_harness(
     request: TopLevelUserRequest,
     pending_response: PendingUserResponse | None,
     output_language: str | None,
-) -> str:
-    return render_request_language_harness(
+    request_reference: str | None = None,
+    *,
+    evidence_in_turn_context: bool = True,
+) -> tuple[str, str]:
+    """The root request's language harness, split as in
+    ``split_request_language_harness``. ``request_reference`` names where the
+    request text already sits in the prompt; ``None`` means the default
+    "Current user request above" block."""
+    return split_request_language_harness(
         request,
         pending_response,
         output_language=output_language,
         request_reference=(
-            "Current user request above"
+            (request_reference or "Current user request above")
             if request.language_text == request.execution_text
             else ""
         ),
+        evidence_in_turn_context=evidence_in_turn_context,
     )
 
 

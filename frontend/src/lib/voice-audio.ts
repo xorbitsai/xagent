@@ -9,6 +9,9 @@ export class VoiceAudioError extends Error {
   constructor(public code: VoiceAudioFailure) { super(code) }
 }
 
+/** Which side of the call a level reading is for. */
+export type VoiceLevelSource = "mic" | "output"
+
 /** One call owns its microphone, socket, playback sources and fetches. */
 export class VoiceAudio {
   private closed = false
@@ -16,6 +19,11 @@ export class VoiceAudio {
   private microphone: MediaStream | null = null
   private capture: AudioWorkletNode | null = null
   private source: MediaStreamAudioSourceNode | null = null
+  // Taps for the waveform. The microphone tap is read-only; playback goes
+  // through the output tap on its way to the speakers.
+  private micTap: AnalyserNode | null = null
+  private outputTap: AnalyserNode | null = null
+  private levelSamples: Float32Array<ArrayBuffer> | null = null
   private sink: GainNode | null = null
   private socket: WebSocket | null = null
   private playback = new Set<AudioBufferSourceNode>()
@@ -33,6 +41,14 @@ export class VoiceAudio {
   }
 
   constructor(private options: {
+    /**
+     * An audio context already created and resumed inside the user's click.
+     * Browsers (Safari above all) only let a context start from a user gesture,
+     * and a call can only begin after its models and settings have loaded, so
+     * the caller unlocks one up front and hands it over here. The call owns
+     * it from then on and closes it.
+     */
+    context?: AudioContext
     asr: string
     tts: string
     voice?: string
@@ -46,11 +62,16 @@ export class VoiceAudio {
   }) {}
 
   async start(): Promise<void> {
-    this.context = new AudioContext()
-    // Resume during the start button's user activation, before network awaits.
+    this.context = this.options.context ?? new AudioContext()
+    // Usually this is the context unlocked by the click that opened the call
+    // (see `useVoiceCall`); resume is a no-op then. A context made here still
+    // needs the user activation to be live, so resume before any network await.
     await this.context.resume()
     if (this.closed) return
     const context = this.context
+    this.outputTap = context.createAnalyser()
+    this.outputTap.fftSize = 1024
+    this.outputTap.connect(context.destination)
     const media = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     })
@@ -107,6 +128,9 @@ export class VoiceAudio {
     if (this.closed) return
     const resampler = new VoiceResampler(context.sampleRate)
     this.source = context.createMediaStreamSource(media)
+    this.micTap = context.createAnalyser()
+    this.micTap.fftSize = 1024
+    this.source.connect(this.micTap)
     this.capture = new AudioWorkletNode(context, "xagent-voice-capture", { channelCount: 1, channelCountMode: "explicit" })
     this.sink = context.createGain()
     this.sink.gain.value = 0
@@ -139,6 +163,21 @@ export class VoiceAudio {
       if (!this.closed) this.options.activity(false)
     }
     if (!this.closed) this.options.vadFallback?.()
+  }
+
+  /**
+   * Current loudness of the microphone or of the assistant's voice, 0..1.
+   * Cheap enough to read every animation frame; 0 before the call is running
+   * and while the microphone is muted (a muted track reads as silence).
+   */
+  level(source: VoiceLevelSource): number {
+    const tap = source === "mic" ? this.micTap : this.outputTap
+    if (!tap || this.closed) return 0
+    const samples = (this.levelSamples ??= new Float32Array(new ArrayBuffer(tap.fftSize * 4)))
+    tap.getFloatTimeDomainData(samples)
+    let sum = 0
+    for (let index = 0; index < samples.length; index++) sum += samples[index] * samples[index]
+    return Math.min(1, Math.sqrt(sum / samples.length) * 5)
   }
 
   stopAudio() {
@@ -199,7 +238,7 @@ export class VoiceAudio {
           for (let index = 0; index < length; index++) samples[index] = view.getInt16(offset + index * 2, true) / 32768
           const source = context.createBufferSource()
           source.buffer = buffer
-          source.connect(context.destination)
+          source.connect(this.outputTap ?? context.destination)
           source.onended = () => { source.disconnect(); this.playback.delete(source) }
           this.playback.add(source)
           next = Math.max(next, context.currentTime + 0.01)
@@ -231,6 +270,7 @@ export class VoiceAudio {
     this.stopAudio()
     if (this.socket) { this.socket.onclose = this.socket.onerror = this.socket.onmessage = this.socket.onopen = null; this.socket.close() }
     this.capture?.disconnect(); this.source?.disconnect(); this.sink?.disconnect()
+    this.micTap?.disconnect(); this.outputTap?.disconnect()
     this.microphone?.getTracks().forEach(track => track.stop())
     void this.context?.close().catch(() => {})
   }

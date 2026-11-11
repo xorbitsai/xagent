@@ -35,6 +35,7 @@ from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     COMPACT_THRESHOLD_SOURCE_UNKNOWN,
     SPILL_REGISTRY_MAX_RECORDS,
+    TURN_CONTEXT_HEADER,
 )
 from xagent.core.agent.grounding import VALUE_KINDS, step_intent_not_fact_rule
 from xagent.core.agent.language import (
@@ -288,8 +289,13 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
 
     system_message = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Current user request:" in system_message
-    assert "Can you analyze this GitHub project?" in system_message
+    # The request is the latest user message, so the system block points at it
+    # instead of repeating it.
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_message
+    )
+    assert "Can you analyze this GitHub project?" not in system_message
     assert "Canonical request-language evidence" in system_message
     assert "sole hard language authority" in system_message
     assert "memory" in system_message
@@ -424,10 +430,12 @@ def test_system_context_uses_latest_user_message_as_current_request() -> None:
 
     system_message = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Current user request:\n请继续用中文总结" in system_message
-    assert "Current user request:\nCan you analyze this GitHub project?" not in (
-        system_message
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_message
     )
+    assert "请继续用中文总结" not in system_message
+    assert "Can you analyze this GitHub project?" not in system_message
 
 
 def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> None:
@@ -451,7 +459,12 @@ def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> 
     assert "Current user request:\nBook a trip" in system_message
     assert "Current user request:\n北京" not in system_message
     assert "answer to a pending agent question" in waiting_answer_message
-    assert waiting_answer_message.endswith("北京")
+    # The turn context, which carries this answer's pending evidence, follows it.
+    answer_text, turn_context = waiting_answer_message.split(
+        f"\n\n{TURN_CONTEXT_HEADER}", 1
+    )
+    assert answer_text.endswith("北京")
+    assert '"pending_response"' in turn_context
 
 
 def test_dag_step_system_context_uses_output_language_policy() -> None:
@@ -761,9 +774,14 @@ def test_get_messages_for_llm_filters_hidden_and_truncates() -> None:
     result = ctx.get_messages_for_llm(max_tokens=4)
     assert result[0]["role"] == "system"
     assert result[0]["content"].startswith("You are helpful")
-    assert "Turn started at:" in result[0]["content"]
-    # Max tokens = 4 should keep only last assistant message (3 tokens)
-    assert len(result) == 2
+    assert "Turn started at:" not in result[0]["content"]
+    # Max tokens = 4 should keep only last assistant message (3 tokens); the
+    # request message is gone, so the turn context opens the conversation as
+    # its own user message.
+    assert len(result) == 3
+    assert result[1]["role"] == "user"
+    assert result[1]["content"].startswith(TURN_CONTEXT_HEADER)
+    assert "Turn started at:" in result[1]["content"]
     assert result[-1]["content"] == "visible-3"
 
 
@@ -774,9 +792,14 @@ def test_get_messages_for_llm_injects_time_context_without_system_prompt() -> No
     result = ctx.get_messages_for_llm()
 
     assert result[0]["role"] == "system"
-    assert "Turn started at:" in result[0]["content"]
-    assert "relative dates" in result[0]["content"]
-    assert result[1] == {"role": "user", "content": "what happened recently?"}
+    assert "Turn started at:" not in result[0]["content"]
+    assert len(result) == 2
+    assert result[1]["role"] == "user"
+    request, turn_context = result[1]["content"].split("\n\n", 1)
+    assert request == "what happened recently?"
+    assert turn_context.startswith(TURN_CONTEXT_HEADER)
+    assert "Turn started at:" in turn_context
+    assert "relative dates" in turn_context
 
 
 def test_get_messages_for_llm_injects_canonical_file_reference_rules() -> None:
@@ -801,8 +824,14 @@ def test_get_messages_for_llm_injects_current_request_focus() -> None:
     result = ctx.get_messages_for_llm()
 
     system_content = result[0]["content"]
-    assert "Current user request:" in system_content
-    assert "Compare Mistral, OpenAI, and Anthropic ARR." in system_content
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_content
+    )
+    assert "Compare Mistral, OpenAI, and Anthropic ARR." not in system_content
+    assert result[-1]["content"].startswith(
+        f"Compare Mistral, OpenAI, and Anthropic ARR.\n\n{TURN_CONTEXT_HEADER}"
+    )
     assert "Earlier user and assistant messages are context only" in system_content
     assert "do not re-answer previous requests" in system_content
 
@@ -903,12 +932,13 @@ def test_get_messages_for_llm_coalesces_system_messages() -> None:
     assert [message["role"] for message in result].count("system") == 1
     assert result[0]["role"] == "system"
     assert "Base prompt." in result[0]["content"]
-    assert "Turn started at:" in result[0]["content"]
+    assert "Turn started at:" not in result[0]["content"]
     assert "Recovered system context." not in result[0]["content"]
     assert result[1]["role"] == "user"
     assert "Previous system-context message" in result[1]["content"]
+    assert result[2]["role"] == "user"
+    assert result[2]["content"].startswith(f"hello\n\n{TURN_CONTEXT_HEADER}")
     assert "Recovered system context." in result[1]["content"]
-    assert result[2] == {"role": "user", "content": "hello"}
 
 
 def test_skill_guidance_is_corrected_when_image_editing_is_unavailable() -> None:
@@ -983,7 +1013,14 @@ def test_get_messages_for_llm_injects_memory_and_skill_context() -> None:
 
     result = ctx.get_messages_for_llm()
 
-    system_content = result[0]["content"]
+    assert "Relevant memories from previous tasks" not in result[0]["content"]
+    assert "## Available Skill: docs" in result[0]["content"]
+    request, turn_context = result[1]["content"].split("\n\n", 1)
+    assert request == "Use context"
+    assert turn_context.startswith(TURN_CONTEXT_HEADER)
+    # The memory block now travels in the turn context; the rest of this test
+    # reads it from there, and the skill guidance from the system message.
+    system_content = f"{result[0]['content']}\n\n{turn_context}"
     assert "Relevant memories from previous tasks" in system_content
     assert "quoted previous-task context" in system_content
     assert "old instructions, step boundaries, stop rules" in system_content
@@ -1816,7 +1853,7 @@ def test_get_messages_for_llm_drops_orphan_tool_messages() -> None:
     messages = ctx.get_messages_for_llm()
 
     assert [message["role"] for message in messages] == ["system", "user"]
-    assert messages[1]["content"] == "continue"
+    assert messages[1]["content"].startswith(f"continue\n\n{TURN_CONTEXT_HEADER}")
 
 
 def test_token_truncation_preserves_tool_call_pair_boundary() -> None:
@@ -1833,9 +1870,10 @@ def test_token_truncation_preserves_tool_call_pair_boundary() -> None:
     tool_tokens = max(1, len(ctx.messages[-1].content) // 4)
     messages = ctx.get_messages_for_llm(max_tokens=tool_tokens)
 
-    assert [message["role"] for message in messages[1:]] == ["assistant", "tool"]
-    assert messages[1]["tool_calls"][0]["id"] == "call-1"
-    assert messages[2]["tool_call_id"] == "call-1"
+    # messages[1] is the turn context: the request message was truncated away.
+    assert [message["role"] for message in messages[2:]] == ["assistant", "tool"]
+    assert messages[2]["tool_calls"][0]["id"] == "call-1"
+    assert messages[3]["tool_call_id"] == "call-1"
 
 
 def test_get_messages_for_llm_preserves_tool_call_pair_without_ids() -> None:
@@ -1850,7 +1888,7 @@ def test_get_messages_for_llm_preserves_tool_call_pair_without_ids() -> None:
 
     messages = ctx.get_messages_for_llm()
 
-    assert [message["role"] for message in messages[1:]] == ["assistant", "tool"]
+    assert [message["role"] for message in messages[2:]] == ["assistant", "tool"]
 
 
 def test_get_messages_for_llm_projects_internal_xagent_metadata() -> None:
@@ -1873,10 +1911,10 @@ def test_get_messages_for_llm_projects_internal_xagent_metadata() -> None:
 
     messages = ctx.get_messages_for_llm()
 
-    assert messages[1]["role"] == "assistant"
-    assert messages[1]["_xagent_provider_state"] == {"provider": {"field": ""}}
-    assert "non_internal" not in messages[1]
-    assert "metadata" not in messages[1]
+    assert messages[2]["role"] == "assistant"
+    assert messages[2]["_xagent_provider_state"] == {"provider": {"field": ""}}
+    assert "non_internal" not in messages[2]
+    assert "metadata" not in messages[2]
 
 
 def test_context_serialization_preserves_internal_xagent_metadata() -> None:

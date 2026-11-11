@@ -10,6 +10,8 @@ import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useVoiceCallView } from "@/contexts/voice-call-store";
+import { VoiceOrb } from "./voice-call-ui";
 
 export interface PromptCard {
   icon?: React.ElementType<{ className?: string }>;
@@ -164,9 +166,18 @@ export function ChatStartScreen({
   // and the header falls back to the plain title/description below.
   const leadAgent = agents && agents.length > 0 ? selectedAgents[0] : undefined;
 
+  // During a voice call the greeting gives way to the orb.
+  const voiceCall = useVoiceCallView();
+  const voiceHero = Boolean(voiceCall && voiceInputEnabled && onVoiceConversation);
+
   return (
     <div className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center">
-      {leadAgent ? (
+      {voiceHero && voiceCall ? (
+        // About the height of the logo and title it replaces, so nothing jumps.
+        <div className="mb-2 flex h-[92px] items-center justify-center" data-testid="voice-orb-hero">
+          <VoiceOrb call={voiceCall} className="h-[68px] w-[68px]" />
+        </div>
+      ) : leadAgent ? (
         <div className="w-full max-w-[680px] mx-auto flex items-center gap-4 mb-6 text-left">
           <PersonaAvatar
             persona={{
@@ -234,6 +245,12 @@ export function ChatStartScreen({
           />
         </div>
 
+        {/* A call is not modal, so keep the teammate strip and prompt cards from
+            changing what the call will do (or editing the hidden draft). */}
+        <div
+          className={voiceHero ? "pointer-events-none space-y-5 opacity-50" : "space-y-5"}
+          {...(voiceHero ? { inert: true, "aria-hidden": true } : {})}
+        >
         {prompts && prompts.length > 0 && (
           <div className={agents ? "flex flex-wrap items-center justify-center gap-2" : "space-y-3"}>
             {!agents && (
@@ -368,6 +385,7 @@ export function ChatStartScreen({
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

@@ -7,7 +7,6 @@ import asyncio
 import inspect
 import logging
 import tempfile
-from contextvars import copy_context
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -19,6 +18,8 @@ from typing import (
     TypedDict,
     cast,
 )
+
+from xagent.core.utils.blocking import run_blocking
 
 from ..core.schemas import (
     CrawlResult,
@@ -452,7 +453,6 @@ async def _run_web_ingestion_impl(
         total_embeddings = 0
         pages_started = 0
 
-        loop = asyncio.get_event_loop()
         page_semaphore = asyncio.Semaphore(max(1, ing_cfg.page_ingest_concurrency))
 
         async def _process_page(i: int, crawl_result: CrawlResult) -> None:
@@ -607,9 +607,9 @@ async def _run_web_ingestion_impl(
 
                         # Copy the current ContextVars after the page child operation is active.
                         # This preserves user scope and lets document ingestion record into the same child.
-                        request_context = copy_context()
-                        ingest_result: IngestionResult = await loop.run_in_executor(
-                            None, lambda: request_context.run(_ingest_file)
+                        # ``run_blocking`` copies the context at this point.
+                        ingest_result: IngestionResult = await run_blocking(
+                            _ingest_file
                         )
 
                         # Track statistics

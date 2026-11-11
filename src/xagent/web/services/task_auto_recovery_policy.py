@@ -49,6 +49,7 @@ _SHORT_MAX_BACKOFF_SECONDS = 60
 _SHORT_JITTER_CAP_SECONDS = 30.0
 _LLM_JITTER_CAP_SECONDS = 30.0
 _MODEL_OUTPUT_JITTER_CAP_SECONDS = 5.0
+_SHUTDOWN_JITTER_CAP_SECONDS = 3.0
 
 # ``2 ** attempt`` is bounded past this point: the cap always wins long before.
 _MAX_BACKOFF_EXPONENT = 62
@@ -108,9 +109,21 @@ def auto_resume_policy(reason: InterruptionReason | str) -> AutoResumePolicy | N
             max_elapsed_seconds=None,
             jitter_cap_seconds=_MODEL_OUTPUT_JITTER_CAP_SECONDS,
         )
-    # ``shutdown`` is reserved for a future graceful-shutdown hand-off and is
-    # not auto-resumed yet. user_pause, input_outcome_unknown,
-    # unknown_tool_effect and not_recoverable need a human by definition.
+    if reason == InterruptionReason.SHUTDOWN:
+        # A planned hand-off (``release_handover``): the run stopped at a safe
+        # point on purpose, so the successor resumes it at once. It makes no
+        # progress claim either way, so only the staleness window and the
+        # per-run total cap bound it; the jitter spreads the resumes of a busy
+        # release over a few seconds.
+        return AutoResumePolicy(
+            initial_backoff_seconds=0,
+            max_backoff_seconds=0,
+            max_no_progress=None,
+            max_elapsed_seconds=None,
+            jitter_cap_seconds=_SHUTDOWN_JITTER_CAP_SECONDS,
+        )
+    # user_pause, input_outcome_unknown, unknown_tool_effect and
+    # not_recoverable need a human by definition.
     return None
 
 

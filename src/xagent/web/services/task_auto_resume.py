@@ -108,6 +108,7 @@ from .task_command_transport import (
     COMMAND_PENDING,
     COMMAND_PROCESSING,
     COMMAND_TERMINAL,
+    HANDOVER_COMMAND_PREFIX,
     TaskCommandKind,
     notify_task_command_dispatcher,
     stage_task_command,
@@ -1376,6 +1377,8 @@ class AutoResumeTickReport:
     inflight: int | None = None
     budget: int | None = None
     admission_full: bool = False
+    # Handed-over pauses recorded as ``shutdown`` (``promote_handover_pauses``).
+    handed_over: int = 0
     notices: list[RecoveryNotice] = field(default_factory=list)
 
     def record(self, result: _CandidateResult) -> None:
@@ -1660,11 +1663,112 @@ def scan_due(
             )
 
 
+# A handed-over pause is looked for this long after its command was staged.
+HANDOVER_PROMOTE_WINDOW = timedelta(hours=2)
+HANDOVER_PROMOTE_LIMIT = 50
+
+
+def promote_handover_pauses(
+    now: datetime, report: AutoResumeTickReport, *, limit: int = HANDOVER_PROMOTE_LIMIT
+) -> None:
+    """Record recent release hand-over pauses that nothing recorded yet.
+
+    A release hand-over's completed PAUSE is the durable mark that the pause
+    was the platform's (``release_handover``). Its host normally records it
+    (``settle_handover_sync``); when that never happened (the release was
+    aborted, the controller died) the run would rest as a user pause for
+    good. Bounded: PAUSED tasks whose latest hand-over PAUSE completed within
+    ``HANDOVER_PROMOTE_WINDOW`` and that have no recovery row at their current
+    ``state_version``, at most ``limit`` per tick. The recording is the
+    settle step's own routine, so a person's pause or cancel still wins.
+    A pause with no resumable checkpoint gets its ``manual`` row too, so it
+    is not looked at again; one whose checkpoint cannot be read now is.
+    """
+
+    from ..models.database import get_session_local
+    from .release_handover import RecordOutcome, record_handover_pause_no_commit
+
+    fence = exists().where(
+        TaskAutoRecovery.task_id == Task.id,
+        TaskAutoRecovery.run_id == Task.run_id,
+        TaskAutoRecovery.paused_state_version == Task.state_version,
+    )
+    with get_session_local()() as db:
+        task_ids = list(
+            dict.fromkeys(
+                int(task_id)
+                for task_id in db.execute(
+                    select(TaskExecutionCommand.task_id)
+                    .join(
+                        Task,
+                        and_(
+                            Task.id == TaskExecutionCommand.task_id,
+                            Task.run_id == TaskExecutionCommand.target_run_id,
+                        ),
+                    )
+                    .where(
+                        TaskExecutionCommand.status == COMMAND_COMPLETED,
+                        TaskExecutionCommand.created_at
+                        >= now - HANDOVER_PROMOTE_WINDOW,
+                        TaskExecutionCommand.kind == TaskCommandKind.PAUSE.value,
+                        func.substr(
+                            TaskExecutionCommand.command_id,
+                            1,
+                            len(HANDOVER_COMMAND_PREFIX),
+                        )
+                        == HANDOVER_COMMAND_PREFIX,
+                        Task.status == TaskStatus.PAUSED,
+                        Task.control_state == TaskControlState.PAUSED.value,
+                        ~fence,
+                    )
+                    .order_by(TaskExecutionCommand.id)
+                    .limit(limit)
+                ).scalars()
+            )
+        )
+        db.rollback()
+    for task_id in task_ids:
+        with get_session_local()() as db:
+            try:
+                task = db.execute(
+                    select(Task).where(Task.id == task_id).with_for_update()
+                ).scalar_one_or_none()
+                result = (
+                    record_handover_pause_no_commit(db, task, now)
+                    if task is not None
+                    else None
+                )
+                if result is None or result.outcome not in (
+                    RecordOutcome.RECORDED,
+                    RecordOutcome.NOT_RECOVERABLE,
+                ):
+                    db.rollback()
+                    continue
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                if is_database_pool_timeout(exc):
+                    raise
+                report.failed += 1
+                logger.exception(
+                    "component=auto-resume task_id=%s recording a handed-over "
+                    "pause failed; retrying next tick",
+                    task_id,
+                )
+                continue
+        if result.outcome is RecordOutcome.RECORDED:
+            report.handed_over += 1
+        if result.notice is not None:
+            report.notices.append(result.notice)
+
+
 def run_auto_resume_tick(*, now: datetime | None = None) -> AutoResumeTickReport:
     """One sweeper pass; synchronous, for a worker thread.
 
-    One ``EXISTS`` first: with nothing due (always, until something records
-    ``scheduled`` rows) the tick ends there. With the switch off it drains
+    With the switch on, :func:`promote_handover_pauses` runs first (records
+    release hand-over pauses nothing else did). Then one ``EXISTS``: with
+    nothing due (always, until something records ``scheduled`` rows) the tick
+    ends there. With the switch off it drains
     ``scheduled`` rows and closes ended ``dispatched`` ones (see the module
     docstring). Otherwise housekeeping runs first (it frees in-flight
     slots), then due rows are dispatched within
@@ -1684,6 +1788,9 @@ def run_auto_resume_tick(*, now: datetime | None = None) -> AutoResumeTickReport
         if not enabled:
             # Nothing is dispatched while off; queued commands meet the guard.
             _last_inflight = 0
+        if enabled:
+            # Before the due check: a handed-over pause is not due work yet.
+            promote_handover_pauses(now, report)
         with get_session_local()() as db:
             if not has_due_work(db, now, enabled=enabled):
                 return report

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import List, Union
 
 import pytest
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
+from xagent.core.tools.core.RAG_tools.core.exceptions import (
+    DatabaseOperationError,
+    EmbeddingAdapterError,
+)
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     ChunkForEmbedding,
     EmbeddingReadResponse,
@@ -71,7 +76,6 @@ def _read_response(chunks: List[ChunkForEmbedding]) -> EmbeddingReadResponse:
 def _install(
     monkeypatch: pytest.MonkeyPatch,
     read,
-    adapter: _StubAdapter,
     events: List[tuple],
 ) -> None:
     monkeypatch.setattr(document_ingestion, "read_chunks_for_embedding", read)
@@ -108,7 +112,6 @@ def _embed(
     adapter: _StubAdapter,
     cfg: IngestionConfig,
     *,
-    chunk_count: int | None = None,
     commit_gate=None,
     result: EmbeddingStageResult | None = None,
     is_spreadsheet: bool = False,
@@ -124,28 +127,27 @@ def _embed(
         cfg=cfg,
         user_id=42,
         is_admin=True,
-        chunk_count=chunk_count,
         is_spreadsheet=is_spreadsheet,
         commit_gate=commit_gate,
         result=result,
     )
 
 
-def test_embed_document_chunks_fills_only_missing_chunks_for_the_model(
+def test_embed_document_chunks_forwards_model_id_and_embeds_returned_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = _StubAdapter()
     events: List[tuple] = []
     seen: List[dict] = []
-    missing = _chunks(1, start=3)
+    returned = _chunks(1, start=3)
 
     def _read(**kwargs: object) -> EmbeddingReadResponse:
         seen.append(kwargs)
-        return _read_response(missing)
+        return _read_response(returned)
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
-    result = _embed(adapter, _cfg(batch_size=10), chunk_count=3)
+    result = _embed(adapter, _cfg(batch_size=10))
 
     assert seen[0]["model"] == MODEL_ID
     assert adapter.calls == [["text-3"]]
@@ -164,11 +166,11 @@ def test_embed_document_chunks_second_call_computes_nothing_but_still_commits(
     def _read(**_: object) -> EmbeddingReadResponse:
         return responses.pop(0)
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
-    first = _embed(adapter, _cfg(), chunk_count=2)
+    first = _embed(adapter, _cfg())
     calls_after_first = len(adapter.calls)
-    second = _embed(adapter, _cfg(), chunk_count=2)
+    second = _embed(adapter, _cfg())
 
     assert first.embedding_count == 2
     assert second.pending_count == 0
@@ -176,6 +178,25 @@ def test_embed_document_chunks_second_call_computes_nothing_but_still_commits(
     assert second.vector_count == 0
     assert len(adapter.calls) == calls_after_first
     assert [event[0] for event in events] == ["write", "commit", "commit"]
+
+
+def test_embed_document_chunks_requires_an_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="document owner"):
+        embed_document_chunks(
+            collection="demo",
+            doc_id="doc-1",
+            parse_hash="hash-1",
+            embedding_config=EmbeddingModelConfig(
+                id=MODEL_ID, model_name="stub", dimension=2
+            ),
+            embedding_adapter=_StubAdapter(),
+            cfg=_cfg(),
+            user_id=None,
+            is_admin=True,
+            is_spreadsheet=False,
+        )
 
 
 def test_embed_document_chunks_writes_rows_with_the_given_owner(
@@ -189,9 +210,9 @@ def test_embed_document_chunks_writes_rows_with_the_given_owner(
         seen.append(kwargs)
         return _read_response(_chunks(1))
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
-    _embed(adapter, _cfg(), chunk_count=1)
+    _embed(adapter, _cfg())
 
     assert seen[0]["user_id"] == 42
     assert seen[0]["is_admin"] is True
@@ -208,12 +229,12 @@ def test_embed_document_chunks_calls_commit_gate_before_each_write(
     def _read(**_: object) -> EmbeddingReadResponse:
         return _read_response(_chunks(3))
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
     def _gate() -> None:
         events.append(("gate",))
 
-    _embed(adapter, _cfg(batch_size=1), chunk_count=3, commit_gate=_gate)
+    _embed(adapter, _cfg(batch_size=1), commit_gate=_gate)
 
     assert events == [
         ("gate",),
@@ -226,8 +247,9 @@ def test_embed_document_chunks_calls_commit_gate_before_each_write(
     ]
 
 
+@pytest.mark.parametrize("use_async", [False, True])
 def test_embed_document_chunks_creates_index_only_on_last_batch(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, use_async: bool
 ) -> None:
     adapter = _StubAdapter()
     events: List[tuple] = []
@@ -235,9 +257,9 @@ def test_embed_document_chunks_creates_index_only_on_last_batch(
     def _read(**_: object) -> EmbeddingReadResponse:
         return _read_response(_chunks(5))
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
-    _embed(adapter, _cfg(batch_size=2), chunk_count=5)
+    _embed(adapter, _cfg(use_async=use_async, batch_size=2))
 
     assert [event[1] for event in events if event[0] == "write"] == [
         False,
@@ -256,14 +278,42 @@ def test_embed_document_chunks_computes_counts_on_both_paths(
     def _read(**_: object) -> EmbeddingReadResponse:
         return _read_response(_chunks(4))
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
-    result = _embed(adapter, _cfg(use_async=use_async, batch_size=2), chunk_count=4)
+    result = _embed(adapter, _cfg(use_async=use_async, batch_size=2))
 
     assert result.embedding_count == 4
     assert result.vector_count == 4
     assert result.compute_completed is True
     assert result.current_step == "write_vectors_to_db"
+
+
+def test_embed_document_chunks_logs_compute_completed_before_final_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+
+    def _read(**_: object) -> EmbeddingReadResponse:
+        return _read_response(_chunks(2))
+
+    def _commit(**_: object) -> None:
+        raise RuntimeError("commit failed")
+
+    _install(monkeypatch, _read, events)
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
+
+    stage = EmbeddingStageResult()
+    with caplog.at_level(logging.INFO, logger=document_ingestion.__name__):
+        with pytest.raises(RuntimeError, match="commit failed"):
+            _embed(adapter, _cfg(batch_size=10), result=stage)
+
+    assert stage.compute_completed is True
+    assert any(
+        record.message == "Step compute_embeddings completed"
+        for record in caplog.records
+    )
 
 
 def test_embed_document_chunks_reports_write_step_and_partial_counts_on_failure(
@@ -287,8 +337,8 @@ def test_embed_document_chunks_reports_write_step_and_partial_counts_on_failure(
     )
 
     stage = EmbeddingStageResult()
-    with pytest.raises(Exception, match="Failed to write embedding batch"):
-        _embed(adapter, _cfg(batch_size=10), chunk_count=2, result=stage)
+    with pytest.raises(DatabaseOperationError, match="Failed to write embedding batch"):
+        _embed(adapter, _cfg(batch_size=10), result=stage)
 
     assert stage.current_step == "write_vectors_to_db"
     assert stage.embedding_count == 2
@@ -298,8 +348,49 @@ def test_embed_document_chunks_reports_write_step_and_partial_counts_on_failure(
     assert events == []
 
 
-def test_embed_document_chunks_fails_before_commit_when_nothing_was_embedded(
+def test_embed_document_chunks_async_write_failure_raises_database_error(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+
+    def _read(**_: object) -> EmbeddingReadResponse:
+        return _read_response(_chunks(2))
+
+    def _write_vectors(**_: object) -> EmbeddingWriteResponse:
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(document_ingestion, "read_chunks_for_embedding", _read)
+    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _write_vectors)
+    monkeypatch.setattr(
+        document_ingestion,
+        "commit_vectors_to_db",
+        lambda **_: events.append(("commit",)),
+    )
+
+    stage = EmbeddingStageResult()
+    with pytest.raises(DatabaseOperationError, match="Failed to write embedding batch"):
+        _embed(adapter, _cfg(use_async=True, batch_size=10), result=stage)
+
+    assert stage.current_step == "write_vectors_to_db"
+    assert stage.embedding_count == 2
+    assert stage.vector_count == 0
+    assert stage.compute_completed is False
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("use_async", "error", "match"),
+    [
+        (True, EmbeddingAdapterError, "Failed to generate any embeddings"),
+        (False, RuntimeError, "provider down"),
+    ],
+)
+def test_embed_document_chunks_fails_before_commit_when_provider_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    use_async: bool,
+    error: type[Exception],
+    match: str,
 ) -> None:
     adapter = _StubAdapter()
     events: List[tuple] = []
@@ -311,11 +402,11 @@ def test_embed_document_chunks_fails_before_commit_when_nothing_was_embedded(
         raise RuntimeError("provider down")
 
     adapter.encode = _encode  # type: ignore[method-assign]
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
     stage = EmbeddingStageResult()
-    with pytest.raises(Exception, match="Failed to generate any embeddings"):
-        _embed(adapter, _cfg(use_async=True), chunk_count=1, result=stage)
+    with pytest.raises(error, match=match):
+        _embed(adapter, _cfg(use_async=use_async), result=stage)
 
     assert stage.current_step == "compute_embeddings"
     assert events == []
@@ -331,11 +422,11 @@ def test_embed_document_chunks_resets_a_reused_result_holder(
     def _read(**_: object) -> EmbeddingReadResponse:
         return responses.pop(0)
 
-    _install(monkeypatch, _read, adapter, events)
+    _install(monkeypatch, _read, events)
 
     holder = EmbeddingStageResult()
-    _embed(adapter, _cfg(), chunk_count=2, result=holder)
-    _embed(adapter, _cfg(), chunk_count=2, result=holder)
+    _embed(adapter, _cfg(), result=holder)
+    _embed(adapter, _cfg(), result=holder)
 
     assert holder.embedding_count == 0
     assert holder.vector_count == 0
@@ -343,40 +434,19 @@ def test_embed_document_chunks_resets_a_reused_result_holder(
     assert holder.compute_completed is False
 
 
-def test_embed_document_chunks_falls_back_to_read_total_when_chunk_count_omitted(
+def test_embed_document_chunks_forces_async_path_for_spreadsheets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = _StubAdapter()
     events: List[tuple] = []
 
     def _read(**_: object) -> EmbeddingReadResponse:
-        return _read_response(_chunks(1))
+        return _read_response(_chunks(2))
 
-    def _encode(_text: str) -> List[float]:
-        raise RuntimeError("provider down")
+    _install(monkeypatch, _read, events)
 
-    adapter.encode = _encode  # type: ignore[method-assign]
-    _install(monkeypatch, _read, adapter, events)
+    result = _embed(adapter, _cfg(use_async=False, batch_size=10), is_spreadsheet=True)
 
-    with pytest.raises(Exception, match="Failed to generate any embeddings"):
-        _embed(adapter, _cfg(use_async=True))
-
-
-def test_embed_document_chunks_async_creates_index_only_on_last_batch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = _StubAdapter()
-    events: List[tuple] = []
-
-    def _read(**_: object) -> EmbeddingReadResponse:
-        return _read_response(_chunks(5))
-
-    _install(monkeypatch, _read, adapter, events)
-
-    _embed(adapter, _cfg(use_async=True, batch_size=2), chunk_count=5)
-
-    assert [event[1] for event in events if event[0] == "write"] == [
-        False,
-        False,
-        True,
-    ]
+    assert all(isinstance(call, str) for call in adapter.calls)
+    assert result.embedding_count == 2
+    assert result.vector_count == 2

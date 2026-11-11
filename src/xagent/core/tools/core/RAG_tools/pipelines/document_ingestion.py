@@ -79,13 +79,7 @@ def _is_spreadsheet_source(source_path: str) -> bool:
     return Path(source_path).suffix.lower() in _SPREADSHEET_EXTENSIONS
 
 
-def _apply_spreadsheet_ingestion_safeguards(
-    cfg: IngestionConfig, source_path: str
-) -> IngestionConfig:
-    ext = Path(source_path).suffix.lower()
-    if ext not in _SPREADSHEET_EXTENSIONS:
-        return cfg
-
+def _spreadsheet_safeguarded_config(cfg: IngestionConfig) -> IngestionConfig:
     updates: Dict[str, Any] = {
         "chunk_strategy": ChunkStrategy.RECURSIVE,
         "use_token_count": True,
@@ -109,8 +103,16 @@ def _apply_spreadsheet_ingestion_safeguards(
             cfg.chunk_overlap, _SPREADSHEET_CHUNK_OVERLAP_TOKENS
         )
 
-    updated_cfg = cfg.model_copy(update=updates)
+    return cfg.model_copy(update=updates)
 
+
+def _apply_spreadsheet_ingestion_safeguards(
+    cfg: IngestionConfig, source_path: str
+) -> IngestionConfig:
+    if Path(source_path).suffix.lower() not in _SPREADSHEET_EXTENSIONS:
+        return cfg
+
+    updated_cfg = _spreadsheet_safeguarded_config(cfg)
     logger.info(
         "Applied spreadsheet ingestion safeguards",
         extra={
@@ -530,10 +532,14 @@ def _resolve_embedding_adapter(
 class EmbeddingStageResult:
     """Counts, timings and failure position of :func:`embed_document_chunks`.
 
-    Filled as the stage runs, so a holder passed into a raising call stays readable.
+    Filled as the stage runs, so a holder passed into a raising call stays
+    readable. After a raise, ``current_step``, ``embedding_count``, the
+    ``*_completed`` flags and ``pending_count`` are reliable; ``vector_count``
+    and ``last_write_response`` are only set once every batch and the commit
+    have succeeded.
     """
 
-    total_count: int = 0
+    read_count: int = 0
     pending_count: int = 0
     embedding_count: int = 0
     vector_count: int = 0
@@ -575,20 +581,57 @@ def embed_document_chunks(
     user_id: Optional[int],
     is_admin: bool,
     is_spreadsheet: bool,
-    chunk_count: Optional[int] = None,
     commit_gate: Optional[Callable[[], None]] = None,
     progress_tracker: Optional[ProgressTracker] = None,
     result: Optional[EmbeddingStageResult] = None,
 ) -> EmbeddingStageResult:
     """Embed and persist the vectors this document lacks for one model.
 
-    A repeat call computes nothing but still commits; ``result`` is reset on entry
-    and stays readable after a raise.
+    A repeat call computes nothing but still commits; ``result`` is reset on
+    entry and stays readable after a raise.
+
+    Args:
+        collection: Collection holding the document.
+        doc_id: Document whose chunks are embedded.
+        parse_hash: Parse version the chunks belong to.
+        embedding_config: Model identity; its Hub ``id`` tags read and write.
+        embedding_adapter: Provider used to encode chunk text.
+        cfg: Embedding behaviour. Rewritten by the spreadsheet safeguards when
+            ``is_spreadsheet`` is set.
+        user_id: Document owner, used for reads and writes. Required: a missing
+            owner would read across owners and write ownerless rows.
+        is_admin: Admin scope for reads and commit. Writes always use
+            ``user_id`` alone.
+        is_spreadsheet: Enforce the spreadsheet safeguards (async path, chunk
+            token budget).
+        commit_gate: Invoked before each write and the final commit; it may
+            raise to abort a superseded run.
+        progress_tracker: Optional tracker receiving one entry per step.
+        result: Optional holder, reset on entry and populated as the stage runs.
+
+    Returns:
+        The same ``result`` holder, fully populated on success.
+
+    Raises:
+        ValueError: ``user_id`` is None.
+        DatabaseOperationError: A batch write or the final commit failed. The
+            gate's own exception propagates unchanged from the final commit.
+        EmbeddingAdapterError: A spreadsheet chunk exceeded the token budget,
+            or no chunk produced an embedding.
+        VectorValidationError: The batch path got a mismatched vector count.
+        Exception: Raw provider errors on the batch path, which fails the whole
+            document; the async path drops failed chunks and only raises above
+            when every chunk fails. The async path calls ``asyncio.run``, so it
+            needs a thread with no running event loop.
     """
+    if user_id is None:
+        raise ValueError("embed_document_chunks requires the document owner")
     if result is None:
         result = EmbeddingStageResult()
     else:
         vars(result).update(vars(EmbeddingStageResult()))
+    if is_spreadsheet:
+        cfg = _spreadsheet_safeguarded_config(cfg)
 
     # Step 4: Read chunks for embedding
     with _track_step(progress_tracker, "read_chunks_for_embedding"):
@@ -621,9 +664,8 @@ def embed_document_chunks(
     )
     chunks: List[ChunkForEmbedding] = read_model.chunks
     pending_count = read_model.pending_count
-    result.total_count = len(chunks)
+    result.read_count = len(chunks)
     result.pending_count = pending_count
-    effective_chunk_count = chunk_count if chunk_count is not None else len(chunks)
     if is_spreadsheet:
         _validate_spreadsheet_chunk_token_budget(
             chunks,
@@ -935,16 +977,26 @@ def embed_document_chunks(
     result.embedding_elapsed_ms = int((time.time() - embedding_start) * 1000)
 
     # Check if embedding generation failed completely
-    if effective_chunk_count > 0 and result.embedding_count == 0:
+    if chunks and result.embedding_count == 0:
         raise EmbeddingAdapterError(
             "Failed to generate any embeddings",
             details={
-                "chunk_count": effective_chunk_count,
+                "chunk_count": len(chunks),
                 "use_async": cfg.embedding_use_async,
                 "embedding_model": embedding_config.model_name,
             },
         )
     result.compute_completed = True
+    logger.info(
+        "Step compute_embeddings completed",
+        extra={
+            "collection": collection,
+            "doc_id": doc_id,
+            "embedding_count": result.embedding_count,
+            "use_async": cfg.embedding_use_async,
+            "elapsed_ms": result.embedding_elapsed_ms,
+        },
+    )
 
     result.vector_count = total_vector_count
     result.write_elapsed_ms = int(write_elapsed_total * 1000)
@@ -1074,7 +1126,7 @@ def _read_chunks_step(result: EmbeddingStageResult) -> IngestionStepResult:
     return IngestionStepResult(
         name="read_chunks_for_embedding",
         metadata={
-            "total_count": result.total_count,
+            "total_count": result.read_count,
             "pending_count": result.pending_count,
             "elapsed_ms": result.read_elapsed_ms,
         },
@@ -1534,7 +1586,6 @@ def _process_document_impl(
                 cfg=cfg,
                 user_id=user_id,
                 is_admin=is_admin,
-                chunk_count=chunk_count,
                 is_spreadsheet=_is_spreadsheet_source(source_path),
                 commit_gate=commit_gate,
                 progress_tracker=progress_tracker,
@@ -1576,16 +1627,6 @@ def _process_document_impl(
         current_step = embedding_stage.current_step
         completed_steps.append(_compute_embeddings_step(embedding_stage, cfg))
         embedding_count = embedding_stage.embedding_count
-        logger.info(
-            "Step compute_embeddings completed",
-            extra={
-                "collection": collection,
-                "doc_id": doc_id,
-                "embedding_count": embedding_count,
-                "use_async": cfg.embedding_use_async,
-                "elapsed_ms": embedding_stage.embedding_elapsed_ms,
-            },
-        )
 
         vector_count = embedding_stage.vector_count
         completed_steps.append(_write_vectors_step(embedding_stage))

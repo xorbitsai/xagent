@@ -35,6 +35,7 @@ from xagent.web.connector_checks.declarations import (
 from xagent.web.connector_checks.registry import (
     CONNECTOR_CHECKS,
     WRITE_WITHOUT_CLEANUP,
+    WRITE_WITHOUT_REVERT,
     _declared_l3,
     connector_checks_for,
     l3_read_check,
@@ -928,27 +929,27 @@ def test_a_cleanable_write_keeps_a_pending_exemption() -> None:
         assert exemptions[tool].endswith("decided in #3567"), tool
 
 
-def test_only_the_writes_without_cleanup_carry_the_permanent_reason() -> None:
+def test_each_permanent_write_reason_names_its_own_tools() -> None:
     expected = {
-        "gmail": {"gmail_send_messages"},
+        "gmail": {"gmail_send_messages": WRITE_WITHOUT_CLEANUP},
         "google-docs": {
-            "google_docs_append_text",
-            "google_docs_batch_update",
-            "google_docs_create_document",
-            "google_docs_replace_text",
+            "google_docs_append_text": WRITE_WITHOUT_REVERT,
+            "google_docs_batch_update": WRITE_WITHOUT_REVERT,
+            "google_docs_create_document": WRITE_WITHOUT_CLEANUP,
+            "google_docs_replace_text": WRITE_WITHOUT_REVERT,
         },
-        "google-sheets": {"google_sheets_create_spreadsheet"},
+        "google-sheets": {"google_sheets_create_spreadsheet": WRITE_WITHOUT_CLEANUP},
         "google-slides": {
-            "google_slides_create_presentation",
-            "google_slides_import_pptx",
+            "google_slides_create_presentation": WRITE_WITHOUT_CLEANUP,
+            "google_slides_import_pptx": WRITE_WITHOUT_CLEANUP,
         },
     }
 
     for app_id, tools in expected.items():
         actual = {
-            exemption.tool
+            exemption.tool: exemption.reason
             for exemption in CONNECTOR_CHECKS[app_id].exemptions
-            if exemption.reason == WRITE_WITHOUT_CLEANUP
+            if exemption.reason in (WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT)
         }
         assert actual == tools, app_id
 

@@ -24,6 +24,7 @@ from xagent.web.connector_checks.registry import (
     CONNECTOR_CHECKS,
     LEGACY_CONNECTORS,
     WRITE_WITHOUT_CLEANUP,
+    WRITE_WITHOUT_REVERT,
 )
 
 # LEGACY_CONNECTORS, pinned. A connector that adopts V2 leaves both lists in
@@ -146,12 +147,17 @@ def test_a_legacy_connector_is_a_builtin_connector():
     assert not removed, f"{sorted(removed)} are no longer builtin connectors"
 
 
+# A reason no later issue turns into a check: the server's own tools would have
+# to change first. Every other exemption is pending and names its issue.
+_PERMANENT_REASONS = frozenset({WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT})
+
+
 @pytest.mark.parametrize("app_id", sorted(CONNECTOR_CHECKS))
 def test_a_pending_exemption_names_the_issue_that_decides_it(app_id):
     pending = [
         exemption
         for exemption in CONNECTOR_CHECKS[app_id].exemptions
-        if exemption.reason != WRITE_WITHOUT_CLEANUP
+        if exemption.reason not in _PERMANENT_REASONS
     ]
     unnamed = [e.tool for e in pending if not re.search(r"decided in #\d+$", e.reason)]
     assert not unnamed, f"{app_id}: {unnamed} need the issue that decides their check"

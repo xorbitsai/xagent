@@ -4,12 +4,15 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.exc import OperationalError
 
 from xagent.core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from xagent.core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from xagent.web.api.v1 import mcp_servers as mcp_servers_routes
 from xagent.web.api.v1.errors import _DEFAULT_MESSAGES, V1ErrorCode
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
+from xagent.web.models.database import get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
@@ -529,45 +532,185 @@ def test_transport_matrix(bob, transport):
     assert (body["can_edit"], body["can_delete"]) == (False, True)
 
 
-def _catalog_world() -> dict[str, dict[str, Any]]:
-    """Connector columns per catalog cell; apps are seeded by the caller."""
-    return {
-        "oauth_transport": {"transport": "oauth", "url": None},
-        "auth_app_id_of_existing_app": {"auth": {"app_id": "real-app"}},
-        "auth_app_id_of_deleted_app": {"auth": {"app_id": "deleted-app"}},
-        "auth_provider_only": {"auth": {"provider": "acme"}},
-        "name_matches_two_apps": {},
-    }
-
-
-@pytest.mark.parametrize("cell", list(_catalog_world()))
-def test_catalog_classification_cells(bob, cell):
-    assert len(_catalog_world()) == 5
+def _seed_catalog_apps() -> None:
     _seed_app("real-app", "Real App")
     # Two different apps match this name, one by app id and one by name, which
     # the web code treats as "cannot tell".
     _seed_app("ambiguous", "First")
     _seed_app("second", "ambiguous")
-    name = "ambiguous" if cell == "name_matches_two_apps" else f"conn-{cell}"
-    server_id = _seed(name, owner=bob, **_catalog_world()[cell])
+    db = _direct_db_session()
+    try:
+        db.add(
+            PublicMCPApp(
+                app_id="hidden-app", name="Hidden App", is_visible_in_connector=False
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
 
-    body = _get_one(bob, server_id).json()
 
-    assert body["kind"] == "catalog"
-    assert (body["can_edit"], body["can_delete"]) == (False, False)
-
-
-def test_a_connector_matching_no_catalog_marker_is_custom(bob):
-    _seed_app("some-app", "Some App")
-    server_id = _seed("mine", owner=bob, auth={"type": "bearer", "bearer_token": "t"})
-
-    body = _get_one(bob, server_id).json()
-
-    assert (body["kind"], body["can_edit"], body["can_delete"]) == (
+# cell -> (connector name, columns, expected kind)
+_CATALOG_CELLS: dict[str, tuple[str, dict[str, Any], str]] = {
+    "oauth_transport": ("conn-oauth", {"transport": "oauth", "url": None}, "catalog"),
+    "auth_app_id_of_existing_app": (
+        "conn-auth-app-id",
+        {"auth": {"app_id": "real-app"}},
+        "catalog",
+    ),
+    "auth_app_id_of_deleted_app": (
+        "conn-auth-deleted-app-id",
+        {"auth": {"app_id": "deleted-app"}},
+        "catalog",
+    ),
+    "auth_provider_only": (
+        "conn-auth-provider",
+        {"auth": {"provider": "acme"}},
+        "catalog",
+    ),
+    "name_matches_two_apps": ("ambiguous", {}, "catalog"),
+    "name_equals_one_app_id": ("real-app", {}, "catalog"),
+    "name_equals_one_app_name": ("Real App", {}, "catalog"),
+    "name_equals_hidden_app": ("hidden-app", {}, "catalog"),
+    "custom_case_variant": ("Real-App", {}, "custom"),
+    "custom_no_match": (
+        "mine",
+        {"auth": {"type": "bearer", "bearer_token": "t"}},
         "custom",
-        True,
-        True,
-    )
+    ),
+}
+
+
+def _assert_kind(body: dict, kind: str) -> None:
+    assert body["kind"] == kind
+    expected = (kind == "custom", kind == "custom")
+    assert (body["can_edit"], body["can_delete"]) == expected
+
+
+@pytest.mark.parametrize("cell", list(_CATALOG_CELLS))
+def test_catalog_classification_is_identical_in_list_and_detail(bob, cell):
+    assert len(_CATALOG_CELLS) == 10
+    name, columns, kind = _CATALOG_CELLS[cell]
+    _seed_catalog_apps()
+    server_id = _seed(name, owner=bob, **columns)
+
+    _assert_kind(_get_one(bob, server_id).json(), kind)
+    listed = [row for row in _list(bob) if row["id"] == server_id]
+    assert len(listed) == 1
+    _assert_kind(listed[0], kind)
+
+    db = _direct_db_session()
+    try:
+        server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert mcp_server_management.connector_kind(db, server) == kind
+    finally:
+        db.close()
+
+
+def test_catalog_classification_of_a_mixed_list(bob):
+    _seed_catalog_apps()
+    ids = {
+        cell: _seed(name, owner=bob, **columns)
+        for cell, (name, columns, _kind) in _CATALOG_CELLS.items()
+    }
+
+    rows = {row["id"]: row for row in _list(bob)}
+
+    assert len(rows) == len(_CATALOG_CELLS)
+    for cell, (_name, _columns, kind) in _CATALOG_CELLS.items():
+        _assert_kind(rows[ids[cell]], kind)
+
+
+# ===== the catalog is read once per request =====
+
+
+def _catalog_statements(call) -> int:
+    engine = get_engine()
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if "public_mcp_apps" in statement:
+            statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        call()
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+    return len(statements)
+
+
+def _seed_plain(bob, count: int) -> list[int]:
+    return [_seed(f"plain-{i}", owner=bob) for i in range(count)]
+
+
+def _seed_oauth(bob, count: int) -> None:
+    for i in range(count):
+        _seed(
+            f"oauth-{i}",
+            owner=bob,
+            transport="oauth",
+            url=None,
+            auth={"app_id": f"app-{i}"},
+        )
+
+
+# cell -> (plain connectors, auth-marker-only connectors, oauth connectors, detail?, count)
+_QUERY_CELLS = {
+    "c0": (0, 0, 0, False, 0),
+    "c1": (1, 0, 0, False, 1),
+    "c5": (5, 0, 0, False, 1),
+    "c20": (20, 0, 0, False, 1),
+    "auth_marker_only": (0, 5, 0, False, 0),
+    "detail": (1, 0, 0, True, 1),
+    # One read, plus one app lookup per oauth row that is not batched.
+    "oauth_mix": (3, 0, 3, False, 4),
+}
+
+
+@pytest.mark.parametrize("cell", list(_QUERY_CELLS))
+def test_list_catalog_lookups_do_not_grow_with_rows(bob, cell):
+    assert len(_QUERY_CELLS) == 7
+    plain, marker, oauth, detail, expected = _QUERY_CELLS[cell]
+    plain_ids = _seed_plain(bob, plain)
+    for i in range(marker):
+        _seed(f"auth-marker-{i}", owner=bob, auth={"provider": "acme"})
+    _seed_oauth(bob, oauth)
+
+    if detail:
+        call = lambda: _get_one(bob, plain_ids[0])  # noqa: E731
+    else:
+        call = lambda: _list(bob)  # noqa: E731
+
+    assert _catalog_statements(call) == expected
+
+
+@pytest.mark.parametrize("route", ["list", "detail"])
+def test_a_failing_catalog_query_fails_the_whole_response(bob, route):
+    server_id = _seed("plain", owner=bob)
+    engine = get_engine()
+
+    def fail_catalog_read(conn, cursor, statement, parameters, context, executemany):
+        if "public_mcp_apps" in statement:
+            raise OperationalError(statement, parameters, Exception("boom"))
+
+    sa.event.listen(engine, "before_cursor_execute", fail_catalog_read)
+    try:
+        if route == "list":
+            resp = client.get("/v1/mcp-servers", headers=bob.headers)
+        else:
+            resp = _get_one(bob, server_id)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", fail_catalog_read)
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": _DEFAULT_MESSAGES[V1ErrorCode.INTERNAL_ERROR],
+        }
+    }
+    assert "boom" not in resp.text
 
 
 # cell -> (holder is admin, link fields, expected (can_edit, can_delete))

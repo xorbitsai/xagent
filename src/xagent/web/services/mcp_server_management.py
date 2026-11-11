@@ -13,7 +13,7 @@ module's own ``_masked_auth``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
@@ -143,7 +143,27 @@ def resolve_holder_connector(
     return None
 
 
-def connector_kind(db: Any, server: MCPServer) -> str:
+def _catalog_classification_keys(
+    db: Any, servers: Iterable[MCPServer]
+) -> frozenset[str]:
+    """Every catalog app id and app name, hidden apps included, read once.
+
+    Empty without a query when no connector reaches the name test. A failing
+    read propagates: treating it as an empty catalog would classify catalog
+    connectors as custom, and so editable.
+    """
+    # Without catalog keys only a connector that reaches the name test is
+    # custom, so the classification itself decides whether the read is needed.
+    if not any(classify_connector_kind(s, frozenset()) == "custom" for s in servers):
+        return frozenset()
+    keys: set[str] = set()
+    for app_id, name in db.query(PublicMCPApp.app_id, PublicMCPApp.name).all():
+        keys.add(app_id)
+        keys.add(name)
+    return frozenset(keys)
+
+
+def classify_connector_kind(server: MCPServer, catalog_app_keys: frozenset[str]) -> str:
     """``"catalog"`` unless the connector can be shown to be a user's own.
 
     A connector is ``catalog`` when its transport is ``oauth``, when its
@@ -153,19 +173,22 @@ def connector_kind(db: Any, server: MCPServer) -> str:
     match: the web code treats two matches as "cannot tell" and gives up,
     which here would let a connector that may belong to the platform be
     changed.
+
+    ``catalog_app_keys`` is the set of app ids and names from
+    ``_catalog_classification_keys``; the list and the detail share this
+    function, which does no I/O.
     """
     if server.transport == "oauth":
         return "catalog"
     auth = server.auth
     if isinstance(auth, dict) and any(key in auth for key in _CATALOG_AUTH_KEYS):
         return "catalog"
-    name = str(server.name)
-    app = (
-        db.query(PublicMCPApp.id)
-        .filter((PublicMCPApp.app_id == name) | (PublicMCPApp.name == name))
-        .first()
-    )
-    return "catalog" if app is not None else "custom"
+    return "catalog" if str(server.name) in catalog_app_keys else "custom"
+
+
+def connector_kind(db: Any, server: MCPServer) -> str:
+    # Single-connector entry; it runs the same pure function as the projection.
+    return classify_connector_kind(server, _catalog_classification_keys(db, [server]))
 
 
 def _masked_dict(value: Any) -> Optional[dict[str, Any]]:
@@ -189,6 +212,7 @@ def _project_mcp_server(
     *,
     is_admin: bool,
     oauth_accounts: dict[str, tuple[Optional[str], str, int]],
+    catalog_app_keys: frozenset[str],
 ) -> V1McpServer:
     """The SDK view of one connector.
 
@@ -198,7 +222,7 @@ def _project_mcp_server(
     working directory) are left out: the SDK cannot change them and they can
     carry tokens.
     """
-    kind = connector_kind(db, server)
+    kind = classify_connector_kind(server, catalog_app_keys)
     can_edit = (
         link is not None
         and kind == "custom"
@@ -252,6 +276,10 @@ def _project_rows(
         if any(server.transport == "oauth" for server, _link in rows)
         else {}
     )
+    # At most one catalog read serves every row; a failure here precedes any projection.
+    catalog_app_keys = _catalog_classification_keys(
+        db, [server for server, _link in rows]
+    )
     return [
         _project_mcp_server(
             db,
@@ -259,6 +287,7 @@ def _project_rows(
             link,
             is_admin=bool(user.is_admin),
             oauth_accounts=oauth_accounts,
+            catalog_app_keys=catalog_app_keys,
         )
         for server, link in rows
     ]

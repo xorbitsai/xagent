@@ -21,11 +21,11 @@ from mcp.server.fastmcp import FastMCP
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_checks.registry import (
+    _GMAIL_LABEL_WITHOUT_READ,
     CONNECTOR_CHECKS,
     LEGACY_CONNECTORS,
     WRITE_WITHOUT_CLEANUP,
     WRITE_WITHOUT_REVERT,
-    _GMAIL_LABEL_WITHOUT_READ,
 )
 
 # LEGACY_CONNECTORS, pinned. A connector that adopts V2 leaves both lists in

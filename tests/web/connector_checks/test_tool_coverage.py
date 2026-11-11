@@ -25,6 +25,7 @@ from xagent.web.connector_checks.registry import (
     LEGACY_CONNECTORS,
     WRITE_WITHOUT_CLEANUP,
     WRITE_WITHOUT_REVERT,
+    _GMAIL_LABEL_WITHOUT_READ,
 )
 
 # LEGACY_CONNECTORS, pinned. A connector that adopts V2 leaves both lists in
@@ -149,7 +150,9 @@ def test_a_legacy_connector_is_a_builtin_connector():
 
 # A reason no later issue turns into a check: the server's own tools would have
 # to change first. Every other exemption is pending and names its issue.
-_PERMANENT_REASONS = frozenset({WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT})
+_PERMANENT_REASONS = frozenset(
+    {WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT, _GMAIL_LABEL_WITHOUT_READ}
+)
 
 
 @pytest.mark.parametrize("app_id", sorted(CONNECTOR_CHECKS))

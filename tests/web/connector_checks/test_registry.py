@@ -961,8 +961,13 @@ def test_gmail_manage_labels_is_exempt_for_the_read_step_rule() -> None:
         if exemption.tool == "gmail_manage_labels"
     )
 
-    assert "separate label read" in exemption.reason
-    assert exemption.reason.endswith("decided in #3567")
+    assert exemption.reason == (
+        "read and write in one tool: it is the only Gmail tool that reads a "
+        "label and the only one that creates or deletes one, so a label write "
+        "check's verify or cleanup guard would call its own create and cleanup "
+        "tool, which #3653 refuses; this change adds no label-reading tool, "
+        "which #3567 allows"
+    )
 
 
 # Output samples for the Google read checks

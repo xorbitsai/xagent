@@ -48,14 +48,13 @@ WRITE_WITHOUT_REVERT = (
 )
 # Gmail's one label tool reads and writes labels. A label write check's verify
 # or cleanup guard would therefore call the tool the check creates and deletes
-# with, which the read-step rule of #3653 refuses; #3567 decided not to add the
-# separate label read such a check needs, so the tool stays exempt.
+# with, which the read-step rule of #3653 refuses; #3567 allows leaving the
+# tool exempt instead of adding the separate label read such a check needs.
 _GMAIL_LABEL_WITHOUT_READ = (
     "read and write in one tool: it is the only Gmail tool that reads a label "
     "and the only one that creates or deletes one, so a label write check's "
     "verify or cleanup guard would call its own create and cleanup tool, which "
-    "#3653 refuses; the separate label read such a check needs is not added, "
-    "as decided in #3567"
+    "#3653 refuses; this change adds no label-reading tool, which #3567 allows"
 )
 
 

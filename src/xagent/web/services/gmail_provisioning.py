@@ -59,6 +59,7 @@ from .user_oauth import (
     ordinary_gmail_clause,
     scoped_user_oauth_query,
 )
+from .writer_workers import start_tracked_thread
 
 logger = logging.getLogger(__name__)
 
@@ -1581,14 +1582,13 @@ def provision_gmail_trigger(
     if run_in_thread is None:
 
         def run_in_thread(account_id: int) -> threading.Thread:
-            thread = threading.Thread(
-                target=_provision_in_fresh_session,
+            # Joined with a timeout below, so it can outlive this call while
+            # it still writes the watch state: counted for the writer retire.
+            return start_tracked_thread(
+                _provision_in_fresh_session,
                 args=(account_id,),
-                daemon=True,
                 name=f"gmail-provision-{account_id}",
             )
-            thread.start()
-            return thread
 
     thread = run_in_thread(int(oauth_account_id))
     thread.join(timeout)

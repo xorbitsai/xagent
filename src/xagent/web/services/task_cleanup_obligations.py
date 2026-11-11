@@ -67,6 +67,7 @@ from .task_workspace_cleanup import (
     remove_task_workspace,
     unscoped_workspace_cleanup_target,
 )
+from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -708,7 +709,7 @@ async def _release(
 
     if obligation.kind is CleanupResourceKind.WORKSPACE:
         # ``rmtree`` of a possibly large tree: off the event loop.
-        await asyncio.to_thread(remove_task_workspace, _workspace_target(obligation))
+        await run_tracked(remove_task_workspace, _workspace_target(obligation))
         return
     if obligation.kind is CleanupResourceKind.RUNTIME_EXTENSION:
         context = TaskRuntimeContext(
@@ -764,7 +765,7 @@ async def _warn_if_task_revived_during_release(
     a lock across.
     """
 
-    if await asyncio.to_thread(_task_id_is_live_sync, session_factory, claimed.task_id):
+    if await run_tracked(_task_id_is_live_sync, session_factory, claimed.task_id):
         logger.error(
             "Task cleanup obligation %s (task %s, %s) was released while its "
             "task id became live again; the release may have touched the new "
@@ -784,7 +785,7 @@ async def _attempt_claimed(
 ) -> CleanupObligationStatus | None:
     """Release one claimed obligation and write its outcome."""
 
-    if await asyncio.to_thread(_task_id_is_live_sync, session_factory, claimed.task_id):
+    if await run_tracked(_task_id_is_live_sync, session_factory, claimed.task_id):
         # A live task holds this id again -- SQLite reuses the highest rowid
         # once it is deleted. Whatever sits at this locator now belongs to that
         # task, so releasing it would destroy live data. (A task created in
@@ -831,7 +832,7 @@ async def _attempt_claimed(
                 "updated_at": now,
             }
             await _warn_if_task_revived_during_release(session_factory, claimed)
-            return await asyncio.to_thread(
+            return await run_tracked(
                 _settle_claim_sync, session_factory, claimed, values
             )
         except Exception as exc:  # noqa: BLE001
@@ -852,7 +853,7 @@ async def _attempt_claimed(
             now=now,
             max_attempts=max_attempts,
         )
-    return await asyncio.to_thread(_settle_claim_sync, session_factory, claimed, values)
+    return await run_tracked(_settle_claim_sync, session_factory, claimed, values)
 
 
 async def run_cleanup_obligation_batch(
@@ -874,13 +875,13 @@ async def run_cleanup_obligation_batch(
     """
 
     max_attempts = max_attempts or get_task_cleanup_max_attempts()
-    candidates = await asyncio.to_thread(
+    candidates = await run_tracked(
         _due_candidates_sync, session_factory, now=now or _utcnow(), limit=limit
     )
     report = CleanupRetryReport(due=len(candidates))
     for candidate in candidates:
         try:
-            claimed = await asyncio.to_thread(
+            claimed = await run_tracked(
                 _claim_sync,
                 session_factory,
                 candidate,

@@ -5,6 +5,8 @@ from typing import Any, Callable, Mapping, Optional, Type, get_origin
 
 from pydantic import BaseModel, RootModel, ValidationError, create_model
 
+from xagent.core.utils.blocking import run_blocking
+
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 # Set up logger
@@ -154,12 +156,13 @@ class FunctionTool(AbstractBaseTool):
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         parsed_args = self._args_type(**args)
         if not self._is_async:
-            import asyncio
+            import contextvars
             import functools
 
-            loop = asyncio.get_event_loop()
             func_call = functools.partial(self.func, **parsed_args.model_dump())
-            return_value = await loop.run_in_executor(None, func_call)
+            # The executor thread used to run with an empty context; keep that
+            # while routing the call through the blocking-work seam.
+            return_value = await run_blocking(contextvars.Context().run, func_call)
         else:
             return_value = await self.func(**parsed_args.model_dump())
 

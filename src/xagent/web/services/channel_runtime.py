@@ -64,6 +64,7 @@ from .uploaded_file_store import (
     stage_uploaded_file_from_local_path,
 )
 from .workforce_runtime import sync_workforce_run_status
+from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -1119,7 +1120,7 @@ async def prepare_channel_task(
     """
 
     worker = asyncio.create_task(
-        asyncio.to_thread(
+        run_tracked(
             _prepare_channel_task_sync,
             channel_id=channel_id,
             external_user_id=external_user_id,
@@ -1202,7 +1203,7 @@ def _start_claim_compensation(
     (:func:`_record_unless_compensated`), never on how the wait ended.
     """
     return asyncio.create_task(
-        asyncio.to_thread(_compensate_channel_task_claim_sync, snapshot)
+        run_tracked(_compensate_channel_task_claim_sync, snapshot)
     )
 
 

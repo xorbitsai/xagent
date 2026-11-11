@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useRef } from "react"
+import React, { useCallback, useEffect, useRef } from "react"
 import Link from "next/link"
 import { Mic, MicOff } from "lucide-react"
 
@@ -36,6 +36,7 @@ const levelSource = (phase: VoicePhase) => (phase === "speaking" ? "output" : "m
 const BAR_WIDTH = 3
 const BAR_GAP = 3
 const SAMPLE_EVERY_MS = 45
+const COLOUR_REFRESH_MS = 400
 
 /**
  * Scrolling level meter. History runs left to right (newest on the right):
@@ -55,6 +56,8 @@ export function VoiceWaveform({ call, className }: { call: VoiceCall; className?
 
     let frame = 0
     let lastSample = 0
+    let colourReadAt = -Infinity
+    let colour = ""
     let history: number[] = []
     let width = 0
     let height = 0
@@ -81,7 +84,11 @@ export function VoiceWaveform({ call, className }: { call: VoiceCall; className?
       }
 
       context.clearRect(0, 0, width, height)
-      context.fillStyle = getComputedStyle(canvas).color
+      // A style read forces layout, so take the colour a few times a second
+      // (often enough to follow the fade between the two phases' colours and a
+      // theme change) rather than on every frame.
+      if (now - colourReadAt > COLOUR_REFRESH_MS) { colour = getComputedStyle(canvas).color; colourReadAt = now }
+      context.fillStyle = colour
       const mid = height / 2
       const offset = slots - history.length
       for (let i = 0; i < slots; i += 1) {
@@ -130,12 +137,20 @@ export function VoiceWaveform({ call, className }: { call: VoiceCall; className?
  * wrong) in the input, and below it the mute button, waveform, status and an
  * End button. It replaces the text editor and toolbar for the length of the call.
  */
-export function VoiceCallBar({ call, compact = false }: { call: VoiceCall; compact?: boolean }) {
+export function VoiceCallBar({ call, compact = false, onEnd }: {
+  call: VoiceCall
+  compact?: boolean
+  /** The user ended the call from the bar (End or Escape); runs just before it closes. */
+  onEnd?: () => void
+}) {
   const { t } = useI18n()
   const failed = call.phase === "error"
   const shown = call.alert ?? (call.caption || undefined)
   const root = useRef<HTMLDivElement>(null)
+  const onEndRef = useRef(onEnd)
+  onEndRef.current = onEnd
   const { end } = call
+  const endCall = useCallback(() => { onEndRef.current?.(); end() }, [end])
 
   // The call is no longer a dialog, so give back what a dialog gave: focus moves
   // into it (the button that opened it is gone), and Escape ends it.
@@ -146,26 +161,35 @@ export function VoiceCallBar({ call, compact = false }: { call: VoiceCall; compa
   }, [])
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented && !event.isComposing) end()
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return
+      // The call is not modal: leave Escape to other fields, dialogs and menus
+      // on the page, and only end the call from the composer or from nowhere.
+      const target = event.target
+      const form = root.current?.closest("form")
+      if (target instanceof Element && !form?.contains(target)
+        && target.closest("input, textarea, select, [contenteditable], [role=dialog], [role=menu], [role=listbox], [role=combobox]")) return
+      endCall()
     }
     document.addEventListener("keydown", onKeyDown)
     return () => document.removeEventListener("keydown", onKeyDown)
-  }, [end])
+  }, [endCall])
 
-  const text = shown ? (
+  const text = shown || call.note || call.settingsLink ? (
     <div className={cn("min-w-0 text-left text-[15px]", compact && "flex-1")}>
-      <p
-        role={call.alert ? "alert" : undefined}
-        aria-live={call.alert ? undefined : "polite"}
-        className={cn(
-          call.alert ? "text-muted-foreground" : "text-foreground",
-          compact ? "truncate" : "whitespace-pre-wrap break-words"
-        )}
-        title={shown}
-        data-testid={call.alert ? "voice-alert" : "voice-caption"}
-      >
-        {shown}
-      </p>
+      {shown && (
+        <p
+          role={call.alert ? "alert" : undefined}
+          aria-live={call.alert ? undefined : "polite"}
+          className={cn(
+            call.alert ? "text-muted-foreground" : "text-foreground",
+            compact ? "truncate" : "whitespace-pre-wrap break-words"
+          )}
+          title={shown}
+          data-testid={call.alert ? "voice-alert" : "voice-caption"}
+        >
+          {shown}
+        </p>
+      )}
       {call.settingsLink && (
         <Link
           href="?settings=voice"
@@ -174,6 +198,16 @@ export function VoiceCallBar({ call, compact = false }: { call: VoiceCall; compa
         >
           {t("settings.voice.openSettings")}
         </Link>
+      )}
+      {/* Worth knowing, but the call goes on: shown beside what is being said. */}
+      {call.note && (
+        <p
+          className={cn("text-xs text-muted-foreground", compact ? "truncate" : "mt-1")}
+          title={call.note}
+          data-testid="voice-note"
+        >
+          {call.note}
+        </p>
       )}
     </div>
   ) : null
@@ -225,7 +259,7 @@ export function VoiceCallBar({ call, compact = false }: { call: VoiceCall; compa
       )}
       <button
         type="button"
-        onClick={call.end}
+        onClick={endCall}
         aria-label={t("voiceConversation.end")}
         className="h-9 shrink-0 rounded-full bg-foreground px-4 text-sm font-semibold text-background transition-opacity hover:opacity-85"
       >
@@ -262,22 +296,13 @@ export function VoiceCallBar({ call, compact = false }: { call: VoiceCall; compa
       data-testid="voice-call-bar"
     >
       <div className="flex min-h-[64px] items-start px-4 pt-3.5">{text}</div>
-      {call.note && <p className="px-4 pb-1 text-xs text-muted-foreground">{call.note}</p>}
       <div className="flex items-center gap-3 px-3 pb-3">{controls}</div>
     </div>
   )
 }
 
-// Seconds for the light/shade edge to swing out and back once.
-const ORB_SPIN_SECONDS: Record<VoicePhase, number> = {
-  idle: 9,
-  connecting: 9,
-  listening: 9,
-  muted: 9,
-  error: 9,
-  thinking: 5,
-  speaking: 6.5,
-}
+// Seconds for the light/shade edge to swing out and back once; 9 unless listed.
+const ORB_SPIN_SECONDS: Partial<Record<VoicePhase, number>> = { thinking: 5, speaking: 6.5 }
 
 /**
  * Blue ball lit by a large white disc: the edge between light and shade sweeps
@@ -291,6 +316,8 @@ export function VoiceOrb({ call, className }: { call: VoiceCall; className?: str
   const { level } = call
 
   useEffect(() => {
+    // The swell is motion too: leave it out when the user asks for less.
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return
     let frame = 0
     const update = () => {
       frame = window.requestAnimationFrame(update)
@@ -308,7 +335,7 @@ export function VoiceOrb({ call, className }: { call: VoiceCall; className?: str
       aria-hidden="true"
       data-phase={call.phase}
       className={cn("relative h-24 w-24 shrink-0 transition-transform duration-100", className)}
-      style={{ ["--orb-spin" as string]: `${ORB_SPIN_SECONDS[call.phase]}s` }}
+      style={{ ["--orb-spin" as string]: `${ORB_SPIN_SECONDS[call.phase] ?? 9}s` }}
     >
       {/* Halo */}
       <div className="absolute -inset-[24%] rounded-full bg-[radial-gradient(circle,rgba(76,96,244,0.5)_36%,rgba(76,96,244,0)_72%)] blur-[14px]" />

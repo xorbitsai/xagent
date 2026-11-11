@@ -41,6 +41,14 @@ export class VoiceAudio {
   }
 
   constructor(private options: {
+    /**
+     * An audio context already created and resumed inside the user's click.
+     * Browsers (Safari above all) only let a context start from a user gesture,
+     * and a call can only begin after its models and settings have loaded, so
+     * the caller unlocks one up front and hands it over here. The call owns
+     * it from then on and closes it.
+     */
+    context?: AudioContext
     asr: string
     tts: string
     voice?: string
@@ -54,7 +62,7 @@ export class VoiceAudio {
   }) {}
 
   async start(): Promise<void> {
-    this.context = new AudioContext()
+    this.context = this.options.context ?? new AudioContext()
     // Resume during the start button's user activation, before network awaits.
     await this.context.resume()
     if (this.closed) return

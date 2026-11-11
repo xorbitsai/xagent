@@ -32,6 +32,8 @@ const analyserLevel = { value: 0 }
 const stopTrack = vi.fn()
 const closeContext = vi.fn().mockResolvedValue(undefined)
 class Context {
+  static created = 0
+  constructor() { Context.created += 1 }
   sampleRate = 48000
   currentTime = 0
   destination = {}
@@ -95,6 +97,24 @@ describe("browser voice resources", () => {
     expect(socket.close).toHaveBeenCalledOnce()
     expect(stopTrack).toHaveBeenCalledOnce()
     expect(closeContext).toHaveBeenCalledOnce()
+  })
+
+  it("uses an audio context unlocked earlier instead of creating its own", async () => {
+    const unlocked = new Context()
+    Context.created = 0
+    const call = new VoiceAudio({ ...options(), context: unlocked as unknown as AudioContext })
+    await start(call)
+    expect(Context.created).toBe(0)
+    expect(unlocked.resume).toHaveBeenCalled()
+    // The call owns it from here on.
+    call.close()
+    expect(closeContext).toHaveBeenCalledOnce()
+  })
+
+  it("creates its own audio context when none was handed in", async () => {
+    Context.created = 0
+    await start(new VoiceAudio(options()))
+    expect(Context.created).toBe(1)
   })
 
   it("reads microphone and playback loudness for the waveform", async () => {

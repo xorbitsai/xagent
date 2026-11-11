@@ -3,12 +3,16 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const calls = vi.hoisted(() => [] as Array<{
-  options: { vadSilenceThreshold?: number; activity: (active: boolean) => void; transcript: (type: "partial" | "final", text: string, id: number) => void; error: (reason?: "session_timeout" | "authentication_required") => void }
+  options: { context?: unknown; vadSilenceThreshold?: number; activity: (active: boolean) => void; transcript: (type: "partial" | "final", text: string, id: number) => void; error: (reason?: "session_timeout" | "authentication_required") => void }
   close: ReturnType<typeof vi.fn>; stopAudio: ReturnType<typeof vi.fn>; speak: ReturnType<typeof vi.fn>; level: ReturnType<typeof vi.fn>
 }>)
 const auth = vi.hoisted(() => ({ token: "user-token", user: { id: 1 }, session: { sessionId: "login-1" } }))
 const preferences = vi.hoisted(() => ({ asr_model_id: "live", tts_model_id: "speaker", voice: "saved-voice" }))
-vi.mock("@/hooks/use-voice-preferences", () => ({ useVoicePreferences: () => ({ preferences, loading: false, error: false }) }))
+const prefsHook = vi.hoisted(() => ({ error: false, calls: [] as Array<[boolean, boolean | undefined]> }))
+vi.mock("@/hooks/use-voice-preferences", () => ({ useVoicePreferences: (enabled: boolean, refreshKey?: boolean) => {
+  prefsHook.calls.push([enabled, refreshKey])
+  return { preferences, loading: false, error: prefsHook.error }
+} }))
 vi.mock("@/contexts/auth-context", () => ({ useAuth: () => auth }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 vi.mock("@/lib/voice-audio", async original => ({ ...await original<typeof import("@/lib/voice-audio")>(), VoiceAudio: class {
@@ -48,7 +52,7 @@ function Call(props: Omit<React.ComponentProps<typeof VoiceConversation>, "open"
 const idle = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn(), onInterrupt: vi.fn() }
 
 beforeEach(() => { vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null) })
-afterEach(() => { cleanup(); calls.length = 0; preferences.asr_model_id = "live"; vi.clearAllMocks(); vi.restoreAllMocks() })
+afterEach(() => { cleanup(); calls.length = 0; prefsHook.calls.length = 0; prefsHook.error = false; preferences.asr_model_id = "live"; vi.clearAllMocks(); vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
 describe("voice call lifecycle", () => {
   it("starts as soon as it is opened, with no confirmation step", async () => {
@@ -232,19 +236,136 @@ describe("voice call lifecycle", () => {
       render(<Call {...idle} />)
       await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("voiceConversation.authenticationRequired"))
       expect(calls).toHaveLength(0)
+      expect(screen.queryByRole("button", { name: "voiceConversation.retry" })).not.toBeInTheDocument()
     } finally { auth.token = token }
   })
 
-  it("starts inside the opening click when the voice models were loaded ahead of time", async () => {
+  describe("audio unlock", () => {
+    // The call can only begin after its models and settings have loaded, but a
+    // browser only lets audio start from the user's click.
+    const contexts: Array<{ resume: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn>; state: string }> = []
+    beforeEach(() => {
+      contexts.length = 0
+      vi.stubGlobal("AudioContext", class {
+        state = "running"; resume = vi.fn().mockResolvedValue(undefined); close = vi.fn().mockResolvedValue(undefined)
+        constructor() { contexts.push(this) }
+      })
+    })
+    const slowModels = () => {
+      let release!: () => void
+      vi.mocked(apiRequest).mockImplementationOnce(() => new Promise<Response>(resolve => {
+        release = () => resolve(new Response(JSON.stringify([
+          { id: 1, model_id: "live", model_name: "scribe_v2_realtime", abilities: ["asr"] },
+          { id: 3, model_id: "speaker", model_name: "eleven_flash_v2_5", abilities: ["tts"] },
+        ].map(model => ({ category: "speech", model_provider: "elevenlabs", base_url: null, temperature: null, context_window: null, dimension: null, description: null, created_at: null, updated_at: null, is_active: true, is_owner: true, can_edit: true, can_delete: true, is_shared: false, ...model })))))
+      }))
+      return () => release()
+    }
+
+    it("creates and resumes the audio context in the opening click, before the models have loaded", async () => {
+      const finishLoading = slowModels()
+      const props = { ...idle, onOpenChange: vi.fn() }
+      const view = render(<VoiceCallStoreProvider><VoiceConversation {...props} open={false} /><Composer /></VoiceCallStoreProvider>)
+      expect(contexts).toHaveLength(0)
+      view.rerender(<VoiceCallStoreProvider><VoiceConversation {...props} open /><Composer /></VoiceCallStoreProvider>)
+      expect(contexts).toHaveLength(1)
+      expect(contexts[0].resume).toHaveBeenCalled()
+      expect(calls).toHaveLength(0)
+      await act(async () => { finishLoading() })
+      await waitFor(() => expect(calls).toHaveLength(1))
+      expect(calls[0].options.context).toBe(contexts[0])
+      expect(contexts).toHaveLength(1)
+    })
+
+    it("closes a context that was never used when the call is dismissed", async () => {
+      slowModels()
+      const props = { ...idle, onOpenChange: vi.fn() }
+      const view = render(<VoiceCallStoreProvider><VoiceConversation {...props} open /><Composer /></VoiceCallStoreProvider>)
+      expect(contexts).toHaveLength(1)
+      view.rerender(<VoiceCallStoreProvider><VoiceConversation {...props} open={false} /><Composer /></VoiceCallStoreProvider>)
+      expect(contexts[0].close).toHaveBeenCalledOnce()
+    })
+
+    it("unlocks a fresh context for a retry, which is a click too", async () => {
+      render(<Call {...idle} />)
+      await waitFor(() => expect(calls).toHaveLength(1))
+      act(() => { calls[0].options.error() })
+      expect(contexts).toHaveLength(1)
+      fireEvent.click(screen.getByRole("button", { name: "voiceConversation.retry" }))
+      expect(contexts).toHaveLength(2)
+      await waitFor(() => expect(calls).toHaveLength(2))
+      expect(calls[1].options.context).toBe(contexts[1])
+    })
+  })
+
+  it("looks the models and settings up when a call is opened, not ahead of time", async () => {
     const props = { ...idle, onOpenChange: vi.fn() }
-    const view = render(<VoiceCallStoreProvider><VoiceConversation {...props} preload open={false} /><Composer /></VoiceCallStoreProvider>)
-    await waitFor(() => expect(apiRequest).toHaveBeenCalled())
-    // Let the models and settings finish loading before anyone clicks.
-    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    const view = render(<VoiceCallStoreProvider><VoiceConversation {...props} open={false} /><Composer /></VoiceCallStoreProvider>)
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 30)) })
+    expect(apiRequest).not.toHaveBeenCalled()
+    expect(prefsHook.calls.every(([enabled]) => enabled === false)).toBe(true)
+    view.rerender(<VoiceCallStoreProvider><VoiceConversation {...props} open /><Composer /></VoiceCallStoreProvider>)
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(apiRequest).toHaveBeenCalled()
+    expect(prefsHook.calls.some(([enabled]) => enabled === true)).toBe(true)
+    // Closed and opened again: settings changed in between are read afresh.
+    view.rerender(<VoiceCallStoreProvider><VoiceConversation {...props} open={false} /><Composer /></VoiceCallStoreProvider>)
+    expect(prefsHook.calls[prefsHook.calls.length - 1][0]).toBe(false)
+  })
+
+  it("repeats a failed settings lookup when trying again", async () => {
+    prefsHook.error = true
+    render(<Call {...idle} />)
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("settings.voice.loadFailed"))
     expect(calls).toHaveLength(0)
-    // The click opens the call; the audio context has to start in that same
-    // task, so no network wait may sit between the two.
-    view.rerender(<VoiceCallStoreProvider><VoiceConversation {...props} preload open /><Composer /></VoiceCallStoreProvider>)
-    expect(calls).toHaveLength(1)
+    prefsHook.error = false
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.retry" }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    // The lookup was asked to refresh.
+    expect(prefsHook.calls.some(([, refresh]) => refresh === true)).toBe(true)
+  })
+
+  it("keeps what was said while a message was being sent", async () => {
+    let finishSending!: () => void
+    const onSend = vi.fn(() => new Promise<void>(resolve => { finishSending = resolve }))
+    render(<Call {...idle} onSend={onSend} />)
+    await waitFor(() => expect(calls).toHaveLength(1))
+    await act(async () => {
+      calls[0].options.activity(true)
+      calls[0].options.transcript("final", "First thing.", 0)
+      calls[0].options.activity(false)
+      await new Promise(resolve => setTimeout(resolve, 320))
+    })
+    expect(onSend).toHaveBeenCalledWith("First thing.", expect.any(String))
+    // The user carries on talking while the first message is still on its way.
+    act(() => { calls[0].options.transcript("partial", "And another thing", 1) })
+    await act(async () => { finishSending() })
+    expect(screen.getByTestId("voice-caption")).toHaveTextContent("And another thing")
+  })
+
+  it("keeps showing what is said when only playback failed", async () => {
+    const props = { ...idle, onSend: vi.fn().mockResolvedValue(undefined) }
+    const view = render(<Call {...props} />)
+    await waitFor(() => expect(calls).toHaveLength(1))
+    calls[0].speak.mockRejectedValueOnce(new Error("temporary synthesis failure"))
+    await act(async () => {
+      calls[0].options.transcript("final", "Hello", 0)
+      await new Promise(resolve => setTimeout(resolve, 320))
+    })
+    view.rerender(<Call {...props} messages={[{ id: "answer", role: "assistant", isResult: true, status: "completed", content: "Hello back." }]} />)
+    await screen.findByTestId("voice-note")
+    expect(screen.getByTestId("voice-note")).toHaveTextContent("voiceConversation.playbackFailed")
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    act(() => { calls[0].options.transcript("partial", "Still talking", 1) })
+    expect(screen.getByTestId("voice-caption")).toHaveTextContent("Still talking")
+    expect(screen.getByTestId("voice-note")).toBeInTheDocument()
+  })
+
+  it("does not offer another attempt when the login is gone", async () => {
+    render(<Call {...idle} />)
+    await waitFor(() => expect(calls).toHaveLength(1))
+    act(() => { calls[0].options.error("authentication_required") })
+    expect(screen.getByRole("alert")).toHaveTextContent("voiceConversation.authenticationRequired")
+    expect(screen.queryByRole("button", { name: "voiceConversation.retry" })).not.toBeInTheDocument()
   })
 })

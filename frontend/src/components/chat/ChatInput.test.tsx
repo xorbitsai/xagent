@@ -219,6 +219,52 @@ describe("ChatInput", () => {
     expect(call.toggleMute).toHaveBeenCalledOnce()
   })
 
+  it("puts focus back in the editor when the user ends the call from the bar", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    function Harness() {
+      const [open, setOpen] = React.useState(true)
+      const call = React.useMemo(() => fakeCall({ open, end: () => setOpen(false) }), [open])
+      return (
+        <VoiceCallStoreProvider>
+          <PublishedCall call={call} />
+          <ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="" onInputChange={vi.fn()} />
+        </VoiceCallStoreProvider>
+      )
+    }
+    const { container } = render(<Harness />)
+    fireEvent.click(await screen.findByRole("button", { name: "voiceConversation.end" }))
+    await waitFor(() => expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument())
+    expect(container.querySelector("[contenteditable]")).toHaveFocus()
+  })
+
+  it("leaves focus alone when the call ends some other way", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    function Harness({ open }: { open: boolean }) {
+      return (
+        <VoiceCallStoreProvider>
+          <PublishedCall call={fakeCall({ open })} />
+          <ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="" onInputChange={vi.fn()} />
+        </VoiceCallStoreProvider>
+      )
+    }
+    const view = render(<Harness open />)
+    await screen.findByTestId("voice-call-bar")
+    view.rerender(<Harness open={false} />)
+    await waitFor(() => expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument())
+    expect(view.container.querySelector("[contenteditable]")).not.toHaveFocus()
+  })
+
+  it("pops the send button in only where it swaps with the voice button, and not when sending becomes possible", async () => {
+    const { container, rerender } = render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="hello" onInputChange={vi.fn()} />)
+    const send = () => container.querySelector("button[type='submit']")!
+    expect(send()).toHaveClass("animate-voice-pop")
+    // Sending becoming impossible and possible again must not touch the class.
+    rerender(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="hello" onInputChange={vi.fn()} isLoading />)
+    expect(send()).toHaveClass("animate-voice-pop")
+    rerender(<ChatInput onSend={vi.fn()} inputValue="hello" onInputChange={vi.fn()} />)
+    expect(send()).not.toHaveClass("animate-voice-pop")
+  })
+
   it("shows a failed call in the input with a way to try again", async () => {
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
     const call = fakeCall({ phase: "error", active: false, status: "voiceConversation.states.stopped", alert: "The voice session timed out." })

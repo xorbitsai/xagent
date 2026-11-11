@@ -29,12 +29,6 @@ export interface VoiceCallOptions {
   open: boolean
   onOpenChange: (open: boolean) => void
   allowTaskAdoption?: boolean
-  /**
-   * Load the voice models and saved settings before a call is asked for. The
-   * audio context can only start inside the click that opens the call, so the
-   * call must be able to begin without waiting on the network.
-   */
-  preload?: boolean
 }
 
 /** Why a call that was asked for could not begin. */
@@ -70,13 +64,15 @@ export interface VoiceCall {
   toggleMute: () => void
 }
 
-export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend, onInterrupt, open, onOpenChange, allowTaskAdoption = false, preload = false }: VoiceCallOptions): VoiceCall {
+export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend, onInterrupt, open, onOpenChange, allowTaskAdoption = false }: VoiceCallOptions): VoiceCall {
   const { t } = useI18n()
   const auth = useAuth()
   // Bumped by "try again" so a failed models or settings lookup is repeated.
   const [refresh, setRefresh] = useState(false)
-  const models = useVoiceModels(open || preload, refresh)
-  const saved = useVoicePreferences(open || preload, refresh)
+  // Both are looked up each time a call is opened, so settings changed since
+  // the last call (including the fix for a failed one) are always picked up.
+  const models = useVoiceModels(open, refresh)
+  const saved = useVoicePreferences(open, refresh)
   const { asr: liveAsr, tts: liveTts, loading } = models
   const modelReason = voiceModelReason(models)
   const [phase, setPhase] = useState<VoicePhase>("idle")
@@ -94,6 +90,23 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   const live = useRef({ messages, busy, waiting, onSend, onInterrupt })
   live.current = { messages, busy, waiting, onSend, onInterrupt }
   const identity = useRef({ taskId, sessionId: auth.session?.sessionId, userId: auth.user?.id })
+
+  // An audio context unlocked by the click that opened (or retried) the call,
+  // waiting for the call to begin.
+  const unlocked = useRef<AudioContext | null>(null)
+  const unlock = () => {
+    if (unlocked.current || typeof AudioContext === "undefined") return
+    try {
+      const context = new AudioContext()
+      void context.resume().catch(() => {})
+      unlocked.current = context
+    } catch { /* The call creates its own and reports the failure. */ }
+  }
+  const discardUnlocked = () => {
+    const context = unlocked.current
+    unlocked.current = null
+    if (context && context.state !== "closed") void context.close().catch(() => {})
+  }
 
   const release = () => {
     generation.current += 1
@@ -118,11 +131,13 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   }, [taskId, auth.session?.sessionId, auth.user?.id])
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => () => { release() }, [])
+  useEffect(() => () => { release(); discardUnlocked() }, [])
   useEffect(() => {
+    // Opening is the user's click: unlock audio now, before anything is awaited.
+    if (open) unlock()
     // Closing always resets: a failed call has no audio left to release but
     // still holds its error, which must not greet the next call.
-    if (!open) end()
+    else { end(); discardUnlocked() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
@@ -150,11 +165,15 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
 
   const start = () => {
     if (audio.current || !auth.token || !canStart) return
+    // Take the context unlocked in the click (or make one) before `end` resets.
+    const context = unlocked.current ?? undefined
+    unlocked.current = null
     end()
     const epoch = generation.current
     const current = () => epoch === generation.current
     setPhase("connecting")
     const call = new VoiceAudio({
+      context,
       asr: asrId, tts: ttsId, voice: saved.preferences.voice || undefined, token: auth.token, sessionId: auth.session?.sessionId ?? null,
       vadSilenceThreshold: liveAsr.find(model => model.model_id === asrId)?.model_provider?.trim().toLowerCase() === "elevenlabs" ? 0.5 : undefined,
       activity: speaking => { if (current()) turns.current?.activity(speaking) },
@@ -169,8 +188,9 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
         if (current()) setPlaybackFailed(false)
         try {
           await live.current.onSend(text, generateClientMessageId())
-          // The words now live in the conversation; stop showing them in the input.
-          if (current()) setCaption("")
+          // The words now live in the conversation; stop showing them in the
+          // input, unless the user has already started saying something else.
+          if (current()) setCaption(shown => (shown === text ? "" : shown))
         } catch (error) {
           // The normal task-delivery path supplies a client-safe API error.
           // Keep its explanation separate from microphone/ASR failures.
@@ -200,10 +220,8 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   }
 
   // The button that opens a call is the click that starts it: no confirmation
-  // step. Starting must follow the click without waiting on a network round
-  // trip (the audio context needs the click's user activation), which is why
-  // the models and settings are loaded ahead of time (`preload`) and the call
-  // begins as soon as everything it depends on is ready.
+  // step. The models and settings are looked up first, so the call begins once
+  // they are ready; the audio context was unlocked in the click itself.
   useEffect(() => {
     if (!open) return
     if (phase !== "idle" || audio.current) return
@@ -220,6 +238,8 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   }, [open, phase, auth.token, loading, saved.loading, saved.error, modelReason, selectionUnavailable, canStart])
 
   const retry = () => {
+    // Retrying is a click too: unlock audio now, as opening the call did.
+    unlock()
     end()
     // A failed models or settings lookup is looked up again; the effect above
     // then starts the call on the next render.
@@ -251,14 +271,20 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
     if (audioFailure === "authentication_required") return t("voiceConversation.authenticationRequired")
     return t("voiceConversation.states.error")
   })()
-  const alert = failureText ?? (playbackFailed ? t("voiceConversation.playbackFailed") : undefined)
+  const alert = failureText
   // A call that is open but has not begun connecting yet reads as connecting.
   const status = t(`voiceConversation.states.${phase === "error" ? "stopped" : phase === "idle" ? "connecting" : phase}`)
-  const note = serverVadOnly ? t("voiceConversation.serverVadOnly") : undefined
-  const settingsLink = phase === "error" && (blocked === "preferences" || blocked === "selection" || blocked === "models")
+  // Things worth knowing that do not stop the call, shown beside what is being said.
+  const note = [
+    playbackFailed ? t("voiceConversation.playbackFailed") : "",
+    serverVadOnly ? t("voiceConversation.serverVadOnly") : "",
+  ].filter(Boolean).join(" ") || undefined
+  const settingsLink = phase === "error" && !!blocked
   // Missing or unsuitable models only change in settings, so trying again can
   // not help; everything else (a dropped connection, a failed lookup) can.
-  const retryable = phase === "error" && !(blocked === "selection" || (blocked === "models" && modelReason !== "modelsUnavailable" && modelReason !== "checkingModels"))
+  // Losing the login needs signing in again, not another attempt.
+  const retryable = phase === "error" && audioFailure !== "authentication_required"
+    && !(blocked === "selection" || (blocked === "models" && modelReason !== "modelsUnavailable" && modelReason !== "checkingModels"))
   const retryDisabled = busy || disabled
 
   return useMemo<VoiceCall>(() => ({

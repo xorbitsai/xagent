@@ -1181,7 +1181,6 @@ export function TaskConversationPanel({
 
             {voiceConversationEnabled && voiceInputEnabled && taskControlsEnabled && (
               <VoiceConversation
-                preload
                 open={voiceOpen}
                 onOpenChange={setVoiceOpen}
                 taskId={state.taskId}

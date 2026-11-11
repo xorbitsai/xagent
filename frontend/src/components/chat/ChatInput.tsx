@@ -915,7 +915,8 @@ export function ChatInput({
   const showStopButton = offersStopControl && !hasDraft;
   // With nothing typed, the composer's main action starts a voice call; once
   // there is something to send it becomes the send button.
-  const showVoiceStart = Boolean(voiceInputEnabled && onVoiceConversation && !hasDraft && !isInputBusy && !showStopButton);
+  const voiceOffered = Boolean(voiceInputEnabled && onVoiceConversation);
+  const showVoiceStart = Boolean(voiceOffered && !hasDraft && !isInputBusy && !showStopButton);
   // The stop control and the send control take turns in the same slot, so the
   // size and the box styling come from here instead of each of them carrying
   // its own copy: the slot keeps one shape whichever control is on screen.
@@ -1091,6 +1092,14 @@ export function ChatInput({
   // reliably fire blur, which would leave the composer looking focused.
   useEffect(() => {
     if (voiceCallVisible) editorRef.current?.blur();
+  }, [voiceCallVisible]);
+  // Ending the call from the bar removes the control that had focus, which
+  // would drop focus to the page; the dialog this replaced put it back.
+  const restoreFocusAfterCall = useRef(false);
+  useEffect(() => {
+    if (voiceCallVisible || !restoreFocusAfterCall.current) return;
+    restoreFocusAfterCall.current = false;
+    editorRef.current?.focus();
   }, [voiceCallVisible]);
 
   const handleSubmit = async (e?: React.SyntheticEvent) => {
@@ -1415,7 +1424,9 @@ export function ChatInput({
             </div>
           )}
 
-          {voiceCallVisible && voiceCall && <VoiceCallBar call={voiceCall} compact={compact} />}
+          {voiceCallVisible && voiceCall && (
+            <VoiceCallBar call={voiceCall} compact={compact} onEnd={() => { restoreFocusAfterCall.current = true; }} />
+          )}
 
           <div className={cn("relative flex-1", voiceCallVisible && "hidden")}>
             <div
@@ -1655,7 +1666,7 @@ export function ChatInput({
                   title={sendButtonLabel}
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
-                    hasDraft && canSubmit() && "animate-voice-pop",
+                    voiceOffered && "animate-voice-pop",
                     !canSubmit() && "bg-muted text-muted-foreground/50"
                   )}
                 >

@@ -204,6 +204,7 @@ from ..services.task_execution_controller import (
 from ..services.task_execution_controller import (
     task_execution_controller as task_execution_controller,  # Tests patch this API module's controller.snapshot.
 )
+from ..services.task_execution_host import consumes_task_commands
 from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_orchestrator import TaskTurnError
 from ..services.task_runtime import (
@@ -2349,7 +2350,10 @@ def _task_command_ack(
     After it the row waits for the next owner of the run, so the reply says it
     is queued and takes effect after the restart (``task_command_queued``).
     """
-    queued = release_hold.socket_writes_fenced
+    # Only a process that consumes commands stops applying them at the fence;
+    # in the shared-execution web role the execution workers apply them as
+    # usual, so the plain acceptance is the truthful reply.
+    queued = release_hold.socket_writes_fenced and consumes_task_commands()
     return {
         "type": "task_command_queued" if queued else "task_command_accepted",
         "task_id": task_id,
@@ -2407,9 +2411,9 @@ async def _enqueue_websocket_task_command(
     command_id: str | None = None,
     allow_missing_task: bool = False,
 ) -> EnqueuedTaskCommand | None:
-    # Callers without a user (the server-side enqueue paths) are refused here
-    # and write nothing, so only an authenticated enqueue takes part in the
-    # retire fence below.
+    # A frame without an authenticated user is refused here and writes
+    # nothing, so only an authenticated enqueue takes part in the retire
+    # fence below.
     user = message_data.get("user")
     if user is None:
         raise ClientVisibleValidationError(

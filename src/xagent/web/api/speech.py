@@ -321,7 +321,10 @@ async def stream_asr(
         # reconnect to the successor instead of leaking the cancellation. The
         # usage scope has already delivered what was metered (on its own
         # tracked worker), and the token is held until the finally below.
-        session_task.uncancel()
+        if session_task.uncancel() > 0:
+            # A foreign cancel (shutdown, the revalidate wrapper) landed with
+            # the fence cancel: it must not be swallowed.
+            raise
         await _close_asr_socket(websocket, 1012, "Service restart")
     except _ASRWriteTimeout:
         await _close_asr_socket(websocket, 1000, "Speech session timed out")

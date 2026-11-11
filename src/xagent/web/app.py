@@ -2890,6 +2890,15 @@ async def shutdown_event() -> None:
         await retire_writers(settle_seconds=0, raise_on_stop_error=False)
     except Exception:
         logger.exception("Retiring the writers failed at shutdown; continuing teardown")
+    # The retire above returns early after a completed host retire (channel
+    # CRUD can restart bots afterwards) and while a host retire still holds the
+    # lock mid-stop (which may yet fail). Both stops are idempotent, so shutdown
+    # always runs them: this is the last chance.
+    try:
+        await _stop_runtime_loops()
+        await _stop_chat_channels(raise_errors=False)
+    except Exception:
+        logger.exception("Stopping loops and channels failed at shutdown")
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

@@ -3089,9 +3089,19 @@ async def dispatch_task_command_promptly(
     except asyncio.TimeoutError:
         task.add_done_callback(_consume_prompt_dispatch_result)
         return
-    except BaseException:
+    except BaseException as exc:
         # The dispatch itself failed (the caller sees that), or the caller was
         # cancelled and the shielded dispatch keeps running detached.
+        if (
+            isinstance(exc, asyncio.CancelledError)
+            and task.cancelled()
+            and (current := asyncio.current_task()) is not None
+            and current.cancelling() == 0
+        ):
+            # The drain cancelled the dispatch, not the caller: the row is
+            # durable and the successor claims it, so the caller carries on.
+            _prompt_dispatch_tasks.discard(task)
+            return
         if task.done():
             _prompt_dispatch_tasks.discard(task)
         else:

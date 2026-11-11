@@ -747,7 +747,11 @@ async def test_shutdown_skips_a_retire_the_host_already_completed(teardown):
 
     await app_module.shutdown_event()
 
-    assert teardown == [*stops_before, "close_task_coordinators"]
+    # The stops are idempotent and channel CRUD can restart a bot after the
+    # host's retire, so shutdown runs them again; only the waits are skipped.
+    assert teardown[: len(stops_before)] == stops_before
+    assert CHANNEL_STOP_FLAGS[-1:] == [False]  # the channels were stopped again
+    assert teardown[-1] == "close_task_coordinators"
 
 
 async def test_shutdown_still_drains_the_coordinators_when_the_retire_times_out(
@@ -984,7 +988,7 @@ async def test_shutdown_does_not_wait_for_a_live_tracked_thread(teardown, monkey
         # The fence and the stops still happened.
         assert app_module.release_hold.socket_writes_fenced
         assert "stop_task_lease_recovery_task" in teardown
-        assert CHANNEL_STOP_FLAGS == [False]
+        assert set(CHANNEL_STOP_FLAGS) == {False}
     finally:
         release.set()
         await awaiting
@@ -1098,8 +1102,9 @@ async def test_a_failed_channel_stop_leaves_the_retire_unpublished(
 
 @pytest.mark.parametrize("name", ["PAUSE", "RESUME"])
 @pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("consumes", [True, False])
 async def test_the_steering_ack_says_queued_once_the_fence_is_up(
-    monkeypatch, name, fenced
+    monkeypatch, name, fenced, consumes
 ):
     from xagent.web.api import websocket as ws
     from xagent.web.services.task_command_transport import TaskCommandKind
@@ -1124,6 +1129,7 @@ async def test_the_steering_ack_says_queued_once_the_fence_is_up(
     monkeypatch.setattr(ws, "_enqueue_websocket_task_command", enqueue)
     monkeypatch.setattr(ws.manager, "send_personal_message", record)
     monkeypatch.setattr(ws, "dispatch_task_command_promptly", dispatch)
+    monkeypatch.setattr(ws, "consumes_task_commands", lambda: consumes)
     if fenced:
         app_module.release_hold.mark_writers_retired()
     handler = ws.handle_pause_task if name == "PAUSE" else ws.handle_resume_task
@@ -1133,7 +1139,9 @@ async def test_the_steering_ack_says_queued_once_the_fence_is_up(
     (ack,) = sent
     assert ack["command"] == TaskCommandKind[name].value
     assert ack["task_id"] == 9 and ack["command_id"] == "cmd-1"
-    if fenced:
+    # A web role that only enqueues (shared execution) is never fenced out of
+    # applying: the execution workers apply the command as usual.
+    if fenced and consumes:
         assert ack["type"] == "task_command_queued"
         assert ack["applied_after_restart"] is True
     else:
@@ -1176,8 +1184,10 @@ async def test_a_dispatch_in_its_inline_wait_is_seen_by_the_drain(monkeypatch):
     # What the retire does: the dispatch is cancelled and waited for even
     # though its inline wait has not ended.
     assert await transport.drain_prompt_dispatches(2.0)
-    with suppress(asyncio.CancelledError):
-        await caller
+    # The drain cancelled the dispatch, not the caller: the socket handler
+    # carries on (the command row is durable) instead of dying.
+    await caller
+    assert not caller.cancelled()
     assert transport.prompt_dispatch_count() == 0
     assert not transport._prompt_dispatch_tasks
 
@@ -1515,3 +1525,37 @@ def test_a_tracked_thread_is_counted_from_before_it_starts_until_it_returns():
     release.set()
     thread.join(5)
     assert active_workers() == 0
+
+
+async def test_a_foreign_cancel_beside_the_fence_cancel_is_not_swallowed(monkeypatch):
+    from xagent.web.api import speech
+
+    blocked = asyncio.Event()
+
+    async def authenticated(*_a, **_k):
+        return type("U", (), {"id": 1})()
+
+    async def accept(_websocket) -> None:
+        return None
+
+    async def receive(_websocket):
+        blocked.set()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(speech, "get_authenticated_user", authenticated)
+    monkeypatch.setattr(speech, "accept_authenticated_websocket", accept)
+    monkeypatch.setattr(speech, "_receive_asr_message", receive)
+    socket = _AsrSocket()
+
+    handler = asyncio.create_task(
+        speech.stream_asr.__wrapped__(socket, token=None)  # type: ignore[attr-defined]
+    )
+    await blocked.wait()
+
+    app_module.release_hold.mark_writers_retired()  # cancel number one
+    handler.cancel()  # a foreign cancel (server shutdown) lands with it
+    with suppress(asyncio.CancelledError):
+        await handler
+
+    assert handler.cancelled()
+    assert await app_module.release_hold.drain_socket_writes(1.0)

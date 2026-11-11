@@ -535,8 +535,8 @@ class EmbeddingStageResult:
     Filled as the stage runs, so a holder passed into a raising call stays
     readable. After a raise, ``current_step``, ``embedding_count``, the
     ``*_completed`` flags and ``pending_count`` are reliable; ``vector_count``
-    and ``last_write_response`` are only set once every batch and the commit
-    have succeeded.
+    is set once every batch is written, and ``last_write_response`` only after
+    the final commit succeeds.
     """
 
     read_count: int = 0
@@ -598,8 +598,9 @@ def embed_document_chunks(
         embedding_adapter: Provider used to encode chunk text.
         cfg: Embedding behaviour. Rewritten by the spreadsheet safeguards when
             ``is_spreadsheet`` is set.
-        user_id: Document owner, used for reads and writes. Required: a missing
-            owner would read across owners and write ownerless rows.
+        user_id: Document owner, used for reads and writes. Required when
+            ``is_admin`` is set: an ownerless admin read spans every owner and
+            writes ownerless rows.
         is_admin: Admin scope for reads and commit. Writes always use
             ``user_id`` alone.
         is_spreadsheet: Enforce the spreadsheet safeguards (async path, chunk
@@ -613,7 +614,7 @@ def embed_document_chunks(
         The same ``result`` holder, fully populated on success.
 
     Raises:
-        ValueError: ``user_id`` is None.
+        ValueError: ``is_admin`` is set but ``user_id`` is None.
         DatabaseOperationError: A batch write or the final commit failed. The
             gate's own exception propagates unchanged from the final commit.
         EmbeddingAdapterError: A spreadsheet chunk exceeded the token budget,
@@ -624,8 +625,6 @@ def embed_document_chunks(
             when every chunk fails. The async path calls ``asyncio.run``, so it
             needs a thread with no running event loop.
     """
-    if user_id is None:
-        raise ValueError("embed_document_chunks requires the document owner")
     if result is None:
         result = EmbeddingStageResult()
     else:
@@ -637,6 +636,8 @@ def embed_document_chunks(
     with _track_step(progress_tracker, "read_chunks_for_embedding"):
         pass  # Step marked
     result.current_step = "read_chunks_for_embedding"
+    if user_id is None and is_admin:
+        raise ValueError("embed_document_chunks requires the document owner")
     logger.info(
         "Step read_chunks_for_embedding started",
         extra={
@@ -981,7 +982,7 @@ def embed_document_chunks(
         raise EmbeddingAdapterError(
             "Failed to generate any embeddings",
             details={
-                "chunk_count": len(chunks),
+                "chunk_count": read_model.total_count,
                 "use_async": cfg.embedding_use_async,
                 "embedding_model": embedding_config.model_name,
             },

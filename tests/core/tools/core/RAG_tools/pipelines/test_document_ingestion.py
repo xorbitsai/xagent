@@ -256,7 +256,6 @@ def test_process_document_success(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(),
     )
@@ -322,7 +321,6 @@ def test_process_document_initializes_with_canonical_embedding_model_id(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(embedding_model_id="text-embedding-v4"),
     )
@@ -389,7 +387,6 @@ def test_process_document_reuses_existing_collection_embedding_model_before_init
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(embedding_model_id="text-embedding-v4"),
     )
@@ -437,7 +434,6 @@ def test_process_document_init_failure_after_resolve_is_error(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(embedding_model_id="text-embedding-v4"),
     )
@@ -490,7 +486,6 @@ def test_process_document_applies_spreadsheet_safeguards(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/table.xlsx",
         config=IngestionConfig(
             parse_method=ParseMethod.DEFAULT,
@@ -542,7 +537,6 @@ def test_process_document_preserves_stricter_spreadsheet_limits(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/small.csv",
         config=IngestionConfig(
             chunk_strategy=ChunkStrategy.RECURSIVE,
@@ -586,7 +580,6 @@ def test_process_document_uses_async_writes_for_spreadsheets(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/table.xlsx",
         config=IngestionConfig(
             embedding_use_async=False,
@@ -671,7 +664,6 @@ def test_process_document_rejects_oversized_spreadsheet_row(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/table.xlsx",
         config=IngestionConfig(),
     )
@@ -721,7 +713,6 @@ def test_process_document_passes_file_id_to_register_document(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(),
         file_id="file-123",
@@ -756,7 +747,6 @@ def test_process_document_parses_physical_source_not_metadata_path(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/staging/.background-ingest/abc/doc.pdf",
         config=IngestionConfig(),
         metadata_source_path="/uploads/user_1/kb/doc.pdf",
@@ -790,7 +780,6 @@ def test_process_document_skips_embedding_when_no_pending(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(),
     )
@@ -875,7 +864,6 @@ def test_process_document_fails_without_success_when_the_commit_fails(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(),
     )
@@ -901,7 +889,6 @@ def test_process_document_commit_failure_keeps_completed_steps_in_order(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(),
     )
@@ -986,6 +973,35 @@ def test_process_document_embedding_stage_failure_reports_exact_state(
     assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.FAILED.value
 
 
+@pytest.mark.parametrize(
+    ("is_admin", "expected_status", "expected_failed_step"),
+    [
+        (True, "partial", "read_chunks_for_embedding"),
+        (False, "success", None),
+    ],
+)
+def test_process_document_requires_owner_only_for_admin_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    is_admin: bool,
+    expected_status: str,
+    expected_failed_step: str | None,
+) -> None:
+    """An ownerless non-admin run reads nothing, so only admin scope is rejected."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+        user_id=None,
+        is_admin=is_admin,
+    )
+
+    assert result.status == expected_status
+    assert result.failed_step == expected_failed_step
+
+
 def test_process_document_failed_before_register(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1011,7 +1027,6 @@ def test_process_document_failed_before_register(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(parse_method="deepdoc"),
     )
@@ -1037,7 +1052,6 @@ def test_process_document_with_async_embedding(monkeypatch: pytest.MonkeyPatch) 
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=config,
     )
@@ -1078,7 +1092,6 @@ def test_process_document_with_batch_embedding(monkeypatch: pytest.MonkeyPatch) 
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=config,
     )
@@ -1124,7 +1137,6 @@ def test_process_document_streams_batches(monkeypatch: pytest.MonkeyPatch) -> No
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.pdf",
         config=IngestionConfig(embedding_batch_size=1),
     )
@@ -1189,7 +1201,6 @@ def test_process_document_rejects_path_traversal(
     for malicious_path in malicious_paths:
         result = document_ingestion.process_document(
             collection="demo",
-            user_id=1,
             source_path=malicious_path,
             config=IngestionConfig(),
         )
@@ -1283,7 +1294,6 @@ def test_process_document_rejects_path_traversal_with_existing_file(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path=malicious_path,
         config=IngestionConfig(parse_method="default"),
     )
@@ -1334,7 +1344,6 @@ def test_process_document_rejects_absolute_paths_outside_allowed_dir(
     for abs_path in absolute_paths:
         result = document_ingestion.process_document(
             collection="demo",
-            user_id=1,
             source_path=abs_path,
             config=IngestionConfig(),
         )
@@ -1440,7 +1449,6 @@ def _run_batch_embedding(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.md",
         config=IngestionConfig(
             embedding_use_async=False,
@@ -1514,7 +1522,6 @@ def test_batch_embedding_retries_transient_failure(
 
     result = document_ingestion.process_document(
         collection="demo",
-        user_id=1,
         source_path="/tmp/doc.md",
         config=IngestionConfig(
             embedding_use_async=False,
@@ -1548,7 +1555,6 @@ def test_process_document_compacts_storage_after_success(
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
         result = document_ingestion.process_document(
             collection="demo",
-            user_id=1,
             source_path="/tmp/doc.pdf",
             config=IngestionConfig(),
         )
@@ -1584,7 +1590,6 @@ def test_process_document_succeeds_when_compaction_fails(
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
         result = document_ingestion.process_document(
             collection="demo",
-            user_id=1,
             source_path="/tmp/doc.pdf",
             config=IngestionConfig(),
         )
@@ -1618,7 +1623,6 @@ def test_process_document_compacts_storage_after_failure(
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
         result = document_ingestion.process_document(
             collection="demo",
-            user_id=1,
             source_path="/tmp/doc.pdf",
             config=IngestionConfig(),
         )
@@ -1663,7 +1667,6 @@ def test_process_document_compaction_covers_vendor_prefixed_model_ids(
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
         result = document_ingestion.process_document(
             collection="demo",
-            user_id=1,
             source_path="/tmp/doc.pdf",
             config=IngestionConfig(),
         )
@@ -1785,7 +1788,6 @@ def _run_metered_batch_embedding(
         try:
             result = document_ingestion.process_document(
                 collection="demo",
-                user_id=1,
                 source_path="/tmp/doc.md",
                 config=IngestionConfig(
                     embedding_use_async=False,

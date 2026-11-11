@@ -156,6 +156,25 @@ def test_embed_document_chunks_forwards_model_id_and_embeds_returned_chunks(
     assert result.pending_count == 1
 
 
+def test_embed_document_chunks_read_step_metadata_counts_chunks_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+
+    def _read(**_: object) -> EmbeddingReadResponse:
+        return EmbeddingReadResponse(chunks=_chunks(2), total_count=5, pending_count=4)
+
+    _install(monkeypatch, _read, events)
+
+    result = _embed(adapter, _cfg(batch_size=10))
+
+    assert result.read_count == 2
+    read_step = document_ingestion._read_chunks_step(result)
+    assert read_step.metadata["total_count"] == 2
+    assert read_step.metadata["pending_count"] == 4
+
+
 def test_embed_document_chunks_second_call_computes_nothing_but_still_commits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -180,9 +199,8 @@ def test_embed_document_chunks_second_call_computes_nothing_but_still_commits(
     assert [event[0] for event in events] == ["write", "commit", "commit"]
 
 
-def test_embed_document_chunks_requires_an_owner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_embed_document_chunks_requires_an_owner_for_admin_reads() -> None:
+    stage = EmbeddingStageResult()
     with pytest.raises(ValueError, match="document owner"):
         embed_document_chunks(
             collection="demo",
@@ -196,7 +214,10 @@ def test_embed_document_chunks_requires_an_owner(
             user_id=None,
             is_admin=True,
             is_spreadsheet=False,
+            result=stage,
         )
+
+    assert stage.current_step == "read_chunks_for_embedding"
 
 
 def test_embed_document_chunks_writes_rows_with_the_given_owner(
@@ -396,7 +417,7 @@ def test_embed_document_chunks_fails_before_commit_when_provider_fails(
     events: List[tuple] = []
 
     def _read(**_: object) -> EmbeddingReadResponse:
-        return _read_response(_chunks(1))
+        return EmbeddingReadResponse(chunks=_chunks(1), total_count=5, pending_count=1)
 
     def _encode(_text: str) -> List[float]:
         raise RuntimeError("provider down")
@@ -405,9 +426,11 @@ def test_embed_document_chunks_fails_before_commit_when_provider_fails(
     _install(monkeypatch, _read, events)
 
     stage = EmbeddingStageResult()
-    with pytest.raises(error, match=match):
+    with pytest.raises(error, match=match) as excinfo:
         _embed(adapter, _cfg(use_async=use_async), result=stage)
 
+    if isinstance(excinfo.value, EmbeddingAdapterError):
+        assert excinfo.value.details["chunk_count"] == 5
     assert stage.current_step == "compute_embeddings"
     assert events == []
 

@@ -143,15 +143,6 @@ def resolve_holder_connector(
     return None
 
 
-def _needs_catalog_lookup(server: MCPServer) -> bool:
-    # The oauth transport and a catalog auth marker decide without the
-    # catalog; only the remaining connectors reach the name test.
-    if server.transport == "oauth":
-        return False
-    auth = server.auth
-    return not (isinstance(auth, dict) and any(k in auth for k in _CATALOG_AUTH_KEYS))
-
-
 def _catalog_classification_keys(
     db: Any, servers: Iterable[MCPServer]
 ) -> frozenset[str]:
@@ -161,7 +152,9 @@ def _catalog_classification_keys(
     read propagates: treating it as an empty catalog would classify catalog
     connectors as custom, and so editable.
     """
-    if not any(_needs_catalog_lookup(server) for server in servers):
+    # Without catalog keys only a connector that reaches the name test is
+    # custom, so the classification itself decides whether the read is needed.
+    if not any(classify_connector_kind(s, frozenset()) == "custom" for s in servers):
         return frozenset()
     keys: set[str] = set()
     for app_id, name in db.query(PublicMCPApp.app_id, PublicMCPApp.name).all():

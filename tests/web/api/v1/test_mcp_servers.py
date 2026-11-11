@@ -686,30 +686,6 @@ def test_list_catalog_lookups_do_not_grow_with_rows(bob, cell):
 
 
 @pytest.mark.parametrize("route", ["list", "detail"])
-def test_catalog_read_failure_fails_the_whole_response(bob, monkeypatch, route):
-    server_id = _seed("plain", owner=bob)
-
-    def failing(_db, _servers):
-        raise OperationalError("SELECT", {}, Exception("boom"))
-
-    monkeypatch.setattr(mcp_server_management, "_catalog_classification_keys", failing)
-
-    if route == "list":
-        resp = client.get("/v1/mcp-servers", headers=bob.headers)
-    else:
-        resp = _get_one(bob, server_id)
-
-    assert resp.status_code == 500, resp.text
-    assert resp.json() == {
-        "error": {
-            "code": "internal_error",
-            "message": _DEFAULT_MESSAGES[V1ErrorCode.INTERNAL_ERROR],
-        }
-    }
-    assert "boom" not in resp.text
-
-
-@pytest.mark.parametrize("route", ["list", "detail"])
 def test_a_failing_catalog_query_fails_the_whole_response(bob, route):
     server_id = _seed("plain", owner=bob)
     engine = get_engine()

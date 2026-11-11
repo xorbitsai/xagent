@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import time
 from contextlib import asynccontextmanager
 from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Dict, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    Optional,
+    TypeVar,
+    cast,
+)
 
 import pyarrow as pa  # type: ignore
 
@@ -201,6 +211,28 @@ async def admitted_context_async(collection: str) -> Context:
     context = copy_context()
     context.run(_admit, collection)
     return context
+
+
+F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
+
+
+def admits_collection(
+    get_name: Callable[..., Optional[str]],
+) -> Callable[[F], F]:
+    """Admit the handler's collection for its whole async call."""
+
+    def decorate(func: F) -> F:
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            name = get_name(*args, **kwargs)
+            if name is None:
+                return await func(*args, **kwargs)
+            async with admitted_async(name):
+                return await func(*args, **kwargs)
+
+        return cast(F, wrapper)
+
+    return decorate
 
 
 def run_in_admitted_context(

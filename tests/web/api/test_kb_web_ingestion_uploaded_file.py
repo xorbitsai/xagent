@@ -2594,3 +2594,30 @@ def test_file_restore_compensation_requires_both_receipts(missing: str) -> None:
             record_snapshot={},
             **receipts,
         )
+
+
+def test_ingest_web_route_resolves_dependencies_and_refuses_frozen_entry(
+    web_test_env,
+) -> None:
+    """FastAPI still resolves form/Depends through the admission decorator."""
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        clear_migration_state,
+        write_migration_state,
+    )
+
+    app, headers, _user, _ = web_test_env
+    client = TestClient(app)
+    write_migration_state("frozen-c1", CollectionMigrationState(state=FROZEN))
+    try:
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={"collection": "frozen-c1", "start_url": "https://example.com"},
+            headers=headers,
+        )
+    finally:
+        clear_migration_state("frozen-c1")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "kb_collection_migrating"

@@ -87,6 +87,29 @@ async def test_explicit_google_web_search_provider_uses_google(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_google_web_search_receives_configured_base_url(monkeypatch):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "google")
+
+    tools = await create_web_tools(
+        ToolConfig(
+            {
+                "workspace": None,
+                "tool_credentials": {
+                    "web_search": {
+                        "api_key": "google-key",
+                        "cse_id": "google-cse-id",
+                        "base_url": "https://search.example.com",
+                    },
+                },
+            }
+        )
+    )
+
+    assert tools[0].name == "web_search"
+    assert tools[0]._base_url == "https://search.example.com"
+
+
+@pytest.mark.asyncio
 async def test_explicit_exa_web_search_provider_uses_exa(monkeypatch):
     monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", "exa")
 

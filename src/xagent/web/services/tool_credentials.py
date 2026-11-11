@@ -163,6 +163,12 @@ TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
             "required": True,
             "label": "Google CSE ID",
         },
+        "base_url": {
+            "secret": False,
+            "env": ["GOOGLE_CSE_BASE_URL"],
+            "required": False,
+            "label": "Base URL",
+        },
     },
 }
 

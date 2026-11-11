@@ -39,10 +39,16 @@ class WebSearchTool(AbstractBaseTool):
     read_only = True  # read-only HTTP search ⇒ concurrency-safe
     """Framework wrapper for the pure web search tool"""
 
-    def __init__(self, api_key: str | None = None, cse_id: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        cse_id: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self._api_key = api_key
         self._cse_id = cse_id
+        self._base_url = base_url
 
     @property
     def name(self) -> str:
@@ -72,7 +78,9 @@ class WebSearchTool(AbstractBaseTool):
         search_args = WebSearchArgs.model_validate(args)
 
         # Create core searcher instance
-        searcher = WebSearchCore(api_key=self._api_key, cse_id=self._cse_id)
+        searcher = WebSearchCore(
+            api_key=self._api_key, cse_id=self._cse_id, base_url=self._base_url
+        )
 
         # Perform search
         results = await searcher.search(

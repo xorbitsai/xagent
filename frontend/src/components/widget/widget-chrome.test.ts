@@ -506,21 +506,49 @@ describe("widget chrome", () => {
     fromIframe("widget_expand")
 
     expect(panelEl()).not.toHaveClass("expanded")
-    expect(postToIframe).toHaveBeenCalledWith(
-      { xagent: true, v: 1, type: "widget_expand_rejected" },
-      HOST,
-    )
+    // The size report follows the rejection; widget_expand_rejected stays for
+    // older iframes and for the resize-to-mobile collapse, which sends only
+    // that message.
+    expect(postToIframe.mock.calls).toEqual([
+      [{ xagent: true, v: 1, type: "widget_expand_rejected" }, HOST],
+      [{ xagent: true, v: 1, type: "widget_expand_state", expanded: false }, HOST],
+    ])
   })
 
-  it("does not tell the iframe to correct itself when widget_expand actually succeeds", () => {
+  it.each([
+    { name: "widget_expand", messages: ["widget_expand"], reports: [true] },
+    { name: "widget_collapse", messages: ["widget_expand", "widget_collapse"], reports: [true, false] },
+  ])("answers $name with the resulting size and nothing else", ({ messages, reports }) => {
     runWidget()
     fabEl()?.click()
     const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
 
-    fromIframe("widget_expand")
+    for (const message of messages) fromIframe(message)
 
-    expect(panelEl()).toHaveClass("expanded")
-    expect(postToIframe).not.toHaveBeenCalled()
+    expect(panelEl()!.classList.contains("expanded")).toBe(reports.at(-1))
+    expect(postToIframe.mock.calls).toEqual(reports.map((expanded) => [
+      { xagent: true, v: 1, type: "widget_expand_state", expanded },
+      HOST,
+    ]))
+  })
+
+  it("ends on the panel's real size when a host open({ expanded: true }) lands between a menu collapse and its arrival", () => {
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    // The menu's collapse click is still in flight when the host page asks for
+    // the expanded size; the report for the host's call reaches the iframe
+    // first and the collapse is applied afterwards.
+    ;(window as unknown as { XagentWidget: { open: (options: unknown) => void } }).XagentWidget.open({ expanded: true })
+    fromIframe("widget_collapse")
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect(postToIframe.mock.calls).toEqual([
+      [{ xagent: true, v: 1, type: "widget_expand_state", expanded: true }, HOST],
+      [{ xagent: true, v: 1, type: "widget_expand_state", expanded: false }, HOST],
+    ])
   })
 
   describe("data-expanded", () => {
@@ -554,6 +582,20 @@ describe("widget chrome", () => {
       fabEl()?.click()
       fabEl()?.click()
       expect(warn.mock.calls).toEqual(warns ? [[W_BAD_DATA_EXPANDED]] : [])
+    })
+
+    it("does not try again on a later open once a mobile first open spent it", () => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 })
+      const postToIframe = runExpanded("true")
+      fabEl()?.click()
+      fabEl()?.click()
+
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 })
+      fabEl()?.click()
+
+      expect(panelEl()).toHaveClass("open")
+      expect(panelEl()).not.toHaveClass("expanded")
+      expect(postToIframe.mock.calls).toEqual([[expandState(false), HOST]])
     })
 
     it("applies only to the first open of the page view", () => {
@@ -604,6 +646,19 @@ describe("widget chrome", () => {
     expect(panelEl()).toHaveClass("xagent-widget-chrome-ready")
     expect(postToIframe.mock.calls).toEqual([
       [{ xagent: true, v: 1, type: "widget_expand_state", expanded }, HOST],
+    ])
+  })
+
+  it("answers widget_chrome_ready with the size an open({ expanded: true }) set before the iframe loaded", () => {
+    runWidget()
+    ;(window as unknown as { XagentWidget: { open: (options: unknown) => void } }).XagentWidget.open({ expanded: true })
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("widget_chrome_ready")
+
+    expect(panelEl()).toHaveClass("expanded")
+    expect(postToIframe.mock.calls).toEqual([
+      [{ xagent: true, v: 1, type: "widget_expand_state", expanded: true }, HOST],
     ])
   })
 

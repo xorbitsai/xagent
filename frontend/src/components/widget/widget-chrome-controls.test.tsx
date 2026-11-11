@@ -289,6 +289,15 @@ describe("WidgetChromeControls", () => {
       return screen.getByRole("menuitem")
     }
 
+    it.each([true, false])("posts nothing back to widget.js on expanded: %s", (expanded) => {
+      render(<WidgetChromeControls />)
+      postMessageSpy.mockClear()
+
+      hostState({ expanded })
+
+      expect(postMessageSpy).not.toHaveBeenCalled()
+    })
+
     it.each([
       { expanded: true, label: "widgetChat.collapseWindow", icon: "collapse" },
       { expanded: false, label: "widgetChat.expandWindow", icon: "expand" },

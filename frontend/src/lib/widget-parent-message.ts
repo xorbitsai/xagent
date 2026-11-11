@@ -8,7 +8,8 @@
 // on mount/unmount so widget.js knows whether the iframe currently has its
 // own close control -- see the mobile FAB-hiding guard in widget.js. widget.js
 // answers each widget_chrome_ready with the panel's current size
-// (widget_expand_state), so a menu that mounts or remounts starts out right.
+// (widget_expand_state), so a menu that mounts or remounts starts out right,
+// and reports the size again after every widget_expand/widget_collapse.
 export type WidgetParentMessageType =
   | "widget_close"
   | "widget_chrome_ready"
@@ -72,9 +73,10 @@ export function requestPromptContext(
 
 // The other direction: widget.js can reject a widget_expand (its own mobile
 // guard rejects it) and needs to correct the iframe's optimistic guess about
-// its own state. It also reports the panel size the host page set, or the
-// current size in reply to widget_chrome_ready, as widget_expand_state; that
-// message carries a value, so listenForWidgetExpandState below handles it.
+// its own state. It also reports the panel's size after every size request
+// (the host page's or the menu's own) and in reply to widget_chrome_ready, as
+// widget_expand_state; that message carries a value, so
+// listenForWidgetExpandState below handles it.
 // prompt_context replies go through requestPromptContext instead.
 // event.source, not origin, is the check here:
 // the embedding page is an arbitrary third-party origin the iframe can't

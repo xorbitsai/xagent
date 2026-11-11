@@ -1116,12 +1116,11 @@
   // Read on the first open (not at load), so a host SPA can still set the
   // attribute before the visitor first opens the chat. Only "true" (trimmed,
   // any case) expands; a missing, empty or "false" value quietly does not.
-  var dataExpandedWarned = false;
+  // Called once, from the first open only, so it warns at most once.
   function readDataExpanded() {
     var raw = (scriptTag.getAttribute('data-expanded') || '').trim().toLowerCase();
     if (raw === 'true') return true;
-    if (raw && raw !== 'false' && !dataExpandedWarned) {
-      dataExpandedWarned = true;
+    if (raw && raw !== 'false') {
       console.warn('Xagent Widget: data-expanded must be "true" or "false"; ignoring it.');
     }
     return false;
@@ -1201,9 +1200,11 @@
     return null;
   }
 
-  // Tells the iframe's menu the panel's actual size. Only sent after a size
-  // change the host page asked for, and in reply to widget_chrome_ready; the
-  // iframe's own expand/collapse clicks already know their result.
+  // Tells the iframe's menu the panel's actual size. Sent after every size
+  // request (the host page's and the menu's own widget_expand/widget_collapse)
+  // and in reply to every widget_chrome_ready. Messages to one window arrive
+  // in the order they were posted, so the iframe always ends on the panel's
+  // last actual size.
   function postExpandState() {
     if (!torndown && iframe.contentWindow) {
       iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_state', expanded: isExpanded }, host);
@@ -1282,8 +1283,10 @@
       if (!expandPanel()) {
         iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
       }
+      postExpandState();
     } else if (data.type === 'widget_collapse') {
       collapsePanel();
+      postExpandState();
     } else if (data.type === 'prompt_context_request') {
       // Only the guest channel filters unsigned values; the signed Session
       // path lands later, so Session mode stays silent.

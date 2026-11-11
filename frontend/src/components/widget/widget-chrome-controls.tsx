@@ -39,12 +39,15 @@ interface WidgetChromeControlsProps {
     label: string
     onClick: () => void
   }
-  // Expand/collapse state is owned here (uncontrolled) by default, which is
-  // fine as long as this component's own mount lifetime matches the panel's.
-  // Session mode's header can remount independently of the panel (its
-  // conversation content swaps to an error subtree on reconnect), which would
-  // silently reset this back to false under the panel's back; passing both
-  // props lets that caller lift the state to somewhere that doesn't unmount.
+  // Expand/collapse state is owned here (uncontrolled) by default. Session
+  // mode's header can remount independently of the panel (reconnect swaps its
+  // content to an error subtree); widget.js answers each remount's
+  // widget_chrome_ready with the current size, but until that reply lands, and
+  // with a widget.js older than that reply, a fresh mount would show the
+  // collapsed label on an expanded panel. Passing both props lets that caller
+  // keep the state somewhere that doesn't unmount. onExpandedChange is called
+  // for the visitor's own clicks and for every size widget.js reports
+  // (widget_expand_state, widget_expand_rejected).
   expanded?: boolean
   onExpandedChange?: (expanded: boolean) => void
 }
@@ -122,15 +125,18 @@ export function WidgetChromeControls({
     // mobile guard rejects the widget_expand that caused it -- otherwise the
     // menu keeps reading "Collapse window" with nothing actually expanded,
     // and the next click (a no-op collapse from here) needs a second click
-    // after an eventual desktop-width resize to actually expand.
+    // after an eventual desktop-width resize to actually expand. Kept beside
+    // the widget_expand_state listener below: an older widget.js sends only
+    // this message, and widget.js's resize-to-mobile collapse still does.
     listenForWidgetHostMessage("widget_expand_rejected", () => setIsExpanded(false))
   ), [setIsExpanded])
 
   useEffect(() => (
-    // The host page can also size the panel itself (XagentWidget.open({
-    // expanded }) or data-expanded), and widget.js re-sends the current size
-    // whenever this component mounts (in reply to widget_chrome_ready above),
-    // so the menu follows the panel's actual size rather than its own guess.
+    // widget.js reports the panel's actual size after every size request,
+    // including this menu's own widget_expand/widget_collapse and the host
+    // page's XagentWidget.open({ expanded }) / data-expanded, and in reply to
+    // widget_chrome_ready when this component mounts, so the menu follows the
+    // panel's actual size rather than its own guess.
     listenForWidgetExpandState((expanded) => setIsExpanded(expanded))
   ), [setIsExpanded])
 
@@ -146,15 +152,13 @@ export function WidgetChromeControls({
 
   const handleToggleExpand = () => {
     setIsMenuOpen(false)
-    // Optimistic: widget.js owns the actual panel size and doesn't confirm a
-    // click back, but this is the same origin/deployment on both sides of the
-    // postMessage, not an untrusted round-trip. The only other things that
-    // change the size are widget.js's mobile guard and the host page's own
-    // XagentWidget.open() / data-expanded; widget.js corrects this state for
-    // those through widget_expand_rejected and widget_expand_state (the two
-    // listeners above). The postMessage call is a side effect, so it belongs
-    // here in the click handler, not inside setIsExpanded's updater (React
-    // may invoke that updater more than once, e.g. under StrictMode).
+    // Optimistic so the menu responds immediately: widget.js owns the actual
+    // panel size and reports it back after every click (widget_expand_state,
+    // plus widget_expand_rejected when its mobile guard refuses an expand),
+    // which the two listeners above apply. The postMessage call is a side
+    // effect, so it belongs here in the click handler, not inside
+    // setIsExpanded's updater (React may invoke that updater more than once,
+    // e.g. under StrictMode).
     const next = !isExpanded
     setIsExpanded(next)
     postToParentWidget(next ? "widget_expand" : "widget_collapse")

@@ -26,7 +26,6 @@ from xagent.core.tools.core.RAG_tools.management.migration_state import (
     IDLE,
     MIGRATION_TABLE,
     CollectionMigrationState,
-    admitted,
     admitted_async,
     admitted_context_async,
     clear_migration_state,
@@ -387,8 +386,9 @@ async def test_rename_collection_moves_migration_row() -> None:
 # --- Single admission per operation -----------------------------------------
 
 
-def test_admitted_scope_suppresses_nested_check_and_does_not_leak() -> None:
-    with admitted("kb"):
+@pytest.mark.asyncio
+async def test_admitted_scope_suppresses_nested_check_and_does_not_leak() -> None:
+    async with admitted_async("kb"):
         _freeze("kb")
         ensure_collection_writable("kb")
 

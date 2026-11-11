@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 import pyarrow as pa  # type: ignore
 
@@ -178,20 +178,6 @@ def _admit(collection: str) -> None:
 
 def _is_admitted(collection: str) -> bool:
     return collection in _ADMITTED.get()
-
-
-@contextmanager
-def admitted(collection: str) -> Iterator[None]:
-    """Check the freeze once per operation; nested checks for it are no-ops."""
-    if _is_admitted(collection):
-        yield
-        return
-    ensure_collection_writable(collection)
-    token = _ADMITTED.set(_ADMITTED.get() | {collection})
-    try:
-        yield
-    finally:
-        _ADMITTED.reset(token)
 
 
 @asynccontextmanager

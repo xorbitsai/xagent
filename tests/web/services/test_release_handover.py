@@ -286,7 +286,9 @@ def _set(factory: sessionmaker, task_id: int, **fields: Any) -> None:
 # -- begin ------------------------------------------------------------------
 
 
-def test_begin_stages_one_pause_per_run_and_runner_and_is_idempotent(factory):
+def test_begin_stages_one_pause_per_run_and_runner_and_is_idempotent(
+    factory, checkpoint
+):
     with factory() as db:
         mine = _task(db)
         other_runner = _task(db, runner_id="runner-elsewhere")
@@ -305,7 +307,7 @@ def test_begin_stages_one_pause_per_run_and_runner_and_is_idempotent(factory):
     assert len(_commands(factory, mine)) == 1
 
 
-def test_begin_covers_every_runner_of_a_pool(factory):
+def test_begin_covers_every_runner_of_a_pool(factory, checkpoint):
     with factory() as db:
         ids = [_task(db, runner_id=f"worker-{n}") for n in range(3)]
         db.commit()
@@ -356,7 +358,7 @@ def test_begin_leaves_runs_the_successor_would_not_resume_to_the_drain(
     ids=["marked", "false", "not-a-bool", "unmarked"],
 )
 def test_begin_hands_over_a_channel_task_only_when_its_host_marked_the_reply(
-    factory, monkeypatch, agent_config, staged
+    factory, checkpoint, monkeypatch, agent_config, staged
 ):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     with factory() as db:
@@ -408,7 +410,7 @@ _MARK = {HANDOVER_DELIVERY_AGENT_CONFIG_KEY: True}
     ],
 )
 def test_a_marked_external_channel_task_is_handed_over_and_nothing_else_changes(
-    factory, monkeypatch, fields, staged
+    factory, checkpoint, monkeypatch, fields, staged
 ):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     with factory() as db:
@@ -417,6 +419,91 @@ def test_a_marked_external_channel_task_is_handed_over_and_nothing_else_changes(
 
     assert begin_handover_sync(RELEASE, {RUNNER}).staged == staged
     assert len(_commands(factory, task_id)) == staged
+
+
+@pytest.mark.parametrize(
+    ("verdict", "tool_in_flight"),
+    [
+        (CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT, False),
+        (CheckpointRecoveryVerdict.RECOVERABLE, True),
+        (CheckpointRecoveryVerdict.INDETERMINATE, False),
+        (CheckpointRecoveryVerdict.NOT_RECOVERABLE, False),
+    ],
+    ids=["unknown-tool-effect", "legacy-tool-in-flight", "unreadable", "no-checkpoint"],
+)
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"channel": True, "source": "external", "agent_config": _MARK}],
+    ids=["normal", "marked-external-channel"],
+)
+def test_begin_keeps_a_run_with_a_tool_in_flight_or_no_usable_checkpoint(
+    factory, checkpoint, monkeypatch, verdict, tool_in_flight, fields
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    checkpoint["verdict"] = verdict
+    checkpoint["tool_in_flight"] = tool_in_flight
+    with factory() as db:
+        task_id = _task(db, **fields)
+        db.commit()
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (0, 1)
+    assert _commands(factory, task_id) == []
+    with factory() as db:
+        assert db.get(Task, task_id).control_state == "running"
+
+
+def test_begin_still_hands_over_a_run_in_an_llm_call_with_no_tool_started(
+    factory, checkpoint
+):
+    # RECOVERABLE with no tool call that may have started: the common case.
+    with factory() as db:
+        mid_llm = _task(db)
+        db.commit()
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (1, 0)
+    assert [c.kind for c in _commands(factory, mid_llm)] == ["pause"]
+
+
+def test_begin_keeps_only_the_run_with_a_tool_in_flight(factory, monkeypatch):
+    with factory() as db:
+        busy = _task(db)
+        idle = _task(db)
+        db.commit()
+    monkeypatch.setattr(
+        release_handover,
+        "resolve_checkpoint_recovery_with_data",
+        lambda _db, candidate: CheckpointRecoveryResolution(
+            CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+            if candidate.task_id == busy
+            else CheckpointRecoveryVerdict.RECOVERABLE
+        ),
+    )
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (1, 1)
+    assert _commands(factory, busy) == []
+    assert len(_commands(factory, idle)) == 1
+
+
+def test_begin_keeps_a_run_whose_checkpoint_read_raises(factory, monkeypatch):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+
+    def boom(_db, _candidate):
+        raise RuntimeError("checkpoint read failed")
+
+    monkeypatch.setattr(release_handover, "resolve_checkpoint_recovery_with_data", boom)
+
+    report = begin_handover_sync(RELEASE, {RUNNER})
+
+    assert (report.staged, report.kept) == (0, 1)
+    assert _commands(factory, task_id) == []
 
 
 def test_a_marked_external_channel_task_needs_shared_execution(factory, monkeypatch):
@@ -471,7 +558,9 @@ def test_begin_stages_nothing_when_automatic_resume_is_off(factory, monkeypatch)
     assert _commands(factory, task_id) == []
 
 
-def test_one_task_that_cannot_be_staged_does_not_fail_the_others(factory, monkeypatch):
+def test_one_task_that_cannot_be_staged_does_not_fail_the_others(
+    factory, checkpoint, monkeypatch
+):
     with factory() as db:
         bad = _task(db)
         good = _task(db)
@@ -636,12 +725,14 @@ def test_a_run_that_moved_on_is_not_recorded(factory, checkpoint):
     assert _row(factory, task_id) is None
 
 
-def test_a_legacy_checkpoint_with_a_started_tool_call_rests_manual(factory, checkpoint):
-    checkpoint["tool_in_flight"] = True
+def test_a_tool_started_after_the_stage_rests_manual(factory, checkpoint):
+    # The race begin cannot close: the run had no tool in flight when the PAUSE
+    # was staged, and its checkpoint shows a started tool call when it rests.
     with factory() as db:
         task_id = _task(db)
         db.commit()
     _handed_over(factory, task_id)
+    checkpoint["tool_in_flight"] = True
 
     assert settle_handover_sync(RELEASE).recorded == 1
 
@@ -1000,7 +1091,9 @@ def _owns(factory: sessionmaker, task_id: int) -> bool:
         return handover_pause_owns_run(db, task_id, RUN)
 
 
-def test_the_stage_snapshots_the_state_version_the_ownership_is_anchored_on(factory):
+def test_the_stage_snapshots_the_state_version_the_ownership_is_anchored_on(
+    factory, checkpoint
+):
     with factory() as db:
         task_id = _task(db, state_version=11)
         db.commit()
@@ -1147,7 +1240,9 @@ def test_the_sweeper_does_not_let_user_paused_tasks_starve_newer_handovers(
     assert all(_row(factory, t) is None for t in users)
 
 
-def test_begin_reads_and_stages_each_run_inside_its_own_savepoint(factory, monkeypatch):
+def test_begin_reads_and_stages_each_run_inside_its_own_savepoint(
+    factory, checkpoint, monkeypatch
+):
     # PostgreSQL aborts the transaction on a failed statement: every read of one
     # run's turn must be inside the SAVEPOINT that is rolled back, or the later
     # runs and the final commit are lost with it.
@@ -1247,9 +1342,9 @@ def test_a_handover_that_lands_manual_ends_the_trigger_run_and_a_scheduled_one_k
     manual_run = _trigger_run(factory, manual)
     _handed_over(factory, scheduled, "rel-1")
     assert settle_handover_sync("rel-1").recorded == 1
+    _handed_over(factory, manual, "rel-2")
     # No resumable checkpoint for the second run: its row is ``manual``.
     checkpoint["verdict"] = CheckpointRecoveryVerdict.NOT_RECOVERABLE
-    _handed_over(factory, manual, "rel-2")
     assert settle_handover_sync("rel-2").recorded == 0
 
     assert _row(factory, manual).state == "manual"
@@ -1283,7 +1378,7 @@ def test_a_handover_whose_resume_window_is_spent_is_reported_stopped_not_recorde
 
 
 def test_a_run_pause_requested_one_step_after_the_stage_is_owned_until_it_moves_on(
-    factory,
+    factory, checkpoint
 ):
     # The window settlement and lease recovery read: RUNNING, pause requested.
     with factory() as db:

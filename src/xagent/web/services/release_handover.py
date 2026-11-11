@@ -4,26 +4,34 @@ A host that replaces this process on purpose (the SaaS thin ingress Gate)
 drains up to a deadline. Runs that are still executing at the deadline are
 not re-run from a checkpoint: they stop through the run's own pause, at the
 step boundary it defines and in command order, and the successor resumes
-them. That pause interrupts the work in flight (see below), so this is a
-pause between steps, not a promise that nothing is cancelled.
+them. That pause interrupts the work in flight (see below), so only a run
+with nothing it cannot safely repeat is paused: a run with a tool call in
+flight or unconfirmed tool effects is not handed over and keeps draining.
 
 This module is the engine half and adds no new execution path:
 
 - :func:`begin_handover_sync` stages one ordinary durable PAUSE command for
   each RUNNING run owned by the given runners that
   :func:`~.task_auto_recovery.shutdown_handoff_eligible` accepts (the one
-  predicate for it: status-only sdk tasks and channel tasks are not, and only
-  drain). The lease owner applies it exactly as it applies a user's pause:
-  the command completes when the pause is *requested*, and the run rests
-  ``PAUSED`` at its next step boundary with its checkpoint intact. The
-  pause is the run's ordinary one: ``request_interrupt`` cancels the LLM call
-  and the tool call that are in flight. A run whose checkpoint then shows a
-  tool call that may have started is **not** handed over: it rests ``PAUSED``
-  with a ``manual`` row (``unknown_tool_effect``, or ``tool_in_flight`` for a
-  legacy checkpoint) for its user and is never resumed automatically. This
-  is narrower than a pause "between tool calls": a running tool is
-  interrupted, not waited for, and the pause is not deferred until none is
-  active.
+  predicate for it: status-only sdk tasks are not, nor are channel tasks
+  unless their host marked the reply for delivery, and they only drain) and whose checkpoint is ``RECOVERABLE`` with no tool call that may
+  have started (:func:`_checkpoint_allows_handover`, the read lease recovery
+  uses). A run with a tool call in flight or an unconfirmed tool effect, with
+  no resumable checkpoint, or whose checkpoint cannot be read now is counted
+  ``kept`` and drains, like a channel run: pausing it would cancel the tool
+  and leave a ``manual`` row nobody resumes. A run in the middle of an LLM
+  call with no tool started is handed over. The lease owner applies the PAUSE
+  exactly as it applies a user's pause: the command completes when the pause
+  is *requested*, and the run rests ``PAUSED`` at its next step boundary
+  with its checkpoint intact. The pause is the run's ordinary one:
+  ``request_interrupt`` cancels the LLM call (and any tool call) in flight.
+  One race remains: a tool call that starts after the PAUSE was staged is
+  interrupted too, and its checkpoint then rests ``PAUSED`` with a ``manual``
+  row (``unknown_tool_effect``, or ``tool_in_flight`` for a legacy
+  checkpoint) for its user, never resumed automatically
+  (:func:`record_handover_pause_no_commit`). Closing it would need the PAUSE
+  to wait for the step to finish, which is the engine's pause semantics and
+  not changed here.
 - The completed PAUSE command, in the reserved ``release-handover:``
   namespace, is the durable marker that the pause was the platform's
   (:func:`~.task_auto_recovery.handover_pause_owns_run`: the run has not
@@ -47,7 +55,8 @@ This module is the engine half and adds no new execution path:
 Runs whose user already asked for a pause or cancel (queued before or after
 the hand-over, in command order or not) are the user's and are left alone.
 Nothing here times out or queues work; the only work it cancels is what
-``request_interrupt`` cancels in a run it pauses (above).
+``request_interrupt`` cancels in a run it pauses (above): an LLM call, and a
+tool call only in the race above.
 
 Host contract, enforced where it can be:
 
@@ -107,6 +116,7 @@ from .task_command_transport import (
 )
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
+    CheckpointRecoveryVerdict,
     resolve_checkpoint_recovery_with_data,
 )
 from .task_settlement_report import RecordedInterruption
@@ -211,6 +221,35 @@ def _person_stop_queued(db: Session, task_id: int, run_id: str) -> bool:
     )
 
 
+def _checkpoint_allows_handover(db: Session, task_id: int) -> bool:
+    """Whether the run's checkpoint shows it can be handed over right now.
+
+    The read lease recovery and the settle step use
+    (``resolve_checkpoint_recovery_with_data``), asked before the PAUSE is
+    staged. Only a ``RECOVERABLE`` checkpoint with no tool call that may have
+    started qualifies: a run in the middle of an LLM call, with no tool
+    started, is recoverable and is handed over. Anything else stays with the
+    drain, because pausing it would only cancel the work in flight and leave
+    a ``manual`` row nobody resumes: a checkpoint to resume from does not
+    exist (``NOT_RECOVERABLE``), a tool call is in flight or its effect is
+    unconfirmed (``UNKNOWN_TOOL_EFFECT``, or a legacy checkpoint
+    :func:`~.task_auto_recovery.resolution_tool_call_in_flight` flags), or
+    the checkpoint cannot be read now (``INDETERMINATE``). A read that
+    raises propagates: the caller's SAVEPOINT rolls back and the run is kept.
+    Kept apart from ``shutdown_handoff_eligible``, which the orchestrator's
+    shutdown path shares and which judges the task, not its checkpoint.
+    """
+
+    task = db.get(Task, task_id)
+    if task is None or task.status != TaskStatus.RUNNING or task.run_id is None:
+        return False
+    resolution = resolve_checkpoint_recovery_with_data(db, _settlement_candidate(task))
+    return (
+        resolution.verdict is CheckpointRecoveryVerdict.RECOVERABLE
+        and not resolution_tool_call_in_flight(resolution)
+    )
+
+
 def begin_handover_sync(
     release_id: str, runner_ids: frozenset[str] | set[str] | list[str]
 ) -> HandoverReport:
@@ -219,7 +258,9 @@ def begin_handover_sync(
     Safe to repeat (the host calls it while it waits): a run that already has
     this release's command is not staged twice. A run whose staging fails
     stays on the drain and the others are still staged. A run whose user has
-    a pause or cancel queued is left to that user.
+    a pause or cancel queued is left to that user, and so is a run whose
+    checkpoint shows a tool call in flight or cannot be read (see
+    :func:`_checkpoint_allows_handover`).
 
     The PAUSE carries the task owner as its actor, like the sweeper's RESUME:
     executing a command needs a real actor. Staging snapshots the run's
@@ -284,9 +325,12 @@ def begin_handover_sync(
                         control_state != TaskControlState.RUNNING.value
                         or _person_stop_queued(db, task_id, run_id)
                         or not shutdown_handoff_eligible(db, task_id)
+                        or not _checkpoint_allows_handover(db, task_id)
                     ):
-                        # A pause (the user's) already moves it, or it is not a
-                        # run the successor would resume: it keeps draining.
+                        # A pause (the user's) already moves it, it is not a
+                        # run the successor would resume, or it has a tool
+                        # call in flight (or no readable checkpoint): it
+                        # keeps draining.
                         left_to_drain = True
                     else:
                         created = int(

@@ -264,13 +264,16 @@ def render_root_request_language_harness(
     request: TopLevelUserRequest,
     pending_response: PendingUserResponse | None,
     output_language: str | None,
+    request_reference: str | None = None,
 ) -> str:
+    """``request_reference`` names where the request text already sits in the
+    prompt; ``None`` means the default "Current user request above" block."""
     return render_request_language_harness(
         request,
         pending_response,
         output_language=output_language,
         request_reference=(
-            "Current user request above"
+            (request_reference or "Current user request above")
             if request.language_text == request.execution_text
             else ""
         ),

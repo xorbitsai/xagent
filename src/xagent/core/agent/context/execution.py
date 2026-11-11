@@ -1195,15 +1195,20 @@ class ExecutionContext:
         system_parts: list[str] = []
         if include_system and self.system_prompt:
             system_parts.append(self.system_prompt)
-        if include_system:
-            system_parts.append(
-                self._system_context(form_answer_continuation_target=form_answer_target)
-            )
 
         visible_messages = [message for message in self.messages if not message.hidden]
         if max_tokens:
             visible_messages = self._truncate_by_tokens(visible_messages, max_tokens)
         visible_messages = self._sanitize_tool_message_pairs(visible_messages)
+        if include_system:
+            system_parts.append(
+                self._system_context(
+                    form_answer_continuation_target=form_answer_target,
+                    request_in_latest_user_message=(
+                        self._request_is_latest_user_message(visible_messages)
+                    ),
+                )
+            )
         latest_pending_message = next(
             (
                 message
@@ -1351,8 +1356,38 @@ class ExecutionContext:
             return request.language_text
         return request.execution_text
 
+    def _request_is_latest_user_message(self, visible_messages: list[Message]) -> bool:
+        """Whether the current request text is sent verbatim as the latest user
+        message of the request being built (so the system block can point at
+        it instead of repeating it).
+
+        True only when the latest user message that will be sent is itself the
+        top-level request: not a waiting-response / form-answer message, not a
+        DAG step message, with string content identical to the request's
+        execution text. Every other shape -- the request message compacted or
+        truncated away, a later answer message after it, a request taken from
+        stored state or ``metadata["task"]``, a DAG step -- keeps the full copy
+        in the system block, because there it may be the only one.
+        """
+        request = top_level_user_request(self)
+        if not self._renders_current_request_block(request):
+            return False
+        latest = next(
+            (m for m in reversed(visible_messages) if m.role == "user"),
+            None,
+        )
+        if latest is None or not isinstance(latest.content, str):
+            return False
+        metadata = latest.metadata if isinstance(latest.metadata, dict) else {}
+        if metadata.get("response_to_waiting_for_user") or metadata.get("dag_step_id"):
+            return False
+        return latest.content.strip() == request.execution_text
+
     def _system_context(
-        self, *, form_answer_continuation_target: Message | None = None
+        self,
+        *,
+        form_answer_continuation_target: Message | None = None,
+        request_in_latest_user_message: bool = False,
     ) -> str:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
@@ -1365,17 +1400,28 @@ class ExecutionContext:
                 request,
                 pending_response,
                 output_language,
+                request_reference=(
+                    "Latest user message" if request_in_latest_user_message else None
+                ),
             )
             form_answer_instruction = (
                 FORM_ANSWER_CONTINUATION_INSTRUCTION
                 if form_answer_continuation_target is not None
                 else ""
             )
+            # The request text is the latest user message of this very call, so
+            # repeating it here would double its tokens on every model call and
+            # put per-turn text into the system prefix, which then never caches.
+            if request_in_latest_user_message:
+                request_block = "Current user request: the latest user message.\n\n"
+                request_ref = "the latest user message"
+            else:
+                request_block = f"Current user request:\n{current_task}\n\n"
+                request_ref = "the current user request above"
             parts.append(
-                "Current user request:\n"
-                f"{current_task}\n\n"
+                f"{request_block}"
                 f"{form_answer_instruction}"
-                "Conversation focus rules: answer the current user request above. "
+                f"Conversation focus rules: answer {request_ref}. "
                 "Earlier user and assistant messages are context only; use them to "
                 "resolve references and preserve continuity, but do not re-answer "
                 "previous requests or repeat previous final answers unless the "

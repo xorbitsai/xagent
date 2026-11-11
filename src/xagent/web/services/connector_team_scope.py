@@ -58,7 +58,6 @@ that declares it is checked; one that does not is not.
 | ``mcp._persist_team_member_mcp_oauth_connect_flow`` | two row locks: ``mcp_servers`` ``FOR UPDATE`` and ``users`` ``FOR SHARE`` | no | ``True`` |
 | ``mcp._mcp_oauth_team_flow_state_error`` | nothing -- the callback preflight takes no lock | no | ``False`` |
 | ``mcp._lock_team_member_mcp_oauth_lifecycle`` | three row locks: ``mcp_servers``, ``users`` and ``mcp_oauth_flow_states`` | yes, the callback committed its flow claim | ``True`` |
-| ``mcp.list_mcp_apps`` | nothing -- the listing takes no lock | no | ``False`` |
 
 ``mcp._teardown_mcp_app_server_locally`` is a helper, not a route: it has no
 route decorator, and its only caller in this repository outside tests is the
@@ -360,6 +359,9 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     hook; the answer must be derived from the same link query as the
     runtime's team_visibility answer.
 
+    The connector listing reads the member set from this same answer through
+    ``member_oauth_mcp_ids_from_answer``, so it asks the hook once.
+
     When the two answers disagree, xagent does not reconcile them: each
     question is answered from the hook that owns it, and whatever that
     hook said is what the caller gets. A connector one hook reports and
@@ -473,6 +475,20 @@ def team_member_oauth_scope(
         visible_mcp_ids=frozenset(answer["mcp"]),
         member_oauth_mcp_ids=frozenset(answer[TEAM_MEMBER_OAUTH_MCP_KEY]),
     )
+
+
+def member_oauth_mcp_ids_from_answer(answer: Any) -> frozenset[int]:
+    """The member-OAuth server ids in a visibility answer already in hand.
+
+    For a caller that has the hook's answer from ``visible_team_connector_ids``
+    and must not ask the hook a second time, so that both sets come from the
+    same answer (the connector listing). It runs the validator
+    ``team_member_oauth_scope`` runs and a malformed answer raises the same
+    ``ValueError``; what that means is left to the caller. Unlike
+    ``team_member_oauth_scope``, it checks an answer the hook gate has already
+    returned, so a failure here does not get the gate's session recovery.
+    """
+    return frozenset(_validate_member_oauth_answer(answer)[TEAM_MEMBER_OAUTH_MCP_KEY])
 
 
 def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
@@ -896,8 +912,9 @@ def _call_connector_hook_gate(
     session_boundary_checked: bool = False,
     **kwargs: Any,
 ) -> _HookResult:
-    """The one door every installed connector hook is called through, and
-    the one place its answer is checked.
+    """The one door every installed connector hook is called through, and,
+    apart from ``member_oauth_mcp_ids_from_answer`` (see there), the one place
+    its answer is checked.
 
     Hooks run on the endpoint's own live session (see
     ``delete_team_connector``'s contract note). A hook whose own statement

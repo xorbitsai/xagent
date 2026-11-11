@@ -35,6 +35,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
+import idna
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -105,6 +106,7 @@ from ..services.mcp_oauth import (
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
     SafeOAuthAsyncHTTPTransport,
+    _canonical_issuer,
     _canonical_resource,
     _same_url,
     create_mcp_oauth_http_client,
@@ -1060,6 +1062,54 @@ def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
             detail="MCP OAuth server requires a URL",
         )
     return auth_config
+
+
+def _team_member_mcp_oauth_definition_refusal(
+    server: MCPServer,
+) -> HTTPException | None:
+    """The 400 the member connect path returns from the stored definition alone.
+
+    These are the refusals ``_connect_team_member_mcp_oauth`` makes from the
+    stored definition before it discovers the provider, other than an invalid
+    ``required_scope``, which every connect path reports on its own while
+    discovering. They read only values stored in clear (the auth
+    ``type`` and ``redirect_uri``, ``transport`` and ``url``), so the connector
+    listing can call this for every team row without decrypting the definition.
+    The route raises what is returned; the listing offers a member no sign-in
+    when anything is returned.
+    """
+    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
+    if auth.get("type") != "mcp_oauth":
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP server is not configured for MCP OAuth",
+        )
+    if server.transport not in HTTP_MCP_TRANSPORTS:
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP OAuth is only supported for HTTP MCP transports",
+        )
+    if not server.url:
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP OAuth server requires a URL",
+        )
+    configured_redirect_uri = (
+        _configured_mcp_oauth_value(None, auth, "redirect_uri")
+        or _default_mcp_oauth_redirect_uri()
+    )
+    if configured_redirect_uri != _default_mcp_oauth_redirect_uri():
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "redirect_uri_not_allowed",
+                "message": (
+                    "Member authorization requires the connector to use this "
+                    "deployment's OAuth callback"
+                ),
+            },
+        )
+    return None
 
 
 def _configured_mcp_oauth_value(
@@ -3533,18 +3583,16 @@ def _is_mcp_oauth_server(server: MCPServer) -> bool:
 
 
 def _mcp_oauth_server_is_actually_connected(
-    server: MCPServer, active_grant_server_ids: set[int]
+    server: MCPServer, *, has_active_grant: bool
 ) -> bool:
     """An mcp_oauth-shaped server's UserMCPServer association can exist before
     the user ever completes consent (see connect_mcp_oauth_app), so its mere
-    presence isn't proof of a working connection. Require an active
-    MCPOAuthGrant too, mirroring the check applied in list_mcp_apps' default
-    branch (F1). The location=local/all branch applies the same active-grant
-    test to a row the caller holds an association for, and asks the runtime
-    grant selector for a team-owned row, which has no association."""
+    presence isn't proof of a working connection: only an active grant counts.
+    Every other shape counts as connected by its association. The caller
+    decides ``has_active_grant``."""
     if not _is_mcp_oauth_server(server):
         return True
-    return cast(int, server.id) in active_grant_server_ids
+    return has_active_grant
 
 
 def _local_mcp_can_attach(
@@ -3563,20 +3611,23 @@ def _local_mcp_can_attach(
     only the mcp_oauth shape; every other shape carries them on the server row
     and its env layers.
 
-    Both credential terms are approximations, loose in one direction only
-    (may say yes where the runtime later says no, never no where it would have
-    succeeded):
+    Both credential terms are approximations:
 
     - ``has_active_grant`` is decided by the caller. For a row the caller holds
       an association for, any active ``MCPOAuthGrant`` counts, while the
       runtime's ``select_mcp_oauth_grants`` also matches resource, issuer,
-      ``resource_owner_key``, ``client_id`` and a scope subset. Auth-config
-      edits do not reconcile grants (#1388); narrowing belongs there, not in a
-      fourth copy of that predicate here. For a team-owned row (no
-      association) the caller asks that selector itself, so the answer is the
-      runtime's.
+      ``resource_owner_key``, ``client_id`` and a scope subset, so it may say
+      yes where the runtime says no. Auth-config edits do not reconcile grants
+      (#1388); narrowing belongs there, not in a fourth copy of that predicate
+      here. For a team-owned row (no association) the caller asks that
+      selector under the caller's default owner key, which is the key the
+      web-chat runtime uses. A task run under an actor policy
+      (``select_mcp_oauth_owner``) may instead use a grant under the actor's
+      owner key, which this check does not look at, so for such a task it can
+      say no where the task would find a grant.
     - The resolver hook is probed for presence, not for this provider and
-      user -- see ``oauth_token_resolver_installed``.
+      user -- see ``oauth_token_resolver_installed``. It may say yes where the
+      runtime says no.
     """
     from ..services.connector_team_scope import connector_visible_to_user
 
@@ -3591,20 +3642,96 @@ def _local_mcp_can_attach(
     return has_active_grant or token_resolver_installed
 
 
+def _require_parsable_mcp_oauth_identifiers(auth: dict[str, Any]) -> None:
+    """Raise ``ValueError`` when the configured OAuth resource or issuer does not parse.
+
+    This is the normalization ``select_mcp_oauth_grants`` applies to those two
+    values before it reads any grant, so the definitions refused here are the
+    ones that selector raises for.
+    """
+    resource = _configured_mcp_oauth_value(None, auth, "resource")
+    if resource:
+        _canonical_resource(resource)
+    issuer = _configured_mcp_oauth_value(None, auth, "issuer")
+    if issuer:
+        _canonical_issuer(issuer)
+
+
+def _display_host(url: str) -> str | None:
+    """The host a request to ``url`` goes to, with any non-default port.
+
+    A non-ASCII host is encoded with the ``idna`` package (IDNA 2008), the way
+    httpx encodes it before connecting. Python's built-in ``idna`` codec is
+    IDNA 2003 and turns ``faß.de`` into a different domain, ``fass.de``, so it
+    is not used. A trailing dot is kept, as ``new URL().host`` and httpx keep
+    it. A URL that does not parse, a port out of range, or a host that cannot
+    be encoded gives ``None``.
+    """
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    if ":" in hostname:
+        host = f"[{hostname}]"
+    elif hostname.isascii():
+        host = hostname
+    else:
+        try:
+            host = idna.encode(hostname).decode("ascii")
+        except UnicodeError:
+            return None
+    default_port = {"http": 80, "ws": 80, "https": 443, "wss": 443}.get(
+        parts.scheme.lower()
+    )
+    if port is not None and port != default_port:
+        host = f"{host}:{port}"
+    return host
+
+
+def _team_member_sign_in_host(server: MCPServer) -> str | None:
+    """The host a member's token goes to after signing in on this team connector.
+
+    ``None`` when the listing must not offer a member sign-in: the member
+    connect path refuses the stored definition (see
+    ``_team_member_mcp_oauth_definition_refusal``), the URL gives no host, or
+    the definition's configured OAuth resource differs from its URL, which the
+    member path refuses after discovery as ``resource_mismatch``. The caller has
+    already checked that the resource and issuer parse.
+    """
+    if _team_member_mcp_oauth_definition_refusal(server) is not None:
+        return None
+    url = str(server.url)
+    host = _display_host(url)
+    if host is None:
+        return None
+    configured_resource = _configured_mcp_oauth_value(
+        None, cast(dict[str, Any], server.auth), "resource"
+    )
+    if configured_resource and _canonical_resource(
+        configured_resource
+    ) != _canonical_resource(url):
+        return None
+    return host
+
+
 def _local_mcp_consent_route_ok(
     server: MCPServer,
     user_mcp: Optional[UserMCPServer],
     *,
-    member_oauth_mcp_ids: Collection[int],
+    member_sign_in_open: bool,
 ) -> bool:
     """Whether POST /api/mcp/{server_id}/oauth/connect would admit this caller.
 
-    Mirrors _mcp_oauth_route_access_or_404 with require_member_oauth=True on
-    the mcp_oauth shape. A caller holding an association row, active or not,
-    takes the association path and needs that row active. A caller holding
-    none needs the team overlay to show the server and open it to member
-    authorization; ``member_oauth_mcp_ids`` is always a subset of the ids the
-    overlay shows, so membership in it answers both. The route also refuses a
+    A caller holding an association row, active or not, takes the association
+    path and needs that row active. A caller holding none is decided by the
+    listing and passed in as ``member_sign_in_open``: the team overlay opens the
+    server to member authorization, the member connect path does not refuse the
+    stored definition, the definition's resource and issuer parse, the URL gives
+    a host, and its configured resource equals its URL. The route also refuses a
     member who starts the flow from a regional site other than the callback's.
     That depends on the request, which a listing does not see, so it is not
     part of this answer.
@@ -3621,14 +3748,14 @@ def _local_mcp_consent_route_ok(
         return False
     if user_mcp is not None:
         return bool(user_mcp.is_active)
-    return int(cast(int, server.id)) in member_oauth_mcp_ids
+    return member_sign_in_open
 
 
 def _local_mcp_can_authorize(
     server: MCPServer,
     user_mcp: Optional[UserMCPServer],
     *,
-    member_oauth_mcp_ids: Collection[int],
+    member_sign_in_open: bool,
     token_resolver_installed: bool,
 ) -> bool:
     """Whether starting the per-server MCP OAuth flow is meaningful (#1347).
@@ -3642,8 +3769,8 @@ def _local_mcp_can_authorize(
     False in three cases: the endpoint's own preconditions fail (see
     ``_local_mcp_consent_route_ok`` -- not the mcp_oauth shape, a deactivated
     association, which needs re-enabling rather than re-authorization, or the
-    caller holds no association and the team overlay does not open the
-    server to member authorization); or a resolver hook supplies this deployment's
+    caller holds no association and the listing does not offer them sign-in);
+    or a resolver hook supplies this deployment's
     tokens out of band, where there is no interactive consent and no identity
     the editor could sign in as, so the trigger would assert "needs
     authorization" against a connector that has no authorization step at all
@@ -3656,7 +3783,7 @@ def _local_mcp_can_authorize(
     if token_resolver_installed:
         return False
     return _local_mcp_consent_route_ok(
-        server, user_mcp, member_oauth_mcp_ids=member_oauth_mcp_ids
+        server, user_mcp, member_sign_in_open=member_sign_in_open
     )
 
 
@@ -3808,7 +3935,10 @@ def list_mcp_apps(
                     server_id is not None
                     and shared_server is not None
                     and not _mcp_oauth_server_is_actually_connected(
-                        shared_server, active_grant_server_ids
+                        shared_server,
+                        has_active_grant=(
+                            cast(int, shared_server.id) in active_grant_server_ids
+                        ),
                     )
                 ):
                     server_id = None
@@ -3909,14 +4039,24 @@ def list_mcp_apps(
         # they always did.
         from ..services.connector_team_scope import (
             connector_visible_to_user,
+            member_oauth_mcp_ids_from_answer,
             visible_team_connector_ids,
         )
 
         team_ids = visible_team_connector_ids(db, cast(int, current_user.id))
-        # Read once for the whole listing, like team_ids above.
-        member_oauth_mcp_ids = team_member_oauth_scope(
-            db, cast(int, current_user.id)
-        ).member_oauth_mcp_ids
+        # The member set only decides whether a team row offers member sign-in,
+        # so a malformed answer withholds that on every row rather than failing
+        # the listing; the connect route validates the same answer and refuses.
+        try:
+            member_oauth_mcp_ids = member_oauth_mcp_ids_from_answer(team_ids)
+        except ValueError as exc:
+            logger.warning(
+                "Listing team MCP connectors without member sign-in, the "
+                "visibility answer is malformed: user_id=%s error=%s",
+                current_user.id,
+                exc,
+            )
+            member_oauth_mcp_ids = frozenset()
 
         # (server, user_mcp) for a personal row; (server, None) for a
         # team-owned connector the user holds no association for. Excluding the
@@ -3976,36 +4116,42 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
-            # A team-owned mcp_oauth row (no association) is connected exactly
-            # when the runtime would find a grant for this caller, so it asks
-            # the same selector; a row the caller holds an association for
-            # keeps reading the active-grant set.
+            # Decided below for a team-owned mcp_oauth row; see
+            # _team_member_sign_in_host. A row the caller holds an association
+            # for reads the active-grant set and is never offered member sign-in.
+            member_sign_in_host: str | None = None
             if user_mcp is None and _is_mcp_oauth_server(server):
+                has_active_grant = False
                 try:
-                    has_active_grant = bool(
-                        select_mcp_oauth_grants(
-                            db,
-                            server_id=cast(int, server.id),
-                            user_id=cast(int, current_user.id),
-                            auth_config=server._decrypt_auth_config(server.auth),
-                            resource_owner_key=_default_resource_owner_key(
-                                cast(int, current_user.id)
-                            ),
-                            allow_team_member_grants=True,
-                        )
+                    _require_parsable_mcp_oauth_identifiers(
+                        cast(dict[str, Any], server.auth)
                     )
+                    # The selector only returns grants in this set.
+                    if cast(int, server.id) in active_grant_server_ids:
+                        has_active_grant = bool(
+                            select_mcp_oauth_grants(
+                                db,
+                                server_id=cast(int, server.id),
+                                user_id=cast(int, current_user.id),
+                                auth_config=server._decrypt_auth_config(server.auth),
+                                resource_owner_key=_default_resource_owner_key(
+                                    cast(int, current_user.id)
+                                ),
+                                allow_team_member_grants=True,
+                                endpoint_url=cast(str | None, server.url),
+                            )
+                        )
                 except ValueError as exc:
-                    # The selector raises ValueError for an OAuth resource or
-                    # issuer that does not parse. One misconfigured connector
-                    # must not fail the whole listing, so this row is listed
-                    # as not connected.
                     logger.warning(
-                        "Listing team MCP OAuth connector as not connected, "
-                        "grant selection failed: server_id=%s error=%s",
+                        "Listing team MCP OAuth connector as not connected and "
+                        "without member sign-in, its OAuth resource or issuer "
+                        "does not parse: server_id=%s error=%s",
                         server.id,
                         type(exc).__name__,
                     )
-                    has_active_grant = False
+                else:
+                    if cast(int, server.id) in member_oauth_mcp_ids:
+                        member_sign_in_host = _team_member_sign_in_host(server)
             else:
                 has_active_grant = cast(int, server.id) in active_grant_server_ids
 
@@ -4020,8 +4166,8 @@ def list_mcp_apps(
                 # doesn't gate on a real grant, so a custom mcp_oauth
                 # server the user abandoned mid-consent must not be
                 # reported connected just because the row exists.
-                "is_connected": (
-                    has_active_grant if _is_mcp_oauth_server(server) else True
+                "is_connected": _mcp_oauth_server_is_actually_connected(
+                    server, has_active_grant=has_active_grant
                 ),
                 "provider": "custom",
                 "category": "Local",
@@ -4038,7 +4184,7 @@ def list_mcp_apps(
                 "can_authorize": _local_mcp_can_authorize(
                     server,
                     user_mcp,
-                    member_oauth_mcp_ids=member_oauth_mcp_ids,
+                    member_sign_in_open=member_sign_in_host is not None,
                     token_resolver_installed=token_resolver_installed,
                 ),
                 "can_configure": _local_mcp_can_configure(user_mcp),
@@ -4053,13 +4199,7 @@ def list_mcp_apps(
             # Connect button never renders), while tagging those rows with a
             # catalog classification would repoint the settings dialog's
             # Configure button away from the custom edit form. The condition is
-            # the one POST /{server_id}/oauth/connect applies to the caller
-            # (_local_mcp_consent_route_ok): an inactive association is
-            # excluded because that route requires an active one -- the server
-            # needs re-enabling, not re-authorization -- and a team-owned
-            # server is included only when the team overlay opens it to member
-            # authorization, since otherwise the route refuses the member and
-            # the advertised flow would dead-end in a failed popup.
+            # in _local_mcp_consent_route_ok.
             #
             # can_authorize above repeats that condition on purpose: this field
             # still answers "which Connect flow does the settings dialog
@@ -4068,31 +4208,15 @@ def list_mcp_apps(
             # supplies the tokens. Keeping them separate is what let the picker
             # stop reading auth_type as an attachability hint (#1347).
             if _local_mcp_consent_route_ok(
-                server, user_mcp, member_oauth_mcp_ids=member_oauth_mcp_ids
+                server, user_mcp, member_sign_in_open=member_sign_in_host is not None
             ):
                 entry["auth_type"] = "mcp_oauth"
 
             # Shown by the settings dialog next to Connect so a member can see
-            # where their token will be sent. Only for team-owned rows: a
-            # personal connector is the caller's own URL.
-            if user_mcp is None and server.url:
-                # Host with any non-default port, as `new URL(url).host` shows
-                # it; the user-info part is dropped. A stored URL that does not
-                # parse leaves the key out instead of failing the whole listing.
-                try:
-                    url_parts = urlsplit(str(server.url))
-                    url_host = url_parts.netloc.rsplit("@", 1)[-1].lower()
-                    default_port = {"http": 80, "ws": 80, "https": 443, "wss": 443}.get(
-                        url_parts.scheme.lower()
-                    )
-                    if url_host.endswith(":"):
-                        url_host = url_host[:-1]
-                    elif default_port is not None and url_parts.port == default_port:
-                        url_host = url_host.rsplit(":", 1)[0]
-                except ValueError:
-                    url_host = ""
-                if url_host:
-                    entry["url_host"] = url_host
+            # where their token will be sent; present exactly on the rows that
+            # offer member sign-in.
+            if member_sign_in_host is not None:
+                entry["url_host"] = member_sign_in_host
 
             results.append(entry)
 
@@ -7462,22 +7586,9 @@ async def _connect_team_member_mcp_oauth(
     """
     user_id = cast(int, current_user.id)
     server_id = cast(int, server.id)
-    auth_config = _get_mcp_oauth_config(server)
-    configured_redirect_uri = (
-        _configured_mcp_oauth_value(None, auth_config, "redirect_uri")
-        or _default_mcp_oauth_redirect_uri()
-    )
-    if configured_redirect_uri != _default_mcp_oauth_redirect_uri():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "redirect_uri_not_allowed",
-                "message": (
-                    "Member authorization requires the connector to use this "
-                    "deployment's OAuth callback"
-                ),
-            },
-        )
+    refusal = _team_member_mcp_oauth_definition_refusal(server)
+    if refusal is not None:
+        raise refusal
     discovered = await _discover_mcp_oauth_connect(server)
     # Taken before the client step: that step may roll the session back, after
     # which ``server`` would reload whatever the row holds by then.

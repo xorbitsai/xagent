@@ -24,15 +24,22 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import mcp as mcp_module
-from xagent.web.api.mcp import list_mcp_apps, mcp_router
+from xagent.web.api.mcp import (
+    MCPOAuthConnectRequest,
+    _display_host,
+    connect_mcp_oauth,
+    list_mcp_apps,
+    mcp_router,
+)
 from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import Base, get_db
@@ -886,7 +893,9 @@ def test_every_listed_entry_carries_all_three_decisions(db_session):
 # --- AC: consent route and connected state for team-owned rows ---------------
 
 
-def _matrix_server(db, owner, member, association: str, shape: str):
+def _matrix_server(
+    db, owner, member, association: str, shape: str, definition: str = "default"
+):
     name = "records" if shape == "mcp_oauth" else "files"
     adder = _add_oauth_server if shape == "mcp_oauth" else _add_stdio_server
     if association in ("active", "inactive"):
@@ -902,6 +911,15 @@ def _matrix_server(db, owner, member, association: str, shape: str):
             team_ids = {int(server.id)}
         if association == "none_visible_open":
             open_ids = {int(server.id)}
+    if definition == "custom_redirect_uri":
+        server.auth = {
+            **server.auth,
+            "redirect_uri": "https://elsewhere.example.com/callback",
+        }
+        db.commit()
+    elif definition == "no_url":
+        server.url = None
+        db.commit()
     _install_visibility(
         {
             int(member.id): {
@@ -911,26 +929,82 @@ def _matrix_server(db, owner, member, association: str, shape: str):
             }
         }
     )
-    return name
+    return name, server
 
 
-@pytest.mark.parametrize("shape", ["mcp_oauth", "stdio"])
-@pytest.mark.parametrize(
-    "association",
-    [
-        "active",
-        "inactive",
+class _ReachedDiscovery(Exception):
+    """Raised by the stubbed discovery step: the route got past every check it
+    makes on the caller and the stored definition."""
+
+
+_MATRIX_CELLS = [
+    pytest.param("active", "mcp_oauth", "default", id="active-mcp_oauth"),
+    pytest.param("active", "stdio", "default", id="active-stdio"),
+    pytest.param("inactive", "mcp_oauth", "default", id="inactive-mcp_oauth"),
+    pytest.param("inactive", "stdio", "default", id="inactive-stdio"),
+    pytest.param("none_visible_open", "mcp_oauth", "default", id="open-mcp_oauth"),
+    pytest.param("none_visible_open", "stdio", "default", id="open-stdio"),
+    pytest.param(
+        "none_visible_not_open", "mcp_oauth", "default", id="not_open-mcp_oauth"
+    ),
+    pytest.param("none_visible_not_open", "stdio", "default", id="not_open-stdio"),
+    pytest.param(
+        "none_not_visible", "mcp_oauth", "default", id="not_visible-mcp_oauth"
+    ),
+    pytest.param("none_not_visible", "stdio", "default", id="not_visible-stdio"),
+    pytest.param(
         "none_visible_open",
+        "mcp_oauth",
+        "custom_redirect_uri",
+        id="open-mcp_oauth-custom_redirect_uri",
+    ),
+    pytest.param(
+        "none_visible_open", "mcp_oauth", "no_url", id="open-mcp_oauth-no_url"
+    ),
+    pytest.param(
         "none_visible_not_open",
-        "none_not_visible",
-    ],
-)
+        "mcp_oauth",
+        "custom_redirect_uri",
+        id="not_open-mcp_oauth-custom_redirect_uri",
+    ),
+    pytest.param(
+        "active",
+        "mcp_oauth",
+        "custom_redirect_uri",
+        id="active-mcp_oauth-custom_redirect_uri",
+    ),
+]
+
+
+@pytest.mark.parametrize("association,shape,definition", _MATRIX_CELLS)
 @pytest.mark.parametrize("hook", ["none", "installed"])
-def test_local_mcp_consent_and_authorize_matrix(db_session, hook, association, shape):
+@pytest.mark.asyncio
+async def test_local_mcp_consent_and_authorize_matrix(
+    db_session, monkeypatch, hook, association, shape, definition
+):
+    """The listing offers sign-in exactly where the real connect route gets
+    past its checks on the caller and the stored definition. The route is the
+    judge: discovery, the first step that talks to the provider, is stubbed to
+    raise a sentinel."""
     db, owner, member = db_session
-    name = _matrix_server(db, owner, member, association, shape)
+    name, server = _matrix_server(db, owner, member, association, shape, definition)
     if hook == "installed":
         _install_token_resolver()
+
+    async def _reached(*_args, **_kwargs):
+        raise _ReachedDiscovery
+
+    monkeypatch.setattr(mcp_module, "_discover_mcp_oauth_for_server", _reached)
+    try:
+        await connect_mcp_oauth(
+            server.id, MCPOAuthConnectRequest(redirect_after="/tools"), member, db
+        )
+    except _ReachedDiscovery:
+        route_admits = True
+    except HTTPException:
+        route_admits = False
+    else:
+        raise AssertionError("the connect route returned without reaching discovery")
 
     entries = [
         a
@@ -939,13 +1013,10 @@ def test_local_mcp_consent_and_authorize_matrix(db_session, hook, association, s
     ]
     if association == "none_not_visible":
         assert entries == []
+        assert route_admits is False
         return
     (entry,) = entries
 
-    route_admits = shape == "mcp_oauth" and association in (
-        "active",
-        "none_visible_open",
-    )
     assert ("auth_type" in entry) is route_admits
     if route_admits:
         assert entry["auth_type"] == "mcp_oauth"
@@ -1000,98 +1071,184 @@ def test_a_team_row_ignores_a_member_grant_under_another_owner_key(db_session):
     assert entry["can_attach"] is False
 
 
-def test_none_visible_resource_mismatch(db_session):
+def _open_to_member(member: User, *servers: MCPServer) -> None:
+    """Show the team rows to the member and open them to member sign-in."""
+    ids = {int(server.id) for server in servers}
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": set(ids),
+                "custom_api": set(),
+                "member_oauth_mcp": set(ids),
+            }
+        }
+    )
+
+
+class _SelectorSpy:
+    """Wraps the real selector, recording each call's kwargs and result."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.calls: list[dict] = []
+        self.results: list[list] = []
+        real = mcp_module.select_mcp_oauth_grants
+
+        def spy(*args, **kwargs):
+            self.calls.append(kwargs)
+            result = real(*args, **kwargs)
+            self.results.append(list(result))
+            return result
+
+        monkeypatch.setattr(mcp_module, "select_mcp_oauth_grants", spy)
+
+
+@pytest.mark.parametrize("change", ["url_only", "url_and_resource"])
+def test_none_visible_resource_mismatch(db_session, change):
     """A member grant issued for a URL the connector no longer has is not one
-    the runtime would use, so the row is not connected and Connect returns."""
+    the runtime would use, so the row is not connected.
+
+    ``url_only`` leaves the configured resource alone, so the configured-
+    resource filter keeps the grant and only the member rule (the grant's
+    resource must equal the connector's current URL) drops it. Because the
+    definition's resource then differs from its URL, the member path refuses
+    after discovery and the row offers no sign-in. ``url_and_resource`` moves
+    both, so the configured-resource filter drops the grant and sign-in stays."""
     db, _owner, member = db_session
     server = _add_oauth_server(db, None)
     _grant(db, server, member)
     server.url = "https://moved.example.com/mcp"
-    server.auth = {**server.auth, "resource": "https://moved.example.com/mcp"}
+    if change == "url_and_resource":
+        server.auth = {**server.auth, "resource": "https://moved.example.com/mcp"}
     db.commit()
-    _install_visibility(
-        {
-            int(member.id): {
-                "mcp": {int(server.id)},
-                "custom_api": set(),
-                "member_oauth_mcp": {int(server.id)},
-            }
-        }
-    )
+    _open_to_member(member, server)
 
     entry = _entry(db, member, "records")
     assert entry["is_connected"] is False
-    assert entry["auth_type"] == "mcp_oauth"
-
-
-def test_none_visible_url_host(db_session):
-    db, owner, member = db_session
-    server = _add_oauth_server(db, None)
-    _install_visibility(
-        {
-            int(member.id): {
-                "mcp": {int(server.id)},
-                "custom_api": set(),
-                "member_oauth_mcp": {int(server.id)},
-            }
-        }
-    )
-    assert _entry(db, member, "records")["url_host"] == "mcp.example.com"
-
-    server.url = "https://user:pw@MCP.example.com:8443/mcp"
-    db.commit()
-    assert _entry(db, member, "records")["url_host"] == "mcp.example.com:8443"
-
-    server.url = "http://[::1]:9000/mcp"
-    db.commit()
-    assert _entry(db, member, "records")["url_host"] == "[::1]:9000"
-
-    for url, host in (
-        ("wss://mcp.example.com:443/mcp", "mcp.example.com"),
-        ("ws://mcp.example.com:80/mcp", "mcp.example.com"),
-        ("https://mcp.example.com:/mcp", "mcp.example.com"),
-        ("https://mcp.example.com:443/mcp", "mcp.example.com"),
-        ("http://mcp.example.com:80/mcp", "mcp.example.com"),
-        ("https://mcp.example.com:80/mcp", "mcp.example.com:80"),
-        ("https://[::1]:443/mcp", "[::1]"),
-    ):
-        server.url = url
-        db.commit()
-        assert _entry(db, member, "records")["url_host"] == host
-
-    # A connector the caller holds an association for is their own URL.
-    _add_oauth_server(db, member, "mine")
-    assert "url_host" not in _entry(db, member, "mine")
+    if change == "url_only":
+        assert "auth_type" not in entry
+        assert "url_host" not in entry
+    else:
+        assert entry["auth_type"] == "mcp_oauth"
+        assert entry["url_host"] == "moved.example.com"
 
 
 @pytest.mark.parametrize(
-    "bad",
-    ["server_url", "auth_resource", "auth_issuer", "url_and_resource"],
+    "url,host",
+    [
+        ("https://mcp.example.com/mcp", "mcp.example.com"),
+        ("https://user:pw@MCP.example.com:8443/mcp", "mcp.example.com:8443"),
+        ("http://[::1]:9000/mcp", "[::1]:9000"),
+        ("https://[::1]:443/mcp", "[::1]"),
+        ("wss://mcp.example.com:443/mcp", "mcp.example.com"),
+        ("ws://mcp.example.com:80/mcp", "mcp.example.com"),
+        ("https://mcp.example.com:/mcp", "mcp.example.com"),
+        ("http://mcp.example.com:80/mcp", "mcp.example.com"),
+        ("https://mcp.example.com:80/mcp", "mcp.example.com:80"),
+        ("https://faß.de/mcp", "xn--fa-hia.de"),
+        ("https://Bücher.example/mcp", "xn--bcher-kva.example"),
+        ("https://example.com./mcp", "example.com."),
+        ("foo://host:99999/mcp", None),
+        ("https://mcp.example.com:99999/mcp", None),
+        ("http://[bad/mcp", None),
+        ("https:///mcp", None),
+        ("mcp.example.com", None),
+        ("https://ﬁ.example/", None),
+    ],
+)
+def test_display_host(url, host):
+    assert _display_host(url) == host
+
+
+@pytest.mark.parametrize("url", ["https://faß.de/mcp", "https://Bücher.example/mcp"])
+def test_display_host_matches_the_http_client(url):
+    assert httpx.URL(url).raw_host.decode("ascii") == _display_host(url)
+
+
+def _add_bearer_server(db, name: str = "bearer-api") -> MCPServer:
+    """A team-owned non-mcp_oauth server that has a URL."""
+    server = MCPServer.from_config(
+        {
+            "name": name,
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://api.example.com/mcp",
+            "auth": {"type": "bearer", "bearer_token": "x"},
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    return server
+
+
+def test_url_host_only_on_rows_offering_member_sign_in(db_session):
+    db, owner, member = db_session
+    open_row = _add_oauth_server(db, None, "open")
+    closed_row = _add_oauth_server(db, None, "closed")
+    bearer_row = _add_bearer_server(db)
+    _add_oauth_server(db, member, "mine")
+    idn_row = _add_oauth_server(db, None, "idn")
+    idn_row.url = "https://faß.de/mcp"
+    idn_row.auth = {**idn_row.auth, "resource": "https://faß.de/mcp"}
+    db.commit()
+    _install_visibility(
+        {
+            int(member.id): {
+                "mcp": {
+                    int(open_row.id),
+                    int(closed_row.id),
+                    int(bearer_row.id),
+                    int(idn_row.id),
+                },
+                "custom_api": set(),
+                "member_oauth_mcp": {
+                    int(open_row.id),
+                    int(bearer_row.id),
+                    int(idn_row.id),
+                },
+            }
+        }
+    )
+
+    assert _entry(db, member, "open")["url_host"] == "mcp.example.com"
+    assert "url_host" not in _entry(db, member, "closed")
+    bearer = _entry(db, member, "bearer-api")
+    assert "url_host" not in bearer
+    assert "auth_type" not in bearer
+    # The caller's own connector: the URL is theirs.
+    assert "url_host" not in _entry(db, member, "mine")
+    assert _entry(db, member, "idn")["url_host"] == "xn--fa-hia.de"
+
+
+@pytest.mark.parametrize(
+    "bad,with_grant",
+    [
+        pytest.param("server_url", True, id="server_url-grant"),
+        pytest.param("auth_resource", True, id="auth_resource-grant"),
+        pytest.param("auth_resource", False, id="auth_resource-no_grant"),
+        pytest.param("auth_issuer", True, id="auth_issuer-grant"),
+        pytest.param("auth_issuer", False, id="auth_issuer-no_grant"),
+    ],
 )
 def test_a_team_row_with_unparsable_auth_values_does_not_break_the_list(
-    db_session, bad, caplog
+    db_session, monkeypatch, bad, with_grant, caplog
 ):
     db, _owner, member = db_session
     server = _add_oauth_server(db, None)
     _add_stdio_server(db, member, "files")
+    if with_grant:
+        _grant(db, server, member)
     auth = dict(server.auth)
-    if bad in ("server_url", "url_and_resource"):
+    if bad == "server_url":
         server.url = "http://[bad/mcp"
-    if bad in ("auth_resource", "url_and_resource"):
+    if bad == "auth_resource":
         auth["resource"] = "http://[bad/mcp"
     if bad == "auth_issuer":
         auth["issuer"] = "http://[bad"
     server.auth = auth
     db.commit()
-    _install_visibility(
-        {
-            int(member.id): {
-                "mcp": {int(server.id)},
-                "custom_api": set(),
-                "member_oauth_mcp": {int(server.id)},
-            }
-        }
-    )
+    _open_to_member(member, server)
+    spy = _SelectorSpy(monkeypatch)
 
     app = FastAPI()
     app.include_router(mcp_router)
@@ -1107,27 +1264,29 @@ def test_a_team_row_with_unparsable_auth_values_does_not_break_the_list(
     files = next(a for a in listed if a["id"] == "files")
     assert entry["is_connected"] is False
     assert entry["can_attach"] is False
+    assert entry["can_authorize"] is False
+    assert "auth_type" not in entry
+    assert "url_host" not in entry
     assert files["is_connected"] is True
     assert files["can_attach"] is True
-    if bad in ("server_url", "url_and_resource"):
-        assert "url_host" not in entry
-    else:
-        assert entry["url_host"] == "mcp.example.com"
 
-    # The selector itself raises only for an unparsable resource or issuer;
-    # an unparsable server URL matches no grant without raising.
     warnings = [
         r
         for r in caplog.records
-        if r.levelno == logging.WARNING and "grant selection failed" in r.message
+        if r.levelno == logging.WARNING and "does not parse" in r.message
     ]
     if bad == "server_url":
+        # An unparsable server URL matches no grant without raising: the
+        # selector really ran, once, and returned nothing.
         assert warnings == []
+        assert len(spy.calls) == 1
+        assert spy.results == [[]]
     else:
         assert len(warnings) == 1
         assert f"server_id={server.id}" in warnings[0].message
         assert "error=ValueError" in warnings[0].message
         assert "[bad" not in warnings[0].message
+        assert spy.calls == []
 
 
 def test_a_team_row_grant_selection_failure_other_than_value_error_fails_the_list(
@@ -1137,17 +1296,12 @@ def test_a_team_row_grant_selection_failure_other_than_value_error_fails_the_lis
     # connected; any other selection failure still fails the request.
     db, _owner, member = db_session
     server = _add_oauth_server(db, None)
-    _install_visibility(
-        {
-            int(member.id): {
-                "mcp": {int(server.id)},
-                "custom_api": set(),
-                "member_oauth_mcp": {int(server.id)},
-            }
-        }
-    )
+    _grant(db, server, member)
+    _open_to_member(member, server)
+    recorded: list[int] = []
 
     def _selection_breaks(*args, **kwargs):
+        recorded.append(kwargs["server_id"])
         raise RuntimeError("grant table unavailable")
 
     monkeypatch.setattr(mcp_module, "select_mcp_oauth_grants", _selection_breaks)
@@ -1155,7 +1309,96 @@ def test_a_team_row_grant_selection_failure_other_than_value_error_fails_the_lis
     app.include_router(mcp_router)
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[get_current_user] = lambda: member
-    response = TestClient(app, raise_server_exceptions=False).get(
-        "/api/mcp/apps?location=local"
+    with pytest.raises(RuntimeError, match="grant table unavailable"):
+        TestClient(app).get("/api/mcp/apps?location=local")
+    assert recorded == [int(server.id)]
+
+
+def test_a_team_row_without_an_active_grant_skips_the_selector(db_session, monkeypatch):
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _open_to_member(member, server)
+    spy = _SelectorSpy(monkeypatch)
+
+    entry = _entry(db, member, "records")
+    assert spy.calls == []
+    assert entry["is_connected"] is False
+    assert entry["auth_type"] == "mcp_oauth"
+
+    _grant(db, server, member)
+    entry = _entry(db, member, "records")
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["endpoint_url"] == "https://mcp.example.com/mcp"
+    assert entry["is_connected"] is True
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(
+            lambda sid: {
+                "mcp": frozenset({sid}),
+                "custom_api": set(),
+                "member_oauth_mcp": {sid},
+            },
+            id="mcp_frozenset",
+        ),
+        pytest.param(
+            lambda sid: {
+                "mcp": {sid},
+                "custom_api": set(),
+                "member_oauth_mcp": {sid, sid + 1000},
+            },
+            id="member_not_in_mcp",
+        ),
+        pytest.param(
+            lambda sid: {
+                "mcp": {sid},
+                "custom_api": set(),
+                "member_oauth_mcp": [sid],
+            },
+            id="member_list",
+        ),
+    ],
+)
+def test_a_malformed_member_oauth_answer_withholds_member_sign_in(
+    db_session, answer, caplog
+):
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    sid = int(server.id)
+    connector_team_scope.set_connector_team_hooks(
+        visibility=lambda _db, _user_id: answer(sid)
     )
-    assert response.status_code == 500
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.mcp"):
+        entry = _entry(db, member, "records")
+    assert "auth_type" not in entry
+    assert entry["can_authorize"] is False
+    assert "url_host" not in entry
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "visibility answer is malformed" in r.message
+    ]
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("location", ["local", "all"])
+def test_the_listing_asks_the_visibility_hook_once(db_session, location):
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    calls: list[int] = []
+
+    def visibility(_db, user_id: int) -> dict[str, set[int]]:
+        calls.append(user_id)
+        return {
+            "mcp": {int(server.id)},
+            "custom_api": set(),
+            "member_oauth_mcp": {int(server.id)},
+        }
+
+    connector_team_scope.set_connector_team_hooks(visibility=visibility)
+    list_mcp_apps(location=location, current_user=member, db=db)
+    assert len(calls) == 1

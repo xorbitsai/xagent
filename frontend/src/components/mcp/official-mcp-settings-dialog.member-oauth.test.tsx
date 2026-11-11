@@ -57,9 +57,15 @@ const CASES: Array<{
   { id: "team_mcp_oauth_connected", app: teamMcpOAuth, connected: true, shown: false },
   {
     id: "owned_custom",
-    app: { ...teamMcpOAuth, is_owner: true },
+    app: { ...teamMcpOAuth, is_owner: true, url_host: undefined },
     connected: false,
     shown: false,
+  },
+  {
+    id: "team_mcp_oauth_without_sharing_status",
+    app: { ...teamMcpOAuth, shared: undefined, is_owner: undefined },
+    connected: false,
+    shown: true,
   },
   {
     id: "team_mcp_oauth_not_open",

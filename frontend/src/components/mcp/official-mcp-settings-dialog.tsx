@@ -331,7 +331,6 @@ export function OfficialMcpSettingsDialog({
             {!isGloballyConnected &&
               app.is_custom &&
               app.auth_type === "mcp_oauth" &&
-              isNonOwnedTeamTool &&
               app.url_host && (
                 <p className="text-sm text-slate-500 max-w-sm">
                   {t('tools.mcp.memberOAuth.destination', { host: app.url_host })}

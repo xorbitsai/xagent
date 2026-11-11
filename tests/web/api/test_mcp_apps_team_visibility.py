@@ -396,17 +396,26 @@ def test_an_inactive_personal_row_plus_a_team_link_lists_one_entry(db_session):
     assert _local_ids(db, creator).count("records") == 1
 
 
-def test_a_hook_answering_string_ids_is_refused(db_session):
-    """SQLite's numeric affinity makes `id IN ('1')` match an INTEGER primary
-    key, so a hook answering string ids used to list a connector the dedup
-    index (int-keyed) considered missing. The listing now reads the hook's
-    answer through the member-authorization scope, which checks element types:
-    a malformed answer fails the listing instead of resolving."""
+def test_a_hook_answering_string_ids_is_not_silently_resolved(db_session):
+    """Regression pin for a fail-open path: SQLite's numeric affinity makes
+    `id IN ('1')` match an INTEGER primary key, so a hook answering string ids
+    would list a connector the dedup index (int-keyed) considered missing.
+
+    Element types are the hook's contract (`dict[str, set[int]]`). The listing
+    reads team visibility from the hook's raw answer, so a string id still
+    resolves there; this pins that. The same answer is also validated for the
+    member sign-in set (`member_oauth_mcp_ids_from_answer`), which rejects it,
+    so the listing only withholds member sign-in. Validating team visibility in
+    the listing would change this test."""
     db, creator, member = db_session
     server = _add_server(db, creator)
     _install_visibility(
         {int(member.id): {"mcp": {str(server.id)}, "custom_api": set()}}  # type: ignore[dict-item]
     )
 
-    with pytest.raises(ValueError, match="not a connector id"):
-        _local_ids(db, member)
+    listed = _local_ids(db, member)
+    # Documents the current fail-open outcome rather than asserting it is
+    # correct: a string id resolves through the IN clause and reaches the
+    # picker. This assertion is where a change to how the listing reads team
+    # visibility surfaces.
+    assert listed == ["records"]

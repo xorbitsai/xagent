@@ -1,4 +1,3 @@
-import errno
 import hashlib
 import json
 import threading
@@ -476,7 +475,8 @@ def test_s3_put_bytes_persists_sha256_metadata(tmp_path):
 @pytest.mark.parametrize("method", ["put_file", "put_bytes"])
 def test_s3_writes_do_not_call_makedirs(tmp_path, method):
     # S3 has no directories, and s3fs makedirs may send CreateBucket, which
-    # races with concurrent writers (#3719).
+    # races with concurrent writers (#3719). Recording the call, rather than
+    # raising, also catches a write that tolerates the error but still sends it.
     class WriteHandle:
         def __init__(self, sink):
             self.sink = sink
@@ -491,7 +491,7 @@ def test_s3_writes_do_not_call_makedirs(tmp_path, method):
             self.sink.append(data)
             return len(data)
 
-    class BusyMakedirsStorage:
+    class MakedirsRecordingStorage:
         def __init__(self):
             self.written = []
             self.makedirs_calls = []
@@ -501,11 +501,6 @@ def test_s3_writes_do_not_call_makedirs(tmp_path, method):
 
         def makedirs(self, path, exist_ok=False):
             self.makedirs_calls.append(path)
-            raise OSError(
-                errno.EBUSY,
-                "A conflicting conditional operation is currently in progress "
-                "against this resource. Please try again.",
-            )
 
         def info(self, path):
             return {"size": 4}
@@ -513,7 +508,7 @@ def test_s3_writes_do_not_call_makedirs(tmp_path, method):
         def copy(self, source, destination, **kwargs):
             return None
 
-    backend = BusyMakedirsStorage()
+    backend = MakedirsRecordingStorage()
     storage = FsspecFileStorage(
         fs=backend,
         root="bucket/root",

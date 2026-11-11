@@ -41,6 +41,7 @@ from .fixtures import FixtureRef
 # Why a tool of an in-repo connector has no check yet (#3565). A reason for
 # work still to come names the issue of the connector's family that decides
 # it; a write whose object no tool can delete is a reason of its own.
+_GITHUB_TIER_1 = "#3568"
 _GOOGLE_TIER_1 = "#3567"
 _JIRA_TIER_1 = "#3570"
 _MICROSOFT_365_TIER_1 = "#3569"
@@ -67,6 +68,14 @@ _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
     "read that takes a slide id, and the tenant registry records none: the "
     "seed deck holds Google's default slide, but no fixture names it, so "
     "whether a check is added is decided in #3567"
+)
+# GitHub's 80% cut takes eight tools of its 89 calls in the week measured in
+# #2539, and a Tier 1 connector declares at most five read checks. The five go
+# to the most called tools, and the rest stay unchecked (#3568).
+_GITHUB_READS_OUTSIDE_THE_CUT = (
+    "read left unchecked: GitHub's 80% cut needs more tools than the five read "
+    "checks a Tier 1 connector declares, so the five most called carry the "
+    f"checks, as decided in {_GITHUB_TIER_1}"
 )
 
 
@@ -350,6 +359,124 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "excel_delete_table_row",
             ),
             writes_without_cleanup=("excel_add_table",),
+        ),
+    ),
+    # Tier 1 (#3568): the five most called reads, against the test
+    # organization's private read repository, which the seed fills with one
+    # file and the commit that writes it, one issue, one branch and one pull
+    # request opened from it. The tenant registry records the ids the seed's
+    # `apply` prints, including the two numbers GitHub assigns.
+    "github": ConnectorChecks(
+        "github",
+        reads=(
+            ReadCheck(
+                "github.current_user",
+                "github_get_current_user",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("login", "id", "html_url")),
+                    IsType(("user", "login"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "github.read_repository",
+                "github_get_repository",
+                {"repo": FixtureRef("github.read_repo")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        ("repository",),
+                        ("full_name", "private", "default_branch", "html_url"),
+                    ),
+                    Equals(("repository", "full_name"), FixtureRef("github.read_repo")),
+                    Equals(("repository", "private"), True),
+                ),
+            ),
+            ReadCheck(
+                "github.read_issue",
+                "github_get_issue",
+                {
+                    "repo": FixtureRef("github.read_repo"),
+                    "issue_number": FixtureRef("github.issue_number"),
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        ("issue",),
+                        ("number", "title", "state", "labels", "user", "html_url"),
+                    ),
+                    IsType(("issue", "number"), "number"),
+                    Equals(("issue", "title"), "xagent smoke seed issue"),
+                    Equals(("issue", "state"), "open"),
+                    Equals(("issue", "is_pull_request"), False),
+                ),
+            ),
+            ReadCheck(
+                "github.read_commits",
+                "github_list_commits",
+                {
+                    "repo": FixtureRef("github.read_repo"),
+                    "path": FixtureRef("github.seed_file_path"),
+                    "limit": 1,
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("commits", "truncated")),
+                    Length(("commits",), 1, 1),
+                    EachHasKeys(("commits",), ("sha", "message", "author", "date")),
+                    Equals(("commits", 0, "message"), "xagent smoke seed"),
+                ),
+            ),
+            ReadCheck(
+                "github.read_pull_request",
+                "github_get_pull_request",
+                {
+                    "repo": FixtureRef("github.read_repo"),
+                    "pull_number": FixtureRef("github.pull_number"),
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        ("pull_request",),
+                        ("number", "title", "state", "head", "base", "draft"),
+                    ),
+                    IsType(("pull_request", "number"), "number"),
+                    Equals(
+                        ("pull_request", "title"), "xagent smoke seed pull request"
+                    ),
+                    Equals(("pull_request", "state"), "open"),
+                    Equals(("pull_request", "draft"), False),
+                    Equals(("pull_request", "head"), FixtureRef("github.pr_branch")),
+                ),
+            ),
+        ),
+        exemptions=(
+            *(
+                ToolExemption(tool, _GITHUB_READS_OUTSIDE_THE_CUT)
+                for tool in (
+                    "github_get_file_contents",
+                    "github_get_latest_release",
+                    "github_get_ref_status",
+                    "github_list_issues",
+                    "github_list_pull_requests",
+                    "github_list_workflow_runs",
+                    "github_search_code",
+                    "github_search_repositories",
+                )
+            ),
+            *_exemptions(
+                issue=_GITHUB_TIER_1,
+                in_place_edits=("github_update_release",),
+                writes_without_cleanup=(
+                    "github_comment_on_issue",
+                    "github_create_branch",
+                    "github_create_issue",
+                    "github_create_or_update_file",
+                    "github_create_pull_request",
+                    "github_create_release",
+                    "github_update_submodule",
+                ),
+            ),
         ),
     ),
     "gmail": ConnectorChecks(
@@ -851,7 +978,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "facebook",
         "fireflies",
         "freshdesk",
-        "github",
         "google-maps",
         "google-search-console",
         "granola",

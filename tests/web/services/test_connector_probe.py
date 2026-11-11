@@ -137,9 +137,33 @@ def _connect_catalog_stripe(db, user) -> MCPServer:
     return server
 
 
+def _connect_catalog_chartmogul(db, user) -> MCPServer:
+    """Connect the shared catalog chartmogul row, as the stripe helper does."""
+    server, _ = _ensure_catalog_app_server(db, "chartmogul")
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+            is_active=True,
+            env=encrypt_env_dict({"CHARTMOGUL_API_KEY": "user-key"}),
+            env_source="own",
+        )
+    )
+    db.commit()
+    return server
+
+
 def _stripe_ok() -> _Adapter:
     payload = {"status": "success", "customers": [], "truncated": False}
     return _Adapter("stripe_list_customers", _text_result(json.dumps(payload)))
+
+
+def _chartmogul_ok() -> _Adapter:
+    payload = {"status": "success", "customers": [], "truncated": False}
+    return _Adapter("chartmogul_list_customers", _text_result(json.dumps(payload)))
 
 
 class _ForbiddenSandboxManager:

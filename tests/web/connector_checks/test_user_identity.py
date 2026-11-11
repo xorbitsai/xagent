@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from tests.web.services.test_connector_probe import (
+    _chartmogul_ok,
+    _connect_catalog_chartmogul,
     _connect_catalog_stripe,
     _custom_row,
     _github_ok,
@@ -49,10 +51,10 @@ async def test_the_users_connected_catalog_connectors_run_their_checks(
     db_users, monkeypatch
 ):
     db, user, _ = db_users
+    _connect_catalog_chartmogul(db, user)
     _connect_catalog_stripe(db, user)
-    _connect_github(db, user)
-    github, stripe = _github_ok(), _stripe_ok()
-    loader = _Loader(github, stripe)
+    chartmogul, stripe = _chartmogul_ok(), _stripe_ok()
+    loader = _Loader(chartmogul, stripe)
     monkeypatch.setattr(LOADER, loader)
 
     result = await run_checks(UserIdentityAdapter(db, "monitor"))
@@ -60,14 +62,14 @@ async def test_the_users_connected_catalog_connectors_run_their_checks(
     assert result.identity == "user"
     assert result.failure is None
     assert rows(result) == [
-        ("github", None, "pass", None, None),
-        ("github", "github.l3_probe", "pass", None, None),
+        ("chartmogul", None, "pass", None, None),
+        ("chartmogul", "chartmogul.l3_probe", "pass", None, None),
         ("stripe", None, "pass", None, None),
         ("stripe", "stripe.l3_probe", "pass", None, None),
     ]
     # One listing per connector, then one call per check.
     assert len(loader.calls) == 2
-    assert github.calls == [{}]
+    assert chartmogul.calls == [{"per_page": 1}]
     assert len(stripe.calls) == 1
 
 
@@ -153,12 +155,12 @@ async def test_a_custom_server_is_not_a_target(db_users, monkeypatch):
     db.add(custom)
     db.commit()
     _link(db, user, custom)
-    _connect_github(db, user)
-    monkeypatch.setattr(LOADER, _Loader(_github_ok()))
+    _connect_catalog_stripe(db, user)
+    monkeypatch.setattr(LOADER, _Loader(_stripe_ok()))
 
     result = await run_checks(UserIdentityAdapter(db, "monitor"))
 
-    assert [row[0] for row in rows(result)] == ["github", "github"]
+    assert [row[0] for row in rows(result)] == ["stripe", "stripe"]
 
 
 def _lookalike_rows() -> list[tuple[Any, ...]]:

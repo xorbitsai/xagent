@@ -20,7 +20,12 @@ from typing import Any
 import jsonschema
 import pytest
 
-from tests.web.services.test_connector_probe import _github_ok, _Loader
+from tests.web.services.test_connector_probe import (
+    _connect_catalog_stripe,
+    _github_ok,
+    _Loader,
+    _stripe_ok,
+)
 from tests.web.services.test_mcp_connector_session import (
     LOADER,
     _connect_github,
@@ -376,8 +381,8 @@ def test_a_probe_user_runs_their_connectors_checks(
     db_users, probe_users, monkeypatch, capfd
 ):
     db, user, _ = db_users
-    _connect_github(db, user)
-    monkeypatch.setattr(LOADER, _Loader(_github_ok()))
+    _connect_catalog_stripe(db, user)
+    monkeypatch.setattr(LOADER, _Loader(_stripe_ok()))
     _with_database(monkeypatch, db)
 
     code = cli.main(["--user", "monitor@example.com"])
@@ -387,7 +392,7 @@ def test_a_probe_user_runs_their_connectors_checks(
     assert [
         (row["connector"], row["check"], row["outcome"])
         for row in _document(out)["rows"]
-    ] == [("github", None, "pass"), ("github", "github.l3_probe", "pass")]
+    ] == [("stripe", None, "pass"), ("stripe", "stripe.l3_probe", "pass")]
 
 
 @pytest.mark.parametrize(

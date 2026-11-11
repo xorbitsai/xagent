@@ -33,6 +33,7 @@ from xagent.web.connector_checks.declarations import (
     validate_connector_checks,
 )
 from xagent.web.connector_checks.registry import (
+    _GITHUB_READS_OUTSIDE_THE_CUT,
     _GMAIL_LABEL_WITHOUT_READ,
     _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID,
     CONNECTOR_CHECKS,
@@ -45,6 +46,7 @@ from xagent.web.connector_checks.results import FailureClass
 from xagent.web.tools.mcp import calendar as google_calendar
 from xagent.web.tools.mcp import (
     excel,
+    github,
     gmail,
     google_ads,
     google_analytics,
@@ -828,10 +830,15 @@ _GOOGLE_FIXTURE_KEYS_USED = frozenset(
 
 
 class _Fixtures:
-    """The Google seed's values, as the identity adapter would resolve them."""
+    """The seeds' values, as the identity adapter would resolve them."""
 
     _VALUES = {
         "gmail.seed_label_id": "Label_1",
+        "github.issue_number": "1",
+        "github.pr_branch": "xagent-smoke-seed",
+        "github.pull_number": "2",
+        "github.read_repo": "xagent-smoke/smoke-read",
+        "github.seed_file_path": "seed.md",
         "google-analytics.property_id": "563334905",
         "google-docs.document_id": "doc-1",
         "google-drive.seed_folder_id": "folder-1",
@@ -1658,5 +1665,533 @@ def test_a_google_fixture_check_fails_on_an_error_envelope(
     call: Callable[[], str],
 ) -> None:
     monkeypatch.setattr(module, dependency, _unreachable)
+
+    _assert_check_fails(check_id, call(), "status_success")
+
+
+# --- GitHub (#3568) ------------------------------------------------------------------
+
+_READ_REPO = "xagent-smoke/smoke-read"
+
+# The read checks, pinned: the tool, its arguments and its assertions. These
+# five tools carry the most of the 89 GitHub calls in the week measured in
+# #2539, the five read checks a Tier 1 connector declares at most.
+_GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "github.current_user": (
+        "github_get_current_user",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("user",), ("login", "id", "html_url")),
+            IsType(("user", "login"), "string"),
+        ),
+    ),
+    "github.read_repository": (
+        "github_get_repository",
+        {"repo": FixtureRef("github.read_repo")},
+        (
+            StatusSuccess(),
+            HasKeys(
+                ("repository",),
+                ("full_name", "private", "default_branch", "html_url"),
+            ),
+            Equals(("repository", "full_name"), FixtureRef("github.read_repo")),
+            Equals(("repository", "private"), True),
+        ),
+    ),
+    "github.read_issue": (
+        "github_get_issue",
+        {
+            "repo": FixtureRef("github.read_repo"),
+            "issue_number": FixtureRef("github.issue_number"),
+        },
+        (
+            StatusSuccess(),
+            HasKeys(
+                ("issue",),
+                ("number", "title", "state", "labels", "user", "html_url"),
+            ),
+            IsType(("issue", "number"), "number"),
+            Equals(("issue", "title"), "xagent smoke seed issue"),
+            Equals(("issue", "state"), "open"),
+            Equals(("issue", "is_pull_request"), False),
+        ),
+    ),
+    "github.read_commits": (
+        "github_list_commits",
+        {
+            "repo": FixtureRef("github.read_repo"),
+            "path": FixtureRef("github.seed_file_path"),
+            "limit": 1,
+        },
+        (
+            StatusSuccess(),
+            HasKeys((), ("commits", "truncated")),
+            Length(("commits",), 1, 1),
+            EachHasKeys(("commits",), ("sha", "message", "author", "date")),
+            Equals(("commits", 0, "message"), "xagent smoke seed"),
+        ),
+    ),
+    "github.read_pull_request": (
+        "github_get_pull_request",
+        {
+            "repo": FixtureRef("github.read_repo"),
+            "pull_number": FixtureRef("github.pull_number"),
+        },
+        (
+            StatusSuccess(),
+            HasKeys(
+                ("pull_request",),
+                ("number", "title", "state", "head", "base", "draft"),
+            ),
+            IsType(("pull_request", "number"), "number"),
+            Equals(("pull_request", "title"), "xagent smoke seed pull request"),
+            Equals(("pull_request", "state"), "open"),
+            Equals(("pull_request", "draft"), False),
+            Equals(("pull_request", "head"), FixtureRef("github.pr_branch")),
+        ),
+    ),
+}
+
+# The fixture keys the GitHub read checks use, pinned here so that adding or
+# dropping one shows in the diff. The tenant registry records the three the
+# seed's layout knows; the two numbers GitHub assigns are recorded from the
+# first `apply` (xorbitsai/xagent-saas#2533).
+_GITHUB_FIXTURE_KEYS_USED = frozenset(
+    {
+        "github.issue_number",
+        "github.pr_branch",
+        "github.pull_number",
+        "github.read_repo",
+        "github.seed_file_path",
+    }
+)
+
+# The reads left to an exemption: GitHub's 80% cut needs eight tools, and the
+# five most called have the checks.
+_GITHUB_READS_OUTSIDE_THE_FIVE = frozenset(
+    {
+        "github_get_file_contents",
+        "github_get_latest_release",
+        "github_get_ref_status",
+        "github_list_issues",
+        "github_list_pull_requests",
+        "github_list_workflow_runs",
+        "github_search_code",
+        "github_search_repositories",
+    }
+)
+
+# The writes that create an object GitHub's own tools cannot remove: the server
+# has no delete tool at all, so a write check would have nothing to clean up
+# with. A release edit is the one write that creates no object.
+_GITHUB_WRITES_WITHOUT_CLEANUP = frozenset(
+    {
+        "github_comment_on_issue",
+        "github_create_branch",
+        "github_create_issue",
+        "github_create_or_update_file",
+        "github_create_pull_request",
+        "github_create_release",
+        "github_update_submodule",
+    }
+)
+
+
+@pytest.mark.parametrize(("check_id", "expected"), sorted(_GITHUB_READS.items()))
+def test_a_github_read_check_is_declared_exactly(
+    check_id: str, expected: tuple[str, dict[str, Any], tuple[Assertion, ...]]
+) -> None:
+    tool, arguments, assertions = expected
+    check = _read_check(check_id)
+    assert (check.tool, dict(check.arguments), check.assertions) == (
+        tool,
+        arguments,
+        assertions,
+    )
+
+
+def test_a_github_connector_declares_exactly_its_reads() -> None:
+    assert [check.id for check in CONNECTOR_CHECKS["github"].reads] == list(
+        _GITHUB_READS
+    )
+
+
+def test_the_github_read_checks_use_exactly_these_fixture_keys() -> None:
+    keys = {
+        ref.key
+        for check in CONNECTOR_CHECKS["github"].reads
+        if isinstance(check, ReadCheck)
+        for ref in _google_fixture_keys(check)
+    }
+
+    assert keys == _GITHUB_FIXTURE_KEYS_USED
+
+
+def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
+    """A fixture in the arguments names a parameter of the tool, and every
+    required argument is pinned: an omitted one would make the tool prompt."""
+    for check in CONNECTOR_CHECKS["github"].reads:
+        if not isinstance(check, ReadCheck):
+            continue
+        parameters = inspect.signature(getattr(github, check.tool)).parameters
+        bound = [
+            name for name, value in check.arguments.items() if any(_fixture_refs(value))
+        ]
+        for name in bound:
+            assert name in parameters, (check.tool, name)
+        required = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.default is inspect.Parameter.empty
+            and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        }
+        assert required <= set(check.arguments), (check.tool, required)
+
+
+def test_a_github_read_outside_the_five_is_exempt_for_the_cut() -> None:
+    exemptions = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+    }
+
+    for tool in _GITHUB_READS_OUTSIDE_THE_FIVE:
+        assert exemptions[tool] == _GITHUB_READS_OUTSIDE_THE_CUT, tool
+    assert set(exemptions) == _GITHUB_READS_OUTSIDE_THE_FIVE | (
+        _GITHUB_WRITES_WITHOUT_CLEANUP | {"github_update_release"}
+    )
+
+
+def test_a_github_write_has_no_cleanup_tool() -> None:
+    """Every write but a release edit creates an object, and the server has no
+    delete tool for any of them, so no write check can clean up yet."""
+    exemptions = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+    }
+
+    for tool in _GITHUB_WRITES_WITHOUT_CLEANUP:
+        assert exemptions[tool] == WRITE_WITHOUT_CLEANUP, tool
+
+
+def test_the_github_release_edit_waits_on_an_edit_step() -> None:
+    exemption = next(
+        exemption
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+        if exemption.tool == "github_update_release"
+    )
+
+    assert exemption.reason == (
+        "write that edits content in place: a write check creates, verifies "
+        "and deletes its own object and has no step for an edit, so whether a "
+        "check is added is decided in #3568"
+    )
+
+
+# Output samples for the GitHub read checks
+
+
+class _GitHubResponse:
+    """The part of a ``requests`` response ``github.py`` reads."""
+
+    def __init__(self, body: Any, status: int = 200) -> None:
+        self.status_code = status
+        self.content = json.dumps(body).encode()
+        self.headers: dict[str, str] = {}
+
+    def json(self) -> Any:
+        return json.loads(self.content)
+
+
+class _FakeGitHub:
+    """``github.py``'s HTTP layer, answering one fixed body per route."""
+
+    def __init__(self) -> None:
+        self.routes: dict[tuple[str, str], _GitHubResponse] = {}
+
+    def route(self, method: str, path: str, body: Any, status: int = 200) -> None:
+        self.routes[(method, path)] = _GitHubResponse(body, status)
+
+    def request(self, **kwargs: Any) -> _GitHubResponse:
+        path = str(kwargs["url"]).removeprefix(github.GITHUB_BASE_URL)
+        try:
+            return self.routes[(kwargs["method"], path)]
+        except KeyError:
+            raise AssertionError(f"unrouted request: {kwargs['method']} {path}") from None
+
+
+def _fake_github(
+    monkeypatch: pytest.MonkeyPatch, *routes: tuple[str, str, Any]
+) -> _FakeGitHub:
+    # The token the server reads its grant from; the fake transport never sends
+    # it anywhere.
+    monkeypatch.setenv("GITHUB_ACCESS_TOKEN", "access-token")
+    fake = _FakeGitHub()
+    for method, path, body in routes:
+        fake.route(method, path, body)
+    monkeypatch.setattr(github, "requests", fake)
+    return fake
+
+
+def _github_repository(**overrides: Any) -> dict[str, Any]:
+    return {
+        "full_name": _READ_REPO,
+        "private": True,
+        "default_branch": "main",
+        "html_url": "https://github.com/xagent-smoke/smoke-read",
+        "description": "Seed repository of the GitHub smoke tenant",
+        "stargazers_count": 0,
+        "open_issues_count": 2,
+        "language": None,
+        "updated_at": "2026-11-12T00:00:00Z",
+        **overrides,
+    }
+
+
+def _github_issue(**overrides: Any) -> dict[str, Any]:
+    return {
+        "number": 1,
+        "title": "xagent smoke seed issue",
+        "state": "open",
+        "body": "Seeded issue the read checks assert on.",
+        "labels": [],
+        "user": {"login": "xagent-app"},
+        "comments": 0,
+        "html_url": "https://github.com/xagent-smoke/smoke-read/issues/1",
+        "created_at": "2026-11-12T00:00:00Z",
+        "updated_at": "2026-11-12T00:00:00Z",
+        **overrides,
+    }
+
+
+def _github_commit(**overrides: Any) -> dict[str, Any]:
+    return {
+        "sha": "0" * 40,
+        "commit": {
+            "message": "xagent smoke seed",
+            "author": {"name": "xagent-app", "date": "2026-11-12T00:00:00Z"},
+        },
+        "html_url": "https://github.com/xagent-smoke/smoke-read/commit/" + "0" * 40,
+        **overrides,
+    }
+
+
+def _github_pull_request(**overrides: Any) -> dict[str, Any]:
+    return {
+        "number": 2,
+        "title": "xagent smoke seed pull request",
+        "state": "open",
+        "body": "Seeded pull request the read checks assert on.",
+        "user": {"login": "xagent-app"},
+        "head": {"ref": "xagent-smoke-seed"},
+        "base": {"ref": "main"},
+        "draft": False,
+        "merged": False,
+        "mergeable": True,
+        "html_url": "https://github.com/xagent-smoke/smoke-read/pull/2",
+        "created_at": "2026-11-12T00:00:00Z",
+        "updated_at": "2026-11-12T00:00:00Z",
+        **overrides,
+    }
+
+
+def test_github_current_user_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            "/user",
+            {
+                "login": "xagent-app",
+                "id": 424242,
+                "name": "Xagent Smoke",
+                "email": None,
+                "company": None,
+                "bio": None,
+                "public_repos": 0,
+                "followers": 0,
+                "following": 0,
+                "html_url": "https://github.com/xagent-app",
+            },
+        ),
+    )
+
+    _assert_check_output("github.current_user", github.github_get_current_user())
+
+
+def test_github_repository_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}", _github_repository()),
+    )
+
+    _assert_check_output(
+        "github.read_repository", github.github_get_repository(_READ_REPO)
+    )
+
+
+def test_github_repository_output_fails_on_another_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}",
+            _github_repository(full_name="xagent-smoke/smoke-write"),
+        ),
+    )
+
+    _assert_check_fails(
+        "github.read_repository",
+        github.github_get_repository(_READ_REPO),
+        "equals",
+    )
+
+
+def test_github_repository_output_fails_on_a_public_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A public repository is readable without the organization's grant, so the
+    # check would no longer see a revoked one.
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}", _github_repository(private=False)),
+    )
+
+    _assert_check_fails(
+        "github.read_repository",
+        github.github_get_repository(_READ_REPO),
+        "equals",
+    )
+
+
+def test_github_issue_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/issues/1", _github_issue()),
+    )
+
+    _assert_check_output("github.read_issue", github.github_get_issue(_READ_REPO, 1))
+
+
+def test_github_issue_output_fails_on_a_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GitHub answers both from the issues endpoints, and a number that reaches
+    # a pull request proves the fixture names the wrong one.
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}/issues/1",
+            _github_issue(pull_request={"url": "https://api.github.com/x"}),
+        ),
+    )
+
+    _assert_check_fails(
+        "github.read_issue", github.github_get_issue(_READ_REPO, 1), "equals"
+    )
+
+
+def test_github_commits_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/commits", [_github_commit()]),
+    )
+
+    _assert_check_output(
+        "github.read_commits",
+        github.github_list_commits(_READ_REPO, path="seed.md", limit=1),
+    )
+
+
+def test_github_commits_output_fails_on_another_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    another = _github_commit(
+        commit={"message": "edit by hand", "author": {"name": "someone"}}
+    )
+    _fake_github(monkeypatch, ("GET", f"/repos/{_READ_REPO}/commits", [another]))
+
+    _assert_check_fails(
+        "github.read_commits",
+        github.github_list_commits(_READ_REPO, path="seed.md", limit=1),
+        "equals",
+    )
+
+
+def test_github_pull_request_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/pulls/2", _github_pull_request()),
+    )
+
+    _assert_check_output(
+        "github.read_pull_request", github.github_get_pull_request(_READ_REPO, 2)
+    )
+
+
+def test_github_pull_request_output_fails_on_another_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The head is the seed's branch, so a pull request opened from anywhere
+    # else is not the seeded one.
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}/pulls/2",
+            _github_pull_request(head={"ref": "someone-elses-branch"}),
+        ),
+    )
+
+    _assert_check_fails(
+        "github.read_pull_request",
+        github.github_get_pull_request(_READ_REPO, 2),
+        "equals",
+    )
+
+
+class _NoNetwork:
+    @staticmethod
+    def request(**kwargs: Any) -> Any:
+        raise RuntimeError("unauthorized")
+
+
+@pytest.mark.parametrize(
+    ("check_id", "call"),
+    [
+        ("github.current_user", lambda: github.github_get_current_user()),
+        (
+            "github.read_repository",
+            lambda: github.github_get_repository(_READ_REPO),
+        ),
+        ("github.read_issue", lambda: github.github_get_issue(_READ_REPO, 1)),
+        (
+            "github.read_commits",
+            lambda: github.github_list_commits(_READ_REPO, path="seed.md", limit=1),
+        ),
+        (
+            "github.read_pull_request",
+            lambda: github.github_get_pull_request(_READ_REPO, 2),
+        ),
+    ],
+)
+def test_a_github_check_fails_on_an_error_envelope(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, call: Callable[[], str]
+) -> None:
+    monkeypatch.setenv("GITHUB_ACCESS_TOKEN", "access-token")
+    monkeypatch.setattr(github, "requests", _NoNetwork)
 
     _assert_check_fails(check_id, call(), "status_success")

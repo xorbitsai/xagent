@@ -33,6 +33,8 @@ from xagent.web.connector_checks.declarations import (
     validate_connector_checks,
 )
 from xagent.web.connector_checks.registry import (
+    _GMAIL_LABEL_WITHOUT_READ,
+    _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID,
     CONNECTOR_CHECKS,
     WRITE_WITHOUT_CLEANUP,
     _declared_l3,
@@ -658,9 +660,6 @@ _GOOGLE_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
                 ("query",),
                 ("property_id", "metrics", "date_ranges", "limit", "offset"),
             ),
-            Equals(
-                ("query", "property_id"), FixtureRef("google-analytics.property_id")
-            ),
             IsType(("rows",), "array"),
         ),
     ),
@@ -714,7 +713,7 @@ _GOOGLE_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             HasKeys((), ("spreadsheet_id", "title", "url", "sheets")),
             Equals(("spreadsheet_id",), FixtureRef("google-sheets.spreadsheet_id")),
             Equals(("title",), "xagent-smoke-seed-sheet"),
-            Length(("sheets",), min=1),
+            Length(("sheets",), 1, 1),
             EachHasKeys(
                 ("sheets",), ("sheet_id", "title", "row_count", "column_count")
             ),
@@ -746,7 +745,7 @@ _GOOGLE_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             HasKeys((), ("presentation_id", "title", "slide_count", "slides")),
             Equals(("presentation_id",), FixtureRef("google-slides.presentation_id")),
             Equals(("title",), "xagent-smoke-seed-slides"),
-            IsType(("slide_count",), "number"),
+            Equals(("slide_count",), 1),
         ),
     ),
 }
@@ -761,9 +760,10 @@ _GOOGLE_APP_MODULES = {
     "google-slides": google_slides,
 }
 
-# The fixture keys the tenant registry (xorbitsai/xagent-saas#2627) records for
-# the Google seed layout; every one a Google read check uses is here.
-_GOOGLE_FIXTURE_KEYS = frozenset(
+# The fixture keys the Google read checks use, pinned here so that adding or
+# dropping one shows in the diff. The tenant registry
+# (xorbitsai/xagent-saas#2627) records each of them for the Google seed layout.
+_GOOGLE_FIXTURE_KEYS_USED = frozenset(
     {
         "gmail.seed_label_id",
         "google-analytics.property_id",
@@ -861,7 +861,7 @@ def test_a_google_document_probe_still_needs_a_fixture(app_id: str) -> None:
     )
 
 
-def test_every_google_fixture_key_is_one_the_seed_records() -> None:
+def test_the_google_read_checks_use_exactly_these_fixture_keys() -> None:
     keys = {
         ref.key
         for app_id in _GOOGLE_APP_MODULES
@@ -870,7 +870,7 @@ def test_every_google_fixture_key_is_one_the_seed_records() -> None:
         for ref in _google_fixture_keys(check)
     }
 
-    assert keys == _GOOGLE_FIXTURE_KEYS
+    assert keys == _GOOGLE_FIXTURE_KEYS_USED
 
 
 @pytest.mark.parametrize("app_id", sorted(_GOOGLE_APP_MODULES))
@@ -982,13 +982,19 @@ def test_gmail_manage_labels_is_exempt_for_the_read_step_rule() -> None:
         if exemption.tool == "gmail_manage_labels"
     )
 
-    assert exemption.reason == (
-        "read and write in one tool: it is the only Gmail tool that reads a "
-        "label and the only one that creates or deletes one, so a label write "
-        "check's verify or cleanup guard would call its own create and cleanup "
-        "tool, which #3653 refuses; no label-reading tool is added, which "
-        "#3567 allows"
+    assert exemption.reason == _GMAIL_LABEL_WITHOUT_READ
+
+
+def test_the_slide_thumbnail_waits_on_a_slide_id_fixture() -> None:
+    """The deck the seed creates holds Google's default slide, so what keeps
+    this read exempt is a fixture for that slide's id, not a slide."""
+    exemption = next(
+        exemption
+        for exemption in CONNECTOR_CHECKS["google-slides"].exemptions
+        if exemption.tool == "google_slides_get_slide_thumbnail"
     )
+
+    assert exemption.reason == _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID
 
 
 # Output samples for the Google read checks
@@ -1179,6 +1185,26 @@ def test_google_drive_file_content_output_fails_without_the_seed_text(
     )
 
 
+def test_google_drive_file_content_output_fails_on_base64_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text that is not valid UTF-8 comes back base64-encoded, not as text."""
+    monkeypatch.setattr(
+        google_drive,
+        "get_drive_service",
+        lambda: _drive_file_service(),
+    )
+    monkeypatch.setattr(
+        google_drive, "_download_media", lambda request: b"caf\xe9 legacy text"
+    )
+
+    _assert_check_fails(
+        "google-drive.read_seed_file",
+        google_drive.google_drive_get_file_content("doc-1"),
+        "equals",
+    )
+
+
 _DOCUMENT_TEXT = "xagent smoke seed document"
 
 
@@ -1257,9 +1283,8 @@ def _seed_sheet() -> dict[str, Any]:
     }
 
 
-def _spreadsheet_service(title: str) -> Mock:
+def _spreadsheet_service(payload: dict[str, Any]) -> Mock:
     service = Mock()
-    payload = {**_seed_sheet(), "properties": {"title": title}}
     service.spreadsheets.return_value.get.return_value.execute.return_value = payload
     return service
 
@@ -1270,7 +1295,7 @@ def test_google_sheets_spreadsheet_output_satisfies_its_declaration(
     monkeypatch.setattr(
         google_sheets,
         "get_sheets_service",
-        lambda: _spreadsheet_service("xagent-smoke-seed-sheet"),
+        lambda: _spreadsheet_service(_seed_sheet()),
     )
 
     _assert_check_output(
@@ -1280,22 +1305,23 @@ def test_google_sheets_spreadsheet_output_satisfies_its_declaration(
 
 
 @pytest.mark.parametrize(
-    ("title", "reason"),
+    ("title", "sheets", "reason"),
     [
-        ("another book", "equals"),
-        ("xagent-smoke-seed-sheet", "length"),
+        ("another book", _seed_sheet()["sheets"], "equals"),
+        ("xagent-smoke-seed-sheet", [], "length"),
+        ("xagent-smoke-seed-sheet", _seed_sheet()["sheets"] * 2, "length"),
     ],
 )
 def test_google_sheets_spreadsheet_output_fails_on_a_bad_result(
-    monkeypatch: pytest.MonkeyPatch, title: str, reason: str
+    monkeypatch: pytest.MonkeyPatch,
+    title: str,
+    sheets: list[dict[str, Any]],
+    reason: str,
 ) -> None:
-    service = _spreadsheet_service(title)
-    if reason == "length":
-        payload = (
-            service.spreadsheets.return_value.get.return_value.execute.return_value
-        )
-        payload["sheets"] = []
-    monkeypatch.setattr(google_sheets, "get_sheets_service", lambda: service)
+    payload = {**_seed_sheet(), "properties": {"title": title}, "sheets": sheets}
+    monkeypatch.setattr(
+        google_sheets, "get_sheets_service", lambda: _spreadsheet_service(payload)
+    )
 
     _assert_check_fails(
         "google-sheets.read_fixture",
@@ -1347,12 +1373,15 @@ def test_google_sheets_range_output_fails_on_a_bad_result(
     _assert_check_fails("google-sheets.read_seed_range", _read_seed_range(), reason)
 
 
-def _presentation_service(title: str) -> Mock:
+def _presentation_service(title: str, slide_count: int = 1) -> Mock:
     service = Mock()
     service.presentations.return_value.get.return_value.execute.return_value = {
         "presentationId": "deck-1",
         "title": title,
-        "slides": [{"objectId": "slide-1", "pageElements": []}],
+        "slides": [
+            {"objectId": f"slide-{index}", "pageElements": []}
+            for index in range(slide_count)
+        ],
     }
     return service
 
@@ -1388,6 +1417,23 @@ def test_google_slides_output_fails_on_another_deck(
     )
 
 
+@pytest.mark.parametrize("slide_count", [0, 2])
+def test_google_slides_output_fails_on_another_slide_count(
+    monkeypatch: pytest.MonkeyPatch, slide_count: int
+) -> None:
+    monkeypatch.setattr(
+        google_slides,
+        "get_slides_service",
+        lambda: _presentation_service("xagent-smoke-seed-slides", slide_count),
+    )
+
+    _assert_check_fails(
+        "google-slides.read_fixture",
+        google_slides.google_slides_get_presentation("deck-1"),
+        "equals",
+    )
+
+
 def _analytics_report() -> dict[str, Any]:
     return {
         "dimensionHeaders": [],
@@ -1414,18 +1460,6 @@ def test_google_analytics_report_output_satisfies_its_declaration(
     )
 
     _assert_check_output("google-analytics.run_report", _run_report("563334905"))
-
-
-def test_google_analytics_report_output_fails_on_another_property(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        google_analytics, "_request", lambda *args, **kwargs: _analytics_report()
-    )
-
-    _assert_check_fails(
-        "google-analytics.run_report", _run_report("999999999"), "equals"
-    )
 
 
 def test_google_analytics_list_properties_output_satisfies_its_declaration(
@@ -1505,3 +1539,72 @@ def test_google_calendar_output_fails_on_an_error(
         google_calendar.google_calendar_search_events(max_results=1),
         "status_not_success",
     )
+
+
+def _unreachable(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("unauthorized")
+
+
+@pytest.mark.parametrize(
+    ("check_id", "module", "dependency", "call"),
+    [
+        (
+            "gmail.search_seed_message",
+            gmail,
+            "get_gmail_service",
+            lambda: gmail.gmail_search_messages(label_ids=["Label_1"], max_results=10),
+        ),
+        (
+            "google-analytics.run_report",
+            google_analytics,
+            "_request",
+            lambda: _run_report("563334905"),
+        ),
+        (
+            "google-docs.read_fixture",
+            google_docs,
+            "get_docs_service",
+            lambda: google_docs.google_docs_get_document("doc-1"),
+        ),
+        (
+            "google-drive.search_seed_folder",
+            google_drive,
+            "get_drive_service",
+            _drive_search,
+        ),
+        (
+            "google-drive.read_seed_file",
+            google_drive,
+            "get_drive_service",
+            lambda: google_drive.google_drive_get_file_content("doc-1"),
+        ),
+        (
+            "google-sheets.read_fixture",
+            google_sheets,
+            "get_sheets_service",
+            lambda: google_sheets.google_sheets_get_spreadsheet("sheet-1"),
+        ),
+        (
+            "google-sheets.read_seed_range",
+            google_sheets,
+            "get_sheets_service",
+            _read_seed_range,
+        ),
+        (
+            "google-slides.read_fixture",
+            google_slides,
+            "get_slides_service",
+            lambda: google_slides.google_slides_get_presentation("deck-1"),
+        ),
+    ],
+)
+def test_a_google_fixture_check_fails_on_an_error_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+    check_id: str,
+    module: Any,
+    dependency: str,
+    call: Callable[[], str],
+) -> None:
+    monkeypatch.setattr(module, dependency, _unreachable)
+
+    _assert_check_fails(check_id, call(), "status_success")

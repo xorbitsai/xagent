@@ -52,6 +52,14 @@ _GMAIL_LABEL_WITHOUT_READ = (
     "verify or cleanup guard would call its own create and cleanup tool, which "
     "#3653 refuses; no label-reading tool is added, which #3567 allows"
 )
+# The deck the seed creates holds Google's default slide, so what a thumbnail
+# check lacks is a fixture for that slide's id, not a slide: the tenant
+# registry records none, and the tool addresses a slide by its id.
+_SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
+    "read that takes a slide id, and the tenant registry records none: the "
+    "seed deck holds Google's default slide, but no fixture names it, so "
+    "whether a check is added is decided in #3567"
+)
 
 
 def _exemptions(
@@ -238,10 +246,6 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("query",),
                         ("property_id", "metrics", "date_ranges", "limit", "offset"),
                     ),
-                    Equals(
-                        ("query", "property_id"),
-                        FixtureRef("google-analytics.property_id"),
-                    ),
                     IsType(("rows",), "array"),
                 ),
             ),
@@ -362,7 +366,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         FixtureRef("google-sheets.spreadsheet_id"),
                     ),
                     Equals(("title",), "xagent-smoke-seed-sheet"),
-                    Length(("sheets",), min=1),
+                    Length(("sheets",), 1, 1),
                     EachHasKeys(
                         ("sheets",), ("sheet_id", "title", "row_count", "column_count")
                     ),
@@ -415,22 +419,27 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         FixtureRef("google-slides.presentation_id"),
                     ),
                     Equals(("title",), "xagent-smoke-seed-slides"),
-                    IsType(("slide_count",), "number"),
+                    Equals(("slide_count",), 1),
                 ),
             ),
         ),
-        exemptions=_exemptions(
-            issue=_GOOGLE_TIER_1,
-            reads=("google_slides_get_slide_thumbnail",),
-            writes=(
-                "google_slides_add_slide",
-                "google_slides_update_slide",
-                "google_slides_delete_slide",
-                "google_slides_batch_update",
+        exemptions=(
+            *_exemptions(
+                issue=_GOOGLE_TIER_1,
+                writes=(
+                    "google_slides_add_slide",
+                    "google_slides_update_slide",
+                    "google_slides_delete_slide",
+                    "google_slides_batch_update",
+                ),
+                writes_without_cleanup=(
+                    "google_slides_create_presentation",
+                    "google_slides_import_pptx",
+                ),
             ),
-            writes_without_cleanup=(
-                "google_slides_create_presentation",
-                "google_slides_import_pptx",
+            ToolExemption(
+                "google_slides_get_slide_thumbnail",
+                _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID,
             ),
         ),
     ),

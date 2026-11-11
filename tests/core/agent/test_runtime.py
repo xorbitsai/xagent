@@ -34,6 +34,7 @@ from xagent.core.agent.runtime import (
     LLMCallInterrupted,
     ToolCallInterrupted,
     prepare_llm_for_context,
+    resolve_compact_llm,
     resolved_llm_metadata,
 )
 from xagent.core.model.chat.basic.adapter import create_base_llm
@@ -3668,3 +3669,123 @@ async def test_on_llm_end_ignores_non_string_fallback_markers() -> None:
     assert "stream_finish_reason" not in data
     assert STREAM_ABORTED_KEY not in data
     assert "stream_usage" not in data
+
+
+def _oversized_compaction_context(execution_id: str) -> ExecutionContext:
+    context = ExecutionContext(execution_id=execution_id)
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+    return context
+
+
+class _ConcreteCompactLLM:
+    model_name = "concrete-candidate"
+    context_window = 64_000
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def chat(self, **_: Any) -> Any:
+        self.calls += 1
+        return {"content": "summary from the selected candidate"}
+
+
+class _VirtualCompactLLM:
+    """An Auto-like compact model: no window of its own, resolved per call."""
+
+    model_name = "auto"
+    context_window = None
+
+    def __init__(self, concrete: Any = None, error: Exception | None = None) -> None:
+        self.concrete = concrete
+        self.error = error
+        self.prepared = 0
+
+    async def prepare_for_call(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        preferred_input_modalities: tuple[str, ...] = (),
+    ) -> Any:
+        self.prepared += 1
+        if self.error is not None:
+            raise self.error
+        return self.concrete
+
+    async def chat(self, **_: Any) -> Any:  # pragma: no cover - must not run
+        raise AssertionError("an unresolved virtual model must not be called")
+
+
+@pytest.mark.asyncio
+async def test_virtual_compact_model_is_resolved_before_compacting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicit Auto compact model has no window until it picks a candidate.
+
+    Passing it through unresolved read as "no context_window" and switched
+    compaction off entirely, with no message-dropping fallback either.
+    """
+    context = _oversized_compaction_context("virtual-compact")
+    concrete = _ConcreteCompactLLM()
+    virtual = _VirtualCompactLLM(concrete)
+
+    with caplog.at_level("WARNING"):
+        result = await PatternRuntime().compact_context_if_needed(
+            context=context,
+            llm=await resolve_compact_llm(llm=virtual, context=context),
+            metadata={"phase": "test"},
+        )
+
+    assert virtual.prepared == 1
+    assert concrete.calls == 1
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert "no context_window" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolving_a_virtual_compact_model_keeps_the_main_threshold() -> None:
+    """The compact model's window must not replace the main model's threshold."""
+    context = _oversized_compaction_context("virtual-compact-threshold")
+    context.compact_config.threshold = 30_000
+    context.compact_config.threshold_source = COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    concrete = _ConcreteCompactLLM()
+    concrete.context_window = 1_048_576  # would derive a far larger threshold
+
+    await PatternRuntime().compact_context_if_needed(
+        context=context,
+        llm=await resolve_compact_llm(
+            llm=_VirtualCompactLLM(concrete), context=context
+        ),
+        metadata={},
+    )
+
+    assert context.compact_config.threshold == 30_000
+    assert context.compact_config.threshold_source == (
+        COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW
+    )
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_virtual_compact_model_falls_back_to_dropping() -> None:
+    context = _oversized_compaction_context("virtual-compact-unresolvable")
+    virtual = _VirtualCompactLLM(error=RuntimeError("no candidate available"))
+
+    result = await PatternRuntime().compact_context_if_needed(
+        context=context,
+        llm=await resolve_compact_llm(llm=virtual, context=context),
+        metadata={},
+    )
+
+    assert virtual.prepared == 1
+    assert result.compacted
+    assert result.strategy != "llm_summary"

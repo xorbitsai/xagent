@@ -640,3 +640,46 @@ async def test_retry_path_records_only_the_turn_key_when_not_applied(
     retry_messages = llm.stream_calls[1]["messages"]
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION not in retry_messages[0]["content"]
     assert FORM_ANSWER_FRAMING not in retry_messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_react_resolves_an_explicit_virtual_compact_model() -> None:
+    """An Auto compact model compacts on its selected candidate in a ReAct run."""
+    context = ExecutionContext(execution_id="exec-react-virtual-compact")
+    context.compact_config.threshold = 32000
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "function": {"name": "read_file", "arguments": "{}"}}
+        ],
+    )
+    context.add_tool_result(
+        "read_file", {"output": "x" * 200_000}, tool_call_id="call-1"
+    )
+    concrete = _NamedFakeLLM(
+        [{"content": "summary from the selected candidate"}],
+        model_name="candidate",
+        context_window=64_000,
+    )
+
+    class _VirtualCompact:
+        model_name = "auto"
+        context_window = None
+
+        async def prepare_for_call(
+            self, messages: list[dict[str, Any]], **_: Any
+        ) -> "_NamedFakeLLM":
+            return concrete
+
+    main = _NamedFakeLLM([_final_answer_call("Done.")])
+    result = await ReActPattern(max_iterations=2).run(
+        context=context,
+        tools=[],
+        llm=main,
+        runtime=PatternRuntime(execution_id="exec-react-virtual-compact"),
+        compact_llm=_VirtualCompact(),
+    )
+
+    assert result["success"] is True
+    assert len(concrete.calls) == 1

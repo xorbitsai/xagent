@@ -1707,7 +1707,10 @@ def promote_handover_pauses(now: datetime, report: AutoResumeTickReport) -> None
         .where(
             person.task_id == TaskExecutionCommand.task_id,
             person_stop_after_handover_clause(
-                person, TaskExecutionCommand.id, TaskExecutionCommand.target_run_id
+                person,
+                TaskExecutionCommand.id,
+                TaskExecutionCommand.target_run_id,
+                TaskExecutionCommand.target_state_version,
             ),
         )
         .correlate(TaskExecutionCommand)

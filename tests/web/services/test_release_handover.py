@@ -67,6 +67,7 @@ from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
     COMMAND_PENDING,
+    PAUSE_ALREADY_PAUSED_ERROR,
     TaskCommandKind,
     stage_task_command,
 )
@@ -873,9 +874,9 @@ def test_a_person_pause_before_an_earlier_resume_is_not_this_stops(factory, chec
     _stage(
         factory, task_id, TaskCommandKind.PAUSE, "user:old", status=COMMAND_COMPLETED
     )
-    _stage(
-        factory, task_id, TaskCommandKind.RESUME, "user:lift", status=COMMAND_COMPLETED
-    )
+    _transition(factory, task_id, TaskControlState.PAUSE_REQUESTED)
+    _step_boundary(factory, task_id)
+    _continue(factory, task_id, TaskCommandKind.RESUME)
     _handed_over(factory, task_id)
 
     assert settle_handover_sync(RELEASE).recorded == 1
@@ -1586,3 +1587,131 @@ def test_settle_returns_the_notice_of_a_stopped_outcome(factory, checkpoint):
     assert report.recorded == 0
     assert [(n.task_id, n.run_id) for n in report.notices] == [(task_id, RUN)]
     assert settle_handover_sync(RELEASE).notices == ()
+
+
+# Who owns a run's stop: the hand-over, or a person? One case per combination of
+# a person's command (kind, state, queued before or after the hand-over PAUSE,
+# for one queued before: aimed at this stop or an earlier episode's) and where
+# the run rests (one or two ``state_version`` steps after the hand-over's).
+def _owner_matrix() -> list[Any]:
+    cases = []
+    stops = (TaskCommandKind.PAUSE, TaskCommandKind.CANCEL)
+    for kind in (*stops, TaskCommandKind.RESUME, TaskCommandKind.MESSAGE):
+        for state in ("pending", "completed", "failed", "rejected"):
+            if state == "rejected" and kind is not TaskCommandKind.PAUSE:
+                continue
+            for order in ("lower_same_stop", "lower_earlier_stop", "higher"):
+                if order == "lower_earlier_stop" and state == "pending":
+                    continue
+                for steps in (1, 2):
+                    if kind in stops:
+                        # A failed command stops nothing, but a PAUSE rejected
+                        # for finding nothing to pause was the person's request.
+                        counts = state != "failed"
+                        if order == "lower_earlier_stop":
+                            counts = False
+                        if order != "higher" and state == "pending":
+                            counts = True
+                        owned = not counts
+                    else:
+                        # A resume or a message stops nothing; once applied
+                        # after the stop it is a continuation, which moves the
+                        # run past the hand-over's versions.
+                        owned = not (state == "completed" and order == "higher")
+                    cases.append(
+                        pytest.param(
+                            kind,
+                            state,
+                            order,
+                            steps,
+                            owned,
+                            id=f"{kind.value}-{state}-{order}-step{steps}",
+                        )
+                    )
+    return cases
+
+
+@pytest.mark.parametrize(("kind", "state", "order", "steps", "owned"), _owner_matrix())
+def test_the_handover_owns_a_stop_only_when_no_person_stopped_it(
+    factory, checkpoint, kind, state, order, steps, owned
+):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    status = {
+        "pending": COMMAND_PENDING,
+        "completed": COMMAND_COMPLETED,
+        "failed": COMMAND_FAILED,
+        "rejected": COMMAND_FAILED,
+    }[state]
+    error = {
+        "failed": "boom",
+        "rejected": PAUSE_ALREADY_PAUSED_ERROR,
+    }.get(state)
+
+    def person() -> None:
+        _stage(factory, task_id, kind, "user:cmd", status=status)
+        if error is not None:
+            with factory() as db:
+                db.execute(
+                    sa.update(TaskExecutionCommand)
+                    .where(TaskExecutionCommand.command_id == "user:cmd")
+                    .values(error=error)
+                )
+                db.commit()
+
+    if order != "higher":
+        person()
+    if order == "lower_earlier_stop":
+        # The earlier episode: the run was paused and resumed since.
+        _transition(factory, task_id, TaskControlState.PAUSE_REQUESTED)
+        _transition(factory, task_id, TaskControlState.PAUSED, TaskStatus.PAUSED)
+        _transition(factory, task_id, TaskControlState.RUNNING, TaskStatus.RUNNING)
+    _stage(
+        factory,
+        task_id,
+        TaskCommandKind.PAUSE,
+        handover_command_id(RELEASE, task_id, RUN),
+        status=COMMAND_COMPLETED,
+        handover=True,
+    )
+    if steps == 2:
+        _transition(factory, task_id, TaskControlState.PAUSE_REQUESTED)
+    _step_boundary(factory, task_id)
+    if order == "higher":
+        person()
+        if (
+            kind in (TaskCommandKind.RESUME, TaskCommandKind.MESSAGE)
+            and state == "completed"
+        ):
+            _continue(factory, task_id)
+
+    with factory() as db:
+        assert handover_pause_owns_run(db, task_id, RUN) is owned
+    # The sweeper reads the same stop through SQL and must agree.
+    release_hold.reopen()
+    assert run_auto_resume_tick(now=utc_now()).handed_over == int(owned)
+
+
+def test_a_settled_earlier_pause_with_an_unknown_target_version_counts_as_a_stop(
+    factory, checkpoint
+):
+    # Without a version to tell its stop apart, it fails closed: the run stays
+    # with its user.
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _stage(
+        factory, task_id, TaskCommandKind.PAUSE, "user:old", status=COMMAND_COMPLETED
+    )
+    with factory() as db:
+        db.execute(
+            sa.update(TaskExecutionCommand)
+            .where(TaskExecutionCommand.command_id == "user:old")
+            .values(target_state_version=None)
+        )
+        db.commit()
+    _handed_over(factory, task_id)
+
+    with factory() as db:
+        assert not handover_pause_owns_run(db, task_id, RUN)

@@ -336,33 +336,52 @@ def person_stop_command_clause(command: Any, run_id: Any) -> Any:
 
 
 def person_stop_after_handover_clause(
-    command: Any, handover_command_id: Any, run_id: Any
+    command: Any, handover_command_id: Any, run_id: Any, handover_version: Any
 ) -> Any:
     """A person's stop of ``run_id`` that the hand-over's pause does not own.
 
-    Either a command after the hand-over PAUSE in any state but failed (a
-    PAUSE that failed because the run was already paused counts: it was the
-    person's request, rejected only for lack of anything left to pause), or
-    one queued before it that is not yet settled. Command ids order commands
-    per task, and a settled earlier command belongs to an earlier episode.
+    ``handover_version`` is the hand-over PAUSE's ``target_state_version``.
+    A person's PAUSE or CANCEL, in any state but failed (a PAUSE that failed
+    because the run was already paused counts: it was the person's request,
+    rejected only for lack of anything to pause), is the person's stop of
+    this episode when it:
+
+    - was queued after the hand-over PAUSE (a higher command id), or
+    - is not yet settled (queued before it, still waiting), or
+    - is settled, queued before it, but aimed at the same stop: its
+      ``target_state_version`` is not below the hand-over's (or is unknown).
+
+    Command ids only order commands per task; they do not say which stop a
+    command belongs to. On PostgreSQL a person's PAUSE can take a lower id
+    than the hand-over's while the run is still RUNNING and be applied in the
+    same unwind, so a settled one is told apart by the version it targeted:
+    every control transition bumps ``state_version``, so an earlier episode's
+    command targeted a strictly lower version.
     """
 
+    not_failed = or_(
+        command.status != COMMAND_FAILED,
+        and_(
+            command.kind == TaskCommandKind.PAUSE.value,
+            command.error.in_(PAUSE_NOT_APPLICABLE_ERRORS),
+        ),
+    )
     return and_(
         person_stop_command_clause(command, run_id),
         or_(
-            and_(
-                command.id > handover_command_id,
-                or_(
-                    command.status != COMMAND_FAILED,
-                    and_(
-                        command.kind == TaskCommandKind.PAUSE.value,
-                        command.error.in_(PAUSE_NOT_APPLICABLE_ERRORS),
-                    ),
-                ),
-            ),
+            and_(command.id > handover_command_id, not_failed),
             and_(
                 command.id < handover_command_id,
-                command.status.not_in(COMMAND_TERMINAL),
+                or_(
+                    command.status.not_in(COMMAND_TERMINAL),
+                    and_(
+                        not_failed,
+                        or_(
+                            command.target_state_version.is_(None),
+                            command.target_state_version >= handover_version,
+                        ),
+                    ),
+                ),
             ),
         ),
     )
@@ -409,7 +428,8 @@ def handover_pause_owner(
     hand-over's, however its commands were ordered. And no person has stopped
     it: no other PAUSE or CANCEL for the run after the hand-over (in any state
     but failed, except a PAUSE rejected for finding nothing to pause), nor one
-    queued before it that is not yet settled
+    queued before it that is not yet settled or that targeted this stop's
+    ``state_version`` or a later one
     (:func:`person_stop_after_handover_clause`).
 
     ``SHUTDOWN`` is recorded for such a pause by the release's settle step, by
@@ -466,7 +486,9 @@ def handover_pause_owner(
         select(Command.id)
         .where(
             Command.task_id == task_id,
-            person_stop_after_handover_clause(Command, handover.id, run_id),
+            person_stop_after_handover_clause(
+                Command, handover.id, run_id, handover.target_state_version
+            ),
         )
         .limit(1)
     ).first()

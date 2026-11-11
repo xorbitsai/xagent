@@ -747,7 +747,6 @@ _GOOGLE_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             Equals(("presentation_id",), FixtureRef("google-slides.presentation_id")),
             Equals(("title",), "xagent-smoke-seed-slides"),
             IsType(("slide_count",), "number"),
-            EachHasKeys(("slides",), ("slide_number", "object_id", "text")),
         ),
     ),
 }

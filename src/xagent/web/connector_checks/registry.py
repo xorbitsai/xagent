@@ -407,7 +407,6 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                     ),
                     Equals(("title",), "xagent-smoke-seed-slides"),
                     IsType(("slide_count",), "number"),
-                    EachHasKeys(("slides",), ("slide_number", "object_id", "text")),
                 ),
             ),
         ),

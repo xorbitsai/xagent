@@ -38,6 +38,17 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
+
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
@@ -534,7 +545,10 @@ async def test_auto_decision_sees_memory_context() -> None:
         for message in decision_messages
         if message["role"] == "system"
     )
-    assert "Answer simple follow-ups using the project memory." in system_context
+    assert "Answer simple follow-ups using the project memory." not in system_context
+    assert "Answer simple follow-ups using the project memory." in _all_text(
+        decision_messages
+    )
     assert [tool["function"]["name"] for tool in llm.calls[0]["tools"]] == [
         DECISION_TOOL_NAME,
         "load_skill",
@@ -1889,8 +1903,10 @@ async def test_auto_pattern_final_answer_redecision_refreshes_enrichment() -> No
         for message in resumed_llm.calls[0]["messages"]
         if message["role"] == "system"
     )
-    assert "memory for replacement question" in resumed_system_context
-    assert "memory for first question" not in resumed_system_context
+    resumed_prompt = _all_text(resumed_llm.calls[0]["messages"])
+    assert "memory for replacement question" in resumed_prompt
+    assert "memory for first question" not in resumed_prompt
+    assert "memory for replacement question" not in resumed_system_context
 
 
 @pytest.mark.asyncio
@@ -2494,7 +2510,10 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert child.kwargs is not None
     child_messages = child.kwargs["context"].get_messages_for_llm()
     child_system = child_messages[0]["content"]
-    assert "请始终使用中文回答。" in child_system
+    # The stale memory reaches the child as recalled context in the turn
+    # context, never as the language policy in the system message.
+    assert "请始终使用中文回答。" not in child_system
+    assert "请始终使用中文回答。" in _all_text(child_messages)
     assert "Output language:" not in child_system
     assert "Output language policy:" not in child_system
     request_text = "Summarize the quarterly revenue trend in one paragraph."

@@ -26,6 +26,16 @@ from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
 
 
 class FakeLLM:
@@ -631,11 +641,9 @@ async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
     )
 
     assert result["success"] is True
-    system_prompt = next(
-        message["content"]
-        for message in llm.calls[0]["messages"]
-        if message["role"] == "system"
-    )
+    # The turn clock is in the turn context and the turn-start date in the
+    # system message; read the prompt as a whole.
+    system_prompt = _all_text(llm.calls[0]["messages"])
 
     # created_at is a dataclass default_factory, so it cannot be monkeypatched
     # from here. Reading the UTC stamp back out of the prompt pins the pair
@@ -677,11 +685,7 @@ async def test_request_context_without_timezone_keeps_utc_clocks() -> None:
     result = await adapter.execute(task="Say done", task_id="utc-exec", context={})
 
     assert result["success"] is True
-    system_prompt = next(
-        message["content"]
-        for message in llm.calls[0]["messages"]
-        if message["role"] == "system"
-    )
+    system_prompt = _all_text(llm.calls[0]["messages"])
     assert "Turn-start date (UTC): " in system_prompt
     assert " UTC. Real time keeps advancing" in system_prompt
     assert "which is" not in system_prompt
@@ -980,7 +984,9 @@ async def test_execution_adapter_includes_persisted_conversation_history() -> No
     assert result["success"] is True
     messages = llm.calls[0]["messages"]
     assert [
-        message["content"] for message in messages if message["role"] == "user"
+        _without_turn_context(message["content"])
+        for message in messages
+        if message["role"] == "user"
     ] == [
         "用 Python 生成随机整数",
         "生成一个返回给我",
@@ -1031,9 +1037,11 @@ async def test_execution_adapter_includes_persisted_execution_context_before_his
         and "Previous tool result: output/index_en.html exists." in message["content"]
         for message in messages
     )
-    assert [message["content"] for message in messages if message["role"] == "user"][
-        -2:
-    ] == ["写到文件", "继续修改文件"]
+    assert [
+        _without_turn_context(message["content"])
+        for message in messages
+        if message["role"] == "user"
+    ][-2:] == ["写到文件", "继续修改文件"]
 
 
 @pytest.mark.asyncio
@@ -1062,7 +1070,9 @@ async def test_agent_service_passes_conversation_history_to_execution_adapter() 
     assert result["success"] is True
     messages = llm.calls[0]["messages"]
     assert [
-        message["content"] for message in messages if message["role"] == "user"
+        _without_turn_context(message["content"])
+        for message in messages
+        if message["role"] == "user"
     ] == [
         "用 Python 生成随机整数",
         "生成一个返回给我",

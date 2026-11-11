@@ -28,7 +28,8 @@ def test_normal_turn_sends_request_once_with_focus_and_language_rules() -> None:
     messages = ctx.get_messages_for_llm()
 
     assert _count(messages, "UNIQUE-REQ") == 1
-    assert messages[-1]["content"] == LONG_REQUEST
+    # The request text leads the message; the per-turn context follows it.
+    assert messages[-1]["content"].startswith(f"{LONG_REQUEST}\n\nTurn context")
     system = _system(messages)
     assert "the latest user message written by the user" in system
     assert FOCUS in system

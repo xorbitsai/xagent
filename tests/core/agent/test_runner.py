@@ -63,6 +63,16 @@ from xagent.core.model.chat.exceptions import (
 from xagent.core.model.chat.routing_context import xinference_routing_key
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 from xagent.core.user_context import current_user_id
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
 
 
 @pytest.fixture(autouse=True)
@@ -3197,9 +3207,9 @@ async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> Non
     assert "Output language: Simplified Chinese" not in system_content
     # The request is sent once, as the latest user message.
     assert "Summarize the release notes in one paragraph." not in system_content
-    assert [m["content"] for m in sent if m["role"] == "user"] == [
-        "Summarize the release notes in one paragraph."
-    ]
+    assert [
+        _without_turn_context(m["content"]) for m in sent if m["role"] == "user"
+    ] == ["Summarize the release notes in one paragraph."]
 
 
 @pytest.mark.asyncio
@@ -3244,9 +3254,9 @@ async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
     assert "Output language: Simplified Chinese" not in system_content
     # The request is sent once, as the latest user message.
     assert "Summarize the release notes in one paragraph." not in system_content
-    assert [m["content"] for m in sent if m["role"] == "user"] == [
-        "Summarize the release notes in one paragraph."
-    ]
+    assert [
+        _without_turn_context(m["content"]) for m in sent if m["role"] == "user"
+    ] == ["Summarize the release notes in one paragraph."]
 
 
 @pytest.mark.asyncio

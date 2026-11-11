@@ -929,29 +929,36 @@ def test_a_cleanable_write_keeps_a_pending_exemption() -> None:
         assert exemptions[tool].endswith("decided in #3567"), tool
 
 
-def test_each_permanent_write_reason_names_its_own_tools() -> None:
-    expected = {
-        "gmail": {"gmail_send_messages": WRITE_WITHOUT_CLEANUP},
-        "google-docs": {
-            "google_docs_append_text": WRITE_WITHOUT_REVERT,
-            "google_docs_batch_update": WRITE_WITHOUT_REVERT,
-            "google_docs_create_document": WRITE_WITHOUT_CLEANUP,
-            "google_docs_replace_text": WRITE_WITHOUT_REVERT,
-        },
-        "google-sheets": {"google_sheets_create_spreadsheet": WRITE_WITHOUT_CLEANUP},
-        "google-slides": {
-            "google_slides_create_presentation": WRITE_WITHOUT_CLEANUP,
-            "google_slides_import_pptx": WRITE_WITHOUT_CLEANUP,
-        },
+# Each Google app's write exemptions that carry a permanent reason instead of a
+# pending one. A connector whose writes can all be cleaned up has none.
+_GOOGLE_PERMANENT_WRITE_REASONS: Mapping[str, Mapping[str, str]] = {
+    "gmail": {"gmail_send_messages": WRITE_WITHOUT_CLEANUP},
+    "google-analytics": {},
+    "google-calendar": {},
+    "google-docs": {
+        "google_docs_append_text": WRITE_WITHOUT_REVERT,
+        "google_docs_batch_update": WRITE_WITHOUT_REVERT,
+        "google_docs_create_document": WRITE_WITHOUT_CLEANUP,
+        "google_docs_replace_text": WRITE_WITHOUT_REVERT,
+    },
+    "google-drive": {},
+    "google-sheets": {"google_sheets_create_spreadsheet": WRITE_WITHOUT_CLEANUP},
+    "google-slides": {
+        "google_slides_create_presentation": WRITE_WITHOUT_CLEANUP,
+        "google_slides_import_pptx": WRITE_WITHOUT_CLEANUP,
+    },
+}
+
+
+@pytest.mark.parametrize("app_id", sorted(_GOOGLE_APP_MODULES))
+def test_each_permanent_write_reason_names_its_own_tools(app_id: str) -> None:
+    actual = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS[app_id].exemptions
+        if exemption.reason in (WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT)
     }
 
-    for app_id, tools in expected.items():
-        actual = {
-            exemption.tool: exemption.reason
-            for exemption in CONNECTOR_CHECKS[app_id].exemptions
-            if exemption.reason in (WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT)
-        }
-        assert actual == tools, app_id
+    assert actual == _GOOGLE_PERMANENT_WRITE_REASONS[app_id], app_id
 
 
 def test_gmail_manage_labels_is_exempt_for_the_read_step_rule() -> None:

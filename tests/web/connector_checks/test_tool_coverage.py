@@ -25,7 +25,6 @@ from xagent.web.connector_checks.registry import (
     CONNECTOR_CHECKS,
     LEGACY_CONNECTORS,
     WRITE_WITHOUT_CLEANUP,
-    WRITE_WITHOUT_REVERT,
 )
 
 # LEGACY_CONNECTORS, pinned. A connector that adopts V2 leaves both lists in
@@ -152,7 +151,7 @@ def test_a_legacy_connector_is_a_builtin_connector():
 # the tool has no check without one. Every other exemption is pending and names
 # its issue.
 _REASONS_THAT_NAME_NO_ISSUE = frozenset(
-    {WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT, _GMAIL_LABEL_WITHOUT_READ}
+    {WRITE_WITHOUT_CLEANUP, _GMAIL_LABEL_WITHOUT_READ}
 )
 
 

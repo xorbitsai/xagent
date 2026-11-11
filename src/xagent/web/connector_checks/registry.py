@@ -33,7 +33,7 @@ from .fixtures import FixtureRef
 
 # Why a tool of an in-repo connector has no check yet (#3565). A reason for
 # work still to come names the issue of the connector's family that decides
-# it; a write the server's own tools cannot undo is a reason of its own.
+# it; a write whose object no tool can delete is a reason of its own.
 _GOOGLE_TIER_1 = "#3567"
 _MICROSOFT_365_TIER_1 = "#3569"
 # Tier 2 runs structural reads only: no seeded objects and no write checks.
@@ -41,10 +41,6 @@ _TIER_2 = "#3573"
 WRITE_WITHOUT_CLEANUP = (
     "write that creates an object no tool of this server deletes, so a write "
     "check has nothing to clean up with"
-)
-WRITE_WITHOUT_REVERT = (
-    "write that edits content in place, and no tool of this server restores "
-    "it, so a write check has nothing to clean up with"
 )
 # Gmail's one label tool reads and writes labels. A label write check's verify
 # or cleanup guard would therefore call the tool the check creates and deletes
@@ -63,8 +59,8 @@ def _exemptions(
     issue: str,
     reads: tuple[str, ...] = (),
     writes: tuple[str, ...] = (),
+    in_place_edits: tuple[str, ...] = (),
     writes_without_cleanup: tuple[str, ...] = (),
-    writes_without_revert: tuple[str, ...] = (),
 ) -> tuple[ToolExemption, ...]:
     return (
         *(
@@ -82,10 +78,18 @@ def _exemptions(
             for tool in writes
         ),
         *(
+            ToolExemption(
+                tool,
+                "write that edits content in place: a write check creates, "
+                "verifies and deletes its own object and has no step for an "
+                f"edit, so whether a check is added is decided in {issue}",
+            )
+            for tool in in_place_edits
+        ),
+        *(
             ToolExemption(tool, WRITE_WITHOUT_CLEANUP)
             for tool in writes_without_cleanup
         ),
-        *(ToolExemption(tool, WRITE_WITHOUT_REVERT) for tool in writes_without_revert),
     )
 
 
@@ -279,12 +283,12 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
         exemptions=_exemptions(
             issue=_GOOGLE_TIER_1,
-            writes_without_cleanup=("google_docs_create_document",),
-            writes_without_revert=(
+            in_place_edits=(
                 "google_docs_append_text",
                 "google_docs_batch_update",
                 "google_docs_replace_text",
             ),
+            writes_without_cleanup=("google_docs_create_document",),
         ),
     ),
     "google-drive": ConnectorChecks(

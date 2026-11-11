@@ -35,7 +35,6 @@ from xagent.web.connector_checks.declarations import (
 from xagent.web.connector_checks.registry import (
     CONNECTOR_CHECKS,
     WRITE_WITHOUT_CLEANUP,
-    WRITE_WITHOUT_REVERT,
     _declared_l3,
     connector_checks_for,
     l3_read_check,
@@ -935,12 +934,7 @@ _GOOGLE_PERMANENT_WRITE_REASONS: Mapping[str, Mapping[str, str]] = {
     "gmail": {"gmail_send_messages": WRITE_WITHOUT_CLEANUP},
     "google-analytics": {},
     "google-calendar": {},
-    "google-docs": {
-        "google_docs_append_text": WRITE_WITHOUT_REVERT,
-        "google_docs_batch_update": WRITE_WITHOUT_REVERT,
-        "google_docs_create_document": WRITE_WITHOUT_CLEANUP,
-        "google_docs_replace_text": WRITE_WITHOUT_REVERT,
-    },
+    "google-docs": {"google_docs_create_document": WRITE_WITHOUT_CLEANUP},
     "google-drive": {},
     "google-sheets": {"google_sheets_create_spreadsheet": WRITE_WITHOUT_CLEANUP},
     "google-slides": {
@@ -955,10 +949,30 @@ def test_each_permanent_write_reason_names_its_own_tools(app_id: str) -> None:
     actual = {
         exemption.tool: exemption.reason
         for exemption in CONNECTOR_CHECKS[app_id].exemptions
-        if exemption.reason in (WRITE_WITHOUT_CLEANUP, WRITE_WITHOUT_REVERT)
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
     }
 
     assert actual == _GOOGLE_PERMANENT_WRITE_REASONS[app_id], app_id
+
+
+def test_the_docs_in_place_edits_wait_on_an_edit_step() -> None:
+    """A write check creates, verifies and deletes its own object and has no
+    step for an edit, so the three Docs edits stay pending (#3567)."""
+    exemptions = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS["google-docs"].exemptions
+    }
+
+    for tool in (
+        "google_docs_append_text",
+        "google_docs_batch_update",
+        "google_docs_replace_text",
+    ):
+        assert exemptions[tool] == (
+            "write that edits content in place: a write check creates, "
+            "verifies and deletes its own object and has no step for an "
+            "edit, so whether a check is added is decided in #3567"
+        ), tool
 
 
 def test_gmail_manage_labels_is_exempt_for_the_read_step_rule() -> None:

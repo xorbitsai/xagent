@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import threading
@@ -470,6 +471,66 @@ def test_s3_put_bytes_persists_sha256_metadata(tmp_path):
         "MetadataDirective": "REPLACE",
         "ContentType": "text/plain",
     }
+
+
+@pytest.mark.parametrize("method", ["put_file", "put_bytes"])
+def test_s3_writes_do_not_call_makedirs(tmp_path, method):
+    # S3 has no directories, and s3fs makedirs may send CreateBucket, which
+    # races with concurrent writers (#3719).
+    class WriteHandle:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def write(self, data):
+            self.sink.append(data)
+            return len(data)
+
+    class BusyMakedirsStorage:
+        def __init__(self):
+            self.written = []
+            self.makedirs_calls = []
+
+        def open(self, path, mode, **kwargs):
+            return WriteHandle(self.written)
+
+        def makedirs(self, path, exist_ok=False):
+            self.makedirs_calls.append(path)
+            raise OSError(
+                errno.EBUSY,
+                "A conflicting conditional operation is currently in progress "
+                "against this resource. Please try again.",
+            )
+
+        def info(self, path):
+            return {"size": 4}
+
+        def copy(self, source, destination, **kwargs):
+            return None
+
+    backend = BusyMakedirsStorage()
+    storage = FsspecFileStorage(
+        fs=backend,
+        root="bucket/root",
+        backend="s3",
+        base_uri="s3://bucket/root",
+        materialize_dir=tmp_path,
+    )
+
+    if method == "put_file":
+        source = tmp_path / "data.txt"
+        source.write_bytes(b"data")
+        storage.put_file(source, "uploads/nested/data.txt", "text/plain")
+    else:
+        storage.put_bytes(b"data", "uploads/nested/data.txt", "text/plain")
+
+    assert b"".join(backend.written) == b"data"
+    assert backend.makedirs_calls == []
 
 
 def test_s3_content_hash_reads_sha256_metadata(tmp_path):

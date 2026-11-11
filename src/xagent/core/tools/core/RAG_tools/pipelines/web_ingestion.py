@@ -21,7 +21,6 @@ from typing import (
 
 from xagent.core.utils.blocking import run_blocking
 
-from ..core.exceptions import CollectionMigratingError
 from ..core.schemas import (
     CrawlResult,
     IngestionConfig,
@@ -30,7 +29,7 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from ..kb.operation_compatibility import _close_awaitable_if_possible
-from ..management.migration_state import ensure_collection_writable_async
+from ..management.migration_state import admitted_async
 from ..progress import get_progress_manager
 from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
@@ -389,8 +388,30 @@ async def _run_web_ingestion_impl(
     user_id = scope.user_id
     is_admin = scope.is_admin
 
-    await ensure_collection_writable_async(collection)
+    async with admitted_async(collection):
+        return await _run_web_ingestion_body(
+            collection,
+            crawl_config,
+            ingestion_config=ingestion_config,
+            progress_callback=progress_callback,
+            user_id=user_id,
+            is_admin=is_admin,
+            file_handler=file_handler,
+            pipeline_facade=pipeline_facade,
+        )
 
+
+async def _run_web_ingestion_body(
+    collection: str,
+    crawl_config: WebCrawlConfig,
+    *,
+    ingestion_config: Optional[IngestionConfig] = None,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    file_handler: Optional[Callable[[Path, str, str, str], FileHandlerResult]] = None,
+    pipeline_facade: Optional["KBPipelineCompatibilityFacade"] = None,
+) -> WebIngestionResult:
     start_time = datetime.now(timezone.utc)
     warnings: list[str] = []
     failed_urls: dict[str, str] = {}
@@ -570,8 +591,6 @@ async def _run_web_ingestion_impl(
                                 final_file_path,
                                 final_file_id,
                             )
-                        except CollectionMigratingError:
-                            raise
                         except Exception as e:
                             logger.exception(
                                 "File handler failed for %s", crawl_result.url
@@ -669,8 +688,6 @@ async def _run_web_ingestion_impl(
                                 message=ingest_result.message,
                             )
 
-                    except CollectionMigratingError:
-                        raise
                     except Exception as e:
                         logger.exception("Failed to ingest %s", crawl_result.url)
                         failed_urls[crawl_result.url] = str(e)
@@ -698,8 +715,6 @@ async def _run_web_ingestion_impl(
                             message=failure_message,
                         )
 
-                except CollectionMigratingError:
-                    raise
                 except Exception as e:
                     logger.exception("Failed to ingest %s", crawl_result.url)
                     failed_urls[crawl_result.url] = str(e)
@@ -725,8 +740,6 @@ async def _run_web_ingestion_impl(
             return_exceptions=True,
         )
         for (_, crawl_result), outcome in zip(pending_pages, page_outcomes):
-            if isinstance(outcome, CollectionMigratingError):
-                raise outcome
             if isinstance(outcome, Exception):
                 logger.error(
                     "Unexpected error ingesting %s: %s",

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, Optional
 
 import pyarrow as pa  # type: ignore
 
@@ -23,6 +25,11 @@ FROZEN = "frozen"
 WRITE_MAX_RETRIES = 3
 
 logger = logging.getLogger(__name__)
+
+# Collections whose operation already passed its single admission check.
+_ADMITTED: ContextVar[frozenset[str]] = ContextVar(
+    "kb_admitted_collections", default=frozenset()
+)
 
 _SCHEMA = pa.schema(
     [
@@ -165,6 +172,62 @@ def move_migration_state(old_name: str, new_name: str) -> None:
     clear_migration_state(old_name)
 
 
+def _admit(collection: str) -> None:
+    _ADMITTED.set(_ADMITTED.get() | {collection})
+
+
+def _is_admitted(collection: str) -> bool:
+    return collection in _ADMITTED.get()
+
+
+@contextmanager
+def admitted(collection: str) -> Iterator[None]:
+    """Check the freeze once per operation; nested checks for it are no-ops."""
+    if _is_admitted(collection):
+        yield
+        return
+    ensure_collection_writable(collection)
+    token = _ADMITTED.set(_ADMITTED.get() | {collection})
+    try:
+        yield
+    finally:
+        _ADMITTED.reset(token)
+
+
+@asynccontextmanager
+async def admitted_async(collection: str) -> AsyncIterator[None]:
+    """Async counterpart of :func:`admitted`."""
+    if _is_admitted(collection):
+        yield
+        return
+    await ensure_collection_writable_async(collection)
+    token = _ADMITTED.set(_ADMITTED.get() | {collection})
+    try:
+        yield
+    finally:
+        _ADMITTED.reset(token)
+
+
+async def admitted_context_async(collection: str) -> Context:
+    """Check once, then return a context carrying the admission into a thread."""
+    if not _is_admitted(collection):
+        await ensure_collection_writable_async(collection)
+    context = copy_context()
+    context.run(_admit, collection)
+    return context
+
+
+def run_in_admitted_context(
+    context: Context,
+    fn: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run ``fn`` under a context returned by :func:`admitted_context_async`."""
+    return context.run(fn, *args, **kwargs)
+
+
 def _raise_if_frozen(collection_name: str, state: CollectionMigrationState) -> None:
     if state.state == FROZEN:
         raise CollectionMigratingError(
@@ -176,10 +239,14 @@ def _raise_if_frozen(collection_name: str, state: CollectionMigrationState) -> N
 
 def ensure_collection_writable(collection_name: str) -> None:
     """Raise before a write when the collection is frozen for migration."""
+    if _is_admitted(collection_name):
+        return
     _raise_if_frozen(collection_name, read_migration_state(collection_name))
 
 
 async def ensure_collection_writable_async(collection_name: str) -> None:
     """Async guard: runs the blocking state read off the event loop."""
+    if _is_admitted(collection_name):
+        return
     state = await asyncio.to_thread(read_migration_state, collection_name)
     _raise_if_frozen(collection_name, state)

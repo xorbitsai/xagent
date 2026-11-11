@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
+from xagent.core.tools.core.RAG_tools.core.schemas import CollectionOperationResult
 from xagent.core.tools.core.RAG_tools.utils.user_scope import get_user_scope
 from xagent.web.api.kb import handle_kb_exceptions, with_kb_user_scope
 
@@ -432,7 +433,7 @@ async def test_delete_collection_route_maps_migration_freeze_to_409() -> None:
             return_value=(user, access),
         ),
         patch(
-            "xagent.web.api.kb.ensure_collection_writable_async",
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -468,7 +469,7 @@ async def test_batch_delete_frozen_collection_is_per_item_failure_and_continues(
             return_value=(user, access),
         ),
         patch(
-            "xagent.web.api.kb.ensure_collection_writable_async",
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
             new=_guard,
         ),
         patch(
@@ -537,7 +538,7 @@ async def test_ingest_route_maps_migration_freeze_to_409() -> None:
         ),
         patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
         patch(
-            "xagent.web.api.kb.ensure_collection_writable_async",
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -573,7 +574,7 @@ async def test_ingest_cloud_route_maps_migration_freeze_to_409() -> None:
         patch("xagent.web.api.kb._enforce_storage_gate"),
         patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
         patch(
-            "xagent.web.api.kb.ensure_collection_writable_async",
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -598,7 +599,7 @@ async def test_ingest_web_route_maps_migration_freeze_to_409() -> None:
         ),
         patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
         patch(
-            "xagent.web.api.kb.ensure_collection_writable_async",
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -671,7 +672,7 @@ async def test_delete_document_route_maps_migration_freeze_to_409() -> None:
         ),
         patch("xagent.web.api.kb.get_vector_index_store") as vector_store,
         patch(
-            "xagent.web.api.kb.ensure_collection_writable_async",
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -686,3 +687,169 @@ async def test_delete_document_route_maps_migration_freeze_to_409() -> None:
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == _MIGRATION_DETAIL
     vector_store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_route_admission_covers_the_core_guard() -> None:
+    """A freeze after the route admission must not refuse the delete half-way."""
+    from unittest.mock import patch
+
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+    from xagent.web.api.kb import delete_collection_api
+
+    user, db, access = _migration_mocks()
+    success = CollectionOperationResult(collection="kb", status="success", message="")
+
+    def _perform(name: str, *args: object) -> object:
+        # Freeze lands after the route admitted, before the core guard.
+        _freeze_state(name)
+        state_module.ensure_collection_writable(name)
+        return success
+
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb.notify_knowledge_base_deleted"),
+        patch(
+            "xagent.web.api.kb._perform_kb_collection_delete",
+            side_effect=_perform,
+        ),
+    ):
+        result = await delete_collection_api(collection_name="kb", _user=user, db=db)
+
+    assert result is success
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_route_admission_covers_the_core_guard() -> None:
+    from unittest.mock import patch
+
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+    from xagent.web.api.kb import (
+        BatchDeleteCollectionsRequest,
+        batch_delete_collections_api,
+    )
+
+    user, db, access = _migration_mocks()
+    success = CollectionOperationResult(collection="kb", status="success", message="")
+
+    def _perform(name: str, *args: object) -> object:
+        _freeze_state(name)
+        state_module.ensure_collection_writable(name)
+        return success
+
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb.notify_knowledge_base_deleted"),
+        patch(
+            "xagent.web.api.kb._perform_kb_collection_delete",
+            side_effect=_perform,
+        ) as delete_one,
+    ):
+        result = await batch_delete_collections_api(
+            body=BatchDeleteCollectionsRequest(collection_names=["a", "b"]),
+            _user=user,
+            db=db,
+        )
+
+    assert result.deleted == ["a", "b"]
+    assert result.failed == []
+    assert [call.args[0] for call in delete_one.call_args_list] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_rename_route_admission_covers_the_coordinator_leg() -> None:
+    """The coordinator must still rename everything when a freeze lands mid-route."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+    from xagent.web.api.kb import rename_collection_api
+
+    user, db, access = _migration_mocks()
+    renamed = {"vector": False, "status": False, "metadata": False}
+
+    class _Facade:
+        async def rename_collection_data(self, **kwargs: object) -> list[str]:
+            # Route precheck saw idle; the freeze lands before this core leg.
+            _freeze_state("kb")
+            await state_module.ensure_collection_writable_async("kb")
+            renamed["vector"] = True
+            return []
+
+        async def rename_collection_metadata(self, **kwargs: object) -> None:
+            renamed["metadata"] = True
+
+        def rename_collection_status(self, **kwargs: object) -> list[str]:
+            renamed["status"] = True
+            return []
+
+    physical = MagicMock(
+        status="not_found",
+        error=None,
+        old_collection_dir=None,
+        new_collection_dir=None,
+    )
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb._list_collections_with_retry",
+            new=AsyncMock(return_value=SimpleNamespace(collections=[])),
+        ),
+        patch(
+            "xagent.web.api.kb._resolve_collection_mutation_scope",
+            return_value=SimpleNamespace(
+                owner_user_ids=[1], file_ids_by_owner={1: set()}
+            ),
+        ),
+        patch(
+            "xagent.web.api.kb.get_upload_path",
+            return_value=MagicMock(exists=lambda: False),
+        ),
+        patch(
+            "xagent.web.api.kb.rename_collection_storage", return_value=physical
+        ) as physical_rename,
+        patch(
+            "xagent.web.api.kb._get_api_compatibility_facade", return_value=_Facade()
+        ),
+        patch("xagent.web.api.kb.notify_knowledge_base_renamed"),
+    ):
+        result = await rename_collection_api(
+            collection_name="kb", new_name="kb-new", _user=user, db=db
+        )
+
+    physical_rename.assert_called_once()
+    assert renamed == {"vector": True, "status": True, "metadata": True}
+    assert result["status"] == "partial_success"
+
+
+@pytest.mark.asyncio
+async def test_delete_helper_lets_migration_refusal_through() -> None:
+    """A direct core refusal must stay CollectionMigratingError, not become a 500."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from xagent.web.api.kb import _perform_kb_collection_delete
+
+    _freeze_state("kb")
+    with patch(
+        "xagent.web.api.kb._resolve_collection_mutation_scope",
+        return_value=SimpleNamespace(owner_user_ids=[], file_ids_by_owner={}),
+    ):
+        with pytest.raises(CollectionMigratingError):
+            _perform_kb_collection_delete("kb", 1, True, MagicMock())

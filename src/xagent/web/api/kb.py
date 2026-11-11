@@ -93,7 +93,10 @@ from ...core.tools.core.RAG_tools.kb.models import (
     RollbackFailedUploadIngestionRequest,
 )
 from ...core.tools.core.RAG_tools.management.migration_state import (
+    admitted_async,
+    admitted_context_async,
     ensure_collection_writable_async,
+    run_in_admitted_context,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
@@ -3495,7 +3498,7 @@ async def ingest(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
-    await ensure_collection_writable_async(safe_collection)
+    ingest_admission = await admitted_context_async(safe_collection)
 
     try:
         get_collection_sync(safe_collection)
@@ -3653,8 +3656,11 @@ async def ingest(
         loop = asyncio.get_running_loop()
         # Billed to the member who uploaded, not the storage tenant. The scope
         # lives in the worker, so a cancelled request still delivers it.
+        # run_in_executor does not carry contextvars; the admission goes in explicitly.
         api_result = await loop.run_in_executor(
             None,
+            run_in_admitted_context,
+            ingest_admission,
             run_in_usage_scope,
             int(actor_user.id),
             "kb_ingest",
@@ -4085,7 +4091,7 @@ async def ingest_cloud(
         collection_existed_before = False
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
-    await ensure_collection_writable_async(safe_collection)
+    cloud_ingest_admission = await admitted_context_async(safe_collection)
     # Once access is confirmed and before anything is downloaded; every file
     # is ingested under this resolution and checked again as it starts.
     model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
@@ -4400,6 +4406,8 @@ async def ingest_cloud(
                         api_result: KBApiOperationResult[
                             IngestionResult
                         ] = await asyncio.to_thread(
+                            run_in_admitted_context,
+                            cloud_ingest_admission,
                             run_in_usage_scope,
                             actor_user_id,
                             "kb_ingest_cloud",
@@ -5253,7 +5261,7 @@ async def ingest_web(
         )
 
         await _ensure_collection_access(safe_collection, _user, allow_create=True)
-        await ensure_collection_writable_async(safe_collection)
+        web_ingest_admission = await admitted_context_async(safe_collection)
 
         url_patterns_list = (
             [p.strip() for p in url_patterns.split(",")] if url_patterns else None
@@ -5531,6 +5539,8 @@ async def ingest_web(
         # tasks.
         api_result = await asyncio.get_running_loop().run_in_executor(
             None,
+            run_in_admitted_context,
+            web_ingest_admission,
             run_in_usage_scope,
             int(actor_user.id),
             "kb_ingest_web",
@@ -6289,6 +6299,9 @@ def _perform_kb_collection_delete(
 
     except HTTPException:
         raise
+    except CollectionMigratingError:
+        # The 409 mapping lives in handle_kb_exceptions; do not wrap as 500.
+        raise
     except Exception as exc:
         logger.exception("Failed to delete collection '%s'", collection_name)
         raise HTTPException(
@@ -6332,14 +6345,14 @@ async def delete_collection_api(
     _user, access = _effective_knowledge_base_user(
         db, _user, safe_collection, action="delete"
     )
-    await ensure_collection_writable_async(safe_collection)
-    notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
-    result = _perform_kb_collection_delete(
-        safe_collection,
-        int(_user.id),
-        bool(_user.is_admin),
-        db,
-    )
+    async with admitted_async(safe_collection):
+        notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
+        result = _perform_kb_collection_delete(
+            safe_collection,
+            int(_user.id),
+            bool(_user.is_admin),
+            db,
+        )
     if result.status in ("success", "partial_success"):
         db.commit()
     else:
@@ -6386,23 +6399,23 @@ async def batch_delete_collections_api(
                 effective_user, access = _effective_knowledge_base_user(
                     db, _user, safe_name, action="delete"
                 )
-                await ensure_collection_writable_async(safe_name)
-                # Validate the current delete mode before the lifecycle hook,
-                # then let the delete pipeline re-check it immediately before
-                # mutation. Ownership can change between these two points.
-                if not effective_user.is_admin:
-                    _get_collection_delete_mode(
+                async with admitted_async(safe_name):
+                    # Validate the current delete mode before the lifecycle hook,
+                    # then let the delete pipeline re-check it immediately before
+                    # mutation. Ownership can change between these two points.
+                    if not effective_user.is_admin:
+                        _get_collection_delete_mode(
+                            safe_name,
+                            int(effective_user.id),
+                            is_admin=False,
+                        )
+                    notify_knowledge_base_deleted(db, access.storage_user_id, safe_name)
+                    result = _perform_kb_collection_delete(
                         safe_name,
                         int(effective_user.id),
-                        is_admin=False,
+                        bool(effective_user.is_admin),
+                        db,
                     )
-                notify_knowledge_base_deleted(db, access.storage_user_id, safe_name)
-                result = _perform_kb_collection_delete(
-                    safe_name,
-                    int(effective_user.id),
-                    bool(effective_user.is_admin),
-                    db,
-                )
                 if result.status in ("success", "partial_success"):
                     db.commit()
                     deleted.append(name)
@@ -6581,7 +6594,7 @@ async def delete_document_api(
 
     # Collection-level gate + vector fallback (rename / metadata lag vs strict visibility).
     await _ensure_collection_access_for_document_delete(safe_collection_name, _user)
-    await ensure_collection_writable_async(safe_collection_name)
+    document_delete_admission = await admitted_context_async(safe_collection_name)
 
     # Use storage abstraction layer to fetch document records
     vector_store = get_vector_index_store()
@@ -7088,7 +7101,8 @@ async def delete_document_api(
             logger.error("%s", error_msg)
             continue
         try:
-            delete_result = delete_document(
+            delete_result = document_delete_admission.run(
+                delete_document,
                 safe_collection_name,
                 resolved_doc_id,
                 int(_user.id),
@@ -7263,7 +7277,6 @@ async def rename_collection_api(
 
     # Access control check
     await _ensure_collection_access(safe_old_collection, _user, hide_missing=False)
-    await ensure_collection_writable_async(safe_old_collection)
 
     # Validate that target collection doesn't exist or user has access
     visible_for_user = await _list_collections_with_retry(
@@ -7326,66 +7339,69 @@ async def rename_collection_api(
                 detail=_rename_target_has_files_detail(safe_new_collection),
             )
 
-    physical_rename_results = {}
-    renamed_owner_ids: list[int] = []
-    for owner_id in sorted(mutation_scope.owner_user_ids):
-        physical_rename = rename_collection_storage(
-            db,
-            user_id=owner_id,
-            old_collection_name=safe_old_collection,
-            new_collection_name=safe_new_collection,
-            collection_file_ids=mutation_scope.file_ids_by_owner.get(owner_id, set()),
-        )
-        physical_rename_results[owner_id] = physical_rename
-        if physical_rename.status == "success":
-            renamed_owner_ids.append(owner_id)
-        if physical_rename.status != "failed":
-            continue
-
-        for rollback_owner_id in reversed(renamed_owner_ids):
-            rollback = rename_collection_storage(
+    async with admitted_async(safe_old_collection):
+        physical_rename_results = {}
+        renamed_owner_ids: list[int] = []
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            physical_rename = rename_collection_storage(
                 db,
-                user_id=rollback_owner_id,
-                old_collection_name=safe_new_collection,
-                new_collection_name=safe_old_collection,
+                user_id=owner_id,
+                old_collection_name=safe_old_collection,
+                new_collection_name=safe_new_collection,
                 collection_file_ids=mutation_scope.file_ids_by_owner.get(
-                    rollback_owner_id, set()
+                    owner_id, set()
                 ),
             )
-            if rollback.status != "success":
-                logger.error(
-                    "Failed to roll back physical collection rename for user_%s %s -> %s: %s",
-                    rollback_owner_id,
-                    safe_new_collection,
-                    safe_old_collection,
-                    rollback.error,
+            physical_rename_results[owner_id] = physical_rename
+            if physical_rename.status == "success":
+                renamed_owner_ids.append(owner_id)
+            if physical_rename.status != "failed":
+                continue
+
+            for rollback_owner_id in reversed(renamed_owner_ids):
+                rollback = rename_collection_storage(
+                    db,
+                    user_id=rollback_owner_id,
+                    old_collection_name=safe_new_collection,
+                    new_collection_name=safe_old_collection,
+                    collection_file_ids=mutation_scope.file_ids_by_owner.get(
+                        rollback_owner_id, set()
+                    ),
                 )
+                if rollback.status != "success":
+                    logger.error(
+                        "Failed to roll back physical collection rename for user_%s %s -> %s: %s",
+                        rollback_owner_id,
+                        safe_new_collection,
+                        safe_old_collection,
+                        rollback.error,
+                    )
 
-        physical_rename_error = physical_rename.error
-        if (
-            physical_rename_error
-            == "Another operation is in progress; please try again later."
-        ):
-            raise HTTPException(status_code=409, detail=physical_rename_error)
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to rename collection: cannot rename physical directory. "
-                f"Error: {physical_rename_error}. "
-                "Please ensure the directory is not in use and you have proper permissions."
-            ),
-        )
+            physical_rename_error = physical_rename.error
+            if (
+                physical_rename_error
+                == "Another operation is in progress; please try again later."
+            ):
+                raise HTTPException(status_code=409, detail=physical_rename_error)
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Failed to rename collection: cannot rename physical directory. "
+                    f"Error: {physical_rename_error}. "
+                    "Please ensure the directory is not in use and you have proper permissions."
+                ),
+            )
 
-    # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
-    # Use storage abstraction layer which handles all tables including embeddings
-    warnings.extend(
-        await _get_api_compatibility_facade().rename_collection_data(
-            collection_name=safe_old_collection,
-            new_name=safe_new_collection,
-            user_id=int(_user.id),
-            is_admin=bool(_user.is_admin),
+        # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
+        # Use storage abstraction layer which handles all tables including embeddings
+        warnings.extend(
+            await _get_api_compatibility_facade().rename_collection_data(
+                collection_name=safe_old_collection,
+                new_name=safe_new_collection,
+                user_id=int(_user.id),
+                is_admin=bool(_user.is_admin),
+            )
         )
-    )
 
     try:
         await _get_api_compatibility_facade().rename_collection_metadata(

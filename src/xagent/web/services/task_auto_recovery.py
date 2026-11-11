@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -76,7 +76,11 @@ from .task_command_transport import (
     AUTO_RESUME_COMMAND_PREFIX,
     COMMAND_COMPLETED,
     COMMAND_FAILED,
+    COMMAND_TERMINAL,
     HANDOVER_COMMAND_PREFIX,
+    PAUSE_NOT_APPLICABLE_ERRORS,
+    TaskCommandKind,
+    command_id_has_prefix,
 )
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
@@ -298,82 +302,190 @@ def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
     return auto_recovery_eligibility(db, task).eligible
 
 
-def handover_pause_owns_run(db: Session, task_id: int, run_id: str | None) -> bool:
-    """Whether a release hand-over's pause, and no person's, stopped ``run_id``.
+# ``state_version`` steps from the version a hand-over PAUSE was staged at (the
+# command's ``target_state_version``, the run RUNNING). Every control
+# transition bumps it by exactly one: the pause request (``pause_requested``)
+# is one step and the rest at the step boundary (``paused``) the next. A run
+# that settled PAUSED before its pause request was written (the command then
+# completes as applied) is one step. Any continuation of the run (a resume, a
+# message, an input answer, a later pause) moves it past these steps.
+HANDOVER_REQUESTED_STEP = 1
+HANDOVER_PAUSED_STEPS = (1, 2)
 
-    The durable marker of a planned shutdown (``release_handover``): a
-    *completed* hand-over PAUSE (command id in the reserved
-    ``release-handover:`` namespace) aimed at ``run_id``, and no other PAUSE
-    or CANCEL for it -- a person's, queued before or after, in any state but
-    failed. A CANCEL with no target counts too. Command id order does not
-    matter, so a user pause queued before the hand-over began is seen.
 
-    Only commands since the last RESUME completed before that hand-over count
-    (a resume keeps the run id, so a person's older pause of the same run is
-    not this stop's). ``SHUTDOWN`` is recorded for such a pause by the
-    release's settle step, by lease recovery and by the auto-resume sweeper
-    alike, so a controller that died or a release that was aborted after the
-    pause applied does not leave a user pause behind.
+def person_stop_command_clause(command: Any, run_id: Any) -> Any:
+    """A person's PAUSE or CANCEL aimed at ``run_id``, whatever its state.
+
+    A PAUSE in the reserved ``release-handover:`` namespace is the platform's.
+    A CANCEL with no target counts, as it stops whichever run is current.
+    ``command`` is the ``TaskExecutionCommand`` (or an alias of it) and
+    ``run_id`` a value or a column.
+    """
+
+    return or_(
+        and_(
+            command.kind == TaskCommandKind.PAUSE.value,
+            command.target_run_id == run_id,
+            ~command_id_has_prefix(command.command_id, HANDOVER_COMMAND_PREFIX),
+        ),
+        and_(
+            command.kind == TaskCommandKind.CANCEL.value,
+            or_(command.target_run_id == run_id, command.target_run_id.is_(None)),
+        ),
+    )
+
+
+def person_stop_after_handover_clause(
+    command: Any, handover_command_id: Any, run_id: Any
+) -> Any:
+    """A person's stop of ``run_id`` that the hand-over's pause does not own.
+
+    Either a command after the hand-over PAUSE in any state but failed (a
+    PAUSE that failed because the run was already paused counts: it was the
+    person's request, rejected only for lack of anything left to pause), or
+    one queued before it that is not yet settled. Command ids order commands
+    per task, and a settled earlier command belongs to an earlier episode.
+    """
+
+    return and_(
+        person_stop_command_clause(command, run_id),
+        or_(
+            and_(
+                command.id > handover_command_id,
+                or_(
+                    command.status != COMMAND_FAILED,
+                    and_(
+                        command.kind == TaskCommandKind.PAUSE.value,
+                        command.error.in_(PAUSE_NOT_APPLICABLE_ERRORS),
+                    ),
+                ),
+            ),
+            and_(
+                command.id < handover_command_id,
+                command.status.not_in(COMMAND_TERMINAL),
+            ),
+        ),
+    )
+
+
+def handover_version_step_clause(task_version: Any, command: Any) -> Any:
+    """SQL form of :data:`HANDOVER_PAUSED_STEPS` for a PAUSED task."""
+
+    return and_(
+        command.target_state_version.is_not(None),
+        (task_version - command.target_state_version).in_(HANDOVER_PAUSED_STEPS),
+    )
+
+
+@dataclass(frozen=True)
+class HandoverPauseOwner:
+    """The completed hand-over PAUSE that owns a run's current stop."""
+
+    command_db_id: int
+    # When the pause completed (its last update when that was not stamped):
+    # the run stopped no later than this.
+    completed_at: datetime | None
+
+
+def handover_pause_owner(
+    db: Session, task_id: int, run_id: str | None
+) -> HandoverPauseOwner | None:
+    """The hand-over PAUSE that stopped ``run_id`` as it stands now, or ``None``.
+
+    Ownership is tied to the run's state, not to command history: the run has
+    not left the stop the hand-over produced. The latest *completed*
+    hand-over PAUSE for the run (command id in the reserved
+    ``release-handover:`` namespace) recorded the task's ``state_version`` when
+    it was staged, the run RUNNING. The run is the hand-over's while it is
+    still at that stop:
+
+    - PAUSED (control state too) at one or two ``state_version`` steps after
+      it (see :data:`HANDOVER_PAUSED_STEPS`), or
+    - RUNNING with the pause requested, one step after it (the run is about to
+      rest PAUSED, or died first and lease recovery will pause it).
+
+    Any continuation advances ``state_version`` past those, so a run its user
+    resumed, answered or messaged, or that was paused again later, is not the
+    hand-over's, however its commands were ordered. And no person has stopped
+    it: no other PAUSE or CANCEL for the run after the hand-over (in any state
+    but failed, except a PAUSE rejected for finding nothing to pause), nor one
+    queued before it that is not yet settled
+    (:func:`person_stop_after_handover_clause`).
+
+    ``SHUTDOWN`` is recorded for such a pause by the release's settle step, by
+    lease recovery and by the auto-resume sweeper alike, so a controller that
+    died or a release that was aborted after the pause applied does not leave
+    a user pause behind.
     """
 
     if run_id is None:
-        return False
-    from sqlalchemy import and_, func, or_
+        return None
 
     from ..models.task_command import TaskExecutionCommand as Command
 
-    def _handover(column: Any) -> Any:
-        return (
-            func.substr(column, 1, len(HANDOVER_COMMAND_PREFIX))
-            == HANDOVER_COMMAND_PREFIX
+    task = db.execute(
+        select(Task.run_id, Task.status, Task.control_state, Task.state_version).where(
+            Task.id == task_id
         )
-
-    handover_id = db.execute(
-        select(func.max(Command.id)).where(
+    ).first()
+    if task is None or task.run_id != run_id:
+        return None
+    handover = db.execute(
+        select(
+            Command.id,
+            Command.target_state_version,
+            Command.completed_at,
+            Command.updated_at,
+        )
+        .where(
             Command.task_id == task_id,
-            Command.kind == "pause",
+            Command.kind == TaskCommandKind.PAUSE.value,
             Command.status == COMMAND_COMPLETED,
             Command.target_run_id == run_id,
-            _handover(Command.command_id),
+            command_id_has_prefix(Command.command_id, HANDOVER_COMMAND_PREFIX),
         )
-    ).scalar_one_or_none()
-    if handover_id is None:
-        return False
-    epoch_start = (
-        db.execute(
-            select(func.max(Command.id)).where(
-                Command.task_id == task_id,
-                Command.kind == "resume",
-                Command.status == COMMAND_COMPLETED,
-                Command.id < handover_id,
-            )
-        ).scalar_one_or_none()
-        or 0
+        .order_by(Command.id.desc())
+        .limit(1)
+    ).first()
+    if handover is None or handover.target_state_version is None:
+        return None
+    step = int(task.state_version or 0) - int(handover.target_state_version)
+    resting = (
+        task.status == TaskStatus.PAUSED
+        and task.control_state == TaskControlState.PAUSED.value
+        and step in HANDOVER_PAUSED_STEPS
     )
+    requested = (
+        task.status == TaskStatus.RUNNING
+        and task.control_state == TaskControlState.PAUSE_REQUESTED.value
+        and step == HANDOVER_REQUESTED_STEP
+    )
+    if not (resting or requested):
+        return None
     person = db.execute(
         select(Command.id)
         .where(
             Command.task_id == task_id,
-            Command.id > epoch_start,
-            Command.status != COMMAND_FAILED,
-            or_(
-                and_(
-                    Command.kind == "pause",
-                    Command.target_run_id == run_id,
-                    ~_handover(Command.command_id),
-                ),
-                and_(
-                    Command.kind == "cancel",
-                    or_(
-                        Command.target_run_id == run_id,
-                        Command.target_run_id.is_(None),
-                    ),
-                ),
-            ),
+            person_stop_after_handover_clause(Command, handover.id, run_id),
         )
         .limit(1)
     ).first()
-    return person is None
+    if person is not None:
+        return None
+    completed_at = handover.completed_at or handover.updated_at
+    return HandoverPauseOwner(
+        command_db_id=int(handover.id),
+        completed_at=_as_utc(completed_at) if completed_at is not None else None,
+    )
+
+
+def handover_pause_owns_run(db: Session, task_id: int, run_id: str | None) -> bool:
+    """Whether a release hand-over's pause, and no person's, stopped ``run_id``.
+
+    See :func:`handover_pause_owner` for what that means.
+    """
+
+    return handover_pause_owner(db, task_id, run_id) is not None
 
 
 def record_interruption_no_commit(
@@ -661,7 +773,7 @@ def _user_command_since_dispatch(
 
     if last_command_id is None:
         return False
-    from sqlalchemy import and_, func, select
+    from sqlalchemy import func
 
     from ..models.task_command import TaskExecutionCommand
 
@@ -694,12 +806,9 @@ def _user_command_since_dispatch(
             # A release hand-over's pause is the platform's, not a person's.
             ~and_(
                 TaskExecutionCommand.kind == "pause",
-                func.substr(
-                    TaskExecutionCommand.command_id,
-                    1,
-                    len(HANDOVER_COMMAND_PREFIX),
-                )
-                == HANDOVER_COMMAND_PREFIX,
+                command_id_has_prefix(
+                    TaskExecutionCommand.command_id, HANDOVER_COMMAND_PREFIX
+                ),
             ),
         )
         .limit(1)

@@ -1,10 +1,11 @@
 """Hand unfinished runs of a draining process to its successor.
 
 A host that replaces this process on purpose (the SaaS thin ingress Gate)
-drains up to a deadline. Runs that are still executing at the deadline must
-neither be cancelled nor re-run from a checkpoint: they stop at the step
-boundary the run's own pause already defines, in command order, and the
-successor resumes them.
+drains up to a deadline. Runs that are still executing at the deadline are
+not re-run from a checkpoint: they stop through the run's own pause, at the
+step boundary it defines and in command order, and the successor resumes
+them. That pause interrupts the work in flight (see below), so this is a
+pause between steps, not a promise that nothing is cancelled.
 
 This module is the engine half and adds no new execution path:
 
@@ -14,14 +15,20 @@ This module is the engine half and adds no new execution path:
   predicate for it: status-only sdk tasks and channel tasks are not, and only
   drain). The lease owner applies it exactly as it applies a user's pause:
   the command completes when the pause is *requested*, and the run rests
-  ``PAUSED`` at its next step boundary with its checkpoint intact.
-  ``request_interrupt`` cancels a tool call that is in flight, so a
-  legacy-checkpoint run is resumed only when its checkpoint shows no started
-  tool call.
+  ``PAUSED`` at its next step boundary with its checkpoint intact. The
+  pause is the run's ordinary one: ``request_interrupt`` cancels the LLM call
+  and the tool call that are in flight. A run whose checkpoint then shows a
+  tool call that may have started is **not** handed over: it rests ``PAUSED``
+  with a ``manual`` row (``unknown_tool_effect``, or ``tool_in_flight`` for a
+  legacy checkpoint) for its user and is never resumed automatically. This
+  is narrower than a pause "between tool calls": a running tool is
+  interrupted, not waited for, and the pause is not deferred until none is
+  active.
 - The completed PAUSE command, in the reserved ``release-handover:``
   namespace, is the durable marker that the pause was the platform's
-  (:func:`~.task_auto_recovery.handover_pause_owns_run`, which also checks
-  that no person paused or cancelled the run). Whoever then sees the run
+  (:func:`~.task_auto_recovery.handover_pause_owns_run`: the run has not
+  left the stop the hand-over produced, judged by ``state_version``, and no
+  person paused or cancelled it). Whoever then sees the run
   PAUSED records it as a ``shutdown`` interruption: this module's
   :func:`settle_handover_sync` as an accelerator, and without it lease
   recovery (a run that died while PAUSE_REQUESTED) and the auto-resume
@@ -39,7 +46,8 @@ This module is the engine half and adds no new execution path:
 
 Runs whose user already asked for a pause or cancel (queued before or after
 the hand-over, in command order or not) are the user's and are left alone.
-Nothing here cancels, times out or queues work.
+Nothing here times out or queues work; the only work it cancels is what
+``request_interrupt`` cancels in a run it pauses (above).
 
 Host contract, enforced where it can be:
 
@@ -66,19 +74,21 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import cast
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ...config import get_task_auto_resume_enabled
 from ...core.agent.interruption import InterruptionReason
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
-from ..models.task_auto_recovery import TaskAutoRecovery
+from ..models.task_auto_recovery import TaskAutoRecovery, TaskAutoRecoveryState
 from ..models.task_command import TaskExecutionCommand
 from .release_hold import release_hold
 from .task_auto_recovery import (
+    _project_interruption_pause_no_commit,
     _settlement_candidate,
-    handover_pause_owns_run,
+    handover_pause_owner,
+    person_stop_command_clause,
     record_interruption_no_commit,
     resolution_progress_marker,
     resolution_tool_call_in_flight,
@@ -91,12 +101,12 @@ from .task_command_transport import (
     COMMAND_TERMINAL,
     HANDOVER_COMMAND_PREFIX,
     TaskCommandKind,
+    command_id_has_prefix,
     notify_task_command_dispatcher,
     stage_task_command,
 )
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
-    CheckpointRecoveryVerdict,
     resolve_checkpoint_recovery_with_data,
 )
 from .task_settlement_report import RecordedInterruption
@@ -137,6 +147,9 @@ class RecordOutcome(Enum):
     # No resumable checkpoint (or an unknown tool effect): the run stays paused
     # for its user, with a ``manual`` row saying why. Committed like RECORDED.
     NOT_RECOVERABLE = "not_recoverable"
+    # Recorded as ``shutdown``, but automatic resume will not take the run
+    # (its window or attempts are spent): it stays paused for its user.
+    STOPPED = "stopped"
     # Not (or no longer) a handed-over pause, or already recorded.
     SKIPPED = "skipped"
 
@@ -148,6 +161,11 @@ class RecordResult:
 
 
 _SKIPPED = RecordResult(RecordOutcome.SKIPPED)
+# Rows that say automatic resume will not run the paused run.
+_AUTO_RESUME_SPENT_STATES = (
+    TaskAutoRecoveryState.EXHAUSTED.value,
+    TaskAutoRecoveryState.EXPIRED.value,
+)
 
 
 def _release_prefix(release_id: str) -> str:
@@ -167,8 +185,7 @@ def _release_commands(db: Session, release_id: str) -> list[TaskExecutionCommand
         db.execute(
             select(TaskExecutionCommand)
             .where(
-                # Exact and case-sensitive (``LIKE`` is neither on SQLite).
-                func.substr(TaskExecutionCommand.command_id, 1, len(prefix)) == prefix,
+                command_id_has_prefix(TaskExecutionCommand.command_id, prefix),
                 TaskExecutionCommand.kind == TaskCommandKind.PAUSE.value,
             )
             .order_by(TaskExecutionCommand.id)
@@ -178,33 +195,15 @@ def _release_commands(db: Session, release_id: str) -> list[TaskExecutionCommand
     )
 
 
-def _person_stop_queued(db: Session, task: Task) -> bool:
-    """A person's PAUSE or CANCEL of the current run is not yet terminal."""
+def _person_stop_queued(db: Session, task_id: int, run_id: str) -> bool:
+    """A person's PAUSE or CANCEL of the run is not yet terminal."""
     return (
         db.execute(
             select(TaskExecutionCommand.id)
             .where(
-                TaskExecutionCommand.task_id == task.id,
+                TaskExecutionCommand.task_id == task_id,
                 TaskExecutionCommand.status.not_in(COMMAND_TERMINAL),
-                or_(
-                    and_(
-                        TaskExecutionCommand.kind == TaskCommandKind.PAUSE.value,
-                        TaskExecutionCommand.target_run_id == task.run_id,
-                        func.substr(
-                            TaskExecutionCommand.command_id,
-                            1,
-                            len(HANDOVER_COMMAND_PREFIX),
-                        )
-                        != HANDOVER_COMMAND_PREFIX,
-                    ),
-                    and_(
-                        TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
-                        or_(
-                            TaskExecutionCommand.target_run_id == task.run_id,
-                            TaskExecutionCommand.target_run_id.is_(None),
-                        ),
-                    ),
-                ),
+                person_stop_command_clause(TaskExecutionCommand, run_id),
             )
             .limit(1)
         ).first()
@@ -223,7 +222,11 @@ def begin_handover_sync(
     a pause or cancel queued is left to that user.
 
     The PAUSE carries the task owner as its actor, like the sweeper's RESUME:
-    executing a command needs a real actor.
+    executing a command needs a real actor. Staging snapshots the run's
+    ``state_version`` (the command's ``target_state_version``, the run being
+    RUNNING under the lock taken here): the anchor the hand-over's ownership
+    of the stop it produces is judged by
+    (:func:`~.task_auto_recovery.handover_pause_owner`).
     """
 
     if not release_hold.closed or release_hold.sealed:
@@ -237,8 +240,16 @@ def begin_handover_sync(
     staged = 0
     kept = 0
     with get_session_local()() as db:
-        tasks = (
-            db.execute(
+        # Plain values: a rolled-back SAVEPOINT expires the session's objects,
+        # and a later task's row must not be reloaded outside its own try.
+        rows = [
+            (
+                int(task.id),
+                str(task.run_id) if task.run_id is not None else None,
+                int(task.user_id),
+                str(task.control_state),
+            )
+            for task in db.execute(
                 select(Task)
                 .where(Task.status == TaskStatus.RUNNING, Task.runner_id.in_(runners))
                 .order_by(Task.id)
@@ -246,48 +257,58 @@ def begin_handover_sync(
             )
             .scalars()
             .all()
-        )
-        for task in tasks:
-            if task.run_id is None:
+        ]
+        for task_id, run_id, user_id, control_state in rows:
+            if run_id is None:
                 kept += 1
                 continue
-            command_id = handover_command_id(release_id, int(task.id), str(task.run_id))
+            command_id = handover_command_id(release_id, task_id, run_id)
+            created = 0
+            left_to_drain = False
             try:
-                already = db.execute(
-                    select(TaskExecutionCommand.id).where(
-                        TaskExecutionCommand.task_id == task.id,
-                        TaskExecutionCommand.command_id == command_id,
-                    )
-                ).first()
-                if already is not None:
-                    # This release's pause is in flight or failed; settle says which.
-                    continue
-                if (
-                    task.control_state != TaskControlState.RUNNING.value
-                    or _person_stop_queued(db, task)
-                    or not shutdown_handoff_eligible(db, int(task.id))
-                ):
-                    # A pause (the user's) already moves it, or it is not a run
-                    # the successor would resume: it keeps draining.
-                    kept += 1
-                    continue
+                # Every read and the staging in one SAVEPOINT: on PostgreSQL a
+                # failed statement aborts the transaction, and the others'
+                # commands (and the final commit) must survive it.
                 with db.begin_nested():
-                    result = stage_task_command(
-                        db,
-                        task_id=int(task.id),
-                        actor_user_id=int(task.user_id),
-                        command_id=command_id,
-                        kind=TaskCommandKind.PAUSE,
-                        payload={},
-                        target_run_id=str(task.run_id),
-                        handover=True,
-                    )
-                staged += int(result.created)
+                    already = db.execute(
+                        select(TaskExecutionCommand.id).where(
+                            TaskExecutionCommand.task_id == task_id,
+                            TaskExecutionCommand.command_id == command_id,
+                        )
+                    ).first()
+                    if already is not None:
+                        # This release's pause is in flight or failed; settle says
+                        # which.
+                        continue
+                    if (
+                        control_state != TaskControlState.RUNNING.value
+                        or _person_stop_queued(db, task_id, run_id)
+                        or not shutdown_handoff_eligible(db, task_id)
+                    ):
+                        # A pause (the user's) already moves it, or it is not a
+                        # run the successor would resume: it keeps draining.
+                        left_to_drain = True
+                    else:
+                        created = int(
+                            stage_task_command(
+                                db,
+                                task_id=task_id,
+                                actor_user_id=user_id,
+                                command_id=command_id,
+                                kind=TaskCommandKind.PAUSE,
+                                payload={},
+                                target_run_id=run_id,
+                                handover=True,
+                            ).created
+                        )
             except Exception:
                 logger.exception(
-                    "Staging the handover pause of task %s failed", task.id
+                    "Staging the handover pause of task %s failed", task_id
                 )
                 kept += 1
+                continue
+            staged += created
+            kept += int(left_to_drain)
         if staged:
             db.commit()
         else:
@@ -304,13 +325,16 @@ def record_handover_pause_no_commit(
 
     ``task`` is the locked row. Shared by :func:`settle_handover_sync` and the
     auto-resume sweeper. Only a task resting PAUSED whose pause
-    :func:`~.task_auto_recovery.handover_pause_owns_run` attributes to a
+    :func:`~.task_auto_recovery.handover_pause_owner` attributes to a
     hand-over, with no recovery row at its current fence yet, is recorded. A
     run with no resumable checkpoint is left paused (``NOT_RECOVERABLE``), one
     whose legacy checkpoint shows a started tool call rests as
-    ``manual(tool_in_flight)``, as after a crash, and one whose checkpoint
-    cannot be read now is ``PENDING``. Idempotent per ``(run, state_version)``;
-    a run handed over again in a later release is recorded again.
+    ``manual(tool_in_flight)``, as after a crash, one whose automatic resume
+    window or attempts are spent is ``STOPPED``, and one whose checkpoint
+    cannot be read now is ``PENDING``. A trigger task's TriggerRun follows the
+    recording as in every settling path. ``interrupted_at`` is when the pause
+    completed. Idempotent per ``(run, state_version)``; a run handed over
+    again in a later release is recorded again.
     """
 
     if (
@@ -326,61 +350,61 @@ def record_handover_pause_no_commit(
         and int(row.paused_state_version) == int(task.state_version or 0)
     ):
         return _SKIPPED
-    if not handover_pause_owns_run(db, int(task.id), str(task.run_id)):
+    owner = handover_pause_owner(db, int(task.id), str(task.run_id))
+    if owner is None:
         return _SKIPPED
     savepoint = db.begin_nested()
     try:
         resolution = resolve_checkpoint_recovery_with_data(
             db, _settlement_candidate(task)
         )
-        if resolution.verdict is CheckpointRecoveryVerdict.INDETERMINATE:
+        # A recoverable run is recorded for the successor; without a checkpoint
+        # to resume from (or with a tool whose effect is unknown) it stays
+        # paused for its user and the row says so, as after a crash. Without a
+        # row the sweeper would look at it again on every tick.
+        reason = verdict_interruption_reason(
+            resolution.verdict,
+            control_state=cast(str | None, task.control_state),
+            recoverable_reason=InterruptionReason.SHUTDOWN,
+            handover_pause=True,
+        )
+        if reason is None:
             # The checkpoint cannot be read this round: retry.
             savepoint.rollback()
             return RecordResult(RecordOutcome.PENDING)
-        if resolution.verdict is CheckpointRecoveryVerdict.RECOVERABLE:
-            reason = InterruptionReason.SHUTDOWN
-        else:
-            # No checkpoint to resume from (or a tool whose effect is unknown):
-            # the run stays paused for its user, and the row says so, as after
-            # a crash. Without a row the sweeper would look at it again on
-            # every tick.
-            maybe_reason = verdict_interruption_reason(
-                resolution.verdict,
-                control_state=cast(str | None, task.control_state),
-                recoverable_reason=InterruptionReason.SHUTDOWN,
-            )
-            if maybe_reason is None:
-                savepoint.rollback()
-                return RecordResult(RecordOutcome.PENDING)
-            reason = maybe_reason
         recorded_row = record_interruption_no_commit(
             db,
             task=task,
             reason=reason,
             task_status=TaskStatus.PAUSED,
-            interrupted_at=now,
+            # The run stopped when its pause completed, not when this noticed:
+            # a sweeper that finds it late must not stretch the staleness
+            # window measured from it.
+            interrupted_at=min(owner.completed_at or now, now),
             now=now,
             progress_marker=resolution_progress_marker(db, int(task.id), resolution),
             gated_by_settlement_switches=False,
             tool_call_in_flight=resolution_tool_call_in_flight(resolution),
         )
+        if recorded_row is None:
+            savepoint.rollback()
+            return _SKIPPED
+        recorded = RecordedInterruption.from_row(recorded_row)
+        # As every settling path does: a trigger task's TriggerRun follows the
+        # recording (it stays RUNNING while a resume is scheduled, else ends).
+        _project_interruption_pause_no_commit(db, task, recorded)
     except Exception:
         savepoint.rollback()
         logger.exception("Recording the handover pause of task %s failed", task.id)
         return RecordResult(RecordOutcome.PENDING)
     savepoint.commit()
-    return RecordResult(
-        (
-            RecordOutcome.RECORDED
-            if reason is InterruptionReason.SHUTDOWN
-            else RecordOutcome.NOT_RECOVERABLE
-        ),
-        recorded_notice(
-            RecordedInterruption.from_row(recorded_row)
-            if recorded_row is not None
-            else None
-        ),
-    )
+    if reason is not InterruptionReason.SHUTDOWN:
+        outcome = RecordOutcome.NOT_RECOVERABLE
+    elif recorded.state in _AUTO_RESUME_SPENT_STATES:
+        outcome = RecordOutcome.STOPPED
+    else:
+        outcome = RecordOutcome.RECORDED
+    return RecordResult(outcome, recorded_notice(recorded))
 
 
 def settle_handover_sync(release_id: str) -> HandoverReport:
@@ -431,7 +455,10 @@ def settle_handover_sync(release_id: str) -> HandoverReport:
                 wrote = True
                 if result.notice is not None:
                     notices.append(result.notice)
-            elif result.outcome is RecordOutcome.NOT_RECOVERABLE:
+            elif result.outcome in (
+                RecordOutcome.NOT_RECOVERABLE,
+                RecordOutcome.STOPPED,
+            ):
                 wrote = True
         if wrote:
             db.commit()

@@ -91,8 +91,10 @@ from .task_auto_recovery import (
     PLANNED_RECOVERY_EVENTS,
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     auto_recovery_eligibility,
+    handover_version_step_clause,
     is_auto_resume_command_id,
     is_status_only_source,
+    person_stop_after_handover_clause,
 )
 from .task_auto_recovery_policy import (
     auto_resume_limit,
@@ -110,6 +112,7 @@ from .task_command_transport import (
     COMMAND_TERMINAL,
     HANDOVER_COMMAND_PREFIX,
     TaskCommandKind,
+    command_id_has_prefix,
     notify_task_command_dispatcher,
     stage_task_command,
 )
@@ -1668,21 +1671,26 @@ HANDOVER_PROMOTE_WINDOW = timedelta(hours=2)
 HANDOVER_PROMOTE_LIMIT = 50
 
 
-def promote_handover_pauses(
-    now: datetime, report: AutoResumeTickReport, *, limit: int = HANDOVER_PROMOTE_LIMIT
-) -> None:
+def promote_handover_pauses(now: datetime, report: AutoResumeTickReport) -> None:
     """Record recent release hand-over pauses that nothing recorded yet.
 
     A release hand-over's completed PAUSE is the durable mark that the pause
     was the platform's (``release_handover``). Its host normally records it
     (``settle_handover_sync``); when that never happened (the release was
     aborted, the controller died) the run would rest as a user pause for
-    good. Bounded: PAUSED tasks whose latest hand-over PAUSE completed within
-    ``HANDOVER_PROMOTE_WINDOW`` and that have no recovery row at their current
-    ``state_version``, at most ``limit`` per tick. The recording is the
-    settle step's own routine, so a person's pause or cancel still wins.
-    A pause with no resumable checkpoint gets its ``manual`` row too, so it
-    is not looked at again; one whose checkpoint cannot be read now is.
+    good. Bounded: at most ``HANDOVER_PROMOTE_LIMIT`` tasks per tick, oldest
+    first, each counted once. A candidate is a PAUSED task whose hand-over
+    PAUSE completed within ``HANDOVER_PROMOTE_WINDOW``, that is still at the
+    stop that pause produced (``state_version`` within its steps, see
+    :func:`~.task_auto_recovery.handover_pause_owner`), that no person
+    stopped, and that has no recovery row at its current ``state_version``.
+    A run its user resumed, messaged or paused again has moved past those
+    versions and is never selected, and a person's pause or cancel excludes
+    the task in the query itself: neither is re-read every tick, so they
+    cannot crowd newer pauses out of the batch. The recording is the settle
+    step's own routine, which re-checks everything under the task's lock. A
+    pause with no resumable checkpoint gets its ``manual`` row too, so it is
+    not looked at again; one whose checkpoint cannot be read now is.
     """
 
     from ..models.database import get_session_local
@@ -1693,39 +1701,51 @@ def promote_handover_pauses(
         TaskAutoRecovery.run_id == Task.run_id,
         TaskAutoRecovery.paused_state_version == Task.state_version,
     )
-    with get_session_local()() as db:
-        task_ids = list(
-            dict.fromkeys(
-                int(task_id)
-                for task_id in db.execute(
-                    select(TaskExecutionCommand.task_id)
-                    .join(
-                        Task,
-                        and_(
-                            Task.id == TaskExecutionCommand.task_id,
-                            Task.run_id == TaskExecutionCommand.target_run_id,
-                        ),
-                    )
-                    .where(
-                        TaskExecutionCommand.status == COMMAND_COMPLETED,
-                        TaskExecutionCommand.created_at
-                        >= now - HANDOVER_PROMOTE_WINDOW,
-                        TaskExecutionCommand.kind == TaskCommandKind.PAUSE.value,
-                        func.substr(
-                            TaskExecutionCommand.command_id,
-                            1,
-                            len(HANDOVER_COMMAND_PREFIX),
-                        )
-                        == HANDOVER_COMMAND_PREFIX,
-                        Task.status == TaskStatus.PAUSED,
-                        Task.control_state == TaskControlState.PAUSED.value,
-                        ~fence,
-                    )
-                    .order_by(TaskExecutionCommand.id)
-                    .limit(limit)
-                ).scalars()
-            )
+    person = aliased(TaskExecutionCommand)
+    person_stop = (
+        exists()
+        .where(
+            person.task_id == TaskExecutionCommand.task_id,
+            person_stop_after_handover_clause(
+                person, TaskExecutionCommand.id, TaskExecutionCommand.target_run_id
+            ),
         )
+        .correlate(TaskExecutionCommand)
+    )
+    with get_session_local()() as db:
+        task_ids = [
+            int(task_id)
+            for task_id in db.execute(
+                select(TaskExecutionCommand.task_id)
+                .join(
+                    Task,
+                    and_(
+                        Task.id == TaskExecutionCommand.task_id,
+                        Task.run_id == TaskExecutionCommand.target_run_id,
+                    ),
+                )
+                .where(
+                    TaskExecutionCommand.status == COMMAND_COMPLETED,
+                    TaskExecutionCommand.created_at >= now - HANDOVER_PROMOTE_WINDOW,
+                    TaskExecutionCommand.kind == TaskCommandKind.PAUSE.value,
+                    command_id_has_prefix(
+                        TaskExecutionCommand.command_id, HANDOVER_COMMAND_PREFIX
+                    ),
+                    Task.status == TaskStatus.PAUSED,
+                    Task.control_state == TaskControlState.PAUSED.value,
+                    handover_version_step_clause(
+                        func.coalesce(Task.state_version, 0), TaskExecutionCommand
+                    ),
+                    ~fence,
+                    ~person_stop,
+                )
+                # One slot per task: a task with several hand-over commands in
+                # the window must not take several.
+                .group_by(TaskExecutionCommand.task_id)
+                .order_by(func.min(TaskExecutionCommand.id))
+                .limit(HANDOVER_PROMOTE_LIMIT)
+            ).scalars()
+        ]
         db.rollback()
     for task_id in task_ids:
         with get_session_local()() as db:
@@ -1741,6 +1761,7 @@ def promote_handover_pauses(
                 if result is None or result.outcome not in (
                     RecordOutcome.RECORDED,
                     RecordOutcome.NOT_RECOVERABLE,
+                    RecordOutcome.STOPPED,
                 ):
                     db.rollback()
                     continue

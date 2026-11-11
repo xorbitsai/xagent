@@ -162,6 +162,8 @@ from .task_command_transport import (
     COMMAND_ID_PATTERN,
     COMMAND_PROCESSING,
     MAX_COMMAND_FAILURES,
+    PAUSE_ALREADY_PAUSED_ERROR,
+    PAUSE_NO_LIVE_EXECUTION_ERROR,
     ClaimedTaskCommand,
     SettledTaskCommand,
     TaskCommandDeferred,
@@ -3404,9 +3406,9 @@ async def _pause_cap_held_commands_without_agent(
     ):
         return False
     pause_failure = (
-        "Task is already paused"
+        PAUSE_ALREADY_PAUSED_ERROR
         if status == TaskStatus.PAUSED
-        else "No live execution found to pause"
+        else PAUSE_NO_LIVE_EXECUTION_ERROR
     )
     message_data["_durable_command_error"] = pause_failure
     message_data["_durable_pause_not_applicable"] = True
@@ -3537,9 +3539,9 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 # is not running at all. Those read very differently to a user,
                 # so the persisted status picks the message.
                 pause_failure = (
-                    "Task is already paused"
+                    PAUSE_ALREADY_PAUSED_ERROR
                     if task_fields.status == TaskStatus.PAUSED
-                    else "No live execution found to pause"
+                    else PAUSE_NO_LIVE_EXECUTION_ERROR
                 )
                 message_data["_durable_command_error"] = pause_failure
                 error_payload = await _read_task_error_payload_offloop(

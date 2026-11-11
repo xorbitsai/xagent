@@ -29,6 +29,7 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from ..kb.operation_compatibility import _close_awaitable_if_possible
+from ..management.migration_state import ensure_collection_writable
 from ..progress import get_progress_manager
 from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
@@ -386,6 +387,8 @@ async def _run_web_ingestion_impl(
     scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
     user_id = scope.user_id
     is_admin = scope.is_admin
+
+    ensure_collection_writable(collection)
 
     start_time = datetime.now(timezone.utc)
     warnings: list[str] = []

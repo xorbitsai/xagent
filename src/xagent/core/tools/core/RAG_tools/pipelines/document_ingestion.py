@@ -47,6 +47,7 @@ from ..management.collection_manager import (
     update_collection_stats_sync,
     validate_document_processing_sync,
 )
+from ..management.migration_state import ensure_collection_writable
 from ..management.status import write_ingestion_status
 from ..parse.parse_document import parse_document
 from ..progress import ProgressManager, ProgressTracker
@@ -689,6 +690,8 @@ def _process_document_impl(
         coerce_ingestion_config(config),
         source_path,
     )
+
+    ensure_collection_writable(collection)
 
     # Initialize progress tracking
     if progress_manager is None:

@@ -30,6 +30,7 @@ from ..core.schemas import (
     RegisterDocumentResponse,
     SparseSearchResponse,
 )
+from ..management.migration_state import ensure_collection_writable
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
@@ -1023,6 +1024,8 @@ class KBCoordinator:
         """
         int_user_id = _normalize_user_id(user_id)
 
+        ensure_collection_writable(collection)
+
         handle = await self.open_collection(
             KBContextRequest(
                 collection=collection,
@@ -1218,6 +1221,8 @@ class KBCoordinator:
             A list of warning strings (empty on full success).
         """
         int_user_id = _normalize_user_id(user_id)
+
+        ensure_collection_writable(old_name)
 
         handle = await self.open_collection(
             KBContextRequest(

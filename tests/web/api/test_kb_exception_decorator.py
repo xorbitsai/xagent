@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from xagent.core.tools.core.RAG_tools.utils.user_scope import get_user_scope
 from xagent.web.api.kb import handle_kb_exceptions, with_kb_user_scope
 
@@ -365,3 +366,165 @@ async def test_with_kb_user_scope_ignores_positional_duck_typed_objects() -> Non
 
     assert user_id is None
     assert is_admin is False
+
+
+# --- Embedding-migration freeze mapping ---
+
+_MIGRATION_DETAIL = {
+    "code": "kb_collection_migrating",
+    "message": "frozen",
+}
+
+
+def _migration_error() -> CollectionMigratingError:
+    return CollectionMigratingError("frozen")
+
+
+@pytest.mark.asyncio
+async def test_handle_kb_exceptions_maps_migration_freeze_to_409() -> None:
+    exc = _migration_error()
+
+    @handle_kb_exceptions
+    async def _fn() -> None:
+        raise exc
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _fn()
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+def _migration_mocks() -> tuple[object, object, object]:
+    from unittest.mock import MagicMock
+
+    from xagent.web.models.user import User
+
+    user = MagicMock(spec=User)
+    user.id = 1
+    user.is_admin = True
+    db = MagicMock()
+    access = MagicMock()
+    access.storage_user_id = 1
+    return user, db, access
+
+
+@pytest.mark.asyncio
+async def test_delete_collection_route_maps_migration_freeze_to_409() -> None:
+    from unittest.mock import patch
+
+    from xagent.web.api.kb import delete_collection_api
+
+    user, db, access = _migration_mocks()
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch(
+            "xagent.web.api.kb.ensure_collection_writable",
+            side_effect=_migration_error(),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_collection_api(collection_name="kb", _user=user, db=db)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_batch_delete_route_maps_migration_freeze_to_409() -> None:
+    from unittest.mock import patch
+
+    from xagent.web.api.kb import (
+        BatchDeleteCollectionsRequest,
+        batch_delete_collections_api,
+    )
+
+    user, db, access = _migration_mocks()
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch(
+            "xagent.web.api.kb.ensure_collection_writable",
+            side_effect=_migration_error(),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await batch_delete_collections_api(
+                body=BatchDeleteCollectionsRequest(collection_names=["kb"]),
+                _user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+    db.rollback.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_rename_route_maps_migration_freeze_to_409() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from xagent.web.api.kb import rename_collection_api
+
+    user, db, access = _migration_mocks()
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb.ensure_collection_writable",
+            side_effect=_migration_error(),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await rename_collection_api(
+                collection_name="kb",
+                new_name="kb-new",
+                _user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_ingest_route_maps_migration_freeze_to_409() -> None:
+    import io
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi import UploadFile
+
+    from xagent.web.api.kb import ingest
+
+    user, db, access = _migration_mocks()
+    upload = UploadFile(filename="doc.pdf", file=io.BytesIO(b"content"))
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb.ensure_collection_writable",
+            side_effect=_migration_error(),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await ingest(
+                collection="kb",
+                file=upload,
+                parse_method=None,
+                _user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL

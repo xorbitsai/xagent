@@ -53,7 +53,10 @@ from ...config import (
 )
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
-from ...core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
+from ...core.tools.core.RAG_tools.core.exceptions import (
+    CollectionMigratingError,
+    DatabaseOperationError,
+)
 from ...core.tools.core.RAG_tools.core.parser_registry import (
     get_supported_parsers,
     validate_parser_compatibility,
@@ -88,6 +91,9 @@ from ...core.tools.core.RAG_tools.kb.config_merge import (
 from ...core.tools.core.RAG_tools.kb.models import (
     KBDocumentRowsSnapshot,
     RollbackFailedUploadIngestionRequest,
+)
+from ...core.tools.core.RAG_tools.management.migration_state import (
+    ensure_collection_writable,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
@@ -2630,6 +2636,14 @@ def handle_kb_exceptions(func: T) -> T:
             )
         except FileReferenceConflict:
             raise HTTPException(status_code=409, detail=ADMISSION_CONFLICT_MESSAGE)
+        except CollectionMigratingError as e:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "kb_collection_migrating",
+                    "message": e.message,
+                },
+            ) from e
         except RollbackFailureError as e:
             logger.error("KB rollback failure in %s: %s", func.__name__, e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -3481,6 +3495,8 @@ async def ingest(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
 
+    ensure_collection_writable(safe_collection)
+
     try:
         get_collection_sync(safe_collection)
         collection_existed_before = True
@@ -3844,6 +3860,7 @@ async def create_ingest_job(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
     await _ensure_background_job_queue_available_async()
+    ensure_collection_writable(safe_collection)
     # Before the upload is staged; the job resolves and checks again when it
     # runs.
     _, ingest_model_ids = await _resolve_kb_ingestion_models(
@@ -4068,6 +4085,7 @@ async def ingest_cloud(
         collection_existed_before = False
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    ensure_collection_writable(safe_collection)
     # Once access is confirmed and before anything is downloaded; every file
     # is ingested under this resolution and checked again as it starts.
     model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
@@ -5235,6 +5253,7 @@ async def ingest_web(
         )
 
         await _ensure_collection_access(safe_collection, _user, allow_create=True)
+        ensure_collection_writable(safe_collection)
 
         url_patterns_list = (
             [p.strip() for p in url_patterns.split(",")] if url_patterns else None
@@ -5589,6 +5608,8 @@ async def ingest_web(
         raise
     except CollectionConfigSaveError:
         raise
+    except CollectionMigratingError:
+        raise
     except (ValueError, KeyError, TypeError) as e:
         if "collection_existed_before" in locals() and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
@@ -5659,6 +5680,7 @@ async def create_ingest_web_job(
     )
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    ensure_collection_writable(safe_collection)
 
     url_patterns_list = (
         [p.strip() for p in url_patterns.split(",")] if url_patterns else None
@@ -6310,6 +6332,7 @@ async def delete_collection_api(
     _user, access = _effective_knowledge_base_user(
         db, _user, safe_collection, action="delete"
     )
+    ensure_collection_writable(safe_collection)
     notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
     result = _perform_kb_collection_delete(
         safe_collection,
@@ -6363,6 +6386,7 @@ async def batch_delete_collections_api(
                 effective_user, access = _effective_knowledge_base_user(
                     db, _user, safe_name, action="delete"
                 )
+                ensure_collection_writable(safe_name)
                 # Validate the current delete mode before the lifecycle hook,
                 # then let the delete pipeline re-check it immediately before
                 # mutation. Ownership can change between these two points.
@@ -6404,6 +6428,9 @@ async def batch_delete_collections_api(
                     name,
                 )
                 continue
+            except CollectionMigratingError:
+                db.rollback()
+                raise
             except Exception as e:
                 db.rollback()
                 logger.exception("Batch delete failed for collection %s: %s", name, e)
@@ -6553,6 +6580,7 @@ async def delete_document_api(
 
     # Collection-level gate + vector fallback (rename / metadata lag vs strict visibility).
     await _ensure_collection_access_for_document_delete(safe_collection_name, _user)
+    ensure_collection_writable(safe_collection_name)
 
     # Use storage abstraction layer to fetch document records
     vector_store = get_vector_index_store()
@@ -7234,6 +7262,7 @@ async def rename_collection_api(
 
     # Access control check
     await _ensure_collection_access(safe_old_collection, _user, hide_missing=False)
+    ensure_collection_writable(safe_old_collection)
 
     # Validate that target collection doesn't exist or user has access
     visible_for_user = await _list_collections_with_retry(

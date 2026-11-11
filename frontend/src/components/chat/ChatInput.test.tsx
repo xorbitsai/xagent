@@ -85,6 +85,15 @@ vi.mock("sonner", () => ({
 
 import { generateClientMessageId } from "@/lib/utils"
 import { ChatInput } from "./ChatInput"
+import { VoiceCallStoreProvider, usePublishVoiceCall } from "@/contexts/voice-call-store"
+import type { VoiceCall } from "@/hooks/use-voice-call"
+
+function PublishedCall({ call }: { call: VoiceCall }) { usePublishVoiceCall(call); return null }
+const fakeCall = (over: Partial<VoiceCall> = {}): VoiceCall => ({
+  open: true, phase: "listening", active: true, caption: "", muted: false,
+  status: "voiceConversation.states.listening", settingsLink: false, retryable: true, retryDisabled: false,
+  level: () => 0, retry: vi.fn(), end: vi.fn(), toggleMute: vi.fn(), ...over,
+})
 
 const emptyJsonResponse = () =>
   new Response(JSON.stringify([]), {
@@ -138,7 +147,7 @@ describe("ChatInput", () => {
     vi.unstubAllGlobals()
   })
 
-  it("opens voice mode beside the composer without sending or clearing its draft", async () => {
+  it("offers voice mode in place of the send button while nothing is typed", async () => {
     apiRequestMock.mockImplementation(async () => new Response(JSON.stringify([
       { id: 1, model_id: "live", model_name: "scribe_v2_realtime", abilities: ["asr"] },
       { id: 2, model_id: "tts", model_name: "eleven_v3", abilities: ["tts"] },
@@ -149,14 +158,21 @@ describe("ChatInput", () => {
     const onSend = vi.fn()
     const onInputChange = vi.fn()
     const { container, rerender } = render(<ChatInput onSend={onSend}
-      onVoiceConversation={openVoice} inputValue="Keep my draft" onInputChange={onInputChange}
+      onVoiceConversation={openVoice} inputValue="" onInputChange={onInputChange}
       readOnlyConfig taskConfig={{ model: "selected-model", executionMode: "flash" }} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
+    // Nothing to send, so the main action is the voice button, not send.
+    expect(container.querySelector("button[type='submit']")).toBeNull()
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
     expect(openVoice).toHaveBeenCalledWith(expect.objectContaining({ model: "selected-model", executionMode: { mode: "flash" } }))
-    expect(container.querySelector("[contenteditable]")).toHaveTextContent("Keep my draft")
     expect(onSend).not.toHaveBeenCalled()
     expect(onInputChange).not.toHaveBeenCalled()
+    // Once there is something to send it becomes the send button.
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} inputValue="Keep my draft"
+      onInputChange={onInputChange} readOnlyConfig taskConfig={{ model: "selected-model" }} />)
+    expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
+    expect(container.querySelector("button[type='submit']")).not.toBeNull()
+    expect(container.querySelector("[contenteditable]")).toHaveTextContent("Keep my draft")
     rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceConversationDisabled
       readOnlyConfig taskConfig={{ model: "selected-model" }} />)
     expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeDisabled()
@@ -164,6 +180,111 @@ describe("ChatInput", () => {
     expect(openVoice).toHaveBeenCalledOnce()
     rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceInputEnabled={false} />)
     expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { label: "a running task", props: { taskStatus: "running" } },
+    { label: "a run in progress", props: { isLoading: true, taskStatus: "waiting_for_user" } },
+  ])("will not offer to start a call during $label", async ({ props }) => {
+    apiRequestMock.mockImplementation(async () => new Response(JSON.stringify([
+      { id: 1, model_id: "live", model_name: "scribe_v2_realtime", abilities: ["asr"] },
+      { id: 2, model_id: "tts", model_name: "eleven_v3", abilities: ["tts"] },
+    ].map(model => ({ category: "speech", model_provider: "elevenlabs", base_url: null, temperature: null,
+      context_window: null, dimension: null, description: null, created_at: null, updated_at: null,
+      is_active: true, is_owner: true, can_edit: true, can_delete: true, is_shared: false, ...model }))), { status: 200 }))
+    const openVoice = vi.fn()
+    render(<ChatInput onSend={vi.fn()} onVoiceConversation={openVoice} inputValue="" onInputChange={vi.fn()}
+      readOnlyConfig taskConfig={{ model: "selected-model" }} {...props} />)
+    const button = await screen.findByRole("button", { name: "voiceConversation.open" })
+    expect(button).toBeDisabled()
+    // The disabled button says why, rather than just "Voice mode".
+    expect(button.parentElement).toHaveAttribute("title", "voiceConversation.busy")
+    expect(button).toHaveAccessibleDescription("voiceConversation.busy")
+    fireEvent.click(button)
+    expect(openVoice).not.toHaveBeenCalled()
+  })
+
+  it("replaces the editor and toolbar with the call bar while a call is open", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    const call = fakeCall({ caption: "nothing much thank you" })
+    const { container } = render(<VoiceCallStoreProvider><PublishedCall call={call} />
+      <ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="" onInputChange={vi.fn()} /></VoiceCallStoreProvider>)
+    expect(await screen.findByTestId("voice-call-bar")).toBeInTheDocument()
+    // What is being said goes where typed text would, above the controls.
+    expect(screen.getByTestId("voice-caption")).toHaveTextContent("nothing much thank you")
+    expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.states.listening")
+    expect(container.querySelector("[contenteditable]")?.closest(".hidden")).not.toBeNull()
+    // The toolbar (with the voice button) stays mounted but hidden.
+    expect(screen.getByRole("button", { name: "voiceConversation.open" }).closest(".hidden")).not.toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.end" }))
+    expect(call.end).toHaveBeenCalledOnce()
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.mute" }))
+    expect(call.toggleMute).toHaveBeenCalledOnce()
+  })
+
+  it("puts focus back in the editor when the user ends the call from the bar", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    function Harness() {
+      const [open, setOpen] = React.useState(true)
+      const call = React.useMemo(() => fakeCall({ open, end: () => setOpen(false) }), [open])
+      return (
+        <VoiceCallStoreProvider>
+          <PublishedCall call={call} />
+          <ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="" onInputChange={vi.fn()} />
+        </VoiceCallStoreProvider>
+      )
+    }
+    const { container } = render(<Harness />)
+    fireEvent.click(await screen.findByRole("button", { name: "voiceConversation.end" }))
+    await waitFor(() => expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument())
+    expect(container.querySelector("[contenteditable]")).toHaveFocus()
+  })
+
+  it("leaves focus alone when the call ends some other way", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    function Harness({ open }: { open: boolean }) {
+      return (
+        <VoiceCallStoreProvider>
+          <PublishedCall call={fakeCall({ open })} />
+          <ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="" onInputChange={vi.fn()} />
+        </VoiceCallStoreProvider>
+      )
+    }
+    const view = render(<Harness open />)
+    await screen.findByTestId("voice-call-bar")
+    view.rerender(<Harness open={false} />)
+    await waitFor(() => expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument())
+    expect(view.container.querySelector("[contenteditable]")).not.toHaveFocus()
+  })
+
+  it("pops the send button in only where it swaps with the voice button, and not when sending becomes possible", async () => {
+    const { container, rerender } = render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="hello" onInputChange={vi.fn()} />)
+    const send = () => container.querySelector("button[type='submit']")!
+    // Only for people who have not asked for reduced motion.
+    expect(send()).toHaveClass("motion-safe:animate-voice-pop")
+    expect(send()).not.toHaveClass("animate-voice-pop")
+    // Sending becoming impossible and possible again must not touch the class.
+    rerender(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="hello" onInputChange={vi.fn()} isLoading />)
+    expect(send()).toHaveClass("motion-safe:animate-voice-pop")
+    rerender(<ChatInput onSend={vi.fn()} inputValue="hello" onInputChange={vi.fn()} />)
+    expect(send()).not.toHaveClass("motion-safe:animate-voice-pop")
+  })
+
+  it("shows a failed call in the input with a way to try again", async () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    const call = fakeCall({ phase: "error", active: false, status: "voiceConversation.states.stopped", alert: "The voice session timed out." })
+    render(<VoiceCallStoreProvider><PublishedCall call={call} />
+      <ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="" onInputChange={vi.fn()} /></VoiceCallStoreProvider>)
+    expect(await screen.findByRole("alert")).toHaveTextContent("The voice session timed out.")
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.retry" }))
+    expect(call.retry).toHaveBeenCalledOnce()
+  })
+
+  it("leaves a composer that cannot run calls alone while a call is open elsewhere", async () => {
+    const { container } = render(<VoiceCallStoreProvider><PublishedCall call={fakeCall()} />
+      <ChatInput onSend={vi.fn()} inputValue="" onInputChange={vi.fn()} /></VoiceCallStoreProvider>)
+    expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument()
+    expect(container.querySelector("[contenteditable]")?.closest(".hidden")).toBeNull()
   })
 
   it("labels the non-compact send icon and submits through it", async () => {

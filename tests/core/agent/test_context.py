@@ -459,7 +459,12 @@ def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> 
     assert "Current user request:\nBook a trip" in system_message
     assert "Current user request:\n北京" not in system_message
     assert "answer to a pending agent question" in waiting_answer_message
-    assert waiting_answer_message.endswith("北京")
+    # The turn context, which carries this answer's pending evidence, follows it.
+    answer_text, turn_context = waiting_answer_message.split(
+        f"\n\n{TURN_CONTEXT_HEADER}", 1
+    )
+    assert answer_text.endswith("北京")
+    assert '"pending_response"' in turn_context
 
 
 def test_dag_step_system_context_uses_output_language_policy() -> None:

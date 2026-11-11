@@ -7888,7 +7888,8 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
     resumed_messages = resumed_llm.calls[0]["messages"]
     assert resumed_messages[-1]["role"] == "user"
     assert "answer to a pending agent question" in resumed_messages[-1]["content"]
-    assert resumed_messages[-1]["content"].endswith("B")
+    # The turn context follows the answer it carries the pending evidence for.
+    assert _without_turn_context(resumed_messages[-1]["content"]).endswith("B")
 
 
 @pytest.mark.asyncio

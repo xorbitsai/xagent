@@ -250,11 +250,10 @@ def render_request_language_harness(
 
 REQUEST_LANGUAGE_EVIDENCE_HEADING = "Canonical request-language evidence (JSON):"
 # Stands in the system context for evidence that quotes request or answer
-# text: that text changes every turn, so it is sent in the turn context, which
-# follows the request text, after the static system prompt and tool schemas.
+# text: that text changes every turn, so it is sent in the turn context block,
+# after the static system prompt and tool schemas.
 REQUEST_LANGUAGE_EVIDENCE_IN_TURN_CONTEXT = (
-    f"{REQUEST_LANGUAGE_EVIDENCE_HEADING} given in the turn context after the "
-    "request text."
+    f"{REQUEST_LANGUAGE_EVIDENCE_HEADING} given in the turn context block."
 )
 
 

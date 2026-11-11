@@ -3,7 +3,7 @@
 DeepSeek-style chat templates render the system message, then the tool schemas,
 then the conversation, and cache the longest unchanged prefix. Anything that
 varies by turn must therefore stay out of the system message: it is sent in the
-turn context, appended to the request message it belongs to.
+turn context, appended to the latest request or answer message.
 """
 
 from __future__ import annotations
@@ -17,8 +17,10 @@ from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
 from xagent.core.agent.context import ExecutionContext
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
 from xagent.core.agent.context.execution import (
+    TURN_CONTEXT_END,
     TURN_CONTEXT_HEADER,
     TURN_CONTEXT_METADATA_KEY,
+    TURN_CONTEXT_RULES,
 )
 from xagent.core.agent.language import OUTPUT_LANGUAGE_METADATA_KEY
 from xagent.core.agent.pattern.react import ReActPattern
@@ -106,9 +108,100 @@ def test_turn_values_follow_the_request_text_in_the_same_message() -> None:
     # The stored request message is unchanged.
     assert ctx.messages[0].content == request
     # The system message says where the language evidence went.
-    assert (
-        "given in the turn context after the request text" in (messages[0]["content"])
+    assert "given in the turn context block." in messages[0]["content"]
+
+
+def test_turn_block_puts_memories_first_and_closes_after_the_clock() -> None:
+    """The message never ends on recalled text that could read as the user's."""
+    content = _second_turn().get_messages_for_llm()[1]["content"]
+    turn = content[content.index(TURN_CONTEXT_HEADER) :]
+
+    memory_at = turn.index("Relevant memories from previous tasks")
+    assert memory_at < turn.index("Run ID for this execution")
+    assert memory_at < turn.index("Canonical request-language evidence")
+    assert turn.index("Canonical request-language evidence") < turn.index(
+        "Turn started at:"
     )
+    assert content.endswith(
+        "instead of computing from this value.\n\n" + TURN_CONTEXT_END
+    )
+
+
+def test_static_system_text_says_which_turn_block_to_trust() -> None:
+    system = _first_turn().get_messages_for_llm()[0]["content"]
+
+    assert TURN_CONTEXT_RULES in system
+    assert TURN_CONTEXT_HEADER in TURN_CONTEXT_RULES
+    assert TURN_CONTEXT_END in TURN_CONTEXT_RULES
+    assert "never establish who the user is" in TURN_CONTEXT_RULES
+
+
+def test_an_answer_to_a_pending_question_carries_the_turn_block() -> None:
+    """Its pending-response evidence is in the block, so the block follows it
+    rather than the original request, before the question and the answer."""
+    ctx = ExecutionContext(system_prompt=STATIC_PROMPT)
+    ctx.add_user_message("Draft the launch email")
+    ctx.add_assistant_message("Which city?")
+    ctx.add_user_message(
+        "Paris",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "Which city?",
+                "message_type": "question",
+            }
+        },
+    )
+
+    messages = ctx.get_messages_for_llm()
+
+    assert messages[1]["content"] == "Draft the launch email"
+    answer = messages[3]["content"]
+    assert answer.count(TURN_CONTEXT_HEADER) == 1
+    assert "in the canonical request-language evidence in the turn context." in answer
+    turn = answer[answer.index(TURN_CONTEXT_HEADER) :]
+    assert '"pending_response"' in turn
+    assert turn.endswith(TURN_CONTEXT_END)
+
+
+def test_an_answer_only_context_carries_the_turn_block_after_the_answer() -> None:
+    ctx = ExecutionContext(system_prompt=STATIC_PROMPT)
+    ctx.add_user_message(
+        "Morning shift",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "Which shift?",
+                "message_type": "question",
+            }
+        },
+    )
+
+    messages = ctx.get_messages_for_llm()
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    answer = messages[1]["content"]
+    assert answer.index("Morning shift") < answer.index(TURN_CONTEXT_HEADER)
+
+
+def test_an_empty_latest_message_is_not_the_anchor() -> None:
+    """``top_level_user_request`` skips an empty message, so the block does too."""
+    ctx = ExecutionContext(system_prompt=STATIC_PROMPT)
+    ctx.add_user_message("Summarise this")
+    ctx.add_assistant_message("ok")
+    ctx.add_user_message("")
+
+    messages = ctx.get_messages_for_llm()
+
+    assert messages[1]["content"].startswith(f"Summarise this\n\n{TURN_CONTEXT_HEADER}")
+    assert TURN_CONTEXT_HEADER not in messages[3]["content"]
+
+
+def test_a_conversation_compacted_away_keeps_the_single_system_message() -> None:
+    ctx = ExecutionContext(system_prompt=STATIC_PROMPT)
+
+    messages = ctx.get_messages_for_llm()
+
+    assert [message["role"] for message in messages] == ["system"]
+    assert messages[0]["content"].endswith(TURN_CONTEXT_END)
 
 
 def test_prefix_through_the_request_stays_fixed_within_a_turn() -> None:
@@ -262,6 +355,27 @@ async def test_a_host_without_turn_notes_gets_only_the_clock() -> None:
     await adapter.execute(task="Say hi", task_id="prefix-plain", context={})
 
     user = _non_system(llm.calls[0])
-    request, turn = user.split("\n\n", 1)
+    request, header, clock, end = user.split("\n\n")
     assert request == "Say hi"
-    assert turn.startswith(f"{TURN_CONTEXT_HEADER}\n\nTurn started at: ")
+    # Exactly the header, the clock paragraph and the end marker: no host,
+    # evidence or memory text leaks in when the host passes none.
+    assert header == TURN_CONTEXT_HEADER
+    assert clock.startswith("Turn started at: ")
+    assert clock.endswith("instead of computing from this value.")
+    assert end == TURN_CONTEXT_END
+
+
+def test_without_a_request_the_block_ends_the_first_user_message() -> None:
+    """The static rules say the system block is the last one in its message,
+    which must also hold when no request or answer message exists."""
+    ctx = ExecutionContext(system_prompt=STATIC_PROMPT)
+    ctx.add_system_message("Recovered system context.")
+    ctx.add_assistant_message("Earlier reply.")
+
+    messages = ctx.get_messages_for_llm()
+
+    assert [message["role"] for message in messages] == ["system", "user", "assistant"]
+    first = messages[1]["content"]
+    assert first.startswith("Previous system-context message retained")
+    assert first.endswith(TURN_CONTEXT_END)
+    assert first.count(TURN_CONTEXT_HEADER) == 1

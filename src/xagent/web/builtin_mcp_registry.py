@@ -537,7 +537,7 @@ GOOGLE_DRIVE_COMPOSIO_DESCRIPTION = (
 def _google_app_via_composio(app_id: str) -> bool:
     """Whether this Google app's new connects go through Composio's Google
     app, which holds Google's restricted-scope approval (#3649)."""
-    from .composio_auth import composio_app
+    from .composio_apps import composio_app
 
     return composio_app("google", app_id) is not None
 

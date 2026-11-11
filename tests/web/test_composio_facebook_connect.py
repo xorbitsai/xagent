@@ -25,7 +25,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
-from xagent.web import composio_auth
+from xagent.web import composio_apps, composio_auth
 from xagent.web.api import auth as auth_api
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.mcp_apps import ensure_builtin_oauth_server_definition
@@ -1625,7 +1625,7 @@ def test_a_denial_shaped_callback_is_native_while_the_switch_is_off(
 def test_an_unknown_backend_value_warns_and_stays_native(monkeypatch, caplog, app_id):
     app = composio_auth.COMPOSIO_APPS[app_id]
     monkeypatch.setenv(app.backend_env, "composio-x")
-    monkeypatch.setattr(composio_auth, "_WARNED_BACKENDS", set())
+    monkeypatch.setattr(composio_apps, "_WARNED_BACKENDS", set())
 
     assert composio_auth.composio_app("meta", app_id) is None
     assert composio_auth.composio_app("meta", app_id) is None

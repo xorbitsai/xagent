@@ -192,6 +192,8 @@ The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `p
 
 `zendesk` and `zoom` have adopted V2: each keeps its L3 call through `l3_read_check` and adds structural read checks on list tools that take no object id, and exempts every other tool, because Tier 2 seeds no objects and runs no write checks (#3573).
 
+`google-ads` has adopted V2 the same way as `zendesk` and `zoom`: it keeps its L3 call through `l3_read_check` and adds a structural read check on `google_ads_list_accessible_customers`, its one list tool that takes no object id and the tool its probe calls, which asserts the `customer_ids` list; `google_ads_search`, which takes a customer id and a query, is exempted (#3573).
+
 `jira` has adopted V2 at the Tier 1 bar (#3570). It keeps its L3 call and adds four read checks on the test tenant's seeded read project: `jira_search_issues` with the query `jira.seed.search_jql`, whose first issue is `jira.seed.issue_key`; `jira_list_comments` on that issue, whose first comment is `jira.seed.comment_id`; `jira_get_issue` on it; and `jira_get_current_user`. Its write check is the round trip shown under [Write checks and the sweep](#write-checks-and-the-sweep), with the sweep reading `jira.write_sweep_jql`. Each step that reads or writes issues passes `cloud_id` from `jira.tenant_id` instead of relying on the tool's single-site auto-detection; the tenant pin still refuses the write when the grant reaches any other site. The other seven tools are exempt: three reads the checked tools make unnecessary (they carry over 80% of Jira's calls), and four writes the write-check format cannot express, since each edits or adds to an existing issue rather than creating one it can delete.
 
 ## Identity adapters

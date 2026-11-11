@@ -323,6 +323,25 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("excel_add_table",),
         ),
     ),
+    # Tier 2 (#3573): the connector's only read that takes no object id or
+    # query is the tool its L3 probe calls, so that tool keeps the L3 row and
+    # carries the check.
+    "google-ads": ConnectorChecks(
+        "google-ads",
+        reads=(
+            _declared_l3("google-ads"),
+            ReadCheck(
+                "google-ads.list_accessible_customers",
+                "google_ads_list_accessible_customers",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("customer_ids",)),
+                    IsType(("customer_ids",), "array"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(issue=_TIER_2, reads=("google_ads_search",)),
+    ),
     "google-docs": ConnectorChecks(
         "google-docs",
         reads=(
@@ -621,7 +640,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "freshdesk",
         "github",
         "gmail",
-        "google-ads",
         "google-analytics",
         "google-calendar",
         "google-drive",

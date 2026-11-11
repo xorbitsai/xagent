@@ -714,7 +714,7 @@ const zh = {
   widgetChat: {
     title: "AI 助手",
     newConversation: "新建会话",
-    close: "关闭",
+    minimize: "最小化",
     moreOptions: "更多选项",
     expandWindow: "展开窗口",
     collapseWindow: "收起窗口",

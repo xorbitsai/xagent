@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useRef, useState } from "react"
-import { History, Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
+import { History, Loader2, Maximize2, MessageSquarePlus, Minimize2, Minus, MoreHorizontal } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import {
   listenForWidgetExpandState,
@@ -239,11 +239,11 @@ export function WidgetChromeControls({
       <button
         type="button"
         onClick={handleClose}
-        title={t("widgetChat.close")}
-        aria-label={t("widgetChat.close")}
+        title={t("widgetChat.minimize")}
+        aria-label={t("widgetChat.minimize")}
         className={iconButtonClassName}
       >
-        <X className="w-4 h-4" />
+        <Minus className="w-4 h-4" data-icon="minimize" />
       </button>
     </div>
   )

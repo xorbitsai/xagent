@@ -253,7 +253,7 @@ describe("SessionAgentChatPage", () => {
     // this close button) never rendering here; a regression that added it
     // without the panel actually being able to close would go uncaught
     // without this.
-    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).not.toBeInTheDocument()
     expect(app.provider?.token).toBeUndefined()
     expect(app.provider?.transport?.legacyErrorProse).toBe("untrusted")
     expect(app.provider?.transport?.session).toEqual({
@@ -387,7 +387,7 @@ describe("SessionAgentChatPage", () => {
     // No conversation yet — nothing to reset, but the "..." trigger still
     // renders since expand/collapse is always offered regardless.
     expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "widgetChat.minimize" })).toBeInTheDocument()
   })
 
   it("renders the conversation with files disabled and gates reset on pending work", () => {
@@ -658,7 +658,7 @@ describe("SessionAgentChatPage", () => {
     expect(screen.getByText("widgetSession.unavailable.description")).toBeInTheDocument()
     expect(screen.queryByText("widgetChat.status.initializing")).not.toBeInTheDocument()
     expect(screen.queryByText("widgetChat.status.connecting")).not.toBeInTheDocument()
-    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).not.toBeInTheDocument()
   })
 
   it("removes all conversation controls after degradation with an existing Agent", () => {
@@ -680,7 +680,7 @@ describe("SessionAgentChatPage", () => {
     // itself, not just its menu. A regression that only dropped the menu
     // item's own render path (leaving the close button behind) would slip
     // past the two assertions above alone.
-    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).not.toBeInTheDocument()
     expect(screen.queryByTestId("session-conversation-panel")).not.toBeInTheDocument()
     expect(app.provider?.transport?.session?.connection).toBeNull()
   })

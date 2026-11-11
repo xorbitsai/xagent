@@ -150,10 +150,12 @@ describe("widget chrome", () => {
     expect(fabEl()).toHaveAttribute("aria-label", "Open chat")
 
     fabEl()?.click()
-    expect(fabEl()).toHaveAttribute("aria-label", "Close chat")
+    expect(fabEl()).toHaveAttribute("aria-label", "Minimize chat")
+    expect(fabEl()?.innerHTML).toContain("M16.59 8.59L12 13.17")
 
     fabEl()?.click()
     expect(fabEl()).toHaveAttribute("aria-label", "Open chat")
+    expect(fabEl()?.innerHTML).toContain("M20 2H4")
   })
 
   it("closes the panel when the iframe posts widget_close", () => {

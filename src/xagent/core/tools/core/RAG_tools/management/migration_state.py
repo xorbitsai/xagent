@@ -110,29 +110,29 @@ def write_migration_state(
     )
     conn = get_metadata_store().get_raw_connection()
     row = {"name": collection_name, **stamped.to_row()}
-    for attempt in range(WRITE_MAX_RETRIES):
+    for attempt in range(WRITE_MAX_RETRIES - 1):
         try:
-            _ensure_table(conn)
-            table = conn.open_table(MIGRATION_TABLE)
-            try:
-                table.merge_insert(
-                    ["name"]
-                ).when_matched_update_all().when_not_matched_insert_all().execute([row])
-            finally:
-                _safe_close_table(table)
+            _merge_row(conn, row)
             return stamped
         except Exception as exc:
-            if attempt == WRITE_MAX_RETRIES - 1:
-                logger.error(
-                    "Failed to write migration state for %s after %s attempts: %s",
-                    collection_name,
-                    WRITE_MAX_RETRIES,
-                    exc,
-                )
-                raise
-            # Concurrent index builds can raise CommitConflict; back off and retry.
+            # Retries any error: commit conflicts are transient, other faults re-raise below.
+            logger.warning(
+                "Retrying migration state write for %s: %s", collection_name, exc
+            )
             time.sleep(0.1 * (2**attempt))
-    raise AssertionError("unreachable")
+    _merge_row(conn, row)
+    return stamped
+
+
+def _merge_row(conn: Any, row: dict[str, Any]) -> None:
+    _ensure_table(conn)
+    table = conn.open_table(MIGRATION_TABLE)
+    try:
+        table.merge_insert(
+            ["name"]
+        ).when_matched_update_all().when_not_matched_insert_all().execute([row])
+    finally:
+        _safe_close_table(table)
 
 
 def clear_migration_state(collection_name: str) -> None:

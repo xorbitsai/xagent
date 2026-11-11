@@ -27,7 +27,10 @@ from xagent.core.agent import (
 )
 from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.context import execution as execution_module
-from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    CLOCK_TIMEZONE_METADATA_KEY,
+    TURN_CONTEXT_HEADER,
+)
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
     _INTERACTION_TRIM_CHARS,
@@ -57,7 +60,6 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
 )
 from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
-from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 
 
 def _without_turn_context(content: object) -> str:

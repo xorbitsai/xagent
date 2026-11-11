@@ -35,6 +35,7 @@ from xagent.core.agent.clarification import (
 )
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.grounding import step_intent_not_fact_rule
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -56,7 +57,6 @@ from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.exceptions import ModelProviderError
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
-from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 
 
 def _without_turn_context(content: object) -> str:

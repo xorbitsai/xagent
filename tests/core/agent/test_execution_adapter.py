@@ -17,6 +17,7 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
@@ -26,7 +27,6 @@ from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
-from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 
 
 def _without_turn_context(content: object) -> str:

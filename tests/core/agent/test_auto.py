@@ -21,6 +21,7 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.grounding import VALUE_KINDS
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -38,7 +39,6 @@ from xagent.core.model.chat.tool_protocol import (
     tool_protocol_error_response,
 )
 from xagent.core.model.chat.types import ChunkType, StreamChunk
-from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 
 
 def _without_turn_context(content: object) -> str:

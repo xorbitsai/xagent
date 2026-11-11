@@ -33,6 +33,7 @@ from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
+    TURN_CONTEXT_HEADER,
     context_checkpoint_gate,
     tool_evidence_state,
 )
@@ -63,7 +64,6 @@ from xagent.core.model.chat.exceptions import (
 from xagent.core.model.chat.routing_context import xinference_routing_key
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 from xagent.core.user_context import current_user_id
-from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 
 
 def _without_turn_context(content: object) -> str:

@@ -11,6 +11,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+import pytest
+
+from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
 from xagent.core.agent.context import ExecutionContext
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
 from xagent.core.agent.context.execution import (
@@ -167,3 +170,98 @@ def test_react_system_message_is_byte_identical_across_turns() -> None:
 
     assert first == second
     assert "Turn started at" not in first
+
+
+class _RecordingLLM:
+    model_name = "recording-llm"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        return "done"
+
+
+class _NoSkills:
+    async def list_skills(self) -> list[Any]:
+        return []
+
+    async def get_skill(self, _name: str) -> None:
+        return None
+
+
+def _adapter(llm: _RecordingLLM) -> AgentExecutionAdapter:
+    return AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="prefix-host",
+            pattern="react",
+            llm=llm,
+            tools=[],
+            system_prompt="Base host instructions.",
+            service_id="prefix-host-test",
+            skill_manager=_NoSkills(),
+        )
+    )
+
+
+def _system(call: dict[str, Any]) -> str:
+    return next(m["content"] for m in call["messages"] if m["role"] == "system")
+
+
+def _non_system(call: dict[str, Any]) -> str:
+    return "\n\n".join(
+        str(m["content"]) for m in call["messages"] if m["role"] != "system"
+    )
+
+
+@pytest.mark.asyncio
+async def test_host_turn_notes_stay_out_of_the_system_message() -> None:
+    llm = _RecordingLLM()
+    adapter = _adapter(llm)
+
+    for run_id in ("run-first", "run-second"):
+        await adapter.execute(
+            task="Say hi",
+            task_id=f"prefix-{run_id}",
+            context={TURN_CONTEXT_METADATA_KEY: f"Run ID: `{run_id}`"},
+        )
+
+    assert _system(llm.calls[0]) == _system(llm.calls[1])
+    assert "run-first" not in _system(llm.calls[0])
+    assert "Run ID: `run-first`" in _non_system(llm.calls[0])
+    assert "Run ID: `run-second`" in _non_system(llm.calls[1])
+    assert "run-first" not in _non_system(llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_a_host_using_system_prompt_still_extends_the_system_message() -> None:
+    """Hosts that pass per-run text as ``system_prompt`` (older xagent-saas)
+    keep today's behaviour: it is appended to the system prompt."""
+    llm = _RecordingLLM()
+    adapter = _adapter(llm)
+
+    await adapter.execute(
+        task="Say hi",
+        task_id="prefix-legacy",
+        context={"system_prompt": "## Current execution identity\nRun ID `run-old`."},
+    )
+
+    system = _system(llm.calls[0])
+    assert system.startswith(
+        "Base host instructions.\n\n## Current execution identity\nRun ID `run-old`."
+    )
+    assert "run-old" not in _non_system(llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_a_host_without_turn_notes_gets_only_the_clock() -> None:
+    llm = _RecordingLLM()
+    adapter = _adapter(llm)
+
+    await adapter.execute(task="Say hi", task_id="prefix-plain", context={})
+
+    user = _non_system(llm.calls[0])
+    request, turn = user.split("\n\n", 1)
+    assert request == "Say hi"
+    assert turn.startswith(f"{TURN_CONTEXT_HEADER}\n\nTurn started at: ")

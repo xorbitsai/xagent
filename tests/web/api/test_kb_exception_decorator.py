@@ -434,7 +434,7 @@ async def test_delete_collection_route_maps_migration_freeze_to_409() -> None:
             return_value=(user, access),
         ),
         patch(
-            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
+            "xagent.web.api.kb.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -673,7 +673,7 @@ async def test_delete_document_route_maps_migration_freeze_to_409() -> None:
         ),
         patch("xagent.web.api.kb.get_vector_index_store") as vector_store,
         patch(
-            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
+            "xagent.web.api.kb.ensure_collection_writable_async",
             new=AsyncMock(side_effect=_migration_error()),
         ),
     ):
@@ -1095,3 +1095,38 @@ async def test_ingest_cloud_rollback_delete_runs_after_a_mid_flight_freeze(
     assert rollback_calls == ["kb"]
     messages = json.dumps([result.model_dump() for result in results])
     assert "being upgraded" not in messages
+
+
+@pytest.mark.asyncio
+async def test_delete_route_authorizes_before_the_freeze_check() -> None:
+    """A non-owner must not learn a foreign collection is migrating."""
+    from unittest.mock import patch
+
+    from xagent.web.api.kb import delete_collection_api
+
+    user, db, _access = _migration_mocks()
+    _freeze_state("kb")
+    denied = HTTPException(status_code=403, detail="forbidden")
+    with patch("xagent.web.api.kb._effective_knowledge_base_user", side_effect=denied):
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_collection_api(collection_name="kb", _user=user, db=db)
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_rename_route_authorizes_before_the_freeze_check() -> None:
+    from unittest.mock import patch
+
+    from xagent.web.api.kb import rename_collection_api
+
+    user, db, _access = _migration_mocks()
+    _freeze_state("kb")
+    denied = HTTPException(status_code=403, detail="forbidden")
+    with patch("xagent.web.api.kb._effective_knowledge_base_user", side_effect=denied):
+        with pytest.raises(HTTPException) as exc_info:
+            await rename_collection_api(
+                collection_name="kb", new_name="kb-new", _user=user, db=db
+            )
+
+    assert exc_info.value.status_code == 403

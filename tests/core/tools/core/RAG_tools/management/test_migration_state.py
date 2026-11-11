@@ -31,6 +31,7 @@ from xagent.core.tools.core.RAG_tools.management.migration_state import (
     clear_migration_state,
     ensure_collection_writable,
     move_migration_state,
+    pending_collection,
     read_migration_state,
     write_migration_state,
 )
@@ -384,6 +385,16 @@ async def test_rename_collection_moves_migration_row() -> None:
 
 
 # --- Single admission per operation -----------------------------------------
+
+
+def test_pending_scope_admits_on_first_check_then_suppresses() -> None:
+    with pending_collection("kb"):
+        ensure_collection_writable("kb")
+        _freeze("kb")
+        ensure_collection_writable("kb")
+
+    with pytest.raises(CollectionMigratingError):
+        ensure_collection_writable("kb")
 
 
 @pytest.mark.asyncio

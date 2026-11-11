@@ -6374,6 +6374,7 @@ async def delete_collection_api(
     _user, access = _effective_knowledge_base_user(
         db, _user, safe_collection, action="delete"
     )
+    await ensure_collection_writable_async(safe_collection)
     notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
     result = _perform_kb_collection_delete(
         safe_collection,
@@ -6623,6 +6624,7 @@ async def delete_document_api(
 
     # Collection-level gate + vector fallback (rename / metadata lag vs strict visibility).
     await _ensure_collection_access_for_document_delete(safe_collection_name, _user)
+    await ensure_collection_writable_async(safe_collection_name)
 
     # Use storage abstraction layer to fetch document records
     vector_store = get_vector_index_store()
@@ -7305,6 +7307,7 @@ async def rename_collection_api(
 
     # Access control check
     await _ensure_collection_access(safe_old_collection, _user, hide_missing=False)
+    await ensure_collection_writable_async(safe_old_collection)
 
     # Validate that target collection doesn't exist or user has access
     visible_for_user = await _list_collections_with_retry(

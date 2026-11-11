@@ -535,3 +535,43 @@ def test_staged_job_routes_through_the_patched_wrapper(
         err = _run_staged_job(test_env, tmp_path)
 
     assert str(err) == "x"
+
+
+def test_staged_job_rollback_runs_inside_admission_after_mid_job_freeze(
+    test_env, tmp_path, monkeypatch
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        clear_migration_state,
+        write_migration_state,
+    )
+
+    rollback_calls: list[str] = []
+
+    def _ingested(**_kw: Any) -> IngestionResult:
+        # The pipeline's entry guard admits before the freeze lands.
+        state_module.ensure_collection_writable("existing-kb")
+        write_migration_state("existing-kb", CollectionMigrationState(state=FROZEN))
+        return _result(message="ingestion failed")
+
+    async def _rollback(**kwargs: Any) -> None:
+        # The guard the rollback's document delete hits.
+        state_module.ensure_collection_writable(str(kwargs["collection_name"]))
+        rollback_calls.append(str(kwargs["collection_name"]))
+
+    monkeypatch.setattr("xagent.web.jobs.kb_tasks.run_document_ingestion", _ingested)
+    try:
+        with patch(
+            "xagent.web.api.kb._rollback_failed_cloud_ingestion",
+            side_effect=_rollback,
+        ):
+            err = _run_staged_job(test_env, tmp_path)
+    finally:
+        clear_migration_state("existing-kb")
+
+    assert rollback_calls == ["existing-kb"]
+    assert str(err) == "ingestion failed"

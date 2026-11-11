@@ -6,7 +6,7 @@ import asyncio
 import functools
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -16,6 +16,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterator,
     Optional,
     TypeVar,
     cast,
@@ -36,9 +37,13 @@ WRITE_MAX_RETRIES = 3
 
 logger = logging.getLogger(__name__)
 
-# Collections whose operation already passed its single admission check.
+# Collections whose operation already passed its single admission check, and
+# collections whose enclosing operation may still admit on its first guard call.
 _ADMITTED: ContextVar[frozenset[str]] = ContextVar(
     "kb_admitted_collections", default=frozenset()
+)
+_PENDING: ContextVar[frozenset[str]] = ContextVar(
+    "kb_pending_collections", default=frozenset()
 )
 
 _SCHEMA = pa.schema(
@@ -190,9 +195,21 @@ def _is_admitted(collection: str) -> bool:
     return collection in _ADMITTED.get()
 
 
+@contextmanager
+def pending_collection(collection: str) -> Iterator[None]:
+    """Open a scope whose first guard call decides admission for the collection."""
+    token = _PENDING.set(_PENDING.get() | {collection})
+    admitted_token = _ADMITTED.set(_ADMITTED.get())
+    try:
+        yield
+    finally:
+        _ADMITTED.reset(admitted_token)
+        _PENDING.reset(token)
+
+
 @asynccontextmanager
 async def admitted_async(collection: str) -> AsyncIterator[None]:
-    """Async counterpart of :func:`admitted`."""
+    """Check the freeze and mark the collection admitted for this scope."""
     if _is_admitted(collection):
         yield
         return
@@ -214,12 +231,13 @@ async def admitted_context_async(collection: str) -> Context:
 
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
+S = TypeVar("S", bound=Callable[..., Any])
 
 
 def admits_collection(
     get_name: Callable[..., Optional[str]],
 ) -> Callable[[F], F]:
-    """Admit the handler's collection for its whole async call."""
+    """Open a pending admission for the handler; its first guard call checks."""
 
     def decorate(func: F) -> F:
         @functools.wraps(func)
@@ -227,10 +245,29 @@ def admits_collection(
             name = get_name(*args, **kwargs)
             if name is None:
                 return await func(*args, **kwargs)
-            async with admitted_async(name):
+            with pending_collection(name):
                 return await func(*args, **kwargs)
 
         return cast(F, wrapper)
+
+    return decorate
+
+
+def admits_collection_sync(
+    get_name: Callable[..., Optional[str]],
+) -> Callable[[S], S]:
+    """Sync variant of :func:`admits_collection`, for job handlers."""
+
+    def decorate(func: S) -> S:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            name = get_name(*args, **kwargs)
+            if name is None:
+                return func(*args, **kwargs)
+            with pending_collection(name):
+                return func(*args, **kwargs)
+
+        return cast(S, wrapper)
 
     return decorate
 
@@ -260,6 +297,8 @@ def ensure_collection_writable(collection_name: str) -> None:
     if _is_admitted(collection_name):
         return
     _raise_if_frozen(collection_name, read_migration_state(collection_name))
+    if collection_name in _PENDING.get():
+        _ADMITTED.set(_ADMITTED.get() | {collection_name})
 
 
 async def ensure_collection_writable_async(collection_name: str) -> None:
@@ -268,3 +307,5 @@ async def ensure_collection_writable_async(collection_name: str) -> None:
         return
     state = await asyncio.to_thread(read_migration_state, collection_name)
     _raise_if_frozen(collection_name, state)
+    if collection_name in _PENDING.get():
+        _ADMITTED.set(_ADMITTED.get() | {collection_name})

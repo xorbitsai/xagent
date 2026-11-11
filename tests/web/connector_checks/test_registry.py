@@ -972,8 +972,8 @@ def test_gmail_manage_labels_is_exempt_for_the_read_step_rule() -> None:
         "read and write in one tool: it is the only Gmail tool that reads a "
         "label and the only one that creates or deletes one, so a label write "
         "check's verify or cleanup guard would call its own create and cleanup "
-        "tool, which #3653 refuses; this change adds no label-reading tool, "
-        "which #3567 allows"
+        "tool, which #3653 refuses; no label-reading tool is added, which "
+        "#3567 allows"
     )
 
 

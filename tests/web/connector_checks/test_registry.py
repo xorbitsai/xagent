@@ -876,9 +876,9 @@ def test_every_google_fixture_key_is_one_the_seed_records() -> None:
 
 @pytest.mark.parametrize("app_id", sorted(_GOOGLE_APP_MODULES))
 def test_a_google_fixture_is_bound_to_a_parameter_of_its_tool(app_id: str) -> None:
-    """The fixture names an argument of the tool, at any depth (Gmail's is the
-    one item of ``label_ids``), and every required argument is pinned: an
-    omitted one would make the tool prompt for it."""
+    """A fixture in the arguments names a parameter of the tool, at any depth
+    (Gmail's is the one item of ``label_ids``), and every required argument is
+    pinned: an omitted one would make the tool prompt for it."""
     module = _GOOGLE_APP_MODULES[app_id]
     for check in CONNECTOR_CHECKS[app_id].reads:
         if not isinstance(check, ReadCheck):

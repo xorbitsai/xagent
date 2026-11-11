@@ -302,6 +302,10 @@ class FsspecFileStorage:
         return normalized
 
     def _makedirs_for_key(self, key: str) -> None:
+        if self._backend == "s3":
+            # S3 has no directories, and s3fs makedirs may send CreateBucket,
+            # which fails under concurrent writes (see #3719).
+            return
         parent = str(Path(self._full_path(key)).parent)
         if parent and parent != ".":
             self._fs.makedirs(parent, exist_ok=True)

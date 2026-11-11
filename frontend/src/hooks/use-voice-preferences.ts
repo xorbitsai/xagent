@@ -6,10 +6,10 @@ import { fetchUserPreferences, type VoiceConversationPreferences } from "@/lib/u
 
 const defaults: VoiceConversationPreferences = {}
 
-export function useVoicePreferences(enabled: boolean) {
+export function useVoicePreferences(enabled: boolean, refreshKey = false) {
   const auth = useAuth()
   const signedIn = Boolean(auth.token)
-  const owner = useMemo(() => ({}), [enabled, auth.user?.id, auth.session?.sessionId, signedIn])
+  const owner = useMemo(() => ({}), [enabled, auth.user?.id, auth.session?.sessionId, signedIn, refreshKey])
   const [state, setState] = useState<{ owner: object | null; preferences: VoiceConversationPreferences; error: boolean }>({ owner: null, preferences: defaults, error: false })
   useEffect(() => {
     if (!enabled || !signedIn) return

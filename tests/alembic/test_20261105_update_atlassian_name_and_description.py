@@ -282,7 +282,8 @@ def test_previous_values_match_seed_and_current_values_match_registry():
         for row in get_builtin_public_mcp_app_rows()
         if row["app_id"] == migration.APP_ID
     )
-    assert registry_row["name"] == migration.CURRENT_NAME
+    # The name has since been superseded by 20261110_rename_atlassian_to_confluence
+    # (see its own test); the description is still the one set here.
     assert registry_row["description"] == migration.CURRENT_DESCRIPTION
     assert "Jira" not in migration.CURRENT_NAME
 

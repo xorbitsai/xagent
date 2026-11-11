@@ -77,6 +77,7 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
+from ...services.writer_workers import run_tracked
 from ..batch_control import (
     BatchChannelControl,
     selected_task_id,
@@ -381,7 +382,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
                     while not stopped():
                         lookup, cancellation = await await_task_settlement(
                             asyncio.create_task(
-                                asyncio.to_thread(lookup_channel_inputs, incoming)
+                                run_tracked(lookup_channel_inputs, incoming)
                             )
                         )
                         owner_id, pending, replays, rejected = lookup
@@ -439,7 +440,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
                                             cancellation,
                                         ) = await await_task_settlement(
                                             asyncio.create_task(
-                                                asyncio.to_thread(
+                                                run_tracked(
                                                     stage_uploaded_file_from_local_path,
                                                     local_path=downloaded.path,
                                                     user_id=owner_id,
@@ -486,7 +487,7 @@ class FeishuBotInstance(BatchChannelControl[str]):
                                 active_task_id = self.active_tasks.get(open_id)
                                 accepted, cancellation = await await_task_settlement(
                                     asyncio.create_task(
-                                        asyncio.to_thread(
+                                        run_tracked(
                                             accept_channel_input,
                                             pending[0],
                                             additional_inputs=pending[1:],
@@ -1023,8 +1024,9 @@ class FeishuBotInstance(BatchChannelControl[str]):
                     chat_id,
                     loading_msg_id,
                     text_chunks[0],
-                    is_current=lambda: self._conversation_generation(open_id)
-                    == generation,
+                    is_current=lambda: (
+                        self._conversation_generation(open_id) == generation
+                    ),
                 )
             else:
                 await self._send_text(chat_id, text_chunks[0])

@@ -62,11 +62,15 @@ export interface AppIntegration {
   can_attach?: boolean
   // Whether starting the per-server MCP OAuth flow is meaningful for this
   // entry. False for catalog entries (they connect through
-  // /apps/{id}/oauth/connect, dispatched on auth_type), for a connector with
-  // no active personal association (the per-server route would 404), and for
-  // a deployment whose tokens arrive through the resolver hook, where no
-  // interactive consent exists at all.
+  // /apps/{id}/oauth/connect, dispatched on auth_type), for a connector the
+  // per-server route would refuse the viewer on (a deactivated association,
+  // or a team-owned connector the team has not opened to member
+  // authorization or whose definition the member sign-in path refuses), and for a deployment whose tokens arrive through the
+  // resolver hook, where no interactive consent exists at all.
   can_authorize?: boolean
+  // Present only on a team-owned custom MCP entry that offers the viewer member
+  // sign-in: the host the token will be sent to, shown before sign-in.
+  url_host?: string
   // Whether this viewer's Configure route would resolve, decided by the
   // backend (_local_mcp_can_configure in src/xagent/web/api/mcp.py for
   // local entries; the connection state for a catalog entry, whose

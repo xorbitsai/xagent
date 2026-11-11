@@ -22,12 +22,14 @@ describe("WidgetChromeControls", () => {
     vi.unstubAllGlobals()
   })
 
-  it("renders the close button and a collapsed menu trigger even with no new-conversation action", () => {
+  it("renders the minimize button and a collapsed menu trigger even with no new-conversation action", () => {
     // Expand/collapse is always offered regardless of newConversation, so
     // the "..." trigger has something to open onto even without it.
     render(<WidgetChromeControls />)
 
-    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    const minimizeButton = screen.getByRole("button", { name: "widgetChat.minimize" })
+    expect(minimizeButton).toBeInTheDocument()
+    expect(minimizeButton.querySelector('[data-icon="minimize"]')).not.toBeNull()
     const menuTrigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("menu")).toBeNull()
@@ -43,10 +45,10 @@ describe("WidgetChromeControls", () => {
     expect(items[0]).toHaveTextContent("widgetChat.expandWindow")
   })
 
-  it("posts widget_close to the parent window when the close button is clicked", () => {
+  it("posts widget_close to the parent window when the minimize button is clicked", () => {
     render(<WidgetChromeControls />)
 
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.close" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.minimize" }))
 
     expect(postMessageSpy).toHaveBeenCalledWith(
       { xagent: true, v: 1, type: "widget_close" },
@@ -95,7 +97,7 @@ describe("WidgetChromeControls", () => {
     const realPostMessageSpy = vi.spyOn(window, "postMessage")
 
     render(<WidgetChromeControls />)
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.close" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.minimize" }))
 
     expect(realPostMessageSpy).not.toHaveBeenCalled()
     realPostMessageSpy.mockRestore()
@@ -274,6 +276,77 @@ describe("WidgetChromeControls", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
     expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+  })
+
+  describe("follows the size widget.js reports", () => {
+    function hostState(data: Record<string, unknown>, source: unknown = window.parent) {
+      fireEvent(window, new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_expand_state", ...data },
+        source: source as MessageEventSource,
+      }))
+    }
+
+    function openMenuItem() {
+      fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+      return screen.getByRole("menuitem")
+    }
+
+    it.each([true, false])("posts nothing back to widget.js on expanded: %s", (expanded) => {
+      render(<WidgetChromeControls />)
+      postMessageSpy.mockClear()
+
+      hostState({ expanded })
+
+      expect(postMessageSpy).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      { expanded: true, label: "widgetChat.collapseWindow", icon: "collapse" },
+      { expanded: false, label: "widgetChat.expandWindow", icon: "expand" },
+    ])("shows $label after expanded: $expanded", ({ expanded, label, icon }) => {
+      render(<WidgetChromeControls />)
+      // Start from the opposite state, so following the message is a change.
+      if (!expanded) fireEvent.click(openMenuItem())
+
+      hostState({ expanded })
+
+      const item = openMenuItem()
+      expect(item).toHaveTextContent(label)
+      expect(item.querySelector(`svg[data-icon='${icon}']`)).not.toBeNull()
+    })
+
+    it.each([
+      { name: "a string expanded", data: { expanded: "true" }, source: undefined, direct: false },
+      { name: "a missing expanded", data: {}, source: undefined, direct: false },
+      { name: "a message not from window.parent", data: { expanded: true }, source: window, direct: false },
+      { name: "a direct visit", data: { expanded: true }, source: window, direct: true },
+    ])("ignores $name", ({ data, source, direct }) => {
+      if (direct) vi.stubGlobal("parent", window)
+      render(<WidgetChromeControls />)
+
+      hostState(data, source ?? window.parent)
+
+      expect(openMenuItem()).toHaveTextContent("widgetChat.expandWindow")
+    })
+
+    it("hands the reported size to a controlling parent", () => {
+      const onExpandedChange = vi.fn()
+      render(<WidgetChromeControls expanded={false} onExpandedChange={onExpandedChange} />)
+
+      hostState({ expanded: true })
+
+      expect(onExpandedChange.mock.calls).toEqual([[true]])
+    })
+
+    it("collapses with one click after the host page expanded the panel", () => {
+      render(<WidgetChromeControls />)
+      hostState({ expanded: true })
+      postMessageSpy.mockClear()
+
+      fireEvent.click(openMenuItem())
+
+      expect(postMessageSpy.mock.calls).toEqual([[{ xagent: true, v: 1, type: "widget_collapse" }, "*"]])
+    })
   })
 
   it("keeps the new-conversation item and the expand toggle as two independent menu items", () => {

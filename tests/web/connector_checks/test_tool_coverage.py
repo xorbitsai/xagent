@@ -50,7 +50,6 @@ _PINNED_LEGACY = frozenset(
         "hubspot",
         "instagram",
         "intercom",
-        "jira",
         "linear",
         "linkedin",
         "magento",

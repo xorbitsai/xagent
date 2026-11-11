@@ -322,14 +322,7 @@ def _host(pipe, environment: dict[str, str], role: str, root: str) -> None:
         import sqlalchemy as sa
 
         from tests.shared.execution_event_read_guard import reject_legacy_content
-        from xagent.web.models.task import Task
 
-        # Select V2 before INSERT only in these test processes; production
-        # creation defaults and existing task versions are unchanged.
-        def select_event_storage(_mapper, _connection, task):
-            task.conversation_storage_version = 2
-
-        sa.event.listen(Task, "before_insert", select_event_storage)
         sa.event.listen(
             sa.engine.Engine, "before_cursor_execute", reject_legacy_content
         )
@@ -554,6 +547,16 @@ def open_shared_app(
             db.commit()
             user_id = user.id
         environment = dict(os.environ)
+        if event_read_acceptance:
+            # The production selector, not a test hook, must choose V2.
+            from xagent.config import EXECUTION_EVENT_STORAGE_ENTRIES
+            from xagent.web.services.conversation_storage_rollout import (
+                STORAGE_ENTRIES,
+            )
+
+            environment[EXECUTION_EVENT_STORAGE_ENTRIES] = ",".join(
+                sorted(STORAGE_ENTRIES)
+            )
         if host_database_url is not None:
             environment["DATABASE_URL"] = host_database_url
         app = SharedExecutionApp(

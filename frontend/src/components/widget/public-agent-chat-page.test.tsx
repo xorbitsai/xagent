@@ -222,7 +222,7 @@ async function expectWidgetAuthFailure(detail: string) {
   // This early-return branch renders no header at all -- widget.js's mobile
   // full-screen FAB-hiding guard depends on WidgetChromeControls never
   // rendering (and thus never announcing chrome-ready) here.
-  expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+  expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).toBeNull()
 }
 
 function expectPublicProviderToken() {
@@ -322,7 +322,7 @@ describe("PublicAgentChatPage", () => {
 
     renderWidgetPage({ embedTicket: "embed-ticket", widgetKey: "widget-secret" })
 
-    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).toBeNull()
     // Pin a positive assertion too, not just the negative above -- otherwise
     // a bug that made this branch render nothing at all would pass this test
     // undetected. The loading spinner has no accessible role/text of its own
@@ -485,7 +485,7 @@ describe("PublicAgentChatPage", () => {
     expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
     // The close control still renders — it toggles the host panel, not the
     // chat itself, so it's independent of whether a conversation exists.
-    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "widgetChat.minimize" })).toBeInTheDocument()
   })
 
   it("offers no conversation history in the menu", async () => {
@@ -871,7 +871,7 @@ describe("PublicAgentChatPage", () => {
     // in widget mode at this same taskless start screen, so it wouldn't
     // prove anything about the share/widget exclusion specifically; that's
     // covered instead once there's an active share conversation, below.)
-    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).toBeNull()
   })
 
   it("reuses a persisted, unexpired share token without re-authing", async () => {
@@ -965,7 +965,7 @@ describe("PublicAgentChatPage", () => {
     // and close button (see the standalone-newConversation share button
     // asserted below).
     expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
-    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.minimize" })).toBeNull()
     expect(screen.getByRole("button", { name: "widgetChat.newConversation" })).toBeInTheDocument()
   })
 

@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -582,13 +582,13 @@ def embed_document_chunks(
 ) -> EmbeddingStageResult:
     """Embed and persist the vectors this document lacks for one model.
 
-    A repeat call computes nothing but still commits; ``result`` stays readable after a raise.
+    A repeat call computes nothing but still commits; ``result`` is reset on entry
+    and stays readable after a raise.
     """
     if result is None:
         result = EmbeddingStageResult()
     else:
-        for stage_field in fields(result):
-            setattr(result, stage_field.name, stage_field.default)
+        vars(result).update(vars(EmbeddingStageResult()))
 
     # Step 4: Read chunks for embedding
     with _track_step(progress_tracker, "read_chunks_for_embedding"):

@@ -3192,9 +3192,14 @@ async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> Non
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    sent = result["context"].get_messages_for_llm()
+    system_content = sent[0]["content"]
     assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    # The request is sent once, as the latest user message.
+    assert "Summarize the release notes in one paragraph." not in system_content
+    assert [m["content"] for m in sent if m["role"] == "user"] == [
+        "Summarize the release notes in one paragraph."
+    ]
 
 
 @pytest.mark.asyncio
@@ -3234,9 +3239,14 @@ async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
     restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
     assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
-    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    sent = result["context"].get_messages_for_llm()
+    system_content = sent[0]["content"]
     assert "Output language: Simplified Chinese" not in system_content
-    assert "Summarize the release notes in one paragraph." in system_content
+    # The request is sent once, as the latest user message.
+    assert "Summarize the release notes in one paragraph." not in system_content
+    assert [m["content"] for m in sent if m["role"] == "user"] == [
+        "Summarize the release notes in one paragraph."
+    ]
 
 
 @pytest.mark.asyncio

@@ -442,6 +442,86 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1McpServer(BaseModel):
+    """One MCP connector the key holder can see.
+
+    Secret values are never returned. Header values, the sensitive entries of
+    ``auth`` (bearer tokens, API key values, client secrets, access tokens)
+    and the values of ``env`` and ``user_env`` read ``********`` when they are
+    set; the keys stay visible. Launch details of local-process connectors
+    (command, arguments, working directory) are not returned.
+
+    Fields with a fixed set of values are plain strings, and other values may
+    be added later, so clients should accept any string.
+    """
+
+    id: int
+    name: str
+    description: Optional[str] = None
+    transport: str = Field(
+        ...,
+        description=(
+            "The stored transport. Only connectors with the 'streamable_http' or "
+            "'sse' transport can have can_edit=true."
+        ),
+    )
+    url: Optional[str] = None
+    headers: Optional[dict[str, Any]] = Field(
+        None, description="Request headers; values are masked."
+    )
+    auth: Optional[dict[str, Any]] = Field(
+        None, description="Authentication settings; secret values are masked."
+    )
+    env: Optional[dict[str, Any]] = Field(
+        None, description="Environment of the definition; values are masked."
+    )
+    user_env: Optional[dict[str, Any]] = Field(
+        None,
+        description=(
+            "The key holder's own environment overrides for this connector; "
+            "values are masked. Null for a connector seen only through a team."
+        ),
+    )
+    runtime_input_schema: Optional[dict[str, Any]] = None
+    runtime_bindings: Optional[Any] = None
+    signed_uploads: Optional[Any] = None
+    signed_uploads_error: Optional[str] = Field(
+        None, description="Why the stored signed-upload settings are unusable."
+    )
+    allow_delegated_authorization: bool
+    access: str = Field(
+        ...,
+        description=(
+            "'own' when the key holder has a link to the connector (enabled or "
+            "not), 'team' when it is visible only because the holder's team "
+            "shares it."
+        ),
+    )
+    kind: str = Field(
+        ...,
+        description=(
+            "'custom' for a connector a user created from a URL, 'catalog' for "
+            "a platform app connection or one that cannot be shown not to be."
+        ),
+    )
+    enabled: Optional[bool] = Field(
+        None,
+        description=(
+            "The key holder's own on/off switch. Null for a connector seen "
+            "only through a team."
+        ),
+    )
+    can_edit: bool
+    can_delete: bool
+    app_id: Optional[str] = None
+    provider: Optional[str] = None
+    connected_account: Optional[str] = Field(
+        None, description="The key holder's own connected third-party account."
+    )
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 class CreateTaskResponse(BaseModel):
     """``POST /v1/chat/tasks`` -> 202 Accepted response.
 

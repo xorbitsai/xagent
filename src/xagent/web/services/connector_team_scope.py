@@ -600,6 +600,15 @@ def team_connector_hook_installed() -> bool:
     return _team_connector_visibility_hook is not None
 
 
+def connector_access_hook_installed() -> bool:
+    """Whether an application installed a direct-id connector access hook.
+
+    Callers select on this, never on an empty answer: an installed hook
+    legitimately omits a connector the caller's team does not link.
+    """
+    return _connector_access_hook is not None
+
+
 def _normalize_connector_refs(
     refs: "Collection[ConnectorRef]",
 ) -> "frozenset[ConnectorRef]":

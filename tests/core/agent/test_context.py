@@ -290,7 +290,10 @@ def test_system_context_preserves_current_request_language_over_memory() -> None
 
     # The request is the latest user message, so the system block points at it
     # instead of repeating it.
-    assert "Current user request: the latest user message." in system_message
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_message
+    )
     assert "Can you analyze this GitHub project?" not in system_message
     assert "Canonical request-language evidence" in system_message
     assert "sole hard language authority" in system_message
@@ -426,7 +429,10 @@ def test_system_context_uses_latest_user_message_as_current_request() -> None:
 
     system_message = ctx.get_messages_for_llm()[0]["content"]
 
-    assert "Current user request: the latest user message." in system_message
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_message
+    )
     assert "请继续用中文总结" not in system_message
     assert "Can you analyze this GitHub project?" not in system_message
 
@@ -802,7 +808,10 @@ def test_get_messages_for_llm_injects_current_request_focus() -> None:
     result = ctx.get_messages_for_llm()
 
     system_content = result[0]["content"]
-    assert "Current user request: the latest user message." in system_content
+    assert (
+        "Current user request: the latest user message written by the user"
+        in system_content
+    )
     assert "Compare Mistral, OpenAI, and Anthropic ARR." not in system_content
     assert result[-1]["content"] == "Compare Mistral, OpenAI, and Anthropic ARR."
     assert "Earlier user and assistant messages are context only" in system_content

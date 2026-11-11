@@ -644,6 +644,16 @@ FORM_ANSWER_CONTINUATION_INSTRUCTION = (
     "action.\n\n"
 )
 
+# How the system block names the request message when it does not repeat the
+# text. Patterns append runtime user messages after the context is rendered
+# (iteration-limit notices, "Additional instruction" feedback), so "the latest
+# user message" alone could resolve to English runtime text; the qualifier keeps
+# the request, and the language decision, on the user's own message.
+USER_REQUEST_MESSAGE_POINTER = (
+    "the latest user message written by the user (not a runtime notice or "
+    "additional instruction appended by the system)"
+)
+
 FORM_ANSWER_FRAMING = "It replies to the form you asked for. "
 
 
@@ -1401,7 +1411,9 @@ class ExecutionContext:
                 pending_response,
                 output_language,
                 request_reference=(
-                    "Latest user message" if request_in_latest_user_message else None
+                    f"The {USER_REQUEST_MESSAGE_POINTER[4:]}"
+                    if request_in_latest_user_message
+                    else None
                 ),
             )
             form_answer_instruction = (
@@ -1413,8 +1425,10 @@ class ExecutionContext:
             # repeating it here would double its tokens on every model call and
             # put per-turn text into the system prefix, which then never caches.
             if request_in_latest_user_message:
-                request_block = "Current user request: the latest user message.\n\n"
-                request_ref = "the latest user message"
+                request_block = (
+                    f"Current user request: {USER_REQUEST_MESSAGE_POINTER}.\n\n"
+                )
+                request_ref = USER_REQUEST_MESSAGE_POINTER
             else:
                 request_block = f"Current user request:\n{current_task}\n\n"
                 request_ref = "the current user request above"

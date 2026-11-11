@@ -30,11 +30,11 @@ def test_normal_turn_sends_request_once_with_focus_and_language_rules() -> None:
     assert _count(messages, "UNIQUE-REQ") == 1
     assert messages[-1]["content"] == LONG_REQUEST
     system = _system(messages)
-    assert "the latest user message" in system
+    assert "the latest user message written by the user" in system
     assert FOCUS in system
-    assert "answer the latest user message" in system
+    assert "answer the latest user message written by the user" in system
     assert LANGUAGE in system
-    assert "Latest user message" in system
+    assert "The latest user message written by the user" in system
 
 
 def test_system_prefix_is_stable_across_different_requests() -> None:
@@ -133,3 +133,23 @@ def test_dag_step_context_unchanged() -> None:
 
     assert "Current user request" not in system
     assert "DAG step execution scope:" in system
+
+
+def test_pointer_excludes_runtime_notices_appended_after_rendering() -> None:
+    from xagent.core.agent.pattern.base import append_user_message_preserving_turns
+
+    ctx = ExecutionContext(execution_id="dedupe-runtime-notice")
+    ctx.add_user_message("请帮我总结一下这份报告")
+    ctx.add_assistant_message("working")
+    messages = ctx.get_messages_for_llm()
+    messages = append_user_message_preserving_turns(
+        messages, content="Runtime notice: stopped at the iteration limit."
+    )
+
+    system = _system(messages)
+
+    # The notice is now the positionally last user message, so the system block
+    # must not name "the latest user message" without excluding runtime text.
+    assert messages[-1]["content"].startswith("Runtime notice:")
+    assert "not a runtime notice or additional instruction" in system
+    assert "The latest user message written by the user" in system

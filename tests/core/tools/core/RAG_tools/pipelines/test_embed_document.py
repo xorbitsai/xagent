@@ -108,7 +108,7 @@ def _embed(
     adapter: _StubAdapter,
     cfg: IngestionConfig,
     *,
-    chunk_count: int,
+    chunk_count: int | None = None,
     commit_gate=None,
     result: EmbeddingStageResult | None = None,
     is_spreadsheet: bool = False,
@@ -319,3 +319,64 @@ def test_embed_document_chunks_fails_before_commit_when_nothing_was_embedded(
 
     assert stage.current_step == "compute_embeddings"
     assert events == []
+
+
+def test_embed_document_chunks_resets_a_reused_result_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+    responses = [_read_response(_chunks(2)), _read_response([])]
+
+    def _read(**_: object) -> EmbeddingReadResponse:
+        return responses.pop(0)
+
+    _install(monkeypatch, _read, adapter, events)
+
+    holder = EmbeddingStageResult()
+    _embed(adapter, _cfg(), chunk_count=2, result=holder)
+    _embed(adapter, _cfg(), chunk_count=2, result=holder)
+
+    assert holder.embedding_count == 0
+    assert holder.vector_count == 0
+    assert holder.pending_count == 0
+    assert holder.compute_completed is False
+
+
+def test_embed_document_chunks_falls_back_to_read_total_when_chunk_count_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+
+    def _read(**_: object) -> EmbeddingReadResponse:
+        return _read_response(_chunks(1))
+
+    def _encode(_text: str) -> List[float]:
+        raise RuntimeError("provider down")
+
+    adapter.encode = _encode  # type: ignore[method-assign]
+    _install(monkeypatch, _read, adapter, events)
+
+    with pytest.raises(Exception, match="Failed to generate any embeddings"):
+        _embed(adapter, _cfg(use_async=True))
+
+
+def test_embed_document_chunks_async_creates_index_only_on_last_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+
+    def _read(**_: object) -> EmbeddingReadResponse:
+        return _read_response(_chunks(5))
+
+    _install(monkeypatch, _read, adapter, events)
+
+    _embed(adapter, _cfg(use_async=True, batch_size=2), chunk_count=5)
+
+    assert [event[1] for event in events if event[0] == "write"] == [
+        False,
+        False,
+        True,
+    ]

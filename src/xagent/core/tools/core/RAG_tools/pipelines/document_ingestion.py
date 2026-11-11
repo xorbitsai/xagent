@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -530,9 +530,7 @@ def _resolve_embedding_adapter(
 class EmbeddingStageResult:
     """Counts, timings and failure position of :func:`embed_document_chunks`.
 
-    The object is filled as the stage progresses, so a caller that passes one
-    in can still read ``current_step`` and the partial counts when the stage
-    raises mid-way.
+    Filled as the stage runs, so a holder passed into a raising call stays readable.
     """
 
     total_count: int = 0
@@ -576,21 +574,21 @@ def embed_document_chunks(
     cfg: IngestionConfig,
     user_id: Optional[int],
     is_admin: bool,
+    is_spreadsheet: bool,
     chunk_count: Optional[int] = None,
-    is_spreadsheet: bool = False,
     commit_gate: Optional[Callable[[], None]] = None,
     progress_tracker: Optional[ProgressTracker] = None,
     result: Optional[EmbeddingStageResult] = None,
 ) -> EmbeddingStageResult:
-    """Embed and persist exactly the vectors this document lacks for a model.
+    """Embed and persist the vectors this document lacks for one model.
 
-    ``read_chunks_for_embedding`` returns only chunks without a vector for
-    ``embedding_config.id``, so a repeat call computes nothing and still runs
-    the final commit. ``chunk_count`` enables the all-embeddings-failed error
-    ingestion reports. Pass ``result`` to recover the failed step and the
-    counts written before it.
+    A repeat call computes nothing but still commits; ``result`` stays readable after a raise.
     """
-    result = result if result is not None else EmbeddingStageResult()
+    if result is None:
+        result = EmbeddingStageResult()
+    else:
+        for stage_field in fields(result):
+            setattr(result, stage_field.name, stage_field.default)
 
     # Step 4: Read chunks for embedding
     with _track_step(progress_tracker, "read_chunks_for_embedding"):
@@ -625,6 +623,7 @@ def embed_document_chunks(
     pending_count = read_model.pending_count
     result.total_count = len(chunks)
     result.pending_count = pending_count
+    effective_chunk_count = chunk_count if chunk_count is not None else len(chunks)
     if is_spreadsheet:
         _validate_spreadsheet_chunk_token_budget(
             chunks,
@@ -936,11 +935,11 @@ def embed_document_chunks(
     result.embedding_elapsed_ms = int((time.time() - embedding_start) * 1000)
 
     # Check if embedding generation failed completely
-    if chunk_count is not None and chunk_count > 0 and result.embedding_count == 0:
+    if effective_chunk_count > 0 and result.embedding_count == 0:
         raise EmbeddingAdapterError(
             "Failed to generate any embeddings",
             details={
-                "chunk_count": chunk_count,
+                "chunk_count": effective_chunk_count,
                 "use_async": cfg.embedding_use_async,
                 "embedding_model": embedding_config.model_name,
             },

@@ -877,6 +877,35 @@ def test_process_document_fails_without_success_when_the_commit_fails(
     ]
 
 
+def test_process_document_commit_failure_keeps_completed_steps_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_pipeline_dependencies(monkeypatch)
+
+    def _commit(**_: object) -> None:
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == "write_vectors_to_db"
+    assert [step.name for step in result.completed_steps] == [
+        "resolve_embedding_adapter",
+        "initialize_collection",
+        "register_document",
+        "parse_document",
+        "chunk_document",
+        "read_chunks_for_embedding",
+        "compute_embeddings",
+    ]
+
+
 def test_process_document_partial_on_write_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

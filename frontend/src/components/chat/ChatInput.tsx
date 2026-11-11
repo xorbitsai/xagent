@@ -1082,12 +1082,13 @@ export function ChatInput({
     <VoiceModeButton iconOnly
       reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
       disabled={voiceConversationDisabled || isInputBusy || voiceRunInProgress || voiceInput.status !== "idle"}
+      disabledHint={voiceRunInProgress ? t("voiceConversation.busy") : undefined}
       onClick={() => {
         onVoiceConversation(deliveryConfig());
       }} />
   ) : null;
   // While a call is open the bar replaces the editor and toolbar entirely.
-  const voiceCallVisible = Boolean(voiceCall && voiceInputEnabled && onVoiceConversation);
+  const voiceCallVisible = Boolean(voiceCall && voiceOffered);
   // The editor is hidden for the call. Hiding a focused element does not
   // reliably fire blur, which would leave the composer looking focused.
   useEffect(() => {
@@ -1666,7 +1667,7 @@ export function ChatInput({
                   title={sendButtonLabel}
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
-                    voiceOffered && "animate-voice-pop",
+                    voiceOffered && "motion-safe:animate-voice-pop",
                     !canSubmit() && "bg-muted text-muted-foreground/50"
                   )}
                 >

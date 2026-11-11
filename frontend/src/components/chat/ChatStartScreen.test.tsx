@@ -68,6 +68,8 @@ const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["age
 
 afterEach(() => {
   cleanup()
+  // `clearMocks` only clears call history; put back what spyOn replaced.
+  vi.restoreAllMocks()
   chatInputProps.current = null
   localeState.value = "en"
 })

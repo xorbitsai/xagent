@@ -197,6 +197,9 @@ describe("ChatInput", () => {
       readOnlyConfig taskConfig={{ model: "selected-model" }} {...props} />)
     const button = await screen.findByRole("button", { name: "voiceConversation.open" })
     expect(button).toBeDisabled()
+    // The disabled button says why, rather than just "Voice mode".
+    expect(button.parentElement).toHaveAttribute("title", "voiceConversation.busy")
+    expect(button).toHaveAccessibleDescription("voiceConversation.busy")
     fireEvent.click(button)
     expect(openVoice).not.toHaveBeenCalled()
   })
@@ -257,12 +260,14 @@ describe("ChatInput", () => {
   it("pops the send button in only where it swaps with the voice button, and not when sending becomes possible", async () => {
     const { container, rerender } = render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="hello" onInputChange={vi.fn()} />)
     const send = () => container.querySelector("button[type='submit']")!
-    expect(send()).toHaveClass("animate-voice-pop")
+    // Only for people who have not asked for reduced motion.
+    expect(send()).toHaveClass("motion-safe:animate-voice-pop")
+    expect(send()).not.toHaveClass("animate-voice-pop")
     // Sending becoming impossible and possible again must not touch the class.
     rerender(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} inputValue="hello" onInputChange={vi.fn()} isLoading />)
-    expect(send()).toHaveClass("animate-voice-pop")
+    expect(send()).toHaveClass("motion-safe:animate-voice-pop")
     rerender(<ChatInput onSend={vi.fn()} inputValue="hello" onInputChange={vi.fn()} />)
-    expect(send()).not.toHaveClass("animate-voice-pop")
+    expect(send()).not.toHaveClass("motion-safe:animate-voice-pop")
   })
 
   it("shows a failed call in the input with a way to try again", async () => {

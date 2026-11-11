@@ -63,7 +63,9 @@ export class VoiceAudio {
 
   async start(): Promise<void> {
     this.context = this.options.context ?? new AudioContext()
-    // Resume during the start button's user activation, before network awaits.
+    // Usually this is the context unlocked by the click that opened the call
+    // (see `useVoiceCall`); resume is a no-op then. A context made here still
+    // needs the user activation to be live, so resume before any network await.
     await this.context.resume()
     if (this.closed) return
     const context = this.context

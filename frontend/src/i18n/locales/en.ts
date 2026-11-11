@@ -141,6 +141,7 @@ const en = {
     end: "End conversation",
     endShort: "End",
     retry: "Try again",
+    busy: "Voice mode is available once the current run has finished.",
     mute: "Mute microphone",
     unmute: "Unmute microphone",
     transcriptionModel: "Listening model",

@@ -141,6 +141,7 @@ const zh = {
     end: "结束对话",
     endShort: "结束",
     retry: "重试",
+    busy: "当前任务运行结束后才能使用语音模式。",
     mute: "关闭麦克风",
     unmute: "打开麦克风",
     transcriptionModel: "语音识别模型",

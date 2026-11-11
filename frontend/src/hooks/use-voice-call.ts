@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { generateClientMessageId } from "@/lib/utils"
-import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models"
+import { useVoiceModels, voiceModelReason, type VoiceModelReason } from "@/hooks/use-voice-models"
 import { useVoicePreferences } from "@/hooks/use-voice-preferences"
 import { VoiceAudio, VoiceAudioError, type VoiceAudioFailure, type VoiceLevelSource } from "@/lib/voice-audio"
 import { VoiceTurns, type VoicePhase } from "@/lib/voice-conversation"
@@ -32,7 +32,7 @@ export interface VoiceCallOptions {
 }
 
 /** Why a call that was asked for could not begin. */
-type Blocked = "models" | "selection" | "preferences"
+type Blocked = "models" | "selection" | "preferences" | "busy"
 
 /** Everything the composer needs to show and control a voice call. */
 export interface VoiceCall {
@@ -80,6 +80,10 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   const [sendFailure, setSendFailure] = useState("")
   const [audioFailure, setAudioFailure] = useState<VoiceAudioFailure>()
   const [blocked, setBlocked] = useState<Blocked>()
+  // Why the models were refused, as it stood when the call was refused. The
+  // lookup is repeated on window focus, which passes through "checking" and
+  // then clears, and the message and the retry button must not follow that.
+  const [modelsReason, setModelsReason] = useState<VoiceModelReason>()
   const [playbackFailed, setPlaybackFailed] = useState(false)
   const [muted, setMuted] = useState(false)
   const [serverVadOnly, setServerVadOnly] = useState(false)
@@ -115,7 +119,7 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   }
   const end = () => {
     release()
-    setPhase("idle"); setMuted(false); setCaption(""); setSendFailure(""); setAudioFailure(undefined); setBlocked(undefined); setPlaybackFailed(false); setServerVadOnly(false)
+    setPhase("idle"); setMuted(false); setCaption(""); setSendFailure(""); setAudioFailure(undefined); setBlocked(undefined); setModelsReason(undefined); setPlaybackFailed(false); setServerVadOnly(false)
   }
   const fail = (reason?: VoiceAudioFailure) => { release(); setAudioFailure(reason); setPlaybackFailed(false); setCaption(""); setPhase("error") }
 
@@ -190,7 +194,9 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
           await live.current.onSend(text, generateClientMessageId())
           // The words now live in the conversation; stop showing them in the
           // input, unless the user has already started saying something else.
-          if (current()) setCaption(shown => (shown === text ? "" : shown))
+          // A held message grows as the user keeps talking ("A", then "A B"
+          // is sent) while the caption only shows the latest part ("B").
+          if (current()) setCaption(shown => (shown && text.endsWith(shown) ? "" : shown))
         } catch (error) {
           // The normal task-delivery path supplies a client-safe API error.
           // Keep its explanation separate from microphone/ASR failures.
@@ -227,15 +233,17 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
     if (phase !== "idle" || audio.current) return
     if (!auth.token) { setAudioFailure("authentication_required"); setPhase("error"); return }
     if (loading || saved.loading) return
-    if (modelReason) { setBlocked("models"); setPhase("error"); return }
+    if (modelReason) { setBlocked("models"); setModelsReason(modelReason); setPhase("error"); return }
     if (saved.error) { setBlocked("preferences"); setPhase("error"); return }
     if (selectionUnavailable) { setBlocked("selection"); setPhase("error"); return }
-    // Another run is in progress, or voice is switched off: nothing to start.
+    // A run began while the lookups were loading: say so, and let the user try
+    // again once it has finished. (Voice being switched off just closes.)
+    if (busy && !disabled) { setBlocked("busy"); setPhase("error"); return }
     if (!canStart) { onOpenChange(false); return }
     start()
     // `start` and `onOpenChange` are recreated every render and read current state.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, phase, auth.token, loading, saved.loading, saved.error, modelReason, selectionUnavailable, canStart])
+  }, [open, phase, auth.token, loading, saved.loading, saved.error, modelReason, selectionUnavailable, canStart, busy])
 
   const retry = () => {
     // Retrying is a click too: unlock audio now, as opening the call did.
@@ -243,7 +251,7 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
     end()
     // A failed models or settings lookup is looked up again; the effect above
     // then starts the call on the next render.
-    if (blocked) setRefresh(value => !value)
+    if (blocked && blocked !== "busy") setRefresh(value => !value)
   }
   const toggleMute = () => {
     const next = !muted
@@ -261,17 +269,17 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
   const stableToggleMute = useCallback(() => controls.current.toggleMute(), [])
   const level = useCallback((source: VoiceLevelSource) => audio.current?.level(source) ?? 0, [])
 
-  const failureText = (() => {
+  const alert = (() => {
     if (phase !== "error") return undefined
     if (sendFailure) return sendFailure
+    if (blocked === "busy") return t("voiceConversation.busy")
     if (blocked === "preferences") return t("settings.voice.loadFailed")
     if (blocked === "selection") return t("settings.voice.selectionUnavailable")
-    if (blocked === "models" && modelReason) return t(`voiceConversation.${modelReason}`)
+    if (blocked === "models" && modelsReason) return t(`voiceConversation.${modelsReason}`)
     if (audioFailure === "session_timeout") return t("voiceConversation.sessionTimeout")
     if (audioFailure === "authentication_required") return t("voiceConversation.authenticationRequired")
     return t("voiceConversation.states.error")
   })()
-  const alert = failureText
   // A call that is open but has not begun connecting yet reads as connecting.
   const status = t(`voiceConversation.states.${phase === "error" ? "stopped" : phase === "idle" ? "connecting" : phase}`)
   // Things worth knowing that do not stop the call, shown beside what is being said.
@@ -279,12 +287,13 @@ export function useVoiceCall({ taskId, messages, busy, waiting, disabled, onSend
     playbackFailed ? t("voiceConversation.playbackFailed") : "",
     serverVadOnly ? t("voiceConversation.serverVadOnly") : "",
   ].filter(Boolean).join(" ") || undefined
-  const settingsLink = phase === "error" && !!blocked
+  // Busy is about the run in progress, not about the saved settings.
+  const settingsLink = phase === "error" && !!blocked && blocked !== "busy"
   // Missing or unsuitable models only change in settings, so trying again can
   // not help; everything else (a dropped connection, a failed lookup) can.
   // Losing the login needs signing in again, not another attempt.
   const retryable = phase === "error" && audioFailure !== "authentication_required"
-    && !(blocked === "selection" || (blocked === "models" && modelReason !== "modelsUnavailable" && modelReason !== "checkingModels"))
+    && !(blocked === "selection" || (blocked === "models" && modelsReason !== "modelsUnavailable" && modelsReason !== "checkingModels"))
   const retryDisabled = busy || disabled
 
   return useMemo<VoiceCall>(() => ({

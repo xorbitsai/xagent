@@ -17,12 +17,12 @@ beforeEach(() => { vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockRetur
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers() })
 
 describe("voice call bar", () => {
-  it("ends the call on Escape, as the dialog it replaced did", () => {
+  it("ends the call on Escape pressed in the composer, as the dialog it replaced did", () => {
     const active = call()
-    render(<VoiceCallBar call={active} />)
-    fireEvent.keyDown(document, { key: "Escape" })
+    render(<form><VoiceCallBar call={active} /></form>)
+    fireEvent.keyDown(screen.getByRole("button", { name: "voiceConversation.mute" }), { key: "Escape" })
     expect(active.end).toHaveBeenCalledOnce()
-    fireEvent.keyDown(document, { key: "Enter" })
+    fireEvent.keyDown(screen.getByRole("group", { name: "voiceConversation.title" }), { key: "Enter" })
     expect(active.end).toHaveBeenCalledOnce()
   })
 
@@ -82,16 +82,17 @@ describe("voice call bar", () => {
     expect(screen.queryByTestId("voice-caption")).not.toBeInTheDocument()
   })
 
-  it("lets the page's other fields keep their Escape", () => {
+  it("leaves Escape to the rest of the page: fields, overlays and an unfocused page", () => {
     const active = call()
-    render(<div><input aria-label="elsewhere" /><form><VoiceCallBar call={active} /></form></div>)
+    render(<div><input aria-label="elsewhere" /><button>overlay trigger</button><form><VoiceCallBar call={active} /></form></div>)
     fireEvent.keyDown(screen.getByLabelText("elsewhere"), { key: "Escape" })
+    // Panels and menus that close on Escape without marking it handled.
+    fireEvent.keyDown(screen.getByText("overlay trigger"), { key: "Escape" })
+    fireEvent.keyDown(document.body, { key: "Escape" })
+    fireEvent.keyDown(window, { key: "Escape" })
     expect(active.end).not.toHaveBeenCalled()
-    // From inside the composer, or with nothing focused, it ends the call.
     fireEvent.keyDown(screen.getByRole("button", { name: "voiceConversation.mute" }), { key: "Escape" })
     expect(active.end).toHaveBeenCalledOnce()
-    fireEvent.keyDown(document.body, { key: "Escape" })
-    expect(active.end).toHaveBeenCalledTimes(2)
   })
 
   it("lets menus and dialogs have their Escape too", () => {
@@ -108,7 +109,7 @@ describe("voice call bar", () => {
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.end" }))
     expect(onEnd).toHaveBeenCalledTimes(1)
     expect(active.end).toHaveBeenCalledTimes(1)
-    fireEvent.keyDown(document.body, { key: "Escape" })
+    fireEvent.keyDown(screen.getByRole("group", { name: "voiceConversation.title" }), { key: "Escape" })
     expect(onEnd).toHaveBeenCalledTimes(2)
     expect(active.end).toHaveBeenCalledTimes(2)
   })
@@ -141,5 +142,30 @@ describe("voice call bar", () => {
     render(<VoiceOrb call={call()} />)
     expect(frames).toHaveBeenCalled()
     vi.unstubAllGlobals()
+  })
+
+  it("keeps focus in the bar when the control that had it goes away", () => {
+    const failed = call({ phase: "error", active: false, alert: "Dropped." })
+    const view = render(<form><VoiceCallBar call={failed} /></form>)
+    screen.getByRole("button", { name: "voiceConversation.retry" }).focus()
+    expect(screen.getByRole("button", { name: "voiceConversation.retry" })).toHaveFocus()
+    // Trying again works: the error clears and the Try again button is gone.
+    view.rerender(<form><VoiceCallBar call={call()} /></form>)
+    expect(screen.queryByRole("button", { name: "voiceConversation.retry" })).not.toBeInTheDocument()
+    expect(screen.getByRole("group", { name: "voiceConversation.title" })).toHaveFocus()
+  })
+
+  it("keeps focus in the bar when an error removes the mute button that had it", () => {
+    const view = render(<form><VoiceCallBar call={call()} /></form>)
+    screen.getByRole("button", { name: "voiceConversation.mute" }).focus()
+    view.rerender(<form><VoiceCallBar call={call({ phase: "error", active: false, alert: "Dropped." })} /></form>)
+    expect(screen.getByRole("group", { name: "voiceConversation.title" })).toHaveFocus()
+  })
+
+  it("does not take focus from somewhere else when the call state changes", () => {
+    const view = render(<div><input aria-label="elsewhere" /><form><VoiceCallBar call={call()} /></form></div>)
+    screen.getByLabelText("elsewhere").focus()
+    view.rerender(<div><input aria-label="elsewhere" /><form><VoiceCallBar call={call({ phase: "error", active: false, alert: "Dropped." })} /></form></div>)
+    expect(screen.getByLabelText("elsewhere")).toHaveFocus()
   })
 })

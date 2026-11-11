@@ -196,10 +196,64 @@ describe("voice call lifecycle", () => {
     expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument()
   })
 
-  it("does not start a call while an agent run is in progress", async () => {
-    render(<Call {...idle} busy />)
-    await waitFor(() => expect(screen.queryByTestId("voice-call-bar")).not.toBeInTheDocument())
+  it("says so, and starts once the run has finished, when a run begins before the call can", async () => {
+    const view = render(<Call {...idle} busy />)
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("voiceConversation.busy"))
     expect(calls).toHaveLength(0)
+    expect(screen.getByRole("button", { name: "voiceConversation.retry" })).toBeDisabled()
+    // Nothing to fix in the settings: no link there, and no needless lookups.
+    expect(screen.queryByRole("link", { name: "settings.voice.openSettings" })).not.toBeInTheDocument()
+    const lookups = vi.mocked(apiRequest).mock.calls.length
+    view.rerender(<Call {...idle} />)
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.retry" }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(vi.mocked(apiRequest).mock.calls.length).toBe(lookups)
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("keeps saying why the models were refused while they are looked up again", async () => {
+    vi.mocked(apiRequest).mockResolvedValueOnce(new Response("unavailable", { status: 500 }))
+    render(<Call {...idle} />)
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("voiceConversation.modelsUnavailable"))
+    // Coming back to the window repeats the lookup: "checking", then fine.
+    let release!: () => void
+    vi.mocked(apiRequest).mockImplementationOnce(() => new Promise<Response>(resolve => {
+      release = () => resolve(new Response(JSON.stringify([]), { status: 200 }))
+    }))
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    expect(screen.getByRole("alert")).toHaveTextContent("voiceConversation.modelsUnavailable")
+    expect(screen.queryByText("voiceConversation.checkingModels")).not.toBeInTheDocument()
+    await act(async () => { release() })
+    expect(screen.getByRole("alert")).toHaveTextContent("voiceConversation.modelsUnavailable")
+    expect(screen.queryByText("voiceConversation.states.error")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "voiceConversation.retry" })).toBeEnabled()
+  })
+
+  it("clears what was said once a held message has been sent together with it", async () => {
+    // Said while a run was in progress: "A" is held, then "B" joins it, and
+    // "A B" goes out when the run ends, while the caption only ever showed "B".
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const props = { ...idle, onSend, onInterrupt: vi.fn() }
+    const view = render(<Call {...props} />)
+    await waitFor(() => expect(calls).toHaveLength(1))
+    view.rerender(<Call {...props} busy />)
+    await act(async () => {
+      calls[0].options.activity(true)
+      calls[0].options.transcript("final", "Add a chart.", 0)
+      calls[0].options.activity(false)
+      await new Promise(resolve => setTimeout(resolve, 320))
+    })
+    await act(async () => {
+      calls[0].options.activity(true)
+      calls[0].options.transcript("final", "Make it blue.", 1)
+      calls[0].options.activity(false)
+      await new Promise(resolve => setTimeout(resolve, 320))
+    })
+    expect(screen.getByTestId("voice-caption")).toHaveTextContent("Make it blue.")
+    expect(onSend).not.toHaveBeenCalled()
+    view.rerender(<Call {...props} />)
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("Add a chart. Make it blue.", expect.any(String)))
+    await waitFor(() => expect(screen.queryByTestId("voice-caption")).not.toBeInTheDocument())
   })
 
   it("offers to try again when the models lookup failed, and repeats the lookup", async () => {

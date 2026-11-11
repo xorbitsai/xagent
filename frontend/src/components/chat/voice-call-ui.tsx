@@ -152,6 +152,15 @@ export function VoiceCallBar({ call, compact = false, onEnd }: {
   const { end } = call
   const endCall = useCallback(() => { onEndRef.current?.(); end() }, [end])
 
+  // Buttons come and go as the call fails and recovers (Try again, mute). When
+  // the one that has focus goes, focus would drop to the page: keep it here.
+  const firstRender = useRef(true)
+  useEffect(() => {
+    if (firstRender.current) { firstRender.current = false; return }
+    const active = document.activeElement
+    if (!active || active === document.body) root.current?.focus({ preventScroll: true })
+  }, [failed])
+
   // The call is no longer a dialog, so give back what a dialog gave: focus moves
   // into it (the button that opened it is gone), and Escape ends it.
   useEffect(() => {
@@ -162,12 +171,11 @@ export function VoiceCallBar({ call, compact = false, onEnd }: {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return
-      // The call is not modal: leave Escape to other fields, dialogs and menus
-      // on the page, and only end the call from the composer or from nowhere.
-      const target = event.target
-      const form = root.current?.closest("form")
-      if (target instanceof Element && !form?.contains(target)
-        && target.closest("input, textarea, select, [contenteditable], [role=dialog], [role=menu], [role=listbox], [role=combobox]")) return
+      // The call is not modal, and other parts of the page (the progress panel,
+      // the user menu, dialogs, fields) close on Escape without marking it
+      // handled. Only end the call when Escape is pressed in the composer.
+      const composer = root.current?.closest("form") ?? root.current
+      if (!(event.target instanceof Node) || !composer?.contains(event.target)) return
       endCall()
     }
     document.addEventListener("keydown", onKeyDown)

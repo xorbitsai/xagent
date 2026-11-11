@@ -13,23 +13,25 @@ module's own ``_masked_auth``.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, cast
 
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ..api.mcp import (
     _check_mcp_permission,
+    _default_resource_owner_key,
     _enrich_oauth_server_info,
     _format_optional_datetime,
     _mask_env,
+    _mcp_oauth_configuration_error,
     _oauth_account_summaries,
 )
 from ..models.database import get_session_local
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
-from ..schemas.v1 import V1McpServer
+from ..schemas.v1 import V1McpServer, V1McpServerAuthorization
 from .connector_team_scope import (
     ConnectorHookSessionBoundaryError,
     connector_access_hook_installed,
@@ -37,6 +39,8 @@ from .connector_team_scope import (
     visible_team_connector_ids,
 )
 from .db_runtime import run_db_io_cancellation_safe
+from .mcp_oauth import select_mcp_oauth_grants
+from .mcp_runtime import _is_mcp_oauth_http_server
 
 logger = logging.getLogger(__name__)
 
@@ -205,11 +209,81 @@ def _masked_auth(auth: Any) -> Optional[dict[str, Any]]:
     return masked
 
 
+_AUTHORIZATION_MESSAGE = (
+    "Authorization is done in the xagent web app: open Connectors, select this "
+    "connector and choose Connect. An API key cannot complete browser "
+    "authorization."
+)
+
+_BUILTIN_OAUTH_STATUS = {
+    "connected": "authorized",
+    "needs_reconnect": "needs_reconnect",
+}
+
+
+def _authorization(
+    db: Any,
+    server: MCPServer,
+    link: UserMCPServer | None,
+    *,
+    holder_id: int,
+    connection_status: Optional[str],
+) -> Optional[V1McpServerAuthorization]:
+    """The holder's own OAuth authorization of the connector, if it uses OAuth.
+
+    A failing grant read propagates: it must not read as "not authorized". An OAuth
+    resource or issuer that does not parse is reported as "configuration_error", so
+    one misconfigured connector does not fail the whole response.
+    """
+    if server.transport == "oauth":
+        return V1McpServerAuthorization(
+            kind="builtin_oauth",
+            status=_BUILTIN_OAUTH_STATUS.get(connection_status or "", "not_authorized"),
+            message=_AUTHORIZATION_MESSAGE,
+        )
+    if not _is_mcp_oauth_http_server(server, server.auth):
+        return None
+    # The check above guarantees a dict; the ORM column type does not say so.
+    auth = cast(dict[str, Any], server.auth)
+    if _mcp_oauth_configuration_error(auth) is not None:
+        status = "configuration_error"
+    else:
+        try:
+            grants = select_mcp_oauth_grants(
+                db,
+                server_id=int(server.id),
+                user_id=holder_id,
+                auth_config=auth,
+                resource_owner_key=_default_resource_owner_key(holder_id),
+                # A connector seen only through the team has no link: the holder's
+                # own authorization of it counts when it targets the current URL.
+                allow_team_member_grants=link is None,
+            )
+        except ValueError as exc:
+            # The selector raises for an OAuth resource or issuer it cannot
+            # parse. Such settings are unusable, so report them for this
+            # connector instead of failing the whole response.
+            logger.warning(
+                "Reporting MCP OAuth connector authorization as "
+                "configuration_error, its OAuth resource or issuer does not "
+                "parse: server_id=%s error=%s",
+                server.id,
+                type(exc).__name__,
+            )
+            status = "configuration_error"
+        else:
+            status = "authorized" if grants else "not_authorized"
+    return V1McpServerAuthorization(
+        kind="mcp_oauth", status=status, message=_AUTHORIZATION_MESSAGE
+    )
+
+
 def _project_mcp_server(
     db: Any,
     server: MCPServer,
     link: UserMCPServer | None,
     *,
+    holder_id: int,
     is_admin: bool,
     oauth_accounts: dict[str, tuple[Optional[str], str, int]],
     catalog_app_keys: frozenset[str],
@@ -234,7 +308,7 @@ def _project_mcp_server(
         and kind == "custom"
         and _check_mcp_permission(link, is_admin, require="delete")
     )
-    app_id, provider, connected_account, _status = _enrich_oauth_server_info(
+    app_id, provider, connected_account, connection_status = _enrich_oauth_server_info(
         db, server, oauth_accounts
     )
     return V1McpServer(
@@ -262,6 +336,13 @@ def _project_mcp_server(
         app_id=app_id,
         provider=provider,
         connected_account=connected_account,
+        authorization=_authorization(
+            db,
+            server,
+            link,
+            holder_id=holder_id,
+            connection_status=connection_status,
+        ),
         created_at=_format_optional_datetime(server.created_at),
         updated_at=_format_optional_datetime(server.updated_at),
     )
@@ -285,6 +366,7 @@ def _project_rows(
             db,
             server,
             link,
+            holder_id=int(user.id),
             is_admin=bool(user.is_admin),
             oauth_accounts=oauth_accounts,
             catalog_app_keys=catalog_app_keys,

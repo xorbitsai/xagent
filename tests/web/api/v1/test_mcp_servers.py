@@ -1,5 +1,6 @@
 """Integration tests for the read-only /v1 MCP connector endpoints."""
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,13 +15,16 @@ from xagent.web.api.v1.errors import _DEFAULT_MESSAGES, V1ErrorCode
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.database import get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope, mcp_server_management
 from xagent.web.services.connector_team_scope import (
     ConnectorAccess,
     ConnectorHookSessionBoundaryError,
 )
+from xagent.web.services.mcp_oauth import _canonical_resource
 
 from ..conftest import (
     _admin_headers,
@@ -792,3 +796,314 @@ def test_timestamps_are_iso_strings_or_null(bob, stamped):
     body = _get_one(bob, server_id).json()
 
     assert (body["created_at"], body["updated_at"]) == expected
+
+
+# ===== the holder's own OAuth authorization =====
+
+AUTHORIZATION_MESSAGE = (
+    "Authorization is done in the xagent web app: open Connectors, select this "
+    "connector and choose Connect. An API key cannot complete browser "
+    "authorization."
+)
+OTHER_URL = "https://old.example.test/mcp"
+OAUTH_AUTH = {"type": "mcp_oauth", "scope": "read write"}
+
+
+def _seed_grant(
+    holder: Holder,
+    server_id: int,
+    *,
+    resource: str | None = None,
+    owner_key: str | None = None,
+    status: str = "active",
+    scope: str = "read write",
+) -> None:
+    """One OAuth grant of ``holder`` on a connector, with its client row."""
+    db = _direct_db_session()
+    try:
+        client_row = MCPOAuthClient(
+            mcp_server_id=server_id,
+            issuer="https://auth.example.test",
+            authorization_endpoint="https://auth.example.test/authorize",
+            token_endpoint="https://auth.example.test/token",
+            client_id=f"client-{holder.user_id}-{server_id}",
+            redirect_uri="https://xagent.example.test/callback",
+            lookup_hash=f"client-{holder.user_id}-{server_id}",
+        )
+        db.add(client_row)
+        db.flush()
+        db.add(
+            MCPOAuthGrant(
+                mcp_server_id=server_id,
+                user_id=holder.user_id,
+                mcp_oauth_client_id=client_row.id,
+                lookup_hash=f"grant-{holder.user_id}-{server_id}-{owner_key}-{status}",
+                resource_owner_key=owner_key or f"xagent:user:{holder.user_id}",
+                issuer="https://auth.example.test",
+                resource=resource or _canonical_resource(CONNECTOR_URL),
+                scope=scope,
+                access_token="encrypted",
+                status=status,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _seed_user_oauth(holder: Holder, *, connected: bool) -> None:
+    db = _direct_db_session()
+    try:
+        db.add(
+            UserOAuth(
+                user_id=holder.user_id,
+                provider="acme",
+                provider_user_id="acme-1",
+                access_token="token" if connected else "",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _authorization(holder: Holder, server_id: int) -> dict | None:
+    """The field as the detail route reports it; the list must agree."""
+    detail = _get_one(holder, server_id)
+    assert detail.status_code == 200, detail.text
+    listed = [row for row in _list(holder) if row["id"] == server_id]
+    assert len(listed) == 1
+    assert listed[0]["authorization"] == detail.json()["authorization"]
+    return detail.json()["authorization"]
+
+
+def _assert_authorization(body: dict | None, kind: str, status: str) -> None:
+    assert body == {"kind": kind, "status": status, "message": AUTHORIZATION_MESSAGE}
+
+
+def _own_oauth(holder: Holder, **columns: Any) -> int:
+    columns.setdefault("auth", OAUTH_AUTH)
+    return _seed("own-oauth", owner=holder, **columns)
+
+
+def _team_oauth(owner: Holder, bob: Holder) -> int:
+    """A connector owned by ``owner`` that ``bob`` sees only through the team."""
+    server_id = _seed("team-oauth", owner=owner, auth=OAUTH_AUTH)
+    _share_with_team(server_id)
+    return server_id
+
+
+def _cell_own_grant(bob, carol):
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_own_no_grant(bob, carol):
+    return bob, _own_oauth(bob), "mcp_oauth", "not_authorized"
+
+
+def _cell_only_others_grant(bob, carol):
+    server_id = _own_oauth(bob)
+    _seed_grant(carol, server_id)
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_own_grant_revoked(bob, carol):
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id, status="revoked")
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_invalid_required_scope(bob, carol):
+    server_id = _own_oauth(
+        bob, auth={"type": "mcp_oauth", "scope": "read", "required_scope": "write"}
+    )
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "configuration_error"
+
+
+def _cell_catalog_connected(bob, carol):
+    _seed_app("acme-app", "Acme App")
+    db = _direct_db_session()
+    try:
+        db.query(PublicMCPApp).filter_by(app_id="acme-app").one().provider_name = "acme"
+        db.commit()
+    finally:
+        db.close()
+    _seed_user_oauth(bob, connected=True)
+    server_id = _seed(
+        "acme-app", owner=bob, transport="oauth", url=None, auth={"app_id": "acme-app"}
+    )
+    return bob, server_id, "builtin_oauth", "authorized"
+
+
+def _cell_catalog_needs_reconnect(bob, carol):
+    _holder, server_id, _kind, _status = _cell_catalog_connected(bob, carol)
+    db = _direct_db_session()
+    try:
+        db.query(UserOAuth).update({"access_token": ""})
+        db.commit()
+    finally:
+        db.close()
+    return bob, server_id, "builtin_oauth", "needs_reconnect"
+
+
+def _cell_catalog_no_account(bob, carol):
+    _holder, server_id, _kind, _status = _cell_catalog_connected(bob, carol)
+    db = _direct_db_session()
+    try:
+        db.query(UserOAuth).delete()
+        db.commit()
+    finally:
+        db.close()
+    return bob, server_id, "builtin_oauth", "not_authorized"
+
+
+def _cell_bearer_connector(bob, carol):
+    server_id = _seed(
+        "bearer", owner=bob, auth={"type": "bearer", "bearer_token": "secret"}
+    )
+    return bob, server_id, None, None
+
+
+def _cell_team_row_member_grant(bob, carol):
+    server_id = _team_oauth(carol, bob)
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_team_row_grant_other_url(bob, carol):
+    server_id = _team_oauth(carol, bob)
+    _seed_grant(bob, server_id, resource=_canonical_resource(OTHER_URL))
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_team_row_grant_non_default_identity(bob, carol):
+    server_id = _team_oauth(carol, bob)
+    _seed_grant(bob, server_id, owner_key="acme:actor:1")
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_own_grant_other_url(bob, carol):
+    # A holder with a link of their own is matched without a URL comparison.
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id, resource=_canonical_resource(OTHER_URL))
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_own_grant_non_default_identity(bob, carol):
+    # Only another owner key holds a grant; the holder's default owner key has none.
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id, owner_key="acme:actor:1")
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_mcp_oauth_on_stdio(bob, carol):
+    server_id = _own_oauth(bob, transport="stdio", url=None, command="acme-mcp")
+    _seed_grant(bob, server_id)
+    return bob, server_id, None, None
+
+
+def _cell_own_unparseable_resource(bob, carol):
+    # The grant selector raises ValueError for a resource that does not parse.
+    server_id = _own_oauth(bob, auth={**OAUTH_AUTH, "resource": "http://[::1"})
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "configuration_error"
+
+
+def _cell_team_row_unparseable_issuer(bob, carol):
+    server_id = _seed(
+        "team-oauth", owner=carol, auth={**OAUTH_AUTH, "issuer": "http://[::1"}
+    )
+    _share_with_team(server_id)
+    return bob, server_id, "mcp_oauth", "configuration_error"
+
+
+_AUTHORIZATION_CELLS = {
+    "own_grant": _cell_own_grant,
+    "own_no_grant": _cell_own_no_grant,
+    "only_others_grant": _cell_only_others_grant,
+    "own_grant_revoked": _cell_own_grant_revoked,
+    "invalid_required_scope": _cell_invalid_required_scope,
+    "catalog_connected": _cell_catalog_connected,
+    "catalog_needs_reconnect": _cell_catalog_needs_reconnect,
+    "catalog_no_account": _cell_catalog_no_account,
+    "bearer_connector": _cell_bearer_connector,
+    "team_row_member_grant": _cell_team_row_member_grant,
+    "team_row_grant_other_url": _cell_team_row_grant_other_url,
+    "team_row_grant_non_default_identity": _cell_team_row_grant_non_default_identity,
+    "own_grant_other_url": _cell_own_grant_other_url,
+    "own_grant_non_default_identity": _cell_own_grant_non_default_identity,
+    "mcp_oauth_on_stdio": _cell_mcp_oauth_on_stdio,
+    "own_unparseable_resource": _cell_own_unparseable_resource,
+    "team_row_unparseable_issuer": _cell_team_row_unparseable_issuer,
+}
+
+
+@pytest.mark.parametrize("cell", list(_AUTHORIZATION_CELLS))
+def test_authorization_projection(bob, carol, cell):
+    assert len(_AUTHORIZATION_CELLS) == 17
+    holder, server_id, kind, status = _AUTHORIZATION_CELLS[cell](bob, carol)
+
+    body = _authorization(holder, server_id)
+
+    if kind is None:
+        assert body is None
+    else:
+        _assert_authorization(body, kind, status)
+
+
+@pytest.mark.parametrize("route", ["list", "detail"])
+def test_authorization_read_failure_fails_the_whole_response(bob, carol, route):
+    server_id = _team_oauth(carol, bob)
+    _seed_grant(bob, server_id)
+    engine = get_engine()
+
+    def fail_grant_read(conn, cursor, statement, parameters, context, executemany):
+        if "mcp_oauth_grants" in statement:
+            raise OperationalError(statement, parameters, Exception("boom"))
+
+    sa.event.listen(engine, "before_cursor_execute", fail_grant_read)
+    try:
+        if route == "list":
+            resp = client.get("/v1/mcp-servers", headers=bob.headers)
+        else:
+            resp = _get_one(bob, server_id)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", fail_grant_read)
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json() == {
+        "error": {
+            "code": "internal_error",
+            "message": _DEFAULT_MESSAGES[V1ErrorCode.INTERNAL_ERROR],
+        }
+    }
+    assert "boom" not in resp.text
+
+
+def test_an_unparseable_oauth_address_does_not_fail_the_list(bob, carol, caplog):
+    good_id = _own_oauth(bob)
+    _seed_grant(bob, good_id)
+    bad_id = _seed(
+        "team-oauth", owner=carol, auth={**OAUTH_AUTH, "resource": "http://[::1"}
+    )
+    _share_with_team(bad_id)
+
+    with caplog.at_level(logging.WARNING, logger=mcp_server_management.__name__):
+        rows = {row["id"]: row for row in _list(bob)}
+
+    assert rows[good_id]["authorization"]["status"] == "authorized"
+    assert rows[bad_id]["authorization"]["status"] == "configuration_error"
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == mcp_server_management.__name__
+    ]
+    assert warnings == [
+        "Reporting MCP OAuth connector authorization as configuration_error, "
+        f"its OAuth resource or issuer does not parse: server_id={bad_id} "
+        "error=ValueError"
+    ]
+    assert not any("[::1" in message for message in warnings)

@@ -442,6 +442,33 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1McpServerAuthorization(BaseModel):
+    """Whether the key holder has authorized an OAuth connector.
+
+    Fields with a fixed set of values are plain strings, and other values may
+    be added later, so clients should accept any string.
+    """
+
+    kind: str = Field(
+        ...,
+        description=(
+            "'mcp_oauth' for a connector with its own OAuth settings, "
+            "'builtin_oauth' for a platform app connection."
+        ),
+    )
+    status: str = Field(
+        ...,
+        description=(
+            "'authorized', 'not_authorized', 'needs_reconnect' (platform app "
+            "connections only) or 'configuration_error' (the connector's "
+            "OAuth settings are unusable)."
+        ),
+    )
+    message: str = Field(
+        ..., description="Where to complete authorization; an API key cannot."
+    )
+
+
 class V1McpServer(BaseModel):
     """One MCP connector the key holder can see.
 
@@ -517,6 +544,20 @@ class V1McpServer(BaseModel):
     provider: Optional[str] = None
     connected_account: Optional[str] = Field(
         None, description="The key holder's own connected third-party account."
+    )
+    authorization: Optional[V1McpServerAuthorization] = Field(
+        None,
+        description=(
+            "The key holder's own OAuth authorization of this connector. Null "
+            "unless `auth.type` is `mcp_oauth` on an `sse`, `streamable_http` "
+            "or `websocket` transport, or the transport is `oauth`. "
+            "'authorized' means a "
+            "usable authorization is stored, not that its token can still be "
+            "refreshed. For a connector seen only through a team it reports "
+            "the key holder's own authorization; the web route "
+            "`/api/mcp/{server_id}/oauth/status` answers 404 for such a "
+            "holder because it requires the holder's own enabled link."
+        ),
     )
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

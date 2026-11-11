@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -3808,4 +3809,13 @@ def google_drive_remove_permission(file_id: str, permission_id: str) -> str:
 
 
 if __name__ == "__main__":
+    # ``python -m xagent.web.tools.mcp.google_drive`` runs this file as
+    # ``__main__``, so its package name is not bound in sys.modules. The
+    # Composio branches import google_drive_composio lazily, and that module
+    # reads this module's content-update primitives: without this binding it
+    # would execute this file a second time, leaving a second module object
+    # with its own FastMCP instance and its own error classes. A plain import
+    # already has the binding, so setdefault leaves it alone.
+    if __spec__ is not None:
+        sys.modules.setdefault(__spec__.name, sys.modules[__name__])
     mcp.run()

@@ -3,7 +3,10 @@
 No request leaves the process: ``requests.request`` is replaced, so these
 tests pin the request shapes Composio's documented API takes and the
 messages a caller gets back, including that no credential or presigned URL
-reaches them.
+reaches them. The redirect tests go one layer lower instead: the real
+``public_requests`` Session with only its adapter's send replaced, because
+what a 3xx does to a request is requests' own behaviour and a fake above
+``Session.send`` cannot show it.
 """
 
 from __future__ import annotations
@@ -12,7 +15,9 @@ import json
 from typing import Any
 
 import pytest
+from requests.hooks import dispatch_hook
 
+from xagent.core.utils import public_requests
 from xagent.web.tools.mcp import composio_proxy, composio_tools
 from xagent.web.tools.mcp.google_drive_composio import (
     GOOGLEDRIVE_CREATE_FILE,
@@ -60,8 +65,8 @@ class FakeHttp:
         self.calls.append(call)
         for expected_method, needle, response in self.by_url:
             if method == expected_method and needle in url:
-                return response
-        return self.default
+                return dispatch_hook("response", kwargs.get("hooks"), response)
+        return dispatch_hook("response", kwargs.get("hooks"), self.default)
 
     def calls_to(self, needle: str, method: str | None = None) -> list[dict[str, Any]]:
         return [
@@ -72,15 +77,47 @@ class FakeHttp:
 
 
 @pytest.fixture
-def http(monkeypatch) -> FakeHttp:
+def composio_env(monkeypatch) -> None:
+    """The launch variables a Composio-backed grant starts with."""
+    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
+    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
+    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
+
+
+@pytest.fixture
+def http(monkeypatch, composio_env) -> FakeHttp:
     fake = FakeHttp()
     monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
     # composio_tools and composio_proxy share the same public_requests module,
     # so one patch covers the upload, the tool call and a download.
-    monkeypatch.setenv(composio_proxy.COMPOSIO_API_KEY_ENV, API_KEY)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, ACCOUNT_ID)
-    monkeypatch.setenv(composio_proxy.COMPOSIO_USER_ID_ENV, COMPOSIO_USER)
     return fake
+
+
+class _RedirectingAdapter:
+    """The real public-only Session with only its network send replaced.
+
+    ``requests.request`` is left alone, so ``Session.send`` runs the response
+    hooks and, even with ``allow_redirects`` false, still asks
+    ``resolve_redirects`` for the next request. That is where the
+    public-only client refuses to replay a cross-origin body, after the
+    request has already gone out, so this layer is the only one that can show
+    what a 3xx does.
+    """
+
+    def __init__(self, status_code: int, location: str) -> None:
+        self.status_code = status_code
+        self.location = location
+        self.sent: list[Any] = []
+
+    def send(self, request: Any, **kwargs: Any) -> Any:
+        self.sent.append(request)
+        response = public_requests.Response()
+        response.status_code = self.status_code
+        response.headers["Location"] = self.location
+        response._content = b'{"error": {"message": "moved"}}'
+        response.url = request.url
+        response.request = request
+        return response
 
 
 def _upload_answer(**overrides: Any) -> dict[str, Any]:
@@ -374,28 +411,84 @@ def test_execute_tool_sends_the_account_the_user_and_the_arguments(http):
         "arguments": {"name": "notes.txt", "file_to_upload": {"s3key": "k"}},
     }
     assert call["headers"]["x-api-key"] == API_KEY
-    # A redirect is not followed: replaying the JSON body to another origin
-    # fails after the POST was sent (see the redirect test below).
+    # A redirect is neither followed nor resolved: the response hook reports a
+    # 3xx before requests can build the next request (see the redirect test
+    # below).
     assert call["allow_redirects"] is False
+    assert call["hooks"]["response"] is composio_tools._TOOL_REDIRECT_REFUSAL
 
 
-def test_a_redirect_on_the_tool_post_is_reported_as_an_unknown_result(http):
-    """A cross-origin 307/308 cannot be replayed, and the client's own
-    refusal arrives after the POST was sent. The 3xx status is reported
-    instead, so a caller never reads it as "nothing was sent"."""
-    http.answer(
-        "/tools/execute/GOOGLEDRIVE_CREATE_FILE",
-        307,
-        {"error": {"message": "moved"}},
-    )
+@pytest.mark.parametrize(
+    ("status", "location"),
+    [
+        (
+            307,
+            "https://other-origin.example.com/api/v3.1/tools/execute/"
+            "GOOGLEDRIVE_CREATE_FILE",
+        ),
+        (
+            308,
+            "https://other-origin.example.com/api/v3.1/tools/execute/"
+            "GOOGLEDRIVE_CREATE_FILE",
+        ),
+        (
+            307,
+            f"{composio_tools.COMPOSIO_API_BASE_URL}"
+            "/tools/execute/v2/GOOGLEDRIVE_CREATE_FILE",
+        ),
+    ],
+    ids=["cross-origin-307", "cross-origin-308", "same-origin-307"],
+)
+def test_a_redirect_on_the_tool_post_is_reported_as_sent_and_unknown(
+    monkeypatch, composio_env, status, location
+):
+    """A 3xx is reported with its status instead of being resolved.
+
+    The real client is used, with only the network send replaced: with
+    ``allow_redirects`` false it still resolves the next request, and for a
+    cross-origin 307/308 the public-only client raises its own ``ValueError``
+    there, after the POST has already gone out. The response hook must stop
+    that resolution, so the caller reads that the request was sent rather
+    than that nothing was.
+    """
+    adapter = _RedirectingAdapter(status, location)
+    monkeypatch.setattr(public_requests._PublicAdapter, "send", adapter.send)
 
     with pytest.raises(composio_tools.ComposioToolError) as raised:
         _execute(GOOGLEDRIVE_CREATE_FILE, {})
 
-    assert raised.value.status == 307
-    assert "redirect (HTTP 307)" in str(raised.value)
+    # One POST: nothing was replayed towards the redirect target.
+    assert len(adapter.sent) == 1
+    assert raised.value.status == status
+    assert f"redirect (HTTP {status})" in str(raised.value)
     assert "the request was sent" in str(raised.value)
     assert "nothing was sent" not in str(raised.value)
+
+
+@pytest.mark.parametrize("status", [307, 308], ids=["307", "308"])
+def test_a_redirect_on_the_staging_put_is_reported_as_not_uploaded(monkeypatch, status):
+    """The presigned PUT runs through the same client: a 3xx there means the
+    bytes were not stored, and it must not escape as the client's own
+    ``ValueError`` either."""
+    adapter = _RedirectingAdapter(
+        status, "https://other-storage.example.com/report.pdf"
+    )
+    monkeypatch.setattr(public_requests._PublicAdapter, "send", adapter.send)
+
+    with pytest.raises(composio_tools.ComposioToolError) as raised:
+        composio_tools._put_file(
+            UPLOAD_URL,
+            data=_BYTES,
+            length=len(_BYTES),
+            mimetype="application/pdf",
+            backend=None,
+        )
+
+    assert len(adapter.sent) == 1
+    assert raised.value.status == status
+    assert f"redirect (HTTP {status})" in str(raised.value)
+    assert "not uploaded" in str(raised.value)
+    assert UPLOAD_URL not in str(raised.value)
 
 
 def test_execute_tool_returns_a_tool_failure_without_raising(http):

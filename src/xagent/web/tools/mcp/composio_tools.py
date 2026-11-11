@@ -200,6 +200,42 @@ def _storage_backend(answer: Mapping[str, Any]) -> str | None:
     return backend if isinstance(backend, str) else None
 
 
+def _redirect_refusal(message: str) -> Callable[..., Any]:
+    """A response hook that turns every 3xx into a ``ComposioToolError``.
+
+    ``requests.Session.send`` runs the response hooks before it resolves a
+    redirect, and it still resolves one when ``allow_redirects`` is false, to
+    fill ``Response.next``. Resolving a cross-origin 307/308 calls
+    ``Session.rebuild_auth``, which the public-only client refuses with a
+    plain ``ValueError`` once the request has already been sent, outside the
+    exceptions these callers translate. Raising here keeps that resolution
+    from running at all, so every 3xx is reported with its status whatever
+    the destination origin. ``message`` is the error text, with the status
+    substituted.
+    """
+
+    def refuse(response: Any, **kwargs: Any) -> Any:
+        status = int(response.status_code)
+        if 300 <= status < 400:
+            raise ComposioToolError(message.format(status), status=status)
+        return response
+
+    return refuse
+
+
+# A 3xx from the tool call may arrive after the tool ran, so it is reported
+# as sent with its result unknown. A 3xx from the presigned PUT is part of
+# staging: the bytes were not stored, so nothing reached the tool.
+_TOOL_REDIRECT_REFUSAL = _redirect_refusal(
+    "Composio answered with a redirect (HTTP {}) that was not followed: the "
+    "request was sent, and its result is not known"
+)
+_STAGING_REDIRECT_REFUSAL = _redirect_refusal(
+    "Composio's file storage answered with a redirect (HTTP {}) that was not "
+    "followed, so the file was not uploaded"
+)
+
+
 def _put_file(
     url: str,
     *,
@@ -212,8 +248,10 @@ def _put_file(
 
     Only an HTTPS URL is followed. ``public_requests`` resolves and pins the
     destination to a public address, so the URL Composio returns cannot be
-    used to reach an internal host. The URL is a credential and is never put
-    in a message or a log line.
+    used to reach an internal host. A 3xx is refused by the response hook
+    before requests can resolve it, since resolving a cross-origin redirect
+    there raises its own ``ValueError``. The URL is a credential and is never
+    put in a message or a log line.
     """
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname:
@@ -229,6 +267,7 @@ def _put_file(
             headers=headers,
             timeout=DEFAULT_TIMEOUT_SECONDS,
             allow_redirects=False,
+            hooks={"response": _STAGING_REDIRECT_REFUSAL},
         )
     except (PrivateNetworkHostError, requests.exceptions.InvalidURL):
         # The public-only client refuses a non-public destination before a
@@ -269,12 +308,14 @@ def _call(path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
             },
             json=dict(payload),
             timeout=DEFAULT_TIMEOUT_SECONDS,
-            # A redirect is not followed: a 307/308 replays the JSON body to
-            # another origin, which the public-only client refuses after the
-            # POST has been sent. The 3xx is reported instead, so a caller can
-            # see that the request went out and the result is unknown rather
-            # than that nothing was sent.
+            # A redirect is neither followed nor resolved: the response hook
+            # raises on any 3xx before requests builds the next request, so a
+            # cross-origin 307/308 never reaches rebuild_auth (which refuses
+            # a replayed body only after the POST was sent) and the status is
+            # reported instead of a bare ValueError that reads like "nothing
+            # was sent".
             allow_redirects=False,
+            hooks={"response": _TOOL_REDIRECT_REFUSAL},
         )
     except (requests.RequestException, OSError) as exc:
         # Type only: a connection error's text can name the request. A
@@ -286,13 +327,6 @@ def _call(path: str, payload: Mapping[str, Any]) -> tuple[int, Any]:
             type(exc).__name__,
         )
         raise ComposioToolError("Composio could not be reached") from None
-    if 300 <= response.status_code < 400:
-        raise ComposioToolError(
-            f"Composio answered with a redirect (HTTP {response.status_code}) "
-            "that was not followed: the request was sent, and its result is "
-            "not known",
-            status=int(response.status_code),
-        )
     try:
         answer = response.json()
     except Exception:

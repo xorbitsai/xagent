@@ -4,7 +4,10 @@ Such a grant holds no Google token: the tool process is launched with the
 Composio ids instead (``tools/config._composio_grant_env``), JSON and media
 reads go through the proxy transport, and the three byte-writing tools stage
 the file through Composio's Files API and run Composio's Drive tool.
-Composio is faked here; no request leaves the process.
+Composio is faked here; no request leaves the process. The redirect tests
+are the exception: they drive the real ``public_requests`` Session with only
+its adapter's send replaced, because what a 3xx does to a request is
+requests' own behaviour and a fake above ``Session.send`` cannot show it.
 """
 
 from __future__ import annotations
@@ -12,6 +15,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import subprocess
+import sys
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +25,9 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from requests.hooks import dispatch_hook
 
+from xagent.core.utils import public_requests
 from xagent.web.tools import config as tools_config
 from xagent.web.tools.mcp import (
     composio_proxy,
@@ -158,10 +166,18 @@ class FakeHttp:
         if "/tools/execute/" in url:
             slug = url.rsplit("/", 1)[-1]
             self.tool_calls.append((slug, kwargs["json"]["arguments"]))
-            return _Response(self._tool_status.get(slug, 200), self._tool_answers[slug])
+            answer = _Response(
+                self._tool_status.get(slug, 200), self._tool_answers[slug]
+            )
+            # A fake at this boundary sits above Session.send, so it has to
+            # dispatch the response hooks itself; that is where a 3xx is
+            # refused.
+            return dispatch_hook("response", kwargs.get("hooks"), answer)
         if method == "PUT":
             self.puts.append(call)
-            return _Response(self.put_status)
+            return dispatch_hook(
+                "response", kwargs.get("hooks"), _Response(self.put_status)
+            )
         if method == "GET" and url in self.downloads:
             return _Response(200, content=self.downloads[url])
         raise AssertionError(f"unexpected request: {method} {url}")
@@ -215,6 +231,54 @@ def http(monkeypatch, composio_env) -> FakeHttp:
     fake = FakeHttp()
     monkeypatch.setattr(composio_proxy.requests, "request", fake.request)
     return fake
+
+
+class _AdapterHttp:
+    """The real public-only Session with only its network send replaced.
+
+    Routes are matched by URL substring, first match wins, and each answer is
+    a real ``requests.Response``, so requests' own session, response hooks and
+    redirect resolution all run as they do in production. Nothing resolves or
+    connects: the adapter never opens a socket.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str]] = []
+        self.routes: list[tuple[str, str | None, int, Any, dict[str, str]]] = []
+
+    def answer(
+        self,
+        needle: str,
+        *,
+        method: str | None = None,
+        status: int = 200,
+        payload: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.routes.append((needle, method, status, payload, headers or {}))
+
+    def send(self, request: Any, **kwargs: Any) -> Any:
+        url = request.url or ""
+        self.sent.append((request.method or "", url))
+        for needle, route_method, route_status, payload, headers in self.routes:
+            if needle in url and (
+                route_method is None or route_method == request.method
+            ):
+                body = b"" if payload is None else json.dumps(payload).encode()
+                return self._response(request, route_status, body, headers)
+        raise AssertionError(f"unexpected request: {request.method} {url}")
+
+    @staticmethod
+    def _response(
+        request: Any, status: int, body: bytes, headers: dict[str, str]
+    ) -> Any:
+        response = public_requests.Response()
+        response.status_code = status
+        response.headers.update(headers)
+        response._content = body
+        response.url = request.url
+        response.request = request
+        return response
 
 
 def _query(payload: dict[str, Any]) -> dict[str, str]:
@@ -1344,30 +1408,66 @@ def test_upload_file_says_nothing_was_sent_when_the_call_never_started(
     assert http.proxy_calls == []
 
 
-def test_upload_file_does_not_say_nothing_was_sent_after_a_redirect(
-    http, _isolate_environment
+@pytest.mark.parametrize("tool_status", [307, 308], ids=["307", "308"])
+@pytest.mark.parametrize("action", ["upload", "create"])
+def test_a_cross_origin_redirect_on_the_create_tool_is_unknown_not_nothing_sent(
+    monkeypatch, composio_env, _isolate_environment, action, tool_status
 ):
-    """An answer of 307/308 means the POST went out and its result is not
-    known: the redirect is not followed, so this is not a pre-send failure
-    and must not be reported as one."""
-    local = _isolate_environment / "Report.pdf"
-    local.write_bytes(NEW_CONTENT)
-    http.tool(google_drive_composio.GOOGLEDRIVE_CREATE_FILE, status=307, data={})
-    http.proxy("name = ", 200, {"files": []})
+    """A cross-origin 307/308 is not replayed and the request went out, so
+    the answer must say the result is unknown and carry the status.
 
-    result = json.loads(google_drive.google_drive_upload_file(str(local)))
+    The real client is used, with only the network send replaced: requests
+    still resolves the next request with ``allow_redirects`` false, and the
+    public-only client raises its own ``ValueError`` there, after the POST was
+    sent. Without the response hook that ValueError reached the caller as
+    "nothing was sent to Google Drive", which is what this test fails on.
+    """
+    adapter = _AdapterHttp()
+    # The Proxy Execute endpoint is .../tools/execute/proxy, so it is routed
+    # before the tool call's own needle.
+    adapter.answer(
+        composio_proxy.COMPOSIO_PROXY_URL,
+        payload={"status": 200, "data": {"files": []}},
+    )
+    adapter.answer(
+        "/files/upload/request",
+        payload={
+            "key": "projects/pr_1/requests/googledrive/report.pdf",
+            "new_presigned_url": UPLOAD_URL,
+        },
+    )
+    adapter.answer(UPLOAD_URL, method="PUT")
+    adapter.answer(
+        "/tools/execute/GOOGLEDRIVE",
+        status=tool_status,
+        payload={"error": {"message": "moved"}},
+        headers={
+            "Location": "https://other-origin.example.com/api/v3.1/tools/execute/"
+            "GOOGLEDRIVE_CREATE_FILE"
+        },
+    )
+    monkeypatch.setattr(public_requests._PublicAdapter, "send", adapter.send)
+
+    if action == "upload":
+        local = _isolate_environment / "Report.pdf"
+        local.write_bytes(NEW_CONTENT)
+        result = json.loads(google_drive.google_drive_upload_file(str(local)))
+        done = "uploaded"
+    else:
+        result = json.loads(google_drive.google_drive_create_file("notes.txt", "hello"))
+        done = "created"
 
     assert result["status"] == "error"
     assert "nothing was sent to Google Drive" not in result["message"]
-    assert "not known whether it was uploaded" in result["message"]
-    # The tool's own words say the request was sent.
-    assert "redirect (HTTP 307)" in result["message"]
+    assert f"not known whether it was {done}" in result["message"]
+    # The tool's own words say the request was sent, with its status.
+    assert f"redirect (HTTP {tool_status})" in result["message"]
     assert "the request was sent" in result["message"]
-    tool_call = [call for call in http.calls if "/tools/execute/" in call["url"]][0]
-    assert tool_call["allow_redirects"] is False
-    # One tool call, one lookup: a retry could create a duplicate.
-    assert len(http.tool_calls) == 1
-    assert len([call for call in http.proxy_calls if "name = " in str(call)]) == 1
+    # One tool POST and one lookup: a retry could create a duplicate, and
+    # nothing was replayed towards the redirect target.
+    tool_posts = [url for _, url in adapter.sent if "/tools/execute/GOOGLEDRIVE" in url]
+    assert len(tool_posts) == 1
+    assert not [url for _, url in adapter.sent if "other-origin" in url]
 
 
 def test_upload_file_never_puts_the_api_key_or_upload_url_in_an_error(
@@ -2359,3 +2459,53 @@ def test_a_composio_grant_leaves_the_per_file_caveat_out(http):
 def test_a_native_grant_keeps_the_per_file_caveat():
     assert "per-file Drive access" in google_drive._per_file_access_note()
     assert "per-file Drive access" in google_drive._empty_search_note()
+
+
+# --- module layout ---------------------------------------------------------
+
+
+def test_running_the_entry_module_does_not_execute_it_a_second_time():
+    """``python -m xagent.web.tools.mcp.google_drive`` runs the file as
+    ``__main__``, so its package name is unbound; the lazy import of
+    google_drive_composio would then execute it again, with a second FastMCP
+    instance and a second set of error classes. The entry module binds itself
+    under its own name first, so both names are one module object.
+
+    A subprocess, because this interpreter already imported the package and
+    the ``__main__`` round trip only exists on a fresh start.
+    """
+    source_root = Path(google_drive.__file__).resolve().parents[4]
+    script = """
+import importlib
+import runpy
+import sys
+
+from mcp.server.fastmcp import FastMCP
+
+FastMCP.run = lambda self, *args: None
+ran = runpy.run_module(
+    "xagent.web.tools.mcp.google_drive", run_name="__main__", alter_sys=True
+)
+entry = sys.modules["xagent.web.tools.mcp.google_drive"]
+google_drive_composio = importlib.import_module(
+    "xagent.web.tools.mcp.google_drive_composio"
+)
+assert sys.modules["xagent.web.tools.mcp.google_drive"] is entry
+assert entry.mcp is ran["mcp"]
+assert google_drive_composio._ReplacementChangedError is ran["_ReplacementChangedError"]
+print("one module object", entry.__file__)
+"""
+    pythonpath = os.pathsep.join(
+        part for part in (str(source_root), os.environ.get("PYTHONPATH", "")) if part
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env={**os.environ, "PYTHONPATH": pythonpath},
+    )
+
+    assert result.returncode == 0, result.stderr
+    # The child must have imported this checkout, not another install.
+    assert f"one module object {source_root}" in result.stdout

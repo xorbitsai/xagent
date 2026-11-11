@@ -27,6 +27,7 @@ from ..connector_probes import ConnectorProbe
 from ..services.connector_probe import ConnectorProbeOutcome, evaluate_probe_result
 from .declarations import (
     Assertion,
+    Contains,
     CreatedRef,
     EachHasKeys,
     Equals,
@@ -56,6 +57,7 @@ _KINDS: Mapping[type, str] = {
     StatusSuccess: "status_success",
     HasKeys: "has_keys",
     EachHasKeys: "each_has_keys",
+    Contains: "contains",
     IsType: "is_type",
     Length: "length",
     Equals: "equals",
@@ -221,6 +223,8 @@ def _holds(assertion: Assertion, payload: Any) -> bool:
         return isinstance(value, list) and all(
             _has_keys(item, assertion.keys) for item in value
         )
+    if isinstance(assertion, Contains):
+        return isinstance(value, str) and assertion.value in value
     if isinstance(assertion, IsType):
         return _json_type(value) == assertion.type
     if isinstance(assertion, Length):

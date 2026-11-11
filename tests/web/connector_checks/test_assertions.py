@@ -15,6 +15,7 @@ from xagent.web.connector_checks.assertions import (
     value_at,
 )
 from xagent.web.connector_checks.declarations import (
+    Contains,
     CreatedRef,
     EachHasKeys,
     Equals,
@@ -167,6 +168,7 @@ _DOCUMENT = {
         HasKeys(("site",), ("id", "name")),
         EachHasKeys(("items",), ("id", "name")),
         EachHasKeys(("empty",), ("id",)),
+        Contains(("site", "name"), "ai"),
         IsType(("site",), "object"),
         IsType(("items",), "array"),
         IsType(("site", "id"), "string"),
@@ -195,6 +197,9 @@ def test_an_assertion_that_holds_passes(assertion: Any) -> None:
         (HasKeys(("missing",), ("id",)), "has_keys"),
         (EachHasKeys(("items",), ("id", "url")), "each_has_keys"),
         (EachHasKeys(("site",), ("id",)), "each_has_keys"),
+        (Contains(("site", "name"), "xyz"), "contains"),
+        (Contains(("count",), "2"), "contains"),
+        (Contains(("absent",), "x"), "contains"),
         (IsType(("count",), "string"), "is_type"),
         (IsType(("enabled",), "number"), "is_type"),
         (IsType(("count",), "boolean"), "is_type"),

@@ -45,7 +45,7 @@ ConnectorChecks(
 
 - Every tool an in-repo (`python -m`) connector's server registers has a check or an exemption, and every tool a declaration names is registered. A remote (`url`) or `npx` connector is not held to per-tool coverage (see Today's L3 probes).
 - The legacy list only shrinks, and the test pins it. A connector leaves both `LEGACY_CONNECTORS` and the test's pinned list in the PR that adds its declaration; a new builtin connector ships with its declaration and cannot join it, and a name on it must still be a builtin connector.
-- An exemption's reason says why the tool has no check yet. A read or write whose check is still to come names the issue of its connector family that decides it (#3567 for the Google document connectors, #3569 for the Microsoft 365 ones; a write check also needs the rules of #3653). A write that creates an object no tool of the server deletes has its own reason, since a write check would have nothing to clean up with. When a check is added for a tool, its exemption goes in the same change: a tool cannot be both.
+- An exemption's reason says why the tool has no check yet. A read or write whose check is still to come names the issue of its connector family that decides it (#3567 for the Google connectors, #3569 for the Microsoft 365 ones; a write check also needs the rules of #3653). A write that edits content in place says so in its reason: a write check creates, verifies and deletes its own object and has no step for an edit. A write that creates an object no tool of the server deletes has a reason of its own, since a write check would have nothing to clean up with. A tool that reads and writes in one step has its own reason too, since a write check's verify or cleanup guard would have to call that same tool, which the read-step rule of #3653 refuses. When a check is added for a tool, its exemption goes in the same change: a tool cannot be both.
 
 Arguments are JSON values. Any value, at any depth, can be a `FixtureRef`. A write check's steps can also use a `RunScopedName`, its `verify`, `cleanup` and `cleanup_guard` a `CreatedRef`, and a sweep's `delete` an `ItemRef`. None of them ever comes from the caller of the engine.
 
@@ -165,16 +165,17 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 | `StatusSuccess()` | the payload's `status` is `"success"` (the in-repo envelope) |
 | `HasKeys(path, keys)` | the object at `path` has every key |
 | `EachHasKeys(path, keys)` | every item of the array at `path` has every key |
+| `Contains(path, text)` | the string at `path` contains `text` |
 | `IsType(path, type)` | the value at `path` has JSON type `object`, `array`, `string`, `number`, `boolean` or `null` |
 | `Length(path, min=0, max=None)` | the array at `path` has between `min` and `max` items |
 | `Equals(path, value)` | the value at `path` equals `value`, typically a seeded fixture |
 | `L3Envelope(expect_keys=())` | the L3 probe would pass the result (`evaluate_probe_result`, which reads the whole result); must be the only assertion, with the default `json_text` payload |
 
-`assertions.judge_result` runs the assertions in order, and the first that does not hold fails the check as `assertion_failed` with its kind as the `reason`: `status_success`, `has_keys`, `each_has_keys`, `is_type`, `length` or `equals`. A path that does not exist fails the assertion that reads it. `Equals` compares as JSON does: a boolean never equals a number, and `1` equals `1.0`. A payload that cannot be taken fails the same way, with the reason `not_a_json_object` (`json_text`), `not_json_text` (a text item of `json_text_items` that is not JSON) or `no_structured_content`. A result that is not a mapping is `call_failed`/`invalid_result`, and one flagged `is_error` is `call_failed`/`tool_error`. `L3Envelope` keeps the probe's own reasons (`not_a_json_object`, `status_not_success`, `no_status`, `missing_keys`).
+`assertions.judge_result` runs the assertions in order, and the first that does not hold fails the check as `assertion_failed` with its kind as the `reason`: `status_success`, `has_keys`, `each_has_keys`, `contains`, `is_type`, `length` or `equals`. A path that does not exist fails the assertion that reads it. `Equals` compares as JSON does: a boolean never equals a number, and `1` equals `1.0`. A payload that cannot be taken fails the same way, with the reason `not_a_json_object` (`json_text`), `not_json_text` (a text item of `json_text_items` that is not JSON) or `no_structured_content`. A result that is not a mapping is `call_failed`/`invalid_result`, and one flagged `is_error` is `call_failed`/`tool_error`. `L3Envelope` keeps the probe's own reasons (`not_a_json_object`, `status_not_success`, `no_status`, `missing_keys`).
 
 ### Fixture keys
 
-A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The document connectors' `read_fixture` checks use these keys; the probe route does not take fixtures yet (#3284).
+A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The document and Google connectors' read checks use these keys; the probe route does not take fixtures yet (#3284).
 
 ### Today's L3 probes
 
@@ -195,6 +196,10 @@ The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `p
 `google-ads` has adopted V2 the same way as `zendesk` and `zoom`: it keeps its L3 call through `l3_read_check` and adds a structural read check on `google_ads_list_accessible_customers`, its one list tool that takes no object id and the tool its probe calls, which asserts the `customer_ids` list; `google_ads_search`, which takes a customer id and a query, is exempted (#3573).
 
 `jira` has adopted V2 at the Tier 1 bar (#3570). It keeps its L3 call and adds four read checks on the test tenant's seeded read project: `jira_search_issues` with the query `jira.seed.search_jql`, whose first issue is `jira.seed.issue_key`; `jira_list_comments` on that issue, whose first comment is `jira.seed.comment_id`; `jira_get_issue` on it; and `jira_get_current_user`. Its write check is the round trip shown under [Write checks and the sweep](#write-checks-and-the-sweep), with the sweep reading `jira.write_sweep_jql`. Each step that reads or writes issues passes `cloud_id` from `jira.tenant_id` instead of relying on the tool's single-site auto-detection; the tenant pin still refuses the write when the grant reaches any other site. The other seven tools are exempt: three reads the checked tools make unnecessary (they carry over 80% of Jira's calls), and four writes the write-check format cannot express, since each edits or adds to an existing issue rather than creating one it can delete.
+
+`gmail`, `google-analytics`, `google-calendar`, `google-docs`, `google-drive`, `google-sheets` and `google-slides` have adopted V2 against the Google test tenant (#3567). Every read check but the probe-derived `l3_probe` is bound to a fixture key the tenant registry records for the seed layout: `gmail.seed_label_id` (the label's one seeded message), `google-drive.seed_folder_id` (the closed seed folder, found by a Drive search), `google-docs.document_id` (read directly, and again through Drive's text export), `google-sheets.spreadsheet_id` (the spreadsheet's one tab, and the seeded `item`/`quantity` block through `google_sheets_read_range`), `google-slides.presentation_id` (the deck's title and its one slide), and `google-analytics.property_id`. The checks assert the seed's own values where the seed pins one, such as the document's text `xagent smoke seed document`, the spreadsheet's `alpha`/`1` row and the deck's one slide, so a change to that seed is a change to the checks that read it. Assertions the seed does not pin are shape guards: a spreadsheet tab's `row_count` and `column_count` are Google's default grid, and an Analytics report's `rows` is an array. `google_analytics_run_report` returns no property field of GA's own: `query.property_id` is its normalization of the argument it was given, so no assertion reads it, and `google-analytics.property_id` must be a bare-digit string (`563334905`), the form the tenant registry records. `google-analytics` also runs its probe-derived `l3_probe`, which takes no fixture. `google-calendar` keeps only that check, because every Calendar tool addresses `primary`, while the seed's calendar is a secondary one, so no seeded event is reachable.
+
+Every other Google tool is exempt: the reads outside the 80% cut; the writes, whose checks are decided with the write flows (#3567); the writes that create an object no tool of their server deletes (`google_docs_create_document`, `google_sheets_create_spreadsheet`, `google_slides_create_presentation`, `google_slides_import_pptx`, `gmail_send_messages`); and the in-place Docs edits (`google_docs_append_text`, `google_docs_replace_text`, `google_docs_batch_update`), which stay pending: a write check creates, verifies and deletes its own object and has no step for an edit, and the tenant registry sets aside no write-area document to edit. `google_slides_get_slide_thumbnail` is exempt because the tenant registry records no slide-id fixture: the deck the seed creates holds Google's default slide, but no fixture names it, and `gmail_manage_labels` is exempt because it is the only tool that reads a label and the only one that creates or deletes one, so a label write check's verify or cleanup guard would call its own create and cleanup tool (`#3653`); no separate label-reading tool is added.
 
 ## Identity adapters
 
@@ -318,7 +323,7 @@ The `user` adapter (`user_identity.py`):
 {
   "schema": "xagent.connector_smoke.result",
   "schema_version": 2,
-  "declaration_format_version": 1,
+  "declaration_format_version": 2,
   "identity": "toby",
   "environment": "production-au",
   "started_at": "2026-11-06T04:00:00Z",
@@ -326,10 +331,10 @@ The `user` adapter (`user_identity.py`):
   "complete": true,
   "failure": null,
   "rows": [
-    {"row": "session", "connector": "gmail", "check": null, "kind": null, "tool": null,
+    {"row": "session", "connector": "slack", "check": null, "kind": null, "tool": null,
      "outcome": "pass", "failure_class": null, "reason": null, "duration_ms": 1800},
-    {"row": "check", "connector": "gmail", "check": "gmail.l3_probe", "kind": "read",
-     "tool": "gmail_search_messages", "outcome": "pass", "failure_class": null,
+    {"row": "check", "connector": "slack", "check": "slack.l3_probe", "kind": "read",
+     "tool": "slack_list_channels", "outcome": "pass", "failure_class": null,
      "reason": null, "duration_ms": 900},
     {"row": "session", "connector": "jira", "check": null, "kind": null, "tool": null,
      "outcome": "fail", "failure_class": "client_rejected", "reason": "client_rejected",

@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from ..connector_probes import get_connector_probe, get_unprobeable_reason
 from .declarations import (
     ConnectorChecks,
+    Contains,
     CreatedRef,
     DeclarationError,
     EachHasKeys,
@@ -49,6 +50,24 @@ WRITE_WITHOUT_CLEANUP = (
     "write that creates an object no tool of this server deletes, so a write "
     "check has nothing to clean up with"
 )
+# Gmail's one label tool reads and writes labels. A label write check's verify
+# or cleanup guard would therefore call the tool the check creates and deletes
+# with, which the read-step rule of #3653 refuses; #3567 allows leaving the
+# tool exempt instead of adding the separate label read such a check needs.
+_GMAIL_LABEL_WITHOUT_READ = (
+    "read and write in one tool: it is the only Gmail tool that reads a label "
+    "and the only one that creates or deletes one, so a label write check's "
+    "verify or cleanup guard would call its own create and cleanup tool, which "
+    "#3653 refuses; no label-reading tool is added, which #3567 allows"
+)
+# The deck the seed creates holds Google's default slide, so what a thumbnail
+# check lacks is a fixture for that slide's id, not a slide: the tenant
+# registry records none, and the tool addresses a slide by its id.
+_SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
+    "read that takes a slide id, and the tenant registry records none: the "
+    "seed deck holds Google's default slide, but no fixture names it, so "
+    "whether a check is added is decided in #3567"
+)
 
 
 def _exemptions(
@@ -56,6 +75,7 @@ def _exemptions(
     issue: str,
     reads: tuple[str, ...] = (),
     writes: tuple[str, ...] = (),
+    in_place_edits: tuple[str, ...] = (),
     writes_without_cleanup: tuple[str, ...] = (),
 ) -> tuple[ToolExemption, ...]:
     return (
@@ -72,6 +92,15 @@ def _exemptions(
                 f"is decided in {issue}",
             )
             for tool in writes
+        ),
+        *(
+            ToolExemption(
+                tool,
+                "write that edits content in place: a write check creates, "
+                "verifies and deletes its own object and has no step for an "
+                f"edit, so whether a check is added is decided in {issue}",
+            )
+            for tool in in_place_edits
         ),
         *(
             ToolExemption(tool, WRITE_WITHOUT_CLEANUP)
@@ -323,6 +352,37 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("excel_add_table",),
         ),
     ),
+    "gmail": ConnectorChecks(
+        "gmail",
+        reads=(
+            ReadCheck(
+                "gmail.search_seed_message",
+                "gmail_search_messages",
+                {
+                    "label_ids": [FixtureRef("gmail.seed_label_id")],
+                    "max_results": 10,
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("messages",)),
+                    Length(("messages",), 1, 1),
+                    EachHasKeys(
+                        ("messages",),
+                        ("id", "threadId", "snippet", "subject", "from"),
+                    ),
+                    Equals(("messages", 0, "subject"), "xagent smoke seed message"),
+                ),
+            ),
+        ),
+        exemptions=(
+            *_exemptions(
+                issue=_GOOGLE_TIER_1,
+                reads=("gmail_read_threads",),
+                writes_without_cleanup=("gmail_send_messages",),
+            ),
+            ToolExemption("gmail_manage_labels", _GMAIL_LABEL_WITHOUT_READ),
+        ),
+    ),
     # Tier 2 (#3573): the connector's only read that takes no object id or
     # query is the tool its L3 probe calls, so that tool keeps the L3 row and
     # carries the check.
@@ -342,6 +402,62 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
         exemptions=_exemptions(issue=_TIER_2, reads=("google_ads_search",)),
     ),
+    "google-analytics": ConnectorChecks(
+        "google-analytics",
+        reads=(
+            _declared_l3("google-analytics"),
+            ReadCheck(
+                "google-analytics.run_report",
+                "google_analytics_run_report",
+                {
+                    "property_id": FixtureRef("google-analytics.property_id"),
+                    "metrics": ["sessions"],
+                    "date_ranges": [
+                        {"start_date": "7daysAgo", "end_date": "yesterday"}
+                    ],
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        (),
+                        (
+                            "query",
+                            "metric_headers",
+                            "totals",
+                            "rows",
+                            "row_count",
+                            "returned_count",
+                            "has_more",
+                            "truncated",
+                        ),
+                    ),
+                    HasKeys(
+                        ("query",),
+                        ("property_id", "metrics", "date_ranges", "limit", "offset"),
+                    ),
+                    IsType(("rows",), "array"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
+            reads=("google_analytics_get_metadata",),
+        ),
+    ),
+    "google-calendar": ConnectorChecks(
+        "google-calendar",
+        reads=(_declared_l3("google-calendar"),),
+        exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
+            reads=("google_calendar_get_event",),
+            writes=(
+                "google_calendar_create_events",
+                "google_calendar_delete_events",
+                "google_calendar_update_events",
+                "google_calendar_respond_to_event",
+            ),
+        ),
+    ),
     "google-docs": ConnectorChecks(
         "google-docs",
         reads=(
@@ -351,18 +467,77 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 {"document_id": FixtureRef("google-docs.document_id")},
                 assertions=(
                     StatusSuccess(),
-                    HasKeys((), ("document_id", "title")),
+                    HasKeys((), ("document_id", "title", "content")),
+                    Equals(("document_id",), FixtureRef("google-docs.document_id")),
+                    Equals(("title",), "xagent-smoke-seed-doc"),
+                    Contains(("content",), "xagent smoke seed document"),
                 ),
             ),
         ),
         exemptions=_exemptions(
             issue=_GOOGLE_TIER_1,
-            writes=(
+            in_place_edits=(
                 "google_docs_append_text",
-                "google_docs_replace_text",
                 "google_docs_batch_update",
+                "google_docs_replace_text",
             ),
             writes_without_cleanup=("google_docs_create_document",),
+        ),
+    ),
+    "google-drive": ConnectorChecks(
+        "google-drive",
+        reads=(
+            ReadCheck(
+                "google-drive.search_seed_folder",
+                "google_drive_search",
+                {
+                    "query": (
+                        "name = 'xagent-smoke-seed' and "
+                        "mimeType = 'application/vnd.google-apps.folder' and "
+                        "trashed = false"
+                    ),
+                    "max_results": 10,
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("files", "truncated")),
+                    Length(("files",), 1, 1),
+                    EachHasKeys(("files",), ("id", "name", "mimeType", "modifiedTime")),
+                    Equals(
+                        ("files", 0, "id"), FixtureRef("google-drive.seed_folder_id")
+                    ),
+                ),
+            ),
+            ReadCheck(
+                "google-drive.read_seed_file",
+                "google_drive_get_file_content",
+                {"file_id": FixtureRef("google-docs.document_id")},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("file", "content", "encoding", "truncated")),
+                    HasKeys(("file",), ("id", "name", "mimeType")),
+                    Equals(("file", "id"), FixtureRef("google-docs.document_id")),
+                    Equals(("file", "name"), "xagent-smoke-seed-doc"),
+                    Equals(("encoding",), "utf-8"),
+                    Contains(("content",), "xagent smoke seed document"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_GOOGLE_TIER_1,
+            reads=("google_drive_download_file", "google_drive_list_permissions"),
+            writes=(
+                "google_drive_create_file",
+                "google_drive_create_folder",
+                "google_drive_delete_file",
+                "google_drive_move_file",
+                "google_drive_remove_permission",
+                "google_drive_rename_file",
+                "google_drive_share_file",
+                "google_drive_update_file_content",
+                "google_drive_update_permission",
+                "google_drive_upload_file",
+            ),
         ),
     ),
     "google-sheets": ConnectorChecks(
@@ -374,13 +549,40 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 {"spreadsheet_id": FixtureRef("google-sheets.spreadsheet_id")},
                 assertions=(
                     StatusSuccess(),
-                    HasKeys((), ("spreadsheet_id", "title", "sheets")),
+                    HasKeys((), ("spreadsheet_id", "title", "url", "sheets")),
+                    Equals(
+                        ("spreadsheet_id",),
+                        FixtureRef("google-sheets.spreadsheet_id"),
+                    ),
+                    Equals(("title",), "xagent-smoke-seed-sheet"),
+                    Length(("sheets",), 1, 1),
+                    EachHasKeys(
+                        ("sheets",), ("sheet_id", "title", "row_count", "column_count")
+                    ),
+                ),
+            ),
+            ReadCheck(
+                "google-sheets.read_seed_range",
+                "google_sheets_read_range",
+                {
+                    "spreadsheet_id": FixtureRef("google-sheets.spreadsheet_id"),
+                    "range_name": "A1:B3",
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("range", "values", "truncated")),
+                    Length(("values",), 3, 3),
+                    Equals(("values", 0, 0), "item"),
+                    Equals(("values", 0, 1), "quantity"),
+                    Equals(("values", 1, 0), "alpha"),
+                    Equals(("values", 1, 1), "1"),
+                    Equals(("values", 2, 0), "beta"),
+                    Equals(("values", 2, 1), "2"),
                 ),
             ),
         ),
         exemptions=_exemptions(
             issue=_GOOGLE_TIER_1,
-            reads=("google_sheets_read_range",),
             writes=(
                 "google_sheets_update_range",
                 "google_sheets_append_rows",
@@ -400,22 +602,33 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 {"presentation_id": FixtureRef("google-slides.presentation_id")},
                 assertions=(
                     StatusSuccess(),
-                    HasKeys((), ("presentation_id", "title", "slides")),
+                    HasKeys((), ("presentation_id", "title", "slide_count", "slides")),
+                    Equals(
+                        ("presentation_id",),
+                        FixtureRef("google-slides.presentation_id"),
+                    ),
+                    Equals(("title",), "xagent-smoke-seed-slides"),
+                    Equals(("slide_count",), 1),
                 ),
             ),
         ),
-        exemptions=_exemptions(
-            issue=_GOOGLE_TIER_1,
-            reads=("google_slides_get_slide_thumbnail",),
-            writes=(
-                "google_slides_add_slide",
-                "google_slides_update_slide",
-                "google_slides_delete_slide",
-                "google_slides_batch_update",
+        exemptions=(
+            *_exemptions(
+                issue=_GOOGLE_TIER_1,
+                writes=(
+                    "google_slides_add_slide",
+                    "google_slides_update_slide",
+                    "google_slides_delete_slide",
+                    "google_slides_batch_update",
+                ),
+                writes_without_cleanup=(
+                    "google_slides_create_presentation",
+                    "google_slides_import_pptx",
+                ),
             ),
-            writes_without_cleanup=(
-                "google_slides_create_presentation",
-                "google_slides_import_pptx",
+            ToolExemption(
+                "google_slides_get_slide_thumbnail",
+                _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID,
             ),
         ),
     ),
@@ -639,10 +852,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "fireflies",
         "freshdesk",
         "github",
-        "gmail",
-        "google-analytics",
-        "google-calendar",
-        "google-drive",
         "google-maps",
         "google-search-console",
         "granola",

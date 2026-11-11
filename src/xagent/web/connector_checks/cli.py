@@ -179,7 +179,7 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         type=_selector_names,
         metavar="CHECK_ID",
-        help="run only these checks, by id (gmail.l3_probe); repeatable or "
+        help="run only these checks, by id (slack.l3_probe); repeatable or "
         "comma-separated",
     )
     parser.add_argument(

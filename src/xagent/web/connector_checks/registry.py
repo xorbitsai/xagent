@@ -142,11 +142,13 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
 
     Drive has no tool that returns the Workspace customer id, so the pin reads
     the seed folder instead: the one folder the seed names ``xagent-smoke-seed``
-    and only this tenant's account can see. The check creates a text file in
-    the registry's write folder, reads it back (the same read guards the
-    cleanup) and deletes it. The sweep lists that folder with the registry's
-    query fixture, since Drive's search takes the whole query, and deletes
-    leftovers by id.
+    in the account's My Drive root, and only this tenant's account can see. The
+    query is the seed's own uniqueness rule, so a folder with that name outside
+    the root, such as one in a shared drive, does not make the pin fail. The
+    check creates a text file in the registry's write folder, reads it back
+    (the same read guards the cleanup) and deletes it. The sweep lists that
+    folder with the registry's query fixture, since Drive's search takes the
+    whole query, and deletes leftovers by id.
     """
     pin = TenantPin(
         ToolStep(
@@ -155,6 +157,7 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
                 "query": (
                     "name = 'xagent-smoke-seed' and "
                     "mimeType = 'application/vnd.google-apps.folder' and "
+                    "'root' in parents and "
                     "trashed = false"
                 ),
                 "max_results": 10,

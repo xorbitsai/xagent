@@ -939,6 +939,7 @@ def test_google_drive_declares_its_write_check() -> None:
                 "query": (
                     "name = 'xagent-smoke-seed' and "
                     "mimeType = 'application/vnd.google-apps.folder' and "
+                    "'root' in parents and "
                     "trashed = false"
                 ),
                 "max_results": 10,
@@ -947,7 +948,8 @@ def test_google_drive_declares_its_write_check() -> None:
         ),
         path=("files", 0, "id"),
         # Drive has no tool that returns the tenant's customer id, so the pin
-        # reads the seed folder only this tenant's account can see.
+        # reads the seed folder only this tenant's account can see, found by
+        # the seed's own rule: its name, its type and the root as its parent.
         expected=FixtureRef("google-drive.seed_folder_id"),
     )
     name = RunScopedName("drive-file")

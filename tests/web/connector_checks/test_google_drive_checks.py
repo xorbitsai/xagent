@@ -42,10 +42,20 @@ FIXTURES = {
 VERDICTS = {"google_drive_create_file": "allow", "google_drive_delete_file": "allow"}
 NAMED = re.compile(r"xagent-smoke-[0-9]{12}-[0-9a-f]{6}-drive-file")
 _NAME_QUERY = re.compile(
-    r"name = '(?P<name>[^']*)' and mimeType = '(?P<mime_type>[^']*)' "
-    "and trashed = false"
+    r"name = '(?P<name>[^']*)' and mimeType = '(?P<mime_type>[^']*)'"
+    r"(?: and '(?P<root>root)' in parents)? and trashed = false"
 )
 _PARENT_QUERY = re.compile(r"'(?P<parent>[^']*)' in parents and trashed = false")
+
+
+def _in_parent(item: dict[str, Any], parent: str | None) -> bool:
+    """Whether a name query's parent clause holds: anywhere when it has none,
+    the root for the fake's top-level items, or one of the item's parents."""
+    if parent is None:
+        return True
+    if parent == "root":
+        return not item["parents"]
+    return parent in item["parents"]
 
 
 class Drive:
@@ -103,6 +113,7 @@ class Drive:
                 for item in self.items.values()
                 if item["name"] == by_name["name"]
                 and item["mimeType"] == by_name["mime_type"]
+                and _in_parent(item, by_name["root"])
             ]
         else:
             by_parent = _PARENT_QUERY.fullmatch(query)
@@ -379,6 +390,30 @@ async def test_a_pin_that_reads_another_seed_folder_refuses_the_write(
 
 
 @pytest.mark.usefixtures("writes_on")
+async def test_a_same_named_folder_outside_the_root_does_not_fail_the_pin(
+    drive: Drive,
+) -> None:
+    # The seed's own uniqueness rule counts folders in My Drive's root only,
+    # so the pin's search does too: a folder with the seed's name deeper in
+    # the tree is not a second seed folder.
+    drive.add("folder-nested", "xagent-smoke-seed", FOLDER_MIME, parent=SEED_FOLDER)
+
+    result = await run_checks(
+        _adapter(),
+        checks=["google-drive.file_round_trip"],
+        check_timeout=5.0,
+        total_timeout=60.0,
+    )
+
+    assert _check_rows(result)["google-drive.file_round_trip"] == (
+        "pass",
+        None,
+        None,
+    )
+    assert len(drive.created) == 1
+
+
+@pytest.mark.usefixtures("writes_on")
 async def test_a_file_that_lost_its_run_scoped_name_is_not_deleted(
     drive: Drive,
 ) -> None:
@@ -403,6 +438,30 @@ async def test_a_file_that_lost_its_run_scoped_name_is_not_deleted(
     )
     assert not [kind for kind, _ in drive.requests if kind == "delete"]
     assert set(drive.items) == set(seeded) | {drive.created[0]["id"]}
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_create_that_returns_an_error_is_not_cleaned_up(
+    drive: Drive,
+) -> None:
+    seeded = dict(drive.items)
+
+    def refuse(body: dict[str, Any], media: Any) -> dict[str, Any]:
+        raise RuntimeError("403 Client Error: Forbidden")
+
+    drive.create = refuse  # type: ignore[method-assign]
+
+    result = await _run(_adapter())
+
+    # The tool turns the Drive error into its own error envelope, so the create
+    # fails its status assertion; with no created id, nothing is deleted.
+    assert _check_rows(result)["google-drive.file_round_trip"] == (
+        "fail",
+        "assertion_failed",
+        "create:status_success",
+    )
+    assert not [kind for kind, _ in drive.requests if kind == "delete"]
+    assert drive.items == seeded
 
 
 # Drifted seed objects
@@ -455,12 +514,14 @@ async def test_the_sweep_deletes_only_old_leftovers_in_the_write_folder(
         return f"xagent-smoke-{(now - age).strftime('%Y%m%d%H%M')}-a1b2c3-drive-file"
 
     seeded = dict(drive.items)
-    old = drive.add(
-        "file-old", run_name(timedelta(hours=3)), "text/plain", parent=WRITE_FOLDER
-    )
+    stale = run_name(timedelta(hours=3))
+    old = drive.add("file-old", stale, "text/plain", parent=WRITE_FOLDER)
     young = drive.add(
         "file-young", run_name(timedelta(minutes=30)), "text/plain", parent=WRITE_FOLDER
     )
+    # The same old run-scoped name outside the write folder: the sweep lists
+    # the write folder alone, so it stays.
+    elsewhere = drive.add("file-elsewhere", stale, "text/plain", parent=SEED_FOLDER)
     tools = _tools()
 
     result = await run_sweep(
@@ -472,5 +533,6 @@ async def test_the_sweep_deletes_only_old_leftovers_in_the_write_folder(
     assert (row["connector"], row["outcome"]) == ("google-drive", "pass")
     assert old not in drive.items
     assert young in drive.items
-    assert set(drive.items) == set(seeded) | {young}
+    assert elsewhere in drive.items
+    assert set(drive.items) == set(seeded) | {young, elsewhere}
     assert ("list", FIXTURES["google-drive.write_sweep_query"]) in drive.requests

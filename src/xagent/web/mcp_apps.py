@@ -23,6 +23,7 @@ from .builtin_mcp_registry import (
     _persisted_builtin_provenance_matches,
     get_builtin_execution_fields_and_optional_scopes,
 )
+from .composio_apps import normalize_oauth_grant_key
 from .models.public_mcp import PublicMCPApp
 from .oauth_account_hosts import get_oauth_account_host
 
@@ -195,20 +196,14 @@ def get_catalog_mcp_oauth_credentials(
 _APPS_REQUIRING_PROVENANCE_FOR_OAUTH_POLICY = frozenset({"word"})
 
 
-def _normalize_oauth_grant_key(value: object) -> str | None:
-    """Case/whitespace-insensitive key, matching ``normalize_catalog_key``.
-
-    Duplicated rather than imported: mcp.py imports this module, so importing
-    back would cycle. An admin-created PublicMCPApp.app_id is free-form (see
-    POST /admin/mcp/apps), so every APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT
-    membership test must normalize the same way the connector-display layer
-    does, or a differently-cased app_id (e.g. "Facebook") silently bypasses
-    the policy at whichever call site compares raw strings instead.
-    """
-    if value is None:
-        return None
-    normalized = "-".join(str(value).strip().lower().split())
-    return normalized or None
+# An admin-created PublicMCPApp.app_id is free-form (see POST /admin/mcp/apps),
+# so every APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT membership test must normalize
+# the same way the connector-display layer does (``normalize_catalog_key``), or
+# a differently-cased app_id (e.g. "Facebook") silently bypasses the policy at
+# whichever call site compares raw strings instead. The implementation lives in
+# the dependency-free composio_apps module, which this module and composio_auth
+# can both import without a cycle.
+_normalize_oauth_grant_key = normalize_oauth_grant_key
 
 
 def _oauth_policy_app_id(app_or_id: object) -> object:

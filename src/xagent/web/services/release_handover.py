@@ -503,7 +503,11 @@ def settle_handover_sync(release_id: str) -> HandoverReport:
                 RecordOutcome.NOT_RECOVERABLE,
                 RecordOutcome.STOPPED,
             ):
+                # A committed outcome publishes its notice too (an expired or
+                # exhausted row is stopped now), without counting as recorded.
                 wrote = True
+                if result.notice is not None:
+                    notices.append(result.notice)
         if wrote:
             db.commit()
         else:

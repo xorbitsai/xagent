@@ -9,9 +9,11 @@ boundary. The checkpoint read is replaced by a scripted verdict.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Iterator
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -33,7 +35,15 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
-from xagent.web.services import release_handover, task_auto_resume
+from xagent.web.services import (
+    agent_service_manager,
+    release_handover,
+    task_auto_resume,
+)
+from xagent.web.services import task_command_execution as commands
+from xagent.web.services import (
+    task_setup_snapshot,
+)
 from xagent.web.services.release_handover import (
     HandoverOrderError,
     begin_handover_sync,
@@ -67,6 +77,7 @@ from xagent.web.services.task_execution_controller import (
 from xagent.web.services.task_lease_service import (
     CheckpointRecoveryResolution,
     CheckpointRecoveryVerdict,
+    TaskLease,
     TaskLeaseRecoveryCandidate,
     utc_now,
 )
@@ -1391,3 +1402,187 @@ def test_a_run_pause_requested_one_step_after_the_stage_is_owned_until_it_moves_
     # Something else moved the run (a second request, a takeover): not ours.
     _transition(factory, task_id, TaskControlState.PAUSE_REQUESTED)
     assert not _owns(factory, task_id)
+
+
+# -- the pause command is at-least-once: a retry must not move the version again ---
+
+
+def _leased(factory: sessionmaker, task_id: int) -> TaskLease:
+    attempt = "attempt-1"
+    _set(
+        factory,
+        task_id,
+        lease_attempt_id=attempt,
+        lease_expires_at=utc_now() + timedelta(minutes=5),
+    )
+    return TaskLease(task_id, RUNNER, RUN, attempt)
+
+
+def _real_pause_handler(
+    monkeypatch, lease: TaskLease, *, sink_failures: int
+) -> tuple[Any, list[str]]:
+    """The production ``pause_task``, with only its edges replaced.
+
+    The agent accepts the interrupt every time (the run is still unwinding),
+    and the ``task_pause_requested`` event sink raises ``sink_failures`` times
+    before it works, as the durable transport's retry of the same command sees.
+    """
+    published: list[str] = []
+
+    async def inline(fn):
+        return fn()
+
+    async def publish(event, _task_id):
+        if sink_failures > len(published):
+            published.append("failed")
+            raise RuntimeError("event sink down")
+        published.append(event["type"])
+
+    task = SimpleNamespace(user_id=1, run_id=RUN, status=TaskStatus.RUNNING)
+    monkeypatch.setattr(
+        task_setup_snapshot,
+        "load_task_setup_snapshot_sync",
+        lambda *a, **k: SimpleNamespace(task=task, runtime_user=object()),
+    )
+    monkeypatch.setattr(commands, "resolve_execution_scope_off_turn", lambda *a: None)
+    monkeypatch.setattr(commands, "run_db_io_cancellation_safe", inline)
+    monkeypatch.setattr(commands, "local_task_lease_holders", lambda *_a: (lease,))
+    monkeypatch.setattr(commands, "_mark_task_pause_accepted", lambda *a: None)
+    monkeypatch.setattr(commands, "publish_task_event", publish)
+    service = SimpleNamespace(pause_execution=lambda: asyncio.sleep(0, result=True))
+    monkeypatch.setattr(
+        agent_service_manager,
+        "get_agent_manager",
+        lambda: SimpleNamespace(get_agent_for_task=lambda *a, **k: _done(service)),
+    )
+
+    async def run_once() -> None:
+        message = {"user": SimpleNamespace(id=1, is_admin=False)}
+        await commands.pause_task(lambda _payload: _done(None), 1, message)
+
+    return run_once, published
+
+
+async def _done(value):
+    return value
+
+
+def test_a_pause_retried_after_its_event_sink_failed_leaves_the_handover_owned(
+    factory, checkpoint, monkeypatch
+):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    lease = _leased(factory, task_id)
+    begin_handover_sync(RELEASE, {RUNNER})
+    run_once, published = _real_pause_handler(monkeypatch, lease, sink_failures=1)
+    target = _commands(factory, task_id)[0].target_state_version
+
+    # Attempt one writes PAUSE_REQUESTED and the sink raises; the transport
+    # retries the same command while the run is still unwinding.
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_once())
+    asyncio.run(run_once())
+
+    assert published == ["failed", "task_pause_requested"]
+    with factory() as db:
+        assert db.get(Task, task_id).state_version == target + 1
+    # The run now rests at its step boundary: settlement and the sweeper agree.
+    with factory() as db:
+        for command in db.scalars(sa.select(TaskExecutionCommand)):
+            command.status = COMMAND_COMPLETED
+        db.commit()
+    _step_boundary(factory, task_id)
+    assert _owns(factory, task_id)
+    assert settle_handover_sync(RELEASE).recorded == 1
+
+
+def test_a_retried_pause_is_picked_up_by_the_sweeper_when_nobody_settled(
+    factory, checkpoint, monkeypatch
+):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    lease = _leased(factory, task_id)
+    begin_handover_sync(RELEASE, {RUNNER})
+    run_once, _ = _real_pause_handler(monkeypatch, lease, sink_failures=2)
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            asyncio.run(run_once())
+    asyncio.run(run_once())
+    with factory() as db:
+        for command in db.scalars(sa.select(TaskExecutionCommand)):
+            command.status = COMMAND_COMPLETED
+        db.commit()
+    _step_boundary(factory, task_id)
+    release_hold.reopen()
+
+    assert run_auto_resume_tick(now=utc_now()).handed_over == 1
+
+
+def test_the_pause_write_is_idempotent_only_for_a_row_this_holder_fenced(
+    factory, checkpoint
+):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    lease = _leased(factory, task_id)
+    first = commands._apply_pause_requested_isolated(
+        task_id, expected_run_id=RUN, owner_leases=(lease,)
+    )
+    again = commands._apply_pause_requested_isolated(
+        task_id, expected_run_id=RUN, owner_leases=(lease,)
+    )
+    assert first is again is commands.PauseWriteOutcome.APPLIED
+    with factory() as db:
+        assert db.get(Task, task_id).state_version == 4  # 3 + one write
+
+    # Another acquisition's pause request is still deferred, not reported done.
+    stranger = TaskLease(task_id, RUNNER, RUN, "someone-else")
+    with pytest.raises(commands.ClientVisibleTaskCommandDeferred):
+        commands._apply_pause_requested_isolated(
+            task_id, expected_run_id=RUN, owner_leases=(stranger,)
+        )
+
+
+def test_a_user_continuation_after_a_retried_pause_is_still_not_the_handovers(
+    factory, checkpoint, monkeypatch
+):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    lease = _leased(factory, task_id)
+    begin_handover_sync(RELEASE, {RUNNER})
+    run_once, _ = _real_pause_handler(monkeypatch, lease, sink_failures=1)
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_once())
+    asyncio.run(run_once())
+    with factory() as db:
+        for command in db.scalars(sa.select(TaskExecutionCommand)):
+            command.status = COMMAND_COMPLETED
+        db.commit()
+    _step_boundary(factory, task_id)
+    _continue(factory, task_id, TaskCommandKind.RESUME)
+
+    assert not _owns(factory, task_id)
+
+
+def test_settle_returns_the_notice_of_a_stopped_outcome(factory, checkpoint):
+    with factory() as db:
+        task_id = _task(db)
+        db.commit()
+    _handed_over(factory, task_id)
+    long_ago = utc_now() - timedelta(days=30)
+    with factory() as db:
+        db.execute(
+            sa.update(TaskExecutionCommand).values(
+                completed_at=long_ago, updated_at=long_ago
+            )
+        )
+        db.commit()
+
+    report = settle_handover_sync(RELEASE)
+
+    assert report.recorded == 0
+    assert [(n.task_id, n.run_id) for n in report.notices] == [(task_id, RUN)]
+    assert settle_handover_sync(RELEASE).notices == ()

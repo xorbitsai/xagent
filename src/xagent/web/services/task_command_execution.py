@@ -162,8 +162,6 @@ from .task_command_transport import (
     COMMAND_ID_PATTERN,
     COMMAND_PROCESSING,
     MAX_COMMAND_FAILURES,
-    PAUSE_ALREADY_PAUSED_ERROR,
-    PAUSE_NO_LIVE_EXECUTION_ERROR,
     ClaimedTaskCommand,
     SettledTaskCommand,
     TaskCommandDeferred,
@@ -3272,9 +3270,18 @@ def _apply_pause_requested_isolated(
             # RUNNING rows that predate run ids.
             values["run_id"] = str(uuid.uuid4())
 
+        # Idempotent per run: a row already PAUSE_REQUESTED has had this write
+        # (the command is at-least-once, and its retry follows a failed event
+        # sink while the run is still unwinding). Writing it again would bump
+        # ``state_version`` a second time, so the run would settle PAUSED one
+        # step past what the release handover's ownership rule accepts.
         statement = update(Task).where(
             Task.id == task_id,
             Task.status == TaskStatus.RUNNING,
+            or_(
+                Task.control_state.is_(None),
+                Task.control_state != TaskControlState.PAUSE_REQUESTED.value,
+            ),
         )
         statement = (
             statement.where(Task.run_id.is_(None))
@@ -3289,6 +3296,24 @@ def _apply_pause_requested_isolated(
         )
         if int(getattr(result, "rowcount", 0) or 0) == 1:
             db.commit()
+            return PauseWriteOutcome.APPLIED
+
+        if (
+            expected_run_id is not None
+            and db.query(Task.id)
+            .filter(
+                Task.id == task_id,
+                Task.status == TaskStatus.RUNNING,
+                Task.run_id == expected_run_id,
+                Task.control_state == TaskControlState.PAUSE_REQUESTED.value,
+                task_lease_holder_predicate(owner_leases, now=utc_now()),
+            )
+            .first()
+            is not None
+        ):
+            # An earlier attempt of this pause already recorded it under the
+            # same fence: the retry carries on (event, acknowledgement) and
+            # leaves the version where it is.
             return PauseWriteOutcome.APPLIED
 
         current = db.query(Task.run_id, Task.status).filter(Task.id == task_id).first()
@@ -3406,9 +3431,11 @@ async def _pause_cap_held_commands_without_agent(
     ):
         return False
     pause_failure = (
-        PAUSE_ALREADY_PAUSED_ERROR
+        # Literal text: the client-safe guard reads literals (a test pins them to
+        # the transport's PAUSE_*_ERROR constants).
+        "Task is already paused"
         if status == TaskStatus.PAUSED
-        else PAUSE_NO_LIVE_EXECUTION_ERROR
+        else "No live execution found to pause"
     )
     message_data["_durable_command_error"] = pause_failure
     message_data["_durable_pause_not_applicable"] = True
@@ -3539,9 +3566,9 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 # is not running at all. Those read very differently to a user,
                 # so the persisted status picks the message.
                 pause_failure = (
-                    PAUSE_ALREADY_PAUSED_ERROR
+                    "Task is already paused"
                     if task_fields.status == TaskStatus.PAUSED
-                    else PAUSE_NO_LIVE_EXECUTION_ERROR
+                    else "No live execution found to pause"
                 )
                 message_data["_durable_command_error"] = pause_failure
                 error_payload = await _read_task_error_payload_offloop(

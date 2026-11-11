@@ -185,7 +185,7 @@ def test_selectors_and_bounds_reach_the_engine(monkeypatch, capfd):
             "--connector",
             "slack, notion",
             "--connector",
-            "notion",
+            "jira",
             "--check",
             "slack.l3_probe",
             "--environment",
@@ -199,7 +199,7 @@ def test_selectors_and_bounds_reach_the_engine(monkeypatch, capfd):
 
     assert seen == {
         "environment": "stage",
-        "connectors": frozenset({"slack", "notion"}),
+        "connectors": frozenset({"slack", "notion", "jira"}),
         "checks": frozenset({"slack.l3_probe"}),
         "check_timeout": 5.0,
         "total_timeout": 60.0,

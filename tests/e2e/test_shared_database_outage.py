@@ -87,12 +87,13 @@ def pg_link(postgres_url):
 
 
 @pytest.fixture
-def pg_shared_app(tmp_path, monkeypatch, postgres_url, pg_link):
+def pg_shared_app(tmp_path, monkeypatch, postgres_url, pg_link, request):
     with open_shared_app(
         tmp_path,
         monkeypatch,
         database_url=postgres_url,
         host_database_url=pg_link.url,
+        event_read_acceptance=getattr(request, "param", 1) == 2,
     ) as app:
         try:
             yield app

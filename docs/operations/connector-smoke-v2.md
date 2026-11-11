@@ -192,7 +192,7 @@ The six document connectors (`google-docs`, `google-sheets`, `google-slides`, `p
 
 `zendesk` and `zoom` have adopted V2: each keeps its L3 call through `l3_read_check` and adds structural read checks on list tools that take no object id, and exempts every other tool, because Tier 2 seeds no objects and runs no write checks (#3573).
 
-`google-ads` has adopted V2 the same way: it keeps its L3 call through `l3_read_check` and adds a structural read check on `google_ads_list_accessible_customers`, its one list tool that takes no object id and the tool its probe calls, which asserts the `customer_ids` list; `google_ads_search`, which takes a customer id and a query, is exempted (#3573).
+`google-ads` has adopted V2 the same way as `zendesk` and `zoom`: it keeps its L3 call through `l3_read_check` and adds a structural read check on `google_ads_list_accessible_customers`, its one list tool that takes no object id and the tool its probe calls, which asserts the `customer_ids` list; `google_ads_search`, which takes a customer id and a query, is exempted (#3573).
 
 ## Identity adapters
 

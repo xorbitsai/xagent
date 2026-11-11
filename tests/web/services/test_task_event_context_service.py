@@ -14,7 +14,10 @@ from tests.web.services.test_task_execution_event_writer import (
     task_id as task_id_fixture,
 )
 from xagent.core.agent.context import ExecutionContext
-from xagent.core.agent.context.execution import MODEL_CONTEXT_WATERMARK_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    MODEL_CONTEXT_WATERMARK_METADATA_KEY,
+    TURN_CONTEXT_HEADER,
+)
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.task_execution_event import TaskExecutionEvent
@@ -626,7 +629,12 @@ async def test_event_context_reaches_actual_model_with_batch_and_current_input_o
     result = await service.execute_task("continue", task_id="model-context")
     assert result["success"] is True
     messages = llm.calls[0]["messages"]
-    assert [m["content"] for m in messages if m["role"] == "user"] == [
+    # The latest request also carries the turn context after its own text.
+    assert [
+        str(m["content"]).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+        for m in messages
+        if m["role"] == "user"
+    ] == [
         "earlier",
         "continue",
     ]

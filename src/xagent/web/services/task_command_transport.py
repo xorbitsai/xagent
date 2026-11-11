@@ -332,6 +332,26 @@ AUTO_RESUME_COMMAND_PREFIX = "auto-resume:"
 # not ``reserved``: they are ordinary pause commands, not background ones.
 HANDOVER_COMMAND_PREFIX = "release-handover:"
 
+# What a PAUSE that found nothing to pause records as its error: the run was
+# already paused, or is not running. The pause handlers set these together with
+# ``_durable_pause_not_applicable``; readers of the command history match them.
+PAUSE_ALREADY_PAUSED_ERROR = "Task is already paused"
+PAUSE_NO_LIVE_EXECUTION_ERROR = "No live execution found to pause"
+PAUSE_NOT_APPLICABLE_ERRORS = (
+    PAUSE_ALREADY_PAUSED_ERROR,
+    PAUSE_NO_LIVE_EXECUTION_ERROR,
+)
+
+
+def command_id_has_prefix(column: Any, prefix: str) -> Any:
+    """``column`` starts with ``prefix``, exactly and case-sensitively.
+
+    ``startswith`` compiles to ``LIKE``, which ignores ASCII case on SQLite,
+    so a person's ``RELEASE-HANDOVER:...`` would pass for a reserved id.
+    """
+
+    return func.substr(column, 1, len(prefix)) == prefix
+
 
 def _normalize_command_id(command_id: str, *, reserved: bool = False) -> str:
     """Strip and validate a caller-supplied command_id.

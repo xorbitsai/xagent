@@ -3062,12 +3062,18 @@ async def dispatch_task_command_promptly(
     checkpoint work continues in its own task, allowing the socket receive loop
     to accept the next pause/message command instead of blocking behind it.
 
-    The chokepoint of the retire fence: once the host fenced this process's
-    writers (``app.retire_writers``) nothing is applied here any more. The
-    command row is already durable, so this only wakes the dispatcher and the
-    successor claims the row. Every producer that enqueues a command and then
-    kicks it (socket handlers, ``execute_existing_task``, task start, workforce
-    pauses) goes through here, so none needs its own check.
+    The chokepoint of the retire fence for the socket and internal producers
+    that enqueue a command and then kick it (socket handlers,
+    ``execute_existing_task``, task start, workforce pauses): once the host
+    fenced this process's writers (``app.retire_writers``) nothing is applied
+    here any more. The command row is already durable, so this only wakes the
+    dispatcher and the successor claims the row. HTTP producers that call
+    :func:`dispatch_one_task_command` directly (``api/a2a.py``) do not pass
+    through here and are not fenced; they are HTTP producers, which the retire
+    does not cover.
+
+    The dispatch task is registered for :func:`drain_prompt_dispatches` before
+    the inline wait, so a retire that starts during the wait still sees it.
     """
 
     if release_hold.socket_writes_fenced or not consumes_task_commands():
@@ -3077,12 +3083,21 @@ async def dispatch_task_command_promptly(
     task = asyncio.get_running_loop().create_task(
         dispatch_one_task_command(executor, command_db_id=command_db_id)
     )
+    _prompt_dispatch_tasks.add(task)
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
     except asyncio.TimeoutError:
-        _prompt_dispatch_tasks.add(task)
         task.add_done_callback(_consume_prompt_dispatch_result)
         return
+    except BaseException:
+        # The dispatch itself failed (the caller sees that), or the caller was
+        # cancelled and the shielded dispatch keeps running detached.
+        if task.done():
+            _prompt_dispatch_tasks.discard(task)
+        else:
+            task.add_done_callback(_consume_prompt_dispatch_result)
+        raise
+    _prompt_dispatch_tasks.discard(task)
 
 
 def prompt_dispatch_count() -> int:

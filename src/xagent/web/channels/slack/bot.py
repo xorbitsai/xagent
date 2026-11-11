@@ -89,6 +89,7 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
+from ...services.writer_workers import run_tracked
 from .trace_handler import SlackTraceHandler
 from .utils import (
     SlackFileRef,
@@ -805,7 +806,7 @@ class SlackBotInstance:
                             raise SlackFileDownloadError("Slack attachment unavailable")
                         file_id = str(uuid4())
                         worker = asyncio.create_task(
-                            asyncio.to_thread(
+                            run_tracked(
                                 stage_uploaded_file_from_local_path,
                                 local_path=downloaded.path,
                                 user_id=owner_id,
@@ -838,7 +839,7 @@ class SlackBotInstance:
                         item.filename for item in staged
                     )
                     acceptance = asyncio.create_task(
-                        asyncio.to_thread(
+                        run_tracked(
                             accept_channel_input,
                             incoming,
                             owner_id=owner_id,

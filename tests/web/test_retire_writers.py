@@ -17,10 +17,15 @@ from xagent.web.services.writer_workers import (
     run_tracked,
 )
 
+# The ``raise_errors`` flag of every stubbed ``_stop_chat_channels`` call.
+CHANNEL_STOP_FLAGS: list[bool] = []
+
 
 @pytest.fixture
 def steps(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     calls: list[str] = []
+    stop_flags = CHANNEL_STOP_FLAGS
+    stop_flags.clear()
 
     def stopper(name: str):
         async def stop(*_args, **_kwargs) -> None:
@@ -39,8 +44,9 @@ def steps(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     ):
         monkeypatch.setattr(app_module, name, stopper(name))
 
-    async def stop_chat_channels() -> None:
+    async def stop_chat_channels(*, raise_errors: bool) -> None:
         calls.append("stop_chat_channels")
+        stop_flags.append(raise_errors)
 
     monkeypatch.setattr(app_module, "_stop_chat_channels", stop_chat_channels)
     monkeypatch.setattr(app_module, "_writers_retired", False)
@@ -948,3 +954,564 @@ async def test_execution_status_reports_the_fence_and_the_admitted_socket_writes
     assert (fenced["socket_writes_fenced"], fenced["socket_writes"]) == (True, 1)
     # Diagnostics only: they never make the process look busy.
     assert not before["busy"]
+
+
+# -- shutdown never waits for the tracked threads -----------------------------------
+
+
+async def test_shutdown_does_not_wait_for_a_live_tracked_thread(teardown, monkeypatch):
+    monkeypatch.setattr(app_module, "RETIRE_SETTLE_SECONDS", 30)
+    release = threading.Event()
+    started = threading.Event()
+
+    def worker() -> None:
+        started.set()
+        release.wait(10)
+
+    awaiting = asyncio.create_task(run_tracked(worker))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+    try:
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        await app_module.shutdown_event()
+        elapsed = loop.time() - began
+        # The thread is still counted, and the drain after the retire ran at once.
+        assert active_workers() == 1
+        assert "close_task_coordinators" in teardown
+        assert elapsed < 5
+        assert not app_module.writers_retired()
+        # The fence and the stops still happened.
+        assert app_module.release_hold.socket_writes_fenced
+        assert "stop_task_lease_recovery_task" in teardown
+        assert CHANNEL_STOP_FLAGS == [False]
+    finally:
+        release.set()
+        await awaiting
+
+
+async def test_shutdown_does_not_queue_behind_a_host_retire_that_is_running(
+    teardown, monkeypatch
+):
+    monkeypatch.setattr(app_module, "RETIRE_SETTLE_SECONDS", 30)
+    token = app_module.release_hold.acquire_socket_write()
+    host_retire = asyncio.create_task(app_module.retire_writers())
+    await asyncio.sleep(0.2)
+    assert not host_retire.done()
+    try:
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        await app_module.shutdown_event()
+        assert loop.time() - began < 5
+        assert "close_task_coordinators" in teardown
+    finally:
+        token.release()
+        await host_retire
+    assert app_module.writers_retired()
+
+
+async def test_a_host_retire_waits_and_asks_the_channel_stop_to_raise(steps):
+    await app_module.retire_writers()
+
+    assert CHANNEL_STOP_FLAGS == [True]
+
+
+# -- a failed channel stop ---------------------------------------------------------------
+
+
+@pytest.fixture
+def failing_channel(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from xagent.web.channels.feishu import bot as feishu_bot
+    from xagent.web.channels.slack import bot as slack_bot
+    from xagent.web.channels.telegram import bot as telegram_bot
+
+    stopped: list[str] = []
+
+    class _Channel:
+        enabled = True
+
+        def __init__(self, name: str, fail: bool) -> None:
+            self.name = name
+            self.fail = fail
+
+        async def stop(self) -> None:
+            stopped.append(self.name)
+            if self.fail:
+                raise RuntimeError(f"{self.name} stop failed")
+
+    monkeypatch.setattr(
+        telegram_bot, "get_telegram_channel", lambda: _Channel("telegram", True)
+    )
+    monkeypatch.setattr(
+        feishu_bot, "get_feishu_channel", lambda: _Channel("feishu", False)
+    )
+    monkeypatch.setattr(
+        slack_bot, "get_slack_channel", lambda: _Channel("slack", False)
+    )
+    return stopped
+
+
+async def test_the_retire_path_raises_a_failed_channel_stop_after_stopping_the_rest(
+    failing_channel,
+):
+    with pytest.raises(RuntimeError, match="telegram stop failed"):
+        await app_module._stop_chat_channels(raise_errors=True)
+
+    assert failing_channel == ["telegram", "feishu", "slack"]
+
+
+async def test_the_shutdown_path_logs_a_failed_channel_stop_and_goes_on(
+    failing_channel,
+):
+    await app_module._stop_chat_channels(raise_errors=False)
+
+    assert failing_channel == ["telegram", "feishu", "slack"]
+
+
+async def test_a_failed_channel_stop_leaves_the_retire_unpublished(
+    failing_channel, monkeypatch
+):
+    for name in (
+        "stop_orphan_upload_gc_task",
+        "stop_composio_reconcile_task",
+        "stop_retention_purge_task",
+        "stop_task_cleanup_retry_task",
+        "stop_uploaded_file_recovery_task",
+        "stop_task_auto_resume_task",
+        "stop_task_lease_recovery_task",
+    ):
+
+        async def noop(*_a, **_k) -> None:
+            return None
+
+        monkeypatch.setattr(app_module, name, noop)
+    monkeypatch.setattr(app_module, "_writers_retired", False)
+    monkeypatch.setattr(app_module, "_retire_writers_lock", None)
+
+    with pytest.raises(RuntimeError, match="telegram stop failed"):
+        await app_module.retire_writers()
+    assert not app_module.writers_retired()
+
+
+# -- steering commands after the fence are acknowledged as queued ---------------------------
+
+
+@pytest.mark.parametrize("name", ["PAUSE", "RESUME"])
+@pytest.mark.parametrize("fenced", [False, True])
+async def test_the_steering_ack_says_queued_once_the_fence_is_up(
+    monkeypatch, name, fenced
+):
+    from xagent.web.api import websocket as ws
+    from xagent.web.services.task_command_transport import TaskCommandKind
+
+    class _Enqueued:
+        created = False
+        payload_matches = True
+        client_command_id = "cmd-1"
+        command_id = 5
+
+    async def enqueue(**_k):
+        return _Enqueued()
+
+    sent: list[dict] = []
+
+    async def record(message, _websocket):
+        sent.append(message)
+
+    async def dispatch(*_a, **_k) -> None:
+        return None
+
+    monkeypatch.setattr(ws, "_enqueue_websocket_task_command", enqueue)
+    monkeypatch.setattr(ws.manager, "send_personal_message", record)
+    monkeypatch.setattr(ws, "dispatch_task_command_promptly", dispatch)
+    if fenced:
+        app_module.release_hold.mark_writers_retired()
+    handler = ws.handle_pause_task if name == "PAUSE" else ws.handle_resume_task
+
+    await handler(object(), 9, {"user": object()})  # type: ignore[arg-type]
+
+    (ack,) = sent
+    assert ack["command"] == TaskCommandKind[name].value
+    assert ack["task_id"] == 9 and ack["command_id"] == "cmd-1"
+    if fenced:
+        assert ack["type"] == "task_command_queued"
+        assert ack["applied_after_restart"] is True
+    else:
+        assert ack["type"] == "task_command_accepted"
+        assert "applied_after_restart" not in ack
+
+
+# -- a prompt dispatch is counted from the moment it exists ---------------------------------
+
+
+async def test_a_dispatch_in_its_inline_wait_is_seen_by_the_drain(monkeypatch):
+    from xagent.web.services import task_command_transport as transport
+
+    started = asyncio.Event()
+
+    async def dispatch_one(_executor, *, command_db_id):
+        started.set()
+        await asyncio.sleep(60)
+        return True
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch_one)
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    # Hold the caller inside its inline wait long enough to retire meanwhile.
+    real_wait_for = asyncio.wait_for
+    entered = asyncio.Event()
+
+    async def slow_wait_for(awaitable, timeout):
+        entered.set()
+        return await real_wait_for(awaitable, 5)
+
+    monkeypatch.setattr(transport.asyncio, "wait_for", slow_wait_for)
+
+    caller = asyncio.create_task(
+        transport.dispatch_task_command_promptly(object(), command_db_id=3)  # type: ignore[arg-type]
+    )
+    await entered.wait()
+    await started.wait()
+    assert transport.prompt_dispatch_count() == 1
+
+    # What the retire does: the dispatch is cancelled and waited for even
+    # though its inline wait has not ended.
+    assert await transport.drain_prompt_dispatches(2.0)
+    with suppress(asyncio.CancelledError):
+        await caller
+    assert transport.prompt_dispatch_count() == 0
+    assert not transport._prompt_dispatch_tasks
+
+
+async def test_a_dispatch_that_finishes_inline_leaves_nothing_registered(monkeypatch):
+    from xagent.web.services import task_command_transport as transport
+
+    async def dispatch_one(_executor, *, command_db_id):
+        return True
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch_one)
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+
+    await transport.dispatch_task_command_promptly(object(), command_db_id=3)  # type: ignore[arg-type]
+
+    assert not transport._prompt_dispatch_tasks
+
+
+async def test_a_dispatch_that_fails_inline_raises_once_and_leaves_nothing_registered(
+    monkeypatch,
+):
+    from xagent.web.services import task_command_transport as transport
+
+    async def dispatch_one(_executor, *, command_db_id):
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch_one)
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        await transport.dispatch_task_command_promptly(object(), command_db_id=3)  # type: ignore[arg-type]
+
+    assert not transport._prompt_dispatch_tasks
+
+
+async def test_a_slow_dispatch_stays_registered_until_it_finishes(monkeypatch):
+    from xagent.web.services import task_command_transport as transport
+
+    gate = asyncio.Event()
+
+    async def dispatch_one(_executor, *, command_db_id):
+        await gate.wait()
+        return True
+
+    monkeypatch.setattr(transport, "dispatch_one_task_command", dispatch_one)
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+
+    await transport.dispatch_task_command_promptly(object(), command_db_id=3)  # type: ignore[arg-type]
+    assert transport.prompt_dispatch_count() == 1
+
+    gate.set()
+    for _ in range(50):
+        if not transport._prompt_dispatch_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert not transport._prompt_dispatch_tasks
+
+
+# -- a fence-cancelled builder turn tells the client -----------------------------------------
+
+
+async def test_a_fence_cancelled_builder_turn_sends_paused_and_reraises(monkeypatch):
+    from xagent.web.api import websocket as ws
+
+    paused: list[bool] = []
+
+    async def send_paused(_websocket, **_k) -> None:
+        paused.append(True)
+
+    async def runtime_inputs(*_a, **_k):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(ws, "send_execution_paused", send_paused)
+    monkeypatch.setattr(ws, "create_ephemeral_tracer", lambda **_k: object())
+    monkeypatch.setattr(
+        "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+        runtime_inputs,
+    )
+
+    class _Socket:
+        state = type("S", (), {})()
+
+    task = asyncio.create_task(
+        ws.handle_builder_chat(
+            _Socket(),  # type: ignore[arg-type]
+            {"message": "hi"},
+            type("U", (), {"id": 1, "is_admin": False})(),  # type: ignore[arg-type]
+        )
+    )
+    await asyncio.sleep(0.1)
+    app_module.release_hold.mark_writers_retired()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert paused == [True]
+
+
+async def test_a_genuine_builder_cancel_is_not_reported_as_paused(monkeypatch):
+    from xagent.web.api import websocket as ws
+
+    paused: list[bool] = []
+
+    async def send_paused(_websocket, **_k) -> None:
+        paused.append(True)
+
+    monkeypatch.setattr(ws, "send_execution_paused", send_paused)
+    monkeypatch.setattr(ws, "create_ephemeral_tracer", lambda **_k: object())
+
+    async def hang(*_a, **_k):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(
+        "xagent.web.services.builder_chat_runtime.load_builder_chat_runtime_inputs",
+        hang,
+    )
+
+    class _Socket:
+        state = type("S", (), {})()
+
+    task = asyncio.create_task(
+        ws.handle_builder_chat(
+            _Socket(),  # type: ignore[arg-type]
+            {"message": "hi"},
+            type("U", (), {"id": 1, "is_admin": False})(),  # type: ignore[arg-type]
+        )
+    )
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert paused == []
+
+
+# -- the preview enqueue is part of the preview's own write ----------------------------------
+
+
+async def test_a_fence_that_rises_after_the_preview_row_does_not_refuse_the_enqueue(
+    monkeypatch,
+):
+    from xagent.web.api import websocket as ws
+    from xagent.web.services.task_command_transport import TaskCommandKind
+
+    created: list[int] = []
+    enqueued: list[int] = []
+
+    async def create(*_a, **_k) -> int:
+        created.append(7)
+        # The row is written; only now does the host raise the fence.
+        app_module.release_hold.mark_writers_retired()
+        return 7
+
+    def fake_enqueue(**kwargs):
+        enqueued.append(kwargs["task_id"])
+        return object()
+
+    async def send_chat(_websocket, task_id, user, _message):
+        # What handle_chat_message does for the first preview message.
+        await ws._enqueue_websocket_task_command(
+            task_id=task_id,
+            message_data={"user": user},
+            kind=TaskCommandKind.MESSAGE,
+        )
+
+    class _Socket:
+        state = type("S", (), {})()
+
+    monkeypatch.setattr(ws, "_create_preview_task", create)
+    monkeypatch.setattr(ws, "_send_preview_chat", send_chat)
+    monkeypatch.setattr(ws, "_enqueue_websocket_task_command_sync", fake_enqueue)
+    monkeypatch.setattr(ws.manager, "register_connection", lambda *_a, **_k: None)
+
+    await ws.handle_build_preview_execution(
+        _Socket(),  # type: ignore[arg-type]
+        {"message": "hello"},
+        type("U", (), {"id": 1, "is_admin": False})(),  # type: ignore[arg-type]
+    )
+
+    assert created == [7] and enqueued == [7]
+    assert not app_module.release_hold._socket_writes
+    # The hold is scoped to that handler: a later enqueue is fenced again.
+    from xagent.web.services.client_error_messages import ClientErrorCode
+
+    with pytest.raises(ws.ClientVisibleValidationError) as caught:
+        await ws._enqueue_websocket_task_command(
+            task_id=1,
+            message_data={"user": type("U", (), {"id": 1, "is_admin": False})()},
+            kind=TaskCommandKind.MESSAGE,
+        )
+    assert caught.value.error_code is ClientErrorCode.EXECUTION_PAUSED
+
+
+# -- run_tracked's runner ------------------------------------------------------------------------
+
+
+async def test_the_runner_of_an_abandoned_call_does_nothing_and_leaves_no_count(
+    monkeypatch,
+):
+    from xagent.web.services import writer_workers
+
+    runners: list = []
+
+    async def never_started(runner, *_a, **_k):
+        runners.append(runner)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(writer_workers.asyncio, "to_thread", never_started)
+    ran: list[bool] = []
+    task = asyncio.create_task(run_tracked(lambda: ran.append(True)))
+    await asyncio.sleep(0)
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    assert active_workers() == 0
+
+    # The executor picks the abandoned work item up late.
+    (runner,) = runners
+    assert runner() is None
+
+    assert ran == []
+    assert active_workers() == 0
+
+
+async def test_a_drain_ends_even_when_the_count_went_negative():
+    from xagent.web.services import writer_workers
+
+    writer_workers._active = -1
+    try:
+        assert await drain_workers(0.5)
+    finally:
+        writer_workers._active = 0
+
+
+# -- the blocking-call seam core uses -----------------------------------------------------------
+
+
+async def test_a_core_blocking_call_is_counted_only_inside_the_tracking_scope():
+    from xagent.core.utils.blocking import run_blocking
+    from xagent.web.services.writer_workers import tracked_blocking_scope
+
+    release = threading.Event()
+    started = threading.Event()
+    counts: list[int] = []
+
+    def work() -> str:
+        counts.append(active_workers())
+        started.set()
+        release.wait(5)
+        return "done"
+
+    # Outside a scope (an execution, an HTTP route): not counted.
+    release.set()
+    assert await run_blocking(work) == "done"
+    assert counts == [0]
+
+    release.clear()
+    started.clear()
+    counts.clear()
+    with tracked_blocking_scope():
+        awaiting = asyncio.create_task(run_blocking(work))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+    awaiting.cancel()
+    with suppress(asyncio.CancelledError):
+        await awaiting
+    # The cancelled await does not end the thread, and the count says so.
+    assert counts == [1]
+    assert active_workers() == 1
+    assert not await drain_workers(0.2)
+    release.set()
+    assert await drain_workers(5.0)
+
+
+async def test_a_core_blocking_call_keeps_the_callers_context_and_the_registration_is_idempotent():
+    import contextvars
+
+    from xagent.core.utils.blocking import get_blocking_tracker, run_blocking
+    from xagent.web.services import writer_workers
+
+    var: contextvars.ContextVar[str] = contextvars.ContextVar("v", default="unset")
+    var.set("caller")
+    before = get_blocking_tracker()
+    writer_workers.install_blocking_tracker()
+    writer_workers.install_blocking_tracker()
+
+    assert get_blocking_tracker() is before
+    assert await run_blocking(var.get) == "caller"
+    with writer_workers.tracked_blocking_scope():
+        assert await run_blocking(var.get) == "caller"
+
+
+async def test_core_blocking_without_a_tracker_is_a_plain_executor_call():
+    from xagent.core.utils.blocking import (
+        get_blocking_tracker,
+        run_blocking,
+        set_blocking_tracker,
+    )
+
+    previous = get_blocking_tracker()
+    set_blocking_tracker(None)
+    try:
+        assert await run_blocking(lambda a, b=0: a + b, 1, b=2) == 3
+        assert active_workers() == 0
+    finally:
+        set_blocking_tracker(previous)
+
+
+async def test_a_builder_turn_runs_in_the_tracking_scope(monkeypatch):
+    from xagent.core.utils.blocking import run_blocking
+    from xagent.web.api import websocket as ws
+
+    seen: list[int] = []
+
+    async def turn(*_a, **_k) -> None:
+        def work() -> None:
+            seen.append(active_workers())
+
+        await run_blocking(work)
+
+    monkeypatch.setattr(ws, "handle_builder_chat", turn)
+
+    await ws._run_builder_turn(object(), {}, object())  # type: ignore[arg-type]
+
+    assert seen == [1]
+    assert active_workers() == 0
+
+
+def test_a_tracked_thread_is_counted_from_before_it_starts_until_it_returns():
+    from xagent.web.services.writer_workers import start_tracked_thread
+
+    release = threading.Event()
+    thread = start_tracked_thread(release.wait, args=(5,), name="t")
+    assert active_workers() == 1
+    release.set()
+    thread.join(5)
+    assert active_workers() == 0

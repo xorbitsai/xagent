@@ -10,6 +10,8 @@ from collections.abc import Coroutine, Sequence
 from contextvars import copy_context
 from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
 
+from xagent.core.utils.blocking import run_blocking
+
 from ..core.exceptions import (
     CascadeCleanupError,
     DatabaseOperationError,
@@ -375,7 +377,7 @@ class KBCoordinator:
         )
         # The handle call is synchronous and blocking (file hashing + LanceDB
         # I/O); offload it so awaiting this method never stalls the event loop.
-        return await asyncio.to_thread(handle.register_document, request)
+        return await run_blocking(handle.register_document, request)
 
     def register_document_sync(
         self, request: RegisterDocumentRequest
@@ -401,7 +403,7 @@ class KBCoordinator:
             )
         )
         # Blocking LanceDB read; offload so awaiting this never stalls the loop.
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.load_document, doc_id, user_id=user_id, is_admin=is_admin
         )
 
@@ -436,7 +438,7 @@ class KBCoordinator:
             )
         )
         # Blocking LanceDB scan; offload so awaiting this never stalls the loop.
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.list_documents, user_id=user_id, is_admin=is_admin, limit=limit
         )
 
@@ -473,7 +475,7 @@ class KBCoordinator:
             )
         )
         # Blocking LanceDB delete; offload so awaiting this never stalls the loop.
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.delete_document_record, doc_id, user_id=user_id, is_admin=is_admin
         )
 
@@ -754,7 +756,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        await asyncio.to_thread(
+        await run_blocking(
             handle.write_ingestion_status,
             doc_id,
             status=status,
@@ -828,7 +830,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.load_ingestion_status,
             doc_id=doc_id,
             user_id=user_id,
@@ -890,7 +892,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        await asyncio.to_thread(
+        await run_blocking(
             handle.clear_ingestion_status,
             doc_id,
             user_id=user_id,
@@ -952,7 +954,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.rename_collection_status,
             new_name,
             user_id,
@@ -1041,7 +1043,7 @@ class KBCoordinator:
         affected_doc_ids: list[str] = []
         if is_admin or doc_ids is None:
             try:
-                affected_doc_ids = await asyncio.to_thread(
+                affected_doc_ids = await run_blocking(
                     handle.list_collection_documents,
                     user_id=int_user_id,
                     is_admin=is_admin,
@@ -1075,7 +1077,7 @@ class KBCoordinator:
 
         try:
             if is_admin:
-                result_counts = await asyncio.to_thread(
+                result_counts = await run_blocking(
                     handle.delete_collection_data,
                     user_id=int_user_id,
                     is_admin=is_admin,
@@ -1083,7 +1085,7 @@ class KBCoordinator:
                 )
                 _merge_positive_counts(deleted_counts, result_counts)
             elif effective_doc_ids:
-                result_counts = await asyncio.to_thread(
+                result_counts = await run_blocking(
                     handle.delete_documents_data,
                     effective_doc_ids,
                     user_id=int_user_id,
@@ -1110,7 +1112,7 @@ class KBCoordinator:
             # Skip config cleanup when the data-plane delete failed — removing
             # config while data rows remain would lose the user's KB state.
             try:
-                remaining = await asyncio.to_thread(
+                remaining = await run_blocking(
                     handle.count_documents,
                     user_id=None,
                     is_admin=True,
@@ -1235,7 +1237,7 @@ class KBCoordinator:
         # gate: a hard exception (e.g. no DB connection) propagates out, and
         # per-table failures are returned as a non-empty warnings list (the store
         # catches them per table rather than raising) — short-circuit on those too.
-        data_warnings = await asyncio.to_thread(
+        data_warnings = await run_blocking(
             handle.rename_collection_data,
             new_name,
             int_user_id,
@@ -1246,7 +1248,7 @@ class KBCoordinator:
             return warnings
 
         try:
-            status_warnings = await asyncio.to_thread(
+            status_warnings = await run_blocking(
                 handle.rename_collection_status,
                 new_name,
                 int_user_id,
@@ -1285,9 +1287,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
-            handle.get_main_pointer, doc_id, step_type, model_tag
-        )
+        return await run_blocking(handle.get_main_pointer, doc_id, step_type, model_tag)
 
     def get_main_pointer_sync(
         self,
@@ -1321,7 +1321,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.set_main_pointer,
             doc_id,
             step_type,
@@ -1369,7 +1369,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(handle.list_main_pointers, doc_id, limit)
+        return await run_blocking(handle.list_main_pointers, doc_id, limit)
 
     def list_main_pointers_sync(
         self,
@@ -1399,7 +1399,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.delete_main_pointer, doc_id, step_type, model_tag
         )
 
@@ -1434,7 +1434,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.list_candidates,
             doc_id,
             step_type,
@@ -1490,7 +1490,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.promote_version_main,
             doc_id,
             step_type,
@@ -1551,7 +1551,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.cleanup_cascade,
             doc_id,
             scope,
@@ -1615,7 +1615,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.cleanup_document_cascade,
             doc_id,
             model_tag=model_tag,
@@ -1671,7 +1671,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.cleanup_parse_cascade,
             doc_id,
             old_parse_hash=old_parse_hash,
@@ -1730,7 +1730,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.cleanup_chunk_cascade,
             doc_id,
             old_parse_hash=old_parse_hash,
@@ -1788,7 +1788,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.cleanup_embed_cascade,
             doc_id,
             model_tag=model_tag,
@@ -1912,7 +1912,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.capture_main_pointer_snapshot,
             doc_id,
             step_type,
@@ -1945,7 +1945,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.restore_main_pointer_snapshot,
             snapshot,
             operator=operator,
@@ -1984,7 +1984,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.capture_candidate_cleanup_snapshot,
             doc_id,
             scope,
@@ -2039,7 +2039,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.capture_status_snapshot,
             doc_id,
             user_id=user_id,
@@ -2079,7 +2079,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        await asyncio.to_thread(
+        await run_blocking(
             handle.restore_status_snapshot,
             doc_id,
             snapshot,
@@ -2117,7 +2117,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        await asyncio.to_thread(
+        await run_blocking(
             handle.clear_status_snapshot,
             doc_id,
             user_id=user_id,
@@ -2216,7 +2216,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.restore_candidate_cleanup_snapshot,
             snapshot,
             cleanup_executed=cleanup_executed,
@@ -2634,7 +2634,7 @@ class KBCoordinator:
                 hide_missing=True,
             )
         )
-        return await asyncio.to_thread(
+        return await run_blocking(
             handle.cleanup_embeddings_for_operation,
             doc_id=doc_id,
             parse_hash=parse_hash,

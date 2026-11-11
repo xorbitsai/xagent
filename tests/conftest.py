@@ -1005,19 +1005,27 @@ def _isolate_retire_writers_state():
     """
     import sys
 
-    def reset() -> None:
+    def reset() -> int:
+        """Clear the retirement state; return the tracked workers left over."""
         app_module = sys.modules.get("xagent.web.app")
-        if app_module is None:
-            return
-        app_module._writers_retired = False
-        app_module._retire_writers_lock = None
-        app_module._uploaded_file_reconcile_task = None
-        app_module.release_hold.reset_writers_retired()
+        if app_module is not None:
+            app_module._writers_retired = False
+            app_module._retire_writers_lock = None
+            app_module._uploaded_file_reconcile_task = None
+            app_module.release_hold.reset_writers_retired()
+        writers = sys.modules.get("xagent.web.services.writer_workers")
+        if writers is None:
+            return 0
+        leaked = writers._active
         # A test that leaked a tracked worker must not skew the next one.
-        from xagent.web.services import writer_workers
-
-        writer_workers._active = 0
+        writers._active = 0
+        writers.install_blocking_tracker()
+        return int(leaked)
 
     reset()
     yield
-    reset()
+    leaked = reset()
+    assert leaked == 0, (
+        f"{leaked} tracked writer worker(s) were still counted when the test "
+        "ended: a run_tracked/run_blocking thread was never released"
+    )

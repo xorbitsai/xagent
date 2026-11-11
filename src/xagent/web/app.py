@@ -2525,34 +2525,47 @@ async def _stop_runtime_loops() -> None:
                 await task
 
 
-async def _stop_chat_channels() -> None:
-    """Cancel the chat channel tasks and stop each channel; shared by shutdown and abort."""
-    try:
-        channel_tasks = [
-            task
-            for name in ("telegram_task", "feishu_task", "slack_task")
-            if (task := getattr(app.state, name, None)) is not None
-        ]
-        for task in channel_tasks:
-            task.cancel()
-        await asyncio.gather(*channel_tasks, return_exceptions=True)
+async def _stop_chat_channels(*, raise_errors: bool) -> None:
+    """Cancel the chat channel tasks and stop each channel.
 
+    Every channel is stopped even if an earlier one fails. ``raise_errors``
+    decides what a failure means: the writer retire re-raises (it must not
+    publish success beside a channel that may still accept messages), while
+    shutdown and the standby abort log it and carry on with their teardown.
+    """
+    errors: list[Exception] = []
+    channel_tasks = [
+        task
+        for name in ("telegram_task", "feishu_task", "slack_task")
+        if (task := getattr(app.state, name, None)) is not None
+    ]
+    for task in channel_tasks:
+        task.cancel()
+    await asyncio.gather(*channel_tasks, return_exceptions=True)
+
+    stops: list[tuple[str, Callable[[], Awaitable[None]]]] = []
+    try:
         from .channels.feishu.bot import get_feishu_channel
         from .channels.slack.bot import get_slack_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
         if telegram_channel.enabled:
-            await telegram_channel.stop()
-            logger.info("Telegram channel stopped successfully")
-
-        feishu_channel = get_feishu_channel()
-        await feishu_channel.stop()
-
-        slack_channel = get_slack_channel()
-        await slack_channel.stop()
+            stops.append(("Telegram", telegram_channel.stop))
+        stops.append(("Feishu", get_feishu_channel().stop))
+        stops.append(("Slack", get_slack_channel().stop))
     except Exception as e:
-        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+        errors.append(e)
+        logger.error("Failed to look up chat channels: %s", e, exc_info=True)
+    for name, stop in stops:
+        try:
+            await stop()
+            logger.info("%s channel stopped successfully", name)
+        except Exception as e:
+            errors.append(e)
+            logger.error("Failed to stop the %s channel: %s", name, e, exc_info=True)
+    if errors and raise_errors:
+        raise errors[0]
 
 
 async def _abort_standby_activation() -> None:
@@ -2571,7 +2584,9 @@ async def _abort_standby_activation() -> None:
     if cleanup_task is not None:
         cleanup_task.cancel()
         await asyncio.gather(cleanup_task, return_exceptions=True)
-    await _stop_chat_channels()
+    # The abort keeps stopping the remaining parts, so a failed channel stop is
+    # logged here, not raised (the process is stopped by its host afterwards).
+    await _stop_chat_channels(raise_errors=False)
     if get_shared_task_execution_enabled():
         from .api.websocket import manager
         from .services.task_event_bridge import stop_task_event_bridge
@@ -2724,8 +2739,16 @@ _writers_retired = False
 _retire_writers_lock: asyncio.Lock | None = None
 
 
-async def retire_writers() -> None:
+async def retire_writers(
+    *,
+    settle_seconds: float | None = None,
+    raise_on_stop_error: bool = True,
+) -> None:
     """Stop the background writers listed here; the web server keeps serving.
+
+    The guarantee is exactly the lists below: the tracked set plus the
+    audited allowlist in ``tests/web/test_blocking_call_inventory.py``. A
+    thread or task that is in neither is not covered, whatever it does.
 
     **Stopped (tasks cancelled and awaited):** command dispatcher and its
     detached prompt dispatches, orphan-upload GC, Composio reconcile,
@@ -2735,34 +2758,51 @@ async def retire_writers() -> None:
 
     **Fenced:** socket-owned writes. After the fence no WebSocket handler
     starts a write (message/start commands, builder turns, ASR sessions,
-    missing-task chat, preview), ``dispatch_task_command_promptly`` only
-    wakes the dispatcher, and the writes admitted before it are cancelled
-    (long-running ones) and waited for. Pause/resume/cancel commands are
-    still accepted: they only enqueue a durable row for whoever owns the run.
+    missing-task chat, preview), and ``dispatch_task_command_promptly`` only
+    wakes the dispatcher. Writes admitted before the fence are cancelled
+    (long-running ones) and waited for. Pause/resume/cancel commands pass the
+    fence and enqueue their durable row, but nothing applies them here: the
+    socket answers ``task_command_queued`` ("applied after the restart"), not
+    ``task_command_accepted``.
 
-    **Waited for before success (``run_tracked`` threads, audited list):**
+    **Waited for before success (tracked threads, audited list):**
     startup file-storage sync, uploaded-file reconcile, gmail watch renewal
-    and provisioning sweep, scheduled-trigger scan, preview-run reaper,
-    trigger run start and pending-run scan (``services/triggers``), the
-    LanceDB user-id, documents and uploaded-file-link backfills, the
-    retention-purge batch, task-cleanup retry (workspace removal, live-id
-    check, claim, settle), the Composio reconcile pass, and the socket
-    command enqueue. ``asyncio.to_thread`` threads
-    that are not database or remote writers (the temp-file walk, which this
-    stops through its own event and does not wait for) are not tracked.
+    and provisioning sweep (including its provisioning thread), scheduled-
+    trigger scan, preview-run reaper, trigger run start and pending-run scan
+    (``services/triggers``), the LanceDB user-id, documents and
+    uploaded-file-link backfills, the retention-purge batch, task-cleanup
+    retry (workspace removal, live-id check, claim, settle), the Composio
+    reconcile pass, the socket command enqueue, the channel input
+    acceptance/claim/staging threads (Feishu, Slack, Telegram, shared channel
+    execution) and the blocking calls a builder chat turn makes through
+    ``xagent.core.utils.blocking.run_blocking`` (knowledge-base ingestion and
+    the knowledge-base coordinator, LanceDB metadata-table creation).
 
     **Not covered -- the host must quiesce these itself:** HTTP producers
-    (for example the A2A, triggers, MCP and file API routes, webhook
-    ingress) and writers owned by running executions (task coordinators,
-    ``background_task_manager``, which ``execution_status()`` reports). A
-    host that must see no write at all stops routing HTTP traffic here first.
+    (the API routes, including the A2A, triggers, MCP and file routes, and
+    webhook ingress), writers owned by running executions (task
+    coordinators and their tool threads, ``background_task_manager``, which
+    ``execution_status()`` reports), and the same knowledge-base coordinator
+    calls when they are made from an HTTP route or an execution instead of a
+    builder turn. Direct callers of ``dispatch_one_task_command`` (for
+    example ``api/a2a.py``) are HTTP producers and are not fenced. The temp-
+    file walk is stopped through its own event and is not waited for. A host
+    that must see no write at all stops routing HTTP traffic here first.
 
     Success is published only once the tracked work has really settled: the
     fence goes up first, and after the stops this waits for the prompt
     dispatches, the worker threads cancelled tasks left behind and every
-    socket write admitted before the fence. If one does not settle in time
-    the function raises, so the host takes its fallback instead of starting
-    migrations beside a live writer.
+    socket write admitted before the fence. If one does not settle within
+    ``settle_seconds`` (default ``RETIRE_SETTLE_SECONDS``) the function raises, so the host takes its fallback
+    instead of starting migrations beside a live writer. A failed channel
+    stop raises too (``raise_on_stop_error``).
+
+    ``settle_seconds=0`` is the shutdown form: it raises the fence and does
+    the stops, skips every wait and publishes nothing (``writers_retired()``
+    stays false), because waiting cannot stop a thread and shutdown has its
+    own drains. It also does not queue behind a host retire that is already
+    running: that retire owns the stops, the fence is up, and shutdown goes
+    straight on to its own teardown.
 
     Idempotent and safe to call concurrently: the first caller does the work,
     later ones wait for it and return. A step that raises leaves the function
@@ -2772,8 +2812,13 @@ async def retire_writers() -> None:
     """
     global _retire_writers_lock, _writers_retired
 
+    if settle_seconds is None:
+        settle_seconds = RETIRE_SETTLE_SECONDS
     if _retire_writers_lock is None:
         _retire_writers_lock = asyncio.Lock()
+    if settle_seconds <= 0 and _retire_writers_lock.locked():
+        logger.info("Writer retire already in progress; shutdown does not wait for it")
+        return
     async with _retire_writers_lock:
         if _writers_retired:
             return
@@ -2782,18 +2827,20 @@ async def retire_writers() -> None:
         release_hold.mark_writers_retired()
         await _stop_runtime_loops()
         # Chat channels stop before task finalizers drain.
-        await _stop_chat_channels()
+        await _stop_chat_channels(raise_errors=raise_on_stop_error)
+        if settle_seconds <= 0:
+            return
 
         # Cancelling a task that awaits a worker thread does not stop the
         # thread, and an admitted socket write or a detached prompt dispatch
         # is not a task this function owns.
         from .services.task_command_transport import drain_prompt_dispatches
 
-        if not await drain_prompt_dispatches(RETIRE_SETTLE_SECONDS):
+        if not await drain_prompt_dispatches(settle_seconds):
             raise RuntimeError("detached command dispatches did not settle")
-        if not await drain_workers(RETIRE_SETTLE_SECONDS):
+        if not await drain_workers(settle_seconds):
             raise RuntimeError("background writer threads did not settle")
-        if not await release_hold.drain_socket_writes(RETIRE_SETTLE_SECONDS):
+        if not await release_hold.drain_socket_writes(settle_seconds):
             raise RuntimeError("socket writes did not settle")
         _writers_retired = True
 
@@ -2835,11 +2882,12 @@ async def shutdown_event() -> None:
     flush_langfuse()
 
     # Stops the writers (the same step a host may run earlier, then skipped).
-    # A retire that cannot settle must not skip the coordinator drain, the
-    # heartbeat wait and the sandbox cleanup below: this is the last chance to
-    # run them.
+    # Shutdown does not wait for the tracked threads: waiting cannot stop them,
+    # and it would only spend the grace period the coordinator drain and the
+    # sandbox cleanup below need. A failed stop must not skip those either:
+    # this is the last chance to run them.
     try:
-        await retire_writers()
+        await retire_writers(settle_seconds=0, raise_on_stop_error=False)
     except Exception:
         logger.exception("Retiring the writers failed at shutdown; continuing teardown")
 

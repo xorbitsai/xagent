@@ -11,11 +11,14 @@ thread go through :func:`run_tracked`, and the retire waits on
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
+from ...core.utils.blocking import run_in_default_executor, set_blocking_tracker
 from .release_hold import wait_until
 
 T = TypeVar("T")
@@ -57,11 +60,79 @@ async def run_tracked(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
                 _active -= 1
 
 
+def start_tracked_thread(
+    target: Callable[..., Any],
+    *,
+    args: tuple[Any, ...] = (),
+    name: str | None = None,
+    daemon: bool = True,
+) -> threading.Thread:
+    """Start a plain thread that stays counted until ``target`` returns.
+
+    For a worker that is joined with a timeout and so can outlive its caller.
+    The count is taken before the thread starts, so a drain never sees a
+    started thread as absent.
+    """
+    global _active
+
+    def runner() -> None:
+        global _active
+        try:
+            target(*args)
+        finally:
+            with _lock:
+                _active -= 1
+
+    thread = threading.Thread(target=runner, name=name, daemon=daemon)
+    with _lock:
+        _active += 1
+    try:
+        thread.start()
+    except BaseException:
+        with _lock:
+            _active -= 1
+        raise
+    return thread
+
+
+_tracking_scope: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "writer_workers_tracking_scope", default=False
+)
+
+
+@contextmanager
+def tracked_blocking_scope() -> Iterator[None]:
+    """Count the core ``run_blocking`` threads started under this context."""
+    token = _tracking_scope.set(True)
+    try:
+        yield
+    finally:
+        _tracking_scope.reset(token)
+
+
+async def _scoped_blocking_tracker(call: Callable[[], Any]) -> Any:
+    if _tracking_scope.get():
+        return await run_tracked(call)
+    return await run_in_default_executor(call)
+
+
+def install_blocking_tracker() -> None:
+    """Route ``xagent.core`` blocking calls through this module; idempotent."""
+    set_blocking_tracker(_scoped_blocking_tracker)
+
+
+install_blocking_tracker()
+
+
 def active_workers() -> int:
     with _lock:
         return _active
 
 
 async def drain_workers(timeout: float) -> bool:
-    """Wait for every tracked thread to return; ``False`` if some did not."""
-    return await wait_until(lambda: not active_workers(), timeout)
+    """Wait for every tracked thread to return; ``False`` if some did not.
+
+    ``<= 0``, not ``== 0``: a count driven below zero (a test reset racing a
+    live thread) must not make a drain wait for the full timeout.
+    """
+    return await wait_until(lambda: active_workers() <= 0, timeout)

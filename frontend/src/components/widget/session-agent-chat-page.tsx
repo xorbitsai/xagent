@@ -82,9 +82,10 @@ interface SessionConversationContentProps {
   isAbsoluteExpiryWarningVisible: boolean
   // Lifted to the never-unmounting SessionAgentChatPage below: this
   // component's own "active" JSX branch unmounts on a degraded/reconnect
-  // transition (see the status check further down), which would otherwise
-  // silently reset an accepted expand back to the collapsed label/icon while
-  // the panel itself is still actually expanded.
+  // transition (see the status check further down). widget.js re-reports the
+  // size when the header remounts, but keeping it here means the label is
+  // right from the first frame, including with an older widget.js that sends
+  // no such report.
   isExpanded: boolean
   onExpandedChange: (expanded: boolean) => void
   // Present only while the session server advertises file uploads.

@@ -3,6 +3,7 @@
 import json
 
 import pytest
+import sqlalchemy as sa
 
 from tests.e2e.shared_execution_harness import (
     create_sdk_task,
@@ -29,6 +30,20 @@ def _storage_version(task_id: int) -> int:
 
     with get_session_local()() as db:
         return db.get(Task, task_id).conversation_storage_version
+
+
+def _event_kinds(task_id: int) -> list[str]:
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.task_execution_event import TaskExecutionEvent
+
+    with get_session_local()() as db:
+        return list(
+            db.scalars(
+                sa.select(TaskExecutionEvent.kind)
+                .where(TaskExecutionEvent.task_id == task_id)
+                .order_by(TaskExecutionEvent.sequence)
+            )
+        )
 
 
 def test_only_enabled_entries_create_v2_tasks(shared_app):
@@ -62,6 +77,7 @@ def test_switch_off_keeps_existing_v2_task_and_new_tasks_are_v1(shared_app):
     task_id, _ = _sdk_task(app, agent_id, headers, "e2e:ask")
     assert _storage_version(task_id) == 2
     waiting = app.wait_task(task_id, status="waiting_for_user")
+    events_before_restart = len(_event_kinds(task_id))
 
     # Roll back: every host restarts with the switch off.
     restart_hosts(app, "web", "worker", **{ENTRIES: ""})
@@ -80,6 +96,10 @@ def test_switch_off_keeps_existing_v2_task_and_new_tasks_are_v1(shared_app):
     assert completed["run_id"] == waiting["run_id"]
     assert "Shared E2E answer" in completed["output"]
     assert _storage_version(task_id) == 2
+    # The answered turn is still written as V2 events, not only the column.
+    assert {"user_message", "assistant_message"} <= set(
+        _event_kinds(task_id)[events_before_restart:]
+    )
 
     later_id, later_run = _sdk_task(app, agent_id, headers, "after rollback")
     assert _storage_version(later_id) == 1

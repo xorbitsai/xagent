@@ -55,7 +55,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
-from .release_hold import release_hold
+from .release_hold import release_hold, wait_until
 from .task_admission_execution import (
     AdmissionWaiting,
     admission_execution,
@@ -3090,27 +3090,72 @@ async def dispatch_task_command_promptly(
     Fast commands usually finish during the short handoff window. Slow file or
     checkpoint work continues in its own task, allowing the socket receive loop
     to accept the next pause/message command instead of blocking behind it.
+
+    The chokepoint of the retire fence for the socket and internal producers
+    that enqueue a command and then kick it (socket handlers,
+    ``execute_existing_task``, task start, workforce pauses): once the host
+    fenced this process's writers (``app.retire_writers``) nothing is applied
+    here any more. The command row is already durable, so this only wakes the
+    dispatcher and the successor claims the row. HTTP producers that call
+    :func:`dispatch_one_task_command` directly (``api/a2a.py``) do not pass
+    through here and are not fenced; they are HTTP producers, which the retire
+    does not cover.
+
+    The dispatch task is registered for :func:`drain_prompt_dispatches` before
+    the inline wait, so a retire that starts during the wait still sees it.
     """
 
-    if not consumes_task_commands():
+    if release_hold.socket_writes_fenced or not consumes_task_commands():
         notify_task_command_dispatcher()
         return
 
     task = asyncio.get_running_loop().create_task(
         dispatch_one_task_command(executor, command_db_id=command_db_id)
     )
+    _prompt_dispatch_tasks.add(task)
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
     except asyncio.TimeoutError:
-        _prompt_dispatch_tasks.add(task)
         task.add_done_callback(_consume_prompt_dispatch_result)
         return
+    except BaseException as exc:
+        # The dispatch itself failed (the caller sees that), or the caller was
+        # cancelled and the shielded dispatch keeps running detached.
+        if (
+            isinstance(exc, asyncio.CancelledError)
+            and task.cancelled()
+            and (current := asyncio.current_task()) is not None
+            and current.cancelling() == 0
+        ):
+            # The drain cancelled the dispatch, not the caller: the row is
+            # durable and the successor claims it, so the caller carries on.
+            _prompt_dispatch_tasks.discard(task)
+            return
+        if task.done():
+            _prompt_dispatch_tasks.discard(task)
+        else:
+            task.add_done_callback(_consume_prompt_dispatch_result)
+        raise
+    _prompt_dispatch_tasks.discard(task)
 
 
 def prompt_dispatch_count() -> int:
     """Detached prompt dispatches still running (``dispatch_task_command_promptly``)."""
 
     return sum(1 for task in _prompt_dispatch_tasks if not task.done())
+
+
+async def drain_prompt_dispatches(timeout: float) -> bool:
+    """Cancel the detached prompt dispatches and wait until they have finished.
+
+    ``stop_task_command_dispatcher`` does the same, but only when this process
+    runs a dispatcher task; the retire must not publish success while a
+    dispatch that started before the fence can still apply a command.
+    """
+
+    for task in list(_prompt_dispatch_tasks):
+        task.cancel()
+    return await wait_until(lambda: prompt_dispatch_count() == 0, timeout)
 
 
 def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:

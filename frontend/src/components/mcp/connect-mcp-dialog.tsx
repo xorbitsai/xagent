@@ -266,10 +266,13 @@ export function ConnectMcpDialog({
   const isAttachable = (app: AppIntegration) => Boolean(app.can_attach)
 
   // Whether the card may advertise interactive authorization. Separate from
-  // isAttachable because the two genuinely diverge: a hook-resolved connector
-  // (#1332) and a team-owned one (#1338) are both attachable while neither has
-  // a consent flow this editor could complete — the first has none at all, the
-  // second would 404 on /{server_id}/oauth/connect.
+  // isAttachable because the two genuinely diverge: a connector can be
+  // attachable with no card-level consent. A deployment whose tokens come from
+  // a resolver hook (#1332) offers none for any connector; the backend reports
+  // false there, and a team-owned connector is then authorized only through the
+  // per-server route from the connector settings dialog. Without that hook, a
+  // team-owned connector the team has opened to member authorization (#1338)
+  // reports true and gets the card button; one it has not opened reports false.
   const canAuthorize = (app: AppIntegration) => Boolean(app.can_authorize)
 
   // Whether this viewer may open this entry's configuration surface, decided

@@ -1,13 +1,14 @@
 """WebSocket real-time communication handler"""
 
 import asyncio
+import functools
 import json
 import logging
 import uuid
 import weakref
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -145,7 +146,11 @@ from ..services.public_trace_events import (
     public_audience_frame,
     public_task_trace_filter,
 )
-from ..services.release_hold import release_hold
+from ..services.release_hold import (
+    SocketWriteToken,
+    WritersRetired,
+    release_hold,
+)
 from ..services.task_auto_recovery import (
     current_auto_recovery_view,
     is_auto_resume_command_id,
@@ -200,6 +205,7 @@ from ..services.task_execution_controller import (
 from ..services.task_execution_controller import (
     task_execution_controller as task_execution_controller,  # Tests patch this API module's controller.snapshot.
 )
+from ..services.task_execution_host import consumes_task_commands
 from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_orchestrator import TaskTurnError
 from ..services.task_runtime import (
@@ -213,6 +219,7 @@ from ..services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
+from ..services.writer_workers import run_tracked, tracked_blocking_scope
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
@@ -2059,8 +2066,13 @@ async def handle_chat_message(
         # directly rather than through a durable command, so it is admitted
         # like any other new execution: refused before its side effects while
         # a planned restart holds execution, counted until it returns.
+        # It also writes (a replacement task), so it is a socket write too:
+        # refused once the host fenced the writers, counted until it settles.
         admitted = release_hold.try_admit("ws_missing_task_chat", f"task:{task_id}")
-        if admitted is None:
+        write_token = _try_admit_socket_write() if admitted is not None else None
+        if admitted is None or write_token is None:
+            if admitted is not None:
+                admitted.release()
             client_message_id = command_execution_service._client_message_id(
                 message_data.get("client_message_id")
             )
@@ -2070,10 +2082,13 @@ async def handle_chat_message(
                 turn_id=client_message_id or str(uuid.uuid4()),
             )
             return
-        with admitted:
-            await command_execution_service.handle_missing_task_message(
-                _make_command_reply(websocket), task_id, message_data
-            )
+        try:
+            with admitted:
+                await command_execution_service.handle_missing_task_message(
+                    _make_command_reply(websocket), task_id, message_data
+                )
+        finally:
+            write_token.release()
         return
     if not enqueued.payload_matches:
         await send_message_delivery(
@@ -2320,6 +2335,74 @@ def _enqueue_websocket_task_command_sync(
         return result
 
 
+# True while a handler that already holds an admitted socket write token calls
+# into the enqueue (preview creates a Task row first), so the enqueue is part
+# of that write instead of a second, refusable one. Server-side only: it is a
+# context variable, never read from a client frame.
+_socket_write_held: ContextVar[bool] = ContextVar("socket_write_held", default=False)
+
+
+def _task_command_ack(
+    kind: TaskCommandKind, task_id: int, command_id: str
+) -> dict[str, Any]:
+    """The reply to a steering command whose row is now durable.
+
+    Before the retire fence this process applies it (``task_command_accepted``).
+    After it the row waits for the next owner of the run, so the reply says it
+    is queued and takes effect after the restart (``task_command_queued``).
+    """
+    # Only a process that consumes commands stops applying them at the fence;
+    # in the shared-execution web role the execution workers apply them as
+    # usual, so the plain acceptance is the truthful reply.
+    queued = release_hold.socket_writes_fenced and consumes_task_commands()
+    return {
+        "type": "task_command_queued" if queued else "task_command_accepted",
+        "task_id": task_id,
+        "command_id": command_id,
+        "command": kind.value,
+        **({"applied_after_restart": True} if queued else {}),
+    }
+
+
+def _try_admit_socket_write(
+    interrupt: Callable[[], object] | None = None,
+) -> SocketWriteToken | None:
+    """Admit one socket-owned write, or ``None`` once the writers are retired.
+
+    The old process then only waits to be replaced, so a write it started
+    would land while the successor's migrations run. The token is held until
+    the write has settled: the host's retire waits for every admitted token
+    before it reports success.
+    """
+    try:
+        return release_hold.acquire_socket_write(interrupt)
+    except WritersRetired:
+        return None
+
+
+def _admit_socket_write(
+    interrupt: Callable[[], object] | None = None,
+) -> SocketWriteToken:
+    """:func:`_try_admit_socket_write`, refused with the retryable paused error."""
+    token = _try_admit_socket_write(interrupt)
+    if token is None:
+        raise ClientVisibleValidationError(
+            client_error_message(ClientErrorCode.EXECUTION_PAUSED),
+            error_code=ClientErrorCode.EXECUTION_PAUSED,
+        )
+    return token
+
+
+# Commands that only steer a run that already exists. They pass the retire
+# fence so the row is durable for whoever owns the run next, but after the fence
+# ``dispatch_task_command_promptly`` only wakes the dispatcher: nothing in this
+# process applies them. The sender is told so (``_task_command_ack``) instead of
+# being told the command was accepted.
+_FENCE_EXEMPT_COMMAND_KINDS = frozenset(
+    {TaskCommandKind.PAUSE, TaskCommandKind.RESUME, TaskCommandKind.CANCEL}
+)
+
+
 async def _enqueue_websocket_task_command(
     *,
     websocket: WebSocket | None = None,
@@ -2329,6 +2412,9 @@ async def _enqueue_websocket_task_command(
     command_id: str | None = None,
     allow_missing_task: bool = False,
 ) -> EnqueuedTaskCommand | None:
+    # A frame without an authenticated user is refused here and writes
+    # nothing, so only an authenticated enqueue takes part in the retire
+    # fence below.
     user = message_data.get("user")
     if user is None:
         raise ClientVisibleValidationError(
@@ -2372,43 +2458,58 @@ async def _enqueue_websocket_task_command(
         # This remains stable across retries even when an API client omitted
         # or supplied an invalid client_message_id.
         payload["client_message_id"] = resolved_command_id
-    route = {}
-    bridge = None
-    token = None
-    if get_shared_task_execution_enabled():
-        from ..services.task_event_bridge import TaskEventBridge, get_task_event_bridge
-
-        bridge = get_task_event_bridge()
-        if kind == TaskCommandKind.MESSAGE and not bridge.ready.is_set():
-            raise ClientVisibleValidationError(
-                "Task event transport is unavailable; retry after reconnection",
-                error_code=ClientErrorCode.TASK_UNAVAILABLE,
-            )
-        if websocket is not None and bridge.ready.is_set():
-
-            async def reply(message: dict[str, Any]) -> None:
-                if not manager.is_connection_registered(websocket, task_id):
-                    raise ConnectionError("Original task connection is unavailable")
-                await _make_command_reply(websocket)(message)
-
-            token = bridge.register_origin(
-                task_id, resolved_command_id, reply, recipient=websocket
-            )
-            route = {"reply_host_id": bridge.host_id, "reply_origin": token}
-    result = await asyncio.to_thread(
-        _enqueue_websocket_task_command_sync,
-        task_id=int(task_id),
-        actor_user_id=int(user.id),
-        actor_is_admin=bool(user.is_admin),
-        command_id=resolved_command_id,
-        kind=kind,
-        payload=payload,
-        allow_missing_task=allow_missing_task,
-        **route,
+    # Work-starting commands are socket writes: refused once the host fenced
+    # the writers, counted until the thread below returns so the retire can
+    # wait for them. Steering commands pass (see _FENCE_EXEMPT_COMMAND_KINDS).
+    write_token = (
+        None
+        if kind in _FENCE_EXEMPT_COMMAND_KINDS or _socket_write_held.get()
+        else _admit_socket_write()
     )
-    if token is not None and (result is None or not result.created):
-        cast(TaskEventBridge, bridge).discard_origin(token)
-    return result
+    try:
+        route = {}
+        bridge = None
+        token = None
+        if get_shared_task_execution_enabled():
+            from ..services.task_event_bridge import (
+                TaskEventBridge,
+                get_task_event_bridge,
+            )
+
+            bridge = get_task_event_bridge()
+            if kind == TaskCommandKind.MESSAGE and not bridge.ready.is_set():
+                raise ClientVisibleValidationError(
+                    "Task event transport is unavailable; retry after reconnection",
+                    error_code=ClientErrorCode.TASK_UNAVAILABLE,
+                )
+            if websocket is not None and bridge.ready.is_set():
+
+                async def reply(message: dict[str, Any]) -> None:
+                    if not manager.is_connection_registered(websocket, task_id):
+                        raise ConnectionError("Original task connection is unavailable")
+                    await _make_command_reply(websocket)(message)
+
+                token = bridge.register_origin(
+                    task_id, resolved_command_id, reply, recipient=websocket
+                )
+                route = {"reply_host_id": bridge.host_id, "reply_origin": token}
+        result = await run_tracked(
+            _enqueue_websocket_task_command_sync,
+            task_id=int(task_id),
+            actor_user_id=int(user.id),
+            actor_is_admin=bool(user.is_admin),
+            command_id=resolved_command_id,
+            kind=kind,
+            payload=payload,
+            allow_missing_task=allow_missing_task,
+            **route,
+        )
+        if token is not None and (result is None or not result.created):
+            cast(TaskEventBridge, bridge).discard_origin(token)
+        return result
+    finally:
+        if write_token is not None:
+            write_token.release()
 
 
 @dataclass(frozen=True)
@@ -2548,6 +2649,7 @@ async def handle_execute_task(
     hold leaves it pending for the successor instead of refusing it, and no
     execution starts inside this socket's handler. No DB Session is retained.
     """
+    write_token: SocketWriteToken | None = None
     try:
         user = message_data.get("user")
         authorized_task_id: int | None = None
@@ -2556,6 +2658,9 @@ async def handle_execute_task(
                 "User authentication required for task execution",
                 error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
+        # A socket-owned write: refused once the host retired the writers, and
+        # counted until it settles so the retire can wait for it.
+        write_token = _admit_socket_write()
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
 
@@ -2726,6 +2831,9 @@ async def handle_execute_task(
         # logs without exc_info and the public endpoints swallow entirely.
         logger.error("Unexpected error in task execution: %s", e, exc_info=True)
         raise
+    finally:
+        if write_token is not None:
+            write_token.release()
 
 
 @dataclass(frozen=True)
@@ -3966,12 +4074,7 @@ async def handle_pause_task(
         )
         return
     await manager.send_personal_message(
-        {
-            "type": "task_command_accepted",
-            "task_id": task_id,
-            "command_id": enqueued.client_command_id,
-            "command": TaskCommandKind.PAUSE.value,
-        },
+        _task_command_ack(TaskCommandKind.PAUSE, task_id, enqueued.client_command_id),
         websocket,
     )
     if enqueued.created and not get_shared_task_execution_enabled():
@@ -4034,12 +4137,7 @@ async def handle_resume_task(
         )
         return
     await manager.send_personal_message(
-        {
-            "type": "task_command_accepted",
-            "task_id": task_id,
-            "command_id": enqueued.client_command_id,
-            "command": TaskCommandKind.RESUME.value,
-        },
+        _task_command_ack(TaskCommandKind.RESUME, task_id, enqueued.client_command_id),
         websocket,
     )
     if enqueued.created and not get_shared_task_execution_enabled():
@@ -4088,9 +4186,24 @@ async def websocket_builder_chat_endpoint(
             if active_chat_task is not None:
                 await cancel_and_drain_async_task(active_chat_task)
 
-            active_chat_task = asyncio.create_task(
-                handle_builder_chat(websocket, message_data, user)
+            # A builder turn creates agents and knowledge bases; the old
+            # process may no longer write once the host retired its writers.
+            # An admitted turn is a socket write the retire waits for, and is
+            # cancelled when the fence goes up. The task exists before the
+            # token so its own ``cancel`` is the wind-down callback; nothing
+            # awaits between the two, so a refused turn never started.
+            turn_task = asyncio.create_task(
+                _run_builder_turn(websocket, message_data, user)
             )
+            write_token = _try_admit_socket_write(turn_task.cancel)
+            if write_token is None:
+                turn_task.cancel()
+                await cancel_and_drain_async_task(turn_task)
+                await send_execution_paused(websocket)
+                continue
+
+            turn_task.add_done_callback(functools.partial(_release_write, write_token))
+            active_chat_task = turn_task
             websocket.state.chat_task = active_chat_task
 
     except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
@@ -4103,6 +4216,25 @@ async def websocket_builder_chat_endpoint(
         if active_chat_task is not None:
             await cancel_and_drain_async_task(active_chat_task)
         websocket.state.chat_task = None
+
+
+def _release_write(token: SocketWriteToken, _done: asyncio.Future[None]) -> None:
+    token.release()
+
+
+async def _run_builder_turn(
+    websocket: WebSocket,
+    message_data: dict,
+    user: Union[User, WebSocketPrincipal],
+) -> None:
+    """One builder turn, with its core blocking calls counted for the retire.
+
+    The knowledge-base ingestion and agent tools run threads that keep writing
+    after this task is cancelled, so they are tracked (``run_blocking``) for as
+    long as the turn runs.
+    """
+    with tracked_blocking_scope():
+        await handle_builder_chat(websocket, message_data, user)
 
 
 async def handle_builder_chat(
@@ -4514,6 +4646,15 @@ clarification questions as plain assistant text.
             except Exception as e:
                 logger.warning(f"Failed to send task_completed: {e}")
 
+    except asyncio.CancelledError:
+        # The retire fence cancels a running turn. The client would otherwise
+        # wait forever for the turn's end, so tell it the turn was paused
+        # (best effort) and let the cancellation through. Any other cancel is
+        # a genuine one (a newer message, a closed socket) and passes untouched.
+        if release_hold.socket_writes_fenced:
+            with suppress(Exception):
+                await send_execution_paused(websocket)
+        raise
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
         error_metadata = {}
@@ -4686,21 +4827,34 @@ async def handle_build_preview_execution(
         # execution it is refused outright rather than queued for a successor
         # nobody is watching. A follow-up to an existing preview task goes
         # through the durable chat command below like any chat message.
+        # The hidden Task row it creates is a write, so the retire fence is
+        # checked before anything is written, and held until the turn settles.
         admitted = release_hold.try_admit("ws_preview", f"user:{user.id}")
-        if admitted is None:
+        write_token = _try_admit_socket_write() if admitted is not None else None
+        if admitted is None or write_token is None:
+            if admitted is not None:
+                admitted.release()
             await send_execution_paused(websocket)
             return
-        with admitted:
-            preview_task_id = await _create_preview_task(
-                user,
-                user_message=user_message,
-                agent_config=agent_config,
-                llm_ids=llm_ids,
-                execution_mode=execution_mode,
-            )
-            websocket.state.preview_task_id = preview_task_id
-            manager.register_connection(websocket, preview_task_id)
-            await _send_preview_chat(websocket, preview_task_id, user, message_data)
+        # The outer token covers the enqueue below too (``_socket_write_held``):
+        # the fence rising after the hidden Task row exists must not refuse the
+        # enqueue and leave the row orphaned.
+        held = _socket_write_held.set(True)
+        try:
+            with admitted:
+                preview_task_id = await _create_preview_task(
+                    user,
+                    user_message=user_message,
+                    agent_config=agent_config,
+                    llm_ids=llm_ids,
+                    execution_mode=execution_mode,
+                )
+                websocket.state.preview_task_id = preview_task_id
+                manager.register_connection(websocket, preview_task_id)
+                await _send_preview_chat(websocket, preview_task_id, user, message_data)
+        finally:
+            _socket_write_held.reset(held)
+            write_token.release()
         return
     await _send_preview_chat(websocket, int(str(preview_task_id)), user, message_data)
 

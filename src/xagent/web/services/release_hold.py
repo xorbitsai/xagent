@@ -40,7 +40,11 @@ own interpreter and so its own hold) needs two more answers from every worker:
   settled"; this module never decides that for it, and ``busy`` keeps its
   meaning.
 
-Nothing here cancels, times out or queues work. Default state is open with an
+The hold and the ledger never cancel, time out or queue work. The one
+exception is the socket-write fence (:meth:`ReleaseHold.mark_writers_retired`):
+it refuses new socket-owned writes and calls the wind-down callback each
+admitted long-running write registered (an ASR session, a builder turn), once.
+Default state is open with an
 empty ledger, so a process that never closes the hold behaves exactly as
 before (unless ``XAGENT_STANDBY`` is set: then the module seals the hold at
 import, and a malformed value raises on import) -- the ledger only adds counting around existing code paths.
@@ -64,7 +68,7 @@ import itertools
 import logging
 import time
 from collections import Counter, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -76,6 +80,17 @@ logger = logging.getLogger(__name__)
 # How many unsettled entries are kept for diagnostics. ``unsettled_total`` keeps
 # counting past it; dropping old entries never lowers the blocking count.
 UNSETTLED_DIAGNOSTICS_LIMIT = 50
+
+
+async def wait_until(done: Callable[[], bool], timeout: float) -> bool:
+    """Poll ``done`` until it is true; ``False`` if ``timeout`` seconds pass first."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not done():
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
 
 
 @dataclass(frozen=True)
@@ -112,6 +127,27 @@ class HoldToken:
         self.release()
 
 
+class WritersRetired(Exception):
+    """A socket write was refused because the host retired this process's writers."""
+
+
+class SocketWriteToken:
+    """One admitted socket-owned write; hold it until its writes have settled."""
+
+    def __init__(
+        self,
+        hold: ReleaseHold,
+        key: int,
+    ) -> None:
+        self._hold = hold
+        self._key: int | None = key
+
+    def release(self) -> None:
+        key, self._key = self._key, None
+        if key is not None:
+            self._hold._socket_writes.pop(key, None)
+
+
 class ReleaseHold:
     """Process-wide execution admission switch plus hand-off ledger."""
 
@@ -123,6 +159,15 @@ class ReleaseHold:
         # Refusals since the hold last closed, by entry kind; diagnostics only.
         self._refused: Counter[str] = Counter()
         self._sealed = False
+        # One-way for the life of the lifespan: set once the host started to
+        # retire this process's writers (``app.retire_writers``). Entries that
+        # would write while the old process only waits to be replaced refuse
+        # on it. Not "the retire is done": that is ``app.writers_retired()``.
+        self._socket_writes_fenced = False
+        # Socket-owned writers (command enqueue, builder turns, ASR sessions)
+        # admitted before the retire fence, each with an optional callback that
+        # asks a long-running one to wind down once the fence is up.
+        self._socket_writes: dict[int, Callable[[], object] | None] = {}
         # Sticky for the life of the process: the blocking evidence.
         self._unsettled_total = 0
         self._unsettled: deque[dict[str, str]] = deque(
@@ -136,6 +181,65 @@ class ReleaseHold:
     @property
     def sealed(self) -> bool:
         return self._sealed
+
+    @property
+    def socket_writes_fenced(self) -> bool:
+        """Whether the retire fence is up (new socket writes are refused)."""
+        return self._socket_writes_fenced
+
+    @property
+    def socket_write_count(self) -> int:
+        """Admitted socket-owned writes that have not settled yet."""
+        return len(self._socket_writes)
+
+    def mark_writers_retired(self) -> None:
+        """Raise the retire fence: no new socket write is admitted from now on.
+
+        One-way until :meth:`reset_writers_retired`. Writers already admitted
+        are asked to wind down and are waited for by
+        :meth:`drain_socket_writes`; the retire is not complete before that.
+        Synchronous on the event-loop thread, so a write either registered
+        before this call or is refused after it. The wind-down callbacks fire
+        on the False -> True transition only: a retry after a failed retire
+        must not cancel an already winding-down write a second time (a second
+        ``task.cancel()`` can interrupt its cleanup).
+        """
+        if self._socket_writes_fenced:
+            return
+        self._socket_writes_fenced = True
+        for interrupt in list(self._socket_writes.values()):
+            if interrupt is not None:
+                try:
+                    interrupt()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Socket write wind-down failed", exc_info=True)
+
+    def reset_writers_retired(self) -> None:
+        """A new lifespan starts new writers."""
+        self._socket_writes_fenced = False
+        self._socket_writes.clear()
+
+    def acquire_socket_write(
+        self, interrupt: Callable[[], object] | None = None
+    ) -> SocketWriteToken:
+        """Admit one socket-owned write or raise :class:`WritersRetired`.
+
+        Hold the token across the whole write, through any usage hook that
+        settles after it. ``interrupt`` is called once if the fence goes up
+        while the token is held, for writers that may run for minutes.
+        """
+        if self._socket_writes_fenced:
+            raise WritersRetired()
+        key = next(self._keys)
+        self._socket_writes[key] = interrupt
+        return SocketWriteToken(self, key)
+
+    async def drain_socket_writes(self, timeout: float) -> bool:
+        """Wait until every admitted socket write has settled.
+
+        ``False`` if some are still running after ``timeout`` seconds.
+        """
+        return await wait_until(lambda: not self._socket_writes, timeout)
 
     @property
     def unsettled_total(self) -> int:
@@ -303,7 +407,9 @@ def execution_status() -> dict[str, Any]:
     pre-registration reservation, a dispatcher slot reservation, a detached
     prompt dispatch, or a shared-execution task coordinator on this loop
     (always zero in combined mode). Each component is reported so a waiting
-    release can log *why* it waits.
+    release can log *why* it waits. ``socket_writes_fenced`` and
+    ``socket_writes`` report the retire fence and the admitted socket writes
+    still running; they are diagnostics beside ``busy`` and never change it.
 
     ``sealed`` and ``unsettled_total`` (with the bounded ``unsettled`` list)
     are reported beside ``busy`` and never change it; a pooled host blocks on
@@ -323,6 +429,8 @@ def execution_status() -> dict[str, Any]:
     return {
         "busy": any(counts.values()),
         "counts": counts,
+        "socket_writes_fenced": release_hold.socket_writes_fenced,
+        "socket_writes": release_hold.socket_write_count,
         "hold": ledger,
         "sealed": ledger["sealed"],
         "unsettled_total": ledger["unsettled_total"],

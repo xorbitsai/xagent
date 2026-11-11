@@ -64,6 +64,7 @@ import itertools
 import json
 import logging
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -129,6 +130,8 @@ from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...deferred_tools import (
     AVAILABLE_NAMES_SUFFIX,
+    BUILTIN_CATEGORY_MENTION_TERMS,
+    BUILTIN_DEFERRED_RULE,
     DEFAULT_PRELOAD_TOKEN_BUDGET,
     DEFERRED_RULE,
     LOAD_TOOLS_NAME,
@@ -136,6 +139,7 @@ from ...deferred_tools import (
     MAX_AUTO_LOAD_RETRIES,
     MAX_TOOLS_PER_LOAD,
     LoadToolsTool,
+    builtin_source_label,
     servers_mentioned,
     tool_names_mentioned,
 )
@@ -803,14 +807,24 @@ class ReActPattern(AgentPattern):
         user_interaction_enabled: bool = True,
         defer_connector_schemas: bool = False,
         deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET,
+        defer_builtin_tool_categories: Iterable[str] = (),
     ) -> None:
         self.llm = llm
         # Host opt-in: connector tool schemas are withheld until the model
         # loads them (see ``deferred_tools``). Off keeps every schema sent.
         self.defer_connector_schemas = defer_connector_schemas
         self.deferred_preload_token_budget = max(0, int(deferred_preload_token_budget))
+        # Host opt-in: built-in tools of these categories (e.g. "image") are
+        # deferred the same way. Empty keeps every built-in schema sent.
+        self.defer_builtin_tool_categories: frozenset[str] = frozenset(
+            c.strip().casefold()
+            for c in (defer_builtin_tool_categories or ())
+            if isinstance(c, str) and c.strip()
+        )
         self._deferred_tool_names: frozenset[str] = frozenset()
         self._deferred_order: tuple[str, ...] = ()
+        # Deferred built-in tools: category -> names in tool order.
+        self._deferred_builtin_categories: dict[str, tuple[str, ...]] = {}
         # Deferred tools the last provider refusal auto-loaded; the retry
         # instruction names them once and clears this.
         self._just_auto_loaded: list[str] = []
@@ -1052,7 +1066,10 @@ class ReActPattern(AgentPattern):
         self.status = "thinking"
         tools = self._tools_with_deferral(tools, context)
         self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
-        self._connector_tool_sources = connector_tool_sources(tools)
+        self._connector_tool_sources = {
+            **connector_tool_sources(tools),
+            **self._deferred_builtin_sources(),
+        }
         # Read by get_system_context to contradict skill text naming edit_image.
         context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = (
             "generate_image" in self._tool_decision_groups_by_name
@@ -2202,6 +2219,8 @@ class ReActPattern(AgentPattern):
                 instruction = f"{instruction}\n\n{access_context}"
             if self._deferred_tool_names:
                 instruction = f"{instruction}\n\n{DEFERRED_RULE}"
+                if self._deferred_builtin_categories:
+                    instruction = f"{instruction} {BUILTIN_DEFERRED_RULE}"
         else:
             # Reachable only with tool_choice="none", which no production
             # construction site sets. If that ever changes, this branch needs
@@ -4504,28 +4523,59 @@ class ReActPattern(AgentPattern):
         """
         self._deferred_tool_names = frozenset()
         self._deferred_order = ()
-        if not self.defer_connector_schemas or self.tool_choice == "none":
+        self._deferred_builtin_categories = {}
+        if not (self.defer_connector_schemas or self.defer_builtin_tool_categories):
+            return tools
+        if self.tool_choice == "none":
             return tools
         if any(self._tool_name(tool) == LOAD_TOOLS_NAME for tool in tools):
             return tools
-        sources = connector_tool_sources(tools)
+        connector_sources = connector_tool_sources(tools)
+        sources = connector_sources if self.defer_connector_schemas else {}
         reserved = {*self._control_tool_names(), SPILL_READ_TOOL_NAME}
-        deferred = [
-            name
-            for name in (self._tool_name(tool) for tool in tools)
-            if name in sources and name not in reserved
-        ]
+        deferred: list[str] = []
+        categories: dict[str, list[str]] = {}
+        for tool in tools:
+            name = self._tool_name(tool)
+            if name in reserved:
+                continue
+            if name in sources:
+                deferred.append(name)
+                continue
+            if name in connector_sources or not self.defer_builtin_tool_categories:
+                continue
+            category = self._tool_category_value(tool)
+            if category in self.defer_builtin_tool_categories:
+                deferred.append(name)
+                categories.setdefault(category, []).append(name)
         if not deferred:
             return tools
         self._deferred_order = tuple(deferred)
         self._deferred_tool_names = frozenset(deferred)
+        self._deferred_builtin_categories = {
+            category: tuple(names) for category, names in categories.items()
+        }
         self._preload_mentioned(tools, sources, context)
         return [
             *tools,
             LoadToolsTool(
-                lambda names: self._execute_load_tools({"names": names}, context)
+                lambda names: self._execute_load_tools({"names": names}, context),
+                builtin_categories=bool(self._deferred_builtin_categories),
             ),
         ]
+
+    @staticmethod
+    def _tool_category_value(tool: Any) -> str:
+        category = getattr(getattr(tool, "metadata", None), "category", None)
+        return str(getattr(category, "value", category) or "").strip().casefold()
+
+    def _deferred_builtin_sources(self) -> dict[str, str]:
+        """Deferred built-in tool name -> the catalog label of its category."""
+        return {
+            name: builtin_source_label(category)
+            for category, names in self._deferred_builtin_categories.items()
+            for name in names
+        }
 
     def _loaded_component(self, context: Any) -> LoadedToolsComponent:
         component = context.get_component(LOADED_TOOLS_COMPONENT)
@@ -4654,12 +4704,13 @@ class ReActPattern(AgentPattern):
         # dict.fromkeys keeps tool order, so which connector the budget has
         # room for does not depend on the process's hash seed.
         for server in servers_mentioned(
-            text, dict.fromkeys(sources[n] for n in self._deferred_order)
+            text,
+            dict.fromkeys(sources[n] for n in self._deferred_order if n in sources),
         ):
             group = [
                 n
                 for n in self._deferred_order
-                if sources[n] == server
+                if sources.get(n) == server
                 and n not in to_load
                 and n not in component.names
             ]
@@ -4672,6 +4723,24 @@ class ReActPattern(AgentPattern):
                     "Deferred preload skipped connector %r: %d tools, ~%d "
                     "tokens against %d remaining",
                     server,
+                    len(group),
+                    cost,
+                    remaining,
+                )
+        for category, names in self._deferred_builtin_categories.items():
+            terms = (category, *BUILTIN_CATEGORY_MENTION_TERMS.get(category, ()))
+            group = [n for n in names if n not in to_load and n not in component.names]
+            if not group or not servers_mentioned(text, terms):
+                continue
+            cost = sum(self._tool_schema_cost(by_name[n]) for n in group)
+            if cost <= remaining:
+                to_load.extend(group)
+                remaining -= cost
+            else:
+                logger.info(
+                    "Deferred preload skipped built-in category %r: %d tools, "
+                    "~%d tokens against %d remaining",
+                    category,
                     len(group),
                     cost,
                     remaining,
@@ -4751,9 +4820,17 @@ class ReActPattern(AgentPattern):
         """
         component = self._loaded_component(context)
         taken = set(component.names)
-        requested = list(
-            dict.fromkeys(self._resolve_deferred_name(n) or n for n in requested)
-        )
+        resolved: list[str] = []
+        for requested_name in requested:
+            exact = self._resolve_deferred_name(requested_name)
+            if exact is not None:
+                resolved.append(exact)
+                continue
+            folded = requested_name.strip().casefold()
+            resolved.extend(
+                self._deferred_builtin_categories.get(folded, ()) or [requested_name]
+            )
+        requested = list(dict.fromkeys(resolved))
         known = [n for n in requested if n in self._deferred_tool_names]
         unknown = [n for n in requested if n not in self._deferred_tool_names]
         already = [n for n in known if n in taken]

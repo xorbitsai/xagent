@@ -17,6 +17,7 @@ import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
 from lancedb.db import DBConnection
 
+from xagent.core.utils.blocking import run_blocking
 from xagent.providers.vector_store.lancedb import (
     get_async_connection_from_env,
     get_connection_from_env,
@@ -413,7 +414,7 @@ class LanceDBMetadataStore(MetadataStore):
 
     async def ensure_collection_metadata_table(self) -> None:
         conn = await self._get_connection()
-        await asyncio.to_thread(self._ensure_collection_metadata_table_sync, conn)
+        await run_blocking(self._ensure_collection_metadata_table_sync, conn)
 
     def _ensure_collection_metadata_table_sync(self, conn: DBConnection) -> None:
         """Blocking body of :meth:`ensure_collection_metadata_table`.

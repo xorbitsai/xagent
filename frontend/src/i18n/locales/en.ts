@@ -1396,6 +1396,9 @@ Build when you need.`,
         invalidBadge: "Upload settings invalid",
         invalidBadgeDescription: "Upload settings are invalid, so this connector is unavailable.",
       },
+      memberOAuth: {
+        destination: "After you sign in, your account token is sent to {host}",
+      },
       // Account identifier step before a builtin OAuth popup, for providers
       // hosted on the customer's own account (oauth-account-dialog.tsx).
       accountStep: {

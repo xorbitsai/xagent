@@ -761,3 +761,33 @@ async def test_the_sweep_deletes_only_old_leftovers_in_the_write_folder(
     assert elsewhere in drive.items
     assert set(drive.items) == set(seeded) | {young, elsewhere}
     assert ("list", FIXTURES["google-drive.write_sweep_query"]) in drive.requests
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_sweep_whose_pin_cannot_read_the_write_folder_sweeps_nothing(
+    drive: Drive,
+) -> None:
+    # The pin runs before the sweep's find, so a write folder the connection
+    # cannot read ends the sweep there: the old leftover in it is neither
+    # listed nor deleted.
+    drive.add(
+        "file-stale",
+        "xagent-smoke-202601010000-a1b2c3-drive-file",
+        "text/plain",
+        parent=WRITE_FOLDER,
+    )
+    del drive.items[WRITE_FOLDER]
+    seeded = dict(drive.items)
+
+    result = await run_sweep(_adapter(), call_timeout=5.0, total_timeout=60.0)
+
+    (row,) = result.to_document()["rows"]
+    assert (row["outcome"], row["failure_class"], row["reason"]) == (
+        "fail",
+        "tenant_mismatch",
+        "pin_failed",
+    )
+    assert (row["found"], row["deleted"]) == (0, 0)
+    assert ("list", FIXTURES["google-drive.write_sweep_query"]) not in drive.requests
+    assert not [kind for kind, _ in drive.requests if kind == "delete"]
+    assert drive.items == seeded

@@ -495,14 +495,15 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
     the write check and the sweep to their own write-area container instead:
     the one folder the seed names ``xagent-smoke-write`` in the account's My
     Drive root and keeps unshared, which a connection to any other account
-    therefore cannot read. The same read shows both that the connection is the
-    test account and that its writes reach the isolated area. The query is the
-    seed's own uniqueness rule, so a folder with that name outside the root,
-    such as one in a shared drive, does not make the pin fail. The check
-    creates a text file in that folder, reads it back (the same read guards
-    the cleanup) and deletes it. The sweep lists the folder with the
-    registry's query fixture, since Drive's search takes the whole query, and
-    deletes leftovers by id.
+    therefore cannot read. The same read shows that the connection is the test
+    account and that the container the create targets is that account's;
+    whether the file lands there rests on the create's parent, which no step
+    reads. The query is the seed's own uniqueness rule, so a folder with that
+    name outside the root, such as one in a shared drive, does not make the pin
+    fail. The check creates a text file in that folder, reads it back (the same
+    read guards the cleanup) and deletes it. The sweep lists the folder with
+    the registry's query fixture, since Drive's search takes the whole query,
+    and deletes leftovers by id.
     """
     pin = TenantPin(
         ToolStep(

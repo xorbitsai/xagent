@@ -667,6 +667,64 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    # Tier 2 (#3573). Which $select fields Graph returns for every message,
+    # event or contact has not been checked against a live mailbox, so a list
+    # item asserts its id alone.
+    "outlook": ConnectorChecks(
+        "outlook",
+        reads=(
+            _declared_l3("outlook"),
+            ReadCheck(
+                "outlook.get_profile",
+                "outlook_get_profile",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("id", "userPrincipalName")),
+                    IsType(("user", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_messages",
+                "outlook_list_messages",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("messages", "next_link")),
+                    EachHasKeys(("messages",), ("id",)),
+                    Length(("messages",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_events",
+                "outlook_list_events",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("events", "next_link")),
+                    EachHasKeys(("events",), ("id",)),
+                    Length(("events",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_contacts",
+                "outlook_list_contacts",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("contacts", "next_link")),
+                    EachHasKeys(("contacts",), ("id",)),
+                    Length(("contacts",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=("outlook_get_message",),
+            writes=("outlook_create_event", "outlook_delete_event"),
+            in_place_edits=("outlook_update_event",),
+            writes_without_cleanup=("outlook_send_message",),
+        ),
+    ),
     "powerpoint": ConnectorChecks(
         "powerpoint",
         reads=(
@@ -865,7 +923,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "mixpanel",
         "myob",
         "onedrive",
-        "outlook",
         "planner",
         "posthog",
         "rocketlane",

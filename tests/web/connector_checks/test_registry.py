@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 from docx import Document
+from mcp.server.fastmcp.exceptions import ToolError
 from pptx import Presentation
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
@@ -52,6 +53,7 @@ from xagent.web.tools.mcp import (
     google_drive,
     google_sheets,
     google_slides,
+    outlook,
     powerpoint,
     word,
     zendesk,
@@ -485,6 +487,47 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             IsType(("meetings",), "array"),
         ),
     ),
+    # Graph returns only the $select fields an item has (a draft has no
+    # ``from``), so an outlook list item asserts its id alone.
+    "outlook.get_profile": (
+        "outlook_get_profile",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("user",), ("id", "userPrincipalName")),
+            IsType(("user", "id"), "string"),
+        ),
+    ),
+    "outlook.list_messages": (
+        "outlook_list_messages",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("messages", "next_link")),
+            EachHasKeys(("messages",), ("id",)),
+            Length(("messages",), max=1),
+        ),
+    ),
+    "outlook.list_events": (
+        "outlook_list_events",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("events", "next_link")),
+            EachHasKeys(("events",), ("id",)),
+            Length(("events",), max=1),
+        ),
+    ),
+    "outlook.list_contacts": (
+        "outlook_list_contacts",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("contacts", "next_link")),
+            EachHasKeys(("contacts",), ("id",)),
+            Length(("contacts",), max=1),
+        ),
+    ),
 }
 
 
@@ -530,7 +573,7 @@ def test_a_tier_2_read_check_is_declared_exactly(
     assert check.assertions == assertions
 
 
-@pytest.mark.parametrize("app_id", ["google-ads", "zendesk", "zoom"])
+@pytest.mark.parametrize("app_id", ["google-ads", "outlook", "zendesk", "zoom"])
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)
     assert expected is not None
@@ -665,6 +708,150 @@ def test_google_ads_list_check_fails_on_another_shape(
         FailureClass.ASSERTION_FAILED,
         reason,
     )
+
+
+def _call_declared(check_id: str, tool: Callable[..., str]) -> str:
+    """``tool`` called with the arguments its check declares."""
+    return tool(**_read_check(check_id).arguments)
+
+
+_OUTLOOK_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
+    "outlook.list_messages": ("messages", outlook.outlook_list_messages),
+    "outlook.list_events": ("events", outlook.outlook_list_events),
+    "outlook.list_contacts": ("contacts", outlook.outlook_list_contacts),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_OUTLOOK_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+@pytest.mark.parametrize("next_link", [None, "https://graph.microsoft.com/v1.0/me/x"])
+def test_an_outlook_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+    check_id: str,
+    count: int,
+    next_link: str | None,
+) -> None:
+    _, tool = _OUTLOOK_LISTS[check_id]
+    page: dict[str, Any] = {"value": [{"id": "AAMkAD1"}] * count}
+    if next_link is not None:
+        page["@odata.nextLink"] = next_link
+    monkeypatch.setattr(outlook, "_graph_request", lambda *args, **kwargs: page)
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+
+
+def test_outlook_get_profile_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        outlook,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "userPrincipalName": "qa@example.onmicrosoft.com",
+            "displayName": None,
+        },
+    )
+
+    _assert_check_output(
+        "outlook.get_profile",
+        _call_declared("outlook.get_profile", outlook.outlook_get_profile),
+    )
+
+
+@pytest.mark.parametrize("check_id", sorted(_OUTLOOK_LISTS))
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        # A tool's error envelope, whether or not the tool returns one:
+        # outlook_list_messages raises instead (see the test below).
+        (lambda key: {"status": "error", "message": "403"}, "status_success"),
+        (lambda key: {"status": "success", key: []}, "has_keys"),
+        (
+            lambda key: {"status": "success", key: [{}], "next_link": None},
+            "each_has_keys",
+        ),
+        (
+            lambda key: {
+                "status": "success",
+                key: [{"id": "a"}, {"id": "b"}],
+                "next_link": None,
+            },
+            "length",
+        ),
+    ],
+)
+def test_an_outlook_list_check_fails_on_another_shape(
+    check_id: str, payload: Callable[[str], dict[str, Any]], reason: str
+) -> None:
+    list_key, _ = _OUTLOOK_LISTS[check_id]
+
+    _assert_check_fails(check_id, json.dumps(payload(list_key)), reason)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "raises"),
+    [
+        ("outlook.list_messages", True),
+        ("outlook.list_events", False),
+        ("outlook.list_contacts", False),
+    ],
+)
+def test_an_outlook_list_failure_fails_its_check(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, raises: bool
+) -> None:
+    """list_messages raises ToolError, which MCP reports with its error flag
+    set (a call failure); the other two return their error envelope."""
+    _, tool = _OUTLOOK_LISTS[check_id]
+
+    def _graph_request(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("Graph returned 403")
+
+    monkeypatch.setattr(outlook, "_graph_request", _graph_request)
+    check = _read_check(check_id)
+    if raises:
+        with pytest.raises(ToolError):
+            _call_declared(check_id, tool)
+        raw = {
+            "content": [{"type": "text", "text": "Graph returned 403"}],
+            "structured_content": None,
+            "is_error": True,
+        }
+        expected = (FailureClass.CALL_FAILED, "tool_error")
+    else:
+        raw = {
+            "content": [{"type": "text", "text": _call_declared(check_id, tool)}],
+            "structured_content": None,
+            "is_error": False,
+        }
+        expected = (FailureClass.ASSERTION_FAILED, "status_success")
+
+    assert judge_result(raw, check.payload, check.assertions) == expected
+
+
+@pytest.mark.parametrize(
+    ("user", "reason"),
+    [
+        ({"userPrincipalName": "qa@x"}, "has_keys"),
+        ({"id": 1, "userPrincipalName": "qa@x"}, "is_type"),
+    ],
+)
+def test_outlook_get_profile_check_fails_on_another_user(
+    user: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(
+        "outlook.get_profile",
+        json.dumps({"status": "success", "user": user}),
+        reason,
+    )
+
+
+def test_outlook_send_message_has_no_cleanup_tool() -> None:
+    assert [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["outlook"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ] == ["outlook_send_message"]
 
 
 # The Google family (issue #3567): the read checks of the tenant the seed

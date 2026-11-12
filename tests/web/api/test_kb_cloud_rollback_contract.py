@@ -626,9 +626,11 @@ def test_frozen_job_refuses_before_model_resolution(
     assert resolved == []
 
 
-@pytest.mark.parametrize("frozen", [True, False])
+@pytest.mark.parametrize(
+    ("frozen", "final"), [(True, True), (True, False), (False, True)]
+)
 def test_final_attempt_refusal_does_not_compensate_an_existing_document(
-    test_env, tmp_path, monkeypatch, frozen
+    test_env, tmp_path, monkeypatch, frozen, final
 ) -> None:
     from xagent.core.tools.core.RAG_tools.core.exceptions import (
         CollectionMigratingError,
@@ -683,9 +685,9 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
                 "collection_existed_before": True,
                 "document_existed_before": True,
             },
-            max_attempts=1,
+            max_attempts=2,
         )
-        job.attempts = 1
+        job.attempts = 2 if final else 1
         with (
             patch(
                 "xagent.web.api.kb._rollback_failed_cloud_ingestion",
@@ -700,6 +702,8 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
 
     # The unfrozen run is the positive control: this payload does reach compensation.
     assert compensated == ([] if frozen else ["existing-kb"])
+    # A retry still needs the staged copy; the last attempt must not leak it.
+    assert staged.exists() is not final
     if frozen:
         rows = load_ingestion_status("existing-kb", doc_id, user_id=user.id)
         assert [r["status"] for r in rows] == ["success"]

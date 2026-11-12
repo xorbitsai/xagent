@@ -2661,3 +2661,10 @@ def test_frozen_upload_refusal_creates_no_collection_directory(
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "kb_collection_migrating"
     assert not collection_dir.exists()
+    staging_root = (
+        get_upload_path(
+            ".background-ingest", user_id=int(user.id), create_if_not_exists=False
+        ).parent
+        / ".background-ingest"
+    )
+    assert not staging_root.exists() or not any(staging_root.iterdir())

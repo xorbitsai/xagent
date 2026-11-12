@@ -129,6 +129,12 @@ async def _create_knowledge_base_from_file_impl(
     user_id: int,
     is_admin: bool = False,
 ) -> Any:
+    from ...core.RAG_tools.core.exceptions import CollectionMigratingError
+    from ...core.RAG_tools.management.migration_state import (
+        admitted_context_async,
+        run_in_admitted_context,
+    )
+
     collection_name = ""
     ingested_count = 0
     try:
@@ -142,7 +148,6 @@ async def _create_knowledge_base_from_file_impl(
             async_ensure_uploaded_file_local_path,
             log_durable_storage_fault,
         )
-        from ...core.RAG_tools.core.exceptions import CollectionMigratingError
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
             IngestionConfig,
@@ -196,6 +201,8 @@ async def _create_knowledge_base_from_file_impl(
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if every file fails.
         collection_existed_before = await kb_service.collection_exists(collection_name)
+        # One admission for every file, so a freeze between files cannot strand a partial.
+        admission = await admitted_context_async(collection_name)
 
         ingested_count = 0
         errors = []
@@ -250,7 +257,7 @@ async def _create_knowledge_base_from_file_impl(
                 file_id=str(record.file_id),
             )
             try:
-                result = await run_blocking(func)
+                result = await run_blocking(run_in_admitted_context, admission, func)
             except CollectionMigratingError:
                 raise
             except Exception:

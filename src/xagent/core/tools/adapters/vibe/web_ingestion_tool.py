@@ -86,13 +86,14 @@ async def _create_knowledge_base_from_url_impl(
     user_id: int,
     is_admin: bool = False,
 ) -> Any:
+    from ...core.RAG_tools.core.exceptions import CollectionMigratingError
+
     collection_name = ""
     try:
         import hashlib
         import re
         import time
 
-        from ...core.RAG_tools.core.exceptions import CollectionMigratingError
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
             IngestionConfig,

@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
+from ...core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from ...core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
@@ -252,7 +253,12 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
 
     # Before model resolution, which rewrites the collection's metadata row, and
     # outside the try: a job refused here was never admitted and must not compensate.
-    ensure_collection_writable(str(payload["collection"]))
+    try:
+        ensure_collection_writable(str(payload["collection"]))
+    except CollectionMigratingError:
+        if int(job.attempts or 0) >= int(job.max_attempts or 1):
+            _cleanup_staged_document_input(payload)
+        raise
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not

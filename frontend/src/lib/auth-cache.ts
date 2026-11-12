@@ -307,19 +307,30 @@ export function readAuthSessionSnapshot(): AuthSessionSnapshot {
   const inspection = inspectAuthSession()
   return inspection.status === "valid" ? inspection.projection.snapshot : EMPTY_SNAPSHOT
 }
+export type AuthSessionLineage = "same" | "replaced" | "invalid"
+/** Compare two snapshots without touching shared storage. */
+export function compareAuthSessionLineage(captured: AuthSessionSnapshot, current: AuthSessionSnapshot): AuthSessionLineage {
+  if (!captured.sessionId || current.sessionId !== captured.sessionId) return "replaced"
+  if (current.userId !== captured.userId || current.credentialRevision === null || current.profileRevision === null) {
+    return "invalid"
+  }
+  if (current.credentialRevision < (captured.credentialRevision ?? -1) || current.profileRevision < (captured.profileRevision ?? -1)) {
+    return "invalid"
+  }
+  if (current.credentialRevision === captured.credentialRevision && (current.accessToken !== captured.accessToken || current.refreshToken !== captured.refreshToken)) {
+    return "invalid"
+  }
+  if (current.profileRevision === captured.profileRevision && current.profileFingerprint !== captured.profileFingerprint) {
+    return "invalid"
+  }
+  return "same"
+}
 export function compareAuthSession(captured: AuthSessionSnapshot, inspection = inspectAuthSession()): AuthSessionComparison {
   if (inspection.status !== "valid") return { status: inspection.status, projection: null }
   const { cache, snapshot } = inspection.projection
-  if (!captured.sessionId || cache.sessionId !== captured.sessionId) return { status: "replaced", projection: null }
-  if (cache.user.id !== captured.userId || cache.credentialRevision < (captured.credentialRevision ?? -1) || cache.profileRevision < (captured.profileRevision ?? -1)) {
-    return { status: "invalid", projection: null }
-  }
-  if (cache.credentialRevision === captured.credentialRevision && (cache.token !== captured.accessToken || cache.refreshToken !== captured.refreshToken)) {
-    return { status: "invalid", projection: null }
-  }
-  if (cache.profileRevision === captured.profileRevision && snapshot.profileFingerprint !== captured.profileFingerprint) {
-    return { status: "invalid", projection: null }
-  }
+  const lineage = compareAuthSessionLineage(captured, snapshot)
+  if (lineage === "replaced") return { status: "replaced", projection: null }
+  if (lineage === "invalid") return { status: "invalid", projection: null }
   const credentialExact = cache.credentialRevision === captured.credentialRevision && cache.token === captured.accessToken && cache.refreshToken === captured.refreshToken
   const profileExact = cache.profileRevision === captured.profileRevision
   if (credentialExact && profileExact) return { status: "exact", projection: inspection.projection }

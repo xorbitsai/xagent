@@ -385,6 +385,41 @@ describe("api-wrapper collection migration retry", () => {
     }
   })
 
+  it("sends the credential from the snapshot it checked, not a later storage read", async () => {
+    writeAuthCache({ id: "1", username: "alice" }, "token-a")
+    const cacheA = localStorage.getItem(AUTH_CACHE_KEY)
+    writeAuthCache({ id: "2", username: "bob" }, "token-b")
+    const cacheB = localStorage.getItem(AUTH_CACHE_KEY)
+    if (!cacheA || !cacheB) throw new Error("auth cache missing")
+    localStorage.setItem(AUTH_CACHE_KEY, cacheA)
+
+    const originalGetItem = window.localStorage.getItem.bind(window.localStorage)
+    let authReads = 0
+    vi.spyOn(window.localStorage, "getItem").mockImplementation((key: string) => {
+      if (key === AUTH_CACHE_KEY) {
+        authReads += 1
+        // The storage probe plus the snapshot read are one logical read; any
+        // further read would pick up the other tab's session.
+        return authReads <= 2 ? cacheA : cacheB
+      }
+      return originalGetItem(key)
+    })
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(successResponse())
+
+    const response = await uploadWithCollectionMigrationRetry(
+      "/api/kb/ingest/jobs",
+      { method: "POST", body: new FormData() },
+    )
+
+    expect(response.status).toBe(200)
+    expect(authReads).toBe(2)
+    const headers = fetchMock.mock.calls[0][1]?.headers as Record<string, string>
+    expect(headers.Authorization).toBe("Bearer token-a")
+    vi.restoreAllMocks()
+  })
+
   it("keeps retrying after a credential refresh within the initiating session", async () => {
     vi.useFakeTimers()
     try {

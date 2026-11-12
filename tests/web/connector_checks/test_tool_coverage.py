@@ -54,7 +54,6 @@ _PINNED_LEGACY = frozenset(
         "mixpanel",
         "myob",
         "onedrive",
-        "planner",
         "posthog",
         "rocketlane",
         "salesforce",

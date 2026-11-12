@@ -54,6 +54,7 @@ from xagent.web.tools.mcp import (
     google_sheets,
     google_slides,
     outlook,
+    planner,
     powerpoint,
     sharepoint,
     word,
@@ -572,6 +573,38 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             Length(("lists",), max=1),
         ),
     ),
+    # A Planner list takes no page size and projects a page too large for the
+    # output limit down to each item's id and label (and a plan's web_url).
+    "planner.list_my_plans": (
+        "planner_list_my_plans",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("plans", "next_link", "truncated")),
+            EachHasKeys(("plans",), ("id", "web_url")),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "planner.list_my_tasks": (
+        "planner_list_my_tasks",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("tasks", "next_link", "truncated")),
+            EachHasKeys(("tasks",), ("id",)),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "planner.list_my_groups": (
+        "planner_list_my_groups",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("groups", "next_link", "truncated")),
+            EachHasKeys(("groups",), ("id",)),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
 }
 
 
@@ -618,7 +651,7 @@ def test_a_tier_2_read_check_is_declared_exactly(
 
 
 @pytest.mark.parametrize(
-    "app_id", ["google-ads", "outlook", "sharepoint", "zendesk", "zoom"]
+    "app_id", ["google-ads", "outlook", "planner", "sharepoint", "zendesk", "zoom"]
 )
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)
@@ -1024,6 +1057,111 @@ def test_the_sharepoint_writes_stay_pending() -> None:
     assert not [
         exemption.tool
         for exemption in CONNECTOR_CHECKS["sharepoint"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ]
+
+
+# Each Planner list check: its list key, its tool, and an item whose last field
+# is long enough to push the page past the output limit.
+_PLANNER_LISTS: Mapping[str, tuple[str, Callable[..., str], dict[str, Any]]] = {
+    "planner.list_my_plans": (
+        "plans",
+        planner.planner_list_my_plans,
+        {"id": "plan-1", "title": "Roadmap", "owner": "group-1"},
+    ),
+    "planner.list_my_tasks": (
+        "tasks",
+        planner.planner_list_my_tasks,
+        {"id": "task-1", "title": "Ship", "planId": "plan-1"},
+    ),
+    "planner.list_my_groups": (
+        "groups",
+        planner.planner_list_my_groups,
+        {"id": "group-1", "displayName": "Team", "description": "Our team"},
+    ),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_PLANNER_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+def test_a_planner_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
+) -> None:
+    _, tool, item = _PLANNER_LISTS[check_id]
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        planner, "_graph_request", lambda *args, **kwargs: {"value": [item] * count}
+    )
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+
+
+@pytest.mark.parametrize("check_id", sorted(_PLANNER_LISTS))
+@pytest.mark.parametrize(
+    ("limit", "projection"), [(3000, "summary_fields"), (1000, "identity_and_label")]
+)
+def test_a_projected_planner_list_still_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, limit: int, projection: str
+) -> None:
+    """A page over the output limit keeps the summary fields, then only each
+    item's id and label: the per-item keys hold at both levels."""
+    list_key, tool, item = _PLANNER_LISTS[check_id]
+    *_, long_field = item
+    oversized = {**item, long_field: "x" * 2000, "notes": "y" * 4000}
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        planner, "_graph_request", lambda *args, **kwargs: {"value": [oversized]}
+    )
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: limit)
+
+    result = _call_declared(check_id, tool)
+
+    payload = json.loads(result)
+    assert payload["projection"] == projection
+    assert len(payload[list_key]) == 1
+    _assert_check_output(check_id, result)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "planner.list_my_groups",
+            {"status": "error", "message": "Planner cannot list the groups"},
+            "status_success",
+        ),
+        (
+            "planner.list_my_tasks",
+            {"status": "success", "tasks": [], "truncated": False},
+            "has_keys",
+        ),
+        (
+            "planner.list_my_plans",
+            {
+                "status": "success",
+                "plans": [{"id": "plan-1"}],
+                "next_link": None,
+                "truncated": False,
+            },
+            "each_has_keys",
+        ),
+        (
+            "planner.list_my_tasks",
+            {"status": "success", "tasks": [], "next_link": None, "truncated": 0},
+            "is_type",
+        ),
+    ],
+)
+def test_a_planner_check_fails_on_another_shape(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
+def test_every_planner_write_has_a_cleanup_tool() -> None:
+    assert not [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["planner"].exemptions
         if exemption.reason == WRITE_WITHOUT_CLEANUP
     ]
 

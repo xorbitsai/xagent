@@ -725,6 +725,74 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("outlook_send_message",),
         ),
     ),
+    # Tier 2 (#3573). A list takes no page size, so no check bounds its
+    # length, and a page too large for the output limit is projected down to
+    # each item's id and label (and a plan's web_url), so an item asserts
+    # only the keys that survive that projection.
+    "planner": ConnectorChecks(
+        "planner",
+        reads=(
+            _declared_l3("planner"),
+            ReadCheck(
+                "planner.list_my_plans",
+                "planner_list_my_plans",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("plans", "next_link", "truncated")),
+                    EachHasKeys(("plans",), ("id", "web_url")),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "planner.list_my_tasks",
+                "planner_list_my_tasks",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("tasks", "next_link", "truncated")),
+                    EachHasKeys(("tasks",), ("id",)),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "planner.list_my_groups",
+                "planner_list_my_groups",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("groups", "next_link", "truncated")),
+                    EachHasKeys(("groups",), ("id",)),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "planner_list_plans",
+                "planner_get_plan",
+                "planner_list_buckets",
+                "planner_list_tasks",
+                "planner_get_task",
+                "planner_get_task_details",
+            ),
+            writes=(
+                "planner_create_plan",
+                "planner_delete_plan",
+                "planner_create_bucket",
+                "planner_delete_bucket",
+                "planner_create_task",
+                "planner_delete_task",
+                "planner_add_checklist_item",
+                "planner_delete_checklist_item",
+            ),
+            in_place_edits=(
+                "planner_update_task",
+                "planner_update_task_description",
+                "planner_assign_task",
+                "planner_unassign_task",
+                "planner_set_checklist_item_checked",
+            ),
+        ),
+    ),
     "powerpoint": ConnectorChecks(
         "powerpoint",
         reads=(
@@ -995,7 +1063,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "mixpanel",
         "myob",
         "onedrive",
-        "planner",
         "posthog",
         "rocketlane",
         "salesforce",

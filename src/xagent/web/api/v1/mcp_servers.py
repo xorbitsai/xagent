@@ -486,12 +486,12 @@ async def update_mcp_server(
     team answers 403 ``connector_forbidden``; a catalog app connection answers
     409 ``connector_not_editable``; one with another transport answers 400
     ``transport_not_supported``. A holder who may not edit the shared
-    configuration answers 403 when the change moves ``url``,
-    ``auth.issuer`` or ``auth.resource_metadata_url``. When the holder may
-    edit and other accounts hold authorizations that such a change would keep,
-    it answers 409 ``connector_not_editable``: make that change in the web app.
-    Otherwise the authorizations team members made for themselves are removed
-    and they must authorize again.
+    configuration answers 403 ``connector_forbidden`` for any non-empty body.
+    A change that moves ``url``, ``auth.issuer`` or ``auth.resource_metadata_url``
+    answers 409 ``connector_not_editable`` while other accounts hold
+    authorizations it would keep: make that change in the web app. Otherwise
+    it removes the authorizations team members made for themselves, and they
+    must authorize again.
     """
     user, key = authed
     try:

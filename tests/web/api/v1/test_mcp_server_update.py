@@ -28,12 +28,15 @@ from xagent.web.models.mcp_oauth import (
 )
 from xagent.web.schemas.v1 import V1McpServerUpdateRequest
 from xagent.web.services import connector_team_scope, mcp_server_management
+from xagent.web.services.connector_name_policy import catalog_app_name_detail
 
 from ..conftest import _direct_db_session, client
 from .test_mcp_servers import (
     _ACCESS_CELLS,
     _CATALOG_CELLS,
     _INPUT_RULE_CELLS,
+    _NAME_CONFLICT,
+    _NAME_CONFLICT_CELLS,
     _REFUSED_TRANSPORTS,
     CONNECTOR_URL,
     Holder,
@@ -42,6 +45,7 @@ from .test_mcp_servers import (
     _holder,
     _key_prefix,
     _link,
+    _reserved_by_catalog,
     _seed,
     _seed_catalog_apps,
     _share_with_team,
@@ -440,7 +444,7 @@ _CELLS: dict[str, _Cell] = {
         status=403,
         code="connector_forbidden",
         message=_FORBIDDEN,
-        calls=(0, 1, 0),
+        calls=(0, 0, 0),
     ),
     "owner_demoted_while_waiting_for_the_lock": _Cell(
         status=403,
@@ -676,6 +680,41 @@ def test_access_by_id_decides_what_a_change_answers(world, monkeypatch, cell):
     assert calls.counts["update"] == 0
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"headers": {"X-Api-Key": "rotated"}},
+        {"auth": {**OAUTH_AUTH, "client_secret": "rotated"}},
+        {"headers": {}},
+        {"description": "changed"},
+        {"name": "oauth-connector"},
+    ],
+    ids=["headers", "secret_only_auth", "headers_cleared", "description", "same_name"],
+)
+def test_a_holder_who_may_not_edit_changes_nothing(world, monkeypatch, caplog, body):
+    _link(world.erin, world.server_id, is_owner=False, is_active=True)
+    calls = _Calls(monkeypatch)
+    before = _snapshot()
+
+    with caplog.at_level(logging.INFO):
+        resp = _patch(world.erin, world.server_id, body)
+
+    _assert_refused(resp, 403, "connector_forbidden", _FORBIDDEN)
+    assert resp.json()["error"]["details"] == {"reason": "not_permitted"}
+    assert calls.counts["update"] == 0
+    assert _snapshot() == before
+    assert not [r for r in caplog.records if "mcp server write:" in r.getMessage()]
+
+
+def test_an_empty_body_from_a_holder_who_may_not_edit_answers_200(world):
+    _link(world.erin, world.server_id, is_owner=False, is_active=True)
+
+    resp = _patch(world.erin, world.server_id, {})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["can_edit"] is False
+
+
 @pytest.mark.parametrize("transport", _REFUSED_TRANSPORTS)
 def test_patch_refuses_to_move_a_connector_to_another_transport(world, transport):
     before = _snapshot()
@@ -755,7 +794,7 @@ def test_patch_null_is_refused_for_fields_that_cannot_be_cleared(world, field):
     assert _snapshot() == before
 
 
-def test_patch_null_clears_the_declarations_and_an_empty_body_changes_nothing(
+def test_patch_null_and_empty_dicts_clear_and_an_empty_body_changes_nothing(
     world, monkeypatch
 ):
     schema = {"context": {"account_id": {"type": "string", "required": True}}}
@@ -770,6 +809,9 @@ def test_patch_null_clears_the_declarations_and_an_empty_body_changes_nothing(
         owner=world.bob,
         runtime_input_schema=schema,
         runtime_bindings=bindings,
+        signed_uploads=[{"tool": "attach_document"}],
+        headers={"X-Key": "stored-value"},
+        auth={"type": "bearer", "bearer_token": "stored-token"},
     )
     calls = _Calls(monkeypatch)
     before = _snapshot()
@@ -787,11 +829,20 @@ def test_patch_null_clears_the_declarations_and_an_empty_body_changes_nothing(
             "runtime_input_schema": None,
             "runtime_bindings": None,
             "signed_uploads": None,
+            "headers": {},
+            "auth": {},
         },
     )
     assert cleared.status_code == 200, cleared.text
+    assert (cleared.json()["headers"], cleared.json()["auth"]) == ({}, {})
     stored = _stored(server_id)
-    assert (stored.runtime_input_schema, stored.runtime_bindings) == (None, None)
+    assert (
+        stored.runtime_input_schema,
+        stored.runtime_bindings,
+        stored.signed_uploads,
+        stored.headers,
+        stored.auth,
+    ) == (None, None, None, {}, {})
 
 
 # ===== masked values =====
@@ -843,7 +894,11 @@ def test_patch_secret_auth_placeholders(world, key):
             {"url": "ftp://mcp.example.test"},
             "url must be an absolute http(s) URL without user info.",
         ),
-        ({"auth": {"app_id": "real-app"}}, None),
+        (
+            {"auth": {"app_id": "real-app"}},
+            "auth cannot set app_id, provider or builtin_provenance; "
+            "these mark catalog connectors.",
+        ),
         (
             {"auth": {"type": "bearer", "scope": MASKED_SECRET_VALUE}},
             "Only secret auth fields can keep their stored value with '********'.",
@@ -920,14 +975,118 @@ def test_patch_changes_what_was_sent_and_returns_no_secret(world):
     }
 
 
-def test_patch_name_taken_by_the_holders_own_connector_names_it(world):
-    taken = _seed("taken-name", owner=world.bob)
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"url": MOVED_URL},
+        {"url": CONNECTOR_URL + "/"},
+        {"auth": {**OAUTH_AUTH, "issuer": "https://other.example.test"}},
+        {"auth": {}},
+        {"auth": {**OAUTH_AUTH, "client_secret": MASKED_SECRET_VALUE}},
+    ],
+    ids=["url", "trailing_slash", "issuer", "auth_cleared", "masked_secret"],
+)
+def test_the_predicted_binding_is_the_one_the_web_function_stores(
+    world, monkeypatch, body
+):
+    seen: list[tuple] = []
+    real = mcp_server_management._member_grant_binding
+
+    def record(server):
+        seen.append(real(server))
+        return seen[-1]
+
+    monkeypatch.setattr(mcp_server_management, "_member_grant_binding", record)
+    server_id = _seed(
+        "with-secret",
+        owner=world.bob,
+        auth={**OAUTH_AUTH, "client_secret": "stored-secret"},
+    )
+
+    resp = _patch(world.bob, server_id, body)
+
+    assert resp.status_code == 200, resp.text
+    # The binding before the change, then the predicted one.
+    assert len(seen) == 2
+    assert seen[1] == mcp_api._member_grant_binding(_stored(server_id))
+
+
+def test_the_web_account_gone_answer_is_a_401(world, monkeypatch):
+    """The real web function, not a stand-in, raises the account-gone text."""
+    real = mcp_server_management.update_mcp_server
+
+    def drop_the_account_then_update(server_id, data, *, current_user, db):
+        # The foreign keys are checked at commit, which the refusal never
+        # reaches, so the account vanishes without losing its link.
+        db.execute(text("PRAGMA defer_foreign_keys = ON"))
+        db.execute(
+            text("UPDATE users SET id = id + 100000 WHERE id = :bob"),
+            {"bob": world.bob.user_id},
+        )
+        return real(server_id, data, current_user=current_user, db=db)
+
+    monkeypatch.setattr(
+        mcp_server_management, "update_mcp_server", drop_the_account_then_update
+    )
     before = _snapshot()
 
-    resp = _patch(world.bob, world.server_id, {"name": "taken-name"})
+    resp = _patch(world.bob, world.server_id, {"url": MOVED_URL})
+
+    _assert_refused(resp, 401, "invalid_api_key", _INVALID_KEY)
+    assert _snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("body", "dumped"),
+    [
+        ({"name": "renamed"}, {"name": "renamed"}),
+        (
+            {
+                "description": "d",
+                "allow_delegated_authorization": False,
+                "runtime_input_schema": None,
+                "headers": {},
+            },
+            {
+                "description": "d",
+                "allow_delegated_authorization": False,
+                "runtime_input_schema": None,
+                "config": {"headers": {}},
+            },
+        ),
+    ],
+    ids=["name_only", "mixed_with_empty_headers"],
+)
+def test_the_web_update_request_carries_exactly_the_fields_sent(body, dumped):
+    web = mcp_server_management._web_update_request(V1McpServerUpdateRequest(**body))
+
+    assert web.model_dump(exclude_unset=True) == dumped
+    assert web.model_fields_set == set(dumped)
+
+
+@pytest.mark.parametrize(
+    ("name", "seeder", "names_the_connector"),
+    [*_NAME_CONFLICT_CELLS.values(), ("Real_App", _reserved_by_catalog, False)],
+    ids=[*_NAME_CONFLICT_CELLS, "name_that_folds_to_a_catalog_app"],
+)
+def test_patch_name_conflicts_from_the_web_code(
+    world, name, seeder, names_the_connector
+):
+    existing = seeder(world.bob, world.carol)
+    before = _snapshot()
+
+    resp = _patch(world.bob, world.server_id, {"name": name})
 
     error = _error(resp, 409, "connector_name_conflict")
-    assert error["details"] == {"connector_id": taken}
+    if names_the_connector:
+        assert error["details"] == {"connector_id": existing}
+    else:
+        assert "details" not in error
+    assert error["message"] == (
+        catalog_app_name_detail(name)
+        if seeder is _reserved_by_catalog
+        else _NAME_CONFLICT
+    )
     assert _snapshot() == before
 
 

@@ -712,12 +712,22 @@ class V1McpServerUpdateRequest(BaseModel):
         Field(None, description="Absolute http(s) URL without user info.")
     )
     description: Optional[Annotated[str, StringConstraints(max_length=10000)]] = None
-    headers: Optional[dict[_HeaderName, _HeaderValue]] = Field(None, max_length=20)
+    headers: Optional[dict[_HeaderName, _HeaderValue]] = Field(
+        None,
+        max_length=20,
+        description=(
+            "Replaces the stored headers as a whole; send {} to clear them. "
+            "A value sent as '********' keeps the stored value of that header."
+        ),
+    )
     auth: Optional[dict[str, Any]] = Field(
         None,
         max_length=30,
         description=(
-            "Authentication settings. The keys 'app_id', 'provider' and "
+            "Replaces the stored authentication settings as a whole; send {} "
+            "to clear them. Leaving out 'issuer' or 'resource_metadata_url' "
+            "removes it. A secret field sent as '********' keeps its stored "
+            "value. The keys 'app_id', 'provider' and "
             "'builtin_provenance' mark catalog connectors and are rejected."
         ),
     )

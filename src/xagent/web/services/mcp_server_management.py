@@ -296,26 +296,14 @@ def _web_create_request(request: V1McpServerCreateRequest) -> MCPServerCreate:
     )
 
 
-_WEB_UPDATE_CONFIG_FIELDS = ("url", "headers", "auth")
-
-
 def _web_update_request(request: V1McpServerUpdateRequest) -> MCPServerUpdate:
     # The web function decides what to write from which fields are present, so
     # only the fields the body carried are passed, null ones included.
-    sent = request.model_fields_set
-    fields: dict[str, Any] = {
-        name: getattr(request, name)
-        for name in sent
-        if name not in _WEB_UPDATE_CONFIG_FIELDS
-    }
-    config = {
-        name: getattr(request, name)
-        for name in _WEB_UPDATE_CONFIG_FIELDS
-        if name in sent
-    }
+    data = request.model_dump(exclude_unset=True)
+    config = {key: data.pop(key) for key in ("url", "headers", "auth") if key in data}
     if config:
-        fields["config"] = config
-    return MCPServerUpdate(**fields)
+        data["config"] = config
+    return MCPServerUpdate(**data)
 
 
 _REBIND_REFUSED_MESSAGE = (
@@ -369,6 +357,11 @@ def _has_active_grant_surviving_rebind(
     expiry or at the current auth configuration: the runtime does not filter
     grants by expiry, and a configuration switched away and back selects the
     old grants again.
+
+    The web app makes the same change and keeps these grants. This route
+    refuses it instead, because such a change does not always leave a kept
+    grant unusable: grant selection compares a linked user's grant with
+    ``auth.resource`` and ``auth.issuer`` only when they are set.
     """
     return (
         _grants_surviving_rebind(db, server_id=server_id, user_id=user_id).first()
@@ -841,7 +834,9 @@ class McpServerManagementRuntime:
         ``validate`` holds the body rules that need no database; it runs after
         the connector is found and known to be one the holder may try to
         change, so a connector the holder may not change answers before a bad
-        body does. A body with no field changes nothing. The web function
+        body does. A holder who may not edit the shared configuration answers
+        403 for any non-empty body, before the web function runs and without a
+        write line. A body with no field changes nothing. The web function
         commits before the projection runs, so a projection failure answers 500
         with the change stored.
         """
@@ -866,8 +861,19 @@ class McpServerManagementRuntime:
                         f"This connector uses the '{server.transport}' transport; "
                         "change it in the web app.",
                     )
-                validate(request)
                 sent = request.model_fields_set
+                # Every field this body can carry is shared configuration; the
+                # web function refuses or silently drops it for a holder who may
+                # not edit, so such a holder can change nothing here.
+                if sent and not _check_mcp_permission(
+                    link, bool(user.is_admin), require="edit"
+                ):
+                    raise V1ApiError(
+                        V1ErrorCode.CONNECTOR_FORBIDDEN,
+                        403,
+                        details={"reason": "not_permitted"},
+                    )
+                validate(request)
                 shown: tuple[MCPServer, UserMCPServer | None] = (server, link)
                 if sent:
                     if sent & {"url", "auth"}:

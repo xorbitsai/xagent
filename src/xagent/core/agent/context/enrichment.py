@@ -275,6 +275,16 @@ def display_message_override(metadata: Any) -> str | None:
     return display.strip()
 
 
+def is_answer_or_dag_step_message(message: Any) -> bool:
+    """Whether a user message answers a pending agent question or carries a
+    DAG step, so it is never an independent top-level request."""
+    metadata = getattr(message, "metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return bool(
+        metadata.get("response_to_waiting_for_user") or metadata.get("dag_step_id")
+    )
+
+
 def top_level_user_request(
     context: Any,
     *,
@@ -296,12 +306,10 @@ def top_level_user_request(
             message, "hidden", False
         ):
             continue
+        if is_answer_or_dag_step_message(message):
+            continue
         metadata = getattr(message, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}
-        if metadata.get("response_to_waiting_for_user"):
-            continue
-        if metadata.get("dag_step_id"):
-            continue
 
         execution_text = str(getattr(message, "content", "") or "").strip()
         display_text = display_message_override(metadata)

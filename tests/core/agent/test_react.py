@@ -27,7 +27,10 @@ from xagent.core.agent import (
 )
 from xagent.core.agent.checkpoint import CheckpointPersistenceError
 from xagent.core.agent.context import execution as execution_module
-from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
+from xagent.core.agent.context.execution import (
+    CLOCK_TIMEZONE_METADATA_KEY,
+    TURN_CONTEXT_HEADER,
+)
 from xagent.core.agent.pattern.final_answer_stream import ReActFinalAnswerStreamer
 from xagent.core.agent.pattern.react.react import (
     _INTERACTION_TRIM_CHARS,
@@ -57,6 +60,15 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
 )
 from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
 
 
 class CalculatorArgs(BaseModel):
@@ -1816,7 +1828,7 @@ def test_react_defaults_presentation_without_guessing_required_information(
     messages = pattern._messages_for_llm(context, has_tools=True, tool_names=tool_names)
     prompt = messages[0]["content"]
 
-    assert messages[-1]["content"] == user_request
+    assert _without_turn_context(messages[-1]["content"]) == user_request
     assert "including an unspecified output format" in prompt
     assert (
         "deliver the supported work without pausing unless "
@@ -4418,7 +4430,9 @@ async def test_react_pattern_injects_memory_context_and_skill_index() -> None:
         "Do the thing",
     ]
     first_system_prompt = llm.calls[0]["messages"][0]["content"]
-    assert "Use the stored project preference." in first_system_prompt
+    # Recalled memory varies by turn, so it travels in the turn context.
+    assert "Use the stored project preference." not in first_system_prompt
+    assert "Use the stored project preference." in _all_text(llm.calls[0]["messages"])
     assert "Available skills:" in first_system_prompt
     assert "- test-skill: A test skill" in first_system_prompt
     tool_names = [
@@ -7874,7 +7888,8 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
     resumed_messages = resumed_llm.calls[0]["messages"]
     assert resumed_messages[-1]["role"] == "user"
     assert "answer to a pending agent question" in resumed_messages[-1]["content"]
-    assert resumed_messages[-1]["content"].endswith("B")
+    # The turn context follows the answer it carries the pending evidence for.
+    assert _without_turn_context(resumed_messages[-1]["content"]).endswith("B")
 
 
 @pytest.mark.asyncio

@@ -105,6 +105,7 @@ from ...services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     stage_uploaded_file_from_local_path,
 )
+from ...services.writer_workers import run_tracked
 from ...tracking.standalone_usage import StandaloneUsageRefused, usage_scope
 from ..batch_control import (
     BatchChannelControl,
@@ -1620,7 +1621,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                     while not stopped():
                         lookup, cancellation = await await_task_settlement(
                             asyncio.create_task(
-                                asyncio.to_thread(lookup_channel_inputs, incoming)
+                                run_tracked(lookup_channel_inputs, incoming)
                             )
                         )
                         owner_id, pending, replays, rejected = lookup
@@ -1735,7 +1736,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                                             cancellation,
                                         ) = await await_task_settlement(
                                             asyncio.create_task(
-                                                asyncio.to_thread(
+                                                run_tracked(
                                                     stage_uploaded_file_from_local_path,
                                                     local_path=file.path,
                                                     user_id=owner_id,
@@ -1810,7 +1811,7 @@ class TelegramBotInstance(BatchChannelControl[int]):
                                     return
                                 accepted, cancellation = await await_task_settlement(
                                     asyncio.create_task(
-                                        asyncio.to_thread(
+                                        run_tracked(
                                             accept_channel_input,
                                             pending[0],
                                             additional_inputs=pending[1:],

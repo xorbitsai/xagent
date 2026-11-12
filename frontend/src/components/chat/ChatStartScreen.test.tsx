@@ -50,6 +50,8 @@ vi.mock("@/components/chat/ChatInput", () => ({
 }))
 
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
+import { VoiceCallStoreProvider, usePublishVoiceCall } from "@/contexts/voice-call-store"
+import type { VoiceCall } from "@/hooks/use-voice-call"
 
 const AGENTS_SECTION = "chatPage.sections.assignToTeammate"
 
@@ -66,6 +68,8 @@ const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["age
 
 afterEach(() => {
   cleanup()
+  // `clearMocks` only clears call history; put back what spyOn replaced.
+  vi.restoreAllMocks()
   chatInputProps.current = null
   localeState.value = "en"
 })
@@ -502,5 +506,44 @@ describe("ChatStartScreen suggested prompts", () => {
     fireEvent.click(screen.getByText("Show my schedule"))
     expect(onInputChange).toHaveBeenCalledWith("Show my schedule")
     expect(chatInputProps.current?.autoSendRequest).toBeFalsy()
+  })
+})
+
+describe("ChatStartScreen during a voice call", () => {
+  function Published() {
+    const call: VoiceCall = {
+      open: true, phase: "listening", active: true, caption: "", muted: false, status: "Listening",
+      settingsLink: false, retryable: true, retryDisabled: false,
+      level: () => 0, retry: vi.fn(), end: vi.fn(), toggleMute: vi.fn(),
+    }
+    usePublishVoiceCall(call)
+    return null
+  }
+  const screenWith = (published: boolean) => render(
+    <VoiceCallStoreProvider>
+      {published && <Published />}
+      <ChatStartScreen title="Support Agent" agents={[{ id: 1, name: "Maya" } as never]} onSend={vi.fn()} onVoiceConversation={vi.fn()} />
+    </VoiceCallStoreProvider>
+  )
+
+  it("shows the orb instead of the greeting and locks what is under the composer", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    screenWith(true)
+    expect(screen.getByTestId("voice-orb-hero")).toBeInTheDocument()
+    expect(screen.queryByText("Support Agent")).not.toBeInTheDocument()
+    // The call is not modal: the teammate strip must not stay clickable. (Next
+    // renders with its own React, which turns `inert` into the attribute; the
+    // React 18 used by these tests does not know it, so check the rest.)
+    const locked = screen.getByTestId("team-strip").closest("[aria-hidden='true']")
+    expect(locked).not.toBeNull()
+    expect(locked).toHaveClass("pointer-events-none")
+  })
+
+  it("leaves the screen alone when no call is open", () => {
+    screenWith(false)
+    expect(screen.queryByTestId("voice-orb-hero")).not.toBeInTheDocument()
+    expect(screen.getByText("Support Agent")).toBeInTheDocument()
+    expect(screen.getByTestId("team-strip").closest("[aria-hidden='true']")).toBeNull()
   })
 })

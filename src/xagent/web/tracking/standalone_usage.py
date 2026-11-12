@@ -45,6 +45,7 @@ from typing import Any, Callable, Literal, Optional, Sequence, TypeVar
 from fastapi import HTTPException
 
 from ...core.model.chat.token_context import TokenUsage, token_context
+from ..services.writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -299,10 +300,11 @@ class UsageScope:
         details = self._pending()
         if details is not None:
             # Off the event loop: the hook writes to the database. If this
-            # await is cancelled the thread still runs the hook to the end, so
-            # the rows are delivered exactly once either way.
+            # await is cancelled after the thread started it runs the hook to
+            # the end, so the rows are delivered exactly once either way; the
+            # tracked worker keeps a host's writer retire waiting for it.
             try:
-                await asyncio.to_thread(self._deliver, details)
+                await run_tracked(self._deliver, details)
             except RuntimeError:
                 # The default executor is already shut down (the loop is
                 # closing): deliver here rather than lose the rows, and keep

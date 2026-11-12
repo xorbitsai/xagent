@@ -148,6 +148,7 @@ from .task_retention_overrides import (
 )
 from .task_runtime import task_extension_bindings_from_agent_config
 from .task_workspace_cleanup import capture_workspace_cleanup_target_best_effort
+from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -860,7 +861,7 @@ async def run_retention_purge_loop(
         pause = get_retention_sweep_interval_seconds()
         try:
             limit = get_retention_batch_size()
-            report = await asyncio.to_thread(
+            report = await run_tracked(
                 run_retention_purge_batch,
                 session_factory,
                 limit=limit,

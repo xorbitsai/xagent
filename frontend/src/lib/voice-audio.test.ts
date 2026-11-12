@@ -28,9 +28,12 @@ class Socket {
 }
 const captures: Array<{ port: { onmessage: ((event: { data: Float32Array }) => void) | null } }> = []
 const playback: Array<{ start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>; onended: (() => void) | null }> = []
+const analyserLevel = { value: 0 }
 const stopTrack = vi.fn()
 const closeContext = vi.fn().mockResolvedValue(undefined)
 class Context {
+  static created = 0
+  constructor() { Context.created += 1 }
   sampleRate = 48000
   currentTime = 0
   destination = {}
@@ -38,6 +41,7 @@ class Context {
   close = closeContext
   audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) }
   createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() })
+  createAnalyser = () => ({ fftSize: 0, connect: vi.fn(), disconnect: vi.fn(), getFloatTimeDomainData: (samples: Float32Array) => samples.fill(analyserLevel.value) })
   createGain = () => ({ gain: { value: 0 }, connect: vi.fn(), disconnect: vi.fn() })
   createBuffer = (_channels: number, length: number) => ({ getChannelData: () => new Float32Array(length) })
   createBufferSource = () => {
@@ -93,6 +97,40 @@ describe("browser voice resources", () => {
     expect(socket.close).toHaveBeenCalledOnce()
     expect(stopTrack).toHaveBeenCalledOnce()
     expect(closeContext).toHaveBeenCalledOnce()
+  })
+
+  it("uses an audio context unlocked earlier instead of creating its own", async () => {
+    const unlocked = new Context()
+    Context.created = 0
+    const call = new VoiceAudio({ ...options(), context: unlocked as unknown as AudioContext })
+    await start(call)
+    expect(Context.created).toBe(0)
+    expect(unlocked.resume).toHaveBeenCalled()
+    // The call owns it from here on.
+    call.close()
+    expect(closeContext).toHaveBeenCalledOnce()
+  })
+
+  it("creates its own audio context when none was handed in", async () => {
+    Context.created = 0
+    await start(new VoiceAudio(options()))
+    expect(Context.created).toBe(1)
+  })
+
+  it("reads microphone and playback loudness for the waveform", async () => {
+    const call = new VoiceAudio(options())
+    expect(call.level("mic")).toBe(0)
+    await start(call)
+    analyserLevel.value = 0
+    expect(call.level("mic")).toBe(0)
+    analyserLevel.value = 0.1
+    expect(call.level("mic")).toBeCloseTo(0.5)
+    expect(call.level("output")).toBeCloseTo(0.5)
+    analyserLevel.value = 0.9
+    expect(call.level("mic")).toBe(1)
+    call.close()
+    expect(call.level("mic")).toBe(0)
+    analyserLevel.value = 0
   })
 
   it("reports a server session timeout distinctly and releases microphone resources", async () => {

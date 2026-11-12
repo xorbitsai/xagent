@@ -537,7 +537,7 @@ GOOGLE_DRIVE_COMPOSIO_DESCRIPTION = (
 def _google_app_via_composio(app_id: str) -> bool:
     """Whether this Google app's new connects go through Composio's Google
     app, which holds Google's restricted-scope approval (#3649)."""
-    from .composio_auth import composio_app
+    from .composio_apps import composio_app
 
     return composio_app("google", app_id) is not None
 
@@ -1188,7 +1188,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         },
         {
             "app_id": "atlassian",
-            "name": "Atlassian (Confluence, Bitbucket)",
+            "name": "Confluence",
             "description": "Connect to Atlassian to search and work with Confluence pages and Bitbucket repositories through Atlassian's hosted MCP server. For Jira, use the Jira connector.",
             "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
             "transport": "streamable_http",
@@ -1208,9 +1208,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # unsupported after 2026-06-30. This row sits alongside the
             # separate "jira" row (our own local Jira tool launched behind
             # Atlassian 3LO, transport "oauth"). Jira is served by that row,
-            # so this one is named and described as the Confluence +
-            # Bitbucket connector even though the hosted server still exposes
-            # Jira tools (20261105_update_atlassian_name_and_description).
+            # so this one is described as the Confluence + Bitbucket
+            # connector even though the hosted server still exposes Jira
+            # tools (20261105_update_atlassian_name_and_description).
+            # The display name is just "Confluence" (the description still
+            # mentions Bitbucket); app_id stays "atlassian"
+            # (20261110_rename_atlassian_to_confluence).
             # auth.scope overrides the discovered scopes_supported, which is
             # too long to request (see ATLASSIAN_MCP_OAUTH_SCOPES);
             # auth.required_scope is the part of it a grant must include (see

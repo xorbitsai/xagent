@@ -25,6 +25,7 @@ from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.agent.context.execution import (
     FORM_ANSWER_CONTINUATION_INSTRUCTION,
     FORM_ANSWER_FRAMING,
+    TURN_CONTEXT_HEADER,
 )
 from xagent.core.agent.pattern.react.react import (
     FormAnswerDecision,
@@ -399,9 +400,10 @@ async def test_iteration_limit_build_never_applies_even_with_a_form_answer() -> 
     answer_messages = [
         message
         for message in delivery_messages
-        if str(message.get("content") or "").endswith(
-            "Execution-enriched message content follows:\nMorning shift"
-        )
+        # The turn context follows the answer text in the same message.
+        if str(message.get("content") or "")
+        .split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+        .endswith("Execution-enriched message content follows:\nMorning shift")
     ]
     assert len(answer_messages) == 1
     assert FORM_ANSWER_FRAMING not in answer_messages[0]["content"]
@@ -490,7 +492,10 @@ async def test_text_still_applies_after_llm_summary_compaction() -> None:
     )
     assert FORM_ANSWER_CONTINUATION_INSTRUCTION in sent_messages[0]["content"]
     assert FORM_ANSWER_FRAMING in sent_messages[-1]["content"]
-    assert str(sent_messages[-1]["content"]).endswith("Morning shift")
+    answer_text = str(sent_messages[-1]["content"]).split(
+        f"\n\n{TURN_CONTEXT_HEADER}", 1
+    )[0]
+    assert answer_text.endswith("Morning shift")
 
 
 def _final_answer_stream_chunks(answer: str) -> list[StreamChunk]:

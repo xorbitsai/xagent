@@ -77,6 +77,7 @@ from .task_start_protocol import (
 )
 from .turn_settlement import TurnFacts, report_turn_settled, settled_outcome
 from .workspace_binding import canonical_workspace_base
+from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ class SharedChannelTurn:
         if self.stop_requested:
             return interrupted_channel_result()
         acceptance = asyncio.create_task(
-            asyncio.to_thread(_accept_channel_turn, self, payload, bridge.host_id)
+            run_tracked(_accept_channel_turn, self, payload, bridge.host_id)
         )
         command_db_id, cancellation = await await_task_settlement(acceptance)
         self.accepted = True
@@ -349,7 +350,7 @@ async def prepare_shared_channel_turn(
 ) -> SharedChannelTurn | None:
     get_task_event_bridge().require_ready()
     worker = asyncio.create_task(
-        asyncio.to_thread(
+        run_tracked(
             _prepare_channel_task_sync,
             channel_id=channel_id,
             external_user_id=external_user_id,
@@ -881,7 +882,7 @@ async def execute_channel_background(
                 )
 
             finalize_worker = asyncio.get_running_loop().create_task(
-                asyncio.to_thread(finalize)
+                run_tracked(finalize)
             )
             committed, finalize_cancellation = await await_task_settlement(
                 finalize_worker

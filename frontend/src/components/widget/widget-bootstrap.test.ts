@@ -497,7 +497,9 @@ describe("widget bootstrap", () => {
       // already under way. That's reachable in practice: this drag's
       // pointerId is independent of whatever pointer taps "Expand window"
       // inside the iframe (e.g. a second finger, on a touch-capable
-      // desktop-width device, while the first still holds the handle down).
+      // desktop-width device, while the first still holds the handle down),
+      // and the host page's XagentWidget.open({ expanded: true }) can also
+      // arrive mid-drag.
       // Without expandPanel() cancelling it, this pointerId's next
       // pointermove would go on setting an inline width, desyncing the
       // panel's rendered width from the .expanded class it now also carries.
@@ -525,6 +527,24 @@ describe("widget bootstrap", () => {
       // The drag is over: this pointerId's continuation is a no-op, not a
       // desync between an inline width and the .expanded class.
       firePointerEvent(handle(), "pointermove", { pointerId: 30, clientX: 50 })
+      expect(panel().style.width).toBe("")
+      expect(panel()).toHaveClass("expanded")
+    })
+
+    it("cancels an already-active drag when the host page's open({ expanded: true }) arrives mid-drag", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+      firePointerEvent(handle(), "pointerdown", { pointerId: 31, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 31, clientX: 200 })
+      expect(panel().style.width).toBe("480px")
+
+      ;(window as unknown as { XagentWidget: { open: (options: unknown) => void } }).XagentWidget.open({ expanded: true })
+
+      expect(panel()).toHaveClass("expanded")
+      expect(panel().style.width).toBe("")
+      expect(document.body.style.userSelect).toBe("")
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+      firePointerEvent(handle(), "pointermove", { pointerId: 31, clientX: 50 })
       expect(panel().style.width).toBe("")
       expect(panel()).toHaveClass("expanded")
     })

@@ -76,6 +76,9 @@ class AgentExecutionConfig:
     # message, not to the whole session: loaded tools are never evicted, so a
     # long conversation can accumulate more than this in total.
     deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET
+    # Built-in tool categories (e.g. ``("image", "ppt")``) whose schemas are
+    # withheld the same way; empty keeps them all sent.
+    defer_builtin_tool_categories: tuple[str, ...] = ()
     preferred_input_modalities: tuple[str, ...] = ()
     execution_metadata: dict[str, Any] = field(default_factory=dict)
     budget_policy_provider: BudgetPolicyProvider | None = None
@@ -359,6 +362,9 @@ class AgentExecutionAdapter:
                         deferred_preload_token_budget=(
                             self.config.deferred_preload_token_budget
                         ),
+                        defer_builtin_tool_categories=(
+                            self.config.defer_builtin_tool_categories
+                        ),
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
@@ -394,6 +400,9 @@ class AgentExecutionAdapter:
                 defer_connector_schemas=self.config.defer_connector_schemas,
                 deferred_preload_token_budget=(
                     self.config.deferred_preload_token_budget
+                ),
+                defer_builtin_tool_categories=(
+                    self.config.defer_builtin_tool_categories
                 ),
             ),
             "agent_react",

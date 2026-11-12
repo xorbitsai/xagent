@@ -2044,8 +2044,8 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
   // is_active filter drops it — can_attach is the only field that can say so.
   // The grant survives; the auth_type hint does not.
   const deactivatedCustomMcp = () => {
-    // No auth_type: the backend emits it only alongside an *active* personal
-    // association (_local_mcp_consent_association_ok), so a deactivated entry
+    // No auth_type: the backend withholds it from a caller whose association
+    // is deactivated (_local_mcp_consent_route_ok), so a deactivated entry
     // never carries one however its consent went. Deleted rather than omitted
     // because the base factory is the connected shape, which does carry it.
     const entry: Record<string, unknown> = {
@@ -2570,13 +2570,15 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
-  it("attaches a team-owned mcp_oauth connector without advertising a flow that would 404", async () => {
+  it("attaches a team-owned mcp_oauth connector the team has not opened to member sign-in without advertising a flow", async () => {
     // The #1338 population, and the case that motivated splitting the two
-    // fields: the member holds no personal association, so
-    // /{server_id}/oauth/connect would 404 -- but the team overlay listed the
-    // connector precisely so members could attach it. Withholding auth_type
-    // was the only way to say "not authorizable", and it said "not
-    // attachable" too, which is why this entry carries no auth_type at all.
+    // fields: the member holds no personal association and the team has not
+    // opened the connector to member authorization, so
+    // /{server_id}/oauth/connect refuses them -- but the team overlay listed
+    // the connector precisely so members could attach it. Withholding
+    // auth_type is how the listing says "not authorizable", and that must not
+    // read as "not attachable" too, which is why this entry carries no
+    // auth_type at all.
     const onConnectSelected = vi.fn()
     const teamOwned: Record<string, unknown> = {
       ...hookResolvedCustomMcp(),

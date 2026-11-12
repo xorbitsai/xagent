@@ -993,3 +993,39 @@ def clear_langfuse_traces(request):
 #     set_yaml_migration_manager(manager)
 #
 #     yield manager
+
+
+@pytest.fixture(autouse=True)
+def _isolate_retire_writers_state():
+    """A direct ``shutdown_event()`` call retires the writers for good.
+
+    Without a startup in between, the next test's retire would return early and
+    skip the stop calls it asserts, so every test starts and ends with the
+    process-local retirement state cleared.
+    """
+    import sys
+
+    def reset() -> int:
+        """Clear the retirement state; return the tracked workers left over."""
+        app_module = sys.modules.get("xagent.web.app")
+        if app_module is not None:
+            app_module._writers_retired = False
+            app_module._retire_writers_lock = None
+            app_module._uploaded_file_reconcile_task = None
+            app_module.release_hold.reset_writers_retired()
+        writers = sys.modules.get("xagent.web.services.writer_workers")
+        if writers is None:
+            return 0
+        leaked = writers._active
+        # A test that leaked a tracked worker must not skew the next one.
+        writers._active = 0
+        writers.install_blocking_tracker()
+        return int(leaked)
+
+    reset()
+    yield
+    leaked = reset()
+    assert leaked == 0, (
+        f"{leaked} tracked writer worker(s) were still counted when the test "
+        "ended: a run_tracked/run_blocking thread was never released"
+    )

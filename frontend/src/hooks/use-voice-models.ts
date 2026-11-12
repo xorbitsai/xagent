@@ -29,7 +29,9 @@ export function voiceModelReason(state: { asr: ModelWithAccess[]; tts: ModelWith
 
 export function useVoiceModels(enabled: boolean, refreshKey = false) {
   const auth = useAuth()
-  const owner = useMemo(() => ({}), [enabled, auth.token, auth.user?.id, auth.session?.sessionId])
+  // A refresh starts from a clean "loading" state; otherwise the previous
+  // failure would still be on screen while the new lookup is being sent.
+  const owner = useMemo(() => ({}), [enabled, auth.token, auth.user?.id, auth.session?.sessionId, refreshKey])
   const cache = useMemo(() => new Map<string, { value: boolean; checked: number }>(), [owner])
   const [state, setState] = useState<{ owner: object | null; models: ModelWithAccess[]; capabilities?: VoiceCapabilities; loading: boolean; error: boolean }>({ owner: null, models: [], loading: true, error: false })
   useEffect(() => {

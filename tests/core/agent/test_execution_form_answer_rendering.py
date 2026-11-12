@@ -19,6 +19,8 @@ from xagent.core.agent.context.enrichment import PendingUserResponse
 from xagent.core.agent.context.execution import (
     FORM_ANSWER_CONTINUATION_INSTRUCTION,
     FORM_ANSWER_FRAMING,
+    TURN_CONTEXT_END,
+    TURN_CONTEXT_HEADER,
     ExecutionContext,
 )
 from xagent.core.agent.language import serialize_pending_user_response
@@ -102,7 +104,7 @@ def _latest_pending_content(framing: str) -> str:
         "the primary response, not an independent task. "
         f"{framing}"
         "The exact allowlisted question and clean answer are in the canonical "
-        "request-language evidence in the system context.\n"
+        "request-language evidence in the turn context.\n"
         "Execution-enriched message content follows:\nMorning shift"
     )
 
@@ -196,7 +198,16 @@ def test_answer_message_content_matches_the_gate_across_every_shape(
     """
     context = build_context()
     messages = context.get_messages_for_llm(form_answer_continuation=flag)
-    assert str(messages[index]["content"]) == expected
+    content = str(messages[index]["content"])
+    if index == -1:
+        # The latest answer also carries the turn context, after its own text,
+        # with the pending-response evidence its framing points at.
+        content, turn_context = content.split(f"\n\n{TURN_CONTEXT_HEADER}", 1)
+        assert turn_context.endswith(TURN_CONTEXT_END)
+        assert "Turn started at:" in turn_context
+    else:
+        assert TURN_CONTEXT_HEADER not in content
+    assert content == expected
 
 
 def test_instruction_renders_exactly_once_between_the_task_and_the_focus_rules() -> (
@@ -263,8 +274,11 @@ def test_flag_true_puts_framing_only_on_the_latest_of_two_identical_text_answers
     assert FORM_ANSWER_FRAMING in latest_answer_content
     assert (
         "The exact allowlisted question and clean answer are in the canonical "
-        "request-language evidence in the system context."
+        "request-language evidence in the turn context."
     ) in latest_answer_content
+    # That evidence rides in the turn context attached to this latest answer.
+    assert TURN_CONTEXT_HEADER in latest_answer_content
+    assert TURN_CONTEXT_HEADER not in older_answer_content
 
 
 def test_both_texts_are_pinned_literally() -> None:

@@ -442,6 +442,199 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1McpServerAuthorization(BaseModel):
+    """Whether the key holder has authorized an OAuth connector.
+
+    Fields with a fixed set of values are plain strings, and other values may
+    be added later, so clients should accept any string.
+    """
+
+    kind: str = Field(
+        ...,
+        description=(
+            "'mcp_oauth' for a connector with its own OAuth settings, "
+            "'builtin_oauth' for a platform app connection."
+        ),
+    )
+    status: str = Field(
+        ...,
+        description=(
+            "'authorized', 'not_authorized', 'needs_reconnect' (an "
+            "authorization is stored but has expired or expires within five "
+            "minutes and cannot be refreshed, or a platform app connection "
+            "needs reconnecting) or "
+            "'configuration_error' (the connector's OAuth settings are "
+            "unusable, or its platform app cannot be resolved)."
+        ),
+    )
+    message: Optional[str] = Field(
+        None,
+        description=(
+            "What the key holder can do next; null when nothing is needed. "
+            "An API key cannot complete authorization."
+        ),
+    )
+
+
+class V1McpServer(BaseModel):
+    """One MCP connector the key holder can see.
+
+    Secret values are never returned. Header values, the sensitive entries of
+    ``auth`` (bearer tokens, API key values, client secrets, access tokens)
+    and the values of ``env`` and ``user_env`` read ``********`` when they are
+    set; the keys stay visible. Launch details of local-process connectors
+    (command, arguments, working directory) are not returned.
+
+    Fields with a fixed set of values are plain strings, and other values may
+    be added later, so clients should accept any string.
+    """
+
+    id: int
+    name: str
+    description: Optional[str] = None
+    transport: str = Field(
+        ...,
+        description=(
+            "The stored transport. Only connectors with the 'streamable_http' or "
+            "'sse' transport can have can_edit=true."
+        ),
+    )
+    url: Optional[str] = None
+    headers: Optional[dict[str, Any]] = Field(
+        None, description="Request headers; values are masked."
+    )
+    auth: Optional[dict[str, Any]] = Field(
+        None, description="Authentication settings; secret values are masked."
+    )
+    env: Optional[dict[str, Any]] = Field(
+        None, description="Environment of the definition; values are masked."
+    )
+    user_env: Optional[dict[str, Any]] = Field(
+        None,
+        description=(
+            "The key holder's own environment overrides for this connector; "
+            "values are masked. Null for a connector seen only through a team."
+        ),
+    )
+    runtime_input_schema: Optional[dict[str, Any]] = None
+    runtime_bindings: Optional[Any] = None
+    signed_uploads: Optional[Any] = None
+    signed_uploads_error: Optional[str] = Field(
+        None, description="Why the stored signed-upload settings are unusable."
+    )
+    allow_delegated_authorization: bool
+    access: str = Field(
+        ...,
+        description=(
+            "'own' when the key holder has a link to the connector (enabled or "
+            "not), 'team' when it is visible only because the holder's team "
+            "shares it."
+        ),
+    )
+    kind: str = Field(
+        ...,
+        description=(
+            "'custom' for a connector a user created from a URL, 'catalog' for "
+            "a platform app connection or one that cannot be shown not to be."
+        ),
+    )
+    enabled: Optional[bool] = Field(
+        None,
+        description=(
+            "The key holder's own on/off switch. Null for a connector seen "
+            "only through a team."
+        ),
+    )
+    can_edit: bool
+    can_delete: bool
+    app_id: Optional[str] = None
+    provider: Optional[str] = None
+    connected_account: Optional[str] = Field(
+        None, description="The key holder's own connected third-party account."
+    )
+    authorization: Optional[V1McpServerAuthorization] = Field(
+        None,
+        description=(
+            "The key holder's own OAuth authorization of this connector. Null "
+            "unless `auth.type` is `mcp_oauth` on an `sse`, `streamable_http` "
+            "or `websocket` transport, or the transport is `oauth`. "
+            "'authorized' means a "
+            "stored authorization the runtime would use: valid for more than "
+            "five minutes, or holding a refresh token; whether a refresh "
+            "succeeds is not "
+            "checked. A token supplied by an OAuth token resolver hook is not "
+            "reflected. For a connector seen only through a team it reports "
+            "the key holder's own authorization; the web route "
+            "`/api/mcp/{server_id}/oauth/status` answers 404 for such a "
+            "holder because it requires the holder's own enabled link."
+        ),
+    )
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+_HeaderName = Annotated[
+    str,
+    StringConstraints(
+        min_length=1, max_length=256, pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    ),
+]
+# Visible ASCII and tab only: the HTTP client refuses anything else at run time.
+_HeaderValue = Annotated[
+    str, StringConstraints(max_length=4096, pattern=r"^[\x20-\x7e\t]*$")
+]
+
+
+class V1McpServerCreateRequest(BaseModel):
+    """Body for ``POST /v1/mcp-servers``.
+
+    Creates a connector the key holder owns. Only remote connectors can be
+    created. The auth fields ``bearer_token``, ``api_key_value``,
+    ``client_secret`` and ``access_token`` must be strings or null; non-empty
+    values are stored encrypted and returned masked. Header values are stored
+    as sent and returned masked. Other auth values are stored and returned as
+    sent. A new connector has no stored value, so ``********`` is rejected as
+    a header value or as a top-level auth value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, StringConstraints(min_length=1, max_length=100)] = Field(
+        ...,
+        description=(
+            "Unique across all users. Compared case-insensitively, treating "
+            "spaces, hyphens and underscores as the same character."
+        ),
+    )
+    transport: Annotated[str, StringConstraints(min_length=1, max_length=32)] = Field(
+        ..., description="'streamable_http' or 'sse'."
+    )
+    url: Annotated[str, StringConstraints(min_length=1, max_length=500)] = Field(
+        ..., description="Absolute http(s) URL without user info."
+    )
+    description: Optional[Annotated[str, StringConstraints(max_length=10000)]] = None
+    headers: dict[_HeaderName, _HeaderValue] = Field(
+        default_factory=dict,
+        max_length=20,
+        description="Request headers sent to the connector.",
+    )
+    auth: Optional[dict[str, Any]] = Field(
+        None,
+        max_length=30,
+        description=(
+            "Authentication settings. The keys 'app_id', 'provider' and "
+            "'builtin_provenance' mark catalog connectors and are rejected."
+        ),
+    )
+    runtime_input_schema: Optional[dict[str, Any]] = None
+    runtime_bindings: Optional[list[dict[str, Any]]] = None
+    signed_uploads: Optional[list[dict[str, Any]]] = None
+    allow_delegated_authorization: bool = False
+    enabled: bool = Field(
+        True, description="Whether the connector starts switched on for the holder."
+    )
+
+
 class CreateTaskResponse(BaseModel):
     """``POST /v1/chat/tasks`` -> 202 Accepted response.
 

@@ -1,14 +1,14 @@
-import asyncio
 import logging
 import re
 import time
-from contextvars import copy_context
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
+
+from xagent.core.utils.blocking import run_blocking
 
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -237,7 +237,6 @@ async def _create_knowledge_base_from_file_impl(
                 )
                 continue
 
-            loop = asyncio.get_running_loop()
             func = partial(
                 run_document_ingestion,
                 collection=collection_name,
@@ -248,8 +247,7 @@ async def _create_knowledge_base_from_file_impl(
                 file_id=str(record.file_id),
             )
             try:
-                request_context = copy_context()
-                result = await loop.run_in_executor(None, request_context.run, func)
+                result = await run_blocking(func)
             except Exception:
                 # Deliberately does NOT interpolate the exception, for the same
                 # reason as the durable arm above: this string is joined into the

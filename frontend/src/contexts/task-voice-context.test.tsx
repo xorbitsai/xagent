@@ -20,7 +20,7 @@ vi.mock("@/contexts/app-context-chat", () => ({ useApp: () => runtime }))
 vi.mock("@/contexts/auth-context", () => ({ useAuth: () => ({ token: "test-token", user: { id: 1 }, session: { sessionId: runtime.login } }) }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 vi.mock("@/lib/voice-audio", () => ({ VoiceAudio: class {
-  close = vi.fn(); stopAudio = vi.fn(); speak = vi.fn().mockResolvedValue(undefined)
+  close = vi.fn(); stopAudio = vi.fn(); speak = vi.fn().mockResolvedValue(undefined); level = vi.fn().mockReturnValue(0)
   constructor(public options: typeof calls[number]["options"]) { calls.push(this) }
   async start() {}
 } }))
@@ -37,17 +37,23 @@ vi.mock("@/lib/api-wrapper", async importOriginal => ({
 }))
 
 import { TaskVoiceProvider, useTaskVoice } from "./task-voice-context"
+import { VoiceCallStoreProvider, useVoiceCallView } from "./voice-call-store"
+import { VoiceCallBar } from "@/components/chat/voice-call-ui"
 
 function Entry() {
   const open = useTaskVoice()
   return <button onClick={() => open?.({ model: "chosen-model", agentId: 7, metadata: { source: "composer" } })}>home-voice</button>
 }
-const tree = () => <TaskVoiceProvider><Entry /></TaskVoiceProvider>
+// The call is drawn by the composer; this stands in for it.
+function Composer() {
+  const call = useVoiceCallView()
+  return call ? <VoiceCallBar call={call} /> : null
+}
+const tree = () => <VoiceCallStoreProvider><TaskVoiceProvider><Entry /></TaskVoiceProvider><Composer /></VoiceCallStoreProvider>
 async function openCall() {
   const view = render(tree())
+  // Opening the call is also what starts it.
   fireEvent.click(screen.getByRole("button", { name: "home-voice" }))
-  await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
-  fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
   await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.states.listening"))
   return view
 }
@@ -61,12 +67,13 @@ async function speak() {
 }
 
 beforeEach(() => {
+  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
   runtime.path = "/task"; runtime.search = ""; runtime.login = "login-1"
   runtime.state = { taskId: null, messages: [], isProcessing: false, currentTask: null }
   runtime.isConnected = false; runtime.isMessageDeliveryPending = false
   runtime.sendMessage.mockReset(); runtime.pauseTask.mockReset()
 })
-afterEach(() => { cleanup(); calls.length = 0; vi.clearAllMocks() })
+afterEach(() => { cleanup(); calls.length = 0; vi.clearAllMocks(); vi.restoreAllMocks() })
 
 describe("home voice task creation", () => {
   it("retains creation ownership after send resolves but before task navigation and socket readiness", async () => {
@@ -108,7 +115,7 @@ describe("home voice task creation", () => {
     runtime.isMessageDeliveryPending = true
     view.rerender(tree())
     expect(calls[0].close).not.toHaveBeenCalled()
-    expect(screen.getByRole("dialog")).toBeInTheDocument()
+    expect(screen.getByTestId("voice-call-bar")).toBeInTheDocument()
     runtime.isConnected = true; runtime.isMessageDeliveryPending = false
     await act(async () => { accepted() })
     runtime.state.messages = [{ id: "reply", role: "assistant", isResult: true, status: "completed", content: "Welcome back." }]

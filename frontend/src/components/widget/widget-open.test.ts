@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest"
-import { MAX_INITIAL_MESSAGE_LENGTH, listenForOpenMessages } from "@/lib/widget-parent-message"
+import {
+  MAX_INITIAL_MESSAGE_LENGTH,
+  listenForOpenMessages,
+  listenForWidgetExpandState,
+} from "@/lib/widget-parent-message"
 
 import { evaluateWidgetScript, widgetScript } from "@/test-utils/widget-script"
 
@@ -12,6 +16,7 @@ const W_BAD_MESSAGE = "Xagent Widget: XagentWidget.open() message must be a non-
 const unknownOptionsWarning = (keys: string) => (
   `Xagent Widget: XagentWidget.open() ignored unknown option(s): ${keys}.`
 )
+const W_BAD_EXPANDED = "Xagent Widget: XagentWidget.open() expanded must be true or false; ignoring it."
 const DUPLICATE_GRANT_WARNING = "Xagent Widget: this grant is single-use; mint a fresh grant before remounting the widget [duplicate_init]."
 
 type Instance = {
@@ -96,6 +101,8 @@ function deliveriesOfType(instance: Instance, type: string) {
 }
 
 const openDeliveries = (instance: Instance) => deliveriesOfType(instance, "open_message")
+const expandStates = (instance: Instance) => deliveriesOfType(instance, "widget_expand_state")
+const expandState = (expanded: boolean) => ({ xagent: true, v: 1, type: "widget_expand_state", expanded })
 const delivery = (id: string, value: string) => ({ xagent: true, v: 1, type: "open_message", id, value })
 
 function firePageTransition(type: "pagehide" | "pageshow") {
@@ -216,6 +223,12 @@ describe("XagentWidget.open", () => {
         warnings: [[unknownOptionsWarning("conversation")]],
       },
       {
+        name: "an expanded option beside an unknown one",
+        args: [{ expanded: true, conversation: "current" }],
+        sent: null,
+        warnings: [[unknownOptionsWarning("conversation")]],
+      },
+      {
         name: "a misspelled message option",
         args: [{ mesage: "hi" }], // codespell:ignore mesage
         sent: null,
@@ -258,7 +271,7 @@ describe("XagentWidget.open", () => {
     it("knows exactly the options these rows cover", () => {
       const declared = widgetScript.match(/var OPEN_OPTION_KEYS = (\[[^\]]*\]);/)
       expect(declared).not.toBeNull()
-      expect(JSON.parse(declared![1].replace(/'/g, '"'))).toEqual(["message"])
+      expect(JSON.parse(declared![1].replace(/'/g, '"'))).toEqual(["message", "expanded"])
     })
   })
 
@@ -272,7 +285,7 @@ describe("XagentWidget.open", () => {
     open({ message: "hi" })
 
     expect(instance.panel).toHaveClass("open")
-    expect(instance.fab).toHaveAttribute("aria-label", "Close chat")
+    expect(instance.fab).toHaveAttribute("aria-label", "Minimize chat")
   })
 
   describe("open(message) voids data-initial-message", () => {
@@ -469,6 +482,208 @@ describe("XagentWidget.open", () => {
       toWidget(request)
 
       expect(instance.post).toHaveBeenCalledTimes(1)
+      stop()
+    })
+  })
+
+  describe("sizes the panel from open({ expanded })", () => {
+    let originalInnerWidth: number
+    beforeEach(() => {
+      originalInnerWidth = window.innerWidth
+    })
+    afterEach(() => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: originalInnerWidth })
+    })
+
+    function setViewport(viewport: "desktop" | "mobile") {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: viewport === "mobile" ? 400 : 1024 })
+    }
+
+    type Start = "closed, normal" | "closed, expanded" | "open, normal" | "open, expanded"
+    // Reaches the starting state through the visitor's own controls only.
+    function startFrom(instance: Instance, start: Start) {
+      if (start.endsWith("expanded")) {
+        instance.fab.click()
+        fromIframe(instance, "widget_expand")
+        expect(instance.panel).toHaveClass("expanded")
+        if (start.startsWith("closed")) instance.fab.click()
+      } else if (start.startsWith("open")) {
+        instance.fab.click()
+      }
+      expect(instance.panel.classList.contains("open")).toBe(start.startsWith("open"))
+      instance.post.mockClear()
+      warn.mockClear()
+    }
+
+    const desktopCells = ([true, false] as const).flatMap((expanded) => (
+      (["closed, normal", "closed, expanded", "open, normal", "open, expanded"] as const)
+        .map((start) => ({ expanded, start, viewport: "desktop" as const }))
+    ))
+    const mobileCells = ([true, false] as const).flatMap((expanded) => (
+      (["closed, normal", "open, normal"] as const)
+        .map((start) => ({ expanded, start, viewport: "mobile" as const }))
+    ))
+
+    it.each([...desktopCells, ...mobileCells])(
+      "expanded: $expanded from $start on $viewport",
+      ({ expanded, start, viewport }) => {
+        localStorage.setItem("xagent_widget_width", "500")
+        setViewport(viewport)
+        const instance = mountGuest()
+        startFrom(instance, start)
+
+        open({ expanded })
+
+        const wantExpanded = expanded && viewport === "desktop"
+        expect(instance.panel).toHaveClass("open")
+        expect(instance.panel.classList.contains("expanded")).toBe(wantExpanded)
+        const states = expandStates(instance)
+        expect(states).toHaveLength(1)
+        expect(states[states.length - 1]).toEqual(expandState(instance.panel.classList.contains("expanded")))
+        if (viewport === "desktop") {
+          // Collapsing restores the stored width; expanding leaves width to the CSS rule.
+          expect(instance.panel.style.width).toBe(wantExpanded ? "" : "500px")
+        }
+        expect(warn).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each([
+      { name: "the string \"true\"", value: "true" },
+      { name: "1", value: 1 },
+      { name: "0", value: 0 },
+      { name: "null", value: null },
+      { name: "an object", value: {} },
+      { name: "an array", value: [] },
+    ])("ignores $name with one fixed warning, still opening and sending the message", ({ value }) => {
+      const instance = mountGuest()
+      fromIframe(instance, "open_message_request")
+
+      open({ message: "hi", expanded: value })
+
+      expect(warn.mock.calls).toEqual([[W_BAD_EXPANDED]])
+      expect(instance.panel).toHaveClass("open")
+      expect(instance.panel).not.toHaveClass("expanded")
+      expect(openDeliveries(instance)).toEqual([delivery("1", "hi")])
+      expect(expandStates(instance)).toEqual([])
+    })
+
+    it("treats an undefined expanded as not given, without a warning", () => {
+      const instance = mountGuest()
+
+      open({ expanded: undefined })
+
+      expect(warn).not.toHaveBeenCalled()
+      expect(instance.panel).toHaveClass("open")
+      expect(instance.panel).not.toHaveClass("expanded")
+      expect(expandStates(instance)).toEqual([])
+    })
+
+    it.each([
+      { name: "the string \"true\"", value: "true", warnings: [[W_BAD_EXPANDED]] },
+      { name: "1", value: 1, warnings: [[W_BAD_EXPANDED]] },
+      { name: "null", value: null, warnings: [[W_BAD_EXPANDED]] },
+      { name: "undefined", value: undefined, warnings: [] },
+    ])("keeps an open, expanded panel as it is for $name", ({ value, warnings }) => {
+      const instance = mountGuest()
+      startFrom(instance, "open, expanded")
+
+      open({ expanded: value })
+
+      expect(instance.panel).toHaveClass("open")
+      expect(instance.panel).toHaveClass("expanded")
+      expect(expandStates(instance)).toEqual([])
+      expect(warn.mock.calls).toEqual(warnings)
+    })
+
+    describe.each([
+      { start: "open, normal" as const },
+      { start: "open, expanded" as const },
+    ])("leaves the size alone without expanded ($start)", ({ start }) => {
+      it.each([
+        { name: "open()", args: [] },
+        { name: "open({ message })", args: [{ message: "hi" }] },
+      ])("$name", ({ args }) => {
+        const instance = mountGuest()
+        startFrom(instance, start)
+
+        open(...args)
+
+        expect(instance.panel).toHaveClass("open")
+        expect(instance.panel.classList.contains("expanded")).toBe(start === "open, expanded")
+        expect(expandStates(instance)).toEqual([])
+      })
+    })
+
+    it("passes a throwing expanded getter through before anything changes", () => {
+      const instance = mountGuest("widget-secret", { "data-expanded": "true" })
+      const options = { conversation: "current" }
+      Object.defineProperty(options, "expanded", {
+        enumerable: true,
+        get() { throw new Error("expanded getter") },
+      })
+
+      expect(() => open(options)).toThrow("expanded getter")
+
+      expect(warn.mock.calls).toEqual([[unknownOptionsWarning("conversation")]])
+      expect(instance.panel).not.toHaveClass("open")
+      expect(instance.post).not.toHaveBeenCalled()
+
+      // The first-open size rule is still unspent.
+      instance.fab.click()
+      expect(instance.panel).toHaveClass("expanded")
+    })
+
+    it("lets an explicit expanded: false on the first open spend data-expanded", () => {
+      const instance = mountGuest("widget-secret", { "data-expanded": "true" })
+
+      open({ expanded: false })
+      expect(instance.panel).toHaveClass("open")
+      expect(instance.panel).not.toHaveClass("expanded")
+      expect(expandStates(instance)).toEqual([expandState(false)])
+
+      instance.fab.click()
+      instance.fab.click()
+      expect(instance.panel).toHaveClass("open")
+      expect(instance.panel).not.toHaveClass("expanded")
+      expect(expandStates(instance)).toEqual([expandState(false)])
+    })
+
+    it.each([
+      { name: "the FAB", args: null, message: null, warnings: [] },
+      { name: "open()", args: [], message: null, warnings: [] },
+      { name: "open({ message })", args: [{ message: "hi" }], message: "hi", warnings: [] },
+      { name: "open({ expanded: \"true\" })", args: [{ expanded: "true" }], message: null, warnings: [[W_BAD_EXPANDED]] },
+    ])("applies data-expanded to a first open through $name", ({ args, message, warnings }) => {
+      const instance = mountGuest("widget-secret", { "data-expanded": "true" })
+      fromIframe(instance, "open_message_request")
+
+      if (args === null) instance.fab.click()
+      else open(...args)
+
+      expect(instance.panel).toHaveClass("open")
+      expect(instance.panel).toHaveClass("expanded")
+      expect(expandStates(instance)).toEqual([expandState(true)])
+      expect(openDeliveries(instance)).toEqual(message === null ? [] : [delivery("1", message)])
+      expect(warn.mock.calls).toEqual(warnings)
+    })
+
+    it("tells the real iframe listener about the size the host page set", () => {
+      const instance = mountGuest()
+      vi.stubGlobal("parent", { postMessage: vi.fn() })
+      const onState = vi.fn()
+      const stop = listenForWidgetExpandState(onState)
+
+      open({ expanded: true })
+      // The real output of widget.js, passed on unchanged.
+      expect(instance.post).toHaveBeenCalledTimes(1)
+      const [[delivered]] = instance.post.mock.calls
+      window.dispatchEvent(new MessageEvent("message", {
+        data: delivered,
+        source: window.parent as unknown as MessageEventSource,
+      }))
+
+      expect(onState.mock.calls).toEqual([[true]])
       stop()
     })
   })

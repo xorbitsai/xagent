@@ -877,21 +877,15 @@ def test_process_document_fails_without_success_when_the_commit_fails(
     ]
 
 
-def test_process_document_partial_on_write_failure(
+def test_process_document_commit_failure_keeps_completed_steps_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pipeline reports partial status when write step fails."""
-
     _patch_pipeline_dependencies(monkeypatch)
 
-    def _failing_write_vectors_to_db(**_: object) -> None:
-        raise RuntimeError("write failed")
+    def _commit(**_: object) -> None:
+        raise RuntimeError("commit failed")
 
-    monkeypatch.setattr(
-        document_ingestion,
-        "write_vectors_to_db",
-        _failing_write_vectors_to_db,
-    )
+    monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _commit)
 
     result = document_ingestion.process_document(
         collection="demo",
@@ -900,12 +894,112 @@ def test_process_document_partial_on_write_failure(
     )
 
     assert result.status == "partial"
-    # Writing is now integrated into the compute_embeddings step loop
-    assert result.failed_step in ("write_vectors_to_db", "compute_embeddings")
-    assert result.embedding_count == 2
+    assert result.failed_step == "write_vectors_to_db"
+    assert [step.name for step in result.completed_steps] == [
+        "resolve_embedding_adapter",
+        "initialize_collection",
+        "register_document",
+        "parse_document",
+        "chunk_document",
+        "read_chunks_for_embedding",
+        "compute_embeddings",
+    ]
+
+
+_FAILURE_BASE_STEPS = [
+    "resolve_embedding_adapter",
+    "initialize_collection",
+    "register_document",
+    "parse_document",
+    "chunk_document",
+    "read_chunks_for_embedding",
+]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_failed_step", "expected_embedding_count"),
+    [
+        ("write_failure", "write_vectors_to_db", 2),
+        ("all_embeddings_failed", "compute_embeddings", 0),
+        ("pending_zero_commit_failure", "write_vectors_to_db", 0),
+    ],
+)
+def test_process_document_embedding_stage_failure_reports_exact_state(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_failed_step: str,
+    expected_embedding_count: int,
+) -> None:
+    """Rebuild failed_step and completed_steps identically on every stage failure."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+    config = IngestionConfig()
+
+    if scenario == "write_failure":
+
+        def _failing_write(**_kwargs: object) -> None:
+            raise RuntimeError("write failed")
+
+        monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _failing_write)
+    elif scenario == "all_embeddings_failed":
+
+        def _failing_encode(_self, _text, dimension=None, instruct=None):
+            raise RuntimeError("provider down")
+
+        # The async path drops failed chunks, reaching the all-failed check.
+        config = IngestionConfig(embedding_use_async=True)
+        monkeypatch.setattr(_StubEmbeddingAdapter, "encode", _failing_encode)
+    else:
+        _nothing_pending(monkeypatch)
+
+        def _failing_commit(**_kwargs: object) -> None:
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(document_ingestion, "commit_vectors_to_db", _failing_commit)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        user_id=1,
+        source_path="/tmp/doc.pdf",
+        config=config,
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == expected_failed_step
+    assert [step.name for step in result.completed_steps] == _FAILURE_BASE_STEPS
+    assert result.chunk_count == 2
+    assert result.embedding_count == expected_embedding_count
     assert result.vector_count == 0
-    assert result.message.startswith("Failed to write embedding batch")
     assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.FAILED.value
+
+
+@pytest.mark.parametrize(
+    ("is_admin", "expected_status", "expected_failed_step"),
+    [
+        (True, "partial", "read_chunks_for_embedding"),
+        (False, "success", None),
+    ],
+)
+def test_process_document_requires_owner_only_for_admin_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    is_admin: bool,
+    expected_status: str,
+    expected_failed_step: str | None,
+) -> None:
+    """An ownerless non-admin run reads nothing, so only admin scope is rejected."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+        user_id=None,
+        is_admin=is_admin,
+    )
+
+    assert result.status == expected_status
+    assert result.failed_step == expected_failed_step
 
 
 def test_process_document_failed_before_register(

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   MAX_INITIAL_MESSAGE_LENGTH,
   listenForOpenMessages,
+  listenForWidgetExpandState,
   requestInitialMessage,
   requestPromptContext,
 } from "./widget-parent-message"
@@ -328,5 +329,86 @@ describe("listenForOpenMessages", () => {
     expect(post).not.toHaveBeenCalled()
     expect(onMessage).not.toHaveBeenCalled()
     expect(stop()).toBeUndefined()
+  })
+})
+
+describe("listenForWidgetExpandState", () => {
+  let stops: Array<() => void> = []
+  afterEach(() => {
+    for (const stop of stops) stop()
+    stops = []
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  function listen(onState: (expanded: boolean) => void) {
+    const stop = listenForWidgetExpandState(onState)
+    stops.push(stop)
+    return stop
+  }
+
+  function send(
+    data: Record<string, unknown>,
+    source: MessageEventSource = window.parent as unknown as MessageEventSource,
+  ) {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_state", ...data },
+      source,
+    }))
+  }
+
+  it.each([true, false])("passes on expanded: %s once", (expanded) => {
+    stubParent()
+    const onState = vi.fn()
+    listen(onState)
+
+    send({ expanded })
+
+    expect(onState.mock.calls).toEqual([[expanded]])
+  })
+
+  it.each([
+    { name: "a string", data: { expanded: "true" } },
+    { name: "a number", data: { expanded: 1 } },
+    { name: "null", data: { expanded: null } },
+    { name: "a missing value", data: {} },
+  ])("ignores $name as expanded", ({ data }) => {
+    stubParent()
+    const onState = vi.fn()
+    listen(onState)
+
+    send(data)
+
+    expect(onState).not.toHaveBeenCalled()
+  })
+
+  it("ignores a message from another source", () => {
+    stubParent()
+    const onState = vi.fn()
+    listen(onState)
+
+    send({ expanded: true }, window as unknown as MessageEventSource)
+
+    expect(onState).not.toHaveBeenCalled()
+  })
+
+  it("ignores everything on a direct visit", () => {
+    const onState = vi.fn()
+    listen(onState)
+
+    // Here window.parent === window, so the source check alone would accept this.
+    send({ expanded: true }, window as unknown as MessageEventSource)
+
+    expect(onState).not.toHaveBeenCalled()
+  })
+
+  it("stops listening after cleanup", () => {
+    stubParent()
+    const onState = vi.fn()
+    listen(onState)()
+
+    send({ expanded: true })
+
+    expect(onState).not.toHaveBeenCalled()
   })
 })

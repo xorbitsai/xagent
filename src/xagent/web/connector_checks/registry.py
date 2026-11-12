@@ -42,6 +42,7 @@ from .fixtures import FixtureRef
 # work still to come names the issue of the connector's family that decides
 # it; a write whose object no tool can delete is a reason of its own.
 _GOOGLE_TIER_1 = "#3567"
+_JIRA_TIER_1 = "#3570"
 _MICROSOFT_365_TIER_1 = "#3569"
 # Tier 2 runs structural reads only: no seeded objects and no write checks.
 _TIER_2 = "#3573"
@@ -137,6 +138,166 @@ def _declared_l3(app_id: str) -> ReadCheck:
     return check
 
 
+def _jira_checks() -> ConnectorChecks:
+    """Jira's Tier 1 checks (#3570).
+
+    The reads cover the tools that carry most of Jira's calls, against the
+    test tenant's seeded read project; the write check creates an issue in its
+    write project, reads it back and deletes it. Each call that reads or
+    writes issues names the test site by ``cloud_id`` instead of relying on
+    the tool's single-site auto-detection; the tenant pin still refuses the
+    write when the grant reaches any other site.
+    """
+    tenant = FixtureRef("jira.tenant_id")
+    seeded_issue = FixtureRef("jira.seed.issue_key")
+    write_project = FixtureRef("jira.write_project_key")
+    name = RunScopedName("issue")
+    created = CreatedRef(("issue", "key"))
+    pin = TenantPin(
+        ToolStep("jira_list_accessible_sites", assertions=(Length(("sites",), 1, 1),)),
+        path=("sites", 0, "id"),
+        expected=tenant,
+    )
+    read_back = ToolStep(
+        "jira_get_issue",
+        {"cloud_id": tenant, "issue_key": created},
+        assertions=(StatusSuccess(), Equals(("issue", "summary"), name)),
+    )
+    return ConnectorChecks(
+        "jira",
+        reads=(
+            _declared_l3("jira"),
+            ReadCheck(
+                "jira.search_issues",
+                "jira_search_issues",
+                {
+                    "cloud_id": tenant,
+                    "jql": FixtureRef("jira.seed.search_jql"),
+                    "raw_fields": False,
+                },
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("issues", "returned_count", "truncated")),
+                    EachHasKeys(
+                        ("issues",),
+                        ("key", "summary", "status", "issue_type", "project_key"),
+                    ),
+                    Equals(("issues", 0, "key"), seeded_issue),
+                ),
+            ),
+            ReadCheck(
+                "jira.list_comments",
+                "jira_list_comments",
+                {"cloud_id": tenant, "issue_key": seeded_issue},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("comments", "total", "truncated")),
+                    EachHasKeys(("comments",), ("id", "author", "body", "created")),
+                    Equals(("comments", 0, "id"), FixtureRef("jira.seed.comment_id")),
+                    IsType(("comments", 0, "body"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "jira.get_issue",
+                "jira_get_issue",
+                {"cloud_id": tenant, "issue_key": seeded_issue},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("issue", "key"), seeded_issue),
+                    HasKeys(
+                        ("issue",),
+                        ("summary", "description", "status", "issue_type"),
+                    ),
+                    IsType(("issue", "summary"), "string"),
+                    IsType(("issue", "description"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "jira.current_user",
+                "jira_get_current_user",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("account_id", "email", "name")),
+                    IsType(("user", "account_id"), "string"),
+                ),
+            ),
+        ),
+        writes=(
+            WriteCheck(
+                "jira.issue_round_trip",
+                create=ToolStep(
+                    "jira_create_issue",
+                    {"cloud_id": tenant, "project_key": write_project, "summary": name},
+                    assertions=(StatusSuccess(), IsType(("issue", "key"), "string")),
+                ),
+                verify=read_back,
+                cleanup=ToolStep(
+                    "jira_delete_issue",
+                    {"cloud_id": tenant, "issue_key": created},
+                    assertions=(StatusSuccess(), Equals(("deleted",), True)),
+                ),
+                cleanup_guard=read_back,
+                tenant_pin=pin,
+                # Toby withholds both from a member who did not install it.
+                expected_verdicts={
+                    "jira_create_issue": "deny",
+                    "jira_delete_issue": "deny",
+                },
+            ),
+        ),
+        exemptions=(
+            *(
+                ToolExemption(
+                    tool,
+                    "read left unchecked: the checked tools carry over 80% of "
+                    f"Jira's calls, as decided in {_JIRA_TIER_1}",
+                )
+                for tool in (
+                    "jira_list_projects",
+                    "jira_search_users",
+                    "jira_list_transitions",
+                )
+            ),
+            *(
+                ToolExemption(
+                    tool,
+                    "write that edits an existing issue: a write check creates, "
+                    "verifies and deletes its own object and has no step for an "
+                    f"edit, as decided in {_JIRA_TIER_1}",
+                )
+                for tool in ("jira_update_issue", "jira_transition_issue")
+            ),
+            *(
+                ToolExemption(
+                    tool,
+                    "write that adds to an existing issue, which no tool of this "
+                    "server removes on its own: a write check can neither create "
+                    f"the issue first nor delete what it adds, as decided in "
+                    f"{_JIRA_TIER_1}",
+                )
+                for tool in ("jira_add_comment", "jira_add_attachment")
+            ),
+        ),
+        sweep=Sweep(
+            tenant_pin=pin,
+            find=ToolStep(
+                "jira_search_issues",
+                {
+                    "cloud_id": tenant,
+                    "jql": FixtureRef("jira.write_sweep_jql"),
+                    "raw_fields": False,
+                },
+                assertions=(StatusSuccess(), IsType(("issues",), "array")),
+            ),
+            items=("issues",),
+            name=("summary",),
+            delete=ToolStep(
+                "jira_delete_issue",
+                {"cloud_id": tenant, "issue_key": ItemRef(("key",))},
+                assertions=(StatusSuccess(),),
+            ),
+        ),
+    )
 def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
     """Google Drive's write check and sweep (#3567), sharing one tenant pin.
 
@@ -308,6 +469,25 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
             ToolExemption("gmail_manage_labels", _GMAIL_LABEL_WITHOUT_READ),
         ),
+    ),
+    # Tier 2 (#3573): the connector's only read that takes no object id or
+    # query is the tool its L3 probe calls, so that tool keeps the L3 row and
+    # carries the check.
+    "google-ads": ConnectorChecks(
+        "google-ads",
+        reads=(
+            _declared_l3("google-ads"),
+            ReadCheck(
+                "google-ads.list_accessible_customers",
+                "google_ads_list_accessible_customers",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("customer_ids",)),
+                    IsType(("customer_ids",), "array"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(issue=_TIER_2, reads=("google_ads_search",)),
     ),
     "google-analytics": ConnectorChecks(
         "google-analytics",
@@ -539,6 +719,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    "jira": _jira_checks(),
     # Create-only (#3655): its one tool files a ticket no tool of the server
     # can delete, and its L3 slot stays unprobeable for the same reason.
     "jira-ticket": ConnectorChecks(
@@ -573,6 +754,132 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    # Tier 2 (#3573). Which $select fields Graph returns for every message,
+    # event or contact has not been checked against a live mailbox, so a list
+    # item asserts its id alone.
+    "outlook": ConnectorChecks(
+        "outlook",
+        reads=(
+            _declared_l3("outlook"),
+            ReadCheck(
+                "outlook.get_profile",
+                "outlook_get_profile",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("id", "userPrincipalName")),
+                    IsType(("user", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_messages",
+                "outlook_list_messages",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("messages", "next_link")),
+                    EachHasKeys(("messages",), ("id",)),
+                    Length(("messages",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_events",
+                "outlook_list_events",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("events", "next_link")),
+                    EachHasKeys(("events",), ("id",)),
+                    Length(("events",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_contacts",
+                "outlook_list_contacts",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("contacts", "next_link")),
+                    EachHasKeys(("contacts",), ("id",)),
+                    Length(("contacts",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=("outlook_get_message",),
+            writes=("outlook_create_event", "outlook_delete_event"),
+            in_place_edits=("outlook_update_event",),
+            writes_without_cleanup=("outlook_send_message",),
+        ),
+    ),
+    # Tier 2 (#3573). A list takes no page size, so no check bounds its
+    # length, and a page too large for the output limit is projected down to
+    # each item's id and label (and a plan's web_url), so an item asserts
+    # only the keys that survive that projection.
+    "planner": ConnectorChecks(
+        "planner",
+        reads=(
+            _declared_l3("planner"),
+            ReadCheck(
+                "planner.list_my_plans",
+                "planner_list_my_plans",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("plans", "next_link", "truncated")),
+                    EachHasKeys(("plans",), ("id", "web_url")),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "planner.list_my_tasks",
+                "planner_list_my_tasks",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("tasks", "next_link", "truncated")),
+                    EachHasKeys(("tasks",), ("id",)),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "planner.list_my_groups",
+                "planner_list_my_groups",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("groups", "next_link", "truncated")),
+                    EachHasKeys(("groups",), ("id",)),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "planner_list_plans",
+                "planner_get_plan",
+                "planner_list_buckets",
+                "planner_list_tasks",
+                "planner_get_task",
+                "planner_get_task_details",
+            ),
+            writes=(
+                "planner_create_plan",
+                "planner_delete_plan",
+                "planner_create_bucket",
+                "planner_delete_bucket",
+                "planner_create_task",
+                "planner_delete_task",
+                "planner_add_checklist_item",
+                "planner_delete_checklist_item",
+            ),
+            in_place_edits=(
+                "planner_update_task",
+                "planner_update_task_description",
+                "planner_assign_task",
+                "planner_unassign_task",
+                "planner_set_checklist_item_checked",
+            ),
+        ),
+    ),
     "powerpoint": ConnectorChecks(
         "powerpoint",
         reads=(
@@ -599,6 +906,87 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "powerpoint_delete_slide",
             ),
             writes_without_cleanup=("powerpoint_create_presentation",),
+        ),
+    ),
+    # Tier 2 (#3573). get_site and every list take a site id; Graph's "root"
+    # alias names the tenant's root site, so no fixture is needed. list_drives takes no
+    # page size, so its list has no length bound.
+    "sharepoint": ConnectorChecks(
+        "sharepoint",
+        reads=(
+            _declared_l3("sharepoint"),
+            ReadCheck(
+                "sharepoint.get_root_site",
+                "sharepoint_get_root_site",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("site",), ("id", "webUrl")),
+                    IsType(("site", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.get_site",
+                "sharepoint_get_site",
+                {"site_id": "root"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("site",), ("id", "webUrl")),
+                    IsType(("site", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_drives",
+                "sharepoint_list_drives",
+                {"site_id": "root"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("drives", "truncated")),
+                    EachHasKeys(("drives",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_items",
+                "sharepoint_list_items",
+                {"site_id": "root", "top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("items", "truncated")),
+                    EachHasKeys(("items",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                    Length(("items",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_lists",
+                "sharepoint_list_lists",
+                {"site_id": "root", "top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("lists", "truncated")),
+                    EachHasKeys(("lists",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                    Length(("lists",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "sharepoint_search_sites",
+                "sharepoint_search_files",
+                "sharepoint_get_file_content",
+                "sharepoint_download_file",
+                "sharepoint_list_list_items",
+            ),
+            writes=(
+                "sharepoint_create_list_item",
+                "sharepoint_delete_list_item",
+                "sharepoint_move_item",
+                "sharepoint_upload_text_file",
+                "sharepoint_upload_file",
+            ),
+            in_place_edits=("sharepoint_update_list_item",),
         ),
     ),
     "word": ConnectorChecks(
@@ -758,14 +1146,12 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "fireflies",
         "freshdesk",
         "github",
-        "google-ads",
         "google-maps",
         "google-search-console",
         "granola",
         "hubspot",
         "instagram",
         "intercom",
-        "jira",
         "linear",
         "linkedin",
         "magento",
@@ -773,12 +1159,9 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "mixpanel",
         "myob",
         "onedrive",
-        "outlook",
-        "planner",
         "posthog",
         "rocketlane",
         "salesforce",
-        "sharepoint",
         "shopify",
         "slack",
         "stripe",

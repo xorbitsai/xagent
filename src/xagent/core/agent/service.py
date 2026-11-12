@@ -93,6 +93,7 @@ class AgentService:
         user_interaction_enabled: bool = True,
         defer_connector_schemas: bool = False,
         deferred_preload_token_budget: int = DEFAULT_PRELOAD_TOKEN_BUDGET,
+        defer_builtin_tool_categories: tuple[str, ...] | list[str] = (),
         execution_metadata: dict[str, Any] | None = None,
         budget_policy_provider: BudgetPolicyProvider | None = None,
         **agent_kwargs: Any,
@@ -130,6 +131,7 @@ class AgentService:
         # Per newly scanned user message, not a session cap; see
         # ``AgentExecutionConfig.deferred_preload_token_budget``.
         self.deferred_preload_token_budget = deferred_preload_token_budget
+        self.defer_builtin_tool_categories = tuple(defer_builtin_tool_categories or ())
         self.execution_metadata = dict(execution_metadata or {})
         self.budget_policy_provider = budget_policy_provider
         if tools is not None and tool_config is not None:
@@ -695,6 +697,9 @@ class AgentService:
             self._execution_adapter.config.deferred_preload_token_budget = (
                 self.deferred_preload_token_budget
             )
+            self._execution_adapter.config.defer_builtin_tool_categories = (
+                self.defer_builtin_tool_categories
+            )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
@@ -764,6 +769,7 @@ class AgentService:
                 user_interaction_enabled=self.user_interaction_enabled,
                 defer_connector_schemas=self.defer_connector_schemas,
                 deferred_preload_token_budget=self.deferred_preload_token_budget,
+                defer_builtin_tool_categories=self.defer_builtin_tool_categories,
                 preferred_input_modalities=self.preferred_input_modalities,
                 execution_metadata=dict(self.execution_metadata),
             )

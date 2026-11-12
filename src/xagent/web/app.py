@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import importlib
 import json
 import logging
 import mimetypes
@@ -149,6 +150,7 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
+from .services.writer_workers import drain_workers, run_tracked
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
@@ -261,6 +263,10 @@ app = FastAPI(
 
 # Track background migration task for graceful shutdown cleanup.
 _migration_task: asyncio.Task[None] | None = None
+_uploaded_file_reconcile_task: asyncio.Task[None] | None = None
+# How long a retire waits for detached writer threads and admitted socket
+# writes to settle before it fails and leaves the host to its fallback.
+RETIRE_SETTLE_SECONDS = 30.0
 _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
 _trigger_dispatcher_task: asyncio.Task[Any] | None = None
 _task_command_dispatcher_task: asyncio.Task[Any] | None = None
@@ -295,7 +301,7 @@ async def _run_file_storage_startup_sync_with_retries(
 ) -> None:
     while True:
         try:
-            await asyncio.to_thread(run_startup_file_storage_sync)
+            await run_tracked(run_startup_file_storage_sync)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -463,15 +469,13 @@ async def _run_trigger_dispatcher(
             if now >= next_gmail_watch_scan_at:
                 try:
                     if get_gmail_watch_enabled():
-                        renewed = await asyncio.to_thread(
-                            _scan_due_gmail_watch_renewals_tick
-                        )
+                        renewed = await run_tracked(_scan_due_gmail_watch_renewals_tick)
                         if renewed:
                             logger.info(
                                 "Trigger dispatcher renewed %s Gmail watch(es)",
                                 renewed,
                             )
-                        swept = await asyncio.to_thread(_sweep_gmail_provisioning_tick)
+                        swept = await run_tracked(_sweep_gmail_provisioning_tick)
                         if swept:
                             logger.info(
                                 "Trigger dispatcher retried %s Gmail registration(s)",
@@ -483,7 +487,7 @@ async def _run_trigger_dispatcher(
                     )
 
             if tick is not None:
-                processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
+                processed = await run_tracked(_scan_due_scheduled_triggers_tick)
                 if processed:
                     logger.info(
                         "Trigger dispatcher processed %s due schedule(s)", processed
@@ -497,7 +501,7 @@ async def _run_trigger_dispatcher(
             # seconds) is unnecessary load with no corresponding benefit.
             if now >= next_preview_run_reap_at:
                 try:
-                    reaped_pause_targets = await asyncio.to_thread(
+                    reaped_pause_targets = await run_tracked(
                         _reap_stale_preview_workforce_runs_tick
                     )
                     if reaped_pause_targets:
@@ -1147,6 +1151,9 @@ def start_temp_file_cleanup_task(
         started = time.monotonic()
         logger.info("Background orphaned temp-file cleanup started")
         try:
+            # Deliberately not ``run_tracked``: the walk deletes temp files, it
+            # is not a database writer, and a host's retire must not wait on a
+            # minutes-long sweep. ``_stop_runtime_loops`` sets its stop event.
             cleaned_count = await asyncio.to_thread(
                 cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
             )
@@ -2004,7 +2011,7 @@ def _lancedb_auto_migrate() -> bool:
 
 async def _admit_memory_and_lancedb() -> None:
     """Memory admission, LanceDB migrations and the background reconciles."""
-    global _migration_task
+    global _migration_task, _uploaded_file_reconcile_task
     # Admit persistent memory storage before anything is allowed to use it.
     # Startup is the only moment at which this process is guaranteed to have no
     # memory writers, and no store is published unless admission succeeds.
@@ -2089,7 +2096,7 @@ async def _admit_memory_and_lancedb() -> None:
                     from ..migrations.lancedb.backfill_user_id import backfill_all
 
                     try:
-                        result = await asyncio.to_thread(backfill_all, dry_run=False)
+                        result = await run_tracked(backfill_all, dry_run=False)
                         logger.info("=" * 60)
                         logger.info("BACKGROUND LANCEDB MIGRATION COMPLETED")
                         logger.info("=" * 60)
@@ -2204,7 +2211,7 @@ async def _admit_memory_and_lancedb() -> None:
                         )
 
                         try:
-                            result = await asyncio.to_thread(
+                            result = await run_tracked(
                                 backfill_all, dry_run=False, conn=conn
                             )
                             logger.info("=" * 60)
@@ -2315,7 +2322,7 @@ async def _admit_memory_and_lancedb() -> None:
                     backfill_all as backfill_uploaded_file_links,
                 )
 
-                link_result = await asyncio.to_thread(
+                link_result = await run_tracked(
                     backfill_uploaded_file_links, dry_run=False
                 )
                 logger.info("Uploaded file links backfill completed: %s", link_result)
@@ -2344,12 +2351,14 @@ async def _admit_memory_and_lancedb() -> None:
                     db.close()
 
             try:
-                await asyncio.to_thread(_run_uploaded_file_reconcile)
+                await run_tracked(_run_uploaded_file_reconcile)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Uploaded files reconcile failed: %s", e)
 
         # Start background task without awaiting
-        asyncio.create_task(run_uploaded_file_reconcile_background())
+        _uploaded_file_reconcile_task = asyncio.create_task(
+            run_uploaded_file_reconcile_background()
+        )
         logger.info("Started background uploaded files reconcile task")
 
 
@@ -2371,6 +2380,43 @@ async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
             sandbox_mgr.run_idle_sweep_loop()
         )
         logger.info("Started sandbox idle sweep task")
+
+
+def _preload_channel_modules() -> None:
+    """Import the chat channel modules without constructing or starting anything.
+
+    The Feishu and Telegram modules pull in large SDKs (``lark_oapi``,
+    ``aiogram``) that cost several seconds to import, which would otherwise
+    block the event loop inside standby activation. Importing has no side
+    effect beyond ``sys.modules``; the managers are still built and started by
+    :func:`_start_commands_and_channels`.
+    """
+    for name in (
+        ".channels.feishu.bot",
+        ".channels.slack.bot",
+        ".channels.telegram.bot",
+    ):
+        importlib.import_module(name, package=__package__)
+
+
+async def _preload_channel_modules_in_standby() -> None:
+    """Warm the channel imports while still a standby; failures surface at activation.
+
+    WHY on the event loop thread, not ``asyncio.to_thread``: ``lark_oapi.ws.client``
+    binds a module-level ``loop`` from ``asyncio.get_event_loop()`` at import time
+    and later schedules the Feishu receive loop on it. Imported from a worker
+    thread it would bind a fresh loop that never runs, and Feishu would stop
+    receiving messages. A standby serves no traffic, so blocking its loop for
+    the few seconds of the import costs nothing; activation, which runs inside
+    the release's write pause, no longer pays it.
+    """
+    try:
+        with _startup_phase("channel module preload (standby)"):
+            _preload_channel_modules()
+    except Exception:
+        # WHY: activation imports the same modules inside its own try/except and
+        # logs the failure there; a warmup miss must not fail the standby.
+        logger.warning("Channel module preload failed in standby", exc_info=True)
 
 
 async def _start_commands_and_channels() -> None:
@@ -2452,9 +2498,16 @@ async def _stop_runtime_loops() -> None:
     global \
         _file_storage_startup_sync_task, \
         _migration_task, \
+        _uploaded_file_reconcile_task, \
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task
+
+    # The temp-file walk runs in a thread a task cancel cannot stop; its stop
+    # event is what ends it (see ``start_temp_file_cleanup_task``).
+    temp_file_cleanup_stop = getattr(app.state, "temp_file_cleanup_stop", None)
+    if temp_file_cleanup_stop is not None:
+        temp_file_cleanup_stop.set()
 
     if _task_command_dispatcher_task is not None:
         from .services.task_command_transport import stop_task_command_dispatcher
@@ -2498,6 +2551,13 @@ async def _stop_runtime_loops() -> None:
             await _migration_task
     _migration_task = None
 
+    if _uploaded_file_reconcile_task and not _uploaded_file_reconcile_task.done():
+        logger.info("Cancelling uploaded files reconcile task...")
+        _uploaded_file_reconcile_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _uploaded_file_reconcile_task
+    _uploaded_file_reconcile_task = None
+
     # Cancel metadata rebuild background task
     if hasattr(app.state, "metadata_rebuild_task"):
         task = app.state.metadata_rebuild_task
@@ -2507,34 +2567,47 @@ async def _stop_runtime_loops() -> None:
                 await task
 
 
-async def _stop_chat_channels() -> None:
-    """Cancel the chat channel tasks and stop each channel; shared by shutdown and abort."""
-    try:
-        channel_tasks = [
-            task
-            for name in ("telegram_task", "feishu_task", "slack_task")
-            if (task := getattr(app.state, name, None)) is not None
-        ]
-        for task in channel_tasks:
-            task.cancel()
-        await asyncio.gather(*channel_tasks, return_exceptions=True)
+async def _stop_chat_channels(*, raise_errors: bool) -> None:
+    """Cancel the chat channel tasks and stop each channel.
 
+    Every channel is stopped even if an earlier one fails. ``raise_errors``
+    decides what a failure means: the writer retire re-raises (it must not
+    publish success beside a channel that may still accept messages), while
+    shutdown and the standby abort log it and carry on with their teardown.
+    """
+    errors: list[Exception] = []
+    channel_tasks = [
+        task
+        for name in ("telegram_task", "feishu_task", "slack_task")
+        if (task := getattr(app.state, name, None)) is not None
+    ]
+    for task in channel_tasks:
+        task.cancel()
+    await asyncio.gather(*channel_tasks, return_exceptions=True)
+
+    stops: list[tuple[str, Callable[[], Awaitable[None]]]] = []
+    try:
         from .channels.feishu.bot import get_feishu_channel
         from .channels.slack.bot import get_slack_channel
         from .channels.telegram.bot import get_telegram_channel
 
         telegram_channel = get_telegram_channel()
         if telegram_channel.enabled:
-            await telegram_channel.stop()
-            logger.info("Telegram channel stopped successfully")
-
-        feishu_channel = get_feishu_channel()
-        await feishu_channel.stop()
-
-        slack_channel = get_slack_channel()
-        await slack_channel.stop()
+            stops.append(("Telegram", telegram_channel.stop))
+        stops.append(("Feishu", get_feishu_channel().stop))
+        stops.append(("Slack", get_slack_channel().stop))
     except Exception as e:
-        logger.error("Failed to stop chat channels: %s", e, exc_info=True)
+        errors.append(e)
+        logger.error("Failed to look up chat channels: %s", e, exc_info=True)
+    for name, stop in stops:
+        try:
+            await stop()
+            logger.info("%s channel stopped successfully", name)
+        except Exception as e:
+            errors.append(e)
+            logger.error("Failed to stop the %s channel: %s", name, e, exc_info=True)
+    if errors and raise_errors:
+        raise errors[0]
 
 
 async def _abort_standby_activation() -> None:
@@ -2553,7 +2626,9 @@ async def _abort_standby_activation() -> None:
     if cleanup_task is not None:
         cleanup_task.cancel()
         await asyncio.gather(cleanup_task, return_exceptions=True)
-    await _stop_chat_channels()
+    # The abort keeps stopping the remaining parts, so a failed channel stop is
+    # logged here, not raised (the process is stopped by its host afterwards).
+    await _stop_chat_channels(raise_errors=False)
     if get_shared_task_execution_enabled():
         from .api.websocket import manager
         from .services.task_event_bridge import stop_task_event_bridge
@@ -2570,6 +2645,11 @@ async def _abort_standby_activation() -> None:
 # initial database and skill manager
 @app.on_event("startup")
 async def startup_event() -> None:
+    global _uploaded_file_reconcile_task, _writers_retired
+    # A new lifespan starts new writers; the next retire must stop them.
+    _writers_retired = False
+    _uploaded_file_reconcile_task = None
+    release_hold.reset_writers_retired()
     from ..config import (
         get_standby_enabled,
         get_task_execution_role,
@@ -2691,6 +2771,8 @@ async def startup_event() -> None:
     else:
         logger.info("Sandbox manager not available (disabled or init failed)")
 
+    if standby.standby:
+        await _preload_channel_modules_in_standby()
     await _run_or_defer("command dispatch and channels", _start_commands_and_channels)
 
     await _run_or_defer("temp-file cleanup and Composio reconcile", _start_late_tasks)
@@ -2700,6 +2782,126 @@ async def startup_event() -> None:
         is not None
     )
     start_app_process_diagnostics(app)
+
+
+_writers_retired = False
+_retire_writers_lock: asyncio.Lock | None = None
+
+
+async def retire_writers(
+    *,
+    settle_seconds: float | None = None,
+    raise_on_stop_error: bool = True,
+) -> bool:
+    """Stop the background writers listed here; the web server keeps serving.
+
+    The guarantee is exactly the lists below: the tracked set plus the
+    audited allowlist in ``tests/web/test_blocking_call_inventory.py``. A
+    thread or task that is in neither is not covered, whatever it does.
+
+    **Stopped (tasks cancelled and awaited):** command dispatcher and its
+    detached prompt dispatches, orphan-upload GC, Composio reconcile,
+    retention purge, task-cleanup retry, uploaded-file recovery and reconcile,
+    auto-resume, lease recovery, sandbox idle sweep, startup file-storage
+    sync, LanceDB migration, trigger dispatcher, chat channels.
+
+    **Fenced:** socket-owned writes. After the fence no WebSocket handler
+    starts a write (message/start commands, builder turns, ASR sessions,
+    missing-task chat, preview), and ``dispatch_task_command_promptly`` only
+    wakes the dispatcher. Writes admitted before the fence are cancelled
+    (long-running ones) and waited for. Pause/resume/cancel commands pass the
+    fence and enqueue their durable row, but nothing applies them here: the
+    socket answers ``task_command_queued`` ("applied after the restart"), not
+    ``task_command_accepted``.
+
+    **Waited for before success (tracked threads, audited list):**
+    startup file-storage sync, uploaded-file reconcile, gmail watch renewal
+    and provisioning sweep (including its provisioning thread), scheduled-
+    trigger scan, preview-run reaper, trigger run start and pending-run scan
+    (``services/triggers``), the LanceDB user-id, documents and
+    uploaded-file-link backfills, the retention-purge batch, task-cleanup
+    retry (workspace removal, live-id check, claim, settle), the Composio
+    reconcile pass, the socket command enqueue, the channel input
+    acceptance/claim/staging threads (Feishu, Slack, Telegram, shared channel
+    execution) and the blocking calls a builder chat turn makes through
+    ``xagent.core.utils.blocking.run_blocking`` (knowledge-base ingestion and
+    the knowledge-base coordinator, LanceDB metadata-table creation).
+
+    **Not covered -- the host must quiesce these itself:** HTTP producers
+    (the API routes, including the A2A, triggers, MCP and file routes, and
+    webhook ingress), writers owned by running executions (task
+    coordinators and their tool threads, ``background_task_manager``, which
+    ``execution_status()`` reports), and the same knowledge-base coordinator
+    calls when they are made from an HTTP route or an execution instead of a
+    builder turn. Direct callers of ``dispatch_one_task_command`` (for
+    example ``api/a2a.py``) are HTTP producers and are not fenced. The temp-
+    file walk is stopped through its own event and is not waited for. A host
+    that must see no write at all stops routing HTTP traffic here first.
+
+    Success is published only once the tracked work has really settled: the
+    fence goes up first, and after the stops this waits for the prompt
+    dispatches, the worker threads cancelled tasks left behind and every
+    socket write admitted before the fence. If one does not settle within
+    ``settle_seconds`` (default ``RETIRE_SETTLE_SECONDS``) the function raises, so the host takes its fallback
+    instead of starting migrations beside a live writer. A failed channel
+    stop raises too (``raise_on_stop_error``).
+
+    ``settle_seconds=0`` is the shutdown form: it raises the fence and does
+    the stops, skips every wait and publishes nothing (``writers_retired()``
+    stays false), because waiting cannot stop a thread and shutdown has its
+    own drains. It also does not queue behind a host retire that is already
+    running: that retire owns the stops, the fence is up, and shutdown goes
+    straight on to its own teardown.
+
+    Returns whether this call ran the stops itself (``False`` when it found
+    them already done or in progress), so shutdown runs them only when this
+    call did not.
+
+    Idempotent and safe to call concurrently: the first caller does the work,
+    later ones wait for it and return. A step that raises leaves the function
+    unfinished (the caller sees the error) and every step is itself a no-op
+    once done, so calling again continues where it stopped. The later
+    ``shutdown_event`` calls this too and skips it once it completed.
+    """
+    global _retire_writers_lock, _writers_retired
+
+    if settle_seconds is None:
+        settle_seconds = RETIRE_SETTLE_SECONDS
+    if _retire_writers_lock is None:
+        _retire_writers_lock = asyncio.Lock()
+    if settle_seconds <= 0 and _retire_writers_lock.locked():
+        logger.info("Writer retire already in progress; shutdown does not wait for it")
+        return False
+    async with _retire_writers_lock:
+        if _writers_retired:
+            return False
+        # Fence first: no socket write is admitted from here on, and the ones
+        # already admitted are asked to wind down. They are waited for below.
+        release_hold.mark_writers_retired()
+        await _stop_runtime_loops()
+        # Chat channels stop before task finalizers drain.
+        await _stop_chat_channels(raise_errors=raise_on_stop_error)
+        if settle_seconds <= 0:
+            return True
+
+        # Cancelling a task that awaits a worker thread does not stop the
+        # thread, and an admitted socket write or a detached prompt dispatch
+        # is not a task this function owns.
+        from .services.task_command_transport import drain_prompt_dispatches
+
+        if not await drain_prompt_dispatches(settle_seconds):
+            raise RuntimeError("detached command dispatches did not settle")
+        if not await drain_workers(settle_seconds):
+            raise RuntimeError("background writer threads did not settle")
+        if not await release_hold.drain_socket_writes(settle_seconds):
+            raise RuntimeError("socket writes did not settle")
+        _writers_retired = True
+        return True
+
+
+def writers_retired() -> bool:
+    """Whether :func:`retire_writers` has completed in this process."""
+    return _writers_retired
 
 
 @app.on_event("shutdown")
@@ -2733,10 +2935,26 @@ async def shutdown_event() -> None:
 
     flush_langfuse()
 
-    await _stop_runtime_loops()
-
-    # Shutdown chat channels before draining task finalizers.
-    await _stop_chat_channels()
+    # Stops the writers (the same step a host may run earlier, then skipped).
+    # Shutdown does not wait for the tracked threads: waiting cannot stop them,
+    # and it would only spend the grace period the coordinator drain and the
+    # sandbox cleanup below need. A failed stop must not skip those either:
+    # this is the last chance to run them.
+    stops_ran = False
+    try:
+        stops_ran = await retire_writers(settle_seconds=0, raise_on_stop_error=False)
+    except Exception:
+        logger.exception("Retiring the writers failed at shutdown; continuing teardown")
+    # The retire above returns early after a completed host retire (channel
+    # CRUD can restart bots afterwards) and while a host retire still holds the
+    # lock mid-stop (which may yet fail). Both stops are idempotent, so shutdown
+    # always runs them: this is the last chance.
+    try:
+        if not stops_ran:
+            await _stop_runtime_loops()
+            await _stop_chat_channels(raise_errors=False)
+    except Exception:
+        logger.exception("Stopping loops and channels failed at shutdown")
 
     # All producers are stopped. Drain task-owned finalizers and their shared
     # lease heartbeats before tearing down the sandboxes those tasks may use.

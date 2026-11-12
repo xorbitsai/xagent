@@ -35,6 +35,7 @@ from xagent.core.agent.clarification import (
 )
 from xagent.core.agent.context import execution as execution_module
 from xagent.core.agent.context.enrichment import MEMORY_CONTEXT_METADATA_KEY
+from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.grounding import step_intent_not_fact_rule
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
@@ -56,6 +57,16 @@ from xagent.core.memory.core import MemoryResponse
 from xagent.core.model.chat.exceptions import ModelProviderError
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
+
+
+def _without_turn_context(content: object) -> str:
+    """The message text without the per-turn context appended to the request."""
+    return str(content).split(f"\n\n{TURN_CONTEXT_HEADER}", 1)[0]
+
+
+def _all_text(messages: list[dict[str, Any]]) -> str:
+    return "\n\n".join(str(message.get("content") or "") for message in messages)
+
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
@@ -3169,7 +3180,8 @@ async def test_dag_step_appends_current_step_boundary_after_parent_context() -> 
     messages = llm.seen_messages[0]
     assert any(
         message["role"] == "user"
-        and message["content"] == "Extract highlights and generate two posters."
+        and _without_turn_context(message["content"])
+        == "Extract highlights and generate two posters."
         for message in messages
     )
     assert messages[-1]["role"] == "user"
@@ -6701,7 +6713,8 @@ async def test_dag_dependency_summary_does_not_add_extra_system_message() -> Non
     ]
     assert len(system_messages) == 1
     assert system_messages[0]["content"].startswith("You are a precise planner.")
-    assert "Turn started at:" in system_messages[0]["content"]
+    assert "Turn started at:" not in system_messages[0]["content"]
+    assert "Turn started at:" in _all_text(child_messages)
     assert any(
         message["role"] == "user" and "Dependency results" in message["content"]
         for message in child_messages

@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.abc
+import importlib.util
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -183,6 +186,91 @@ async def test_startup_event_defers_every_write_and_singleton_until_activation(
     assert positions == sorted(positions), after
     assert "init_db" not in events
     assert not release_hold.closed and standby.phase is StandbyPhase.ACTIVE
+
+
+_CHANNEL_MODULES = {
+    "xagent.web.channels.feishu.bot": "get_feishu_channel",
+    "xagent.web.channels.slack.bot": "get_slack_channel",
+    "xagent.web.channels.telegram.bot": "get_telegram_channel",
+}
+
+
+class _RecordingChannelFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Serve fake, enabled channel modules and record imports and starts."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        # The loop each import would bind, as lark_oapi.ws.client does at import.
+        self.import_loops: list[asyncio.AbstractEventLoop | None] = []
+
+    def find_spec(self, name, path=None, target=None):
+        if name in _CHANNEL_MODULES:
+            return importlib.util.spec_from_loader(name, self)
+        return None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module) -> None:
+        name = module.__name__
+        short = name.split(".")[-2]
+        self._events.append(f"import_{short}")
+        try:
+            self.import_loops.append(asyncio.get_event_loop())
+        except RuntimeError:
+            self.import_loops.append(None)
+        events = self._events
+
+        class _Channel:
+            enabled = True
+
+            async def start(self) -> None:
+                events.append(f"channel_start_{short}")
+
+        channel = _Channel()
+        setattr(module, _CHANNEL_MODULES[name], lambda: channel)
+
+
+@pytest.mark.usefixtures("unregister_startup_task_extensions")
+@pytest.mark.asyncio
+async def test_standby_preloads_channel_modules_but_only_activation_starts_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_startup(monkeypatch, events)
+    monkeypatch.setattr(
+        "xagent.web.app.get_shared_task_execution_enabled", lambda: False
+    )
+    # Undo the stub modules _patch_startup installed; the finder serves fresh ones.
+    for name in _CHANNEL_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+        del sys.modules[name]
+    for task_name in ("telegram_task", "feishu_task", "slack_task"):
+        # Activation stores its channel tasks here; keep them off later tests.
+        monkeypatch.setattr(app_module.app.state, task_name, None, raising=False)
+    finder = _RecordingChannelFinder(events)
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+
+    await app_module.startup_event()
+
+    assert {"import_feishu", "import_slack", "import_telegram"} <= set(events)
+    # lark_oapi binds its receive loop at import time: the preload must run on
+    # the serving event loop, never in a worker thread with a loop of its own.
+    running = asyncio.get_running_loop()
+    assert finder.import_loops and all(loop is running for loop in finder.import_loops)
+    assert not [e for e in events if e.startswith("channel_start_")]
+    assert standby.phase is StandbyPhase.STANDBY
+
+    await standby.activate()
+    await asyncio.sleep(0)
+
+    assert {
+        "channel_start_feishu",
+        "channel_start_slack",
+        "channel_start_telegram",
+    } <= set(events)
+    # The modules were imported once, in standby, not again at activation.
+    assert len([e for e in events if e.startswith("import_")]) == 3
 
 
 @pytest.mark.usefixtures("unregister_startup_task_extensions")

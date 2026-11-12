@@ -252,6 +252,57 @@ def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
         assert required <= set(check.arguments), (check.tool, required)
 
 
+def _linear_pin(
+    tool: str, field: str, item_keys: tuple[str, ...]
+) -> tuple[str, dict[str, Any], tuple[Assertion, ...]]:
+    return (
+        tool,
+        {"limit": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), (field, "truncated")),
+            EachHasKeys((field,), item_keys),
+            Length((field,), max=1),
+            IsType(("truncated",), "boolean"),
+        ),
+    )
+
+
+def _xero_unpaged_pin(
+    field: str,
+) -> tuple[str, dict[str, Any], tuple[Assertion, ...]]:
+    return (
+        f"list_{field}",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), (field, "total_count", "returned")),
+            IsType(("total_count",), "number"),
+            IsType((field,), "array"),
+            IsType(("returned",), "number"),
+        ),
+    )
+
+
+def _xero_paged_pin(
+    field: str, *, capped: bool = True
+) -> tuple[str, dict[str, Any], tuple[Assertion, ...]]:
+    # `GET /Quotes` has no `pageSize`, so the quotes check caps nothing.
+    cap: tuple[Assertion, ...] = (Length((field,), max=1),) if capped else ()
+    return (
+        f"list_{field}",
+        {"page_size": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), (field, "page", "page_size", "returned", "has_more")),
+            IsType(("has_more",), "boolean"),
+            IsType((field,), "array"),
+            *cap,
+            IsType(("returned",), "number"),
+        ),
+    )
+
+
 # The Tier 2 read checks (issue #3573): the tool, its arguments, and every
 # assertion, so dropping an item key or a whole assertion fails here.
 _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
@@ -444,6 +495,96 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             IsType(("truncated",), "boolean"),
         ),
     ),
+    "linear.list_teams": _linear_pin(
+        "linear_list_teams", "teams", ("id", "key", "name")
+    ),
+    "linear.list_projects": _linear_pin(
+        "linear_list_projects",
+        "projects",
+        ("id", "name", "status", "progress", "url", "teams"),
+    ),
+    "linear.search_users": _linear_pin(
+        "linear_search_users", "users", ("id", "name", "email", "active")
+    ),
+    "linear.search_issues": _linear_pin(
+        "linear_search_issues",
+        "issues",
+        (
+            "id",
+            "identifier",
+            "title",
+            "priority",
+            "url",
+            "createdAt",
+            "updatedAt",
+            "state",
+            "assignee",
+            "team",
+            "project",
+            "labels",
+        ),
+    ),
+    "intercom.list_conversations": (
+        "intercom_list_conversations",
+        {"state": "all", "limit": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("conversations", "total_count", "has_more", "next_cursor")),
+            EachHasKeys(
+                ("conversations",),
+                (
+                    "id",
+                    "state",
+                    "title",
+                    "subject",
+                    "preview",
+                    "created_at",
+                    "updated_at",
+                ),
+            ),
+            Length(("conversations",), max=1),
+            IsType(("has_more",), "boolean"),
+        ),
+    ),
+    "deputy.list_companies": (
+        "deputy_list_resource",
+        {"resource": "Company"},
+        (
+            StatusSuccess(),
+            HasKeys((), ("records", "truncated")),
+            IsType(("records",), "array"),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "deputy.employee_info": (
+        "deputy_resource_info",
+        {"resource": "Employee"},
+        (StatusSuccess(), HasKeys((), ("info",)), IsType(("info",), "object")),
+    ),
+    "employment-hero.list_organisations": (
+        "employment_hero_list_organisations",
+        {"item_per_page": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("organisations",)),
+            IsType(("organisations",), "object"),
+            HasKeys(("organisations",), ("items",)),
+            IsType(("organisations", "items"), "array"),
+            Length(("organisations", "items"), max=1),
+        ),
+    ),
+    "xero.list_accounts": _xero_unpaged_pin("accounts"),
+    "xero.list_contact_groups": _xero_unpaged_pin("contact_groups"),
+    "xero.list_items": _xero_unpaged_pin("items"),
+    "xero.list_tax_rates": _xero_unpaged_pin("tax_rates"),
+    "xero.list_tracking_categories": _xero_unpaged_pin("tracking_categories"),
+    "xero.list_contacts": _xero_paged_pin("contacts"),
+    "xero.list_invoices": _xero_paged_pin("invoices"),
+    "xero.list_credit_notes": _xero_paged_pin("credit_notes"),
+    "xero.list_bank_transactions": _xero_paged_pin("bank_transactions"),
+    "xero.list_payments": _xero_paged_pin("payments"),
+    "xero.list_quotes": _xero_paged_pin("quotes", capped=False),
+    "xero.list_manual_journals": _xero_paged_pin("manual_journals"),
 }
 
 
@@ -490,7 +631,20 @@ def test_a_tier_2_read_check_is_declared_exactly(
 
 
 @pytest.mark.parametrize(
-    "app_id", ["google-ads", "outlook", "planner", "sharepoint", "zendesk", "zoom"]
+    "app_id",
+    [
+        "deputy",
+        "employment-hero",
+        "google-ads",
+        "intercom",
+        "linear",
+        "outlook",
+        "planner",
+        "sharepoint",
+        "xero",
+        "zendesk",
+        "zoom",
+    ],
 )
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)

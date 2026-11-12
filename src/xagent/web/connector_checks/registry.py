@@ -187,35 +187,63 @@ def _declared_l3(app_id: str) -> ReadCheck:
     return check
 
 
-def _xero_list_check(list_field: str, tool: str, *, paged: bool) -> ReadCheck:
+def _xero_list_check(list_field: str, *, paged: bool, capped: bool = True) -> ReadCheck:
     """A structural read check on one of Xero's list tools that take no id.
 
-    Every Xero list answers ``{status, <list_field>: [...], returned}`` through
-    ``_unpaged_response`` (with ``total_count``) or ``_paged_response`` (with
-    ``page``, ``page_size`` and ``has_more``). The items are ``_compact`` views
-    that drop an empty field, so only the list and its paging facts are
-    asserted, never an item's keys.
+    The tool is ``list_<list_field>``. Every Xero list answers
+    ``{status, <list_field>: [...], returned}`` through ``_unpaged_response``
+    (with ``total_count``) or ``_paged_response`` (with ``page``, ``page_size``
+    and ``has_more``). The items are ``_compact`` views that drop an empty
+    field, so only the list and its paging facts are asserted, never an item's
+    keys.
+
+    A paged list is asked for one item and capped at one, unless ``capped`` is
+    false: ``GET /Quotes`` has no ``pageSize`` parameter (Xero's OpenAPI
+    description lists only ``page``), so a QA organisation with two quotes
+    answers both.
     """
+    tool = f"list_{list_field}"
     if paged:
         facts: tuple[Assertion, ...] = (
             HasKeys((), (list_field, "page", "page_size", "returned", "has_more")),
             IsType(("has_more",), "boolean"),
-            Length((list_field,), max=1),
+            # The type first: the judge stops at the first failure, and Length
+            # of a value that is not a list would report `length`.
+            IsType((list_field,), "array"),
+            *((Length((list_field,), max=1),) if capped else ()),
         )
     else:
         facts = (
             HasKeys((), (list_field, "total_count", "returned")),
             IsType(("total_count",), "number"),
+            IsType((list_field,), "array"),
         )
     return ReadCheck(
         f"xero.{tool}",
         tool,
         {"page_size": 1} if paged else {},
+        assertions=(StatusSuccess(), *facts, IsType(("returned",), "number")),
+    )
+
+
+def _linear_list_check(
+    tool_suffix: str, list_field: str, item_keys: tuple[str, ...]
+) -> ReadCheck:
+    """A structural read check on one of Linear's list or search tools.
+
+    Each answers ``{status, <list_field>: [...], truncated}``; the keys of an
+    item are the ones the tool's GraphQL selection always returns, null or not.
+    """
+    return ReadCheck(
+        f"linear.{tool_suffix}",
+        f"linear_{tool_suffix}",
+        {"limit": 1},
         assertions=(
             StatusSuccess(),
-            *facts,
-            IsType((list_field,), "array"),
-            IsType(("returned",), "number"),
+            HasKeys((), (list_field, "truncated")),
+            EachHasKeys((list_field,), item_keys),
+            Length((list_field,), max=1),
+            IsType(("truncated",), "boolean"),
         ),
     )
 
@@ -1465,71 +1493,31 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         "linear",
         reads=(
             _declared_l3("linear"),
-            ReadCheck(
-                "linear.list_teams",
-                "linear_list_teams",
-                {"limit": 1},
-                assertions=(
-                    StatusSuccess(),
-                    HasKeys((), ("teams", "truncated")),
-                    EachHasKeys(("teams",), ("id", "key", "name")),
-                    Length(("teams",), max=1),
-                    IsType(("truncated",), "boolean"),
-                ),
+            _linear_list_check("list_teams", "teams", ("id", "key", "name")),
+            _linear_list_check(
+                "list_projects",
+                "projects",
+                ("id", "name", "status", "progress", "url", "teams"),
             ),
-            ReadCheck(
-                "linear.list_projects",
-                "linear_list_projects",
-                {"limit": 1},
-                assertions=(
-                    StatusSuccess(),
-                    HasKeys((), ("projects", "truncated")),
-                    EachHasKeys(
-                        ("projects",),
-                        ("id", "name", "status", "progress", "url", "teams"),
-                    ),
-                    Length(("projects",), max=1),
-                    IsType(("truncated",), "boolean"),
-                ),
+            _linear_list_check(
+                "search_users", "users", ("id", "name", "email", "active")
             ),
-            ReadCheck(
-                "linear.search_users",
-                "linear_search_users",
-                {"limit": 1},
-                assertions=(
-                    StatusSuccess(),
-                    HasKeys((), ("users", "truncated")),
-                    EachHasKeys(("users",), ("id", "name", "email", "active")),
-                    Length(("users",), max=1),
-                    IsType(("truncated",), "boolean"),
-                ),
-            ),
-            ReadCheck(
-                "linear.search_issues",
-                "linear_search_issues",
-                {"limit": 1},
-                assertions=(
-                    StatusSuccess(),
-                    HasKeys((), ("issues", "truncated")),
-                    EachHasKeys(
-                        ("issues",),
-                        (
-                            "id",
-                            "identifier",
-                            "title",
-                            "priority",
-                            "url",
-                            "createdAt",
-                            "updatedAt",
-                            "state",
-                            "assignee",
-                            "team",
-                            "project",
-                            "labels",
-                        ),
-                    ),
-                    Length(("issues",), max=1),
-                    IsType(("truncated",), "boolean"),
+            _linear_list_check(
+                "search_issues",
+                "issues",
+                (
+                    "id",
+                    "identifier",
+                    "title",
+                    "priority",
+                    "url",
+                    "createdAt",
+                    "updatedAt",
+                    "state",
+                    "assignee",
+                    "team",
+                    "project",
+                    "labels",
                 ),
             ),
         ),
@@ -1552,7 +1540,10 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ReadCheck(
                 "intercom.list_conversations",
                 "intercom_list_conversations",
-                {"limit": 1},
+                # Not the L3 probe's call: its default `state` is "open", which
+                # a QA workspace usually has no conversation in, and the item
+                # keys would never be asserted.
+                {"state": "all", "limit": 1},
                 assertions=(
                     StatusSuccess(),
                     HasKeys(
@@ -1664,20 +1655,18 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         "xero",
         reads=(
             _declared_l3("xero"),
-            _xero_list_check("accounts", "list_accounts", paged=False),
-            _xero_list_check("contact_groups", "list_contact_groups", paged=False),
-            _xero_list_check("items", "list_items", paged=False),
-            _xero_list_check("tax_rates", "list_tax_rates", paged=False),
-            _xero_list_check(
-                "tracking_categories", "list_tracking_categories", paged=False
-            ),
-            _xero_list_check("contacts", "list_contacts", paged=True),
-            _xero_list_check("invoices", "list_invoices", paged=True),
-            _xero_list_check("credit_notes", "list_credit_notes", paged=True),
-            _xero_list_check("bank_transactions", "list_bank_transactions", paged=True),
-            _xero_list_check("payments", "list_payments", paged=True),
-            _xero_list_check("quotes", "list_quotes", paged=True),
-            _xero_list_check("manual_journals", "list_manual_journals", paged=True),
+            _xero_list_check("accounts", paged=False),
+            _xero_list_check("contact_groups", paged=False),
+            _xero_list_check("items", paged=False),
+            _xero_list_check("tax_rates", paged=False),
+            _xero_list_check("tracking_categories", paged=False),
+            _xero_list_check("contacts", paged=True),
+            _xero_list_check("invoices", paged=True),
+            _xero_list_check("credit_notes", paged=True),
+            _xero_list_check("bank_transactions", paged=True),
+            _xero_list_check("payments", paged=True),
+            _xero_list_check("quotes", paged=True, capped=False),
+            _xero_list_check("manual_journals", paged=True),
         ),
         exemptions=_exemptions(
             issue=_TIER_2,

@@ -1,73 +1,38 @@
 """Smoke V2 Tier 2 checks of linear, intercom, deputy, employment-hero and xero (#3573).
 
-Each connector keeps its L3 call and adds structural read checks on the list
-tools that take no object id; every other tool is exempted, because Tier 2
-seeds no objects and runs no write checks. A check runs the real tool with the
-vendor call replaced by a realistic answer and judges what the tool returns, so
-a tool whose output shape drifts from its declaration fails here, not on the
-QA member.
+The declarations are pinned in ``test_registry.py`` (``_TIER_2_READS``). This
+runs each declared call against the real tool with only the vendor request
+replaced by a realistic answer, judges what the tool returns with the check's
+own assertions, and records the request, so a tool whose output shape drifts
+from its declaration, or that stops sending the page size a check relies on,
+fails here and not on the QA member.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any
 
 import pytest
 
 from xagent.web.connector_checks.assertions import judge_result
-from xagent.web.connector_checks.declarations import (
-    Assertion,
-    EachHasKeys,
-    HasKeys,
-    IsType,
-    Length,
-    ReadCheck,
-    StatusSuccess,
-)
+from xagent.web.connector_checks.declarations import ReadCheck
 from xagent.web.connector_checks.registry import (
     _TIER_2,
     CONNECTOR_CHECKS,
     WRITE_WITHOUT_CLEANUP,
-    l3_read_check,
 )
 from xagent.web.connector_checks.results import FailureClass
 from xagent.web.tools.mcp import deputy, employment_hero, intercom, linear, xero
 
-APPS = ("linear", "intercom", "deputy", "employment-hero", "xero")
-
-_XERO_UNPAGED = {
-    "xero.list_accounts": ("accounts", "list_accounts", "Accounts"),
-    "xero.list_contact_groups": (
-        "contact_groups",
-        "list_contact_groups",
-        "ContactGroups",
-    ),
-    "xero.list_items": ("items", "list_items", "Items"),
-    "xero.list_tax_rates": ("tax_rates", "list_tax_rates", "TaxRates"),
-    "xero.list_tracking_categories": (
-        "tracking_categories",
-        "list_tracking_categories",
-        "TrackingCategories",
-    ),
-}
-_XERO_PAGED = {
-    "xero.list_contacts": ("contacts", "list_contacts", "Contacts"),
-    "xero.list_invoices": ("invoices", "list_invoices", "Invoices"),
-    "xero.list_credit_notes": ("credit_notes", "list_credit_notes", "CreditNotes"),
-    "xero.list_bank_transactions": (
-        "bank_transactions",
-        "list_bank_transactions",
-        "BankTransactions",
-    ),
-    "xero.list_payments": ("payments", "list_payments", "Payments"),
-    "xero.list_quotes": ("quotes", "list_quotes", "Quotes"),
-    "xero.list_manual_journals": (
-        "manual_journals",
-        "list_manual_journals",
-        "ManualJournals",
-    ),
+MODULES: dict[str, ModuleType] = {
+    "linear": linear,
+    "intercom": intercom,
+    "deputy": deputy,
+    "employment-hero": employment_hero,
+    "xero": xero,
 }
 
 
@@ -78,19 +43,6 @@ def _check(check_id: str) -> ReadCheck:
     return check
 
 
-def _result(payload: str) -> dict[str, Any]:
-    return {
-        "content": [{"type": "text", "text": payload}],
-        "structured_content": None,
-        "is_error": False,
-    }
-
-
-def _judge(check_id: str, payload: str) -> tuple[FailureClass | None, str | None]:
-    check = _check(check_id)
-    return judge_result(_result(payload), check.payload, check.assertions)
-
-
 def _structural_ids(app_id: str) -> list[str]:
     return [
         c.id
@@ -99,29 +51,38 @@ def _structural_ids(app_id: str) -> list[str]:
     ]
 
 
+ALL_IDS = [cid for app in MODULES for cid in _structural_ids(app)]
+
+
+def _judge(check_id: str, output: str) -> tuple[FailureClass | None, str | None]:
+    check = _check(check_id)
+    raw = {
+        "content": [{"type": "text", "text": output}],
+        "structured_content": None,
+        "is_error": False,
+    }
+    return judge_result(raw, check.payload, check.assertions)
+
+
+def _run(check_id: str) -> str:
+    """The check's own call, made on the real tool: its arguments must fit it."""
+    check = _check(check_id)
+    tool: Callable[..., str] = getattr(MODULES[check_id.split(".", 1)[0]], check.tool)
+    return tool(**check.arguments)
+
+
 # --- what is declared ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("app_id", APPS)
-def test_each_connector_keeps_its_probe_derived_l3_check(app_id: str) -> None:
-    expected = l3_read_check(app_id)
-    assert expected is not None
-
-    l3_checks = [
-        c for c in CONNECTOR_CHECKS[app_id].reads if c.id == f"{app_id}.l3_probe"
-    ]
-    assert l3_checks == [expected]
-
-
-@pytest.mark.parametrize("app_id", APPS)
+@pytest.mark.parametrize("app_id", MODULES)
 def test_tier_2_declares_reads_only(app_id: str) -> None:
     checks = CONNECTOR_CHECKS[app_id]
 
     assert checks.writes == () and checks.sweep is None
-    assert len(_structural_ids(app_id)) >= 1
+    assert _structural_ids(app_id)
 
 
-@pytest.mark.parametrize("app_id", APPS)
+@pytest.mark.parametrize("app_id", MODULES)
 def test_every_exemption_names_tier_2_or_says_why_it_has_no_cleanup(
     app_id: str,
 ) -> None:
@@ -131,149 +92,20 @@ def test_every_exemption_names_tier_2_or_says_why_it_has_no_cleanup(
         ), (app_id, exemption.tool)
 
 
-# What each check calls: the tool and its arguments. A resource of Deputy is an
-# object type, not an object id.
-_CALLS: dict[str, tuple[str, dict[str, Any]]] = {
-    "linear.list_teams": ("linear_list_teams", {"limit": 1}),
-    "linear.list_projects": ("linear_list_projects", {"limit": 1}),
-    "linear.search_users": ("linear_search_users", {"limit": 1}),
-    "linear.search_issues": ("linear_search_issues", {"limit": 1}),
-    "intercom.list_conversations": ("intercom_list_conversations", {"limit": 1}),
-    "deputy.list_companies": ("deputy_list_resource", {"resource": "Company"}),
-    "deputy.employee_info": ("deputy_resource_info", {"resource": "Employee"}),
-    "employment-hero.list_organisations": (
-        "employment_hero_list_organisations",
-        {"item_per_page": 1},
-    ),
-    **{cid: (tool, {}) for cid, (_, tool, _) in _XERO_UNPAGED.items()},
-    **{cid: (tool, {"page_size": 1}) for cid, (_, tool, _) in _XERO_PAGED.items()},
-}
-
-_LINEAR_ITEM_KEYS: dict[str, tuple[str, ...]] = {
-    "teams": ("id", "key", "name"),
-    "projects": ("id", "name", "status", "progress", "url", "teams"),
-    "users": ("id", "name", "email", "active"),
-    "issues": (
-        "id",
-        "identifier",
-        "title",
-        "priority",
-        "url",
-        "createdAt",
-        "updatedAt",
-        "state",
-        "assignee",
-        "team",
-        "project",
-        "labels",
-    ),
-}
-_INTERCOM_KEYS = (
-    "id",
-    "state",
-    "title",
-    "subject",
-    "preview",
-    "created_at",
-    "updated_at",
-)
+# --- what the tools really return, and what they send ------------------------------
 
 
-def _expected_assertions(check_id: str) -> tuple[Assertion, ...]:
-    """What each check must assert, built here and not read from the registry."""
-    if check_id.startswith("linear."):
-        field = {"list_teams": "teams", "list_projects": "projects"}.get(
-            check_id.split(".")[1], check_id.split("_")[-1]
-        )
-        return (
-            StatusSuccess(),
-            HasKeys((), (field, "truncated")),
-            EachHasKeys((field,), _LINEAR_ITEM_KEYS[field]),
-            Length((field,), max=1),
-            IsType(("truncated",), "boolean"),
-        )
-    if check_id == "intercom.list_conversations":
-        return (
-            StatusSuccess(),
-            HasKeys((), ("conversations", "total_count", "has_more", "next_cursor")),
-            EachHasKeys(("conversations",), _INTERCOM_KEYS),
-            Length(("conversations",), max=1),
-            IsType(("has_more",), "boolean"),
-        )
-    if check_id == "deputy.list_companies":
-        return (
-            StatusSuccess(),
-            HasKeys((), ("records", "truncated")),
-            IsType(("records",), "array"),
-            IsType(("truncated",), "boolean"),
-        )
-    if check_id == "deputy.employee_info":
-        return (StatusSuccess(), HasKeys((), ("info",)), IsType(("info",), "object"))
-    if check_id == "employment-hero.list_organisations":
-        return (
-            StatusSuccess(),
-            HasKeys((), ("organisations",)),
-            IsType(("organisations",), "object"),
-            HasKeys(("organisations",), ("items",)),
-            IsType(("organisations", "items"), "array"),
-            Length(("organisations", "items"), max=1),
-        )
-    if check_id in _XERO_UNPAGED:
-        field = _XERO_UNPAGED[check_id][0]
-        return (
-            StatusSuccess(),
-            HasKeys((), (field, "total_count", "returned")),
-            IsType(("total_count",), "number"),
-            IsType((field,), "array"),
-            IsType(("returned",), "number"),
-        )
-    field = _XERO_PAGED[check_id][0]
-    return (
-        StatusSuccess(),
-        HasKeys((), (field, "page", "page_size", "returned", "has_more")),
-        IsType(("has_more",), "boolean"),
-        Length((field,), max=1),
-        IsType((field,), "array"),
-        IsType(("returned",), "number"),
-    )
+class _Capture:
+    """The vendor requests of one tool call."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, Any]] = []
 
 
-@pytest.mark.parametrize("check_id", sorted(_CALLS))
-def test_a_tier_2_read_check_is_declared_exactly(check_id: str) -> None:
-    tool, arguments = _CALLS[check_id]
-    check = _check(check_id)
-
-    assert (check.tool, dict(check.arguments)) == (tool, arguments)
-    assert check.assertions == _expected_assertions(check_id)
-    assert not check.require_read_only_hint  # an in-repo server, not vendor-owned
-
-
-def test_every_structural_check_is_one_of_those_declared_here() -> None:
-    declared = {cid for app in APPS for cid in _structural_ids(app)}
-
-    assert declared == set(_CALLS)
-
-
-# --- what the tools really return -------------------------------------------------
-
-
-def _linear(field: str, item: dict[str, Any], count: int):
-    return lambda *a, **k: (
-        {field: {"nodes": [item] * count, "pageInfo": {"hasNextPage": False}}},
-        None,
-    )
-
-
-_LINEAR_ITEMS = {
-    "teams": (
-        "linear_list_teams",
-        "teams",
-        {"id": "t1", "key": "ENG", "name": "Engineering"},
-    ),
-    "projects": (
-        "linear_list_projects",
-        "projects",
-        {
+def _linear_node(field: str) -> dict[str, Any]:
+    nodes: dict[str, dict[str, Any]] = {
+        "teams": {"id": "t1", "key": "ENG", "name": "Engineering"},
+        "projects": {
             "id": "p1",
             "name": "Roadmap",
             "status": {"id": "s1", "name": "Planned", "type": "planned"},
@@ -281,16 +113,13 @@ _LINEAR_ITEMS = {
             "url": "https://linear.app/x/project/roadmap",
             "teams": {"nodes": [{"id": "t1", "key": "ENG", "name": "Engineering"}]},
         },
-    ),
-    "users": (
-        "linear_search_users",
-        "users",
-        {"id": "u1", "name": "Ada", "email": "ada@example.com", "active": True},
-    ),
-    "issues": (
-        "linear_search_issues",
-        "issues",
-        {
+        "users": {
+            "id": "u1",
+            "name": "Ada",
+            "email": "ada@example.com",
+            "active": True,
+        },
+        "issues": {
             "id": "i1",
             "identifier": "ENG-1",
             "title": "A bug",
@@ -305,29 +134,44 @@ _LINEAR_ITEMS = {
             "project": None,
             "labels": {"nodes": []},
         },
-    ),
+    }
+    return nodes[field]
+
+
+_LINEAR = {
+    "linear.list_teams": "teams",
+    "linear.list_projects": "projects",
+    "linear.search_users": "users",
+    "linear.search_issues": "issues",
 }
 
 
 @pytest.mark.parametrize("count", [0, 1])
-@pytest.mark.parametrize("field", sorted(_LINEAR_ITEMS))
-def test_a_linear_list_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch, field: str, count: int
+@pytest.mark.parametrize("check_id", sorted(_LINEAR))
+def test_a_linear_list_output_satisfies_its_declaration_and_asks_for_one_item(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
 ) -> None:
-    tool, graphql_field, item = _LINEAR_ITEMS[field]
-    monkeypatch.setattr(linear, "_graphql", _linear(graphql_field, item, count))
-    check_id = next(c for c in _CALLS if _CALLS[c][0] == tool)
+    field = _LINEAR[check_id]
+    seen = _Capture()
 
-    assert _judge(check_id, getattr(linear, tool)(**_CALLS[check_id][1])) == (
-        None,
-        None,
-    )
+    def graphql(query: str, variables: dict[str, Any] | None = None):
+        seen.requests.append(variables or {})
+        return (
+            {field: {"nodes": [_linear_node(field)] * count, "pageInfo": {}}},
+            None,
+        )
+
+    monkeypatch.setattr(linear, "_graphql", graphql)
+
+    assert _judge(check_id, _run(check_id)) == (None, None)
+    assert any(v.get("first") == 1 for v in seen.requests), seen.requests
 
 
 @pytest.mark.parametrize("count", [0, 1])
-def test_intercom_list_output_satisfies_its_declaration(
+def test_intercom_list_output_satisfies_its_declaration_and_asks_for_one_item(
     monkeypatch: pytest.MonkeyPatch, count: int
 ) -> None:
+    seen = _Capture()
     conversation = {
         "id": "1",
         "state": "open",
@@ -336,19 +180,28 @@ def test_intercom_list_output_satisfies_its_declaration(
         "created_at": 1700000000,
         "updated_at": 1700000100,
     }
-    monkeypatch.setattr(
-        intercom,
-        "_request",
-        lambda *a, **k: {
+
+    def request(method: str, path: str, *, body: dict[str, Any] | None = None):
+        seen.requests.append(body or {})
+        return {
             "conversations": [conversation] * count,
             "total_count": count,
             "pages": {},
-        },
+        }
+
+    monkeypatch.setattr(intercom, "_request", request)
+
+    assert _judge(
+        "intercom.list_conversations", _run("intercom.list_conversations")
+    ) == (
+        None,
+        None,
     )
-
-    output = intercom.intercom_list_conversations(limit=1)
-
-    assert _judge("intercom.list_conversations", output) == (None, None)
+    (body,) = seen.requests
+    assert body["pagination"]["per_page"] == 1
+    # "all" is not a state filter: an open-only call would miss a closed
+    # conversation, the only kind a QA workspace may hold.
+    assert body["query"]["field"] != "state"
 
 
 @pytest.mark.parametrize("count", [0, 1])
@@ -359,9 +212,10 @@ def test_deputy_list_output_satisfies_its_declaration(
         deputy, "_request", lambda *a, **k: [{"Id": 1, "CompanyName": "Demo"}] * count
     )
 
-    output = deputy.deputy_list_resource(resource="Company")
-
-    assert _judge("deputy.list_companies", output) == (None, None)
+    assert _judge("deputy.list_companies", _run("deputy.list_companies")) == (
+        None,
+        None,
+    )
 
 
 def test_deputy_a_null_list_is_an_empty_one_and_still_satisfies_the_declaration(
@@ -370,9 +224,10 @@ def test_deputy_a_null_list_is_an_empty_one_and_still_satisfies_the_declaration(
     # Deputy serializes "no records" as null on some installs.
     monkeypatch.setattr(deputy, "_request", lambda *a, **k: None)
 
-    output = deputy.deputy_list_resource(resource="Company")
-
-    assert _judge("deputy.list_companies", output) == (None, None)
+    assert _judge("deputy.list_companies", _run("deputy.list_companies")) == (
+        None,
+        None,
+    )
 
 
 def test_deputy_resource_info_output_satisfies_its_declaration(
@@ -384,19 +239,18 @@ def test_deputy_resource_info_output_satisfies_its_declaration(
         lambda *a, **k: {"fields": {"Id": "Integer"}, "assocs": {}, "joins": {}},
     )
 
-    output = deputy.deputy_resource_info(resource="Employee")
-
-    assert _judge("deputy.employee_info", output) == (None, None)
+    assert _judge("deputy.employee_info", _run("deputy.employee_info")) == (None, None)
 
 
 @pytest.mark.parametrize("count", [0, 1])
-def test_employment_hero_organisations_output_satisfies_its_declaration(
+def test_employment_hero_organisations_output_satisfies_its_declaration_and_asks_for_one(
     monkeypatch: pytest.MonkeyPatch, count: int
 ) -> None:
-    monkeypatch.setattr(
-        employment_hero,
-        "_request",
-        lambda *a, **k: {
+    seen = _Capture()
+
+    def request(method: str, path: str, *, params: dict[str, Any] | None = None, **k):
+        seen.requests.append(params or {})
+        return {
             "data": {
                 "items": [{"id": "o1", "name": "Demo", "country": "AU"}] * count,
                 "page_index": 1,
@@ -404,12 +258,50 @@ def test_employment_hero_organisations_output_satisfies_its_declaration(
                 "total_items": count,
                 "total_pages": 1,
             }
-        },
-    )
+        }
 
-    output = employment_hero.employment_hero_list_organisations(item_per_page=1)
+    monkeypatch.setattr(employment_hero, "_request", request)
 
-    assert _judge("employment-hero.list_organisations", output) == (None, None)
+    check_id = "employment-hero.list_organisations"
+    assert _judge(check_id, _run(check_id)) == (None, None)
+    assert [r.get("item_per_page") for r in seen.requests] == [1]
+
+
+# What a Xero list is called in the vendor's answer.
+_XERO_UNPAGED = {
+    "xero.list_accounts": "Accounts",
+    "xero.list_contact_groups": "ContactGroups",
+    "xero.list_items": "Items",
+    "xero.list_tax_rates": "TaxRates",
+    "xero.list_tracking_categories": "TrackingCategories",
+}
+# Every paged list but quotes sends `pageSize`; `GET /Quotes` has none.
+_XERO_PAGED_CAPPED = {
+    "xero.list_contacts": "Contacts",
+    "xero.list_invoices": "Invoices",
+    "xero.list_credit_notes": "CreditNotes",
+    "xero.list_bank_transactions": "BankTransactions",
+    "xero.list_payments": "Payments",
+    "xero.list_manual_journals": "ManualJournals",
+}
+
+
+def _xero_request(
+    seen: _Capture, vendor_key: str, count: int, *, pagination: bool
+) -> Callable[..., Any]:
+    def request(method: str, path: str, *, params: dict[str, Any] | None = None, **k):
+        seen.requests.append(params or {})
+        answer: dict[str, Any] = {vendor_key: [{}] * count}
+        if pagination:
+            answer["pagination"] = {
+                "page": 1,
+                "pageSize": 1,
+                "pageCount": 1,
+                "itemCount": count,
+            }
+        return answer
+
+    return request
 
 
 @pytest.mark.parametrize("count", [0, 1])
@@ -417,60 +309,62 @@ def test_employment_hero_organisations_output_satisfies_its_declaration(
 def test_a_xero_unpaged_list_output_satisfies_its_declaration(
     monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
 ) -> None:
-    _, tool, vendor_key = _XERO_UNPAGED[check_id]
-    monkeypatch.setattr(xero, "_request", lambda *a, **k: {vendor_key: [{}] * count})
-
-    assert _judge(check_id, getattr(xero, tool)()) == (None, None)
-
-
-@pytest.mark.parametrize("count", [0, 1])
-@pytest.mark.parametrize("check_id", sorted(_XERO_PAGED))
-def test_a_xero_paged_list_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
-) -> None:
-    _, tool, vendor_key = _XERO_PAGED[check_id]
     monkeypatch.setattr(
         xero,
         "_request",
-        lambda *a, **k: {
-            vendor_key: [{}] * count,
-            "pagination": {
-                "page": 1,
-                "pageSize": 1,
-                "pageCount": 1,
-                "itemCount": count,
-            },
-        },
+        _xero_request(_Capture(), _XERO_UNPAGED[check_id], count, pagination=False),
     )
 
-    assert _judge(check_id, getattr(xero, tool)(page_size=1)) == (None, None)
+    assert _judge(check_id, _run(check_id)) == (None, None)
 
 
-def test_a_xero_list_without_a_pagination_block_still_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("count", [0, 1])
+@pytest.mark.parametrize("check_id", sorted(_XERO_PAGED_CAPPED))
+def test_a_xero_paged_list_output_satisfies_its_declaration_and_asks_for_one_item(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
 ) -> None:
-    # Some endpoints carry none: the tool falls back to "a full page may have more".
-    monkeypatch.setattr(xero, "_request", lambda *a, **k: {"Quotes": [{}]})
+    seen = _Capture()
+    monkeypatch.setattr(
+        xero,
+        "_request",
+        _xero_request(seen, _XERO_PAGED_CAPPED[check_id], count, pagination=True),
+    )
 
-    assert _judge("xero.list_quotes", xero.list_quotes(page_size=1)) == (None, None)
+    assert _judge(check_id, _run(check_id)) == (None, None)
+    assert [r.get("pageSize") for r in seen.requests] == [1]
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_xero_quotes_answer_a_whole_page_because_the_vendor_has_no_page_size(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    # `GET /Quotes` takes only `page` and answers no pagination block, so an
+    # organisation with several quotes answers all of them to a page_size of 1.
+    monkeypatch.setattr(
+        xero,
+        "_request",
+        _xero_request(_Capture(), "Quotes", count, pagination=False),
+    )
+
+    assert _judge("xero.list_quotes", _run("xero.list_quotes")) == (None, None)
 
 
 # --- what a check rejects ----------------------------------------------------------
 
 
-@pytest.mark.parametrize("check_id", sorted(_CALLS))
+@pytest.mark.parametrize("check_id", ALL_IDS)
 def test_a_check_fails_on_a_tool_error_envelope(check_id: str) -> None:
     # A rejected token or a malformed request: the tool reports it in its own
     # envelope with the MCP error flag unset.
-    payload = json.dumps({"status": "error", "message": "401 Unauthorized"})
+    output = json.dumps({"status": "error", "message": "401 Unauthorized"})
 
-    assert _judge(check_id, payload) == (
+    assert _judge(check_id, output) == (
         FailureClass.ASSERTION_FAILED,
         "status_success",
     )
 
 
-@pytest.mark.parametrize("check_id", sorted(_CALLS))
+@pytest.mark.parametrize("check_id", ALL_IDS)
 def test_a_check_fails_when_the_list_is_missing(check_id: str) -> None:
     assert _judge(check_id, json.dumps({"status": "success"})) == (
         FailureClass.ASSERTION_FAILED,
@@ -538,6 +432,20 @@ def test_a_check_fails_when_the_list_is_missing(check_id: str) -> None:
             },
             "length",
         ),
+        # Not a list at all: the type is judged before the length, so this is
+        # reported as what is wrong with it.
+        (
+            "xero.list_invoices",
+            {
+                "status": "success",
+                "invoices": "none",
+                "page": 1,
+                "page_size": 1,
+                "returned": 0,
+                "has_more": False,
+            },
+            "is_type",
+        ),
     ],
 )
 def test_a_check_fails_on_another_shape(
@@ -547,14 +455,3 @@ def test_a_check_fails_on_another_shape(
         FailureClass.ASSERTION_FAILED,
         reason,
     )
-
-
-def test_the_list_checks_use_a_named_tool_of_the_server() -> None:
-    """Each tool a check calls exists, under that name, in its server module."""
-    modules: dict[str, Callable[..., str]] = {}
-    for app_module in (deputy, employment_hero, intercom, linear, xero):
-        for name in dir(app_module):
-            modules[name] = getattr(app_module, name)
-
-    for check_id, (tool, _) in _CALLS.items():
-        assert callable(modules.get(tool)), (check_id, tool)

@@ -6399,7 +6399,7 @@ async def delete_collection_api(
         if _user.is_admin
         else _get_collection_delete_mode(safe_collection, int(_user.id), is_admin=False)
     )
-    # Config-only entries hold no collection data; only the data path is gated.
+    # A config-only delete removes just the caller's config row; only the data path is gated.
     if delete_mode == "full":
         await ensure_collection_writable_async(safe_collection)
     notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
@@ -6462,7 +6462,7 @@ async def batch_delete_collections_api(
                         safe_name, int(effective_user.id), is_admin=False
                     )
                 )
-                # Config-only entries hold no collection data; only gate data deletes.
+                # A config-only delete removes just the caller's config row; gate data deletes only.
                 if delete_mode == "full":
                     async with admitted_async(safe_name):
                         notify_knowledge_base_deleted(

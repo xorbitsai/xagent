@@ -1401,3 +1401,30 @@ async def test_rename_route_admission_covers_the_target_in_the_coordinator_leg()
         )
 
     assert sorted(renamed) == ["metadata", "status", "vector"]
+
+
+@pytest.mark.asyncio
+async def test_non_admin_full_delete_of_a_frozen_collection_is_refused() -> None:
+    from unittest.mock import patch
+
+    from xagent.web.api.kb import delete_collection_api
+
+    user, db, access = _migration_mocks()
+    user.is_admin = False
+    _freeze_state("kb")
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._get_collection_delete_mode", return_value="full"),
+        patch("xagent.web.api.kb.notify_knowledge_base_deleted") as notify,
+        patch("xagent.web.api.kb._perform_kb_collection_delete") as perform,
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_collection_api(collection_name="kb", _user=user, db=db)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "kb_collection_migrating"
+    notify.assert_not_called()
+    perform.assert_not_called()

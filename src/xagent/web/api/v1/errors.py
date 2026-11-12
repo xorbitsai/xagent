@@ -156,6 +156,16 @@ class V1ErrorCode(str, Enum):
     # names the holder's own connector when the exact name is theirs.
     CONNECTOR_NAME_CONFLICT = "connector_name_conflict"
 
+    # The connector cannot be changed or deleted through the API: it is a
+    # catalog app connection, or a connector with OAuth connections that
+    # another account (such as an automation account) manages through the
+    # holder's link. 409.
+    CONNECTOR_NOT_EDITABLE = "connector_not_editable"
+
+    # The key holder may see the connector but may not change it: the team
+    # shares it, or the web rules deny the holder this change. 403.
+    CONNECTOR_FORBIDDEN = "connector_forbidden"
+
     # The connector cannot be started from the API. 409.
     # ``details.reason`` says why: ``team_shared`` or ``disabled`` from the
     # check made before anything starts; otherwise the connector session's own
@@ -270,6 +280,12 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "This connector name is already in use or reserved. Connector names are "
         "unique across all users and are compared case-insensitively, treating "
         "spaces, hyphens and underscores as the same character."
+    ),
+    V1ErrorCode.CONNECTOR_NOT_EDITABLE: (
+        "This connector can only be changed in the web app."
+    ),
+    V1ErrorCode.CONNECTOR_FORBIDDEN: (
+        "You do not have permission to change this connector."
     ),
     V1ErrorCode.CONNECTOR_UNAVAILABLE: (
         "This connector cannot be started from the API; details.reason says why."

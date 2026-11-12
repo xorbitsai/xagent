@@ -24,6 +24,8 @@ from ...models.user import User
 from ...schemas.v1 import (
     V1McpServer,
     V1McpServerCreateRequest,
+    V1McpServerDeleteResponse,
+    V1McpServerEnabledRequest,
     V1McpServerTools,
     V1McpTool,
     V1McpToolLoadFailure,
@@ -132,6 +134,18 @@ def _is_bad_request(exc: HTTPException) -> bool:
     return exc.status_code == 400
 
 
+def _has_status(
+    status_code: int,
+) -> Callable[[HTTPException, str, Sequence[str]], bool]:
+    return lambda exc, _name, _secrets: exc.status_code == status_code
+
+
+_MANAGED_ELSEWHERE_MESSAGE = (
+    "This connector has connections managed outside your account; remove it in "
+    "the web app."
+)
+
+
 # The first matching row wins; the last row matches every remaining failure.
 _MCP_WRITE_ERROR_ROWS: tuple[_WriteErrorRow, ...] = (
     _WriteErrorRow(
@@ -175,6 +189,27 @@ _MCP_WRITE_ERROR_ROWS: tuple[_WriteErrorRow, ...] = (
         400,
         V1ErrorCode.INVALID_INPUT,
         _no_message,
+    ),
+    _WriteErrorRow(
+        "forbidden",
+        _has_status(403),
+        403,
+        V1ErrorCode.CONNECTOR_FORBIDDEN,
+        _no_message,
+    ),
+    _WriteErrorRow(
+        "not_found",
+        _has_status(404),
+        404,
+        V1ErrorCode.CONNECTOR_NOT_FOUND,
+        _no_message,
+    ),
+    _WriteErrorRow(
+        "managed_elsewhere",
+        _has_status(409),
+        409,
+        V1ErrorCode.CONNECTOR_NOT_EDITABLE,
+        lambda _exc, _name, _secrets: _MANAGED_ELSEWHERE_MESSAGE,
     ),
     _WriteErrorRow(
         "internal_error",
@@ -359,6 +394,66 @@ async def create_mcp_server(
             requested_name=request.name,
             secrets=_request_secrets(request),
             owned_connector_id=owned,
+        )
+
+
+@router.delete("/{server_id}", response_model=V1McpServerDeleteResponse)
+async def delete_mcp_server(
+    server_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1McpServerDeleteResponse:
+    """Delete one of the key holder's connectors.
+
+    This removes the holder's link to the connector; the definition goes with
+    the last link, unless the team keeps it. A connector the holder cannot
+    see answers 404; one seen only through the team answers 403
+    ``connector_forbidden``; a catalog app connection, or a connector with
+    OAuth connections that another account (such as an automation account)
+    manages through your link, answers 409 ``connector_not_editable``.
+    """
+    user, key = authed
+    try:
+        await McpServerManagementRuntime().delete_server(
+            user_id=int(user.id), key_prefix=key.key_prefix, server_id=server_id
+        )
+    except HTTPException as exc:
+        _raise_v1_from_mcp_write_error(
+            exc, action="delete", requested_name="", secrets=()
+        )
+    return V1McpServerDeleteResponse(id=server_id)
+
+
+@router.put("/{server_id}/enabled", response_model=V1McpServer)
+async def set_mcp_server_enabled(
+    request: V1McpServerEnabledRequest,
+    server_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1McpServer:
+    """Switch one of the key holder's connectors on or off.
+
+    Setting the value a connector already has is not an error. Only the
+    holder's own switch changes; catalog and non-remote connectors can be
+    switched too. A connector seen only through the team answers 403
+    ``connector_forbidden``.
+    """
+    user, key = authed
+    try:
+        return await McpServerManagementRuntime().set_enabled(
+            user_id=int(user.id),
+            key_prefix=key.key_prefix,
+            server_id=server_id,
+            enabled=request.enabled,
+        )
+    except HTTPException as exc:
+        _raise_v1_from_mcp_write_error(
+            exc,
+            action="enable" if request.enabled else "disable",
+            requested_name="",
+            secrets=(),
         )
 
 

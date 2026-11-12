@@ -27,7 +27,14 @@ Design notes:
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StringConstraints,
+)
 
 from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
 from .agent import PromptContextFieldDeclaration, PromptContextFieldList
@@ -677,6 +684,20 @@ class V1McpServerCreateRequest(BaseModel):
     enabled: bool = Field(
         True, description="Whether the connector starts switched on for the holder."
     )
+
+
+class V1McpServerEnabledRequest(BaseModel):
+    """Body for ``PUT /v1/mcp-servers/{server_id}/enabled``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: StrictBool = Field(
+        ..., description="Whether the connector is switched on for the key holder."
+    )
+
+
+class V1McpServerDeleteResponse(BaseModel):
+    id: int
 
 
 class CreateTaskResponse(BaseModel):

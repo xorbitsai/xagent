@@ -235,20 +235,25 @@ def _own_routes() -> list[tuple[str, str]]:
         ("GET", "/v1/mcp-servers/{server_id}"),
         ("POST", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}/tools"),
+        ("DELETE", "/v1/mcp-servers/{server_id}"),
+        ("PUT", "/v1/mcp-servers/{server_id}/enabled"),
     ],
 )
 def test_mcp_routes_accept_only_personal_keys(method, path, kind):
     assert _own_routes() == [
+        ("DELETE", "/v1/mcp-servers/{server_id}"),
         ("GET", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}"),
         ("GET", "/v1/mcp-servers/{server_id}/tools"),
         ("POST", "/v1/mcp-servers"),
+        ("PUT", "/v1/mcp-servers/{server_id}/enabled"),
     ]
+    bodies = {"POST": _create_body(), "PUT": {"enabled": True}}
     resp = client.request(
         method,
         path.replace("{server_id}", "1"),
         headers=_headers_for(kind),
-        json=_create_body() if method == "POST" else None,
+        json=bodies.get(method),
     )
     _error(resp, 401, "invalid_api_key")
 
@@ -1637,6 +1642,28 @@ _ROW_CASES: list[tuple[str, HTTPException, int, str, str]] = [
         _DEFAULT_INVALID_INPUT,
     ),
     (
+        "forbidden",
+        HTTPException(403, f"Not allowed: {_REQUEST_SECRET_VALUES[0]}"),
+        403,
+        "connector_forbidden",
+        _DEFAULT_MESSAGES[V1ErrorCode.CONNECTOR_FORBIDDEN],
+    ),
+    (
+        "not_found",
+        HTTPException(404, f"MCP server not found {_REQUEST_SECRET_VALUES[1]}"),
+        404,
+        "connector_not_found",
+        _DEFAULT_MESSAGES[V1ErrorCode.CONNECTOR_NOT_FOUND],
+    ),
+    (
+        "managed_elsewhere",
+        HTTPException(409, f"Has connections: {_REQUEST_SECRET_VALUES[0]}"),
+        409,
+        "connector_not_editable",
+        "This connector has connections managed outside your account; remove it "
+        "in the web app.",
+    ),
+    (
         "internal_error",
         HTTPException(500, f"Failed to create MCP server: {_REQUEST_SECRET_VALUES[0]}"),
         500,
@@ -1655,7 +1682,7 @@ _ROW_CASES: list[tuple[str, HTTPException, int, str, str]] = [
 
 def test_create_success_carries_no_secret(bob):
     rows = mcp_servers_routes._MCP_WRITE_ERROR_ROWS
-    assert len(rows) == 6
+    assert len(rows) == 9
     assert {row.id for row in rows} == {case[0] for case in _ROW_CASES}
 
     ok = _create(bob, name="made-connector", **_REQUEST_SECRETS)
@@ -1676,7 +1703,7 @@ def test_create_success_carries_no_secret(bob):
     ids=[f"{case[0]}-{i}" for i, case in enumerate(_ROW_CASES)],
 )
 def test_write_error_translation(bob, monkeypatch, row_id, exc, status, code, message):
-    assert len(_ROW_CASES) == 10
+    assert len(_ROW_CASES) == 13
     before = _store()
     _fail_web_create(monkeypatch, exc)
 

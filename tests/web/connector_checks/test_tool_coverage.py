@@ -43,7 +43,6 @@ _PINNED_LEGACY = frozenset(
         "google-maps",
         "google-search-console",
         "granola",
-        "hubspot",
         "instagram",
         "intercom",
         "linear",

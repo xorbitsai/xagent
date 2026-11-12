@@ -1124,6 +1124,80 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    # The test account has no seeded objects yet (#3572): a check asserts shape,
+    # and content only that every portal has (CONTACT and its email property).
+    "hubspot": ConnectorChecks(
+        "hubspot",
+        reads=(
+            ReadCheck(
+                "hubspot.search_contacts",
+                "search_crm_objects",
+                {"objectType": "CONTACT", "limit": 1, "properties": ["email"]},
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("results", "total", "offset")),
+                    EachHasKeys(("results",), ("id", "properties")),
+                    Length(("results",), max=1),
+                ),
+                require_read_only_hint=True,
+            ),
+            ReadCheck(
+                "hubspot.query_crm_data",
+                "query_crm_data",
+                {"sql": "SELECT hs_object_id FROM contacts LIMIT 1"},
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("results",)),
+                    IsType(("results",), "array"),
+                ),
+                require_read_only_hint=True,
+            ),
+            ReadCheck(
+                "hubspot.object_types",
+                "discover_hubspot_schema",
+                {
+                    "query": {
+                        "_queryType": "GET_OBJECT_TYPES",
+                        "typeNameFilter": ["CONTACT"],
+                        "limit": 1,
+                    }
+                },
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("objectTypeResults",)),
+                    HasKeys(("objectTypeResults",), ("results", "hasMore")),
+                    EachHasKeys(
+                        ("objectTypeResults", "results"),
+                        ("typeName", "objectTypeId", "readAccess", "writeAccess"),
+                    ),
+                    IsType(("objectTypeResults", "hasMore"), "boolean"),
+                    Length(("objectTypeResults", "results"), min=1),
+                    Equals(("objectTypeResults", "results", 0, "typeName"), "CONTACT"),
+                ),
+                require_read_only_hint=True,
+            ),
+            ReadCheck(
+                "hubspot.search_properties",
+                "search_properties",
+                {"objectType": "CONTACT", "keywords": ["email"]},
+                payload="json_text",
+                assertions=(
+                    HasKeys((), ("results",)),
+                    EachHasKeys(("results",), ("name", "label")),
+                    Length(("results",), min=1),
+                ),
+                require_read_only_hint=True,
+            ),
+            ReadCheck(
+                "hubspot.search_segments",
+                "query_segments",
+                {"operation": {"type": "SearchSegmentsQuery", "limit": 1}},
+                payload="json_text",
+                assertions=(HasKeys(("result",), ("segments",)),),
+                require_read_only_hint=True,
+            ),
+        ),
+    ),
     "jira": _jira_checks(),
     # Create-only (#3655): its one tool files a ticket no tool of the server
     # can delete, and its L3 slot stays unprobeable for the same reason.
@@ -1582,7 +1656,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "google-maps",
         "google-search-console",
         "granola",
-        "hubspot",
         "instagram",
         "intercom",
         "linear",

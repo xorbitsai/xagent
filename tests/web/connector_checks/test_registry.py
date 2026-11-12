@@ -114,7 +114,7 @@ def test_the_l3_expect_keys_carry_over() -> None:
 @pytest.mark.parametrize(
     ("app_id", "reason"),
     [
-        ("hubspot", "covered_by_l2"),
+        ("granola", "covered_by_l2"),
         ("google-maps", "sandboxed"),
         ("chrome-devtools", "execution_scoped"),
     ],
@@ -454,6 +454,66 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
 }
 
 
+# HubSpot's Tier 1 read checks (#3572): the tool, its arguments, and every
+# assertion, so dropping an item key or a whole assertion fails here.
+_HUBSPOT_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "hubspot.search_contacts": (
+        "search_crm_objects",
+        {"objectType": "CONTACT", "limit": 1, "properties": ["email"]},
+        (
+            HasKeys((), ("results", "total", "offset")),
+            EachHasKeys(("results",), ("id", "properties")),
+            Length(("results",), max=1),
+        ),
+    ),
+    # The empty result's shape was not observed, so only ``results`` is
+    # asserted: an absent ``instructions`` key would fail a passing check.
+    "hubspot.query_crm_data": (
+        "query_crm_data",
+        {"sql": "SELECT hs_object_id FROM contacts LIMIT 1"},
+        (
+            HasKeys((), ("results",)),
+            IsType(("results",), "array"),
+        ),
+    ),
+    "hubspot.object_types": (
+        "discover_hubspot_schema",
+        {
+            "query": {
+                "_queryType": "GET_OBJECT_TYPES",
+                "typeNameFilter": ["CONTACT"],
+                "limit": 1,
+            }
+        },
+        (
+            HasKeys((), ("objectTypeResults",)),
+            HasKeys(("objectTypeResults",), ("results", "hasMore")),
+            EachHasKeys(
+                ("objectTypeResults", "results"),
+                ("typeName", "objectTypeId", "readAccess", "writeAccess"),
+            ),
+            IsType(("objectTypeResults", "hasMore"), "boolean"),
+            Length(("objectTypeResults", "results"), min=1),
+            Equals(("objectTypeResults", "results", 0, "typeName"), "CONTACT"),
+        ),
+    ),
+    "hubspot.search_properties": (
+        "search_properties",
+        {"objectType": "CONTACT", "keywords": ["email"]},
+        (
+            HasKeys((), ("results",)),
+            EachHasKeys(("results",), ("name", "label")),
+            Length(("results",), min=1),
+        ),
+    ),
+    "hubspot.search_segments": (
+        "query_segments",
+        {"operation": {"type": "SearchSegmentsQuery", "limit": 1}},
+        (HasKeys(("result",), ("segments",)),),
+    ),
+}
+
+
 def _read_check(check_id: str) -> ReadCheck:
     app_id = check_id.split(".", 1)[0]
     check = next(c for c in CONNECTOR_CHECKS[app_id].reads if c.id == check_id)
@@ -496,6 +556,149 @@ def test_a_tier_2_read_check_is_declared_exactly(
     assert check.assertions == assertions
 
 
+@pytest.mark.parametrize(("check_id", "expected"), sorted(_HUBSPOT_READS.items()))
+def test_a_hubspot_read_check_is_declared_exactly(
+    check_id: str, expected: tuple[str, dict[str, Any], tuple[Assertion, ...]]
+) -> None:
+    tool, arguments, assertions = expected
+    check = _read_check(check_id)
+    assert (check.tool, dict(check.arguments)) == (tool, arguments)
+    assert check.assertions == assertions
+
+
+# Result shapes each check accepts, with synthetic values: an empty list too,
+# except where every portal has a match.
+_HUBSPOT_OUTPUTS: Mapping[str, tuple[dict[str, Any], ...]] = {
+    "hubspot.search_contacts": (
+        {
+            "results": [
+                {
+                    "id": 1,
+                    "properties": {"hs_object_id": "1", "email": "a@example.com"},
+                    "displayName": "A",
+                }
+            ],
+            "total": 3,
+            "urlTemplate": "https://app.hubspot.com/contacts/0/record/0-1/{id}",
+            "offset": 1,
+        },
+        # An empty result omits urlTemplate, which no check asserts.
+        {"results": [], "total": 0, "offset": 0},
+    ),
+    "hubspot.query_crm_data": (
+        {
+            "results": [
+                {
+                    "content": (
+                        '{"objectTypeId":"0-1","properties":{"hs_object_id":"1"}}'
+                    )
+                }
+            ],
+            "instructions": "Showing 1 of 3 total objects.",
+        },
+        {"results": []},
+    ),
+    "hubspot.object_types": (
+        {
+            "objectTypeResults": {
+                "results": [
+                    {
+                        "typeName": "CONTACT",
+                        "objectTypeId": "0-1",
+                        "typeCategory": "HUBSPOT_DEFINED_OBJECTS",
+                        "readAccess": "AVAILABLE",
+                        "writeAccess": "AVAILABLE",
+                        "activationStatus": "PERMANENTLY_ACTIVATED",
+                    }
+                ],
+                "hasMore": False,
+            }
+        },
+    ),
+    "hubspot.search_properties": (
+        {
+            "results": [
+                {
+                    "name": "email",
+                    "label": "Email",
+                    "description": "A contact's email address",
+                    "matchScore": 0.87,
+                }
+            ]
+        },
+    ),
+    "hubspot.search_segments": (
+        {
+            "result": {
+                "segments": {
+                    "segments": [
+                        {
+                            "listId": 9,
+                            "objectTypeId": "0-1",
+                            "listType": "STATIC",
+                            "name": "Example",
+                        }
+                    ],
+                    "totalCount": 1,
+                    "hasMore": False,
+                },
+                "__typename": "x",
+                "type": "SegmentSearchResult",
+            }
+        },
+        {"result": {"segments": {}}},
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload"),
+    [
+        (check_id, payload)
+        for check_id, payloads in sorted(_HUBSPOT_OUTPUTS.items())
+        for payload in payloads
+    ],
+)
+def test_a_hubspot_read_output_satisfies_its_declaration(
+    check_id: str, payload: dict[str, Any]
+) -> None:
+    _assert_check_output(check_id, json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "hubspot.object_types",
+            {"objectTypeResults": {"results": [], "hasMore": False}},
+            "length",
+        ),
+        (
+            "hubspot.object_types",
+            {
+                "objectTypeResults": {
+                    "results": [
+                        {
+                            "typeName": "COMPANY",
+                            "objectTypeId": "0-2",
+                            "readAccess": "AVAILABLE",
+                            "writeAccess": "AVAILABLE",
+                        }
+                    ],
+                    "hasMore": False,
+                }
+            },
+            "equals",
+        ),
+        ("hubspot.search_properties", {"results": []}, "length"),
+    ],
+)
+def test_a_hubspot_check_fails_without_what_every_portal_has(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
 @pytest.mark.parametrize(
     "app_id", ["google-ads", "outlook", "planner", "sharepoint", "zendesk", "zoom"]
 )
@@ -511,7 +714,7 @@ def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     assert l3_checks == [expected]
 
 
-@pytest.mark.parametrize("app_id", ["acme", "hubspot"])
+@pytest.mark.parametrize("app_id", ["acme", "granola"])
 def test_the_declared_l3_helper_rejects_anything_but_a_read_check(app_id: str) -> None:
     with pytest.raises(DeclarationError, match=app_id):
         _declared_l3(app_id)

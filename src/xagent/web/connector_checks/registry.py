@@ -79,21 +79,6 @@ _MICROSOFT_365_WRITE_WITHOUT_TENANT_PIN = (
     "returns a tenant id, so whether it gets a write check is decided in "
     f"{_MICROSOFT_365_TIER_1}"
 )
-# Teams' five read checks, the cap per connector, carry 39 of its 51 calls
-# (76.5%), and its volume is too small for the 80% cut to mean much; #3569
-# accepted that share.
-_TEAMS_READ_UNDER_THE_CAP = (
-    "read left unchecked: the cap of five read checks stops the checked tools "
-    "at 76.5% of Teams' calls, a volume too small for the 80% cut to be "
-    f"meaningful, as decided in {_MICROSOFT_365_TIER_1}"
-)
-# auth_status and get_current_user read the same /me profile, so #3569 spent
-# the fifth Teams check on list_chats instead.
-_TEAMS_SECOND_PROFILE_READ = (
-    "read left unchecked: it reads the same /me profile as auth_status, which "
-    "is checked, so the check goes to list_chats instead, as decided in "
-    f"{_MICROSOFT_365_TIER_1}"
-)
 
 
 def _exemptions(
@@ -145,12 +130,13 @@ def _microsoft_365_exemptions(
 ) -> tuple[ToolExemption, ...]:
     """A Microsoft 365 connector's exemptions (#3569): it runs read checks
     only, which carry over 80% of ``name``'s calls."""
+    possessive = f"{name}'" if name.endswith("s") else f"{name}'s"
     return (
         *(
             ToolExemption(
                 tool,
                 "read left unchecked: the checked tools carry over 80% of "
-                f"{name}'s calls, as decided in {_MICROSOFT_365_TIER_1}",
+                f"{possessive} calls, as decided in {_MICROSOFT_365_TIER_1}",
             )
             for tool in reads
         ),
@@ -377,8 +363,9 @@ def _onedrive_checks() -> ConnectorChecks:
             ReadCheck(
                 "onedrive.search_seed_file",
                 "onedrive_search_files",
-                # q7k2 is in the note's name and in no other file's name or
-                # content, so the search finds the note alone.
+                # q7k2 is in the note's name and in no other seeded file's
+                # name or content, so the search finds the note alone. It
+                # spans the whole drive: no other object may carry q7k2.
                 {"query": "q7k2"},
                 assertions=(
                     StatusSuccess(),
@@ -437,12 +424,14 @@ def _teams_checks() -> ConnectorChecks:
     which lists the seeded message first. The account belongs to other
     teams too, so the team list is checked for its shape only, and the seed
     cannot hold a chat, so the chat list is checked for its shape on an
-    empty list too."""
+    empty list too. The probe-derived L3 row, which reads get_current_user,
+    is kept beside the five reads and takes no slot (#3568, #3569)."""
     team = FixtureRef("teams.seed_team_id")
     channel = FixtureRef("teams.seed_channel_id")
     return ConnectorChecks(
         "teams",
         reads=(
+            _declared_l3("teams"),
             ReadCheck(
                 "teams.auth_status",
                 "auth_status",
@@ -491,16 +480,10 @@ def _teams_checks() -> ConnectorChecks:
                 ),
             ),
         ),
-        exemptions=(
-            *(
-                ToolExemption(tool, _TEAMS_READ_UNDER_THE_CAP)
-                for tool in ("get_chat_messages", "list_team_members")
-            ),
-            ToolExemption("get_current_user", _TEAMS_SECOND_PROFILE_READ),
-            *_exemptions(
-                issue=_MICROSOFT_365_TIER_1,
-                writes_without_cleanup=("send_channel_message", "send_chat_message"),
-            ),
+        exemptions=_microsoft_365_exemptions(
+            "Teams",
+            reads=("get_chat_messages", "list_team_members"),
+            writes_without_cleanup=("send_channel_message", "send_chat_message"),
         ),
     )
 

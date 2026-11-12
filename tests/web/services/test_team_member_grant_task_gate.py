@@ -291,6 +291,8 @@ _REGISTERED_CALLS = frozenset(
         ("web/services/mcp_runtime.py", "build_mcp_runtime_connection"),
         ("web/services/mcp_oauth.py", "resolve_mcp_oauth_runtime_auth"),
         ("web/api/mcp.py", "list_mcp_apps"),
+        ("web/services/mcp_server_management.py", "_authorization"),
+        ("web/services/mcp_server_management.py", "_project_mcp_server"),
     }
 )
 

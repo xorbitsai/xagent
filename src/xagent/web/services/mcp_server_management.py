@@ -12,11 +12,15 @@ module's own ``_masked_auth``.
 A create calls the web ``create_mcp_server`` with a request model built from
 the SDK body, so the web code decides every stored value, name rule and
 encryption. This module never assigns ``url`` or ``auth`` on a stored row.
-The web function's ``HTTPException`` propagates; the route translates it.
+A delete calls the web ``delete_mcp_server`` and a switch calls the web
+``update_mcp_server`` with an ``is_active``-only request, after this module has
+checked that the holder has a link of their own to change. The web function's
+``HTTPException`` propagates; the route translates it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Iterable, Optional, cast
 
@@ -25,6 +29,7 @@ from ...core.tools.adapters.vibe.signed_upload import signed_upload_settings_err
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ..api.mcp import (
     MCPServerCreate,
+    MCPServerUpdate,
     _check_mcp_permission,
     _default_resource_owner_key,
     _enrich_oauth_server_info,
@@ -34,6 +39,8 @@ from ..api.mcp import (
     _oauth_account_summaries,
     _require_parsable_mcp_oauth_identifiers,
     create_mcp_server,
+    delete_mcp_server,
+    update_mcp_server,
 )
 from ..models.database import get_session_local
 from ..models.mcp import MCPServer, UserMCPServer
@@ -68,6 +75,15 @@ _REMOTE_TRANSPORTS = frozenset({"streamable_http", "sse"})
 # An ``auth`` dict carrying any of these keys was written by a catalog app
 # connection (or claims to have been), so the connector is not a user's own.
 _CATALOG_AUTH_KEYS = ("app_id", "provider", "builtin_provenance")
+
+
+_TEAM_READ_ONLY_MESSAGE = (
+    "This connector is shared with your team and is read-only through the API."
+)
+_CATALOG_NOT_EDITABLE_MESSAGE = (
+    "This connector is a catalog app connection, or cannot be shown not to be "
+    "one, so it can only be changed in the web app."
+)
 
 
 def _log_write(action: str, key_prefix: str, user_id: int, server_id: int) -> None:
@@ -174,6 +190,32 @@ def resolve_holder_connector(
     if server_id in visible_team_connector_ids(db, user_id)["mcp"]:
         return server, None
     return None
+
+
+def _resolve_changeable(
+    db: Any, user_id: int, server_id: int
+) -> tuple[MCPServer, UserMCPServer]:
+    """The connector and the holder's own link, for a change the holder may try.
+
+    A connector the holder cannot see is a 404. One seen only through the
+    team has no link of the holder's own to change, so it is refused with 403
+    before any web function runs.
+    """
+    # Imported here for the reason given in ``_load_holder``.
+    from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+    row = resolve_holder_connector(db, user_id, server_id)
+    if row is None:
+        raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
+    server, link = row
+    if link is None:
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_FORBIDDEN,
+            403,
+            _TEAM_READ_ONLY_MESSAGE,
+            details={"reason": "team_shared"},
+        )
+    return server, link
 
 
 def _catalog_classification_keys(
@@ -536,6 +578,71 @@ class McpServerManagementRuntime:
                     raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
                 projected = _project_rows(db, user, [row])[0]
             _log_write("create", key_prefix, user_id, projected.id)
+            return projected
+
+        return await run_db_io_cancellation_safe(run)
+
+    async def delete_server(
+        self, *, user_id: int, key_prefix: str, server_id: int
+    ) -> None:
+        """Delete the holder's link to a connector through the web delete.
+
+        The web function is a coroutine because it revokes OAuth grants over
+        the network after committing. It runs on a new event loop in this
+        worker thread, so none of the web function's database work blocks the
+        loop that serves requests. Catalog connectors are refused before it
+        runs.
+        """
+        # Imported here for the reason given in ``_load_holder``.
+        from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+        def run() -> None:
+            with get_session_local()() as db:
+                user = _load_holder(db, user_id)
+                server, _link = _resolve_changeable(db, user_id, server_id)
+                if connector_kind(db, server) == "catalog":
+                    raise V1ApiError(
+                        V1ErrorCode.CONNECTOR_NOT_EDITABLE,
+                        409,
+                        _CATALOG_NOT_EDITABLE_MESSAGE,
+                        details={"reason": "catalog"},
+                    )
+                asyncio.run(delete_mcp_server(server_id, current_user=user, db=db))
+            _log_write("delete", key_prefix, user_id, server_id)
+
+        await run_db_io_cancellation_safe(run)
+
+    async def set_enabled(
+        self, *, user_id: int, key_prefix: str, server_id: int, enabled: bool
+    ) -> V1McpServer:
+        """Switch the holder's own link on or off and return the connector.
+
+        Only ``is_active`` is sent to the web function, so the shared
+        definition is neither locked nor written.
+        """
+        # Imported here for the reason given in ``_load_holder``.
+        from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+        def run() -> V1McpServer:
+            with get_session_local()() as db:
+                user = _load_holder(db, user_id)
+                _resolve_changeable(db, user_id, server_id)
+                update_mcp_server(
+                    server_id,
+                    MCPServerUpdate(is_active=enabled),
+                    current_user=user,
+                    db=db,
+                )
+                row = resolve_holder_connector(db, user_id, server_id)
+                if row is None or row[1] is None:
+                    # The web function has committed the update, so the
+                    # holder's link is gone only if it was deleted in between,
+                    # even when the team still shares the connector.
+                    raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
+                projected = _project_rows(db, user, [row])[0]
+            _log_write(
+                "enable" if enabled else "disable", key_prefix, user_id, server_id
+            )
             return projected
 
         return await run_db_io_cancellation_safe(run)

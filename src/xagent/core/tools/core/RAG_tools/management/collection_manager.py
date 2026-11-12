@@ -406,35 +406,17 @@ class CollectionManager:
         pass their own). ``recreate_missing`` re-inserts a row that disappeared
         between the caller's read and this write instead of raising.
         """
-        target = store if store is not None else self._get_metadata_store()
         lock = _get_collection_lock(collection.name)
 
         async with lock, _collection_thread_guard(collection.name):
-            try:
-                return await self._update_fields_with_retry(
-                    collection,
-                    field_names,
-                    require_uninitialized=require_uninitialized,
-                    expected_model_id=expected_model_id,
-                    store=target,
-                )
-            except ValueError as exc:
-                if not (recreate_missing and "not found" in str(exc)):
-                    raise
-                created = await _with_retry(
-                    lambda: target.save_collection_if_absent(collection),
-                    description=f"re-creation of collection {collection.name}",
-                )
-                if created:
-                    return True
-                # Another writer created the row in the meantime: update it.
-                return await self._update_fields_with_retry(
-                    collection,
-                    field_names,
-                    require_uninitialized=require_uninitialized,
-                    expected_model_id=expected_model_id,
-                    store=target,
-                )
+            return await self._update_fields_with_retry(
+                collection,
+                field_names,
+                require_uninitialized=require_uninitialized,
+                expected_model_id=expected_model_id,
+                store=store,
+                recreate_missing=recreate_missing,
+            )
 
     async def _update_fields_with_retry(
         self,
@@ -444,27 +426,47 @@ class CollectionManager:
         require_uninitialized: bool = False,
         expected_model_id: Optional[str] = None,
         store: Optional[MetadataStore] = None,
+        recreate_missing: bool = False,
     ) -> bool:
         """Partial write with the same commit-conflict retry as ``save_collection``.
 
         A retried compare-and-set re-evaluates its guard, so a concurrent switch
-        still wins and the call returns ``False``. A missing row is deterministic
-        and is re-raised immediately: search/ingestion resolve the model before
-        the row exists, and retrying would stall that path.
+        still wins and the call returns ``False``. A missing row is re-raised
+        immediately (search/ingestion resolve the model before the row exists, and
+        retrying would stall that path), unless ``recreate_missing`` asks for the
+        row to be re-inserted like the whole-row save it replaced.
         """
         target = store if store is not None else self._get_metadata_store()
-        return await _with_retry(
-            lambda: target.update_collection_fields(
+        try:
+            return await _with_retry(
+                lambda: target.update_collection_fields(
+                    collection,
+                    field_names,
+                    require_uninitialized=require_uninitialized,
+                    expected_model_id=expected_model_id,
+                ),
+                description=f"field update of collection {collection.name}",
+                deterministic=lambda exc: (
+                    isinstance(exc, ValueError) and "not found" in str(exc)
+                ),
+            )
+        except ValueError as exc:
+            if not (recreate_missing and "not found" in str(exc)):
+                raise
+            created = await _with_retry(
+                lambda: target.save_collection_if_absent(collection),
+                description=f"re-creation of collection {collection.name}",
+            )
+            if created:
+                return True
+            # Another writer created the row in the meantime: update it.
+            return await self._update_fields_with_retry(
                 collection,
                 field_names,
                 require_uninitialized=require_uninitialized,
                 expected_model_id=expected_model_id,
-            ),
-            description=f"field update of collection {collection.name}",
-            deterministic=lambda exc: (
-                isinstance(exc, ValueError) and "not found" in str(exc)
-            ),
-        )
+                store=target,
+            )
 
     async def _write_initial_binding(
         self,
@@ -478,7 +480,7 @@ class CollectionManager:
         """Apply a first/canonical binding only if the stored one did not move first."""
         applied = await self._update_fields_with_retry(
             updated,
-            _BINDING_FIELDS,
+            _BINDING_FIELDS + ("schema_version",),
             require_uninitialized=require_uninitialized,
             expected_model_id=expected_model_id,
         )
@@ -786,7 +788,11 @@ class CollectionManager:
                 + (("document_names",) if "document_names" in updated_data else ())
                 + ("schema_version",)
             )
-            await self._update_fields_with_retry(updated_collection, fields)
+            # The read and this write are not atomic: the old whole-row save
+            # recreated a row deleted in between, and stats must keep working then.
+            await self._update_fields_with_retry(
+                updated_collection, fields, recreate_missing=True
+            )
 
             return updated_collection
 
@@ -1488,7 +1494,9 @@ async def _rebuild_collection_stats_impl(
         inserted = await collection_manager.save_collection_if_absent(rebuilt)
         if inserted:
             return rebuilt
-    await collection_manager.update_collection_fields(rebuilt, fields)
+    await collection_manager.update_collection_fields(
+        rebuilt, fields, recreate_missing=True
+    )
     return rebuilt
 
 
@@ -1625,10 +1633,9 @@ def _resolve_effective_embedding_model_sync_impl(
                     candidate, _BINDING_FIELDS, require_uninitialized=True
                 )
                 if not applied:
+                    fresh = get_collection_sync(collection_name)
                     # Inferring is slow enough for a switch to land meanwhile; it wins.
-                    bound = _normalize_model_id(
-                        get_collection_sync(collection_name).embedding_model_id
-                    )
+                    bound = _normalize_model_id(fresh.embedding_model_id)
                     if bound:
                         logger.info(
                             "Collection '%s' was bound to '%s' while inferring",
@@ -1636,6 +1643,14 @@ def _resolve_effective_embedding_model_sync_impl(
                             bound,
                         )
                         return bound
+                    if fresh.embedding_model_id is not None:
+                        # A whitespace-only id reads as unbound but the unbound
+                        # clause does not match it: repair it by exact value.
+                        _sync_wrapper(collection_manager.update_collection_fields)(
+                            candidate,
+                            _BINDING_FIELDS,
+                            expected_model_id=fresh.embedding_model_id,
+                        )
             except Exception as save_error:
                 logger.warning(
                     "Failed to persist inferred embedding metadata for collection '%s': %s",

@@ -115,10 +115,15 @@ def switch_collection_embedding_model(
         require_uninitialized=observed is None,
     )
     if not applied:
-        raise ValueError(
-            f"Collection '{collection_name}' embedding model changed while "
-            "switching; retry the switch."
+        # A concurrent identical switch may have written the same target.
+        current_model_id = _normalize_model_id(
+            get_collection_sync(collection_name).embedding_model_id
         )
+        if current_model_id != canonical_model_id:
+            raise ValueError(
+                f"Collection '{collection_name}' embedding model changed while "
+                "switching; retry the switch."
+            )
 
     logger.info(
         "Switched collection '%s' embedding model from '%s' to '%s'",

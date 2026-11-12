@@ -90,6 +90,34 @@ def _binding(name: str = "kb") -> tuple[Optional[str], Optional[int]]:
     return row.embedding_model_id, row.embedding_dimension
 
 
+def _delete_row(name: str) -> None:
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        _safe_close_table,
+    )
+
+    conn = get_metadata_store().get_raw_connection()
+    table = conn.open_table("collection_metadata")
+    try:
+        table.delete(f"name = '{name}'")
+    finally:
+        _safe_close_table(table)
+
+
+def _raw_row(name: str = "kb") -> dict[str, Any]:
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        _safe_close_table,
+    )
+
+    conn = get_metadata_store().get_raw_connection()
+    table = conn.open_table("collection_metadata")
+    try:
+        rows = table.search().where(f"name = '{name}'").to_arrow().to_pylist()
+    finally:
+        _safe_close_table(table)
+    assert rows
+    return rows[0]
+
+
 def test_switch_sets_both_binding_fields_and_records_the_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -131,6 +159,29 @@ def test_switch_writes_only_the_binding_columns(
     ]
     assert seen[0][1]["expected_model_id"] == OLD_MODEL
     assert seen[0][1]["require_uninitialized"] is False
+
+
+def test_a_lost_race_on_the_same_target_is_a_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    _freeze()
+    _bind_models(monkeypatch)
+    store = get_metadata_store()
+    real_update = store.update_collection_fields
+
+    async def _lose_but_the_target_landed(collection, fields, **kw):
+        if "embedding_model_id" in fields:
+            await real_update(collection, fields)
+            return False
+        return await real_update(collection, fields, **kw)
+
+    monkeypatch.setattr(store, "update_collection_fields", _lose_but_the_target_landed)
+
+    result = switch_collection_embedding_model("kb", NEW_MODEL)
+
+    assert result.target_model_id == NEW_MODEL
+    assert _binding() == (NEW_MODEL, NEW_DIM)
 
 
 def test_switch_refuses_a_collection_that_is_not_frozen(
@@ -283,18 +334,9 @@ def test_stats_update_persists_the_migrated_schema_version() -> None:
 
     cm.update_collection_stats_sync("kb", documents_delta=1)
 
-    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
-        _safe_close_table,
-    )
-
-    conn = get_metadata_store().get_raw_connection()
-    table = conn.open_table("collection_metadata")
-    try:
-        rows = table.search().where("name = 'kb'").to_arrow().to_pylist()
-    finally:
-        _safe_close_table(table)
-    assert rows[0]["schema_version"] == "1.0.0"
-    assert rows[0]["documents"] == 3
+    row = _raw_row()
+    assert row["schema_version"] == "1.0.0"
+    assert row["documents"] == 3
 
 
 def test_rollback_is_the_same_call_with_the_previous_model(
@@ -427,6 +469,31 @@ def test_inferred_model_cannot_overwrite_a_switch(
 
     assert resolved == NEW_MODEL
     assert _binding() == (NEW_MODEL, NEW_DIM)
+
+
+def test_inference_repairs_a_whitespace_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(
+                name="kb",
+                embedding_model_id=" ",
+                embedding_dimension=OLD_DIM,
+                embeddings=5,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        migration_utils,
+        "_infer_embedding_config_from_collection",
+        lambda _name: (OLD_MODEL, OLD_DIM),
+    )
+
+    resolved = cm.resolve_effective_embedding_model_sync("kb", None)
+
+    assert resolved == OLD_MODEL
+    assert _raw_row()["embedding_model_id"] == OLD_MODEL
 
 
 def test_initialization_cannot_revert_a_switch(
@@ -606,6 +673,68 @@ def test_same_model_initialization_race_returns_the_stored_row(
     assert result.embedding_model_id == OLD_MODEL
     assert result.documents == 3
     assert _binding() == (OLD_MODEL, OLD_DIM)
+
+
+def test_stats_recreates_a_row_deleted_after_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync(documents=1)
+    stale = CollectionInfo(
+        name="kb",
+        documents=1,
+        embedding_model_id=OLD_MODEL,
+        embedding_dimension=OLD_DIM,
+    )
+
+    async def _read_then_delete(_: str) -> CollectionInfo:
+        _delete_row("kb")
+        return stale
+
+    monkeypatch.setattr(cm.collection_manager, "get_collection", _read_then_delete)
+
+    cm.update_collection_stats_sync("kb", documents_delta=1)
+
+    assert _raw_row()["documents"] == 2
+    assert _binding() == (OLD_MODEL, OLD_DIM)
+
+
+def test_stats_rebuild_recreates_a_row_deleted_after_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync(documents=1)
+    store = get_metadata_store()
+    real_get = store.get_collection
+
+    async def _read_then_delete(name: str) -> CollectionInfo:
+        row = await real_get(name)
+        _delete_row(name)
+        return row
+
+    monkeypatch.setattr(store, "get_collection", _read_then_delete)
+    coordinator = SimpleNamespace(
+        aggregate_collection_stats_sync=lambda **_: {
+            "kb": {"documents": 5, "parses": 5, "chunks": 5, "embeddings": 5}
+        }
+    )
+
+    asyncio.run(cm._rebuild_collection_stats_impl("kb", coordinator))
+
+    assert _raw_row()["documents"] == 5
+
+
+def test_initialization_persists_the_migrated_schema_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(name="kb", schema_version="0.0.0")
+        )
+    )
+    _bind_models(monkeypatch)
+
+    cm.initialize_collection_embedding_sync("kb", "old")
+
+    assert _raw_row()["schema_version"] == "1.0.0"
 
 
 def test_stats_auto_create_cannot_clear_a_switch(

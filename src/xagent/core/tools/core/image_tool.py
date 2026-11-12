@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 from urllib import parse
 
 from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
+from ...artifact_validation.service import validate_artifact
 from ...file_ref import build_workspace_file_ref, parse_file_id_ref
 from ...model.image.base import BaseImageModel
 from ...utils.media_download import (
@@ -213,8 +214,11 @@ Images are automatically saved to workspace.
         self._generate_model_info_text()
 
     def _build_image_artifacts(
-        self, image_path: Optional[str], file_id: Optional[str]
-    ) -> list[dict[str, str]]:
+        self,
+        image_path: Optional[str],
+        file_id: Optional[str],
+        validation: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
         """Build display-safe image artifact metadata for a registered image."""
         if not file_id:
             return []
@@ -236,8 +240,24 @@ Images are automatically saved to workspace.
                 "filename": filename,
                 "mime_type": mime_type,
                 "display": "inline",
+                **({"validation": validation} if validation is not None else {}),
             }
         ]
+
+    async def _validate_image_output(
+        self, image_path: str, file_ref: Optional[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Format-check a saved image, the way other file producers already do.
+
+        An unvalidated artifact is delivered as "NOT RUN", which the FileRef
+        rules turn into a limitation the model has to repeat to the user. The
+        check starts a bounded parser subprocess, so it runs on a worker thread;
+        file registration stays where it was.
+        """
+        validation = (await asyncio.to_thread(validate_artifact, image_path)).as_dict()
+        if file_ref is not None:
+            file_ref["validation"] = validation
+        return validation
 
     def _generate_model_info_text(self) -> None:
         """Generate formatted text with available models and descriptions."""
@@ -327,6 +347,13 @@ Images are automatically saved to workspace.
         if model_id and model_id in self._image_models:
             return model_id
         if image_model is not None:
+            # The model object carries the id it was configured with, such as
+            # "platform/gpt-image-2.5-flare". The default model is usually a
+            # different instance than the dict entry, so the identity lookup
+            # below misses it and only a bare model_name is left.
+            own_model_id = getattr(image_model, "model_id", None)
+            if isinstance(own_model_id, str) and own_model_id:
+                return own_model_id
             for known_id, model in self._image_models.items():
                 if model is image_model:
                     return known_id
@@ -848,11 +875,17 @@ Images are automatically saved to workspace.
             elif image_url and not self._workspace:
                 logger.warning("No workspace available, image not saved locally")
 
+            validation: Optional[dict[str, Any]] = None
+            if image_file_id and image_path:
+                validation = await self._validate_image_output(image_path, file_ref)
+
             response = {
                 "success": True,
                 "image_path": image_path,
                 "file_id": image_file_id,
-                "artifacts": self._build_image_artifacts(image_path, image_file_id),
+                "artifacts": self._build_image_artifacts(
+                    image_path, image_file_id, validation
+                ),
                 "file_ref": file_ref,
                 "usage": result.get("usage", {}),
                 "task_metric": result.get("task_metric", {}),
@@ -1029,11 +1062,17 @@ Images are automatically saved to workspace.
             elif edited_image_url and not self._workspace:
                 logger.warning("No workspace available, edited image not saved locally")
 
+            validation: Optional[dict[str, Any]] = None
+            if image_file_id and image_path:
+                validation = await self._validate_image_output(image_path, file_ref)
+
             response = {
                 "success": True,
                 "image_path": image_path,
                 "file_id": image_file_id,
-                "artifacts": self._build_image_artifacts(image_path, image_file_id),
+                "artifacts": self._build_image_artifacts(
+                    image_path, image_file_id, validation
+                ),
                 "file_ref": file_ref,
                 "usage": result.get("usage", {}),
                 "task_metric": result.get("task_metric", {}),

@@ -22,6 +22,7 @@ from ...core.tools.core.RAG_tools.kb import (
 )
 from ...core.tools.core.RAG_tools.management.migration_state import (
     admits_collection_sync,
+    ensure_collection_writable,
 )
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
     resolve_ingestion_model_ids,
@@ -250,6 +251,8 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
     try:
+        # Before model resolution, which rewrites the collection's metadata row.
+        ensure_collection_writable(str(payload["collection"]))
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not
         # the storage tenant in payload["user_id"].
@@ -438,6 +441,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
 
     update_job_progress(db, job, message="Crawling website")
     try:
+        ensure_collection_writable(collection)
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         with (
             usage_scope(

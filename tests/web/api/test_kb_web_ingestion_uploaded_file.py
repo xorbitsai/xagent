@@ -2659,4 +2659,5 @@ def test_frozen_upload_refusal_creates_no_collection_directory(
         clear_migration_state("frozen-up")
 
     assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "kb_collection_migrating"
     assert not collection_dir.exists()

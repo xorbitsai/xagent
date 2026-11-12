@@ -636,7 +636,7 @@ async def test_ingest_rollback_delete_runs_after_a_mid_flight_freeze(
         )
 
     def _rollback(**kwargs: object) -> None:
-        # The guard the rollback's document delete hits.
+        # Stands in for a guarded write inside the rollback.
         state_module.ensure_collection_writable(str(kwargs["collection_name"]))
         rollback_calls.append(str(kwargs["collection_name"]))
 

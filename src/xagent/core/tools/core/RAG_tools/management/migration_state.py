@@ -137,7 +137,7 @@ def write_migration_state(
             _merge_row(conn, row)
             return stamped
         except Exception as exc:
-            # Retries any error: commit conflicts are transient, other faults re-raise below.
+            # Retries any error; the final attempt below re-raises.
             logger.warning(
                 "Retrying migration state write for %s: %s", collection_name, exc
             )

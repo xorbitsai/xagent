@@ -559,7 +559,7 @@ def test_staged_job_rollback_runs_inside_admission_after_mid_job_freeze(
         return _result(message="ingestion failed")
 
     async def _rollback(**kwargs: Any) -> None:
-        # The guard the rollback's document delete hits.
+        # Stands in for a guarded write inside the rollback.
         state_module.ensure_collection_writable(str(kwargs["collection_name"]))
         rollback_calls.append(str(kwargs["collection_name"]))
 
@@ -575,3 +575,52 @@ def test_staged_job_rollback_runs_inside_admission_after_mid_job_freeze(
 
     assert rollback_calls == ["existing-kb"]
     assert str(err) == "ingestion failed"
+
+
+@pytest.mark.parametrize("job_type", ["document", "web"])
+def test_frozen_job_refuses_before_model_resolution(
+    test_env, tmp_path, monkeypatch, job_type
+) -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        clear_migration_state,
+        write_migration_state,
+    )
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    resolved: list[str] = []
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks._resolve_job_ingestion_models",
+        lambda *a, **k: resolved.append("called"),
+    )
+    _, _, user, session_local = test_env
+    payload: dict[str, Any] = {
+        "collection": "existing-kb",
+        "user_id": int(user.id),
+        "is_admin": False,
+        "ingestion_config": IngestionConfig().model_dump(mode="json"),
+        "collection_existed_before": True,
+    }
+    if job_type == "document":
+        handler, kind = handle_kb_ingest_document, BackgroundJobType.KB_INGEST_DOCUMENT
+        payload["target_path"] = str(tmp_path / "doc.txt")
+    else:
+        handler, kind = handle_kb_ingest_web, BackgroundJobType.KB_INGEST_WEB
+        payload["crawl_config"] = {"start_url": "https://example.com"}
+    db = session_local()
+    write_migration_state("existing-kb", CollectionMigrationState(state=FROZEN))
+    try:
+        job = create_background_job(
+            db, user_id=int(user.id), job_type=kind, payload=payload
+        )
+        with pytest.raises(CollectionMigratingError):
+            handler(db, job)
+    finally:
+        clear_migration_state("existing-kb")
+        db.close()
+
+    assert resolved == []

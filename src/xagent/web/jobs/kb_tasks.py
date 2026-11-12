@@ -20,6 +20,9 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiOperationResult,
     get_kb_coordinator,
 )
+from ...core.tools.core.RAG_tools.management.migration_state import (
+    admits_collection_sync,
+)
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
     resolve_ingestion_model_ids,
     run_document_ingestion,
@@ -55,6 +58,11 @@ class StagedDocumentIngestSuperseded(RuntimeError):
 
 def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
     return get_kb_coordinator().api_compatibility
+
+
+def _payload_collection(db: Session, job: BackgroundJob) -> str | None:
+    collection = dict(job.payload or {}).get("collection")
+    return str(collection) if collection is not None else None
 
 
 def _collection_existed_before(payload: dict[str, Any]) -> bool:
@@ -217,6 +225,7 @@ def _resolve_job_ingestion_models(
 
 
 @coordinate_ingest_job
+@admits_collection_sync(_payload_collection)
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     target_path = payload.get("target_path")
@@ -385,6 +394,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     return result_payload
 
 
+@admits_collection_sync(_payload_collection)
 def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     crawl_config = WebCrawlConfig.model_validate(payload["crawl_config"])

@@ -129,6 +129,8 @@ async def _create_knowledge_base_from_file_impl(
     user_id: int,
     is_admin: bool = False,
 ) -> Any:
+    collection_name = ""
+    ingested_count = 0
     try:
         from sqlalchemy.orm import Session
 
@@ -140,6 +142,7 @@ async def _create_knowledge_base_from_file_impl(
             async_ensure_uploaded_file_local_path,
             log_durable_storage_fault,
         )
+        from ...core.RAG_tools.core.exceptions import CollectionMigratingError
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
             IngestionConfig,
@@ -248,6 +251,8 @@ async def _create_knowledge_base_from_file_impl(
             )
             try:
                 result = await run_blocking(func)
+            except CollectionMigratingError:
+                raise
             except Exception:
                 # Deliberately does NOT interpolate the exception, for the same
                 # reason as the durable arm above: this string is joined into the
@@ -320,6 +325,19 @@ async def _create_knowledge_base_from_file_impl(
             files_ingested=ingested_count,
         ).model_dump()
 
+    except CollectionMigratingError:
+        logger.warning(
+            "Knowledge base %s is frozen for embedding migration", collection_name
+        )
+        return CreateKnowledgeBaseFromFileResult(
+            success=False,
+            collection_name=collection_name,
+            message=(
+                "The knowledge base is being upgraded to a new embedding model. "
+                "Retry shortly."
+            ),
+            files_ingested=ingested_count,
+        ).model_dump()
     except Exception as e:
         logger.exception("Error creating knowledge base from file: %s", e)
         return CreateKnowledgeBaseFromFileResult(

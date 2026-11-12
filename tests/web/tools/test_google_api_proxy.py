@@ -308,17 +308,14 @@ def test_a_body_that_is_not_json_is_refused_before_sending(proxy, body):
 
 
 def _added_batch(service: Any, ids: list[str], callback) -> Any:
+    """One metadata read per id, the shape a Composio grant asks for: no
+    ``metadataHeaders``, whose repeated name the proxy appears to collapse."""
     batch = service.new_batch_http_request(callback=callback)
     for message_id in ids:
         batch.add(
             service.users()
             .messages()
-            .get(
-                userId="me",
-                id=message_id,
-                format="metadata",
-                metadataHeaders=["Subject", "From"],
-            )
+            .get(userId="me", id=message_id, format="metadata")
         )
     return batch
 
@@ -360,8 +357,6 @@ def test_a_batch_request_keeps_the_query_googleapiclient_built(proxy):
     assert call["method"] == "GET"
     assert call["parameters"] == [
         {"name": "format", "value": "metadata", "type": "query"},
-        {"name": "metadataHeaders", "value": "Subject", "type": "query"},
-        {"name": "metadataHeaders", "value": "From", "type": "query"},
         {"name": "alt", "value": "json", "type": "query"},
         {"name": "accept", "value": "application/json", "type": "header"},
     ]

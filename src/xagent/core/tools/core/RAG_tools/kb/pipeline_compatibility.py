@@ -15,6 +15,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
+from .async_utils import has_async_method
 from .collection_handle import deployment_kb_backend, ingest_scope
 from .operation_compatibility import (
     KBOperation,
@@ -173,7 +174,7 @@ class KBPipelineCompatibilityFacade:
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}
         )
-        if callable(getattr(metadata_store, "update_collection_fields", None)):
+        if has_async_method(metadata_store, "update_collection_fields"):
             await metadata_store.update_collection_fields(
                 updated_collection, ("extra_metadata",)
             )

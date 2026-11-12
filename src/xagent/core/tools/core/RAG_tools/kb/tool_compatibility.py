@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..core.schemas import CollectionInfo, IngestionConfig
-from .async_utils import maybe_await
+from .async_utils import has_async_method, maybe_await
 from .collection_handle import deployment_kb_backend
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
@@ -334,20 +334,20 @@ class KBToolCompatibilityFacade:
             updated_collection = collection_info.model_copy(
                 update={"extra_metadata": extra_metadata}
             )
-            if row_existed and callable(
-                getattr(metadata_store, "update_collection_fields", None)
+            if row_existed and has_async_method(
+                metadata_store, "update_collection_fields"
             ):
                 await metadata_store.update_collection_fields(
                     updated_collection, ("extra_metadata",)
                 )
-            elif not row_existed and callable(
-                getattr(metadata_store, "save_collection_if_absent", None)
+            elif not row_existed and has_async_method(
+                metadata_store, "save_collection_if_absent"
             ):
                 inserted = await metadata_store.save_collection_if_absent(
                     updated_collection
                 )
-                if not inserted and callable(
-                    getattr(metadata_store, "update_collection_fields", None)
+                if not inserted and has_async_method(
+                    metadata_store, "update_collection_fields"
                 ):
                     await metadata_store.update_collection_fields(
                         updated_collection, ("extra_metadata",)

@@ -1135,7 +1135,9 @@ async def test_metadata_rebuild_keeps_the_model_without_lancedb_vectors(
     )
     store, saved = MagicMock(), AsyncMock()
     monkeypatch.setattr(collection_manager, "get_vector_index_store", lambda: store)
-    monkeypatch.setattr(collection_manager.collection_manager, "save_collection", saved)
+    monkeypatch.setattr(
+        collection_manager.collection_manager, "save_collection_if_absent", saved
+    )
 
     await collection_manager._rebuild_collection_metadata_impl()
 

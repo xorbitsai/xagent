@@ -609,6 +609,36 @@ def test_metadata_rebuild_creation_cannot_clear_a_switch(
     assert _binding() == (NEW_MODEL, NEW_DIM)
 
 
+def test_metadata_rebuild_does_not_unbind_a_switched_kb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _switch(monkeypatch)
+    stale = CollectionInfo(name="kb", embeddings=0)
+
+    async def _list_collections(**_: Any) -> SimpleNamespace:
+        return SimpleNamespace(status="success", collections=[stale], message="")
+
+    monkeypatch.setattr(collections, "list_collections", _list_collections)
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.kb.collection_handle.ledger_holds_vectors",
+        lambda: False,
+    )
+    monkeypatch.setattr(cm, "get_vector_index_store", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        collections,
+        "_resolve_coordinator",
+        lambda _coordinator: SimpleNamespace(
+            aggregate_collection_stats_sync=lambda **_: {
+                "kb": {"documents": 0, "parses": 0, "chunks": 0, "embeddings": 0}
+            }
+        ),
+    )
+
+    asyncio.run(cm._rebuild_collection_metadata_impl())
+
+    assert _binding() == (NEW_MODEL, NEW_DIM)
+
+
 def test_stats_rebuild_creation_cannot_clear_a_switch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

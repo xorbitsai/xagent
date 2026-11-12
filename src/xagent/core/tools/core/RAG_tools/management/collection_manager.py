@@ -33,6 +33,7 @@ from ..utils.lancedb_query_utils import list_table_names
 from ..utils.model_resolution_pin import pinned_resolution
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.tag_mapping import register_tag_mapping
+from .migration_state import read_migration_state
 
 if TYPE_CHECKING:
     from ..kb import (
@@ -1796,9 +1797,19 @@ async def _rebuild_collection_metadata_impl() -> None:
                 _sync_wrapper(collection_manager.update_collection_fields)(
                     updated_collection, _COUNT_FIELDS
                 )
-                if binding:
-                    # A switch may have landed since the list snapshot; only an
-                    # unbound row may receive an inferred binding.
+                if binding and current is not None and current.is_initialized:
+                    # A KB with zero vectors is unbound so it can be rebound, but
+                    # only while it still holds the model that was read and is not
+                    # a switched collection.
+                    if binding["embedding_model_id"] is None and not (
+                        read_migration_state(collection.name).target_model_id
+                    ):
+                        _sync_wrapper(collection_manager.update_collection_fields)(
+                            updated_collection,
+                            tuple(binding),
+                            expected_model_id=current.embedding_model_id,
+                        )
+                elif binding:
                     _sync_wrapper(collection_manager.update_collection_fields)(
                         updated_collection,
                         tuple(binding),

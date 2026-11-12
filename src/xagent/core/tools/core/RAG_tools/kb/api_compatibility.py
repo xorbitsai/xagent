@@ -32,7 +32,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from .async_utils import maybe_await
+from .async_utils import has_async_method, maybe_await
 from .collection_handle import deployment_kb_backend
 from .operation_compatibility import (
     KBOperationOutcome,
@@ -655,17 +655,17 @@ class KBApiCompatibilityFacade:
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}
         )
-        if row_existed is True and _has_store_method(store, "update_collection_fields"):
+        if row_existed is True and has_async_method(store, "update_collection_fields"):
             await maybe_await(
                 store.update_collection_fields(updated_collection, ("extra_metadata",))
             )
-        elif row_existed is False and _has_store_method(
+        elif row_existed is False and has_async_method(
             store, "save_collection_if_absent"
         ):
             inserted = await maybe_await(
                 store.save_collection_if_absent(updated_collection)
             )
-            if not inserted and _has_store_method(store, "update_collection_fields"):
+            if not inserted and has_async_method(store, "update_collection_fields"):
                 await maybe_await(
                     store.update_collection_fields(
                         updated_collection, ("extra_metadata",)

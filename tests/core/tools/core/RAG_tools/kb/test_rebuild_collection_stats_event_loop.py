@@ -50,6 +50,14 @@ class _StubMetadataStore:
     async def get_collection(self, collection_name: str) -> CollectionInfo | None:
         return CollectionInfo(name=collection_name)
 
+    async def update_collection_fields(
+        self, collection: CollectionInfo, field_names, **kwargs
+    ) -> bool:
+        return True
+
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        return True
+
 
 @pytest.fixture
 def slow_vector_store(monkeypatch: pytest.MonkeyPatch) -> _SlowVectorStore:

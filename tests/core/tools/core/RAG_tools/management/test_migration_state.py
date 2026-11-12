@@ -33,6 +33,7 @@ from xagent.core.tools.core.RAG_tools.management.migration_state import (
     move_migration_state,
     pending_collection,
     read_migration_state,
+    run_in_admitted_context,
     write_migration_state,
 )
 from xagent.core.tools.core.RAG_tools.pipelines import document_ingestion, web_ingestion
@@ -579,3 +580,95 @@ async def test_direct_coordinator_rename_still_checks_outside_a_scope() -> None:
 
     with pytest.raises(CollectionMigratingError):
         await coordinator.rename_collection("kb", "kb-new", user_id=None, is_admin=True)
+
+
+@pytest.mark.asyncio
+async def test_run_in_admitted_context_supports_overlapping_workers() -> None:
+    import threading
+
+    admission = await admitted_context_async("kb")
+    _freeze("kb")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _hold() -> None:
+        entered.set()
+        release.wait(5)
+
+    loop = asyncio.get_running_loop()
+    holder = loop.run_in_executor(None, admission.run, _hold)
+    assert await asyncio.to_thread(entered.wait, 5)
+    try:
+        await loop.run_in_executor(
+            None,
+            run_in_admitted_context,
+            admission,
+            ensure_collection_writable,
+            "kb",
+        )
+    finally:
+        release.set()
+        await holder
+
+
+class _MultiTenantHandle(_FakeCollectionHandle):
+    def __init__(self, remaining_documents: int) -> None:
+        self.remaining_documents = remaining_documents
+
+    def list_collection_documents(self, **kwargs: object) -> list[str]:
+        return ["doc-a"]
+
+    def delete_documents_data(
+        self, doc_ids: list[str], **kwargs: object
+    ) -> dict[str, int]:
+        return {"documents": len(doc_ids)}
+
+    def count_documents(self, **kwargs: object) -> int:
+        return self.remaining_documents
+
+
+class _TenantRenameHandle(_RecordingHandle):
+    def __init__(self, remaining_documents: int) -> None:
+        super().__init__()
+        self.remaining_documents = remaining_documents
+
+    def count_documents(self, **kwargs: object) -> int:
+        return self.remaining_documents
+
+
+@pytest.mark.asyncio
+async def test_tenant_delete_keeps_the_global_freeze_when_others_remain() -> None:
+    write_migration_state("kb", CollectionMigrationState(state=IDLE))
+    coordinator = KBCoordinator()
+    handle = _MultiTenantHandle(remaining_documents=2)
+
+    with patch.object(
+        coordinator, "open_collection", new=AsyncMock(return_value=handle)
+    ):
+        async with admitted_async("kb"):
+            _freeze("kb")
+            await coordinator.delete_collection("kb", user_id=7, is_admin=False)
+
+    assert read_migration_state("kb").state == FROZEN
+    with pytest.raises(CollectionMigratingError):
+        ensure_collection_writable("kb")
+
+
+@pytest.mark.asyncio
+async def test_tenant_rename_keeps_the_old_name_freeze_when_others_remain() -> None:
+    write_migration_state("old-kb", CollectionMigrationState(state=IDLE))
+    coordinator = KBCoordinator()
+    handle = _TenantRenameHandle(remaining_documents=2)
+
+    with patch.object(
+        coordinator, "open_collection", new=AsyncMock(return_value=handle)
+    ):
+        async with admitted_async("old-kb"):
+            _freeze("old-kb")
+            warnings = await coordinator.rename_collection(
+                "old-kb", "new-kb", user_id=7, is_admin=False
+            )
+
+    assert warnings == []
+    assert read_migration_state("old-kb").state == FROZEN
+    assert read_migration_state("new-kb").state == IDLE

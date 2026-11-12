@@ -897,9 +897,15 @@ class _FakeRollbackFacade:
         self.cleanups += 1
 
 
+@pytest.mark.parametrize(
+    ("collection_arg", "resolved"),
+    [("kb", "kb"), ("", "doc")],
+)
 @pytest.mark.asyncio
 async def test_ingest_rollback_delete_runs_after_a_mid_flight_freeze(
     tmp_path,
+    collection_arg: str,
+    resolved: str,
 ) -> None:
     """Rollback runs in the route's admission after a freeze lands mid-ingest."""
     import io
@@ -912,6 +918,9 @@ async def test_ingest_rollback_delete_runs_after_a_mid_flight_freeze(
     from xagent.core.tools.core.RAG_tools.management import (
         migration_state as state_module,
     )
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        clear_migration_state,
+    )
     from xagent.web.api.kb import ingest
 
     user, db, access = _migration_mocks()
@@ -921,7 +930,7 @@ async def test_ingest_rollback_delete_runs_after_a_mid_flight_freeze(
     upload = UploadFile(filename="doc.pdf", file=io.BytesIO(b"content"))
 
     def _failing_ingest(**kwargs: object) -> KBApiOperationResult:
-        _freeze_state("kb")
+        _freeze_state(resolved)
         return KBApiOperationResult(
             result=IngestionResult(
                 status="error", message="unrelated ingest failure", doc_id="d1"
@@ -971,24 +980,27 @@ async def test_ingest_rollback_delete_runs_after_a_mid_flight_freeze(
             return_value=facade,
         ),
     ):
-        response = await ingest(
-            collection="kb",
-            file=upload,
-            parse_method=None,
-            chunk_strategy=None,
-            chunk_size=None,
-            chunk_overlap=None,
-            separators=None,
-            embedding_model_id="text-embedding-v4",
-            embedding_batch_size=None,
-            max_retries=None,
-            retry_delay=None,
-            _user=user,
-            db=db,
-        )
+        try:
+            response = await ingest(
+                collection=collection_arg,
+                file=upload,
+                parse_method=None,
+                chunk_strategy=None,
+                chunk_size=None,
+                chunk_overlap=None,
+                separators=None,
+                embedding_model_id="text-embedding-v4",
+                embedding_batch_size=None,
+                max_retries=None,
+                retry_delay=None,
+                _user=user,
+                db=db,
+            )
+        finally:
+            clear_migration_state(resolved)
 
     assert response.status_code == 500
-    assert rollback_calls == ["kb"]
+    assert rollback_calls == [resolved]
 
 
 @pytest.mark.asyncio
@@ -1130,3 +1142,41 @@ async def test_rename_route_authorizes_before_the_freeze_check() -> None:
             )
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_guessed_frozen_name_returns_404_in_standalone_mode() -> None:
+    """The default tenant resolver's 404 must win over the freeze 409."""
+    from unittest.mock import patch
+
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        clear_migration_state,
+    )
+    from xagent.web.api.kb import delete_collection_api
+
+    user, db, access = _migration_mocks()
+    user.is_admin = False
+    user.id = 2
+    _freeze_state("guessed")
+    try:
+        with (
+            patch(
+                "xagent.web.api.kb._effective_knowledge_base_user",
+                return_value=(user, access),
+            ),
+            patch(
+                "xagent.web.api.kb._get_collection_document_counts",
+                return_value=(1, 0),
+            ),
+            patch("xagent.web.api.kb.notify_knowledge_base_deleted"),
+            patch("xagent.web.api.kb._perform_kb_collection_delete") as perform,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await delete_collection_api(
+                    collection_name="guessed", _user=user, db=db
+                )
+    finally:
+        clear_migration_state("guessed")
+
+    assert exc_info.value.status_code == 404
+    perform.assert_not_called()

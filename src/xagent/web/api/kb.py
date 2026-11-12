@@ -2626,12 +2626,18 @@ class _WebFileLock:
 def _admission_collection(
     collection: Optional[str] = None,
     collection_name: Optional[str] = None,
+    file: Optional[UploadFile] = None,
     **_: Any,
 ) -> Optional[str]:
     """Route param collector for ``admits_collection``; a bad name is left to the handler."""
     name = collection if collection is not None else collection_name
-    if not name:
-        return None
+    if not (isinstance(name, str) and name.strip()):
+        filename = getattr(file, "filename", None)
+        if not filename:
+            return None
+        name = Path(Path(filename).name).stem
+        if not name:
+            return None
     try:
         return sanitize_path_component(name, "collection")
     except ValueError:
@@ -5945,6 +5951,40 @@ def _resolve_delete_mode_from_counts(
     return "full"
 
 
+def _ensure_tenant_collection_is_in_own_list(
+    collection_name: str,
+    user: Any,
+) -> None:
+    """Read-only config-only ownership check, so a guessed name stays 404."""
+    if getattr(user, "is_admin", False):
+        return
+    delete_mode = _get_collection_delete_mode(
+        collection_name, int(user.id), is_admin=False
+    )
+    if delete_mode != "config_only":
+        return
+    # Only a real owner set proves the row is absent; an unreadable one defers.
+    if _tenant_has_collection_config(collection_name, int(user.id)) is False:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Collection '{collection_name}' is not in your knowledge base list."
+            ),
+        )
+
+
+def _tenant_has_collection_config(collection_name: str, user_id: int) -> Optional[bool]:
+    from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    try:
+        owners = get_metadata_store().list_collection_config_owner_ids(collection_name)
+    except Exception:  # noqa: BLE001 - an unreadable owner list is not proof
+        return None
+    if not isinstance(owners, (set, frozenset)):
+        return None
+    return user_id in owners
+
+
 def _get_collection_delete_mode(
     collection_name: str,
     user_id: int,
@@ -6374,6 +6414,7 @@ async def delete_collection_api(
     _user, access = _effective_knowledge_base_user(
         db, _user, safe_collection, action="delete"
     )
+    _ensure_tenant_collection_is_in_own_list(safe_collection, _user)
     await ensure_collection_writable_async(safe_collection)
     notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
     result = _perform_kb_collection_delete(
@@ -6428,16 +6469,10 @@ async def batch_delete_collections_api(
                 effective_user, access = _effective_knowledge_base_user(
                     db, _user, safe_name, action="delete"
                 )
+                # Read-only ownership check before admission; the pipeline
+                # re-checks the mode immediately before mutation.
+                _ensure_tenant_collection_is_in_own_list(safe_name, effective_user)
                 async with admitted_async(safe_name):
-                    # Validate the current delete mode before the lifecycle hook,
-                    # then let the delete pipeline re-check it immediately before
-                    # mutation. Ownership can change between these two points.
-                    if not effective_user.is_admin:
-                        _get_collection_delete_mode(
-                            safe_name,
-                            int(effective_user.id),
-                            is_admin=False,
-                        )
                     notify_knowledge_base_deleted(db, access.storage_user_id, safe_name)
                     result = _perform_kb_collection_delete(
                         safe_name,

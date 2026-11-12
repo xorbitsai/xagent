@@ -279,8 +279,8 @@ def run_in_admitted_context(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    """Run ``fn`` under a context returned by :func:`admitted_context_async`."""
-    return context.run(fn, *args, **kwargs)
+    """Run ``fn`` in a fresh copy of an admitted context; a Context cannot be shared."""
+    return context.copy().run(fn, *args, **kwargs)
 
 
 def _raise_if_frozen(collection_name: str, state: CollectionMigrationState) -> None:

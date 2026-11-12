@@ -212,16 +212,28 @@ def gmail_search_messages(
     Search and list Gmail messages with optional query and label filters.
     Use query parameter for Gmail search syntax (e.g. 'is:unread', 'from:example@test.com').
     On a Composio-backed grant at most 100 messages are read in one call (the
-    batch fallback sends one proxy request per message, plus the list request);
-    ask for more in smaller calls.
+    batch fallback sends one proxy request per message, plus the list request),
+    so ask for more in smaller calls; pass at most one label id there, and
+    write any other condition into query (for example 'is:unread' or
+    'label:<name>').
     """
     try:
-        if composio_proxy.serves_composio_grant():
+        composio_grant = composio_proxy.serves_composio_grant()
+        if composio_grant:
             _check_composio_batch_budget(
                 max_results,
                 "max_results",
                 unit="message requests (plus the list request)",
             )
+            if label_ids and len(label_ids) > 1:
+                raise ValueError(
+                    "on a Composio-backed grant one search takes at most one "
+                    "label id; Gmail returns only the messages that carry "
+                    "every label given, so splitting the labels into separate "
+                    "searches would return more than asked. Write the other "
+                    "labels or conditions into query instead, for example "
+                    "'label:<name>' or 'is:unread'."
+                )
         service = get_gmail_service()
         kwargs = {"userId": "me", "maxResults": max_results}
         if query:
@@ -264,16 +276,18 @@ def gmail_search_messages(
         # Utilize Google API batch requests to prevent LLM tool execution timeouts
         batch = service.new_batch_http_request(callback=callback)
         for msg in messages:
-            batch.add(
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=msg["id"],
-                    format="metadata",
-                    metadataHeaders=["Subject", "From"],
-                )
-            )
+            get_kwargs: dict[str, Any] = {
+                "userId": "me",
+                "id": msg["id"],
+                "format": "metadata",
+            }
+            # Composio's proxy appears to keep one value of a repeated query
+            # parameter, so only one of the two ``metadataHeaders``
+            # googleapiclient writes would reach Gmail. A metadata read that
+            # names no header returns every header instead.
+            if not composio_grant:
+                get_kwargs["metadataHeaders"] = ["Subject", "From"]
+            batch.add(service.users().messages().get(**get_kwargs))
 
         _execute_batch(batch)
 

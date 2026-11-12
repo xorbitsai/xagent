@@ -95,7 +95,9 @@ from ...core.tools.core.RAG_tools.kb.models import (
 from ...core.tools.core.RAG_tools.management.migration_state import (
     admits_collection,
     admitted_context_async,
+    ensure_collection_writable,
     ensure_collection_writable_async,
+    pending_collection,
     run_in_admitted_context,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
@@ -2624,11 +2626,12 @@ class _WebFileLock:
 
 def _admission_collection(
     collection: Optional[str] = None,
+    collection_name: Optional[str] = None,
     file: Optional[UploadFile] = None,
     **_: Any,
 ) -> Optional[str]:
     """Route param collector for ``admits_collection``; a bad name is left to the handler."""
-    name = collection
+    name = collection if collection is not None else collection_name
     if not (isinstance(name, str) and name.strip()):
         filename = getattr(file, "filename", None)
         if not filename:
@@ -2640,6 +2643,18 @@ def _admission_collection(
         return sanitize_path_component(name, "collection")
     except ValueError:
         return None
+
+
+def _rename_admission_collections(
+    collection_name: str, new_name: Optional[str] = None, **_: Any
+) -> tuple[str, ...]:
+    names = []
+    for raw in (collection_name, new_name):
+        try:
+            names.append(sanitize_path_component(raw or "", "collection"))
+        except ValueError:
+            pass
+    return tuple(names)
 
 
 def _cloud_admission_collection(
@@ -5857,6 +5872,9 @@ class BatchDeleteFailureItem(BaseModel):
 
     name: str = Field(..., description="Collection name")
     error: str = Field(..., description="Error message")
+    code: Optional[str] = Field(
+        None, description="Machine-readable reason, e.g. kb_collection_migrating"
+    )
 
 
 class BatchDeleteCollectionsResponse(BaseModel):
@@ -6238,6 +6256,8 @@ def _perform_kb_collection_delete(
 
         if delete_mode == "config_only":
             return _perform_config_only_collection_delete(safe_collection, user_id)
+        # The mode can turn full after the route's snapshot; check before any tombstone.
+        ensure_collection_writable(safe_collection)
 
         mutation_scope = _resolve_collection_mutation_scope(
             collection_name=safe_collection,
@@ -6333,6 +6353,9 @@ def _perform_kb_collection_delete(
 
     except HTTPException:
         raise
+    except CollectionMigratingError:
+        # The 409 mapping lives in handle_kb_exceptions; do not wrap as 500.
+        raise
     except Exception as exc:
         logger.exception("Failed to delete collection '%s'", collection_name)
         raise HTTPException(
@@ -6346,6 +6369,7 @@ def _perform_kb_collection_delete(
 )
 @with_kb_user_scope
 @handle_kb_exceptions
+@admits_collection(_admission_collection)
 async def delete_collection_api(
     collection_name: str,
     _user: User = Depends(get_current_user),
@@ -6376,6 +6400,14 @@ async def delete_collection_api(
     _user, access = _effective_knowledge_base_user(
         db, _user, safe_collection, action="delete"
     )
+    delete_mode: _DeleteMode = (
+        "full"
+        if _user.is_admin
+        else _get_collection_delete_mode(safe_collection, int(_user.id), is_admin=False)
+    )
+    # A config-only delete removes just the caller's config row; only the data path is gated.
+    if delete_mode == "full":
+        await ensure_collection_writable_async(safe_collection)
     notify_knowledge_base_deleted(db, access.storage_user_id, safe_collection)
     result = _perform_kb_collection_delete(
         safe_collection,
@@ -6429,22 +6461,24 @@ async def batch_delete_collections_api(
                 effective_user, access = _effective_knowledge_base_user(
                     db, _user, safe_name, action="delete"
                 )
-                # Validate the current delete mode before the lifecycle hook,
-                # then let the delete pipeline re-check it immediately before
-                # mutation. Ownership can change between these two points.
-                if not effective_user.is_admin:
-                    _get_collection_delete_mode(
+                delete_mode: _DeleteMode = (
+                    "full"
+                    if effective_user.is_admin
+                    else _get_collection_delete_mode(
+                        safe_name, int(effective_user.id), is_admin=False
+                    )
+                )
+                with pending_collection(safe_name):
+                    # A config-only delete removes just the caller's config row; gate data deletes only.
+                    if delete_mode == "full":
+                        await ensure_collection_writable_async(safe_name)
+                    notify_knowledge_base_deleted(db, access.storage_user_id, safe_name)
+                    result = _perform_kb_collection_delete(
                         safe_name,
                         int(effective_user.id),
-                        is_admin=False,
+                        bool(effective_user.is_admin),
+                        db,
                     )
-                notify_knowledge_base_deleted(db, access.storage_user_id, safe_name)
-                result = _perform_kb_collection_delete(
-                    safe_name,
-                    int(effective_user.id),
-                    bool(effective_user.is_admin),
-                    db,
-                )
                 if result.status in ("success", "partial_success"):
                     db.commit()
                     deleted.append(name)
@@ -6468,6 +6502,14 @@ async def batch_delete_collections_api(
                 logger.warning(
                     "Batch delete aborted after HTTP error for %s; rolled back pending SQL.",
                     name,
+                )
+                continue
+            except CollectionMigratingError as e:
+                db.rollback()
+                failed.append(
+                    BatchDeleteFailureItem(
+                        name=name, error=e.message, code="kb_collection_migrating"
+                    )
                 )
                 continue
             except Exception as e:
@@ -6580,6 +6622,7 @@ async def check_documents_exist_api(
     "/collections/{collection_name}/documents/{filename}",
 )
 @handle_kb_exceptions
+@admits_collection(_admission_collection)
 async def delete_document_api(
     collection_name: str,
     filename: str,
@@ -6619,6 +6662,7 @@ async def delete_document_api(
 
     # Collection-level gate + vector fallback (rename / metadata lag vs strict visibility).
     await _ensure_collection_access_for_document_delete(safe_collection_name, _user)
+    await ensure_collection_writable_async(safe_collection_name)
 
     # Use storage abstraction layer to fetch document records
     vector_store = get_vector_index_store()
@@ -7258,6 +7302,7 @@ async def delete_document_api(
     "/collections/{collection_name}",
 )
 @handle_kb_exceptions
+@admits_collection(_rename_admission_collections)
 async def rename_collection_api(
     collection_name: str,
     new_name: str = Form(..., description="New collection name"),
@@ -7300,6 +7345,7 @@ async def rename_collection_api(
 
     # Access control check
     await _ensure_collection_access(safe_old_collection, _user, hide_missing=False)
+    await ensure_collection_writable_async(safe_old_collection)
 
     # Validate that target collection doesn't exist or user has access
     visible_for_user = await _list_collections_with_retry(
@@ -7362,6 +7408,8 @@ async def rename_collection_api(
                 detail=_rename_target_has_files_detail(safe_new_collection),
             )
 
+    # A frozen row can outlive its collection, so an absent target may still be frozen.
+    await ensure_collection_writable_async(safe_new_collection)
     physical_rename_results = {}
     renamed_owner_ids: list[int] = []
     for owner_id in sorted(mutation_scope.owner_user_ids):

@@ -158,7 +158,7 @@ def _collections_not_frozen(monkeypatch):
     monkeypatch.setattr(
         state_module,
         "read_migration_state",
-        lambda _name: state_module.CollectionMigrationState(),
+        lambda _name, _store=None: state_module.CollectionMigrationState(),
     )
 
 
@@ -1512,7 +1512,9 @@ async def test_create_kb_from_file_admits_once_for_all_files(
     monkeypatch.setattr(
         state_module,
         "read_migration_state",
-        lambda _name: state_module.CollectionMigrationState(state=state["value"]),
+        lambda _name, _store=None: state_module.CollectionMigrationState(
+            state=state["value"]
+        ),
     )
     records = []
     for name in ("a.txt", "b.txt"):

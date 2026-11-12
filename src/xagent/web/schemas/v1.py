@@ -442,6 +442,40 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1McpServerAuthorization(BaseModel):
+    """Whether the key holder has authorized an OAuth connector.
+
+    Fields with a fixed set of values are plain strings, and other values may
+    be added later, so clients should accept any string.
+    """
+
+    kind: str = Field(
+        ...,
+        description=(
+            "'mcp_oauth' for a connector with its own OAuth settings, "
+            "'builtin_oauth' for a platform app connection."
+        ),
+    )
+    status: str = Field(
+        ...,
+        description=(
+            "'authorized', 'not_authorized', 'needs_reconnect' (an "
+            "authorization is stored but has expired or expires within five "
+            "minutes and cannot be refreshed, or a platform app connection "
+            "needs reconnecting) or "
+            "'configuration_error' (the connector's OAuth settings are "
+            "unusable, or its platform app cannot be resolved)."
+        ),
+    )
+    message: Optional[str] = Field(
+        None,
+        description=(
+            "What the key holder can do next; null when nothing is needed. "
+            "An API key cannot complete authorization."
+        ),
+    )
+
+
 class V1McpServer(BaseModel):
     """One MCP connector the key holder can see.
 
@@ -517,6 +551,23 @@ class V1McpServer(BaseModel):
     provider: Optional[str] = None
     connected_account: Optional[str] = Field(
         None, description="The key holder's own connected third-party account."
+    )
+    authorization: Optional[V1McpServerAuthorization] = Field(
+        None,
+        description=(
+            "The key holder's own OAuth authorization of this connector. Null "
+            "unless `auth.type` is `mcp_oauth` on an `sse`, `streamable_http` "
+            "or `websocket` transport, or the transport is `oauth`. "
+            "'authorized' means a "
+            "stored authorization the runtime would use: valid for more than "
+            "five minutes, or holding a refresh token; whether a refresh "
+            "succeeds is not "
+            "checked. A token supplied by an OAuth token resolver hook is not "
+            "reflected. For a connector seen only through a team it reports "
+            "the key holder's own authorization; the web route "
+            "`/api/mcp/{server_id}/oauth/status` answers 404 for such a "
+            "holder because it requires the holder's own enabled link."
+        ),
     )
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

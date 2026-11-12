@@ -121,49 +121,40 @@ def _connect_catalog_stripe(db, user) -> MCPServer:
     """Connect the shared catalog stripe row the way POST /apps/{id}/connect
     does: the row has no owner, and the user's link is a non-owner link."""
     server, _ = _ensure_catalog_app_server(db, "stripe")
-    db.add(
-        UserMCPServer(
-            user_id=user.id,
-            mcpserver_id=server.id,
-            is_owner=False,
-            can_edit=False,
-            can_delete=True,
-            is_active=True,
-            env=encrypt_env_dict({"STRIPE_API_KEY": "user-key"}),
-            env_source="own",
-        )
+    _link_without_owning(
+        db,
+        user,
+        server,
+        env=encrypt_env_dict({"STRIPE_API_KEY": "user-key"}),
+        env_source="own",
     )
-    db.commit()
     return server
 
 
 def _connect_catalog_chartmogul(db, user) -> MCPServer:
     """Connect the shared catalog chartmogul row, as the stripe helper does."""
     server, _ = _ensure_catalog_app_server(db, "chartmogul")
-    db.add(
-        UserMCPServer(
-            user_id=user.id,
-            mcpserver_id=server.id,
-            is_owner=False,
-            can_edit=False,
-            can_delete=True,
-            is_active=True,
-            env=encrypt_env_dict({"CHARTMOGUL_API_KEY": "user-key"}),
-            env_source="own",
-        )
+    _link_without_owning(
+        db,
+        user,
+        server,
+        env=encrypt_env_dict({"CHARTMOGUL_API_KEY": "user-key"}),
+        env_source="own",
     )
-    db.commit()
     return server
 
 
-def _stripe_ok() -> _Adapter:
+def _list_customers_ok(tool: str) -> _Adapter:
     payload = {"status": "success", "customers": [], "truncated": False}
-    return _Adapter("stripe_list_customers", _text_result(json.dumps(payload)))
+    return _Adapter(tool, _text_result(json.dumps(payload)))
+
+
+def _stripe_ok() -> _Adapter:
+    return _list_customers_ok("stripe_list_customers")
 
 
 def _chartmogul_ok() -> _Adapter:
-    payload = {"status": "success", "customers": [], "truncated": False}
-    return _Adapter("chartmogul_list_customers", _text_result(json.dumps(payload)))
+    return _list_customers_ok("chartmogul_list_customers")
 
 
 class _ForbiddenSandboxManager:

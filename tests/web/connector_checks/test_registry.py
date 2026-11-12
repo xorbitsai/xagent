@@ -1721,7 +1721,6 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
                 ("issue",),
                 ("number", "title", "state", "labels", "user", "html_url"),
             ),
-            IsType(("issue", "number"), "number"),
             Equals(("issue", "number"), FixtureRef("github.issue_number")),
             Equals(("issue", "title"), "xagent smoke seed issue"),
             Equals(("issue", "state"), "open"),
@@ -1755,7 +1754,6 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
                 ("pull_request",),
                 ("number", "title", "state", "head", "base", "draft"),
             ),
-            IsType(("pull_request", "number"), "number"),
             Equals(("pull_request", "number"), FixtureRef("github.pull_number")),
             Equals(("pull_request", "title"), "xagent smoke seed pull request"),
             Equals(("pull_request", "state"), "open"),
@@ -1842,10 +1840,10 @@ def test_the_github_read_checks_use_exactly_these_fixture_keys() -> None:
 
 
 def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
-    """A fixture in the arguments names a parameter of the tool, its value is
-    the type that parameter declares, and every required argument is pinned: an
-    omitted one would make the tool prompt, and a string where the tool takes an
-    integer is refused before the call leaves."""
+    """A fixture in the arguments names a parameter of the tool, and every
+    required argument is pinned: an omitted one would make the tool prompt.
+    That the value is the type the parameter declares is the adapter test's
+    judgement, below."""
     for check in CONNECTOR_CHECKS["github"].reads:
         if not isinstance(check, ReadCheck):
             continue
@@ -1855,11 +1853,6 @@ def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
         ]
         for name in bound:
             assert name in parameters, (check.tool, name)
-            declared = parameters[name].annotation
-            for ref in _fixture_refs(check.arguments[name]):
-                value = _FIXTURES.resolve_fixture(ref.key)
-                assert value is not None, ref.key
-                assert isinstance(value, declared), (check.tool, name, ref.key)
         required = {
             name
             for name, parameter in parameters.items()

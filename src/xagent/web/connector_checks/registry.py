@@ -412,7 +412,6 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("issue",),
                         ("number", "title", "state", "labels", "user", "html_url"),
                     ),
-                    IsType(("issue", "number"), "number"),
                     Equals(("issue", "number"), FixtureRef("github.issue_number")),
                     Equals(("issue", "title"), "xagent smoke seed issue"),
                     Equals(("issue", "state"), "open"),
@@ -448,7 +447,6 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("pull_request",),
                         ("number", "title", "state", "head", "base", "draft"),
                     ),
-                    IsType(("pull_request", "number"), "number"),
                     Equals(
                         ("pull_request", "number"),
                         FixtureRef("github.pull_number"),

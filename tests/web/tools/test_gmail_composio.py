@@ -273,6 +273,23 @@ def test_search_reads_subjects_from_every_header_on_a_composio_grant(
     assert [item for item in query if item["name"] == "metadataHeaders"] == []
 
 
+def test_a_composio_search_with_two_label_ids_is_refused_before_sending(
+    proxy, monkeypatch
+):
+    """Two label ids are the same query name twice: the proxy appears to keep
+    only one value, which would quietly widen the search."""
+    proxy.answer("/messages", 200, {"messages": []})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_search_messages("q", label_ids=["INBOX", "STARRED"], max_results=1)
+    )
+
+    assert result["status"] == "error"
+    assert "labelIds" in result["message"]
+    assert proxy.calls == []
+
+
 def test_search_with_no_messages_sends_only_the_list_request(proxy, monkeypatch):
     proxy.answer("/messages", 200, {"messages": []})
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())

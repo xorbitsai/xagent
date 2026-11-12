@@ -41,7 +41,7 @@ def test_a_request_is_mapped_to_one_proxy_call(proxy):
 
     http.request(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-        "?maxResults=10&labelIds=INBOX&labelIds=STARRED",
+        "?maxResults=10&labelIds=INBOX",
         method="POST",
         body='{"raw": "abc"}',
         headers={"content-type": "application/json", "accept": "application/json"},
@@ -56,12 +56,24 @@ def test_a_request_is_mapped_to_one_proxy_call(proxy):
         "parameters": [
             {"name": "maxResults", "value": "10", "type": "query"},
             {"name": "labelIds", "value": "INBOX", "type": "query"},
-            {"name": "labelIds", "value": "STARRED", "type": "query"},
             {"name": "content-type", "value": "application/json", "type": "header"},
             {"name": "accept", "value": "application/json", "type": "header"},
         ],
         "body": {"raw": "abc"},
     }
+
+
+def test_a_query_name_that_repeats_in_the_uri_is_refused_before_sending(proxy):
+    """Composio's proxy appears to keep one value of a repeated query
+    parameter, so a request that would lose a value is refused here."""
+    with pytest.raises(ValueError) as raised:
+        _http().request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+            "?labelIds=INBOX&labelIds=STARRED"
+        )
+
+    assert "labelIds" in str(raised.value)
+    assert proxy.calls == []
 
 
 def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
@@ -79,21 +91,17 @@ def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
     assert all(item["name"] != "content-type" for item in call["parameters"])
 
 
-def test_a_long_get_keeps_its_repeated_parameters(proxy):
+def test_a_long_get_whose_query_repeats_a_name_is_refused_before_sending(proxy):
     """The form body googleapiclient moves the query of a long GET into keeps
-    a repeated parameter as its pairs; restoring the GET must not collapse them
-    into one."""
-    _gmail_service().users().messages().list(
-        userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]
-    ).execute()
+    a repeated parameter as its pairs; restoring the GET must not send them,
+    because the proxy appears to keep one value of a repeated name."""
+    with pytest.raises(ValueError) as raised:
+        _gmail_service().users().messages().list(
+            userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]
+        ).execute()
 
-    (call,) = proxy.calls
-    assert call["method"] == "GET"
-    assert "body" not in call
-    assert [item for item in call["parameters"] if item["name"] == "labelIds"] == [
-        {"name": "labelIds", "value": "INBOX", "type": "query"},
-        {"name": "labelIds", "value": "STARRED", "type": "query"},
-    ]
+    assert "labelIds" in str(raised.value)
+    assert proxy.calls == []
 
 
 def test_only_headers_that_change_the_answer_are_forwarded(proxy):

@@ -31,7 +31,7 @@ from xagent.web.tools.mcp import (
     google_drive_composio,
 )
 
-from .fakes import FakePolicyAdapter, FakeTool, listed, rows, targets
+from .fakes import FakePolicyAdapter, FakeTool, listed, rows, targets, tool_for
 
 SEED_FOLDER = "folder-seed"
 SEED_DOC = "doc-seed"
@@ -204,12 +204,14 @@ class Drive:
             "md5Checksum": hashlib.md5(data, usedforsecurity=False).hexdigest(),
         }
 
-    def media(self, file_id: str) -> _Media:
+    def media(self, file_id: str) -> str:
+        """The id a media request would read, which the downloader indexes
+        ``contents`` by."""
         self.refused()
         self.requests.append(("media", file_id))
         if file_id not in self.items:
             raise RuntimeError("404 Client Error: Not Found")
-        return _Media(file_id)
+        return file_id
 
     def delete(self, file_id: str) -> None:
         self.refused()
@@ -229,13 +231,6 @@ class _Request:
         return self._run()
 
 
-class _Media:
-    """A media request, whose bytes the test's downloader reads."""
-
-    def __init__(self, file_id: str) -> None:
-        self.file_id = file_id
-
-
 class _Files:
     def __init__(self, drive: Drive) -> None:
         self._drive = drive
@@ -251,27 +246,14 @@ class _Files:
     def get(self, **kwargs: Any) -> _Request:
         return _Request(lambda: self._drive.get(kwargs["fileId"]))
 
-    def get_media(self, **kwargs: Any) -> _Media:
+    def get_media(self, **kwargs: Any) -> str:
         return self._drive.media(kwargs["fileId"])
 
-    def export_media(self, **kwargs: Any) -> _Media:
+    def export_media(self, **kwargs: Any) -> str:
         return self._drive.media(kwargs["fileId"])
 
     def delete(self, **kwargs: Any) -> _Request:
         return _Request(lambda: self._drive.delete(kwargs["fileId"]))
-
-
-def _tool(name: str) -> FakeTool:
-    function: Callable[..., str] = getattr(google_drive, name)
-
-    def respond(args: dict[str, Any]) -> Any:
-        return {
-            "content": [{"type": "text", "text": function(**args)}],
-            "structured_content": None,
-            "is_error": False,
-        }
-
-    return FakeTool(name, respond=respond)
 
 
 # Every tool the server registers, so the session lists what production does.
@@ -298,7 +280,7 @@ def drive(monkeypatch: pytest.MonkeyPatch) -> Drive:
     drive = Drive()
     monkeypatch.setattr(google_drive, "get_drive_service", lambda: drive)
     monkeypatch.setattr(
-        google_drive, "_download_media", lambda request: drive.contents[request.file_id]
+        google_drive, "_download_media", lambda file_id: drive.contents[file_id]
     )
     return drive
 
@@ -380,7 +362,7 @@ def writes_on(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _tools() -> dict[str, FakeTool]:
-    return {name: _tool(name) for name in _TOOLS}
+    return {name: tool_for(google_drive, name) for name in _TOOLS}
 
 
 def _adapter(
@@ -395,8 +377,12 @@ def _adapter(
     )
 
 
-async def _run(adapter: FakePolicyAdapter) -> RunResult:
-    return await run_checks(adapter, check_timeout=5.0, total_timeout=60.0)
+async def _run(
+    adapter: FakePolicyAdapter, checks: list[str] | None = None
+) -> RunResult:
+    return await run_checks(
+        adapter, checks=checks, check_timeout=5.0, total_timeout=60.0
+    )
 
 
 def _check_rows(result: RunResult) -> dict[str, tuple[Any, ...]]:
@@ -509,12 +495,7 @@ async def test_a_same_named_folder_outside_the_root_does_not_fail_the_pin(
     # deeper in the tree is not a second write folder.
     drive.add("folder-nested", "xagent-smoke-write", FOLDER_MIME, parent=SEED_FOLDER)
 
-    result = await run_checks(
-        _adapter(),
-        checks=["google-drive.file_round_trip"],
-        check_timeout=5.0,
-        total_timeout=60.0,
-    )
+    result = await _run(_adapter(), checks=["google-drive.file_round_trip"])
 
     assert _check_rows(result)["google-drive.file_round_trip"] == (
         "pass",
@@ -535,18 +516,17 @@ async def test_a_write_folder_the_connection_cannot_read_refuses_the_write(
     del drive.items[WRITE_FOLDER]
     del seeded[WRITE_FOLDER]
 
-    result = await run_checks(
-        _adapter(),
-        checks=["google-drive.file_round_trip"],
-        check_timeout=5.0,
-        total_timeout=60.0,
-    )
+    result = await _run(_adapter(), checks=["google-drive.file_round_trip"])
 
     assert _check_rows(result)["google-drive.file_round_trip"] == (
         "fail",
         "tenant_mismatch",
         "pin_failed",
     )
+    # The pin's search ran, with the registry's own query: an unrecognised
+    # query becomes an error envelope the tool swallows into the same
+    # `pin_failed`, so the test pins the query too.
+    assert ("list", PIN_QUERY) in drive.requests
     assert not drive.created
     assert drive.items == seeded
 
@@ -621,18 +601,17 @@ async def test_a_composio_grant_that_cannot_read_the_write_folder_writes_nothing
     del drive.items[WRITE_FOLDER]
     seeded = dict(drive.items)
 
-    result = await run_checks(
-        _adapter(),
-        checks=["google-drive.file_round_trip"],
-        check_timeout=5.0,
-        total_timeout=60.0,
-    )
+    result = await _run(_adapter(), checks=["google-drive.file_round_trip"])
 
     assert _check_rows(result)["google-drive.file_round_trip"] == (
         "fail",
         "tenant_mismatch",
         "pin_failed",
     )
+    # The pin's search ran, with the registry's own query: an unrecognised
+    # query becomes an error envelope the tool swallows into the same
+    # `pin_failed`.
+    assert ("list", PIN_QUERY) in drive.requests
     assert not composio.executed
     assert not drive.created
     assert drive.items == seeded

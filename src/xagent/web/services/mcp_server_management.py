@@ -8,6 +8,11 @@ Reads never call the web read routes. They query through
 ``_project_mcp_server``. The projection reuses the web module's ``_mask_env``,
 ``_check_mcp_permission`` and OAuth account summaries; auth masking is this
 module's own ``_masked_auth``.
+
+A create calls the web ``create_mcp_server`` with a request model built from
+the SDK body, so the web code decides every stored value, name rule and
+encryption. This module never assigns ``url`` or ``auth`` on a stored row.
+The web function's ``HTTPException`` propagates; the route translates it.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ..api.mcp import (
+    MCPServerCreate,
     _check_mcp_permission,
     _default_resource_owner_key,
     _enrich_oauth_server_info,
@@ -27,13 +33,18 @@ from ..api.mcp import (
     _mcp_oauth_configuration_error,
     _oauth_account_summaries,
     _require_parsable_mcp_oauth_identifiers,
+    create_mcp_server,
 )
 from ..models.database import get_session_local
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.mcp_oauth import MCPOAuthGrant
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
-from ..schemas.v1 import V1McpServer, V1McpServerAuthorization
+from ..schemas.v1 import (
+    V1McpServer,
+    V1McpServerAuthorization,
+    V1McpServerCreateRequest,
+)
 from .connector_team_scope import (
     ConnectorHookSessionBoundaryError,
     connector_access_hook_installed,
@@ -57,6 +68,18 @@ _REMOTE_TRANSPORTS = frozenset({"streamable_http", "sse"})
 # An ``auth`` dict carrying any of these keys was written by a catalog app
 # connection (or claims to have been), so the connector is not a user's own.
 _CATALOG_AUTH_KEYS = ("app_id", "provider", "builtin_provenance")
+
+
+def _log_write(action: str, key_prefix: str, user_id: int, server_id: int) -> None:
+    # Nothing but identifiers: no name, no configuration.
+    logger.info(
+        "personal key mcp server write: action=%s key_prefix=%s user_id=%d "
+        "server_id=%d",
+        action,
+        key_prefix,
+        user_id,
+        server_id,
+    )
 
 
 def _load_holder(db: Any, user_id: int) -> User:
@@ -199,6 +222,27 @@ def classify_connector_kind(server: MCPServer, catalog_app_keys: frozenset[str])
 def connector_kind(db: Any, server: MCPServer) -> str:
     # Single-connector entry; it runs the same pure function as the projection.
     return classify_connector_kind(server, _catalog_classification_keys(db, [server]))
+
+
+def _web_create_request(request: V1McpServerCreateRequest) -> MCPServerCreate:
+    # ``url``, ``headers`` and ``auth`` travel inside ``config``, the web
+    # function's own shape.
+    config: dict[str, Any] = {"url": request.url}
+    if request.headers:
+        config["headers"] = dict(request.headers)
+    if request.auth:
+        config["auth"] = dict(request.auth)
+    return MCPServerCreate(
+        name=request.name,
+        transport=request.transport,
+        description=request.description,
+        config=config,
+        is_active=request.enabled,
+        runtime_input_schema=request.runtime_input_schema,
+        runtime_bindings=request.runtime_bindings,
+        signed_uploads=request.signed_uploads,
+        allow_delegated_authorization=request.allow_delegated_authorization,
+    )
 
 
 def _masked_dict(value: Any) -> Optional[dict[str, Any]]:
@@ -460,5 +504,57 @@ class McpServerManagementRuntime:
                 if row is None:
                     return None
                 return _project_rows(db, user, [row])[0]
+
+        return await run_db_io_cancellation_safe(run)
+
+    async def create_server(
+        self, *, user_id: int, key_prefix: str, request: V1McpServerCreateRequest
+    ) -> V1McpServer:
+        """Create a connector the holder owns and return it as the holder sees it.
+
+        The web function commits before the projection runs, so a projection
+        failure answers 500 with the connector already created.
+        """
+
+        def run() -> V1McpServer:
+            with get_session_local()() as db:
+                user = _load_holder(db, user_id)
+                created = create_mcp_server(
+                    _web_create_request(request), current_user=user, db=db
+                )
+                row = resolve_holder_connector(db, user_id, int(created.id))
+                if row is None:
+                    # The web function just made this link in its own commit.
+                    from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+                    logger.error(
+                        "personal key mcp server write failed: action=create "
+                        "user_id=%d server_id=%d",
+                        user_id,
+                        int(created.id),
+                    )
+                    raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
+                projected = _project_rows(db, user, [row])[0]
+            _log_write("create", key_prefix, user_id, projected.id)
+            return projected
+
+        return await run_db_io_cancellation_safe(run)
+
+    async def owned_connector_id(self, *, user_id: int, name: str) -> Optional[int]:
+        """The id of the connector named exactly ``name`` that the holder owns."""
+
+        def run() -> Optional[int]:
+            with get_session_local()() as db:
+                found = (
+                    db.query(MCPServer.id)
+                    .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+                    .filter(
+                        MCPServer.name == name,
+                        UserMCPServer.user_id == user_id,
+                        UserMCPServer.is_owner.is_(True),
+                    )
+                    .first()
+                )
+                return None if found is None else int(found[0])
 
         return await run_db_io_cancellation_safe(run)

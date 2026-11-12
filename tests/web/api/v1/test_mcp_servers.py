@@ -1,4 +1,4 @@
-"""Integration tests for the read-only /v1 MCP connector endpoints."""
+"""Integration tests for the /v1 MCP connector endpoints."""
 
 import logging
 from dataclasses import dataclass
@@ -7,10 +7,12 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
+from fastapi import HTTPException
 from sqlalchemy.exc import OperationalError
 
 from xagent.core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from xagent.core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
+from xagent.web.api.mcp import TransportFieldValidator
 from xagent.web.api.v1 import mcp_servers as mcp_servers_routes
 from xagent.web.api.v1.errors import _DEFAULT_MESSAGES, V1ErrorCode
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
@@ -19,8 +21,13 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.models.user_api_key import UserApiKey
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import connector_team_scope, mcp_server_management
+from xagent.web.services.connector_name_policy import (
+    catalog_app_name_detail,
+    folded_name_conflict_detail,
+)
 from xagent.web.services.connector_team_scope import (
     ConnectorAccess,
     ConnectorHookSessionBoundaryError,
@@ -89,6 +96,23 @@ def bob() -> Holder:
 @pytest.fixture
 def carol() -> Holder:
     return _holder("carol")
+
+
+def _seed_link(server_id: int, holder: Holder, *, is_owner: bool) -> None:
+    db = _direct_db_session()
+    try:
+        db.add(
+            UserMCPServer(
+                user_id=holder.user_id,
+                mcpserver_id=server_id,
+                is_owner=is_owner,
+                can_delete=False,
+                is_active=True,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
 
 
 def _seed(
@@ -206,15 +230,23 @@ def _own_routes() -> list[tuple[str, str]]:
 @pytest.mark.parametrize("kind", _KEY_KINDS)
 @pytest.mark.parametrize(
     ("method", "path"),
-    [("GET", "/v1/mcp-servers"), ("GET", "/v1/mcp-servers/{server_id}")],
+    [
+        ("GET", "/v1/mcp-servers"),
+        ("GET", "/v1/mcp-servers/{server_id}"),
+        ("POST", "/v1/mcp-servers"),
+    ],
 )
 def test_mcp_routes_accept_only_personal_keys(method, path, kind):
     assert _own_routes() == [
         ("GET", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}"),
+        ("POST", "/v1/mcp-servers"),
     ]
     resp = client.request(
-        method, path.replace("{server_id}", "1"), headers=_headers_for(kind)
+        method,
+        path.replace("{server_id}", "1"),
+        headers=_headers_for(kind),
+        json=_create_body() if method == "POST" else None,
     )
     _error(resp, 401, "invalid_api_key")
 
@@ -1250,3 +1282,658 @@ def test_authorization_reads_grants_once_and_skips_rows_without_one(bob, carol):
     assert sum("mcp_oauth_grants" in s for s in statements) == 2
     # The selector gets the row's URL, so it never reads it again.
     assert not any(s.lstrip().startswith("SELECT mcp_servers.url") for s in statements)
+
+
+# ===== creating a connector =====
+
+
+def _create_body(**fields: Any) -> dict[str, Any]:
+    return {
+        "name": "new-connector",
+        "transport": "streamable_http",
+        "url": CONNECTOR_URL,
+        **fields,
+    }
+
+
+def _create(holder: Holder, **fields: Any):
+    return client.post(
+        "/v1/mcp-servers", headers=holder.headers, json=_create_body(**fields)
+    )
+
+
+def _store() -> tuple[list, list]:
+    """Every connector definition and link, for before/after comparison."""
+    db = _direct_db_session()
+    try:
+        return (
+            sorted(db.query(MCPServer.id, MCPServer.name, MCPServer.url).all()),
+            sorted(
+                db.query(
+                    UserMCPServer.user_id,
+                    UserMCPServer.mcpserver_id,
+                    UserMCPServer.is_active,
+                    UserMCPServer.is_owner,
+                ).all()
+            ),
+        )
+    finally:
+        db.close()
+
+
+def _assert_nothing_written(before: tuple[list, list]) -> None:
+    assert _store() == before
+
+
+def _key_prefix(holder: Holder) -> str:
+    db = _direct_db_session()
+    try:
+        return str(
+            db.query(UserApiKey.key_prefix)
+            .filter(UserApiKey.user_id == holder.user_id)
+            .one()[0]
+        )
+    finally:
+        db.close()
+
+
+def _fail_web_create(monkeypatch, exc: BaseException) -> None:
+    def fail(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(mcp_server_management, "create_mcp_server", fail)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_create_returns_the_new_connector(bob, enabled):
+    resp = _create(
+        bob,
+        description="A search tool",
+        headers={"X-Api-Key": "SECRET-header-value"},
+        auth={"type": "bearer", "bearer_token": "SECRET-bearer"},
+        enabled=enabled,
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["name"] == "new-connector"
+    assert body["description"] == "A search tool"
+    assert (body["transport"], body["url"]) == ("streamable_http", CONNECTOR_URL)
+    assert (body["access"], body["kind"], body["enabled"]) == (
+        "own",
+        "custom",
+        enabled,
+    )
+    assert (body["can_edit"], body["can_delete"]) == (True, True)
+    assert body["headers"] == {"X-Api-Key": MASKED_SECRET_VALUE}
+    assert body["auth"] == {"type": "bearer", "bearer_token": MASKED_SECRET_VALUE}
+    assert _get_one(bob, body["id"]).json() == body
+    db = _direct_db_session()
+    try:
+        link = db.query(UserMCPServer).filter_by(mcpserver_id=body["id"]).one()
+        assert (link.user_id, link.is_owner, link.is_active) == (
+            bob.user_id,
+            True,
+            enabled,
+        )
+    finally:
+        db.close()
+
+
+def test_create_accepts_runtime_declarations(bob):
+    schema = {"context": {"account_id": {"type": "string", "required": True}}}
+    bindings = [
+        {
+            "source": {"input_type": "context", "key": "account_id"},
+            "target": {"target_type": "mcp_meta", "key": "account_id"},
+        }
+    ]
+
+    resp = _create(
+        bob,
+        runtime_input_schema=schema,
+        runtime_bindings=bindings,
+        allow_delegated_authorization=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["runtime_input_schema"] == schema
+    assert body["runtime_bindings"] == bindings
+    assert body["allow_delegated_authorization"] is True
+
+
+# ===== the request rules checked before the web code runs =====
+
+# Transports the API refuses: everything the web code knows how to store except
+# the two remote ones, plus spellings that are not the exact names.
+_REFUSED_TRANSPORTS = sorted(
+    (set(TransportFieldValidator.TRANSPORT_REQUIRED_FIELDS) | {"oauth"})
+    - {"streamable_http", "sse"}
+) + ["SSE", "http"]
+
+
+@pytest.mark.parametrize("transport", _REFUSED_TRANSPORTS)
+def test_create_refuses_other_transports(bob, transport):
+    assert set(_REFUSED_TRANSPORTS) - {"SSE", "http"} == {
+        "oauth",
+        "stdio",
+        "websocket",
+    }
+    before = _store()
+
+    resp = _create(bob, transport=transport)
+
+    error = _error(resp, 400, "transport_not_supported")
+    assert error["message"] == _DEFAULT_MESSAGES[V1ErrorCode.TRANSPORT_NOT_SUPPORTED]
+    _assert_nothing_written(before)
+
+
+def test_create_accepts_the_sse_transport(bob):
+    resp = _create(bob, transport="sse")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transport"] == "sse"
+
+
+# cell -> (request fields, error message)
+_INPUT_RULE_CELLS: dict[str, tuple[dict[str, Any], str]] = {
+    "blank_name": ({"name": "   "}, "Connector name cannot be blank."),
+    "name_ending_in_newline": (
+        {"name": "abc\n"},
+        "Connector names cannot start or end with tabs, line breaks or other "
+        "whitespace besides spaces.",
+    ),
+    "url_without_scheme": (
+        {"url": "mcp.example.test/mcp"},
+        "url must be an absolute http(s) URL without user info.",
+    ),
+    "url_with_user_info": (
+        {"url": "https://user:pass@mcp.example.test/mcp"},
+        "url must be an absolute http(s) URL without user info.",
+    ),
+    "url_with_other_scheme": (
+        {"url": "ftp://mcp.example.test/mcp"},
+        "url must be an absolute http(s) URL without user info.",
+    ),
+    "url_with_port_out_of_range": (
+        {"url": "https://mcp.example.test:99999/mcp"},
+        "url must be an absolute http(s) URL without user info.",
+    ),
+    "url_with_null_character": (
+        {"url": "https://mcp.example.test/m\x00cp"},
+        "url must be an absolute http(s) URL without user info.",
+    ),
+    "auth_claims_a_catalog_app": (
+        {"auth": {"type": "bearer", "app_id": "gmail"}},
+        "auth cannot set app_id, provider or builtin_provenance; these mark "
+        "catalog connectors.",
+    ),
+    "auth_names_a_provider": (
+        {"auth": {"provider": "acme"}},
+        "auth cannot set app_id, provider or builtin_provenance; these mark "
+        "catalog connectors.",
+    ),
+    "auth_sets_builtin_provenance": (
+        {"auth": {"builtin_provenance": "x"}},
+        "auth cannot set app_id, provider or builtin_provenance; these mark "
+        "catalog connectors.",
+    ),
+    "masked_header_value": (
+        {"headers": {"X-Key": MASKED_SECRET_VALUE}},
+        "A new connector has no stored value for '********'; send the real value.",
+    ),
+    "masked_auth_value": (
+        {"auth": {"type": "bearer", "bearer_token": MASKED_SECRET_VALUE}},
+        "A new connector has no stored value for '********'; send the real value.",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    _INPUT_RULE_CELLS.values(),
+    ids=list(_INPUT_RULE_CELLS),
+)
+def test_create_input_rules(bob, fields, message):
+    assert len(_INPUT_RULE_CELLS) == 12
+    before = _store()
+
+    error = _error(_create(bob, **fields), 400, "invalid_input")
+
+    assert error["message"] == message
+    _assert_nothing_written(before)
+
+
+_SHAPE_CELLS: dict[str, dict[str, Any]] = {
+    "name_over_100_characters": {"name": "n" * 101},
+    "empty_transport": {"transport": ""},
+    "transport_over_32_characters": {"transport": "t" * 33},
+    "header_name_with_a_space": {"headers": {"X Key": "v"}},
+    "header_value_with_a_line_break": {"headers": {"X-Key": "a\r\nInjected: 1"}},
+    "header_value_not_ascii": {"headers": {"X-Key": "café"}},
+    "more_than_20_headers": {"headers": {f"X-{i}": "v" for i in range(21)}},
+    "unknown_field": {"user_env": {"A": "b"}},
+    "url_over_500_characters": {"url": "https://example.test/" + "a" * 500},
+}
+
+
+@pytest.mark.parametrize("fields", _SHAPE_CELLS.values(), ids=list(_SHAPE_CELLS))
+def test_create_rejects_a_malformed_body(bob, fields):
+    assert len(_SHAPE_CELLS) == 9
+    before = _store()
+
+    resp = _create(bob, **fields)
+
+    _error(resp, 422, "invalid_input")
+    for leaked in ("Injected", "café"):
+        assert leaked not in resp.text
+    _assert_nothing_written(before)
+
+
+# ===== secrets =====
+
+_REQUEST_SECRETS = {
+    "headers": {"X-Api-Key": "SECRET-request-header"},
+    "auth": {"type": "bearer", "bearer_token": "SECRET-request-bearer"},
+}
+_REQUEST_SECRET_VALUES = ["SECRET-request-header", "SECRET-request-bearer"]
+
+_BAD_CONFIGURATION = "Invalid configuration: Configuration error in field 'url': boom"
+_DEFAULT_INVALID_INPUT = _DEFAULT_MESSAGES[V1ErrorCode.INVALID_INPUT]
+_DEFAULT_INTERNAL = _DEFAULT_MESSAGES[V1ErrorCode.INTERNAL_ERROR]
+_NAME_CONFLICT = _DEFAULT_MESSAGES[V1ErrorCode.CONNECTOR_NAME_CONFLICT]
+
+# (row id, web error to inject, status, code and message the SDK answers). A row
+# may have several cases.
+_ROW_CASES: list[tuple[str, HTTPException, int, str, str]] = [
+    (
+        "exact_name_conflict",
+        HTTPException(400, "MCP server 'new-connector' already exists"),
+        409,
+        "connector_name_conflict",
+        _NAME_CONFLICT,
+    ),
+    (
+        "folded_name_conflict",
+        HTTPException(400, folded_name_conflict_detail("new-connector")),
+        409,
+        "connector_name_conflict",
+        _NAME_CONFLICT,
+    ),
+    (
+        "catalog_name_conflict",
+        HTTPException(400, catalog_app_name_detail("new-connector")),
+        409,
+        "connector_name_conflict",
+        catalog_app_name_detail("new-connector"),
+    ),
+    (
+        "passed_through_message",
+        HTTPException(400, _BAD_CONFIGURATION),
+        400,
+        "invalid_input",
+        _BAD_CONFIGURATION,
+    ),
+    (
+        "passed_through_message",
+        HTTPException(400, f"{_BAD_CONFIGURATION} {_REQUEST_SECRET_VALUES[0]}"),
+        400,
+        "invalid_input",
+        _DEFAULT_INVALID_INPUT,
+    ),
+    (
+        "passed_through_message",
+        HTTPException(400, "x" * 1001),
+        400,
+        "invalid_input",
+        _DEFAULT_INVALID_INPUT,
+    ),
+    (
+        "unclassified_bad_request",
+        HTTPException(400, {"detail": _REQUEST_SECRET_VALUES[1]}),
+        400,
+        "invalid_input",
+        _DEFAULT_INVALID_INPUT,
+    ),
+    (
+        "unclassified_bad_request",
+        HTTPException(400, ""),
+        400,
+        "invalid_input",
+        _DEFAULT_INVALID_INPUT,
+    ),
+    (
+        "internal_error",
+        HTTPException(500, f"Failed to create MCP server: {_REQUEST_SECRET_VALUES[0]}"),
+        500,
+        "internal_error",
+        _DEFAULT_INTERNAL,
+    ),
+    (
+        "internal_error",
+        HTTPException(502, "anything else"),
+        500,
+        "internal_error",
+        _DEFAULT_INTERNAL,
+    ),
+]
+
+
+def test_create_success_carries_no_secret(bob):
+    rows = mcp_servers_routes._MCP_WRITE_ERROR_ROWS
+    assert len(rows) == 6
+    assert {row.id for row in rows} == {case[0] for case in _ROW_CASES}
+
+    ok = _create(bob, name="made-connector", **_REQUEST_SECRETS)
+    assert ok.status_code == 200, ok.text
+    for secret in _REQUEST_SECRET_VALUES:
+        assert secret not in ok.text
+    body = ok.json()
+    assert body["headers"] == {"X-Api-Key": MASKED_SECRET_VALUE}
+    assert body["auth"]["bearer_token"] == MASKED_SECRET_VALUE
+
+
+# ===== error translation =====
+
+
+@pytest.mark.parametrize(
+    ("row_id", "exc", "status", "code", "message"),
+    _ROW_CASES,
+    ids=[f"{case[0]}-{i}" for i, case in enumerate(_ROW_CASES)],
+)
+def test_write_error_translation(bob, monkeypatch, row_id, exc, status, code, message):
+    assert len(_ROW_CASES) == 10
+    before = _store()
+    _fail_web_create(monkeypatch, exc)
+
+    resp = _create(bob, **_REQUEST_SECRETS)
+
+    error = _error(resp, status, code)
+    assert error["message"] == message
+    assert "details" not in error
+    assert "detail" not in resp.json()
+    for secret in _REQUEST_SECRET_VALUES:
+        assert secret not in resp.text
+    _assert_nothing_written(before)
+
+
+def _own_taken(bob, carol):
+    return _seed("taken", owner=bob)
+
+
+def _someone_elses_taken(bob, carol):
+    return _seed("taken", owner=carol)
+
+
+def _taken_with_a_non_owner_link(bob, carol):
+    server_id = _seed("taken", owner=carol)
+    _seed_link(server_id, bob, is_owner=False)
+    return server_id
+
+
+def _folded_taken(bob, carol):
+    return _seed("my_server", owner=carol)
+
+
+def _reserved_by_catalog(bob, carol):
+    _seed_app("real-app", "Real App")
+
+
+# cell -> (name in the request, seeder, whether the error names the holder's own
+# connector)
+_NAME_CONFLICT_CELLS = {
+    "own_connector_with_the_same_name": ("taken", _own_taken, True),
+    "someone_elses_connector_with_the_same_name": (
+        "taken",
+        _someone_elses_taken,
+        False,
+    ),
+    "someone_elses_connector_the_holder_is_linked_to": (
+        "taken",
+        _taken_with_a_non_owner_link,
+        False,
+    ),
+    "name_that_folds_to_an_existing_one": ("My-Server", _folded_taken, False),
+    "name_reserved_for_a_catalog_app": ("real-app", _reserved_by_catalog, False),
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "seeder", "names_the_connector"),
+    _NAME_CONFLICT_CELLS.values(),
+    ids=list(_NAME_CONFLICT_CELLS),
+)
+def test_name_conflicts_from_the_web_code(
+    bob, carol, name, seeder, names_the_connector
+):
+    assert len(_NAME_CONFLICT_CELLS) == 5
+    existing = seeder(bob, carol)
+    before = _store()
+
+    resp = _create(bob, name=name)
+
+    error = _error(resp, 409, "connector_name_conflict")
+    if names_the_connector:
+        assert error["details"] == {"connector_id": existing}
+    else:
+        assert "details" not in error
+    if name == "real-app":
+        assert error["message"] == catalog_app_name_detail("real-app")
+    else:
+        assert error["message"] == _NAME_CONFLICT
+    _assert_nothing_written(before)
+
+
+_PYDANTIC_TAIL = (
+    "    For further information visit https://errors.pydantic.dev/2.12/v/value_error"
+)
+_NAME_REASON = (
+    "Value error, Name can only contain letters, numbers, hyphens and underscores"
+)
+_HEAD = "Invalid configuration: 1 validation error for MCPServerConfig"
+_FIELD_SUMMARY = f"{_HEAD}: name: {_NAME_REASON}"
+
+# cell -> (web detail, expected message)
+_SUMMARY_CELLS: dict[str, tuple[str, str]] = {
+    "field_error": (
+        f"{_HEAD}\nname\n  {_NAME_REASON} "
+        f"[type=value_error, input_value='ab c-INPUT-SENTINEL', input_type=str]\n"
+        f"{_PYDANTIC_TAIL}",
+        _FIELD_SUMMARY,
+    ),
+    "model_error_whose_input_is_the_whole_request": (
+        f"{_HEAD}\n  Value error, external managed servers should not have "
+        "auto_start parameter [type=value_error, input_value={'name': 'ok', "
+        f"'url': 'INPUT-SENTINEL'}}, input_type=dict]\n{_PYDANTIC_TAIL}",
+        f"{_HEAD}: Value error, external managed servers should not have "
+        "auto_start parameter",
+    ),
+    "two_errors": (
+        "Invalid configuration: 2 validation errors for MCPServerConfig\n"
+        f"name\n  {_NAME_REASON} [type=value_error, input_value='a b', "
+        f"input_type=str]\n{_PYDANTIC_TAIL}\n"
+        "url\n  Input should be a valid string [type=string_type, "
+        f"input_value=7, input_type=int]\n{_PYDANTIC_TAIL}",
+        "Invalid configuration: 2 validation errors for MCPServerConfig: "
+        f"name: {_NAME_REASON}",
+    ),
+    "reason_line_of_unknown_shape": (
+        f"{_HEAD}\nname\n  something odd INPUT-SENTINEL",
+        _HEAD,
+    ),
+    "reason_contains_a_request_secret": (
+        f"{_HEAD}\nname\n  Value error, rejected {_REQUEST_SECRET_VALUES[0]} "
+        "[type=value_error, input_value='x', input_type=str]\n"
+        f"{_PYDANTIC_TAIL}",
+        _DEFAULT_INVALID_INPUT,
+    ),
+    "one_line_configuration_error": (
+        "Invalid configuration: Masked secret 'X-Key' has no stored value; "
+        "provide a new value",
+        "Invalid configuration: Masked secret 'X-Key' has no stored value; "
+        "provide a new value",
+    ),
+    "multi_line_text_of_another_shape": (
+        "First line\nsecond line INPUT-SENTINEL",
+        "First line",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("detail", "message"), _SUMMARY_CELLS.values(), ids=list(_SUMMARY_CELLS)
+)
+def test_invalid_configuration_is_summarized(bob, monkeypatch, detail, message):
+    assert len(_SUMMARY_CELLS) == 7
+    _fail_web_create(monkeypatch, HTTPException(400, detail))
+
+    resp = _create(bob, **_REQUEST_SECRETS)
+
+    error = _error(resp, 400, "invalid_input")
+    assert error["message"] == message
+    assert "INPUT-SENTINEL" not in resp.text
+
+
+def test_a_name_the_web_code_rejects_is_summarized_without_the_input(bob):
+    before = _store()
+
+    resp = _create(bob, name="ab c", **_REQUEST_SECRETS)
+
+    error = _error(resp, 400, "invalid_input")
+    assert error["message"] == _FIELD_SUMMARY
+    assert "input_value" not in resp.text
+    _assert_nothing_written(before)
+
+
+# ===== internal errors, retries and the write log =====
+
+_SENTINEL = "SENTINEL-internal-detail"
+
+
+@pytest.mark.parametrize("failure", ["http_500", "runtime_error"])
+def test_internal_errors_are_sanitized(bob, monkeypatch, caplog, failure):
+    exc = {
+        "http_500": HTTPException(500, f"Failed to create MCP server: {_SENTINEL}"),
+        "runtime_error": RuntimeError(_SENTINEL),
+    }[failure]
+    _fail_web_create(monkeypatch, exc)
+
+    with caplog.at_level(logging.DEBUG):
+        resp = _create(bob)
+
+    error = _error(resp, 500, "internal_error")
+    assert error["message"] == _DEFAULT_INTERNAL
+    assert _SENTINEL not in resp.text
+    if failure == "http_500":
+        ours = [
+            r
+            for r in caplog.records
+            if r.name.startswith(("xagent.web.api.v1", mcp_server_management.__name__))
+        ]
+        assert any("action=create status=500" in r.getMessage() for r in ours)
+        for record in ours:
+            assert _SENTINEL not in record.getMessage()
+            assert _SENTINEL not in (record.exc_text or "")
+            assert record.exc_info is None
+
+
+def test_retrying_a_create_names_the_connector_it_made(bob):
+    first = _create(bob, headers={"X-Key": "v"})
+    assert first.status_code == 200, first.text
+    before = _store()
+
+    again = _create(bob, headers={"X-Key": "v"})
+
+    error = _error(again, 409, "connector_name_conflict")
+    assert error["details"] == {"connector_id": first.json()["id"]}
+    _assert_nothing_written(before)
+
+
+def test_a_failing_owned_connector_lookup_answers_500(bob):
+    _seed("taken", owner=bob)
+    engine = get_engine()
+
+    def fail_lookup(conn, cursor, statement, parameters, context, executemany):
+        # The lookup of the holder's own connector id: it selects only the id.
+        flat = " ".join(statement.split())
+        if flat.startswith("SELECT mcp_servers.id AS mcp_servers_id FROM mcp_servers"):
+            raise OperationalError(statement, parameters, Exception(_SENTINEL))
+
+    sa.event.listen(engine, "before_cursor_execute", fail_lookup)
+    try:
+        resp = _create(bob, name="taken")
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", fail_lookup)
+
+    error = _error(resp, 500, "internal_error")
+    assert error["message"] == _DEFAULT_INTERNAL
+    assert _SENTINEL not in resp.text
+
+
+def test_a_created_connector_that_cannot_be_read_back_is_logged(
+    bob, monkeypatch, caplog
+):
+    monkeypatch.setattr(
+        mcp_server_management, "resolve_holder_connector", lambda *_a, **_k: None
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        resp = _create(bob, name="unreadable-subject", **_REQUEST_SECRETS)
+
+    error = _error(resp, 500, "internal_error")
+    assert error["message"] == _DEFAULT_INTERNAL
+    errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and r.name.startswith(("xagent.web.api.v1", mcp_server_management.__name__))
+    ]
+    assert len(errors) == 1
+    db = _direct_db_session()
+    try:
+        server_id = db.query(MCPServer.id).filter_by(name="unreadable-subject").one()[0]
+    finally:
+        db.close()
+    assert errors[0].getMessage() == (
+        "personal key mcp server write failed: action=create "
+        f"user_id={bob.user_id} server_id={server_id}"
+    )
+    assert errors[0].exc_info is None
+    assert "unreadable-subject" not in errors[0].getMessage()
+    assert not any(s in errors[0].getMessage() for s in _REQUEST_SECRET_VALUES)
+    # The connector itself was created; only the read-back failed.
+    db = _direct_db_session()
+    try:
+        assert db.query(UserMCPServer).filter_by(mcpserver_id=server_id).count() == 1
+    finally:
+        db.close()
+    # No success line, and no record at any level carries the name, a secret or
+    # the url. The shared create path (web ``create_mcp_server`` and the
+    # connector manager) logs its own info lines that name the connector; they
+    # predate this endpoint and are left out.
+    shared_loggers = ("xagent.web.api.mcp", "xagent.core.tools.core.mcp.manager.db")
+    records = [r for r in caplog.records if r.name not in shared_loggers]
+    messages = [r.getMessage() for r in records]
+    assert not any("action=create key_prefix=" in m for m in messages)
+    forbidden = ["unreadable-subject", CONNECTOR_URL, *_REQUEST_SECRET_VALUES]
+    assert [(m, f) for m in messages for f in forbidden if f in m] == []
+
+
+def test_a_create_logs_one_line_without_the_name_or_secrets(bob, caplog):
+    with caplog.at_level(logging.INFO):
+        resp = _create(bob, name="log-subject", **_REQUEST_SECRETS)
+
+    assert resp.status_code == 200, resp.text
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("personal key mcp server write:")
+    ]
+    assert lines == [
+        f"personal key mcp server write: action=create "
+        f"key_prefix={_key_prefix(bob)} user_id={bob.user_id} "
+        f"server_id={resp.json()['id']}"
+    ]
+    assert "log-subject" not in lines[0]
+    assert not any(secret in lines[0] for secret in _REQUEST_SECRET_VALUES)

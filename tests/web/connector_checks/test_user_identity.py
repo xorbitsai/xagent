@@ -128,8 +128,9 @@ async def test_a_github_grant_is_still_judged_where_the_checks_need_fixtures(
     db_users, monkeypatch
 ):
     """The user identity resolves no fixture, so the five fixture-bound GitHub
-    checks skip without a call; the probe-derived row reads none, so a revoked
-    grant still fails a row instead of the connector reading green."""
+    checks skip without a call, while the probe-derived row reads none and still
+    calls its tool and reports a result. A revoked grant, which fails that row,
+    is covered by the 401 case in `test_registry.py`."""
     db, user, _ = db_users
     _connect_github(db, user)
     monkeypatch.setattr(LOADER, _Loader(_github_ok()))

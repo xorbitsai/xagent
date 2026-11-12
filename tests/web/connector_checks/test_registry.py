@@ -2219,10 +2219,14 @@ def test_github_commits_output_satisfies_its_declaration(
 def test_github_commits_output_judges_the_seed_files_commit_not_the_branch_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The default branch's newest commit is another file's, as the seed leaves
-    it; the check reads the seed file's history, so it still passes."""
+    """The default branch's newest commit is the seed's second file, under the
+    message the seed writes there, so it is not the message the check asserts;
+    the check reads the seed file's history, so it still passes."""
     head = _github_commit(
-        commit={"message": "edit the seed-after file", "author": {"name": "someone"}}
+        commit={
+            "message": "xagent smoke seed after",
+            "author": {"name": "xagent-app", "date": "2026-11-12T00:00:01Z"},
+        }
     )
     seeded = _github_commit()
     _fake_github(
@@ -2318,8 +2322,8 @@ def test_github_pull_request_output_fails_on_another_number(
 def test_a_github_check_fails_on_a_revoked_grant(
     monkeypatch: pytest.MonkeyPatch, check_id: str, path: str
 ) -> None:
-    # A revoked token is a 401 with this body: the tool raises its API error,
-    # which the check sees as an envelope that is not a success.
+    # A revoked token is a 401 with this body: the tool catches the error and
+    # returns its error envelope, which the check sees as not a success.
     _fake_github(monkeypatch, ("GET", path, {"message": "Bad credentials"}), status=401)
 
     _assert_check_fails(check_id, _github_declared_output(check_id), "status_success")

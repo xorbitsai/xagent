@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 from xagent.core.tools.adapters.vibe.mcp_adapter import MCPLoadResult, MCPWriteHint
@@ -151,3 +151,18 @@ def rows(result: RunResult) -> list[tuple[Any, ...]]:
         )
         for row in result.to_document()["rows"]
     ]
+
+
+def tool_for(module: ModuleType, name: str) -> FakeTool:
+    """A listed tool that runs the in-repo server's own ``name`` function and
+    wraps its JSON text as the MCP adapter does."""
+    function: Callable[..., str] = getattr(module, name)
+
+    def respond(args: dict[str, Any]) -> Any:
+        return {
+            "content": [{"type": "text", "text": function(**args)}],
+            "structured_content": None,
+            "is_error": False,
+        }
+
+    return FakeTool(name, respond=respond)

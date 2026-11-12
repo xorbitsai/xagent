@@ -242,6 +242,11 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "immediately in the sync-to-async bridge.",
     ),
     "core/tools/core/RAG_tools/management/collections.py": (2, READ),
+    "core/tools/core/RAG_tools/management/migration_state.py": (
+        1,
+        "The freeze guard reads one state row (and opens the metadata "
+        "connection to read it); it writes no row.",
+    ),
     "core/tools/core/RAG_tools/pipelines/document_ingestion.py": (
         2,
         "Embedding encode calls: a provider call and a pool joined by its "

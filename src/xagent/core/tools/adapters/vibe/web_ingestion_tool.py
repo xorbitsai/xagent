@@ -86,6 +86,9 @@ async def _create_knowledge_base_from_url_impl(
     user_id: int,
     is_admin: bool = False,
 ) -> Any:
+    from ...core.RAG_tools.core.exceptions import CollectionMigratingError
+
+    collection_name = ""
     try:
         import hashlib
         import re
@@ -224,6 +227,19 @@ async def _create_knowledge_base_from_url_impl(
             pages_crawled=0,
         ).model_dump()
 
+    except CollectionMigratingError:
+        logger.warning(
+            "Knowledge base %s is frozen for embedding migration", collection_name
+        )
+        return CreateKnowledgeBaseFromUrlResult(
+            success=False,
+            collection_name=collection_name,
+            message=(
+                "The knowledge base is being upgraded to a new embedding model. "
+                "Retry shortly."
+            ),
+            pages_crawled=0,
+        ).model_dump()
     except Exception as e:
         logger.exception("Error creating knowledge base from URL: %s", e)
         return CreateKnowledgeBaseFromUrlResult(

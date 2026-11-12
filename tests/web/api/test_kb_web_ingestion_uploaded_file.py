@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -2594,3 +2594,77 @@ def test_file_restore_compensation_requires_both_receipts(missing: str) -> None:
             record_snapshot={},
             **receipts,
         )
+
+
+def test_ingest_web_route_resolves_dependencies_and_refuses_frozen_entry(
+    web_test_env,
+) -> None:
+    """FastAPI still resolves form/Depends through the admission decorator."""
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        clear_migration_state,
+        write_migration_state,
+    )
+
+    app, headers, _user, _ = web_test_env
+    client = TestClient(app)
+    write_migration_state("frozen-c1", CollectionMigrationState(state=FROZEN))
+    try:
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={"collection": "frozen-c1", "start_url": "https://example.com"},
+            headers=headers,
+        )
+    finally:
+        clear_migration_state("frozen-c1")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "kb_collection_migrating"
+
+
+@pytest.mark.parametrize("route", ["/api/kb/ingest", "/api/kb/ingest/jobs"])
+def test_frozen_upload_refusal_creates_no_collection_directory(
+    web_test_env, tmp_path, monkeypatch, route
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        clear_migration_state,
+        write_migration_state,
+    )
+    from xagent.web.config import get_upload_path
+
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setattr(
+        "xagent.web.api.kb._ensure_background_job_queue_available_async",
+        AsyncMock(),
+    )
+    app, headers, user, _ = web_test_env
+    collection_dir = get_upload_path(
+        "a.txt",
+        user_id=int(user.id),
+        collection="frozen-up",
+        create_if_not_exists=False,
+    ).parent
+    write_migration_state("frozen-up", CollectionMigrationState(state=FROZEN))
+    try:
+        response = TestClient(app).post(
+            route,
+            data={"collection": "frozen-up"},
+            files={"file": ("a.txt", b"hello", "text/plain")},
+            headers=headers,
+        )
+    finally:
+        clear_migration_state("frozen-up")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "kb_collection_migrating"
+    assert not collection_dir.exists()
+    staging_root = (
+        get_upload_path(
+            ".background-ingest", user_id=int(user.id), create_if_not_exists=False
+        ).parent
+        / ".background-ingest"
+    )
+    assert not staging_root.exists() or not any(staging_root.iterdir())

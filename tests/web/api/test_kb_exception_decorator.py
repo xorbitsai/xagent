@@ -8,6 +8,8 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
+from xagent.core.tools.core.RAG_tools.kb.api_compatibility import KBApiOperationResult
 from xagent.core.tools.core.RAG_tools.utils.user_scope import get_user_scope
 from xagent.web.api.kb import handle_kb_exceptions, with_kb_user_scope
 
@@ -365,3 +367,549 @@ async def test_with_kb_user_scope_ignores_positional_duck_typed_objects() -> Non
 
     assert user_id is None
     assert is_admin is False
+
+
+# --- Embedding-migration freeze mapping ---
+
+_MIGRATION_DETAIL = {
+    "code": "kb_collection_migrating",
+    "message": "frozen",
+}
+
+
+def _migration_error() -> CollectionMigratingError:
+    return CollectionMigratingError("frozen")
+
+
+def _freeze_state(collection: str = "kb") -> None:
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        write_migration_state,
+    )
+
+    write_migration_state(collection, CollectionMigrationState(state=FROZEN))
+
+
+def _migration_mocks() -> tuple[object, object, object]:
+    from unittest.mock import MagicMock
+
+    from xagent.web.models.user import User
+
+    user = MagicMock(spec=User)
+    user.id = 1
+    user.is_admin = True
+    db = MagicMock()
+    access = MagicMock()
+    access.storage_user_id = 1
+    return user, db, access
+
+
+@pytest.mark.asyncio
+async def test_handle_kb_exceptions_maps_migration_freeze_to_409() -> None:
+    exc = _migration_error()
+
+    @handle_kb_exceptions
+    async def _fn() -> None:
+        raise exc
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _fn()
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_ingest_route_maps_migration_freeze_to_409() -> None:
+    import io
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi import UploadFile
+
+    from xagent.web.api.kb import ingest
+
+    user, db, access = _migration_mocks()
+    upload = UploadFile(filename="doc.pdf", file=io.BytesIO(b"content"))
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
+            new=AsyncMock(side_effect=_migration_error()),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await ingest(
+                collection="kb",
+                file=upload,
+                parse_method=None,
+                _user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_ingest_cloud_route_maps_migration_freeze_to_409() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from xagent.web.api.kb import CloudFile, CloudIngestRequest, ingest_cloud
+
+    user, db, access = _migration_mocks()
+    request = CloudIngestRequest(
+        files=[CloudFile(provider="google_drive", fileId="f1", fileName="a.pdf")],
+        collection="kb",
+    )
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._enforce_storage_gate"),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
+            new=AsyncMock(side_effect=_migration_error()),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await ingest_cloud(request=request, _user=user, db=db)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_ingest_web_route_maps_migration_freeze_to_409() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from xagent.web.api.kb import ingest_web
+
+    user, db, access = _migration_mocks()
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
+            new=AsyncMock(side_effect=_migration_error()),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await ingest_web(
+                collection="kb",
+                start_url="https://example.com",
+                _user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_create_ingest_job_maps_migration_freeze_to_409() -> None:
+    import io
+    from unittest.mock import AsyncMock, patch
+
+    from fastapi import UploadFile
+
+    from xagent.web.api.kb import create_ingest_job
+
+    user, db, access = _migration_mocks()
+    upload = UploadFile(filename="doc.pdf", file=io.BytesIO(b"content"))
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb._ensure_background_job_queue_available_async",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.kb.ensure_collection_writable_async",
+            new=AsyncMock(side_effect=_migration_error()),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await create_ingest_job(
+                collection="kb",
+                file=upload,
+                parse_method=None,
+                _user=user,
+                db=db,
+            )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == _MIGRATION_DETAIL
+
+
+class _FakeRollbackFacade:
+    """Enough of the API facade for a failed-ingest rollback round-trip."""
+
+    def __init__(self) -> None:
+        self.cleanups = 0
+
+    def with_result(self, api_result, result):
+        return KBApiOperationResult(result=result)
+
+    async def run_failed_ingest_rollback_async(self, api_result, rollback):
+        from types import SimpleNamespace
+
+        try:
+            await rollback()
+        except Exception as exc:  # mirrors the facade: errors become a result
+            return SimpleNamespace(operation_result=api_result, error=exc)
+        return SimpleNamespace(operation_result=api_result, error=None)
+
+    def failed_ingest_cleanup_decision(self, api_result, *, successful_documents=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            keeps_new_collection_metadata=False, side_effects_may_remain=False
+        )
+
+    def failed_batch_ingest_cleanup_decision(
+        self, api_results, *, successful_documents=None
+    ):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            keeps_new_collection_metadata=False, side_effects_may_remain=False
+        )
+
+    def with_rollback_complete(self, api_result, value, *, force=False):
+        return api_result
+
+    async def cleanup_failed_new_collection_metadata(self, **kwargs) -> None:
+        self.cleanups += 1
+
+
+@pytest.mark.parametrize(
+    ("collection_arg", "resolved"),
+    [("kb", "kb"), ("", "doc")],
+)
+@pytest.mark.asyncio
+async def test_ingest_rollback_delete_runs_after_a_mid_flight_freeze(
+    tmp_path,
+    collection_arg: str,
+    resolved: str,
+) -> None:
+    """Rollback runs in the route's admission after a freeze lands mid-ingest."""
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fastapi import UploadFile
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        clear_migration_state,
+    )
+    from xagent.web.api.kb import ingest
+
+    user, db, access = _migration_mocks()
+    rollback_calls: list[str] = []
+    facade = _FakeRollbackFacade()
+    pin = SimpleNamespace(run=lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    upload = UploadFile(filename="doc.pdf", file=io.BytesIO(b"content"))
+
+    def _failing_ingest(**kwargs: object) -> KBApiOperationResult:
+        _freeze_state(resolved)
+        return KBApiOperationResult(
+            result=IngestionResult(
+                status="error", message="unrelated ingest failure", doc_id="d1"
+            )
+        )
+
+    def _rollback(**kwargs: object) -> None:
+        # Stands in for a guarded write inside the rollback.
+        state_module.ensure_collection_writable(str(kwargs["collection_name"]))
+        rollback_calls.append(str(kwargs["collection_name"]))
+
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError()),
+        patch("xagent.web.api.kb._enforce_storage_gate"),
+        patch(
+            "xagent.web.api.kb._resolve_kb_ingestion_models",
+            new=AsyncMock(return_value=(pin, ("m",))),
+        ),
+        patch("xagent.web.api.kb.check_standalone_gate_async", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb._document_existed_before_ingest",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "xagent.web.api.kb.get_upload_path",
+            return_value=tmp_path / "uploads" / "doc.pdf",
+        ),
+        patch(
+            "xagent.web.api.kb._upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="f1"),
+        ),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion_with_outcome",
+            side_effect=_failing_ingest,
+        ),
+        patch(
+            "xagent.web.api.kb._rollback_failed_ingestion",
+            side_effect=_rollback,
+        ),
+        patch(
+            "xagent.web.api.kb._get_api_compatibility_facade",
+            return_value=facade,
+        ),
+    ):
+        try:
+            response = await ingest(
+                collection=collection_arg,
+                file=upload,
+                parse_method=None,
+                chunk_strategy=None,
+                chunk_size=None,
+                chunk_overlap=None,
+                separators=None,
+                embedding_model_id="text-embedding-v4",
+                embedding_batch_size=None,
+                max_retries=None,
+                retry_delay=None,
+                _user=user,
+                db=db,
+            )
+        finally:
+            clear_migration_state(resolved)
+
+    assert response.status_code == 500
+    assert rollback_calls == [resolved]
+
+
+@pytest.mark.asyncio
+async def test_ingest_cloud_rollback_delete_runs_after_a_mid_flight_freeze(
+    tmp_path,
+) -> None:
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+    from xagent.web.api.kb import CloudFile, CloudIngestRequest, ingest_cloud
+
+    user, db, access = _migration_mocks()
+    rollback_calls: list[str] = []
+    facade = _FakeRollbackFacade()
+    pin = SimpleNamespace(run=lambda fn, *args, **kwargs: fn(*args, **kwargs))
+
+    service = MagicMock()
+    service.files.return_value.get.return_value.execute.return_value = {
+        "name": "a.pdf",
+        "mimeType": "application/pdf",
+        "size": "4",
+    }
+    service.files.return_value.get_media.return_value.headers = {}
+
+    class _Downloader:
+        def __init__(self, output, request):
+            self._output = output
+
+        def next_chunk(self):
+            self._output.write(b"data")
+            return None, True
+
+    def _failing_ingest(**kwargs: object) -> KBApiOperationResult:
+        _freeze_state("kb")
+        return KBApiOperationResult(
+            result=IngestionResult(
+                status="error", message="unrelated cloud failure", doc_id="a.pdf"
+            )
+        )
+
+    def _rollback(**kwargs: object) -> None:
+        state_module.ensure_collection_writable(str(kwargs["collection_name"]))
+        rollback_calls.append(str(kwargs["collection_name"]))
+
+    (tmp_path / "uploads").mkdir(parents=True)
+    request = CloudIngestRequest(
+        files=[CloudFile(provider="google-drive", fileId="f1", fileName="a.pdf")],
+        collection="kb",
+    )
+
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError()),
+        patch("xagent.web.api.kb._enforce_storage_gate"),
+        patch("xagent.web.api.kb.sessionmaker"),
+        patch("xagent.web.api.kb._load_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=service),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _Downloader),
+        patch(
+            "xagent.web.api.kb._resolve_kb_ingestion_models",
+            new=AsyncMock(return_value=(pin, ("m",))),
+        ),
+        patch("xagent.web.api.kb.check_standalone_gate_async", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb._document_existed_before_ingest",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "xagent.web.api.kb.get_upload_path",
+            return_value=tmp_path / "uploads" / "a.pdf",
+        ),
+        patch(
+            "xagent.web.api.kb._upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="f1"),
+        ),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion_with_outcome",
+            side_effect=_failing_ingest,
+        ),
+        patch(
+            "xagent.web.api.kb._rollback_failed_cloud_ingestion",
+            side_effect=_rollback,
+        ),
+        patch(
+            "xagent.web.api.kb._save_collection_config_after_ingest",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.kb._get_api_compatibility_facade",
+            return_value=facade,
+        ),
+    ):
+        results = await ingest_cloud(request=request, _user=user, db=db)
+
+    assert rollback_calls == ["kb"]
+    messages = json.dumps([result.model_dump() for result in results])
+    assert "being upgraded" not in messages
+
+
+@pytest.mark.asyncio
+async def test_ingest_cloud_runs_overlapping_workers(tmp_path) -> None:
+    """Two concurrent file workers share one admission without entering it twice."""
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+    from xagent.web.api.kb import CloudFile, CloudIngestRequest, ingest_cloud
+
+    user, db, access = _migration_mocks()
+    facade = _FakeRollbackFacade()
+    pin = SimpleNamespace(run=lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    barrier = threading.Barrier(2)
+
+    service = MagicMock()
+    service.files.return_value.get.return_value.execute.return_value = {
+        "name": "a.pdf",
+        "mimeType": "application/pdf",
+        "size": "4",
+    }
+    service.files.return_value.get_media.return_value.headers = {}
+
+    class _Downloader:
+        def __init__(self, output, request):
+            self._output = output
+
+        def next_chunk(self):
+            self._output.write(b"data")
+            return None, True
+
+    def _ingest(**kwargs: object) -> KBApiOperationResult:
+        barrier.wait(timeout=10)
+        return KBApiOperationResult(
+            result=IngestionResult(status="success", message="ok", doc_id="d")
+        )
+
+    (tmp_path / "uploads").mkdir(parents=True)
+    request = CloudIngestRequest(
+        files=[
+            CloudFile(provider="google-drive", fileId="f1", fileName="a.pdf"),
+            CloudFile(provider="google-drive", fileId="f2", fileName="b.pdf"),
+        ],
+        collection="kb",
+    )
+
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError()),
+        patch("xagent.web.api.kb._enforce_storage_gate"),
+        patch("xagent.web.api.kb.sessionmaker"),
+        patch("xagent.web.api.kb._load_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=service),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _Downloader),
+        patch(
+            "xagent.web.api.kb._resolve_kb_ingestion_models",
+            new=AsyncMock(return_value=(pin, ("m",))),
+        ),
+        patch("xagent.web.api.kb.check_standalone_gate_async", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb._document_existed_before_ingest",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "xagent.web.api.kb.get_upload_path",
+            side_effect=lambda filename, **_: tmp_path / "uploads" / filename,
+        ),
+        patch(
+            "xagent.web.api.kb._upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="f1"),
+        ),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion_with_outcome",
+            side_effect=_ingest,
+        ),
+        patch(
+            "xagent.web.api.kb._save_collection_config_after_ingest",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.kb._get_api_compatibility_facade",
+            return_value=facade,
+        ),
+    ):
+        results = await ingest_cloud(request=request, _user=user, db=db)
+
+    assert [result.status for result in results] == ["success", "success"]
+
+
+@pytest.mark.parametrize("collection", [None, "", "   "])
+def test_admission_collection_derives_the_handler_name_from_the_filename(
+    collection,
+) -> None:
+    from types import SimpleNamespace
+
+    from xagent.web.api.kb import _admission_collection
+
+    upload = SimpleNamespace(filename="../nested/report-v2.pdf")
+
+    assert _admission_collection(collection=collection, file=upload) == "report-v2"
+    assert _admission_collection(collection="explicit", file=upload) == "explicit"
+    assert _admission_collection(collection=None, file=None) is None

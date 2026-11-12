@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import inspect
-import io
 import json
 from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from docx import Document
 from mcp.server.fastmcp.exceptions import ToolError
-from pptx import Presentation
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_checks.assertions import judge_result, resolve_expected
@@ -69,50 +66,13 @@ from xagent.web.tools.mcp import (
     zoom,
 )
 
-# The three Microsoft document connectors, and the read each one declares: the
-# tool, the one required argument its fixture binds, the fixture key, and the
-# keys only a successful read of the object returns.
-_DOCUMENT_READS: Mapping[str, tuple[str, str, str, tuple[str, ...]]] = {
-    "excel": (
-        "excel_list_worksheets",
-        "file_path",
-        "excel.file_path",
-        ("worksheets", "truncated"),
-    ),
-    "powerpoint": (
-        "powerpoint_list_slides",
-        "file_path",
-        "powerpoint.file_path",
-        ("slides", "etag"),
-    ),
-    "word": (
-        "word_get_document_text",
-        "file_path",
-        "word.file_path",
-        ("text", "generation"),
-    ),
-}
-
+# The three Microsoft document connectors and the module of each. What their
+# checks assert is covered end to end in test_microsoft_365_checks.py.
 _APP_MODULES = {
     "excel": excel,
     "powerpoint": powerpoint,
     "word": word,
 }
-
-
-def _expected_checks(app_id: str) -> ConnectorChecks:
-    tool, argument, fixture_key, assertion_keys = _DOCUMENT_READS[app_id]
-    return ConnectorChecks(
-        app_id,
-        reads=(
-            ReadCheck(
-                f"{app_id}.read_fixture",
-                tool,
-                {argument: FixtureRef(fixture_key)},
-                assertions=(StatusSuccess(), HasKeys((), assertion_keys)),
-            ),
-        ),
-    )
 
 
 def _fixture_refs(value: Any) -> Iterator[FixtureRef]:
@@ -124,82 +84,6 @@ def _fixture_refs(value: Any) -> Iterator[FixtureRef]:
     elif isinstance(value, (list, tuple)):
         for item in value:
             yield from _fixture_refs(item)
-
-
-def _assert_declared_output(app_id: str, result: str) -> None:
-    """The tool's JSON output satisfies its declared assertions.
-
-    The engine that evaluates declarations is a follow-up, so the two
-    assertion kinds the document connectors declare are checked here directly.
-    """
-    checks = CONNECTOR_CHECKS[app_id]
-    payload = json.loads(result)
-    assert len(checks.reads) == 1
-    for assertion in checks.reads[0].assertions:
-        if isinstance(assertion, StatusSuccess):
-            assert payload.get("status") == "success"
-        elif isinstance(assertion, HasKeys):
-            target = payload
-            for segment in assertion.path:
-                target = target[segment]
-            assert isinstance(target, dict)
-            assert set(assertion.keys) <= set(target)
-        else:
-            raise AssertionError(f"unhandled assertion {assertion!r} for {app_id}")
-
-
-class _GraphResponse:
-    """The subset of ``requests.Response`` the Graph tools read."""
-
-    def __init__(
-        self,
-        *,
-        json_data: Any = None,
-        content: bytes = b"",
-        status_code: int = 200,
-    ) -> None:
-        self._json_data = json_data
-        self.content = (
-            json.dumps(json_data).encode("utf-8") if json_data is not None else content
-        )
-        self.status_code = status_code
-        self.headers: dict[str, str] = {}
-        self.text = self.content.decode("utf-8", errors="replace")
-
-    def json(self) -> Any:
-        return self._json_data
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-    def __enter__(self) -> _GraphResponse:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        return None
-
-    def iter_content(self, chunk_size: int = 1) -> Iterator[bytes]:
-        for start in range(0, len(self.content), chunk_size):
-            yield self.content[start : start + chunk_size]
-
-
-def _docx_bytes() -> bytes:
-    document = Document()
-    document.add_paragraph("Fixture document")
-    buffer = io.BytesIO()
-    document.save(buffer)
-    return buffer.getvalue()
-
-
-def _pptx_bytes() -> bytes:
-    presentation = Presentation()
-    presentation.slides.add_slide(presentation.slide_layouts[0])
-    buffer = io.BytesIO()
-    presentation.save(buffer)
-    return buffer.getvalue()
 
 
 def test_a_probed_connector_gets_its_l3_probe_as_one_read_check() -> None:
@@ -325,35 +209,29 @@ def test_declared_v2_checks_are_valid_and_keyed_by_their_app() -> None:
         validate_connector_checks(checks)
 
 
-@pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
-def test_a_document_connector_declares_its_fixture_read(app_id: str) -> None:
-    # Its other tools are exempted; test_tool_coverage.py covers those.
-    assert connector_checks_for(app_id).reads == _expected_checks(app_id).reads
-
-
 def test_every_document_fixture_key_is_namespaced_by_its_app() -> None:
     refs = [
         (app_id, ref)
-        for app_id in _DOCUMENT_READS
+        for app_id in _APP_MODULES
         for check in CONNECTOR_CHECKS[app_id].reads
         if isinstance(check, ReadCheck)
         for ref in _fixture_refs(check.arguments)
     ]
 
     # Every document connector contributes at least one fixture.
-    assert set(_DOCUMENT_READS) <= {app_id for app_id, _ in refs}
+    assert set(_APP_MODULES) <= {app_id for app_id, _ in refs}
     for app_id, ref in refs:
         assert ref.key.startswith(f"{app_id}."), (app_id, ref.key)
 
 
-@pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
+@pytest.mark.parametrize("app_id", sorted(_APP_MODULES))
 def test_the_probe_route_still_needs_a_fixture(app_id: str) -> None:
     assert l3_read_check(app_id) == UnprobeableCheck(
         f"{app_id}.l3_probe", "needs_fixture"
     )
 
 
-@pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
+@pytest.mark.parametrize("app_id", sorted(_APP_MODULES))
 def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
     """The tool is the module attribute of its own name: the in-repo servers
     register each ``@mcp.tool`` function under that name, and the decorator
@@ -379,54 +257,6 @@ def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
             and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
         }
         assert required <= set(check.arguments), (check.tool, required)
-
-
-def test_word_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
-    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "51200")
-    response = _GraphResponse(content=_docx_bytes())
-    monkeypatch.setattr(word.requests, "request", Mock(return_value=response))
-
-    _assert_declared_output("word", word.word_get_document_text("Report.docx"))
-
-
-def test_excel_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
-    response = _GraphResponse(json_data={"value": [{"id": "ws-1", "name": "Sheet1"}]})
-    monkeypatch.setattr(excel.requests, "request", Mock(return_value=response))
-
-    _assert_declared_output("excel", excel.excel_list_worksheets("Book.xlsx"))
-
-
-def test_powerpoint_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
-    content = _pptx_bytes()
-    responses = iter(
-        [
-            _GraphResponse(
-                json_data={
-                    "id": "item-1",
-                    "size": len(content),
-                    "eTag": '"abc"',
-                    "parentReference": {"driveId": "drive-1"},
-                }
-            ),
-            _GraphResponse(content=content),
-        ]
-    )
-    monkeypatch.setattr(
-        powerpoint.requests, "request", Mock(side_effect=lambda **_: next(responses))
-    )
-
-    _assert_declared_output(
-        "powerpoint", powerpoint.powerpoint_list_slides("Deck.pptx")
-    )
 
 
 # The Tier 2 read checks (issue #3573): the tool, its arguments, and every

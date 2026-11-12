@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
+from ...core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from ...core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
@@ -19,6 +20,10 @@ from ...core.tools.core.RAG_tools.kb import (
     KBApiFailedIngestCleanupDecision,
     KBApiOperationResult,
     get_kb_coordinator,
+)
+from ...core.tools.core.RAG_tools.management.migration_state import (
+    admits_collection_sync,
+    ensure_collection_writable,
 )
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
     resolve_ingestion_model_ids,
@@ -55,6 +60,11 @@ class StagedDocumentIngestSuperseded(RuntimeError):
 
 def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
     return get_kb_coordinator().api_compatibility
+
+
+def _payload_collection(db: Session, job: BackgroundJob) -> str | None:
+    collection = dict(job.payload or {}).get("collection")
+    return str(collection) if collection is not None else None
 
 
 def _collection_existed_before(payload: dict[str, Any]) -> bool:
@@ -217,6 +227,7 @@ def _resolve_job_ingestion_models(
 
 
 @coordinate_ingest_job
+@admits_collection_sync(_payload_collection)
 def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     target_path = payload.get("target_path")
@@ -240,6 +251,14 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         if not _is_staged_document_generation_latest(db, payload):
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
+    # Before model resolution, which rewrites the collection's metadata row, and
+    # outside the try: a job refused here was never admitted and must not compensate.
+    try:
+        ensure_collection_writable(str(payload["collection"]))
+    except CollectionMigratingError:
+        if int(job.attempts or 0) >= int(job.max_attempts or 1):
+            _cleanup_staged_document_input(payload)
+        raise
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not
@@ -385,6 +404,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
     return result_payload
 
 
+@admits_collection_sync(_payload_collection)
 def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
     payload = dict(job.payload or {})
     crawl_config = WebCrawlConfig.model_validate(payload["crawl_config"])
@@ -427,6 +447,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
             db_session.close()
 
     update_job_progress(db, job, message="Crawling website")
+    ensure_collection_writable(collection)
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         with (

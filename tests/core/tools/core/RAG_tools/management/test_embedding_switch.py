@@ -471,6 +471,68 @@ def test_inferred_model_cannot_overwrite_a_switch(
     assert _binding() == (NEW_MODEL, NEW_DIM)
 
 
+def test_switch_repairs_a_whitespace_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(
+                name="kb", embedding_model_id=" ", embedding_dimension=OLD_DIM
+            )
+        )
+    )
+    _freeze()
+    _bind_models(monkeypatch)
+
+    result = switch_collection_embedding_model("kb", NEW_MODEL)
+
+    assert _binding() == (NEW_MODEL, NEW_DIM)
+    assert result.source_model_id is None
+
+
+def test_a_lost_whitespace_repair_returns_the_stored_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(
+                name="kb",
+                embedding_model_id=" ",
+                embedding_dimension=OLD_DIM,
+                embeddings=5,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        migration_utils,
+        "_infer_embedding_config_from_collection",
+        lambda _name: (OLD_MODEL, OLD_DIM),
+    )
+    store = get_metadata_store()
+    real_update = store.update_collection_fields
+
+    async def _lose_the_repair_to_a_switch(collection, fields, **kw):
+        if kw.get("expected_model_id") == " ":
+            await real_update(
+                collection.model_copy(
+                    update={
+                        "embedding_model_id": NEW_MODEL,
+                        "embedding_dimension": NEW_DIM,
+                    }
+                ),
+                fields,
+            )
+            return False
+        return await real_update(collection, fields, **kw)
+
+    monkeypatch.setattr(store, "update_collection_fields", _lose_the_repair_to_a_switch)
+
+    resolved = cm.resolve_effective_embedding_model_sync("kb", None)
+
+    assert resolved == NEW_MODEL
+    assert _binding() == (NEW_MODEL, NEW_DIM)
+
+
 def test_inference_repairs_a_whitespace_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -675,7 +737,7 @@ def test_same_model_initialization_race_returns_the_stored_row(
     assert _binding() == (OLD_MODEL, OLD_DIM)
 
 
-def test_stats_recreates_a_row_deleted_after_the_read(
+def test_stats_recreates_a_deleted_row_without_a_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _save_sync(documents=1)
@@ -694,8 +756,60 @@ def test_stats_recreates_a_row_deleted_after_the_read(
 
     cm.update_collection_stats_sync("kb", documents_delta=1)
 
-    assert _raw_row()["documents"] == 2
-    assert _binding() == (OLD_MODEL, OLD_DIM)
+    row = _raw_row()
+    assert row["documents"] == 2
+    assert (row["embedding_model_id"], row["embedding_dimension"]) == ("", -1)
+
+
+def test_stats_recreate_cannot_put_a_switched_model_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _switch(monkeypatch)
+    stale = CollectionInfo(
+        name="kb",
+        documents=1,
+        embedding_model_id=OLD_MODEL,
+        embedding_dimension=OLD_DIM,
+    )
+
+    async def _read_then_delete(_: str) -> CollectionInfo:
+        _delete_row("kb")
+        return stale
+
+    monkeypatch.setattr(cm.collection_manager, "get_collection", _read_then_delete)
+
+    cm.update_collection_stats_sync("kb", documents_delta=1)
+
+    row = _raw_row()
+    assert (row["embedding_model_id"], row["embedding_dimension"]) == ("", -1)
+
+
+def test_merging_extra_metadata_recreates_the_row_unbound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync(name="demo")
+    store = get_metadata_store()
+    real_get = store.get_collection
+    calls = {"n": 0}
+
+    async def _read_then_delete(name: str) -> CollectionInfo:
+        calls["n"] += 1
+        row = await real_get(name)
+        if calls["n"] == 1:
+            _delete_row(name)
+        return row
+
+    monkeypatch.setattr(store, "get_collection", _read_then_delete)
+
+    asyncio.run(
+        KBApiCompatibilityFacade()._ensure_collection_backend_binding_with_store(
+            "demo", store
+        )
+    )
+
+    row = asyncio.run(real_get("demo"))
+    assert (row.embedding_model_id, row.embedding_dimension) == (None, None)
+    assert row.extra_metadata["kb_storage"] == {"backend": "lancedb"}
 
 
 def test_stats_rebuild_recreates_a_row_deleted_after_the_read(
@@ -904,6 +1018,70 @@ def test_metadata_rebuild_does_not_unbind_a_frozen_kb(
     asyncio.run(cm._rebuild_collection_metadata_impl())
 
     assert _binding() == (NEW_MODEL, NEW_DIM)
+
+
+def test_metadata_rebuild_recreates_a_row_deleted_after_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+
+    async def _list_collections(**_: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            status="success", collections=[CollectionInfo(name="kb")], message=""
+        )
+
+    real_read = cm._read_stored_collection
+
+    async def _read_then_delete(name: str) -> CollectionInfo:
+        row = await real_read(name)
+        _delete_row(name)
+        return row
+
+    monkeypatch.setattr(cm, "_read_stored_collection", _read_then_delete)
+    monkeypatch.setattr(collections, "list_collections", _list_collections)
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.kb.collection_handle.ledger_holds_vectors",
+        lambda: False,
+    )
+    monkeypatch.setattr(cm, "get_vector_index_store", lambda: SimpleNamespace())
+    monkeypatch.setattr(
+        collections,
+        "_resolve_coordinator",
+        lambda _coordinator: SimpleNamespace(
+            aggregate_collection_stats_sync=lambda **_: {
+                "kb": {"documents": 0, "parses": 0, "chunks": 0, "embeddings": 0}
+            }
+        ),
+    )
+
+    asyncio.run(cm._rebuild_collection_metadata_impl())
+
+    row = _raw_row()
+    assert (row["embedding_model_id"], row["embedding_dimension"]) == ("", -1)
+
+
+class _SaveOnlyStore:
+    def __init__(self) -> None:
+        self.saved: list[CollectionInfo] = []
+
+    async def get_collection(self, name: str) -> CollectionInfo:
+        return CollectionInfo(name=name)
+
+    async def save_collection(self, collection: CollectionInfo) -> None:
+        self.saved.append(collection)
+
+
+def test_api_binding_requires_the_insert_only_method() -> None:
+    store = _SaveOnlyStore()
+
+    result = asyncio.run(
+        KBApiCompatibilityFacade()._ensure_collection_backend_binding_with_store(
+            "demo", store
+        )
+    )
+
+    assert result is None
+    assert store.saved == []
 
 
 def test_stats_rebuild_creation_cannot_clear_a_switch(

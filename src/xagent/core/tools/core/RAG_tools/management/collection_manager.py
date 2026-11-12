@@ -453,8 +453,13 @@ class CollectionManager:
         except ValueError as exc:
             if not (recreate_missing and "not found" in str(exc)):
                 raise
+            # Insert unbound: the row was deleted, so its stale binding must not
+            # come back (a switch may have landed after the read).
+            blank = collection.model_copy(
+                update={"embedding_model_id": None, "embedding_dimension": None}
+            )
             created = await _with_retry(
-                lambda: target.save_collection_if_absent(collection),
+                lambda: target.save_collection_if_absent(blank),
                 description=f"re-creation of collection {collection.name}",
             )
             if created:
@@ -1050,8 +1055,11 @@ async def merge_collection_extra_metadata(
             except ValueError as exc:
                 if "not found" not in str(exc):
                     raise
+        create = updated.model_copy(
+            update={"embedding_model_id": None, "embedding_dimension": None}
+        )
         if await _with_retry(
-            lambda: store.save_collection_if_absent(updated),
+            lambda: store.save_collection_if_absent(create),
             description=f"creation of collection {updated.name}",
         ):
             return updated
@@ -1081,15 +1089,30 @@ def write_collection_binding_sync(
             "binding change.",
             details={"collection": collection_name, "migration_state": state.state},
         )
-    return _sync_wrapper(collection_manager.update_collection_fields)(
-        CollectionInfo(
-            name=collection_name,
-            embedding_model_id=embedding_model_id,
-            embedding_dimension=embedding_dimension,
-        ),
+    target = CollectionInfo(
+        name=collection_name,
+        embedding_model_id=embedding_model_id,
+        embedding_dimension=embedding_dimension,
+    )
+    if require_uninitialized:
+        # The store rejects both guards; unbound is the stronger statement here.
+        expected_model_id = None
+    applied = _sync_wrapper(collection_manager.update_collection_fields)(
+        target,
         _BINDING_FIELDS,
         expected_model_id=expected_model_id,
         require_uninitialized=require_uninitialized,
+    )
+    if applied or not require_uninitialized:
+        return applied
+    stored = _sync_wrapper(collection_manager.get_collection)(
+        collection_name
+    ).embedding_model_id
+    if stored is None or _normalize_model_id(stored) is not None:
+        return False
+    # A whitespace-only id reads as unbound but the unbound clause misses it.
+    return _sync_wrapper(collection_manager.update_collection_fields)(
+        target, _BINDING_FIELDS, expected_model_id=stored
     )
 
 
@@ -1651,6 +1674,12 @@ def _resolve_effective_embedding_model_sync_impl(
                             _BINDING_FIELDS,
                             expected_model_id=fresh.embedding_model_id,
                         )
+                        # Losing that compare-and-set means a switch won: use it.
+                        stored = _normalize_model_id(
+                            get_collection_sync(collection_name).embedding_model_id
+                        )
+                        if stored:
+                            return stored
             except Exception as save_error:
                 logger.warning(
                     "Failed to persist inferred embedding metadata for collection '%s': %s",
@@ -1860,11 +1889,14 @@ async def _rebuild_collection_metadata_impl() -> None:
                 )
             if current is not None or not inserted:
                 _sync_wrapper(collection_manager.update_collection_fields)(
-                    updated_collection, _COUNT_FIELDS + ("schema_version",)
+                    updated_collection,
+                    _COUNT_FIELDS + ("schema_version",),
+                    recreate_missing=True,
                 )
                 if binding and current is not None and current.is_initialized:
                     # Unbinding is only safe while the row still holds the model
-                    # that was read, and never for a frozen collection.
+                    # that was read, and skips a collection frozen at this check
+                    # (an unfreeze landing between check and write is not seen).
                     if (
                         binding["embedding_model_id"] is None
                         and read_migration_state(collection.name).state != FROZEN

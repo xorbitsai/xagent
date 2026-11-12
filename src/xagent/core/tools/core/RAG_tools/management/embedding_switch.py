@@ -3,7 +3,9 @@
 The switch writes the model id and dimension together, records the transition in
 ``collection_migration_state``, and leaves every other metadata column and
 ``main_pointers`` untouched. Rolling back is the same call with the previous
-model, after the collection is frozen again.
+model, after the collection is frozen again, provided that model is still
+configured under the id it is recorded with: a legacy row bound to an alias that
+no longer resolves to itself cannot be rolled back by this call.
 """
 
 from __future__ import annotations
@@ -70,8 +72,9 @@ def switch_collection_embedding_model(
 
     Raises:
         CollectionNotFrozenError: If the collection is not frozen for migration.
-        ValueError: If the collection does not exist, the model is not configured,
-            or the stored binding moved while switching.
+        EmbeddingAdapterError: If the model hub is unavailable or has no such model.
+        ValueError: If the collection does not exist, the resolved id differs from
+            the requested one, or the stored binding moved while switching.
     """
     state = read_migration_state(collection_name)
     if state.state != FROZEN:

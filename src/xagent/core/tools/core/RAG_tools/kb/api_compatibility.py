@@ -620,7 +620,7 @@ class KBApiCompatibilityFacade:
         collection: str,
         store: Any,
     ) -> CollectionInfo | None:
-        if not _has_store_method(store, "save_collection"):
+        if not _has_store_method(store, "save_collection_if_absent"):
             return None
 
         collection_info: CollectionInfo | None = None

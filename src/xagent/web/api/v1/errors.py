@@ -160,10 +160,14 @@ class V1ErrorCode(str, Enum):
     # catalog app connection, or a connector with OAuth connections that
     # another account (such as an automation account) manages through the
     # holder's link. 409.
+    # ``details.reason`` says which: ``catalog`` or ``managed_elsewhere``
+    # (``unknown`` for a 409 from a create or a switch, which the web code
+    # does not raise today).
     CONNECTOR_NOT_EDITABLE = "connector_not_editable"
 
     # The key holder may see the connector but may not change it: the team
     # shares it, or the web rules deny the holder this change. 403.
+    # ``details.reason`` says which: ``team_shared`` or ``not_permitted``.
     CONNECTOR_FORBIDDEN = "connector_forbidden"
 
     # The connector cannot be started from the API. 409.

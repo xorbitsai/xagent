@@ -209,7 +209,12 @@ def _resolve_changeable(
         raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
     server, link = row
     if link is None:
-        raise V1ApiError(V1ErrorCode.CONNECTOR_FORBIDDEN, 403, _TEAM_READ_ONLY_MESSAGE)
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_FORBIDDEN,
+            403,
+            _TEAM_READ_ONLY_MESSAGE,
+            details={"reason": "team_shared"},
+        )
     return server, link
 
 
@@ -600,6 +605,7 @@ class McpServerManagementRuntime:
                         V1ErrorCode.CONNECTOR_NOT_EDITABLE,
                         409,
                         _CATALOG_NOT_EDITABLE_MESSAGE,
+                        details={"reason": "catalog"},
                     )
                 asyncio.run(delete_mcp_server(server_id, current_user=user, db=db))
             _log_write("delete", key_prefix, user_id, server_id)
@@ -628,9 +634,10 @@ class McpServerManagementRuntime:
                     db=db,
                 )
                 row = resolve_holder_connector(db, user_id, server_id)
-                if row is None:
+                if row is None or row[1] is None:
                     # The web function has committed the update, so the
-                    # connector is gone only if it was deleted in between.
+                    # holder's link is gone only if it was deleted in between,
+                    # even when the team still shares the connector.
                     raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
                 projected = _project_rows(db, user, [row])[0]
             _log_write(

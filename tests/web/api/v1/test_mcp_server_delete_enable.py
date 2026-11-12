@@ -3,19 +3,23 @@
 import asyncio
 import logging
 import threading
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 import pytest
 import sqlalchemy as sa
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.exc import OperationalError
 
+from xagent.core.utils.encryption import encrypt_value
+from xagent.web.api import mcp as mcp_api
 from xagent.web.api.v1.deps import _bearer, get_user_from_personal_key
 from xagent.web.api.v1.errors import _DEFAULT_MESSAGES, V1ErrorCode
 from xagent.web.models.database import get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
-from xagent.web.models.mcp_oauth import MCPOAuthGrant
+from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.services import connector_team_scope, mcp_server_management
 from xagent.web.services.connector_team_scope import ConnectorDeleteDecision
 
@@ -127,6 +131,38 @@ def _grant_count(server_id: int) -> int:
         db.close()
 
 
+def _seed_flow_state(holder: Holder, server_id: int) -> None:
+    """One pending OAuth flow of ``holder``; the grant seed makes its client row."""
+    db = _direct_db_session()
+    try:
+        client_row = db.query(MCPOAuthClient).filter_by(mcp_server_id=server_id).one()
+        db.add(
+            MCPOAuthFlowState(
+                state=f"state-{holder.user_id}-{server_id}",
+                mcp_server_id=server_id,
+                user_id=holder.user_id,
+                mcp_oauth_client_id=client_row.id,
+                resource_owner_key=f"xagent:user:{holder.user_id}",
+                issuer="https://auth.example.test",
+                resource="https://mcp.example.test/mcp",
+                scope="read write",
+                code_verifier="verifier",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _flow_state_count(server_id: int) -> int:
+    db = _direct_db_session()
+    try:
+        return db.query(MCPOAuthFlowState).filter_by(mcp_server_id=server_id).count()
+    finally:
+        db.close()
+
+
 class _Calls:
     """Counts calls to the web functions, which must not run on a refusal."""
 
@@ -173,9 +209,14 @@ def _fail_statements(match) -> Any:
 # ===== write isolation =====
 
 _REFUSED_CELLS = {
-    "someone_elses": (404, "connector_not_found", _NOT_FOUND),
-    "shared_with_the_team": (403, "connector_forbidden", _TEAM_READ_ONLY),
-    "missing": (404, "connector_not_found", _NOT_FOUND),
+    "someone_elses": (404, "connector_not_found", _NOT_FOUND, None),
+    "shared_with_the_team": (
+        403,
+        "connector_forbidden",
+        _TEAM_READ_ONLY,
+        {"reason": "team_shared"},
+    ),
+    "missing": (404, "connector_not_found", _NOT_FOUND, None),
 }
 
 
@@ -185,7 +226,7 @@ def test_a_connector_the_holder_may_not_change_is_refused_without_a_write(
     bob, carol, monkeypatch, caplog, action, cell
 ):
     assert len(_REFUSED_CELLS) == 3
-    status, code, message = _REFUSED_CELLS[cell]
+    status, code, message, details = _REFUSED_CELLS[cell]
     server_id = _seed("carols", owner=carol)
     if cell == "shared_with_the_team":
         _share_with_team(server_id)
@@ -197,7 +238,9 @@ def test_a_connector_the_holder_may_not_change_is_refused_without_a_write(
     with caplog.at_level(logging.INFO):
         resp = _act(action, bob, server_id)
 
-    assert _error(resp, status, code)["message"] == message
+    error = _error(resp, status, code)
+    assert error["message"] == message
+    assert error.get("details") == details
     assert spy.calls == []
     _assert_nothing_written(before)
     assert not [r for r in caplog.records if "mcp server write:" in r.getMessage()]
@@ -325,6 +368,7 @@ def test_a_web_refusal_to_delete_is_a_403_that_changes_nothing(bob, reason):
 
     error = _error(resp, 403, "connector_forbidden")
     assert error["message"] == _FORBIDDEN
+    assert error["details"] == {"reason": "not_permitted"}
     assert "SECRET" not in resp.text
     _assert_nothing_written(before)
 
@@ -333,8 +377,9 @@ def test_a_link_without_delete_rights_is_a_403_from_the_web_rules(bob):
     server_id = _seed("not-mine", owner=bob, is_owner=False, can_delete=False)
     before = _store()
 
-    _error(_delete(bob, server_id), 403, "connector_forbidden")
+    error = _error(_delete(bob, server_id), 403, "connector_forbidden")
 
+    assert error["details"] == {"reason": "not_permitted"}
     _assert_nothing_written(before)
 
 
@@ -347,6 +392,7 @@ def test_other_accounts_oauth_state_makes_a_delete_a_409(bob):
 
     error = _error(resp, 409, "connector_not_editable")
     assert error["message"] == _MANAGED_ELSEWHERE
+    assert error["details"] == {"reason": "managed_elsewhere"}
     _assert_nothing_written(before)
     assert _grant_count(server_id) == 1
 
@@ -365,6 +411,7 @@ def test_delete_refuses_catalog_connectors_and_deletes_custom_ones(
         resp = _delete(bob, server_id)
         error = _error(resp, 409, "connector_not_editable")
         assert error["message"] == _NOT_EDITABLE_CATALOG
+        assert error["details"] == {"reason": "catalog"}
         assert spy.calls == []
         _assert_nothing_written(before)
     else:
@@ -375,8 +422,11 @@ def test_delete_refuses_catalog_connectors_and_deletes_custom_ones(
 
 def test_a_database_failure_during_delete_is_a_500_that_changes_nothing(bob, caplog):
     server_id = _seed("fragile", owner=bob)
+    _seed_grant(bob, server_id)
+    _seed_flow_state(bob, server_id)
     before = _store()
-    stop = _fail_statements(lambda s: "FROM mcp_oauth_grants" in s)
+    # Fails after the flow states have been deleted, so this checks the rollback.
+    stop = _fail_statements(lambda s: s.startswith("DELETE FROM user_mcpservers"))
     try:
         with caplog.at_level(logging.INFO):
             resp = _delete(bob, server_id)
@@ -387,8 +437,60 @@ def test_a_database_failure_during_delete_is_a_500_that_changes_nothing(bob, cap
     assert error["message"] == _INTERNAL
     assert "boom" not in resp.text
     _assert_nothing_written(before)
+    assert _grant_count(server_id) == 1
+    assert _flow_state_count(server_id) == 1
     assert any("action=delete status=500" in r.getMessage() for r in caplog.records)
     assert not [r for r in caplog.records if "mcp server write:" in r.getMessage()]
+
+
+def test_a_real_delete_removes_the_holders_grants_and_flow_states_and_revokes_them(
+    bob, carol, monkeypatch
+):
+    server_id = _seed("revoked", owner=bob)
+    # Another user keeps the definition, so the foreign-key cascade cannot be
+    # what removes the holder's grant and flow state below.
+    _link(carol, server_id, is_owner=False)
+    _seed_grant(bob, server_id)
+    db = _direct_db_session()
+    try:
+        grant = db.query(MCPOAuthGrant).filter_by(mcp_server_id=server_id).one()
+        grant.access_token = encrypt_value("AT-plain")
+        grant.refresh_token = encrypt_value("RT-plain")
+        client_row = db.query(MCPOAuthClient).filter_by(mcp_server_id=server_id).one()
+        client_row.metadata_json = {
+            "revocation_endpoint": "https://auth.example.test/revoke"
+        }
+        db.commit()
+    finally:
+        db.close()
+    _seed_flow_state(bob, server_id)
+    revoked: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        revoked.append((str(request.url), request.content.decode()))
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        mcp_api,
+        "create_mcp_oauth_http_client",
+        lambda **_kw: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    resp = _delete(bob, server_id)
+
+    assert resp.status_code == 200, resp.text
+    assert _definition_exists(server_id)
+    assert _grant_count(server_id) == 0
+    assert _flow_state_count(server_id) == 0
+    assert [url for url, _ in revoked] == ["https://auth.example.test/revoke"] * 2
+    assert [
+        ("token=AT-plain" in body, "token=RT-plain" in body) for _, body in revoked
+    ] == [
+        (True, False),
+        (False, True),
+    ]
+    assert "token_type_hint=access_token" in revoked[0][1]
+    assert "token_type_hint=refresh_token" in revoked[1][1]
 
 
 # ===== the delete runs outside the request's event loop =====
@@ -503,6 +605,40 @@ def test_a_connector_deleted_during_a_switch_is_a_404(bob, monkeypatch, caplog):
     ]
 
 
+def test_a_link_deleted_during_a_switch_is_a_404_even_when_the_team_shares_it(
+    bob, monkeypatch, caplog
+):
+    server_id = _seed("vanishing-shared", owner=bob)
+    _share_with_team(server_id)
+    real_update = mcp_server_management.update_mcp_server
+
+    def update_then_lose_the_link(*args, **kwargs):
+        result = real_update(*args, **kwargs)
+        other = _direct_db_session()
+        try:
+            other.query(UserMCPServer).filter_by(
+                user_id=bob.user_id, mcpserver_id=server_id
+            ).delete()
+            other.commit()
+        finally:
+            other.close()
+        return result
+
+    monkeypatch.setattr(
+        mcp_server_management, "update_mcp_server", update_then_lose_the_link
+    )
+
+    with caplog.at_level(logging.INFO):
+        resp = _set_enabled(bob, server_id, False)
+
+    error = _error(resp, 404, "connector_not_found")
+    assert error["message"] == _NOT_FOUND
+    assert not [
+        r for r in caplog.records if r.getMessage().startswith("personal key mcp")
+    ]
+    assert _definition_exists(server_id)
+
+
 def test_setting_the_same_value_twice_gives_the_same_answer(bob):
     server_id = _seed("twice", owner=bob, is_active=False)
 
@@ -613,6 +749,22 @@ _REFUSALS = {
         "connector_not_editable",
     ),
 }
+_REFUSAL_DETAILS = {
+    ("forbidden", "delete"): {"reason": "not_permitted"},
+    ("forbidden", "enable"): {"reason": "not_permitted"},
+    ("forbidden", "disable"): {"reason": "not_permitted"},
+    ("not_found", "delete"): None,
+    ("not_found", "enable"): None,
+    ("not_found", "disable"): None,
+    ("not_editable", "delete"): {"reason": "managed_elsewhere"},
+    ("not_editable", "enable"): {"reason": "unknown"},
+    ("not_editable", "disable"): {"reason": "unknown"},
+}
+_REFUSAL_MESSAGES = {
+    "forbidden": _FORBIDDEN,
+    "not_found": _NOT_FOUND,
+}
+_NOT_EDITABLE_DEFAULT = _DEFAULT_MESSAGES[V1ErrorCode.CONNECTOR_NOT_EDITABLE]
 
 
 @pytest.mark.parametrize("row", _REFUSAL_ROWS)
@@ -637,7 +789,12 @@ def test_web_refusals_become_sdk_errors_without_the_web_text(
 
     error = _error(resp, status, code)
     assert _SECRET_DETAIL not in resp.text
-    assert "details" not in error
+    assert error.get("details") == _REFUSAL_DETAILS[(row, action)]
+    if row == "not_editable":
+        expected = _MANAGED_ELSEWHERE if action == "delete" else _NOT_EDITABLE_DEFAULT
+    else:
+        expected = _REFUSAL_MESSAGES[row]
+    assert error["message"] == expected
     assert "detail" not in resp.json()
     _assert_nothing_written(before)
 

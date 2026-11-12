@@ -259,8 +259,17 @@ def test_mcp_routes_accept_only_personal_keys(method, path, kind):
 
 
 @pytest.mark.parametrize("server_id", [0, 2**31])
-def test_server_id_outside_the_column_range_is_rejected(bob, server_id):
-    _error(_get_one(bob, server_id), 422, "invalid_input")
+@pytest.mark.parametrize(
+    ("method", "suffix", "body"),
+    [("GET", "", None), ("DELETE", "", None), ("PUT", "/enabled", {"enabled": True})],
+)
+def test_server_id_outside_the_column_range_is_rejected(
+    bob, server_id, method, suffix, body
+):
+    resp = client.request(
+        method, f"/v1/mcp-servers/{server_id}{suffix}", headers=bob.headers, json=body
+    )
+    _error(resp, 422, "invalid_input")
 
 
 # ===== visibility =====
@@ -1660,8 +1669,7 @@ _ROW_CASES: list[tuple[str, HTTPException, int, str, str]] = [
         HTTPException(409, f"Has connections: {_REQUEST_SECRET_VALUES[0]}"),
         409,
         "connector_not_editable",
-        "This connector has connections managed outside your account; remove it "
-        "in the web app.",
+        _DEFAULT_MESSAGES[V1ErrorCode.CONNECTOR_NOT_EDITABLE],
     ),
     (
         "internal_error",
@@ -1678,6 +1686,14 @@ _ROW_CASES: list[tuple[str, HTTPException, int, str, str]] = [
         _DEFAULT_INTERNAL,
     ),
 ]
+
+
+# The rows whose answer carries ``details.reason``; the other rows here carry
+# no details.
+_ROW_DETAILS = {
+    "forbidden": {"reason": "not_permitted"},
+    "managed_elsewhere": {"reason": "unknown"},
+}
 
 
 def test_create_success_carries_no_secret(bob):
@@ -1711,7 +1727,7 @@ def test_write_error_translation(bob, monkeypatch, row_id, exc, status, code, me
 
     error = _error(resp, status, code)
     assert error["message"] == message
-    assert "details" not in error
+    assert error.get("details") == _ROW_DETAILS.get(row_id)
     assert "detail" not in resp.json()
     for secret in _REQUEST_SECRET_VALUES:
         assert secret not in resp.text

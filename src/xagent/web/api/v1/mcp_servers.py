@@ -209,7 +209,7 @@ _MCP_WRITE_ERROR_ROWS: tuple[_WriteErrorRow, ...] = (
         _has_status(409),
         409,
         V1ErrorCode.CONNECTOR_NOT_EDITABLE,
-        lambda _exc, _name, _secrets: _MANAGED_ELSEWHERE_MESSAGE,
+        _no_message,
     ),
     _WriteErrorRow(
         "internal_error",
@@ -246,14 +246,22 @@ def _raise_v1_from_mcp_write_error(
                 action,
                 exc.status_code,
             )
-        details = (
-            {"connector_id": owned_connector_id}
-            if row.id == "exact_name_conflict" and owned_connector_id is not None
-            else None
-        )
-        raise V1ApiError(
-            row.code, row.status, row.message(exc, requested_name, secrets), details
-        ) from exc
+        message = row.message(exc, requested_name, secrets)
+        details: Optional[dict[str, Any]] = None
+        if row.id == "exact_name_conflict" and owned_connector_id is not None:
+            details = {"connector_id": owned_connector_id}
+        elif row.id == "forbidden":
+            details = {"reason": "not_permitted"}
+        elif row.id == "managed_elsewhere":
+            # Of the web writes called here, only the delete answers 409: the
+            # connector has OAuth connections another account manages. Any
+            # other action has no such 409 today.
+            if action == "delete":
+                message = _MANAGED_ELSEWHERE_MESSAGE
+                details = {"reason": "managed_elsewhere"}
+            else:
+                details = {"reason": "unknown"}
+        raise V1ApiError(row.code, row.status, message, details) from exc
     raise AssertionError("the last row matches every failure")  # pragma: no cover
 
 

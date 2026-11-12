@@ -40,7 +40,6 @@ _PINNED_LEGACY = frozenset(
         "facebook",
         "fireflies",
         "freshdesk",
-        "github",
         "google-maps",
         "google-search-console",
         "granola",

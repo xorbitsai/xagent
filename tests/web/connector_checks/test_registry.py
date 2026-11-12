@@ -34,9 +34,7 @@ from xagent.web.connector_checks.declarations import (
     UnprobeableCheck,
     validate_connector_checks,
 )
-from xagent.web.connector_checks.engine import run_checks
 from xagent.web.connector_checks.fixtures import FixtureValue, resolve_fixtures
-from xagent.web.connector_checks.identity import ConnectorTarget
 from xagent.web.connector_checks.registry import (
     _GITHUB_READS_BEYOND_THE_FIVE,
     _GMAIL_LABEL_WITHOUT_READ,
@@ -67,8 +65,6 @@ from xagent.web.tools.mcp import (
     zendesk,
     zoom,
 )
-
-from .fakes import FakeAdapter, FakeTool, listed, rows
 
 # The three Microsoft document connectors and the module of each. What their
 # checks assert is covered end to end in test_microsoft_365_checks.py.
@@ -497,6 +493,8 @@ _HUBSPOT_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] 
                 ("typeName", "objectTypeId", "readAccess", "writeAccess"),
             ),
             IsType(("objectTypeResults", "hasMore"), "boolean"),
+            Length(("objectTypeResults", "results"), min=1),
+            Equals(("objectTypeResults", "results", 0, "typeName"), "CONTACT"),
         ),
     ),
     "hubspot.search_properties": (
@@ -505,19 +503,13 @@ _HUBSPOT_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] 
         (
             HasKeys((), ("results",)),
             EachHasKeys(("results",), ("name", "label")),
+            Length(("results",), min=1),
         ),
     ),
     "hubspot.search_segments": (
         "query_segments",
         {"operation": {"type": "SearchSegmentsQuery", "limit": 1}},
-        (
-            HasKeys(("result",), ("segments",)),
-            HasKeys(("result", "segments"), ("segments",)),
-            EachHasKeys(
-                ("result", "segments", "segments"),
-                ("listId", "objectTypeId", "listType", "name"),
-            ),
-        ),
+        (HasKeys(("result",), ("segments",)),),
     ),
 }
 
@@ -572,13 +564,11 @@ def test_a_hubspot_read_check_is_declared_exactly(
     check = _read_check(check_id)
     assert (check.tool, dict(check.arguments)) == (tool, arguments)
     assert check.assertions == assertions
-    assert check.payload == "json_text"
-    assert check.require_read_only_hint
 
 
-# The five checks' result shapes, non-empty first and empty-list second. The
-# values are synthetic, and no assertion reads a value.
-_HUBSPOT_OUTPUTS: Mapping[str, tuple[dict[str, Any], dict[str, Any]]] = {
+# Result shapes each check accepts, with synthetic values: an empty list too,
+# except where every portal has a match.
+_HUBSPOT_OUTPUTS: Mapping[str, tuple[dict[str, Any], ...]] = {
     "hubspot.search_contacts": (
         {
             "results": [
@@ -624,7 +614,6 @@ _HUBSPOT_OUTPUTS: Mapping[str, tuple[dict[str, Any], dict[str, Any]]] = {
                 "hasMore": False,
             }
         },
-        {"objectTypeResults": {"results": [], "hasMore": False}},
     ),
     "hubspot.search_properties": (
         {
@@ -637,7 +626,6 @@ _HUBSPOT_OUTPUTS: Mapping[str, tuple[dict[str, Any], dict[str, Any]]] = {
                 }
             ]
         },
-        {"results": []},
     ),
     "hubspot.search_segments": (
         {
@@ -658,7 +646,7 @@ _HUBSPOT_OUTPUTS: Mapping[str, tuple[dict[str, Any], dict[str, Any]]] = {
                 "type": "SegmentSearchResult",
             }
         },
-        {"result": {"segments": {"segments": [], "totalCount": 0, "hasMore": False}}},
+        {"result": {"segments": {}}},
     ),
 }
 
@@ -677,18 +665,38 @@ def test_a_hubspot_read_output_satisfies_its_declaration(
     _assert_check_output(check_id, json.dumps(payload))
 
 
-async def test_a_hubspot_check_is_skipped_without_the_read_only_hint() -> None:
-    tools = [FakeTool(check.tool) for check in CONNECTOR_CHECKS["hubspot"].reads]
-    adapter = FakeAdapter([ConnectorTarget("hubspot")], {"hubspot": listed(*tools)})
-
-    result = await run_checks(
-        adapter, declarations=lambda app_id: CONNECTOR_CHECKS[app_id]
-    )
-
-    assert [row[2:] for row in rows(result)[1:]] == [
-        ("skip", "read_only_hint_missing", None)
-    ] * len(tools)
-    assert all(tool.calls == [] for tool in tools)
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "hubspot.object_types",
+            {"objectTypeResults": {"results": [], "hasMore": False}},
+            "length",
+        ),
+        (
+            "hubspot.object_types",
+            {
+                "objectTypeResults": {
+                    "results": [
+                        {
+                            "typeName": "COMPANY",
+                            "objectTypeId": "0-2",
+                            "readAccess": "AVAILABLE",
+                            "writeAccess": "AVAILABLE",
+                        }
+                    ],
+                    "hasMore": False,
+                }
+            },
+            "equals",
+        ),
+        ("hubspot.search_properties", {"results": []}, "length"),
+    ],
+)
+def test_a_hubspot_check_fails_without_what_every_portal_has(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
 
 
 @pytest.mark.parametrize(

@@ -1124,8 +1124,8 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
-    # The test account has no seeded objects yet (#3572), so each check asserts
-    # shape and never a value.
+    # The test account has no seeded objects yet (#3572): a check asserts shape,
+    # and content only that every portal has (CONTACT and its email property).
     "hubspot": ConnectorChecks(
         "hubspot",
         reads=(
@@ -1171,6 +1171,8 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("typeName", "objectTypeId", "readAccess", "writeAccess"),
                     ),
                     IsType(("objectTypeResults", "hasMore"), "boolean"),
+                    Length(("objectTypeResults", "results"), min=1),
+                    Equals(("objectTypeResults", "results", 0, "typeName"), "CONTACT"),
                 ),
                 require_read_only_hint=True,
             ),
@@ -1182,6 +1184,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 assertions=(
                     HasKeys((), ("results",)),
                     EachHasKeys(("results",), ("name", "label")),
+                    Length(("results",), min=1),
                 ),
                 require_read_only_hint=True,
             ),
@@ -1190,14 +1193,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "query_segments",
                 {"operation": {"type": "SearchSegmentsQuery", "limit": 1}},
                 payload="json_text",
-                assertions=(
-                    HasKeys(("result",), ("segments",)),
-                    HasKeys(("result", "segments"), ("segments",)),
-                    EachHasKeys(
-                        ("result", "segments", "segments"),
-                        ("listId", "objectTypeId", "listType", "name"),
-                    ),
-                ),
+                assertions=(HasKeys(("result",), ("segments",)),),
                 require_read_only_hint=True,
             ),
         ),

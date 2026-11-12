@@ -69,10 +69,11 @@ _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
     "seed deck holds Google's default slide, but no fixture names it, so "
     "whether a check is added is decided in #3567"
 )
-# GitHub's 80% cut takes eight tools of its 89 calls in the week measured in
-# #2539, and a Tier 1 connector declares at most five read checks. The five go
-# to the most called tools, and the rest stay unchecked (#3568).
-_GITHUB_READS_OUTSIDE_THE_CUT = (
+# GitHub's 80% cut takes eight tools of its 89 calls in the 7-day production-au
+# volume reported on #2532, and a Tier 1 connector declares at most five read
+# checks. The five go to the most called tools, and the rest stay unchecked
+# (#3568).
+_GITHUB_READS_BEYOND_THE_FIVE = (
     "read left unchecked: GitHub's 80% cut needs more tools than the five read "
     "checks a Tier 1 connector declares, so the five most called carry the "
     f"checks, as decided in {_GITHUB_TIER_1}"
@@ -364,8 +365,9 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     # Tier 1 (#3568): the five most called reads, against the test
     # organization's private read repository, which the seed fills with one
     # file and the commit that writes it, one issue, one branch and one pull
-    # request opened from it. The tenant registry records the ids the seed's
-    # `apply` prints, including the two numbers GitHub assigns.
+    # request opened from it. The seed has not run against the tenant yet, so
+    # the tenant registry records no number for the issue or the pull request,
+    # and the two checks that read them report `skip` until it has.
     "github": ConnectorChecks(
         "github",
         reads=(
@@ -375,7 +377,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 assertions=(
                     StatusSuccess(),
                     HasKeys(("user",), ("login", "id", "html_url")),
-                    IsType(("user", "login"), "string"),
+                    Equals(("user", "login"), FixtureRef("github.login")),
                 ),
             ),
             ReadCheck(
@@ -441,9 +443,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("number", "title", "state", "head", "base", "draft"),
                     ),
                     IsType(("pull_request", "number"), "number"),
-                    Equals(
-                        ("pull_request", "title"), "xagent smoke seed pull request"
-                    ),
+                    Equals(("pull_request", "title"), "xagent smoke seed pull request"),
                     Equals(("pull_request", "state"), "open"),
                     Equals(("pull_request", "draft"), False),
                     Equals(("pull_request", "head"), FixtureRef("github.pr_branch")),
@@ -452,7 +452,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
         exemptions=(
             *(
-                ToolExemption(tool, _GITHUB_READS_OUTSIDE_THE_CUT)
+                ToolExemption(tool, _GITHUB_READS_BEYOND_THE_FIVE)
                 for tool in (
                     "github_get_file_contents",
                     "github_get_latest_release",

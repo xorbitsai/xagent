@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import Mock
 
@@ -13,6 +14,8 @@ import pytest
 from docx import Document
 from pptx import Presentation
 
+from xagent.core.tools.adapters.vibe import mcp_adapter
+from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_checks.assertions import judge_result, resolve_expected
 from xagent.web.connector_checks.declarations import (
@@ -32,8 +35,9 @@ from xagent.web.connector_checks.declarations import (
     UnprobeableCheck,
     validate_connector_checks,
 )
+from xagent.web.connector_checks.fixtures import FixtureValue, resolve_fixtures
 from xagent.web.connector_checks.registry import (
-    _GITHUB_READS_OUTSIDE_THE_CUT,
+    _GITHUB_READS_BEYOND_THE_FIVE,
     _GMAIL_LABEL_WITHOUT_READ,
     _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID,
     CONNECTOR_CHECKS,
@@ -834,9 +838,10 @@ class _Fixtures:
 
     _VALUES = {
         "gmail.seed_label_id": "Label_1",
-        "github.issue_number": "1",
+        "github.issue_number": 1,
+        "github.login": "xagent-app",
         "github.pr_branch": "xagent-smoke-seed",
-        "github.pull_number": "2",
+        "github.pull_number": 2,
         "github.read_repo": "xagent-smoke/smoke-read",
         "github.seed_file_path": "seed.md",
         "google-analytics.property_id": "563334905",
@@ -846,14 +851,14 @@ class _Fixtures:
         "google-slides.presentation_id": "deck-1",
     }
 
-    def resolve_fixture(self, key: str) -> str | None:
+    def resolve_fixture(self, key: str) -> FixtureValue | None:
         return self._VALUES.get(key)
 
 
 _FIXTURES = _Fixtures()
 
 
-def _google_fixture_keys(check: ReadCheck) -> Iterator[FixtureRef]:
+def _fixture_keys(check: ReadCheck) -> Iterator[FixtureRef]:
     yield from _fixture_refs(check.arguments)
     for assertion in check.assertions:
         if isinstance(assertion, Equals):
@@ -926,7 +931,7 @@ def test_the_google_read_checks_use_exactly_these_fixture_keys() -> None:
         for app_id in _GOOGLE_APP_MODULES
         for check in CONNECTOR_CHECKS[app_id].reads
         if isinstance(check, ReadCheck)
-        for ref in _google_fixture_keys(check)
+        for ref in _fixture_keys(check)
     }
 
     assert keys == _GOOGLE_FIXTURE_KEYS_USED
@@ -1674,8 +1679,9 @@ def test_a_google_fixture_check_fails_on_an_error_envelope(
 _READ_REPO = "xagent-smoke/smoke-read"
 
 # The read checks, pinned: the tool, its arguments and its assertions. These
-# five tools carry the most of the 89 GitHub calls in the week measured in
-# #2539, the five read checks a Tier 1 connector declares at most.
+# five tools carry the most of the 89 GitHub calls in the 7-day production-au
+# tool-call volume reported on #2532, the five read checks a Tier 1 connector
+# declares at most.
 _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
     "github.current_user": (
         "github_get_current_user",
@@ -1683,7 +1689,7 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
         (
             StatusSuccess(),
             HasKeys(("user",), ("login", "id", "html_url")),
-            IsType(("user", "login"), "string"),
+            Equals(("user", "login"), FixtureRef("github.login")),
         ),
     ),
     "github.read_repository": (
@@ -1754,12 +1760,13 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
 }
 
 # The fixture keys the GitHub read checks use, pinned here so that adding or
-# dropping one shows in the diff. The tenant registry records the three the
-# seed's layout knows; the two numbers GitHub assigns are recorded from the
-# first `apply` (xorbitsai/xagent-saas#2533).
+# dropping one shows in the diff. The tenant registry records the login and the
+# three ids the seed's layout knows; the two numbers GitHub assigns are
+# recorded from the first `apply` (xorbitsai/xagent-saas#2533).
 _GITHUB_FIXTURE_KEYS_USED = frozenset(
     {
         "github.issue_number",
+        "github.login",
         "github.pr_branch",
         "github.pull_number",
         "github.read_repo",
@@ -1822,15 +1829,17 @@ def test_the_github_read_checks_use_exactly_these_fixture_keys() -> None:
         ref.key
         for check in CONNECTOR_CHECKS["github"].reads
         if isinstance(check, ReadCheck)
-        for ref in _google_fixture_keys(check)
+        for ref in _fixture_keys(check)
     }
 
     assert keys == _GITHUB_FIXTURE_KEYS_USED
 
 
 def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
-    """A fixture in the arguments names a parameter of the tool, and every
-    required argument is pinned: an omitted one would make the tool prompt."""
+    """A fixture in the arguments names a parameter of the tool, its value is
+    the type that parameter declares, and every required argument is pinned: an
+    omitted one would make the tool prompt, and a string where the tool takes an
+    integer is refused before the call leaves."""
     for check in CONNECTOR_CHECKS["github"].reads:
         if not isinstance(check, ReadCheck):
             continue
@@ -1840,6 +1849,11 @@ def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
         ]
         for name in bound:
             assert name in parameters, (check.tool, name)
+            declared = parameters[name].annotation
+            for ref in _fixture_refs(check.arguments[name]):
+                value = _FIXTURES.resolve_fixture(ref.key)
+                assert value is not None, ref.key
+                assert isinstance(value, declared), (check.tool, name, ref.key)
         required = {
             name
             for name, parameter in parameters.items()
@@ -1849,6 +1863,47 @@ def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
         assert required <= set(check.arguments), (check.tool, required)
 
 
+async def test_a_github_fixture_bound_argument_passes_the_tools_own_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The value a fixture resolves to survives the adapter's own checks.
+
+    The tools validate their arguments locally before a call leaves, and a
+    string where a tool declares an integer is refused there, so a fixture the
+    registry holds as a string would make its check fail on every run. The
+    session is replaced with one that refuses: reaching it means the adapter
+    accepted the arguments.
+    """
+    reached: list[str] = []
+
+    @asynccontextmanager
+    async def _refuse_session(connection: Any) -> Any:
+        reached.append(str(connection))
+        raise RuntimeError("no server in this test")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(mcp_adapter, "create_session", _refuse_session)
+    tools = {tool.name: tool for tool in await github.mcp.list_tools()}
+    for check in CONNECTOR_CHECKS["github"].reads:
+        if not isinstance(check, ReadCheck) or not any(_fixture_refs(check.arguments)):
+            continue
+        adapter = MCPToolAdapter(
+            mcp_tool=tools[check.tool],
+            connection={
+                "transport": "streamable_http",
+                "url": "https://mcp.example.test",
+            },
+        )
+        reached.clear()
+
+        raw = await adapter.run_json_async(
+            resolve_fixtures(dict(check.arguments), _FIXTURES)
+        )
+
+        assert reached, (check.id, raw)
+        assert "Invalid MCP tool arguments" not in raw["content"][0]["text"], check.id
+
+
 def test_a_github_read_outside_the_five_is_exempt_for_the_cut() -> None:
     exemptions = {
         exemption.tool: exemption.reason
@@ -1856,7 +1911,7 @@ def test_a_github_read_outside_the_five_is_exempt_for_the_cut() -> None:
     }
 
     for tool in _GITHUB_READS_OUTSIDE_THE_FIVE:
-        assert exemptions[tool] == _GITHUB_READS_OUTSIDE_THE_CUT, tool
+        assert exemptions[tool] == _GITHUB_READS_BEYOND_THE_FIVE, tool
     assert set(exemptions) == _GITHUB_READS_OUTSIDE_THE_FIVE | (
         _GITHUB_WRITES_WITHOUT_CLEANUP | {"github_update_release"}
     )
@@ -1917,7 +1972,9 @@ class _FakeGitHub:
         try:
             return self.routes[(kwargs["method"], path)]
         except KeyError:
-            raise AssertionError(f"unrouted request: {kwargs['method']} {path}") from None
+            raise AssertionError(
+                f"unrouted request: {kwargs['method']} {path}"
+            ) from None
 
 
 def _fake_github(
@@ -1995,30 +2052,41 @@ def _github_pull_request(**overrides: Any) -> dict[str, Any]:
     }
 
 
+def _github_user(**overrides: Any) -> dict[str, Any]:
+    return {
+        "login": "xagent-app",
+        "id": 424242,
+        "name": "Xagent Smoke",
+        "email": None,
+        "company": None,
+        "bio": None,
+        "public_repos": 0,
+        "followers": 0,
+        "following": 0,
+        "html_url": "https://github.com/xagent-app",
+        **overrides,
+    }
+
+
 def test_github_current_user_output_satisfies_its_declaration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _fake_github(
-        monkeypatch,
-        (
-            "GET",
-            "/user",
-            {
-                "login": "xagent-app",
-                "id": 424242,
-                "name": "Xagent Smoke",
-                "email": None,
-                "company": None,
-                "bio": None,
-                "public_repos": 0,
-                "followers": 0,
-                "following": 0,
-                "html_url": "https://github.com/xagent-app",
-            },
-        ),
-    )
+    _fake_github(monkeypatch, ("GET", "/user", _github_user()))
 
     _assert_check_output("github.current_user", github.github_get_current_user())
+
+
+def test_github_current_user_output_fails_on_another_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tenant registry pins the account the QA member's connection uses. An
+    # account that can see the private repository passes the other four checks,
+    # so this is the one that notices the wrong account.
+    _fake_github(monkeypatch, ("GET", "/user", _github_user(login="qhhh-personal")))
+
+    _assert_check_fails(
+        "github.current_user", github.github_get_current_user(), "equals"
+    )
 
 
 def test_github_repository_output_satisfies_its_declaration(

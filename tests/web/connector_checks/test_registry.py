@@ -55,6 +55,7 @@ from xagent.web.tools.mcp import (
     google_slides,
     outlook,
     powerpoint,
+    sharepoint,
     word,
     zendesk,
     zoom,
@@ -528,6 +529,49 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             Length(("contacts",), max=1),
         ),
     ),
+    # A SharePoint read takes a site id; Graph's "root" alias names the
+    # tenant's root site without a fixture.
+    "sharepoint.get_root_site": (
+        "sharepoint_get_root_site",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("site",), ("id", "webUrl")),
+            IsType(("site", "id"), "string"),
+        ),
+    ),
+    "sharepoint.list_drives": (
+        "sharepoint_list_drives",
+        {"site_id": "root"},
+        (
+            StatusSuccess(),
+            HasKeys((), ("drives", "truncated")),
+            EachHasKeys(("drives",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "sharepoint.list_items": (
+        "sharepoint_list_items",
+        {"site_id": "root", "top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("items", "truncated")),
+            EachHasKeys(("items",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+            Length(("items",), max=1),
+        ),
+    ),
+    "sharepoint.list_lists": (
+        "sharepoint_list_lists",
+        {"site_id": "root", "top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("lists", "truncated")),
+            EachHasKeys(("lists",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+            Length(("lists",), max=1),
+        ),
+    ),
 }
 
 
@@ -573,7 +617,9 @@ def test_a_tier_2_read_check_is_declared_exactly(
     assert check.assertions == assertions
 
 
-@pytest.mark.parametrize("app_id", ["google-ads", "outlook", "zendesk", "zoom"])
+@pytest.mark.parametrize(
+    "app_id", ["google-ads", "outlook", "sharepoint", "zendesk", "zoom"]
+)
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)
     assert expected is not None
@@ -852,6 +898,134 @@ def test_outlook_send_message_has_no_cleanup_tool() -> None:
         for exemption in CONNECTOR_CHECKS["outlook"].exemptions
         if exemption.reason == WRITE_WITHOUT_CLEANUP
     ] == ["outlook_send_message"]
+
+
+_SHAREPOINT_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
+    "sharepoint.list_drives": ("drives", sharepoint.sharepoint_list_drives),
+    "sharepoint.list_items": ("items", sharepoint.sharepoint_list_items),
+    "sharepoint.list_lists": ("lists", sharepoint.sharepoint_list_lists),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_SHAREPOINT_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+def test_a_sharepoint_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
+) -> None:
+    _, tool = _SHAREPOINT_LISTS[check_id]
+    paths: list[str] = []
+
+    def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        paths.append(path)
+        return {"value": [{"id": "01ABC", "name": "Documents"}] * count}
+
+    monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+    assert paths and all(path.startswith("/sites/root/") for path in paths)
+
+
+def test_sharepoint_get_root_site_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sharepoint,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "id": "contoso.sharepoint.com,1111,2222",
+            "webUrl": "https://contoso.sharepoint.com",
+            "name": "",
+        },
+    )
+
+    _assert_check_output(
+        "sharepoint.get_root_site",
+        _call_declared("sharepoint.get_root_site", sharepoint.sharepoint_get_root_site),
+    )
+
+
+def test_a_halved_sharepoint_list_still_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page too large for the output limit is halved down to no items, with
+    a message; the check bounds no lower count and allows extra keys."""
+    monkeypatch.setattr(
+        sharepoint,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "value": [{"id": "b!1", "name": "Documents", "description": "x" * 400}] * 2
+        },
+    )
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 300)
+
+    result = _call_declared("sharepoint.list_drives", sharepoint.sharepoint_list_drives)
+
+    payload = json.loads(result)
+    assert (payload["drives"], payload["truncated"]) == ([], True)
+    assert "message" in payload
+    _assert_check_output("sharepoint.list_drives", result)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "sharepoint.list_drives",
+            {"status": "error", "message": "accessDenied"},
+            "status_success",
+        ),
+        ("sharepoint.list_drives", {"status": "success", "drives": []}, "has_keys"),
+        (
+            "sharepoint.list_drives",
+            {"status": "success", "drives": [{"id": "b!1"}], "truncated": False},
+            "each_has_keys",
+        ),
+        (
+            "sharepoint.list_drives",
+            {"status": "success", "drives": [], "truncated": "false"},
+            "is_type",
+        ),
+        (
+            "sharepoint.list_items",
+            {
+                "status": "success",
+                "items": [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}],
+                "truncated": True,
+            },
+            "length",
+        ),
+        (
+            "sharepoint.list_lists",
+            {
+                "status": "success",
+                "lists": [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}],
+                "truncated": True,
+            },
+            "length",
+        ),
+        (
+            "sharepoint.get_root_site",
+            {"status": "success", "site": {"id": "x"}},
+            "has_keys",
+        ),
+    ],
+)
+def test_a_sharepoint_check_fails_on_another_shape(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
+def test_the_sharepoint_writes_stay_pending() -> None:
+    """An upload's file is a document-library list item, which
+    sharepoint_delete_list_item may be able to delete by a list item id the
+    upload does not return; whether a check can clean up that way is not
+    settled, so no sharepoint write takes the permanent no-cleanup reason."""
+    assert not [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["sharepoint"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ]
 
 
 # The Google family (issue #3567): the read checks of the tenant the seed

@@ -753,6 +753,78 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("powerpoint_create_presentation",),
         ),
     ),
+    # Tier 2 (#3573). Every list takes a site id; Graph's "root" alias names
+    # the tenant's root site, so no fixture is needed. list_drives takes no
+    # page size, so its list has no length bound.
+    "sharepoint": ConnectorChecks(
+        "sharepoint",
+        reads=(
+            _declared_l3("sharepoint"),
+            ReadCheck(
+                "sharepoint.get_root_site",
+                "sharepoint_get_root_site",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("site",), ("id", "webUrl")),
+                    IsType(("site", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_drives",
+                "sharepoint_list_drives",
+                {"site_id": "root"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("drives", "truncated")),
+                    EachHasKeys(("drives",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_items",
+                "sharepoint_list_items",
+                {"site_id": "root", "top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("items", "truncated")),
+                    EachHasKeys(("items",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                    Length(("items",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_lists",
+                "sharepoint_list_lists",
+                {"site_id": "root", "top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("lists", "truncated")),
+                    EachHasKeys(("lists",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                    Length(("lists",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "sharepoint_search_sites",
+                "sharepoint_get_site",
+                "sharepoint_search_files",
+                "sharepoint_get_file_content",
+                "sharepoint_download_file",
+                "sharepoint_list_list_items",
+            ),
+            writes=(
+                "sharepoint_create_list_item",
+                "sharepoint_delete_list_item",
+                "sharepoint_move_item",
+                "sharepoint_upload_text_file",
+                "sharepoint_upload_file",
+            ),
+            in_place_edits=("sharepoint_update_list_item",),
+        ),
+    ),
     "word": ConnectorChecks(
         "word",
         reads=(
@@ -927,7 +999,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "posthog",
         "rocketlane",
         "salesforce",
-        "sharepoint",
         "shopify",
         "slack",
         "stripe",

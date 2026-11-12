@@ -58,7 +58,6 @@ _PINNED_LEGACY = frozenset(
         "posthog",
         "rocketlane",
         "salesforce",
-        "sharepoint",
         "shopify",
         "slack",
         "stripe",

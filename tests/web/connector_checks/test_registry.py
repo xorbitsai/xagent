@@ -1680,8 +1680,8 @@ _READ_REPO = "xagent-smoke/smoke-read"
 
 # The read checks, pinned: the tool, its arguments and its assertions. These
 # five tools carry the most of the 89 GitHub calls in the 7-day production-au
-# tool-call volume reported on #2532, the five read checks a Tier 1 connector
-# declares at most.
+# tool-call volume reported on xorbitsai/xagent-saas#2532, the five read checks
+# a Tier 1 connector declares at most.
 _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
     "github.current_user": (
         "github_get_current_user",
@@ -1718,6 +1718,7 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
                 ("number", "title", "state", "labels", "user", "html_url"),
             ),
             IsType(("issue", "number"), "number"),
+            Equals(("issue", "number"), FixtureRef("github.issue_number")),
             Equals(("issue", "title"), "xagent smoke seed issue"),
             Equals(("issue", "state"), "open"),
             Equals(("issue", "is_pull_request"), False),
@@ -1751,6 +1752,7 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
                 ("number", "title", "state", "head", "base", "draft"),
             ),
             IsType(("pull_request", "number"), "number"),
+            Equals(("pull_request", "number"), FixtureRef("github.pull_number")),
             Equals(("pull_request", "title"), "xagent smoke seed pull request"),
             Equals(("pull_request", "state"), "open"),
             Equals(("pull_request", "draft"), False),
@@ -1776,7 +1778,7 @@ _GITHUB_FIXTURE_KEYS_USED = frozenset(
 
 # The reads left to an exemption: GitHub's 80% cut needs eight tools, and the
 # five most called have the checks.
-_GITHUB_READS_OUTSIDE_THE_FIVE = frozenset(
+_GITHUB_READS_BEYOND_THE_FIVE_TOOLS = frozenset(
     {
         "github_get_file_contents",
         "github_get_latest_release",
@@ -1910,9 +1912,9 @@ def test_a_github_read_outside_the_five_is_exempt_for_the_cut() -> None:
         for exemption in CONNECTOR_CHECKS["github"].exemptions
     }
 
-    for tool in _GITHUB_READS_OUTSIDE_THE_FIVE:
+    for tool in _GITHUB_READS_BEYOND_THE_FIVE_TOOLS:
         assert exemptions[tool] == _GITHUB_READS_BEYOND_THE_FIVE, tool
-    assert set(exemptions) == _GITHUB_READS_OUTSIDE_THE_FIVE | (
+    assert set(exemptions) == _GITHUB_READS_BEYOND_THE_FIVE_TOOLS | (
         _GITHUB_WRITES_WITHOUT_CLEANUP | {"github_update_release"}
     )
 
@@ -2168,6 +2170,21 @@ def test_github_issue_output_fails_on_a_pull_request(
     )
 
 
+def test_github_issue_output_fails_on_another_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fixture names the issue the seed creates, so a payload carrying
+    # another number is not the issue the check reads.
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/issues/1", _github_issue(number=7)),
+    )
+
+    _assert_check_fails(
+        "github.read_issue", github.github_get_issue(_READ_REPO, 1), "equals"
+    )
+
+
 def test_github_commits_output_satisfies_its_declaration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2222,6 +2239,23 @@ def test_github_pull_request_output_fails_on_another_head(
             f"/repos/{_READ_REPO}/pulls/2",
             _github_pull_request(head={"ref": "someone-elses-branch"}),
         ),
+    )
+
+    _assert_check_fails(
+        "github.read_pull_request",
+        github.github_get_pull_request(_READ_REPO, 2),
+        "equals",
+    )
+
+
+def test_github_pull_request_output_fails_on_another_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fixture names the pull request the seed opens, so a payload carrying
+    # another number is not the one the check reads.
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/pulls/2", _github_pull_request(number=9)),
     )
 
     _assert_check_fails(

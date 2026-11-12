@@ -70,9 +70,9 @@ _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
     "whether a check is added is decided in #3567"
 )
 # GitHub's 80% cut takes eight tools of its 89 calls in the 7-day production-au
-# volume reported on #2532, and a Tier 1 connector declares at most five read
-# checks. The five go to the most called tools, and the rest stay unchecked
-# (#3568).
+# volume reported on xorbitsai/xagent-saas#2532, and a Tier 1 connector declares
+# at most five read checks. The five go to the most called tools, and the rest
+# stay unchecked (#3568).
 _GITHUB_READS_BEYOND_THE_FIVE = (
     "read left unchecked: GitHub's 80% cut needs more tools than the five read "
     "checks a Tier 1 connector declares, so the five most called carry the "
@@ -365,9 +365,10 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
     # Tier 1 (#3568): the five most called reads, against the test
     # organization's private read repository, which the seed fills with one
     # file and the commit that writes it, one issue, one branch and one pull
-    # request opened from it. The seed has not run against the tenant yet, so
-    # the tenant registry records no number for the issue or the pull request,
-    # and the two checks that read them report `skip` until it has.
+    # request opened from it. Until the tenant registry records the number
+    # GitHub gives the issue or the pull request, the two checks that read them
+    # report `skip` and never call their tool; once it does, each compares the
+    # number the tool returns with the one the fixture names.
     "github": ConnectorChecks(
         "github",
         reads=(
@@ -408,6 +409,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("number", "title", "state", "labels", "user", "html_url"),
                     ),
                     IsType(("issue", "number"), "number"),
+                    Equals(("issue", "number"), FixtureRef("github.issue_number")),
                     Equals(("issue", "title"), "xagent smoke seed issue"),
                     Equals(("issue", "state"), "open"),
                     Equals(("issue", "is_pull_request"), False),
@@ -443,6 +445,10 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                         ("number", "title", "state", "head", "base", "draft"),
                     ),
                     IsType(("pull_request", "number"), "number"),
+                    Equals(
+                        ("pull_request", "number"),
+                        FixtureRef("github.pull_number"),
+                    ),
                     Equals(("pull_request", "title"), "xagent smoke seed pull request"),
                     Equals(("pull_request", "state"), "open"),
                     Equals(("pull_request", "draft"), False),

@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
-from typing import Annotated, Any, Callable, Iterator, Optional, TypeVar
+from typing import Annotated, Any, Callable, Iterator, Optional, ParamSpec, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field, field_validator
@@ -71,10 +71,13 @@ MemoryIdPath = Annotated[
 MEMORY_ID_ROUTE = "/{memory_id:memory_id}"
 
 
+_P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
-async def _run_store_call(fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+async def _run_store_call(
+    fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs
+) -> _T:
     """Run one synchronous :class:`MemoryStore` call off the event loop.
 
     The management routes are ``async def`` but the store interface is

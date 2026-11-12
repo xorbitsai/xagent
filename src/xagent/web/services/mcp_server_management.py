@@ -26,9 +26,11 @@ from ..api.mcp import (
     _mask_env,
     _mcp_oauth_configuration_error,
     _oauth_account_summaries,
+    _require_parsable_mcp_oauth_identifiers,
 )
 from ..models.database import get_session_local
 from ..models.mcp import MCPServer, UserMCPServer
+from ..models.mcp_oauth import MCPOAuthGrant
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
 from ..schemas.v1 import V1McpServer, V1McpServerAuthorization
@@ -39,7 +41,11 @@ from .connector_team_scope import (
     visible_team_connector_ids,
 )
 from .db_runtime import run_db_io_cancellation_safe
-from .mcp_oauth import select_mcp_oauth_grants
+from .mcp_oauth import (
+    MCPOAuthRuntimeError,
+    _select_runtime_grant,
+    select_mcp_oauth_grants,
+)
 from .mcp_runtime import _is_mcp_oauth_http_server
 
 logger = logging.getLogger(__name__)
@@ -210,10 +216,19 @@ def _masked_auth(auth: Any) -> Optional[dict[str, Any]]:
 
 
 _AUTHORIZATION_MESSAGE = (
-    "Authorization is done in the xagent web app: open Connectors, select this "
-    "connector and choose Connect. An API key cannot complete browser "
-    "authorization."
+    "Authorization can only be completed in the xagent web app, not with an "
+    "API key. Open Connectors and select this connector; if it offers Connect, "
+    "choose it, otherwise ask the connector's owner."
 )
+_CONFIGURATION_ERROR_MESSAGE = (
+    "This connector's OAuth settings are unusable. Its owner must correct them "
+    "in the xagent web app."
+)
+# A status absent here reads _AUTHORIZATION_MESSAGE.
+_STATUS_MESSAGES: dict[str, Optional[str]] = {
+    "authorized": None,
+    "configuration_error": _CONFIGURATION_ERROR_MESSAGE,
+}
 
 _BUILTIN_OAUTH_STATUS = {
     "connected": "authorized",
@@ -221,61 +236,80 @@ _BUILTIN_OAUTH_STATUS = {
 }
 
 
+def _authorization_value(kind: str, status: str) -> V1McpServerAuthorization:
+    return V1McpServerAuthorization(
+        kind=kind,
+        status=status,
+        message=_STATUS_MESSAGES.get(status, _AUTHORIZATION_MESSAGE),
+    )
+
+
 def _authorization(
     db: Any,
     server: MCPServer,
-    link: UserMCPServer | None,
     *,
     holder_id: int,
+    allow_team_member_grants: bool,
+    app_id: Optional[str],
     connection_status: Optional[str],
+    active_grant_server_ids: frozenset[int],
 ) -> Optional[V1McpServerAuthorization]:
     """The holder's own OAuth authorization of the connector, if it uses OAuth.
 
     A failing grant read propagates: it must not read as "not authorized". An OAuth
     resource or issuer that does not parse is reported as "configuration_error", so
-    one misconfigured connector does not fail the whole response.
+    one misconfigured connector does not fail the whole response. A token supplied
+    by an OAuth token resolver hook is not reflected.
     """
     if server.transport == "oauth":
-        return V1McpServerAuthorization(
-            kind="builtin_oauth",
-            status=_BUILTIN_OAUTH_STATUS.get(connection_status or "", "not_authorized"),
-            message=_AUTHORIZATION_MESSAGE,
+        if app_id is None:
+            # The runtime reports such a connector unavailable
+            # (catalog_app_not_found); connecting cannot fix it.
+            return _authorization_value("builtin_oauth", "configuration_error")
+        return _authorization_value(
+            "builtin_oauth",
+            _BUILTIN_OAUTH_STATUS.get(connection_status or "", "not_authorized"),
         )
     if not _is_mcp_oauth_http_server(server, server.auth):
         return None
     # The check above guarantees a dict; the ORM column type does not say so.
     auth = cast(dict[str, Any], server.auth)
     if _mcp_oauth_configuration_error(auth) is not None:
-        status = "configuration_error"
-    else:
-        try:
-            grants = select_mcp_oauth_grants(
-                db,
-                server_id=int(server.id),
-                user_id=holder_id,
-                auth_config=auth,
-                resource_owner_key=_default_resource_owner_key(holder_id),
-                # A connector seen only through the team has no link: the holder's
-                # own authorization of it counts when it targets the current URL.
-                allow_team_member_grants=link is None,
-            )
-        except ValueError as exc:
-            # The selector raises for an OAuth resource or issuer it cannot
-            # parse. Such settings are unusable, so report them for this
-            # connector instead of failing the whole response.
-            logger.warning(
-                "Reporting MCP OAuth connector authorization as "
-                "configuration_error, its OAuth resource or issuer does not "
-                "parse: server_id=%s error=%s",
-                server.id,
-                type(exc).__name__,
-            )
-            status = "configuration_error"
-        else:
-            status = "authorized" if grants else "not_authorized"
-    return V1McpServerAuthorization(
-        kind="mcp_oauth", status=status, message=_AUTHORIZATION_MESSAGE
+        return _authorization_value("mcp_oauth", "configuration_error")
+    try:
+        # The selector raises ValueError for exactly these definitions.
+        _require_parsable_mcp_oauth_identifiers(auth)
+    except ValueError as exc:
+        # Such settings are unusable, so report them for this connector
+        # instead of failing the whole response.
+        logger.warning(
+            "Reporting MCP OAuth connector authorization as "
+            "configuration_error, its OAuth resource or issuer does not "
+            "parse: server_id=%s error=%s",
+            server.id,
+            type(exc).__name__,
+        )
+        return _authorization_value("mcp_oauth", "configuration_error")
+    # The selector only returns grants whose server id is in this set.
+    if int(server.id) not in active_grant_server_ids:
+        return _authorization_value("mcp_oauth", "not_authorized")
+    grants = select_mcp_oauth_grants(
+        db,
+        server_id=int(server.id),
+        user_id=holder_id,
+        auth_config=auth,
+        resource_owner_key=_default_resource_owner_key(holder_id),
+        allow_team_member_grants=allow_team_member_grants,
+        endpoint_url=cast(Optional[str], server.url),
     )
+    if not grants:
+        return _authorization_value("mcp_oauth", "not_authorized")
+    try:
+        # The runtime's own pick; the selector has already applied the scope.
+        _select_runtime_grant(grants, set())
+    except MCPOAuthRuntimeError:
+        return _authorization_value("mcp_oauth", "needs_reconnect")
+    return _authorization_value("mcp_oauth", "authorized")
 
 
 def _project_mcp_server(
@@ -287,6 +321,7 @@ def _project_mcp_server(
     is_admin: bool,
     oauth_accounts: dict[str, tuple[Optional[str], str, int]],
     catalog_app_keys: frozenset[str],
+    active_grant_server_ids: frozenset[int],
 ) -> V1McpServer:
     """The SDK view of one connector.
 
@@ -339,9 +374,13 @@ def _project_mcp_server(
         authorization=_authorization(
             db,
             server,
-            link,
             holder_id=holder_id,
+            # A connector seen only through the team has no link: the holder's
+            # own authorization of it counts when it targets the current URL.
+            allow_team_member_grants=link is None,
+            app_id=app_id,
             connection_status=connection_status,
+            active_grant_server_ids=active_grant_server_ids,
         ),
         created_at=_format_optional_datetime(server.created_at),
         updated_at=_format_optional_datetime(server.updated_at),
@@ -361,6 +400,22 @@ def _project_rows(
     catalog_app_keys = _catalog_classification_keys(
         db, [server for server, _link in rows]
     )
+    # The grant selector only returns grants in this set, so one read lets rows
+    # without an active grant skip it, as the web connector listing does.
+    active_grant_server_ids = (
+        frozenset(
+            int(server_id)
+            for (server_id,) in db.query(MCPOAuthGrant.mcp_server_id)
+            .filter(
+                MCPOAuthGrant.user_id == user.id,
+                MCPOAuthGrant.status == "active",
+            )
+            .distinct()
+            .all()
+        )
+        if any(_is_mcp_oauth_http_server(server, server.auth) for server, _link in rows)
+        else frozenset()
+    )
     return [
         _project_mcp_server(
             db,
@@ -370,6 +425,7 @@ def _project_rows(
             is_admin=bool(user.is_admin),
             oauth_accounts=oauth_accounts,
             catalog_app_keys=catalog_app_keys,
+            active_grant_server_ids=active_grant_server_ids,
         )
         for server, link in rows
     ]

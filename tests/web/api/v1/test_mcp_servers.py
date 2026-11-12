@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -801,9 +802,13 @@ def test_timestamps_are_iso_strings_or_null(bob, stamped):
 # ===== the holder's own OAuth authorization =====
 
 AUTHORIZATION_MESSAGE = (
-    "Authorization is done in the xagent web app: open Connectors, select this "
-    "connector and choose Connect. An API key cannot complete browser "
-    "authorization."
+    "Authorization can only be completed in the xagent web app, not with an "
+    "API key. Open Connectors and select this connector; if it offers Connect, "
+    "choose it, otherwise ask the connector's owner."
+)
+CONFIGURATION_ERROR_MESSAGE = (
+    "This connector's OAuth settings are unusable. Its owner must correct them "
+    "in the xagent web app."
 )
 OTHER_URL = "https://old.example.test/mcp"
 OAUTH_AUTH = {"type": "mcp_oauth", "scope": "read write"}
@@ -817,6 +822,9 @@ def _seed_grant(
     owner_key: str | None = None,
     status: str = "active",
     scope: str = "read write",
+    client_id: str | None = None,
+    expires_at: datetime | None = None,
+    refresh_token: str | None = None,
 ) -> None:
     """One OAuth grant of ``holder`` on a connector, with its client row."""
     db = _direct_db_session()
@@ -826,7 +834,7 @@ def _seed_grant(
             issuer="https://auth.example.test",
             authorization_endpoint="https://auth.example.test/authorize",
             token_endpoint="https://auth.example.test/token",
-            client_id=f"client-{holder.user_id}-{server_id}",
+            client_id=client_id or f"client-{holder.user_id}-{server_id}",
             redirect_uri="https://xagent.example.test/callback",
             lookup_hash=f"client-{holder.user_id}-{server_id}",
         )
@@ -843,6 +851,8 @@ def _seed_grant(
                 resource=resource or _canonical_resource(CONNECTOR_URL),
                 scope=scope,
                 access_token="encrypted",
+                refresh_token=refresh_token,
+                expires_at=expires_at,
                 status=status,
             )
         )
@@ -878,7 +888,11 @@ def _authorization(holder: Holder, server_id: int) -> dict | None:
 
 
 def _assert_authorization(body: dict | None, kind: str, status: str) -> None:
-    assert body == {"kind": kind, "status": status, "message": AUTHORIZATION_MESSAGE}
+    message = {
+        "authorized": None,
+        "configuration_error": CONFIGURATION_ERROR_MESSAGE,
+    }.get(status, AUTHORIZATION_MESSAGE)
+    assert body == {"kind": kind, "status": status, "message": message}
 
 
 def _own_oauth(holder: Holder, **columns: Any) -> int:
@@ -1020,6 +1034,62 @@ def _cell_team_row_unparseable_issuer(bob, carol):
     return bob, server_id, "mcp_oauth", "configuration_error"
 
 
+def _cell_own_grant_disabled_link(bob, carol):
+    # The grant counts through the holder's own link even when it is disabled.
+    server_id = _own_oauth(bob, is_active=False)
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_own_grant_scope_short(bob, carol):
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id, scope="read")
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_own_grant_other_client_id(bob, carol):
+    server_id = _own_oauth(bob, auth={**OAUTH_AUTH, "client_id": "configured"})
+    _seed_grant(bob, server_id, client_id="other")
+    return bob, server_id, "mcp_oauth", "not_authorized"
+
+
+def _cell_own_grant_sse(bob, carol):
+    server_id = _own_oauth(bob, transport="sse")
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_own_grant_websocket(bob, carol):
+    server_id = _own_oauth(bob, transport="websocket")
+    _seed_grant(bob, server_id)
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_own_grant_expired_no_refresh(bob, carol):
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id, expires_at=_AN_HOUR_AGO)
+    return bob, server_id, "mcp_oauth", "needs_reconnect"
+
+
+def _cell_own_grant_expired_with_refresh(bob, carol):
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id, expires_at=_AN_HOUR_AGO, refresh_token="encrypted")
+    return bob, server_id, "mcp_oauth", "authorized"
+
+
+def _cell_catalog_app_unresolved(bob, carol):
+    server_id = _seed(
+        "missing-app",
+        owner=bob,
+        transport="oauth",
+        url=None,
+        auth={"app_id": "missing-app"},
+    )
+    return bob, server_id, "builtin_oauth", "configuration_error"
+
+
+_AN_HOUR_AGO = datetime.now(timezone.utc) - timedelta(hours=1)
+
 _AUTHORIZATION_CELLS = {
     "own_grant": _cell_own_grant,
     "own_no_grant": _cell_own_no_grant,
@@ -1038,12 +1108,19 @@ _AUTHORIZATION_CELLS = {
     "mcp_oauth_on_stdio": _cell_mcp_oauth_on_stdio,
     "own_unparseable_resource": _cell_own_unparseable_resource,
     "team_row_unparseable_issuer": _cell_team_row_unparseable_issuer,
+    "own_grant_disabled_link": _cell_own_grant_disabled_link,
+    "own_grant_scope_short": _cell_own_grant_scope_short,
+    "own_grant_other_client_id": _cell_own_grant_other_client_id,
+    "own_grant_sse": _cell_own_grant_sse,
+    "own_grant_websocket": _cell_own_grant_websocket,
+    "own_grant_expired_no_refresh": _cell_own_grant_expired_no_refresh,
+    "own_grant_expired_with_refresh": _cell_own_grant_expired_with_refresh,
+    "catalog_app_unresolved": _cell_catalog_app_unresolved,
 }
 
 
 @pytest.mark.parametrize("cell", list(_AUTHORIZATION_CELLS))
 def test_authorization_projection(bob, carol, cell):
-    assert len(_AUTHORIZATION_CELLS) == 17
     holder, server_id, kind, status = _AUTHORIZATION_CELLS[cell](bob, carol)
 
     body = _authorization(holder, server_id)
@@ -1054,14 +1131,32 @@ def test_authorization_projection(bob, carol, cell):
         _assert_authorization(body, kind, status)
 
 
+def _is_selector_read(statement: str) -> bool:
+    """The grant selector's query, not the read of the holder's grant server ids."""
+    return "mcp_oauth_grants" in statement and "mcp_oauth_clients" in statement
+
+
+def _is_grant_id_set_read(statement: str) -> bool:
+    """The read of the server ids that hold an active grant for the holder."""
+    return "mcp_oauth_grants" in statement and "mcp_oauth_clients" not in statement
+
+
+@pytest.mark.parametrize(
+    "is_failing_read",
+    [_is_selector_read, _is_grant_id_set_read],
+    ids=["selector", "id_set"],
+)
+@pytest.mark.parametrize("access", ["own", "team"])
 @pytest.mark.parametrize("route", ["list", "detail"])
-def test_authorization_read_failure_fails_the_whole_response(bob, carol, route):
-    server_id = _team_oauth(carol, bob)
+def test_authorization_read_failure_fails_the_whole_response(
+    bob, carol, route, access, is_failing_read
+):
+    server_id = _own_oauth(bob) if access == "own" else _team_oauth(carol, bob)
     _seed_grant(bob, server_id)
     engine = get_engine()
 
     def fail_grant_read(conn, cursor, statement, parameters, context, executemany):
-        if "mcp_oauth_grants" in statement:
+        if is_failing_read(statement):
             raise OperationalError(statement, parameters, Exception("boom"))
 
     sa.event.listen(engine, "before_cursor_execute", fail_grant_read)
@@ -1107,3 +1202,51 @@ def test_an_unparseable_oauth_address_does_not_fail_the_list(bob, carol, caplog)
         "error=ValueError"
     ]
     assert not any("[::1" in message for message in warnings)
+
+
+def test_authorization_value_error_from_the_grant_read_propagates(bob):
+    server_id = _own_oauth(bob)
+    _seed_grant(bob, server_id)
+    engine = get_engine()
+
+    def fail_grant_read(conn, cursor, statement, parameters, context, executemany):
+        if _is_selector_read(statement):
+            raise ValueError("bad stored value")
+
+    sa.event.listen(engine, "before_cursor_execute", fail_grant_read)
+    try:
+        resp = _get_one(bob, server_id)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", fail_grant_read)
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "internal_error"
+    assert "bad stored value" not in resp.text
+
+
+def test_authorization_reads_grants_once_and_skips_rows_without_one(bob, carol):
+    for index in range(2):
+        _seed(f"no-grant-{index}", owner=bob, auth=OAUTH_AUTH)
+    team_id = _team_oauth(carol, bob)
+    _seed_grant(bob, team_id)
+    engine = get_engine()
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", record)
+    try:
+        rows = _list(bob)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", record)
+
+    assert {row["authorization"]["status"] for row in rows} == {
+        "authorized",
+        "not_authorized",
+    }
+    # One read of the holder's grant server ids, and one selector read for the
+    # team row that has a grant.
+    assert sum("mcp_oauth_grants" in s for s in statements) == 2
+    # The selector gets the row's URL, so it never reads it again.
+    assert not any(s.lstrip().startswith("SELECT mcp_servers.url") for s in statements)

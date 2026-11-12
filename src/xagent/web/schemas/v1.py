@@ -459,13 +459,20 @@ class V1McpServerAuthorization(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "'authorized', 'not_authorized', 'needs_reconnect' (platform app "
-            "connections only) or 'configuration_error' (the connector's "
-            "OAuth settings are unusable)."
+            "'authorized', 'not_authorized', 'needs_reconnect' (an "
+            "authorization is stored but has expired or expires within five "
+            "minutes and cannot be refreshed, or a platform app connection "
+            "needs reconnecting) or "
+            "'configuration_error' (the connector's OAuth settings are "
+            "unusable, or its platform app cannot be resolved)."
         ),
     )
-    message: str = Field(
-        ..., description="Where to complete authorization; an API key cannot."
+    message: Optional[str] = Field(
+        None,
+        description=(
+            "What the key holder can do next; null when nothing is needed. "
+            "An API key cannot complete authorization."
+        ),
     )
 
 
@@ -552,8 +559,11 @@ class V1McpServer(BaseModel):
             "unless `auth.type` is `mcp_oauth` on an `sse`, `streamable_http` "
             "or `websocket` transport, or the transport is `oauth`. "
             "'authorized' means a "
-            "usable authorization is stored, not that its token can still be "
-            "refreshed. For a connector seen only through a team it reports "
+            "stored authorization the runtime would use: valid for more than "
+            "five minutes, or holding a refresh token; whether a refresh "
+            "succeeds is not "
+            "checked. A token supplied by an OAuth token resolver hook is not "
+            "reflected. For a connector seen only through a team it reports "
             "the key holder's own authorization; the web route "
             "`/api/mcp/{server_id}/oauth/status` answers 404 for such a "
             "holder because it requires the holder's own enabled link."

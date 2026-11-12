@@ -85,8 +85,8 @@ CHECKS: dict[str, tuple[str, ...]] = {
     ),
     "teams": (
         "teams.auth_status",
-        "teams.current_user",
         "teams.list_teams",
+        "teams.list_chats",
         "teams.list_seed_channels",
         "teams.read_seed_message",
     ),
@@ -204,6 +204,8 @@ class Tenant:
         self.messages: dict[str, list[dict[str, Any]]] = {
             CHANNEL_ID: [self.message(MESSAGE_ID, MESSAGE_TEXT)]
         }
+        # The seed cannot hold a chat, so the account's chat list is empty.
+        self.chats: list[dict[str, Any]] = []
         self.requests: list[tuple[str, str]] = []
 
     @staticmethod
@@ -257,6 +259,16 @@ class Tenant:
                 },
                 url=url,
             )
+        if path == "/me/chats":
+            # Graph takes $top from 1 to 50 here and answers 400 otherwise.
+            top = (kwargs.get("params") or {}).get("$top")
+            if not isinstance(top, int) or not 1 <= top <= 50:
+                return _response(
+                    400,
+                    payload={"error": {"code": "BadRequest", "message": "$top"}},
+                    url=url,
+                )
+            return _response(200, payload={"value": self.chats}, url=url)
         try:
             answer = self.answer(path)
         except LookupError:
@@ -483,6 +495,25 @@ async def test_every_check_passes_on_the_seeded_tenant_and_only_reads(
         tool for app_id in CHECKS for tool in CONNECTOR_CHECKS[app_id].checked_tools()
     }
     assert {method for method, _ in tenant.requests} == {"GET"}
+    # auth_status already reads /me; the second /me read is exempt (#3569).
+    assert "get_current_user" not in _called(tools)
+
+
+@pytest.mark.parametrize("chats", [0, 2])
+async def test_the_chat_list_is_checked_for_its_shape_alone(
+    tenant: Tenant, chats: int
+) -> None:
+    """The seed cannot hold a chat, so an empty list passes, and so does an
+    account that has chats."""
+    tenant.chats = [
+        {"id": f"19:chat-{index}@thread.v2", "chatType": "oneOnOne", "topic": None}
+        for index in range(chats)
+    ]
+
+    outcomes = _outcomes(await _run())
+
+    assert outcomes["teams.list_chats"] == PASS
+    assert ("GET", "/me/chats") in tenant.requests
 
 
 async def test_a_revoked_token_fails_every_check(tenant: Tenant) -> None:
@@ -564,13 +595,21 @@ def _profile_without_id(tenant: Tenant) -> None:
 
 
 def _profile_without_principal_name(tenant: Tenant) -> None:
-    # auth_status reports the profile's fields by name, so only the raw
-    # profile reads can miss one.
+    # auth_status reports the profile's fields by name, so only OneDrive's
+    # raw profile read can miss one.
     del tenant.me["userPrincipalName"]
 
 
 def _team_without_name(tenant: Tenant) -> None:
     del tenant.teams[0]["displayName"]
+
+
+def _chat_without_id(tenant: Tenant) -> None:
+    tenant.chats = [{"chatType": "group", "topic": "no id"}]
+
+
+def _chats_not_a_list(tenant: Tenant) -> None:
+    tenant.chats = {"id": "19:chat@thread.v2"}  # type: ignore[assignment]
 
 
 def _no_teams(tenant: Tenant) -> None:
@@ -655,13 +694,15 @@ def _speaker_notes(tenant: Tenant) -> None:
         (_renamed_note, {"onedrive.get_seed_file"}),
         (
             _profile_without_id,
-            {"onedrive.current_user", "teams.auth_status", "teams.current_user"},
+            {"onedrive.current_user", "teams.auth_status"},
         ),
         (
             _profile_without_principal_name,
-            {"onedrive.current_user", "teams.current_user"},
+            {"onedrive.current_user"},
         ),
         (_team_without_name, {"teams.list_teams"}),
+        (_chat_without_id, {"teams.list_chats"}),
+        (_chats_not_a_list, {"teams.list_chats"}),
         (_no_teams, {"teams.list_teams"}),
         (_other_channel, {"teams.list_seed_channels"}),
         (_extra_channel, {"teams.list_seed_channels"}),

@@ -298,6 +298,8 @@ def _jira_checks() -> ConnectorChecks:
             ),
         ),
     )
+
+
 def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
     """Google Drive's write check and sweep (#3567), sharing one tenant pin.
 

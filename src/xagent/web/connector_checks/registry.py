@@ -15,6 +15,7 @@ from collections.abc import Mapping
 
 from ..connector_probes import get_connector_probe, get_unprobeable_reason
 from .declarations import (
+    Assertion,
     ConnectorChecks,
     Contains,
     CreatedRef,
@@ -184,6 +185,39 @@ def _declared_l3(app_id: str) -> ReadCheck:
     if not isinstance(check, ReadCheck):
         raise DeclarationError(f"{app_id} declares no L3 read check")
     return check
+
+
+def _xero_list_check(list_field: str, tool: str, *, paged: bool) -> ReadCheck:
+    """A structural read check on one of Xero's list tools that take no id.
+
+    Every Xero list answers ``{status, <list_field>: [...], returned}`` through
+    ``_unpaged_response`` (with ``total_count``) or ``_paged_response`` (with
+    ``page``, ``page_size`` and ``has_more``). The items are ``_compact`` views
+    that drop an empty field, so only the list and its paging facts are
+    asserted, never an item's keys.
+    """
+    if paged:
+        facts: tuple[Assertion, ...] = (
+            HasKeys((), (list_field, "page", "page_size", "returned", "has_more")),
+            IsType(("has_more",), "boolean"),
+            Length((list_field,), max=1),
+        )
+    else:
+        facts = (
+            HasKeys((), (list_field, "total_count", "returned")),
+            IsType(("total_count",), "number"),
+        )
+    return ReadCheck(
+        f"xero.{tool}",
+        tool,
+        {"page_size": 1} if paged else {},
+        assertions=(
+            StatusSuccess(),
+            *facts,
+            IsType((list_field,), "array"),
+            IsType(("returned",), "number"),
+        ),
+    )
 
 
 def _jira_checks() -> ConnectorChecks:
@@ -1427,6 +1461,262 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("zoom_create_meeting",),
         ),
     ),
+    "linear": ConnectorChecks(
+        "linear",
+        reads=(
+            _declared_l3("linear"),
+            ReadCheck(
+                "linear.list_teams",
+                "linear_list_teams",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("teams", "truncated")),
+                    EachHasKeys(("teams",), ("id", "key", "name")),
+                    Length(("teams",), max=1),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "linear.list_projects",
+                "linear_list_projects",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("projects", "truncated")),
+                    EachHasKeys(
+                        ("projects",),
+                        ("id", "name", "status", "progress", "url", "teams"),
+                    ),
+                    Length(("projects",), max=1),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "linear.search_users",
+                "linear_search_users",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("users", "truncated")),
+                    EachHasKeys(("users",), ("id", "name", "email", "active")),
+                    Length(("users",), max=1),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "linear.search_issues",
+                "linear_search_issues",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("issues", "truncated")),
+                    EachHasKeys(
+                        ("issues",),
+                        (
+                            "id",
+                            "identifier",
+                            "title",
+                            "priority",
+                            "url",
+                            "createdAt",
+                            "updatedAt",
+                            "state",
+                            "assignee",
+                            "team",
+                            "project",
+                            "labels",
+                        ),
+                    ),
+                    Length(("issues",), max=1),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "linear_get_issue",
+                "linear_list_comments",
+                "linear_list_labels",
+                "linear_list_workflow_states",
+            ),
+            in_place_edits=("linear_update_issue",),
+            writes_without_cleanup=("linear_create_issue", "linear_add_comment"),
+        ),
+    ),
+    "intercom": ConnectorChecks(
+        "intercom",
+        reads=(
+            _declared_l3("intercom"),
+            ReadCheck(
+                "intercom.list_conversations",
+                "intercom_list_conversations",
+                {"limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        (), ("conversations", "total_count", "has_more", "next_cursor")
+                    ),
+                    EachHasKeys(
+                        ("conversations",),
+                        (
+                            "id",
+                            "state",
+                            "title",
+                            "subject",
+                            "preview",
+                            "created_at",
+                            "updated_at",
+                        ),
+                    ),
+                    Length(("conversations",), max=1),
+                    IsType(("has_more",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "intercom_get_contact",
+                "intercom_get_conversation",
+                "intercom_search_contacts",
+            ),
+            in_place_edits=("intercom_close_conversation",),
+            writes_without_cleanup=(
+                "intercom_add_internal_note",
+                "intercom_reply_to_conversation",
+            ),
+        ),
+    ),
+    "deputy": ConnectorChecks(
+        "deputy",
+        reads=(
+            _declared_l3("deputy"),
+            # The resource is a Deputy object type, not an object id.
+            ReadCheck(
+                "deputy.list_companies",
+                "deputy_list_resource",
+                {"resource": "Company"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("records", "truncated")),
+                    IsType(("records",), "array"),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "deputy.employee_info",
+                "deputy_resource_info",
+                {"resource": "Employee"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("info",)),
+                    IsType(("info",), "object"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=("deputy_get_resource", "deputy_query_resource"),
+            in_place_edits=("deputy_update_resource",),
+            writes_without_cleanup=("deputy_add_employee", "deputy_create_resource"),
+        ),
+    ),
+    "employment-hero": ConnectorChecks(
+        "employment-hero",
+        reads=(
+            _declared_l3("employment-hero"),
+            # The list's own `data` envelope, as Employment Hero documents it:
+            # {"items": [...], ...}. The server has not run against a live
+            # account, so a live answer that differs fails here first.
+            ReadCheck(
+                "employment-hero.list_organisations",
+                "employment_hero_list_organisations",
+                {"item_per_page": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("organisations",)),
+                    IsType(("organisations",), "object"),
+                    HasKeys(("organisations",), ("items",)),
+                    IsType(("organisations", "items"), "array"),
+                    Length(("organisations", "items"), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "employment_hero_get_employee",
+                "employment_hero_get_leave_balances",
+                "employment_hero_list_employees",
+                "employment_hero_list_leave_categories",
+                "employment_hero_list_leave_requests",
+                "employment_hero_list_team_employees",
+                "employment_hero_list_teams",
+                "employment_hero_list_timesheet_entries",
+            ),
+            in_place_edits=("employment_hero_approve_leave_request",),
+            writes_without_cleanup=("employment_hero_create_leave_request",),
+        ),
+    ),
+    "xero": ConnectorChecks(
+        "xero",
+        reads=(
+            _declared_l3("xero"),
+            _xero_list_check("accounts", "list_accounts", paged=False),
+            _xero_list_check("contact_groups", "list_contact_groups", paged=False),
+            _xero_list_check("items", "list_items", paged=False),
+            _xero_list_check("tax_rates", "list_tax_rates", paged=False),
+            _xero_list_check(
+                "tracking_categories", "list_tracking_categories", paged=False
+            ),
+            _xero_list_check("contacts", "list_contacts", paged=True),
+            _xero_list_check("invoices", "list_invoices", paged=True),
+            _xero_list_check("credit_notes", "list_credit_notes", paged=True),
+            _xero_list_check("bank_transactions", "list_bank_transactions", paged=True),
+            _xero_list_check("payments", "list_payments", paged=True),
+            _xero_list_check("quotes", "list_quotes", paged=True),
+            _xero_list_check("manual_journals", "list_manual_journals", paged=True),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "list_aged_payables_by_contact",
+                "list_aged_receivables_by_contact",
+                "list_invoice_history",
+                "list_overdue_invoices",
+                "list_paid_invoices",
+                "list_profit_and_loss",
+                "list_receivables_ageing",
+                "list_report_balance_sheet",
+                "list_trial_balance",
+            ),
+            in_place_edits=(
+                "update_bank_transaction",
+                "update_contact",
+                "update_credit_note",
+                "update_invoice",
+                "update_item",
+                "update_manual_journal",
+                "update_quote",
+                "update_tracking_category",
+                "update_tracking_options",
+            ),
+            writes_without_cleanup=(
+                "create_bank_transaction",
+                "create_contact",
+                "create_credit_note",
+                "create_invoice",
+                "create_item",
+                "create_manual_journal",
+                "create_payment",
+                "create_quote",
+                "create_tracking_category",
+                "create_tracking_options",
+            ),
+        ),
+    ),
 }
 
 
@@ -1440,8 +1730,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "aws",
         "chartmogul",
         "chrome-devtools",
-        "deputy",
-        "employment-hero",
         "facebook",
         "fireflies",
         "freshdesk",
@@ -1451,8 +1739,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "granola",
         "hubspot",
         "instagram",
-        "intercom",
-        "linear",
         "linkedin",
         "magento",
         "meta-ads",
@@ -1464,7 +1750,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "shopify",
         "stripe",
         "whatsapp",
-        "xero",
     }
 )
 

@@ -16,9 +16,11 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     Optional,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -93,8 +95,10 @@ def _ensure_table(conn: Any) -> None:
             raise
 
 
-def _read_row(collection_name: str) -> Optional[Dict[str, Any]]:
-    conn = get_metadata_store().get_raw_connection()
+def _read_row(
+    collection_name: str, store: Optional[Any] = None
+) -> Optional[Dict[str, Any]]:
+    conn = (store or get_metadata_store()).get_raw_connection()
     if MIGRATION_TABLE not in list_table_names(conn):
         return None
     table = conn.open_table(MIGRATION_TABLE)
@@ -106,9 +110,11 @@ def _read_row(collection_name: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def read_migration_state(collection_name: str) -> CollectionMigrationState:
+def read_migration_state(
+    collection_name: str, store: Optional[Any] = None
+) -> CollectionMigrationState:
     """Read the collection's state; missing table or row means idle."""
-    row = _read_row(collection_name)
+    row = _read_row(collection_name, store)
     if row is None:
         return CollectionMigrationState()
     return CollectionMigrationState(
@@ -178,9 +184,9 @@ def _is_admitted(collection: str) -> bool:
 
 
 @contextmanager
-def pending_collection(collection: str) -> Iterator[None]:
-    """Open a scope whose first guard call decides admission for the collection."""
-    token = _PENDING.set(_PENDING.get() | {collection})
+def pending_collection(*collections: str) -> Iterator[None]:
+    """Open a scope whose first guard call per collection decides its admission."""
+    token = _PENDING.set(_PENDING.get() | set(collections))
     admitted_token = _ADMITTED.set(_ADMITTED.get())
     try:
         yield
@@ -214,20 +220,29 @@ async def admitted_context_async(collection: str) -> Context:
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 S = TypeVar("S", bound=Callable[..., Any])
+Names = Union[str, Iterable[str], None]
+
+
+def _as_names(value: Names) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
 
 
 def admits_collection(
-    get_name: Callable[..., Optional[str]],
+    get_name: Callable[..., Names],
 ) -> Callable[[F], F]:
     """Open a pending admission for the handler; its first guard call checks."""
 
     def decorate(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            name = get_name(*args, **kwargs)
-            if name is None:
+            names = _as_names(get_name(*args, **kwargs))
+            if not names:
                 return await func(*args, **kwargs)
-            with pending_collection(name):
+            with pending_collection(*names):
                 return await func(*args, **kwargs)
 
         return cast(F, wrapper)
@@ -274,20 +289,24 @@ def _raise_if_frozen(collection_name: str, state: CollectionMigrationState) -> N
         )
 
 
-def ensure_collection_writable(collection_name: str) -> None:
+def ensure_collection_writable(
+    collection_name: str, *, store: Optional[Any] = None
+) -> None:
     """Raise before a write when the collection is frozen for migration."""
     if _is_admitted(collection_name):
         return
-    _raise_if_frozen(collection_name, read_migration_state(collection_name))
+    _raise_if_frozen(collection_name, read_migration_state(collection_name, store))
     if collection_name in _PENDING.get():
         _ADMITTED.set(_ADMITTED.get() | {collection_name})
 
 
-async def ensure_collection_writable_async(collection_name: str) -> None:
+async def ensure_collection_writable_async(
+    collection_name: str, *, store: Optional[Any] = None
+) -> None:
     """Async guard: runs the blocking state read off the event loop."""
     if _is_admitted(collection_name):
         return
-    state = await asyncio.to_thread(read_migration_state, collection_name)
+    state = await asyncio.to_thread(read_migration_state, collection_name, store)
     _raise_if_frozen(collection_name, state)
     if collection_name in _PENDING.get():
         _ADMITTED.set(_ADMITTED.get() | {collection_name})

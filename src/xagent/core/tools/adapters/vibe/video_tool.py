@@ -66,7 +66,7 @@ class VideoGenerationTool(VideoGenerationToolCore):
             VideoGenerationFunctionTool(
                 self.list_available_models,
                 name="list_video_models",
-                description="List all available video generation models, including model ID, availability status, and detailed description information.",
+                description="List available video models and their live Lightning capabilities. For each model, supports_lightning is true, false, or null when unknown. lightning_inference_steps is the loaded Lightning adapter's step count.",
             ),
         ]
 

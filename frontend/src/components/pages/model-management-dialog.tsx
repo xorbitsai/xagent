@@ -608,6 +608,9 @@ export function ModelManagementDialog({
       const models = catalog.models
       // Strip 'models/' prefix from Gemini models returned by the SDK API
       const cleanedModels = models.map(model => {
+        if (formData.model_provider === 'xinference' && category === 'video' && model.model_uid) {
+          return { ...model, id: model.model_uid }
+        }
         if (model.id && model.id.startsWith('models/')) {
           return { ...model, id: model.id.substring(7) }
         }

@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,10 +9,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from xagent.config import get_max_upload_size_bytes
+from xagent.core.model.video import xinference as xinference_video
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BaseVideoModel
 from xagent.core.model.video.xinference import XinferenceVideoModel
-from xagent.core.tools.adapters.vibe.video_tool import VideoGenerationFunctionTool
+from xagent.core.tools.adapters.vibe.video_tool import (
+    VideoGenerationFunctionTool,
+    create_video_tool,
+)
 from xagent.core.tools.core.video_tool import VideoGenerationToolCore
 
 
@@ -279,6 +284,128 @@ async def test_generate_video_keeps_workspace_image_ref_for_xinference(mock_work
     assert generate_kwargs["allowed_local_media_roots"] == [
         mock_workspace.workspace_dir
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_video_models_reports_lightning_by_running_uid(
+    monkeypatch, mock_workspace
+):
+    catalog = AsyncMock(
+        return_value={
+            "custom/fast": {"model_name": "MiniMax-H3", "lightning_inference_steps": 8},
+            "custom/four": {"model_name": "MiniMax-H3", "lightning_inference_steps": 4},
+            "custom/base": {"model_name": "MiniMax-H3"},
+        }
+    )
+    monkeypatch.setattr(xinference_video, "fetch_running_xinference_models", catalog)
+    models: dict[str, BaseVideoModel] = {
+        name: XinferenceVideoModel(model_name="MiniMax-H3", model_uid=f"custom/{name}")
+        for name in ("fast", "four", "base", "missing")
+    }
+    models["other"] = ArkVideoModel(model_name="seedance")
+    _, list_tool = create_video_tool(models, workspace=mock_workspace)
+
+    result = await list_tool.run_json_async({})
+
+    assert result["success"] is True
+    assert {
+        model["model_id"]: (
+            model["supports_lightning"],
+            model["lightning_inference_steps"],
+        )
+        for model in result["models"]
+    } == {
+        "fast": (True, 8),
+        "four": (True, 4),
+        "base": (False, None),
+        "missing": (None, None),
+        "other": (False, None),
+    }
+    catalog.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options, path_suffix, expected_mode",
+    [
+        ({}, "", None),
+        ({"use_lightning": True}, "", True),
+        (
+            {"use_lightning": False, "input_reference": "data:image/png;base64,aW1n"},
+            "/image",
+            False,
+        ),
+        (
+            {
+                "use_lightning_bool": False,
+                "first_frame_image_url": "data:image/png;base64,aW1n",
+                "last_frame_image_url": "data:image/png;base64,aW1n",
+            },
+            "/flf",
+            False,
+        ),
+    ],
+)
+async def test_generate_video_forwards_lightning_without_overriding_steps(
+    monkeypatch, mock_workspace, options, path_suffix, expected_mode
+):
+    catalog = AsyncMock(return_value={"h3": {"lightning_inference_steps": 8}})
+    monkeypatch.setattr(xinference_video, "fetch_running_xinference_models", catalog)
+    model = XinferenceVideoModel(model_name="MiniMax-H3", model_uid="h3")
+    post = AsyncMock(return_value={"data": [{"b64_json": "dmlkZW8="}]})
+    monkeypatch.setattr(
+        model, "_post_video_form" if path_suffix else "_post_video_json", post
+    )
+    generate_tool, _ = create_video_tool({"h3": model}, workspace=mock_workspace)
+
+    result = await generate_tool.run_json_async(
+        {"prompt": "Animate this scene", **options}
+    )
+
+    assert result["success"] is True
+    post.assert_awaited_once()
+    _, path, body = post.await_args.args[:3]
+    assert path == f"/v1/video/generations{path_suffix}"
+    assert body["model"] == "h3"
+    kwargs = json.loads(body["kwargs"])
+    assert "num_inference_steps" not in kwargs
+    if expected_mode is None:
+        assert "use_lightning" not in kwargs
+        catalog.assert_not_awaited()
+    else:
+        assert kwargs["use_lightning"] is expected_mode
+        catalog.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "catalog, error_category",
+    [
+        ({"h3": {"lightning_inference_steps": True}}, "invalid_request"),
+        ({"h3": {}}, "invalid_request"),
+        ({}, "provider_unavailable"),
+    ],
+)
+async def test_generate_video_requires_advertised_lightning_support(
+    monkeypatch, mock_workspace, catalog, error_category
+):
+    monkeypatch.setattr(
+        xinference_video,
+        "fetch_running_xinference_models",
+        AsyncMock(return_value=catalog),
+    )
+    model = XinferenceVideoModel(model_name="h3")
+    generate = AsyncMock()
+    monkeypatch.setattr(model, "generate_video", generate)
+    generate_tool, _ = create_video_tool({"h3": model}, workspace=mock_workspace)
+
+    result = await generate_tool.run_json_async(
+        {"prompt": "Animate this scene", "use_lightning": False}
+    )
+
+    assert result["success"] is False
+    assert result["error_category"] == error_category
+    generate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

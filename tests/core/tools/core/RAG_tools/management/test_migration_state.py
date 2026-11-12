@@ -6,6 +6,7 @@ import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -14,6 +15,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     CrawlResult,
     IngestionResult,
     WebCrawlConfig,
+)
+from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
+from xagent.core.tools.core.RAG_tools.management import (
+    collections as collections_module,
 )
 from xagent.core.tools.core.RAG_tools.management import migration_state as state_module
 from xagent.core.tools.core.RAG_tools.management.migration_state import (
@@ -189,6 +194,19 @@ def test_unfrozen_collection_proceeds_past_guards(
     )
     with pytest.raises(_Reached):
         document_ingestion._process_document_impl("kb", "/tmp/doc.pdf")
+
+    reached_store = {}
+
+    def _store() -> None:
+        reached_store["called"] = True
+        raise _Reached
+
+    monkeypatch.setattr(collections_module, "get_vector_index_store", _store)
+    with pytest.raises(_Reached):
+        collections_module._delete_document_impl(
+            collection="kb", doc_id="doc-1", user_id=1, coordinator=None
+        )
+    assert reached_store["called"]
 
 
 def _migration_names() -> list[str]:
@@ -424,3 +442,239 @@ async def test_run_in_admitted_context_supports_overlapping_workers() -> None:
     finally:
         release.set()
         await holder
+
+
+def test_frozen_collection_blocks_document_delete_before_storage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze()
+
+    def _boom() -> None:
+        raise AssertionError("document delete reached the vector store")
+
+    monkeypatch.setattr(collections_module, "get_vector_index_store", _boom)
+
+    with pytest.raises(CollectionMigratingError):
+        collections_module._delete_document_impl(
+            collection="kb", doc_id="doc-1", user_id=1, coordinator=None
+        )
+
+
+@pytest.mark.asyncio
+async def test_frozen_collection_blocks_collection_delete_and_rename() -> None:
+    _freeze()
+    coordinator = KBCoordinator()
+
+    with pytest.raises(CollectionMigratingError):
+        await coordinator.delete_collection("kb", user_id=None, is_admin=True)
+    with pytest.raises(CollectionMigratingError):
+        await coordinator.rename_collection(
+            "kb", "new-name", user_id=None, is_admin=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_frozen_rename_refuses_before_opening_the_collection() -> None:
+    _freeze()
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(side_effect=AssertionError("collection was opened")),
+    ):
+        with pytest.raises(CollectionMigratingError):
+            await coordinator.rename_collection(
+                "kb", "new-name", user_id=None, is_admin=True
+            )
+
+
+class _FakeCollectionHandle:
+    def list_collection_documents(self, **kwargs: object) -> list[str]:
+        return []
+
+    def delete_collection_data(self, **kwargs: object) -> dict[str, int]:
+        return {"documents": 0}
+
+    def count_documents(self, **kwargs: object) -> int:
+        return 0
+
+    async def delete_collection_config(self, *args: object, **kwargs: object) -> None:
+        return None
+
+    def rename_collection_data(self, *args: object, **kwargs: object) -> list[str]:
+        return []
+
+    def rename_collection_status(self, *args: object, **kwargs: object) -> list[str]:
+        return []
+
+    async def rename_collection_metadata(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+# --- Single admission per operation -----------------------------------------
+
+
+class _RecordingHandle(_FakeCollectionHandle):
+    def __init__(self) -> None:
+        self.renames: list[str] = []
+
+    def rename_collection_data(self, *args: object, **kwargs: object) -> list[str]:
+        self.renames.append("data")
+        return []
+
+    def rename_collection_status(self, *args: object, **kwargs: object) -> list[str]:
+        self.renames.append("status")
+        return []
+
+    async def rename_collection_metadata(self, *args: object, **kwargs: object) -> None:
+        self.renames.append("metadata")
+
+
+@pytest.mark.asyncio
+async def test_rename_inside_admission_completes_after_a_freeze() -> None:
+    write_migration_state("kb", CollectionMigrationState(state=IDLE))
+    coordinator = KBCoordinator()
+    handle = _RecordingHandle()
+
+    with patch.object(
+        coordinator, "open_collection", new=AsyncMock(return_value=handle)
+    ):
+        async with admitted_async("kb"):
+            _freeze("kb")
+            warnings = await coordinator.rename_collection(
+                "kb", "kb-new", user_id=None, is_admin=True
+            )
+
+    assert warnings == []
+    assert handle.renames == ["data", "status", "metadata"]
+    # Rename never moves the row; the migration job owns its lifecycle.
+    assert read_migration_state("kb").state == FROZEN
+    assert read_migration_state("kb-new").state == IDLE
+
+
+@pytest.mark.asyncio
+async def test_direct_coordinator_rename_still_checks_outside_a_scope() -> None:
+    _freeze("kb")
+    coordinator = KBCoordinator()
+
+    with pytest.raises(CollectionMigratingError):
+        await coordinator.rename_collection("kb", "kb-new", user_id=None, is_admin=True)
+
+
+class _TenantHandle(_RecordingHandle):
+    def list_collection_documents(self, **kwargs: object) -> list[str]:
+        return ["doc-a"]
+
+    def delete_documents_data(
+        self, doc_ids: list[str], **kwargs: object
+    ) -> dict[str, int]:
+        return {"documents": len(doc_ids)}
+
+
+@pytest.mark.asyncio
+async def test_delete_and_rename_leave_the_migration_row_untouched() -> None:
+    write_migration_state("kb", CollectionMigrationState(state=IDLE))
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(return_value=_TenantHandle()),
+    ):
+        async with admitted_async("kb"):
+            _freeze("kb")
+            await coordinator.delete_collection("kb", user_id=7, is_admin=False)
+            await coordinator.rename_collection(
+                "kb", "kb-new", user_id=7, is_admin=False
+            )
+
+    assert "kb" in _migration_names()
+    assert read_migration_state("kb").state == FROZEN
+    assert read_migration_state("kb-new").state == IDLE
+
+
+@pytest.mark.asyncio
+async def test_direct_coordinator_rename_checks_the_target_name() -> None:
+    _freeze("kb-target")
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(side_effect=AssertionError("collection was opened")),
+    ):
+        with pytest.raises(CollectionMigratingError):
+            await coordinator.rename_collection(
+                "kb", "kb-target", user_id=1, is_admin=False
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delete", "rename"])
+async def test_coordinator_checks_the_canonical_source_name(operation: str) -> None:
+    _freeze("kb")
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(side_effect=AssertionError("collection was opened")),
+    ):
+        with pytest.raises(CollectionMigratingError):
+            if operation == "delete":
+                await coordinator.delete_collection("  kb  ", None, True)
+            else:
+                await coordinator.rename_collection("  kb  ", "new-name", None, True)
+
+
+def _store_on(path: Path) -> SimpleNamespace:
+    import lancedb
+
+    conn = lancedb.connect(str(path))
+    return SimpleNamespace(
+        get_raw_connection=lambda: conn, get_collection=AsyncMock(return_value=None)
+    )
+
+
+@pytest.mark.asyncio
+async def test_injected_coordinator_reads_the_freeze_from_its_own_store(
+    tmp_path: Path,
+) -> None:
+    from unittest.mock import MagicMock
+
+    store = _store_on(tmp_path / "injected")
+    state_module._merge_row(
+        store.get_raw_connection(),
+        {"name": "kb-b", **CollectionMigrationState(state=FROZEN).to_row()},
+    )
+    _freeze("kb-a")
+    shim = MagicMock()
+    shim.get_metadata_store.return_value = store
+    coordinator = KBCoordinator(storage_shim=shim)
+
+    with patch.object(
+        coordinator, "open_collection", new=AsyncMock(return_value=_RecordingHandle())
+    ):
+        with pytest.raises(CollectionMigratingError):
+            await coordinator.rename_collection("src", "kb-b", None, True)
+        with pytest.raises(CollectionMigratingError):
+            await coordinator.delete_collection("kb-b", None, True)
+        # Frozen only in the ambient store: not this coordinator's concern.
+        await coordinator.rename_collection("src", "kb-a", None, True)
+
+
+@pytest.mark.asyncio
+async def test_direct_coordinator_rename_checks_the_stripped_target_name() -> None:
+    _freeze("kb-target")
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(side_effect=AssertionError("collection was opened")),
+    ):
+        with pytest.raises(CollectionMigratingError):
+            await coordinator.rename_collection(
+                "kb", " kb-target ", user_id=1, is_admin=False
+            )

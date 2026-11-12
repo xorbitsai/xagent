@@ -13,6 +13,7 @@ import os
 import shutil
 import uuid
 from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, Any, Dict, Optional, TypeAlias
 from urllib import parse
@@ -22,6 +23,7 @@ from pydantic import Field
 
 from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
+from ...model.video.adapter import get_video_generation_capabilities
 from ...model.video.ark import ArkVideoModel, seedance_duration_limits
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
@@ -31,7 +33,12 @@ from ...utils.media_download import (
     resolve_workspace_media_path,
 )
 from ...workspace import TaskWorkspace
-from .media_errors import INVALID_REQUEST, media_error_fields, media_failure_fields
+from .media_errors import (
+    INVALID_REQUEST,
+    PROVIDER_UNAVAILABLE,
+    media_error_fields,
+    media_failure_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +60,7 @@ _VIDEO_TOOL_ARG_KEYS = {
     "duration",
     "resolution",
     "generate_audio",
+    "use_lightning",
     "watermark",
     "return_last_frame",
     "first_frame_image_url",
@@ -175,7 +183,7 @@ When given a user request, rewrite and enrich the prompt into a concise professi
 - Describe the subject, action, camera motion, lighting, visual style, environment, and mood.
 - Use concrete temporal language for motion and scene progression.
 - Preserve user-specified text only when the user explicitly asks for visible text.
-- Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.
+- Prefer the default model marked with ⭐[DEFAULT]. Specify model_id when the user requests a different model or the default lacks the requested Lightning capability.
 
 Available models (⭐[DEFAULT] marks the configured default model):
 {}
@@ -191,6 +199,7 @@ Parameters:
 - duration (optional): legacy alias for seconds.
 - resolution (optional): provider alias such as "480p", "720p", or "1080p"; converted with ratio when size is omitted.
 - generate_audio (optional): whether to generate synchronized audio. Defaults to true when supported.
+- use_lightning (optional): omit for ordinary requests. Xinference uses a loaded Lightning adapter by default. Call list_video_models first for an explicit Lightning choice or when the user clearly prioritizes fidelity over speed. If supports_lightning=true, set false for the fidelity-over-speed preference or to disable Lightning. Set true for an explicit Lightning request, matching the requested step count if given.
 - watermark (optional): whether to include provider watermark. Defaults to true when supported.
 - return_last_frame (optional): ask the provider to return the last frame URL when supported.
 - first_frame_image_url / last_frame_image_url (optional): Seedance-style first/last-frame control.
@@ -669,6 +678,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         poll_interval: float = 30.0,
         timeout: Optional[float] = None,
         model_id: Optional[str] = None,
+        use_lightning: Optional[bool] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         actual_model_id = model_id or "default"
@@ -676,6 +686,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         try:
             kwargs = self._normalize_extra_kwargs(kwargs)
             kwargs.pop("allowed_local_media_roots", None)
+            use_lightning = kwargs.pop("use_lightning", use_lightning)
             if not _has_value(ratio):
                 ratio = None
             explicit_ratio = ratio is not None
@@ -731,6 +742,27 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "return_last_frame": return_last_frame,
                 "poll_interval": poll_interval,
             }
+            if use_lightning is not None:
+                capabilities = await get_video_generation_capabilities(
+                    {actual_model_id: video_model}
+                )
+                supported = capabilities[actual_model_id].supports_lightning
+                if supported is None:
+                    return {
+                        "success": False,
+                        "error_category": PROVIDER_UNAVAILABLE,
+                        "error": "Could not verify whether the selected model supports Lightning.",
+                        "video_path": None,
+                    }
+                if not supported:
+                    return {
+                        "success": False,
+                        "error_category": INVALID_REQUEST,
+                        "error": "The selected model does not advertise a Lightning switch.",
+                        "video_path": None,
+                    }
+                generate_params["use_lightning"] = use_lightning
+
             effective_seconds = self._normalize_seconds(
                 seconds if seconds is not None else duration
             )
@@ -974,8 +1006,9 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "video_path": None,
             }
 
-    def list_available_models(self) -> Dict[str, Any]:
+    async def list_available_models(self) -> Dict[str, Any]:
         try:
+            capabilities = await get_video_generation_capabilities(self._video_models)
             models_info = []
             for model_id, model in self._video_models.items():
                 models_info.append(
@@ -984,6 +1017,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                         "available": True,
                         "abilities": getattr(model, "abilities", []),
                         "description": self._model_descriptions.get(model_id, ""),
+                        **asdict(capabilities[model_id]),
                     }
                 )
 

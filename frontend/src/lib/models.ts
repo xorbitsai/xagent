@@ -472,6 +472,7 @@ export interface Provider {
 
 export interface ProviderModel {
   id: string;
+  model_uid?: string;
   object: string;
   created: number;
   owned_by: string;

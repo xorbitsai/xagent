@@ -4,8 +4,9 @@ import asyncio
 import base64
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Self
 from urllib import parse
 from urllib.request import url2pathname
 
@@ -17,12 +18,55 @@ from ...utils.public_download import download_public_input
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
-from .base import BaseVideoModel, BilledVideoTaskError
+from .base import BaseVideoModel, BilledVideoTaskError, VideoGenerationCapabilities
 
 logger = logging.getLogger(__name__)
 # "No response body yet", distinct from anything a server could return.
 _NOT_RECEIVED: Any = object()
 REFERENCE_MEDIA_FETCH_TIMEOUT = 60.0
+
+
+async def fetch_running_xinference_models(
+    base_url: str, api_key: str | None, *, timeout: float = 30.0
+) -> dict[str, dict[str, Any]]:
+    """Read the live catalog keyed by the exact UID used for generation."""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with create_public_model_aiohttp_session(
+        timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as session:
+        async with session.get(
+            f"{base_url.rstrip('/')}/v1/models", headers=headers
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json()
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    return {
+        item["id"]: item
+        for item in entries
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    }
+
+
+def lightning_inference_steps(model_info: dict[str, Any]) -> int | None:
+    """Xinference advertises a step count when the instance supports the switch."""
+    steps = model_info.get("lightning_inference_steps")
+    if type(steps) is int and steps > 0:
+        return steps
+    return None
+
+
+async def _load_capability_catalog(
+    base_url: str, api_key: str | None
+) -> dict[str, dict[str, Any]]:
+    try:
+        return await fetch_running_xinference_models(base_url, api_key, timeout=10)
+    except Exception as exc:
+        logger.warning(
+            "Could not read Xinference video capabilities: %s", type(exc).__name__
+        )
+        return {}
 
 
 def _to_plain_data(value: Any) -> Any:
@@ -102,6 +146,31 @@ def _size_from_resolution_ratio(
 
 class XinferenceVideoModel(BaseVideoModel):
     """Xinference video model client using OpenAI-compatible video endpoints."""
+
+    @classmethod
+    async def discover_generation_capabilities(
+        cls, models: Mapping[str, Self]
+    ) -> dict[str, VideoGenerationCapabilities]:
+        endpoints = {(model.base_url, model.api_key) for model in models.values()}
+        catalogs = await asyncio.gather(
+            *(_load_capability_catalog(*endpoint) for endpoint in endpoints)
+        )
+        catalogs_by_endpoint = dict(zip(endpoints, catalogs, strict=True))
+        capabilities = {}
+        for model_id, model in models.items():
+            model_info = catalogs_by_endpoint[model.base_url, model.api_key].get(
+                model._model_uid
+            )
+            if model_info is None:
+                capabilities[model_id] = VideoGenerationCapabilities(
+                    supports_lightning=None
+                )
+                continue
+            steps = lightning_inference_steps(model_info)
+            capabilities[model_id] = VideoGenerationCapabilities(
+                steps is not None, steps
+            )
+        return capabilities
 
     def __init__(
         self,

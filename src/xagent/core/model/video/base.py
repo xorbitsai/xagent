@@ -1,5 +1,13 @@
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, List, Optional, Self
+
+
+@dataclass(frozen=True)
+class VideoGenerationCapabilities:
+    supports_lightning: bool | None = False
+    lightning_inference_steps: int | None = None
 
 
 class BilledVideoTaskError(RuntimeError):
@@ -26,6 +34,13 @@ class BilledVideoTaskTimeout(BilledVideoTaskError, TimeoutError):
 
 
 class BaseVideoModel(ABC):
+    @classmethod
+    async def discover_generation_capabilities(
+        cls, models: Mapping[str, Self]
+    ) -> dict[str, VideoGenerationCapabilities]:
+        """Describe the optional generation features of configured instances."""
+        return {model_id: VideoGenerationCapabilities() for model_id in models}
+
     """Abstract base class for video generation models."""
 
     @property

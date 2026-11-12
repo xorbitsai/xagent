@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from tests.web.services.test_connector_probe import (
+    _chartmogul_ok,
+    _connect_catalog_chartmogul,
     _connect_catalog_stripe,
     _custom_row,
     _github_ok,
@@ -49,10 +51,10 @@ async def test_the_users_connected_catalog_connectors_run_their_checks(
     db_users, monkeypatch
 ):
     db, user, _ = db_users
+    _connect_catalog_chartmogul(db, user)
     _connect_catalog_stripe(db, user)
-    _connect_github(db, user)
-    github, stripe = _github_ok(), _stripe_ok()
-    loader = _Loader(github, stripe)
+    chartmogul, stripe = _chartmogul_ok(), _stripe_ok()
+    loader = _Loader(chartmogul, stripe)
     monkeypatch.setattr(LOADER, loader)
 
     result = await run_checks(UserIdentityAdapter(db, "monitor"))
@@ -60,14 +62,14 @@ async def test_the_users_connected_catalog_connectors_run_their_checks(
     assert result.identity == "user"
     assert result.failure is None
     assert rows(result) == [
-        ("github", None, "pass", None, None),
-        ("github", "github.l3_probe", "pass", None, None),
+        ("chartmogul", None, "pass", None, None),
+        ("chartmogul", "chartmogul.l3_probe", "pass", None, None),
         ("stripe", None, "pass", None, None),
         ("stripe", "stripe.l3_probe", "pass", None, None),
     ]
     # One listing per connector, then one call per check.
     assert len(loader.calls) == 2
-    assert github.calls == [{}]
+    assert chartmogul.calls == [{"per_page": 1}]
     assert len(stripe.calls) == 1
 
 
@@ -122,6 +124,31 @@ async def test_a_user_is_found_by_email_case_insensitively(
     assert rows(result)[0] == ("github", None, "pass", None, None)
 
 
+async def test_a_github_grant_is_still_judged_where_the_checks_need_fixtures(
+    db_users, monkeypatch
+):
+    """The user identity resolves no fixture, so the five fixture-bound GitHub
+    checks skip without a call, while the probe-derived row reads none and still
+    calls its tool and reports a result. A revoked grant, which fails that row,
+    is covered by the 401 case in `test_registry.py`."""
+    db, user, _ = db_users
+    _connect_github(db, user)
+    monkeypatch.setattr(LOADER, _Loader(_github_ok()))
+
+    result = await run_checks(UserIdentityAdapter(db, "monitor"))
+
+    fixture_missing = ("skip", "fixture_missing")
+    assert rows(result) == [
+        ("github", None, "pass", None, None),
+        ("github", "github.l3_probe", "pass", None, None),
+        ("github", "github.current_user", *fixture_missing, "github.login"),
+        ("github", "github.read_repository", *fixture_missing, "github.read_repo"),
+        ("github", "github.read_issue", *fixture_missing, "github.read_repo"),
+        ("github", "github.read_commits", *fixture_missing, "github.read_repo"),
+        ("github", "github.read_pull_request", *fixture_missing, "github.read_repo"),
+    ]
+
+
 async def test_the_allow_list_is_matched_on_the_user_found(db_users, monkeypatch):
     """Named by username, allowed by email: one account, one rule
     (``is_connector_probe_user``)."""
@@ -153,12 +180,12 @@ async def test_a_custom_server_is_not_a_target(db_users, monkeypatch):
     db.add(custom)
     db.commit()
     _link(db, user, custom)
-    _connect_github(db, user)
-    monkeypatch.setattr(LOADER, _Loader(_github_ok()))
+    _connect_catalog_stripe(db, user)
+    monkeypatch.setattr(LOADER, _Loader(_stripe_ok()))
 
     result = await run_checks(UserIdentityAdapter(db, "monitor"))
 
-    assert [row[0] for row in rows(result)] == ["github", "github"]
+    assert [row[0] for row in rows(result)] == ["stripe", "stripe"]
 
 
 def _lookalike_rows() -> list[tuple[Any, ...]]:

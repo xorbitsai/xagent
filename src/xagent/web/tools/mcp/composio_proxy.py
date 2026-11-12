@@ -834,6 +834,31 @@ def _composio_refusal(what: str, status: int, answer: Any) -> tuple[str, str | N
     return message, slug
 
 
+def _checked_query_pairs(
+    query: Mapping[str, str] | Iterable[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """The query's pairs as a list, refusing a name that appears more than
+    once.
+
+    Composio's proxy appears to keep one value of a repeated query parameter,
+    so a repeated name would lose every value but one without any sign of it.
+    A caller that has several values for one name has to send them in
+    separate requests.
+    """
+    pairs = list(query.items() if isinstance(query, Mapping) else query)
+    seen: set[str] = set()
+    for name, _value in pairs:
+        if name in seen:
+            raise ValueError(
+                f"query parameter {name!r} appears more than once: Composio's "
+                "proxy appears to keep one value of a repeated query "
+                "parameter, so the other values would be dropped without "
+                "notice; give one value for it in each request"
+            )
+        seen.add(name)
+    return pairs
+
+
 def _proxy_payload(
     method: str,
     endpoint: str,
@@ -843,7 +868,7 @@ def _proxy_payload(
     body: Any = None,
 ) -> dict[str, Any]:
     """The JSON body one Proxy Execute call would carry, without sending it."""
-    pairs = query.items() if isinstance(query, Mapping) else query
+    pairs = _checked_query_pairs(query)
     connected_account_id = _required_env(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV)
     user_id = _required_env(COMPOSIO_USER_ID_ENV)
 
@@ -904,7 +929,8 @@ def check_json_body_size(
     max_body_bytes: int | None = None,
 ) -> None:
     """Refuse a proxy call whose JSON payload is above
-    ``MAX_JSON_BODY_BYTES``, before anything is sent.
+    ``MAX_JSON_BODY_BYTES``, before anything is sent; a query name that
+    appears more than once is refused too.
 
     ``proxy_request`` performs the same check. A connector that sends several
     calls in one tool invocation (one message each) calls this for each of
@@ -932,12 +958,13 @@ def proxy_request(
     """Send ``method endpoint`` through Composio as the launched grant.
 
     ``allowed_hosts`` are the hostnames an absolute ``endpoint`` may name.
-    ``query`` is a mapping, or a sequence of pairs when a parameter repeats;
-    ``body`` is sent as JSON. Raises ``ComposioProxyError`` when Composio does
-    not relay the call, and ``ValueError`` before sending anything when the
-    endpoint, a launch variable or a parameter is unusable, or when the JSON
-    body would exceed ``MAX_JSON_BODY_BYTES``. ``max_body_bytes`` overrides
-    that shared default, for a connector whose real limit differs.
+    ``query`` is a mapping or a sequence of pairs, and each name may appear
+    only once; ``body`` is sent as JSON. Raises ``ComposioProxyError`` when
+    Composio does not relay the call, and ``ValueError`` before sending
+    anything when the endpoint, a launch variable or a parameter is unusable,
+    when a query name appears more than once, or when the JSON body would
+    exceed ``MAX_JSON_BODY_BYTES``. ``max_body_bytes`` overrides that shared
+    default, for a connector whose real limit differs.
     """
     if isinstance(allowed_hosts, str):
         raise TypeError("allowed_hosts must be a collection of hostnames, not a str")

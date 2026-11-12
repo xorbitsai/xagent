@@ -48,6 +48,25 @@ _NOT_FOUND = {
         "errors": [{"message": "Not Found", "domain": "global"}],
     }
 }
+# A metadata read that names no header returns every header, in the order
+# the mail carries them; one of them is spelled differently from the name the
+# tool reads, to keep its case-insensitive lookup covered.
+_METADATA_MESSAGE = {
+    "id": "m1",
+    "threadId": "t1",
+    "snippet": "the numbers",
+    "payload": {
+        "headers": [
+            {"name": "Delivered-To", "value": "ada@example.com"},
+            {"name": "Received", "value": "by mx.example.com with SMTP id abc"},
+            {"name": "DKIM-Signature", "value": "v=1; a=rsa-sha256; d=example.com"},
+            {"name": "subject", "value": "Quarterly numbers"},
+            {"name": "To", "value": "Ada <ada@example.com>"},
+            {"name": "From", "value": "Grace <grace@example.com>"},
+            {"name": "Date", "value": "Mon, 10 Nov 2025 09:00:00 +0000"},
+        ]
+    },
+}
 _BATCH_BOUNDARY = "gmail-tools-batch"
 
 
@@ -82,7 +101,11 @@ def _batch_part(request_id: str, status: int, body: str) -> str:
 
 
 class FakeNativeHttp:
-    """A native grant's transport: one JSON answer, or a batch answer."""
+    """A native grant's transport: one JSON answer, or a batch answer.
+
+    ``batch_request_body`` keeps the ``multipart/mixed`` body the batch was
+    sent with, so a test can read the requests it carried.
+    """
 
     def __init__(
         self, list_body: dict[str, Any], parts: list[tuple[str, int, str]]
@@ -91,9 +114,11 @@ class FakeNativeHttp:
         self._batch_body = (
             "".join(_batch_part(*part) for part in parts) + f"--{_BATCH_BOUNDARY}--\r\n"
         )
+        self.batch_request_body = ""
 
     def request(self, uri, method=None, body=None, headers=None):
         if "batch" in uri:
+            self.batch_request_body = body
             response = httplib2.Response(
                 {"content-type": f'multipart/mixed; boundary="{_BATCH_BOUNDARY}"'}
             )
@@ -215,6 +240,78 @@ def test_search_reads_each_message_through_the_proxy(proxy, monkeypatch):
     assert message_call["endpoint"] == (
         "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1"
     )
+
+
+def test_search_reads_subjects_from_every_header_on_a_composio_grant(
+    proxy, monkeypatch
+):
+    """A metadata read that names no header returns every header. Asking for
+    ``metadataHeaders`` twice puts the same query name twice in one request,
+    and the proxy appears to keep one value of it (replies carried From but
+    not Subject), so every subject read "No Subject"."""
+    proxy.answer("/messages/m1", 200, _METADATA_MESSAGE)
+    proxy.answer("/messages", 200, {"messages": [{"id": "m1"}]})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(gmail.gmail_search_messages("q", max_results=1))
+
+    assert result["messages"] == [
+        {
+            "id": "m1",
+            "threadId": "t1",
+            "snippet": "the numbers",
+            "subject": "Quarterly numbers",
+            "from": "Grace <grace@example.com>",
+        }
+    ]
+    list_call, message_call = proxy.calls
+    assert list_call["endpoint"] == (
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+    )
+    query = [item for item in message_call["parameters"] if item["type"] == "query"]
+    assert {"name": "format", "value": "metadata", "type": "query"} in query
+    assert [item for item in query if item["name"] == "metadataHeaders"] == []
+
+
+def test_a_composio_search_with_two_label_ids_is_refused_before_sending(
+    proxy, monkeypatch
+):
+    """The tool refuses a second label id itself and points at ``query``: on a
+    Composio grant a search takes one label id, and Gmail returns only the
+    messages that carry every label given, so one search per label would
+    merge into a wider result. The shared client's refusal stays as a
+    backstop."""
+    proxy.answer("/messages", 200, {"messages": []})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_search_messages("q", label_ids=["INBOX", "STARRED"], max_results=1)
+    )
+
+    assert result["status"] == "error"
+    assert "one label id" in result["message"]
+    assert "query" in result["message"]
+    assert proxy.calls == []
+
+
+def test_a_composio_search_with_one_label_id_carries_it_once(proxy, monkeypatch):
+    """The ``gmail.search_seed_message`` smoke check searches by a single label
+    id on this path: the list request carries that one ``labelIds``
+    parameter."""
+    proxy.answer("/messages", 200, {"messages": []})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_search_messages(label_ids=["INBOX"], max_results=10)
+    )
+
+    assert result["status"] == "success"
+    (list_call,) = proxy.calls
+    assert list_call["endpoint"] == (
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+    )
+    label_ids = [item for item in list_call["parameters"] if item["name"] == "labelIds"]
+    assert label_ids == [{"name": "labelIds", "value": "INBOX", "type": "query"}]
 
 
 def test_search_with_no_messages_sends_only_the_list_request(proxy, monkeypatch):
@@ -431,20 +528,18 @@ def test_a_composio_refusal_is_reported_without_secrets(proxy, monkeypatch):
 
 def test_the_batch_fallback_output_matches_a_native_batch(monkeypatch, proxy):
     """The same messages, one tool run through a real native batch and one
-    through the proxy, come back as the same JSON."""
+    through the proxy, come back as the same messages and the same error. The
+    native run still asks for the two headers by name, so the request URI in
+    the error text differs between the two paths."""
     list_body = {"messages": [{"id": "m1"}, {"id": "m2"}]}
-    native_service = build(
-        "gmail",
-        "v1",
-        http=FakeNativeHttp(
-            list_body,
-            [
-                ("1", 200, json.dumps(_MESSAGE)),
-                ("2", 404, json.dumps(_NOT_FOUND)),
-            ],
-        ),
-        static_discovery=True,
+    native_http = FakeNativeHttp(
+        list_body,
+        [
+            ("1", 200, json.dumps(_MESSAGE)),
+            ("2", 404, json.dumps(_NOT_FOUND)),
+        ],
     )
+    native_service = build("gmail", "v1", http=native_http, static_discovery=True)
 
     for name in (
         composio_proxy.COMPOSIO_API_KEY_ENV,
@@ -464,10 +559,17 @@ def test_the_batch_fallback_output_matches_a_native_batch(monkeypatch, proxy):
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
     proxied_output = json.loads(gmail.gmail_search_messages("q", max_results=2))
 
-    assert proxied_output == native_output
-    assert native_output["status"] == "success"
-    assert native_output["messages"][0]["subject"] == "Hello"
+    assert proxied_output["status"] == native_output["status"] == "success"
+    assert proxied_output["messages"] == native_output["messages"]
+    assert len(proxied_output["errors"]) == len(native_output["errors"]) == 1
+    assert "HttpError 404" in proxied_output["errors"][0]
     assert "HttpError 404" in native_output["errors"][0]
+    assert native_output["messages"][0]["subject"] == "Hello"
+    # A native grant still asks Gmail for the two headers by name.
+    assert (
+        "metadataHeaders=Subject&metadataHeaders=From" in native_http.batch_request_body
+    )
+    assert "metadataHeaders" not in json.dumps(proxy.calls)
 
 
 def test_a_composio_gmail_grant_gets_the_composio_launch_variables(monkeypatch):

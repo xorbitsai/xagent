@@ -41,7 +41,7 @@ def test_a_request_is_mapped_to_one_proxy_call(proxy):
 
     http.request(
         "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-        "?maxResults=10&labelIds=INBOX&labelIds=STARRED",
+        "?maxResults=10&labelIds=INBOX",
         method="POST",
         body='{"raw": "abc"}',
         headers={"content-type": "application/json", "accept": "application/json"},
@@ -56,7 +56,6 @@ def test_a_request_is_mapped_to_one_proxy_call(proxy):
         "parameters": [
             {"name": "maxResults", "value": "10", "type": "query"},
             {"name": "labelIds", "value": "INBOX", "type": "query"},
-            {"name": "labelIds", "value": "STARRED", "type": "query"},
             {"name": "content-type", "value": "application/json", "type": "header"},
             {"name": "accept", "value": "application/json", "type": "header"},
         ],
@@ -64,36 +63,50 @@ def test_a_request_is_mapped_to_one_proxy_call(proxy):
     }
 
 
+def test_a_query_name_that_repeats_in_the_uri_is_refused_before_sending(proxy):
+    """Composio's proxy appears to keep one value of a repeated query
+    parameter, so a request that would lose a value is refused here."""
+    with pytest.raises(ValueError) as raised:
+        _http().request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+            "?labelIds=INBOX&labelIds=STARRED"
+        )
+
+    assert "labelIds" in str(raised.value)
+    assert proxy.calls == []
+
+
 def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
     """A GET whose URI is too long is sent as a POST with the query
     form-encoded in the body. The proxy carries a query as parameters and a
-    body only as JSON, so the query goes back on the URI."""
+    body only as JSON, so every parameter goes back on the URI."""
     long_query = "x" * 2200
 
-    _gmail_service().users().messages().list(userId="me", q=long_query).execute()
-
-    (call,) = proxy.calls
-    assert call["method"] == "GET"
-    assert "body" not in call
-    assert {"name": "q", "value": long_query, "type": "query"} in call["parameters"]
-    assert all(item["name"] != "content-type" for item in call["parameters"])
-
-
-def test_a_long_get_keeps_its_repeated_parameters(proxy):
-    """The form body googleapiclient moves the query of a long GET into keeps
-    a repeated parameter as its pairs; restoring the GET must not collapse them
-    into one."""
     _gmail_service().users().messages().list(
-        userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]
+        userId="me", q=long_query, labelIds=["INBOX"], maxResults=5
     ).execute()
 
     (call,) = proxy.calls
     assert call["method"] == "GET"
     assert "body" not in call
-    assert [item for item in call["parameters"] if item["name"] == "labelIds"] == [
-        {"name": "labelIds", "value": "INBOX", "type": "query"},
-        {"name": "labelIds", "value": "STARRED", "type": "query"},
-    ]
+    assert {"name": "q", "value": long_query, "type": "query"} in call["parameters"]
+    label_ids = [item for item in call["parameters"] if item["name"] == "labelIds"]
+    assert label_ids == [{"name": "labelIds", "value": "INBOX", "type": "query"}]
+    assert {"name": "maxResults", "value": "5", "type": "query"} in call["parameters"]
+    assert all(item["name"] != "content-type" for item in call["parameters"])
+
+
+def test_a_long_get_whose_query_repeats_a_name_is_refused_before_sending(proxy):
+    """The form body googleapiclient moves the query of a long GET into keeps
+    a repeated parameter as its pairs; restoring the GET must not send them,
+    because the proxy appears to keep one value of a repeated name."""
+    with pytest.raises(ValueError) as raised:
+        _gmail_service().users().messages().list(
+            userId="me", q="x" * 2200, labelIds=["INBOX", "STARRED"]
+        ).execute()
+
+    assert "labelIds" in str(raised.value)
+    assert proxy.calls == []
 
 
 def test_only_headers_that_change_the_answer_are_forwarded(proxy):
@@ -308,17 +321,14 @@ def test_a_body_that_is_not_json_is_refused_before_sending(proxy, body):
 
 
 def _added_batch(service: Any, ids: list[str], callback) -> Any:
+    """One metadata read per id, the shape a Composio grant asks for: no
+    ``metadataHeaders``, whose repeated name the proxy appears to collapse."""
     batch = service.new_batch_http_request(callback=callback)
     for message_id in ids:
         batch.add(
             service.users()
             .messages()
-            .get(
-                userId="me",
-                id=message_id,
-                format="metadata",
-                metadataHeaders=["Subject", "From"],
-            )
+            .get(userId="me", id=message_id, format="metadata")
         )
     return batch
 
@@ -360,8 +370,6 @@ def test_a_batch_request_keeps_the_query_googleapiclient_built(proxy):
     assert call["method"] == "GET"
     assert call["parameters"] == [
         {"name": "format", "value": "metadata", "type": "query"},
-        {"name": "metadataHeaders", "value": "Subject", "type": "query"},
-        {"name": "metadataHeaders", "value": "From", "type": "query"},
         {"name": "alt", "value": "json", "type": "query"},
         {"name": "accept", "value": "application/json", "type": "header"},
     ]

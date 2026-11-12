@@ -323,6 +323,37 @@ def test_a_query_mapping_sends_each_name_and_value(proxy):
     ]
 
 
+def test_a_repeated_query_name_is_refused_before_sending(proxy):
+    """Composio's proxy appears to keep one value of a repeated query
+    parameter, so a name that appears twice is refused here instead of
+    losing a value without a sign of it."""
+    with pytest.raises(ValueError) as raised:
+        composio_proxy.proxy_request(
+            "GET",
+            "/services/data/v62.0/query",
+            allowed_hosts=(),
+            query=[("labelIds", "INBOX"), ("q", "is:unread"), ("labelIds", "STARRED")],
+        )
+
+    assert "labelIds" in str(raised.value)
+    assert "repeated query parameter" in str(raised.value)
+    assert proxy.calls == []
+
+
+def test_a_repeated_query_name_is_refused_by_the_size_check(proxy):
+    """``check_json_body_size`` builds the same payload ``proxy_request``
+    would, so it refuses a repeated name before anything is sent too."""
+    with pytest.raises(ValueError) as raised:
+        composio_proxy.check_json_body_size(
+            "GET",
+            "/services/data/v62.0/query",
+            query=[("labelIds", "INBOX"), ("labelIds", "STARRED")],
+        )
+
+    assert "labelIds" in str(raised.value)
+    assert proxy.calls == []
+
+
 def test_allowed_hosts_given_as_one_string_is_refused(proxy):
     with pytest.raises(TypeError):
         composio_proxy.proxy_request(

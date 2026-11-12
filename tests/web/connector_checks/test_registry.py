@@ -5,12 +5,16 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
+from xagent.core.tools.adapters.vibe import mcp_adapter
+from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_checks.assertions import judge_result, resolve_expected
 from xagent.web.connector_checks.declarations import (
@@ -37,7 +41,9 @@ from xagent.web.connector_checks.declarations import (
     WriteCheck,
     validate_connector_checks,
 )
+from xagent.web.connector_checks.fixtures import FixtureValue, resolve_fixtures
 from xagent.web.connector_checks.registry import (
+    _GITHUB_READS_BEYOND_THE_FIVE,
     _GMAIL_LABEL_WITHOUT_READ,
     _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID,
     CONNECTOR_CHECKS,
@@ -50,6 +56,7 @@ from xagent.web.connector_checks.results import FailureClass
 from xagent.web.tools.mcp import calendar as google_calendar
 from xagent.web.tools.mcp import (
     excel,
+    github,
     gmail,
     google_ads,
     google_analytics,
@@ -1203,10 +1210,16 @@ _GOOGLE_FIXTURE_KEYS_USED = frozenset(
 
 
 class _Fixtures:
-    """The Google seed's values, as the identity adapter would resolve them."""
+    """The seeds' values, as the identity adapter would resolve them."""
 
     _VALUES = {
         "gmail.seed_label_id": "Label_1",
+        "github.issue_number": 1,
+        "github.login": "xagent-app",
+        "github.pr_branch": "xagent-smoke-seed",
+        "github.pull_number": 2,
+        "github.read_repo": "xagent-smoke/smoke-read",
+        "github.seed_file_path": "seed.md",
         "google-analytics.property_id": "563334905",
         "google-docs.document_id": "doc-1",
         "google-drive.seed_folder_id": "folder-1",
@@ -1218,14 +1231,14 @@ class _Fixtures:
         "google-slides.presentation_id": "deck-1",
     }
 
-    def resolve_fixture(self, key: str) -> str | None:
+    def resolve_fixture(self, key: str) -> FixtureValue | None:
         return self._VALUES.get(key)
 
 
 _FIXTURES = _Fixtures()
 
 
-def _step_fixture_keys(step: ReadCheck | ToolStep) -> Iterator[FixtureRef]:
+def _fixture_keys(step: ReadCheck | ToolStep) -> Iterator[FixtureRef]:
     yield from _fixture_refs(step.arguments)
     for assertion in step.assertions:
         if isinstance(assertion, Equals):
@@ -1239,7 +1252,7 @@ def _google_fixture_keys() -> Iterator[FixtureRef]:
         checks = CONNECTOR_CHECKS[app_id]
         for read in checks.reads:
             if isinstance(read, ReadCheck):
-                yield from _step_fixture_keys(read)
+                yield from _fixture_keys(read)
         for write in checks.writes:
             yield from _fixture_refs(write.tenant_pin.expected)
             for step in (
@@ -1249,11 +1262,11 @@ def _google_fixture_keys() -> Iterator[FixtureRef]:
                 write.cleanup_guard,
             ):
                 if step is not None:
-                    yield from _step_fixture_keys(step)
+                    yield from _fixture_keys(step)
         if checks.sweep is not None:
             yield from _fixture_refs(checks.sweep.tenant_pin.expected)
-            yield from _step_fixture_keys(checks.sweep.find)
-            yield from _step_fixture_keys(checks.sweep.delete)
+            yield from _fixture_keys(checks.sweep.find)
+            yield from _fixture_keys(checks.sweep.delete)
 
 
 @pytest.mark.parametrize(("check_id", "expected"), sorted(_GOOGLE_READS.items()))
@@ -2153,3 +2166,657 @@ def test_a_google_fixture_check_fails_on_an_error_envelope(
     monkeypatch.setattr(module, dependency, _unreachable)
 
     _assert_check_fails(check_id, call(), "status_success")
+
+
+# --- GitHub (#3568) ------------------------------------------------------------------
+
+_READ_REPO = "xagent-smoke/smoke-read"
+
+# The read checks, pinned: the tool, its arguments and its assertions. Five of
+# them are the five most called tools of the 89 GitHub calls in the 7-day
+# production-au tool-call volume reported on xorbitsai/xagent-saas#2532, the
+# five read checks a Tier 1 connector declares at most; `github.l3_probe` is
+# the probe-derived one the connector keeps alongside them, so a check that
+# reads no fixture still calls GitHub.
+_GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "github.l3_probe": ("github_get_current_user", {}, (L3Envelope(),)),
+    "github.current_user": (
+        "github_get_current_user",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("user",), ("login", "id", "html_url")),
+            Equals(("user", "login"), FixtureRef("github.login")),
+        ),
+    ),
+    "github.read_repository": (
+        "github_get_repository",
+        {"repo": FixtureRef("github.read_repo")},
+        (
+            StatusSuccess(),
+            HasKeys(
+                ("repository",),
+                ("full_name", "private", "default_branch", "html_url"),
+            ),
+            Equals(("repository", "full_name"), FixtureRef("github.read_repo")),
+            Equals(("repository", "private"), True),
+        ),
+    ),
+    "github.read_issue": (
+        "github_get_issue",
+        {
+            "repo": FixtureRef("github.read_repo"),
+            "issue_number": FixtureRef("github.issue_number"),
+        },
+        (
+            StatusSuccess(),
+            HasKeys(
+                ("issue",),
+                ("number", "title", "state", "labels", "user", "html_url"),
+            ),
+            Equals(("issue", "number"), FixtureRef("github.issue_number")),
+            Equals(("issue", "title"), "xagent smoke seed issue"),
+            Equals(("issue", "state"), "open"),
+            Equals(("issue", "is_pull_request"), False),
+        ),
+    ),
+    "github.read_commits": (
+        "github_list_commits",
+        {
+            "repo": FixtureRef("github.read_repo"),
+            "path": FixtureRef("github.seed_file_path"),
+            "limit": 1,
+        },
+        (
+            StatusSuccess(),
+            HasKeys((), ("commits", "truncated")),
+            Length(("commits",), 1, 1),
+            EachHasKeys(("commits",), ("sha", "message", "author", "date")),
+            Equals(("commits", 0, "message"), "xagent smoke seed"),
+        ),
+    ),
+    "github.read_pull_request": (
+        "github_get_pull_request",
+        {
+            "repo": FixtureRef("github.read_repo"),
+            "pull_number": FixtureRef("github.pull_number"),
+        },
+        (
+            StatusSuccess(),
+            HasKeys(
+                ("pull_request",),
+                ("number", "title", "state", "head", "base", "draft"),
+            ),
+            Equals(("pull_request", "number"), FixtureRef("github.pull_number")),
+            Equals(("pull_request", "title"), "xagent smoke seed pull request"),
+            Equals(("pull_request", "state"), "open"),
+            Equals(("pull_request", "draft"), False),
+            Equals(("pull_request", "head"), FixtureRef("github.pr_branch")),
+        ),
+    ),
+}
+
+# The fixture keys the GitHub read checks use, pinned here so that adding or
+# dropping one shows in the diff. The xagent-saas tenant fixtures record the
+# login, the three ids the seed's layout knows, and the two numbers GitHub
+# assigns (xorbitsai/xagent-saas#2533).
+_GITHUB_FIXTURE_KEYS_USED = frozenset(
+    {
+        "github.issue_number",
+        "github.login",
+        "github.pr_branch",
+        "github.pull_number",
+        "github.read_repo",
+        "github.seed_file_path",
+    }
+)
+
+# The reads left to an exemption: GitHub's 80% cut needs eight tools, and the
+# five most called have the checks.
+_GITHUB_READS_BEYOND_THE_FIVE_TOOLS = frozenset(
+    {
+        "github_get_file_contents",
+        "github_get_latest_release",
+        "github_get_ref_status",
+        "github_list_issues",
+        "github_list_pull_requests",
+        "github_list_workflow_runs",
+        "github_search_code",
+        "github_search_repositories",
+    }
+)
+
+# The writes that create an object GitHub's own tools cannot remove: the server
+# has no delete tool at all, so a write check would have nothing to clean up
+# with. A release edit is the one write that creates no object.
+_GITHUB_WRITES_WITHOUT_CLEANUP = frozenset(
+    {
+        "github_comment_on_issue",
+        "github_create_branch",
+        "github_create_issue",
+        "github_create_or_update_file",
+        "github_create_pull_request",
+        "github_create_release",
+        "github_update_submodule",
+    }
+)
+
+
+@pytest.mark.parametrize(("check_id", "expected"), sorted(_GITHUB_READS.items()))
+def test_a_github_read_check_is_declared_exactly(
+    check_id: str, expected: tuple[str, dict[str, Any], tuple[Assertion, ...]]
+) -> None:
+    tool, arguments, assertions = expected
+    check = _read_check(check_id)
+    assert (check.tool, dict(check.arguments), check.assertions) == (
+        tool,
+        arguments,
+        assertions,
+    )
+
+
+def test_a_github_connector_declares_exactly_its_reads() -> None:
+    assert [check.id for check in CONNECTOR_CHECKS["github"].reads] == list(
+        _GITHUB_READS
+    )
+
+
+def test_the_github_read_checks_use_exactly_these_fixture_keys() -> None:
+    keys = {
+        ref.key
+        for check in CONNECTOR_CHECKS["github"].reads
+        if isinstance(check, ReadCheck)
+        for ref in _fixture_keys(check)
+    }
+
+    assert keys == _GITHUB_FIXTURE_KEYS_USED
+
+
+def test_a_github_fixture_is_bound_to_a_parameter_of_its_tool() -> None:
+    """A fixture in the arguments names a parameter of the tool, and every
+    required argument is pinned: an omitted one would make the tool prompt.
+    That the value is the type the parameter declares is the adapter test's
+    judgement, below."""
+    for check in CONNECTOR_CHECKS["github"].reads:
+        if not isinstance(check, ReadCheck):
+            continue
+        parameters = inspect.signature(getattr(github, check.tool)).parameters
+        bound = [
+            name for name, value in check.arguments.items() if any(_fixture_refs(value))
+        ]
+        for name in bound:
+            assert name in parameters, (check.tool, name)
+        required = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.default is inspect.Parameter.empty
+            and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        }
+        assert required <= set(check.arguments), (check.tool, required)
+
+
+async def test_a_github_fixture_bound_argument_passes_the_tools_own_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The value a fixture resolves to survives the adapter's own checks.
+
+    The tools validate their arguments locally before a call leaves, and a
+    string where a tool declares an integer is refused there, so a fixture the
+    registry holds as a string would make its check fail on every run. The
+    session is replaced with one that refuses: reaching it means the adapter
+    accepted the arguments.
+    """
+    reached: list[str] = []
+
+    @asynccontextmanager
+    async def _refuse_session(connection: Any) -> Any:
+        reached.append(str(connection))
+        raise RuntimeError("no server in this test")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(mcp_adapter, "create_session", _refuse_session)
+    tools = {tool.name: tool for tool in await github.mcp.list_tools()}
+    for check in CONNECTOR_CHECKS["github"].reads:
+        if not isinstance(check, ReadCheck) or not any(_fixture_refs(check.arguments)):
+            continue
+        adapter = MCPToolAdapter(
+            mcp_tool=tools[check.tool],
+            connection={
+                "transport": "streamable_http",
+                "url": "https://mcp.example.test",
+            },
+        )
+        reached.clear()
+
+        raw = await adapter.run_json_async(
+            resolve_fixtures(dict(check.arguments), _FIXTURES)
+        )
+
+        assert reached, (check.id, raw)
+        assert "Invalid MCP tool arguments" not in raw["content"][0]["text"], check.id
+
+
+def test_a_github_read_outside_the_five_is_exempt_for_the_cut() -> None:
+    exemptions = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+    }
+
+    for tool in _GITHUB_READS_BEYOND_THE_FIVE_TOOLS:
+        assert exemptions[tool] == _GITHUB_READS_BEYOND_THE_FIVE, tool
+    assert set(exemptions) == _GITHUB_READS_BEYOND_THE_FIVE_TOOLS | (
+        _GITHUB_WRITES_WITHOUT_CLEANUP | {"github_update_release"}
+    )
+
+
+def test_a_github_write_has_no_cleanup_tool() -> None:
+    """Every write but a release edit creates an object, and the server has no
+    delete tool for any of them, so no write check can clean up yet."""
+    exemptions = {
+        exemption.tool: exemption.reason
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+    }
+
+    for tool in _GITHUB_WRITES_WITHOUT_CLEANUP:
+        assert exemptions[tool] == WRITE_WITHOUT_CLEANUP, tool
+
+
+def test_the_github_release_edit_waits_on_an_edit_step() -> None:
+    exemption = next(
+        exemption
+        for exemption in CONNECTOR_CHECKS["github"].exemptions
+        if exemption.tool == "github_update_release"
+    )
+
+    assert exemption.reason == (
+        "write that edits content in place: a write check creates, verifies "
+        "and deletes its own object and has no step for an edit, so whether a "
+        "check is added is decided in #3568"
+    )
+
+
+# Output samples for the GitHub read checks
+
+
+class _GitHubResponse:
+    """The part of a ``requests`` response ``github.py`` reads."""
+
+    def __init__(self, body: Any, status: int = 200) -> None:
+        self.status_code = status
+        self.content = json.dumps(body).encode()
+        self.headers: dict[str, str] = {}
+
+    def json(self) -> Any:
+        return json.loads(self.content)
+
+
+def _fake_github(
+    monkeypatch: pytest.MonkeyPatch,
+    *routes: tuple[str, str, Any],
+    status: int = 200,
+) -> dict[tuple[str, str], Any]:
+    """``github.py``'s HTTP layer: one body per route, answered with ``status``,
+    and the query params every request carried. A callable body is answered
+    from the params, for a route whose answer depends on them."""
+    # The token the server reads its grant from; the fake transport never sends
+    # it anywhere.
+    monkeypatch.setenv("GITHUB_ACCESS_TOKEN", "access-token")
+    bodies = {(method, path): body for method, path, body in routes}
+    params_of: dict[tuple[str, str], Any] = {}
+
+    def request(**kwargs: Any) -> _GitHubResponse:
+        route = (
+            kwargs["method"],
+            str(kwargs["url"]).removeprefix(github.GITHUB_BASE_URL),
+        )
+        params_of[route] = kwargs.get("params")
+        try:
+            body = bodies[route]
+        except KeyError:
+            raise AssertionError(f"unrouted request: {route[0]} {route[1]}") from None
+        if callable(body):
+            body = body(params_of[route] or {})
+        return _GitHubResponse(body, status)
+
+    monkeypatch.setattr(github, "requests", SimpleNamespace(request=request))
+    return params_of
+
+
+def _github_repository(**overrides: Any) -> dict[str, Any]:
+    return {
+        "full_name": _READ_REPO,
+        "private": True,
+        "default_branch": "main",
+        "html_url": "https://github.com/xagent-smoke/smoke-read",
+        "description": "Seed repository of the GitHub smoke tenant",
+        "stargazers_count": 0,
+        "open_issues_count": 2,
+        "language": None,
+        "updated_at": "2026-11-12T00:00:00Z",
+        **overrides,
+    }
+
+
+def _github_issue(**overrides: Any) -> dict[str, Any]:
+    return {
+        "number": 1,
+        "title": "xagent smoke seed issue",
+        "state": "open",
+        "body": "Seeded issue the read checks assert on.",
+        "labels": [],
+        "user": {"login": "xagent-app"},
+        "comments": 0,
+        "html_url": "https://github.com/xagent-smoke/smoke-read/issues/1",
+        "created_at": "2026-11-12T00:00:00Z",
+        "updated_at": "2026-11-12T00:00:00Z",
+        **overrides,
+    }
+
+
+def _github_commit(**overrides: Any) -> dict[str, Any]:
+    return {
+        "sha": "0" * 40,
+        "commit": {
+            "message": "xagent smoke seed",
+            "author": {"name": "xagent-app", "date": "2026-11-12T00:00:00Z"},
+        },
+        "html_url": "https://github.com/xagent-smoke/smoke-read/commit/" + "0" * 40,
+        **overrides,
+    }
+
+
+def _github_pull_request(**overrides: Any) -> dict[str, Any]:
+    return {
+        "number": 2,
+        "title": "xagent smoke seed pull request",
+        "state": "open",
+        "body": "Seeded pull request the read checks assert on.",
+        "user": {"login": "xagent-app"},
+        "head": {"ref": "xagent-smoke-seed"},
+        "base": {"ref": "main"},
+        "draft": False,
+        "merged": False,
+        "mergeable": True,
+        "html_url": "https://github.com/xagent-smoke/smoke-read/pull/2",
+        "created_at": "2026-11-12T00:00:00Z",
+        "updated_at": "2026-11-12T00:00:00Z",
+        **overrides,
+    }
+
+
+def _github_user(**overrides: Any) -> dict[str, Any]:
+    return {
+        "login": "xagent-app",
+        "id": 424242,
+        "name": "Xagent Smoke",
+        "email": None,
+        "company": None,
+        "bio": None,
+        "public_repos": 0,
+        "followers": 0,
+        "following": 0,
+        "html_url": "https://github.com/xagent-app",
+        **overrides,
+    }
+
+
+def _github_declared_output(check_id: str) -> str:
+    """The check's own tool called with the arguments its declaration resolves
+    to: the sample is the call the check makes, not one built from literals."""
+    check = _read_check(check_id)
+    return getattr(github, check.tool)(
+        **resolve_fixtures(dict(check.arguments), _FIXTURES)
+    )
+
+
+def test_github_current_user_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(monkeypatch, ("GET", "/user", _github_user()))
+
+    _assert_check_output(
+        "github.current_user", _github_declared_output("github.current_user")
+    )
+
+
+def test_github_current_user_output_fails_on_another_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The tenant registry pins the account the QA member's connection uses. An
+    # account that can see the private repository passes the other four checks,
+    # so this is the one that notices the wrong account.
+    _fake_github(monkeypatch, ("GET", "/user", _github_user(login="qhhh-personal")))
+
+    _assert_check_fails(
+        "github.current_user", github.github_get_current_user(), "equals"
+    )
+
+
+def test_github_repository_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}", _github_repository()),
+    )
+
+    _assert_check_output(
+        "github.read_repository", _github_declared_output("github.read_repository")
+    )
+
+
+def test_github_repository_output_fails_on_another_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}",
+            _github_repository(full_name="xagent-smoke/smoke-write"),
+        ),
+    )
+
+    _assert_check_fails(
+        "github.read_repository",
+        github.github_get_repository(_READ_REPO),
+        "equals",
+    )
+
+
+def test_github_repository_output_fails_on_a_public_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A public repository is readable without the organization's grant, so the
+    # check would no longer see a revoked one.
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}", _github_repository(private=False)),
+    )
+
+    _assert_check_fails(
+        "github.read_repository",
+        github.github_get_repository(_READ_REPO),
+        "equals",
+    )
+
+
+def test_github_issue_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/issues/1", _github_issue()),
+    )
+
+    _assert_check_output(
+        "github.read_issue", _github_declared_output("github.read_issue")
+    )
+
+
+def test_github_issue_output_fails_on_a_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GitHub answers both from the issues endpoints, and a number that reaches
+    # a pull request proves the fixture names the wrong one.
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}/issues/1",
+            _github_issue(pull_request={"url": "https://api.github.com/x"}),
+        ),
+    )
+
+    _assert_check_fails(
+        "github.read_issue", github.github_get_issue(_READ_REPO, 1), "equals"
+    )
+
+
+def test_github_issue_output_fails_on_another_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fixture names the issue the seed creates, so a payload carrying
+    # another number is not the issue the check reads.
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/issues/1", _github_issue(number=7)),
+    )
+
+    _assert_check_fails(
+        "github.read_issue", github.github_get_issue(_READ_REPO, 1), "equals"
+    )
+
+
+def test_github_commits_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params_of = _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/commits", [_github_commit()]),
+    )
+
+    _assert_check_output(
+        "github.read_commits", _github_declared_output("github.read_commits")
+    )
+    # The declaration's `path` and `limit` are what GitHub is asked for: a
+    # dropped path would judge the branch head instead of the seed file's
+    # commit.
+    assert params_of[("GET", f"/repos/{_READ_REPO}/commits")] == {
+        "per_page": 1,
+        "page": 1,
+        "path": "seed.md",
+    }
+
+
+def test_github_commits_output_judges_the_seed_files_commit_not_the_branch_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default branch's newest commit is the seed's second file, under the
+    message the seed writes there, so it is not the message the check asserts;
+    the check reads the seed file's history, so it still passes."""
+    head = _github_commit(
+        commit={
+            "message": "xagent smoke seed after",
+            "author": {"name": "xagent-app", "date": "2026-11-12T00:00:01Z"},
+        }
+    )
+    seeded = _github_commit()
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}/commits",
+            lambda params: [seeded] if params.get("path") == "seed.md" else [head],
+        ),
+    )
+
+    _assert_check_output(
+        "github.read_commits", _github_declared_output("github.read_commits")
+    )
+
+
+def test_github_commits_output_fails_on_another_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    another = _github_commit(
+        commit={"message": "edit by hand", "author": {"name": "someone"}}
+    )
+    _fake_github(monkeypatch, ("GET", f"/repos/{_READ_REPO}/commits", [another]))
+
+    _assert_check_fails(
+        "github.read_commits",
+        github.github_list_commits(_READ_REPO, path="seed.md", limit=1),
+        "equals",
+    )
+
+
+def test_github_pull_request_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/pulls/2", _github_pull_request()),
+    )
+
+    _assert_check_output(
+        "github.read_pull_request", _github_declared_output("github.read_pull_request")
+    )
+
+
+def test_github_pull_request_output_fails_on_another_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The head is the seed's branch, so a pull request opened from anywhere
+    # else is not the seeded one.
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}/pulls/2",
+            _github_pull_request(head={"ref": "someone-elses-branch"}),
+        ),
+    )
+
+    _assert_check_fails(
+        "github.read_pull_request",
+        github.github_get_pull_request(_READ_REPO, 2),
+        "equals",
+    )
+
+
+def test_github_pull_request_output_fails_on_another_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fixture names the pull request the seed opens, so a payload carrying
+    # another number is not the one the check reads.
+    _fake_github(
+        monkeypatch,
+        ("GET", f"/repos/{_READ_REPO}/pulls/2", _github_pull_request(number=9)),
+    )
+
+    _assert_check_fails(
+        "github.read_pull_request",
+        github.github_get_pull_request(_READ_REPO, 2),
+        "equals",
+    )
+
+
+@pytest.mark.parametrize(
+    ("check_id", "path"),
+    [
+        ("github.current_user", "/user"),
+        ("github.read_repository", f"/repos/{_READ_REPO}"),
+        ("github.read_issue", f"/repos/{_READ_REPO}/issues/1"),
+        ("github.read_commits", f"/repos/{_READ_REPO}/commits"),
+        ("github.read_pull_request", f"/repos/{_READ_REPO}/pulls/2"),
+    ],
+)
+def test_a_github_check_fails_on_a_revoked_grant(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, path: str
+) -> None:
+    # A revoked token is a 401 with this body: the tool catches the error and
+    # returns its error envelope, which the check sees as not a success.
+    _fake_github(monkeypatch, ("GET", path, {"message": "Bad credentials"}), status=401)
+
+    _assert_check_fails(check_id, _github_declared_output(check_id), "status_success")

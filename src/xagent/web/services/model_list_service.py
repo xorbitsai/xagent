@@ -4,8 +4,6 @@ import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
-import aiohttp
-
 from ...core.model.providers import (
     ENDPOINT_KIND_OFFICIAL,
     canonical_provider_name,
@@ -13,7 +11,10 @@ from ...core.model.providers import (
     default_base_url_for_provider,
     get_supported_provider_metadata,
 )
-from ...core.model.public_http import create_public_model_aiohttp_session
+from ...core.model.video.xinference import (
+    fetch_running_xinference_models,
+    lightning_inference_steps,
+)
 from ...core.utils.security import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -179,33 +180,9 @@ async def fetch_xinference_video_models(
     if not base_url:
         raise ValueError("base_url is required for Xinference video")
 
-    from ...core.model.chat.basic.xinference import _normalize_model_list_response
-
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    timeout = aiohttp.ClientTimeout(total=30.0)
-    async with create_public_model_aiohttp_session(timeout=timeout) as session:
-        async with session.get(
-            f"{base_url.rstrip('/')}/v1/models", headers=headers
-        ) as response:
-            if response.status != 200:
-                try:
-                    detail = await response.json()
-                except Exception:
-                    detail = await response.text()
-                raise RuntimeError(
-                    f"Failed to list Xinference video models: HTTP {response.status}, detail: {detail}"
-                )
-            response_data = await response.json()
-    data_list = response_data.get("data", []) if isinstance(response_data, dict) else []
-    models_list = {
-        str(item["id"]): item
-        for item in data_list
-        if isinstance(item, dict) and item.get("id")
-    }
-    normalized_models = _normalize_model_list_response(models_list)
-
+    models = await fetch_running_xinference_models(base_url, api_key)
     result: List[Dict[str, Any]] = []
-    for model_uid, model_info in normalized_models:
+    for model_uid, model_info in models.items():
         abilities = [str(item) for item in model_info.get("model_ability", [])]
         model_type = str(model_info.get("model_type", ""))
         is_video = model_type == "video" or any(
@@ -213,17 +190,19 @@ async def fetch_xinference_video_models(
         )
         if not is_video:
             continue
-        result.append(
-            {
-                "id": model_info.get("model_name", model_uid),
-                "model_uid": model_uid,
-                "model_type": model_type,
-                "category": "video",
-                "model_ability": ["generate"],
-                "abilities": ["generate"],
-                "description": model_info.get("model_description", ""),
-            }
-        )
+        model = {
+            "id": model_info.get("model_name", model_uid),
+            "model_uid": model_uid,
+            "model_type": model_type,
+            "category": "video",
+            "model_ability": ["generate"],
+            "abilities": ["generate"],
+            "description": model_info.get("model_description", ""),
+        }
+        steps = lightning_inference_steps(model_info)
+        if steps is not None:
+            model["lightning_inference_steps"] = steps
+        result.append(model)
     return result
 
 

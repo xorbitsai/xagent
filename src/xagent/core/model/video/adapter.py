@@ -1,3 +1,5 @@
+import asyncio
+from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
@@ -8,8 +10,25 @@ from ...model import VideoModelConfig
 from ...model.providers import canonical_provider_name
 from ...retry import create_retry_wrapper
 from .ark import ArkVideoModel
-from .base import BaseVideoModel, BilledVideoTaskError
+from .base import BaseVideoModel, BilledVideoTaskError, VideoGenerationCapabilities
 from .xinference import XinferenceVideoModel
+
+
+async def get_video_generation_capabilities(
+    models: Mapping[str, BaseVideoModel],
+) -> dict[str, VideoGenerationCapabilities]:
+    """Let each provider discover capabilities for its configured models."""
+    by_provider: dict[type[BaseVideoModel], dict[str, BaseVideoModel]] = {}
+    for model_id, model in models.items():
+        inner = getattr(model, "_inner", model)
+        by_provider.setdefault(type(inner), {})[model_id] = inner
+    batches = await asyncio.gather(
+        *(
+            provider.discover_generation_capabilities(group)
+            for provider, group in by_provider.items()
+        )
+    )
+    return {model_id: info for batch in batches for model_id, info in batch.items()}
 
 
 def retry_on(exc: Exception) -> bool:

@@ -201,3 +201,45 @@ describe("ModelManagementDialog Bedrock settings", () => {
     expect(screen.queryByText("common.refresh")).not.toBeInTheDocument()
   })
 })
+
+describe("ModelManagementDialog Xinference video catalog", () => {
+  afterEach(cleanup)
+
+  it("lets users select either running instance when model names match", async () => {
+    apiRequestMock.mockReset().mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        models: [
+          { id: "MiniMax-H3", model_uid: "h3/fast", category: "video", lightning_inference_steps: 8 },
+          { id: "MiniMax-H3", model_uid: "h3/base", category: "video" },
+        ],
+      }),
+    }).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: 21 }),
+    })
+    renderDialog({
+      initialProviderId: "xinference",
+      activeTab: "video",
+      providers: [{
+        id: "xinference",
+        name: "Xinference",
+        description: "Xinference",
+        icon: <span>xinference</span>,
+        category: ["video"],
+        defaultBaseUrl: "https://xinference.example.com",
+        requires_base_url: true,
+      }],
+    })
+
+    fireEvent.click(screen.getByTitle("models.dialog.refreshModels"))
+    fireEvent.click(screen.getByText("models.form.selectModel"))
+    expect(await screen.findByRole("button", { name: "h3/base" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "h3/fast" }))
+    fireEvent.click(screen.getByRole("button", { name: "models.form.create" }))
+
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(2))
+    const request = apiRequestMock.mock.calls[1][1]
+    expect(JSON.parse(request.body)).toMatchObject({ model_name: "h3/fast" })
+  })
+})

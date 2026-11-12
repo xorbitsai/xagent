@@ -1024,17 +1024,16 @@ class KBCoordinator:
         """
         int_user_id = _normalize_user_id(user_id)
 
-        collection = self._normalize_collection(collection)
-        await self._ensure_writable(collection)
-
-        handle = await self.open_collection(
-            KBContextRequest(
-                collection=collection,
-                user_id=int_user_id,
-                is_admin=is_admin,
-                hide_missing=True,
-            )
+        request = KBContextRequest(
+            collection=self._normalize_collection(collection),
+            user_id=int_user_id,
+            is_admin=is_admin,
+            hide_missing=True,
         )
+        collection = request.collection
+        await self._ensure_writable(request, collection)
+
+        handle = await self.open_collection(request)
 
         warnings: list[str] = warnings_out if warnings_out is not None else []
         deleted_counts: dict[str, int] = {}
@@ -1223,18 +1222,17 @@ class KBCoordinator:
         """
         int_user_id = _normalize_user_id(user_id)
 
-        old_name = self._normalize_collection(old_name)
-        # Both names: a frozen row can outlive its collection, so an absent target may be frozen.
-        await self._ensure_writable(old_name, new_name, new_name.strip())
-
-        handle = await self.open_collection(
-            KBContextRequest(
-                collection=old_name,
-                user_id=int_user_id,
-                is_admin=is_admin,
-                hide_missing=True,
-            )
+        request = KBContextRequest(
+            collection=self._normalize_collection(old_name),
+            user_id=int_user_id,
+            is_admin=is_admin,
+            hide_missing=True,
         )
+        old_name = request.collection
+        # Source and target (as given and stripped): a frozen row can outlive its collection.
+        await self._ensure_writable(request, old_name, new_name, new_name.strip())
+
+        handle = await self.open_collection(request)
 
         warnings: list[str] = []
 
@@ -1830,9 +1828,9 @@ class KBCoordinator:
             )
         )
 
-    async def _ensure_writable(self, *names: str) -> None:
+    async def _ensure_writable(self, request: KBContextRequest, *names: str) -> None:
         # The freeze row lives in this coordinator's store, not necessarily the ambient one.
-        store = self._storage_shim.get_metadata_store()
+        store = (await self.get_context(request)).metadata_store
         for name in dict.fromkeys(names):
             await ensure_collection_writable_async(name, store=store)
 

@@ -58,6 +58,10 @@ def _make_coordinator_with_mock_handle(handle: MagicMock) -> KBCoordinator:
     coordinator._handle_provider = MagicMock()
     coordinator._storage_factory = MagicMock()
     coordinator._storage_shim = MagicMock()
+    # The freeze check resolves the context (and its metadata store) before opening.
+    coordinator._storage_shim.get_metadata_store.return_value.get_collection = (
+        AsyncMock(return_value=None)
+    )
     coordinator._file_compatibility = MagicMock()
     coordinator._management = MagicMock()
     coordinator._parse_display_compatibility = MagicMock()

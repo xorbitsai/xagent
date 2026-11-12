@@ -5872,6 +5872,9 @@ class BatchDeleteFailureItem(BaseModel):
 
     name: str = Field(..., description="Collection name")
     error: str = Field(..., description="Error message")
+    code: Optional[str] = Field(
+        None, description="Machine-readable reason, e.g. kb_collection_migrating"
+    )
 
 
 class BatchDeleteCollectionsResponse(BaseModel):
@@ -6503,7 +6506,11 @@ async def batch_delete_collections_api(
                 continue
             except CollectionMigratingError as e:
                 db.rollback()
-                failed.append(BatchDeleteFailureItem(name=name, error=e.message))
+                failed.append(
+                    BatchDeleteFailureItem(
+                        name=name, error=e.message, code="kb_collection_migrating"
+                    )
+                )
                 continue
             except Exception as e:
                 db.rollback()

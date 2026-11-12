@@ -632,7 +632,9 @@ def _store_on(path: Path) -> SimpleNamespace:
     import lancedb
 
     conn = lancedb.connect(str(path))
-    return SimpleNamespace(get_raw_connection=lambda: conn)
+    return SimpleNamespace(
+        get_raw_connection=lambda: conn, get_collection=AsyncMock(return_value=None)
+    )
 
 
 @pytest.mark.asyncio
@@ -660,3 +662,19 @@ async def test_injected_coordinator_reads_the_freeze_from_its_own_store(
             await coordinator.delete_collection("kb-b", None, True)
         # Frozen only in the ambient store: not this coordinator's concern.
         await coordinator.rename_collection("src", "kb-a", None, True)
+
+
+@pytest.mark.asyncio
+async def test_direct_coordinator_rename_checks_the_stripped_target_name() -> None:
+    _freeze("kb-target")
+    coordinator = KBCoordinator()
+
+    with patch.object(
+        coordinator,
+        "open_collection",
+        new=AsyncMock(side_effect=AssertionError("collection was opened")),
+    ):
+        with pytest.raises(CollectionMigratingError):
+            await coordinator.rename_collection(
+                "kb", " kb-target ", user_id=1, is_admin=False
+            )

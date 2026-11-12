@@ -1024,7 +1024,8 @@ class KBCoordinator:
         """
         int_user_id = _normalize_user_id(user_id)
 
-        await ensure_collection_writable_async(collection)
+        collection = self._normalize_collection(collection)
+        await self._ensure_writable(collection)
 
         handle = await self.open_collection(
             KBContextRequest(
@@ -1222,9 +1223,9 @@ class KBCoordinator:
         """
         int_user_id = _normalize_user_id(user_id)
 
+        old_name = self._normalize_collection(old_name)
         # Both names: a frozen row can outlive its collection, so an absent target may be frozen.
-        await ensure_collection_writable_async(old_name)
-        await ensure_collection_writable_async(new_name)
+        await self._ensure_writable(old_name, new_name, new_name.strip())
 
         handle = await self.open_collection(
             KBContextRequest(
@@ -1828,6 +1829,12 @@ class KBCoordinator:
                 confirm=confirm,
             )
         )
+
+    async def _ensure_writable(self, *names: str) -> None:
+        # The freeze row lives in this coordinator's store, not necessarily the ambient one.
+        store = self._storage_shim.get_metadata_store()
+        for name in dict.fromkeys(names):
+            await ensure_collection_writable_async(name, store=store)
 
     @staticmethod
     def _normalize_collection(collection: str) -> str:

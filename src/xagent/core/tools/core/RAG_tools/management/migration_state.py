@@ -95,8 +95,10 @@ def _ensure_table(conn: Any) -> None:
             raise
 
 
-def _read_row(collection_name: str) -> Optional[Dict[str, Any]]:
-    conn = get_metadata_store().get_raw_connection()
+def _read_row(
+    collection_name: str, store: Optional[Any] = None
+) -> Optional[Dict[str, Any]]:
+    conn = (store or get_metadata_store()).get_raw_connection()
     if MIGRATION_TABLE not in list_table_names(conn):
         return None
     table = conn.open_table(MIGRATION_TABLE)
@@ -108,9 +110,11 @@ def _read_row(collection_name: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def read_migration_state(collection_name: str) -> CollectionMigrationState:
+def read_migration_state(
+    collection_name: str, store: Optional[Any] = None
+) -> CollectionMigrationState:
     """Read the collection's state; missing table or row means idle."""
-    row = _read_row(collection_name)
+    row = _read_row(collection_name, store)
     if row is None:
         return CollectionMigrationState()
     return CollectionMigrationState(
@@ -285,20 +289,24 @@ def _raise_if_frozen(collection_name: str, state: CollectionMigrationState) -> N
         )
 
 
-def ensure_collection_writable(collection_name: str) -> None:
+def ensure_collection_writable(
+    collection_name: str, *, store: Optional[Any] = None
+) -> None:
     """Raise before a write when the collection is frozen for migration."""
     if _is_admitted(collection_name):
         return
-    _raise_if_frozen(collection_name, read_migration_state(collection_name))
+    _raise_if_frozen(collection_name, read_migration_state(collection_name, store))
     if collection_name in _PENDING.get():
         _ADMITTED.set(_ADMITTED.get() | {collection_name})
 
 
-async def ensure_collection_writable_async(collection_name: str) -> None:
+async def ensure_collection_writable_async(
+    collection_name: str, *, store: Optional[Any] = None
+) -> None:
     """Async guard: runs the blocking state read off the event loop."""
     if _is_admitted(collection_name):
         return
-    state = await asyncio.to_thread(read_migration_state, collection_name)
+    state = await asyncio.to_thread(read_migration_state, collection_name, store)
     _raise_if_frozen(collection_name, state)
     if collection_name in _PENDING.get():
         _ADMITTED.set(_ADMITTED.get() | {collection_name})

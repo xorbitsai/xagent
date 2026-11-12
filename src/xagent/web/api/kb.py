@@ -94,9 +94,10 @@ from ...core.tools.core.RAG_tools.kb.models import (
 )
 from ...core.tools.core.RAG_tools.management.migration_state import (
     admits_collection,
-    admitted_async,
     admitted_context_async,
+    ensure_collection_writable,
     ensure_collection_writable_async,
+    pending_collection,
     run_in_admitted_context,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
@@ -6252,6 +6253,8 @@ def _perform_kb_collection_delete(
 
         if delete_mode == "config_only":
             return _perform_config_only_collection_delete(safe_collection, user_id)
+        # The mode can turn full after the route's snapshot; check before any tombstone.
+        ensure_collection_writable(safe_collection)
 
         mutation_scope = _resolve_collection_mutation_scope(
             collection_name=safe_collection,
@@ -6462,19 +6465,10 @@ async def batch_delete_collections_api(
                         safe_name, int(effective_user.id), is_admin=False
                     )
                 )
-                # A config-only delete removes just the caller's config row; gate data deletes only.
-                if delete_mode == "full":
-                    async with admitted_async(safe_name):
-                        notify_knowledge_base_deleted(
-                            db, access.storage_user_id, safe_name
-                        )
-                        result = _perform_kb_collection_delete(
-                            safe_name,
-                            int(effective_user.id),
-                            bool(effective_user.is_admin),
-                            db,
-                        )
-                else:
+                with pending_collection(safe_name):
+                    # A config-only delete removes just the caller's config row; gate data deletes only.
+                    if delete_mode == "full":
+                        await ensure_collection_writable_async(safe_name)
                     notify_knowledge_base_deleted(db, access.storage_user_id, safe_name)
                     result = _perform_kb_collection_delete(
                         safe_name,

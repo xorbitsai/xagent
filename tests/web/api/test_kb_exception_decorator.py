@@ -952,21 +952,13 @@ async def test_batch_delete_frozen_collection_is_per_item_failure_and_continues(
     )
 
     user, db, access = _migration_mocks()
-
-    async def _guard(name: str) -> None:
-        if name == "frozen":
-            raise _migration_error()
-
+    _freeze_state("frozen")
     success = MagicMock(status="success", message="")
 
     with (
         patch(
             "xagent.web.api.kb._effective_knowledge_base_user",
             return_value=(user, access),
-        ),
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.migration_state.ensure_collection_writable_async",
-            new=_guard,
         ),
         patch(
             "xagent.web.api.kb._perform_kb_collection_delete",
@@ -981,7 +973,7 @@ async def test_batch_delete_frozen_collection_is_per_item_failure_and_continues(
 
     assert result.deleted == ["ok"]
     assert [item.name for item in result.failed] == ["frozen"]
-    assert result.failed[0].error == "frozen"
+    assert "being upgraded" in result.failed[0].error
     delete_one.assert_called_once()
     assert delete_one.call_args.args[0] == "ok"
 
@@ -1428,3 +1420,52 @@ async def test_non_admin_full_delete_of_a_frozen_collection_is_refused() -> None
     assert exc_info.value.detail["code"] == "kb_collection_migrating"
     notify.assert_not_called()
     perform.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["single", "batch"])
+async def test_delete_that_turns_full_after_the_snapshot_checks_before_tombstones(
+    route: str,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from xagent.web.api.kb import (
+        BatchDeleteCollectionsRequest,
+        batch_delete_collections_api,
+        delete_collection_api,
+    )
+
+    user, db, access = _migration_mocks()
+    user.is_admin = False
+    _freeze_state("kb")
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        # The route sees config-only; an admitted ingest lands before the helper re-reads.
+        patch(
+            "xagent.web.api.kb._get_collection_delete_mode",
+            side_effect=["config_only", "full"],
+        ),
+        patch("xagent.web.api.kb.notify_knowledge_base_deleted"),
+        patch(
+            "xagent.web.api.kb._resolve_collection_mutation_scope",
+            return_value=SimpleNamespace(owner_user_ids=[1], file_ids_by_owner={}),
+        ),
+        patch("xagent.web.api.kb.tombstone_kb_ingest_targets_for_collection") as tomb,
+    ):
+        if route == "single":
+            with pytest.raises(HTTPException) as exc_info:
+                await delete_collection_api(collection_name="kb", _user=user, db=db)
+            assert exc_info.value.detail["code"] == "kb_collection_migrating"
+        else:
+            result = await batch_delete_collections_api(
+                body=BatchDeleteCollectionsRequest(collection_names=["kb"]),
+                _user=user,
+                db=db,
+            )
+            assert [item.name for item in result.failed] == ["kb"]
+
+    tomb.assert_not_called()

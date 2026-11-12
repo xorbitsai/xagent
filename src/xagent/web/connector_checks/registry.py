@@ -377,9 +377,12 @@ def _onedrive_checks() -> ConnectorChecks:
             ReadCheck(
                 "onedrive.search_seed_file",
                 "onedrive_search_files",
-                {"query": "xagent-smoke-seed-note"},
+                # q7k2 is in the note's name and in no other file's name or
+                # content, so the search finds the note alone.
+                {"query": "q7k2"},
                 assertions=(
                     StatusSuccess(),
+                    Length(("items",), 1, 1),
                     Equals(("items", 0, "id"), note_id),
                 ),
             ),
@@ -398,7 +401,7 @@ def _onedrive_checks() -> ConnectorChecks:
                 {"item_id": note_id},
                 assertions=(
                     StatusSuccess(),
-                    Equals(("item", "name"), "xagent-smoke-seed-note.txt"),
+                    Equals(("item", "name"), "xagent-smoke-seed-note-q7k2.txt"),
                 ),
             ),
             ReadCheck(
@@ -479,6 +482,8 @@ def _teams_checks() -> ConnectorChecks:
                 {"team_id": team, "channel_id": channel},
                 assertions=(
                     StatusSuccess(),
+                    # Graph's message id is a string of digits, so the
+                    # registry records the fixture as a string.
                     Equals(("messages", 0, "id"), FixtureRef("teams.seed_message_id")),
                     Contains(
                         ("messages", 0, "body", "content"), "xagent smoke seed message"
@@ -550,7 +555,12 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ReadCheck(
                 "excel.read_used_range",
                 "excel_get_used_range",
-                {"file_path": FixtureRef("excel.file_path"), "worksheet": "seed"},
+                # Formatting outside A1:B3 must not widen the address.
+                {
+                    "file_path": FixtureRef("excel.file_path"),
+                    "worksheet": "seed",
+                    "values_only": True,
+                },
                 assertions=(
                     StatusSuccess(),
                     Equals(("range", "address"), "seed!A1:B3"),

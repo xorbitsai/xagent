@@ -263,7 +263,7 @@ ALLOWED: dict[str, tuple[int, str]] = {
     "core/tools/core/document_search.py": (1, READ),
     "core/tools/core/exa_web_search.py": (2, NETWORK),
     "core/tools/core/excel.py": (2, FILES),
-    "core/tools/core/image_tool.py": (5, FILES),
+    "core/tools/core/image_tool.py": (6, FILES),
     "core/tools/core/pptx_conversion.py": (3, FILES),
     "core/tools/core/pptx_render.py": (10, FILES),
     "core/tools/core/video_tool.py": (9, FILES),

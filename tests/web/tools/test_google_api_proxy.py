@@ -79,15 +79,20 @@ def test_a_query_name_that_repeats_in_the_uri_is_refused_before_sending(proxy):
 def test_a_get_googleapiclient_rewrote_to_a_post_is_sent_as_a_get(proxy):
     """A GET whose URI is too long is sent as a POST with the query
     form-encoded in the body. The proxy carries a query as parameters and a
-    body only as JSON, so the query goes back on the URI."""
+    body only as JSON, so every parameter goes back on the URI."""
     long_query = "x" * 2200
 
-    _gmail_service().users().messages().list(userId="me", q=long_query).execute()
+    _gmail_service().users().messages().list(
+        userId="me", q=long_query, labelIds=["INBOX"], maxResults=5
+    ).execute()
 
     (call,) = proxy.calls
     assert call["method"] == "GET"
     assert "body" not in call
     assert {"name": "q", "value": long_query, "type": "query"} in call["parameters"]
+    label_ids = [item for item in call["parameters"] if item["name"] == "labelIds"]
+    assert label_ids == [{"name": "labelIds", "value": "INBOX", "type": "query"}]
+    assert {"name": "maxResults", "value": "5", "type": "query"} in call["parameters"]
     assert all(item["name"] != "content-type" for item in call["parameters"])
 
 

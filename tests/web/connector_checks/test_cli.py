@@ -85,8 +85,14 @@ def _slack(tool: FakeTool | None = None) -> FakeAdapter:
     return FakeAdapter([ConnectorTarget("slack")], {"slack": listed(tool)})
 
 
+def _stripe() -> FakeAdapter:
+    """A legacy connector, whose one check is its L3 probe."""
+    tool = FakeTool("stripe_list_customers")
+    return FakeAdapter([ConnectorTarget("stripe")], {"stripe": listed(tool)})
+
+
 def test_a_passing_run_prints_its_document_and_exits_0(monkeypatch, capfd):
-    names = _install_adapter(monkeypatch, _slack())
+    names = _install_adapter(monkeypatch, _stripe())
 
     code = cli.main(["--user", "monitor"])
 
@@ -163,7 +169,7 @@ def test_a_run_the_total_timeout_cut_exits_1(monkeypatch, capfd):
 
 def test_skipped_rows_do_not_fail_the_run(monkeypatch, capfd):
     adapter = FakeAdapter(
-        [ConnectorTarget("slack", skip_reason="not_catalog_identity")]
+        [ConnectorTarget("stripe", skip_reason="not_catalog_identity")]
     )
     _install_adapter(monkeypatch, adapter)
 

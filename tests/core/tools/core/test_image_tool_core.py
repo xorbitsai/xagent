@@ -3,12 +3,15 @@ Tests for ImageGenerationToolCore class
 """
 
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from PIL import Image
 
 from xagent.core.model.image.base import BaseImageModel
+from xagent.core.tools.artifacts import format_tool_result_for_observation
 from xagent.core.tools.core.image_tool import ImageGenerationToolCore
 from xagent.core.workspace import ExternalUploadStagingError, TaskWorkspace
 
@@ -195,15 +198,23 @@ class TestImageGenerationToolCore:
         assert result["usage"] == {"input_tokens": 10, "output_tokens": 20}
         assert result["request_id"] == "req1"
         assert result["saved_to_workspace"] is True
-        assert result["artifacts"] == [
-            {
-                "type": "image",
-                "file_id": "test-file-id",
-                "filename": result["image_path"].split("/")[-1],
-                "mime_type": "image/jpeg",
-                "display": "inline",
-            }
-        ]
+        [artifact] = result["artifacts"]
+        assert set(artifact) == {
+            "type",
+            "file_id",
+            "filename",
+            "mime_type",
+            "display",
+            "validation",
+        }
+        assert artifact["type"] == "image"
+        assert artifact["file_id"] == "test-file-id"
+        assert artifact["filename"] == result["image_path"].split("/")[-1]
+        assert artifact["mime_type"] == "image/jpeg"
+        assert artifact["display"] == "inline"
+        # The downloaded body in this fixture is not a real JPEG, so the format
+        # check that every generated image now reports says so.
+        assert artifact["validation"]["status"] == "invalid"
 
         # Verify the first model was used (default behavior)
         mock_image_models["model1"].generate_image.assert_called_once_with(
@@ -1035,3 +1046,192 @@ class TestTransparentBackground:
         # The legend the descriptions explain has to actually appear.
         assert "◻" in capable._model_info_text
         assert "◻" not in plain._model_info_text
+
+
+def _png_bytes() -> bytes:
+    """A real PNG, so the format check has something it can decode."""
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _serve_image(mock_get, content: bytes) -> None:
+    """Serve one image body through the mocked aiohttp session."""
+    mock_response = Mock()
+    mock_response.status = 200
+    mock_response.headers = {}
+
+    async def mock_iter_chunked(chunk_size):
+        yield content
+
+    mock_response.content.iter_chunked = mock_iter_chunked
+    mock_get.return_value.__aenter__.return_value = mock_response
+
+
+def _workspace_on_disk(tmp_path: Path) -> Mock:
+    """Workspace backed by real files, so a FileRef is actually built."""
+    workspace_root = tmp_path / "workspace"
+    (workspace_root / "output").mkdir(parents=True)
+    workspace = Mock()
+    workspace.workspace_dir = workspace_root
+    workspace.output_dir = workspace_root / "output"
+    workspace.get_file_id_from_path = Mock(return_value="image-file-id")
+
+    @contextmanager
+    def auto_register_files():
+        yield workspace
+
+    workspace.auto_register_files = auto_register_files
+    return workspace
+
+
+def _generating_tool(workspace) -> ImageGenerationToolCore:
+    model = Mock(spec=BaseImageModel)
+    model.generate_image = AsyncMock(
+        return_value={"image_url": "https://example.com/generated.png", "usage": {}}
+    )
+    return ImageGenerationToolCore({"model1": model}, {"model1": "Test"}, workspace)
+
+
+class TestGeneratedImageValidation:
+    """Generated images report the same format check other producers run."""
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_reports_a_readable_png(self, mock_get, tmp_path):
+        _serve_image(mock_get, _png_bytes())
+        tool = _generating_tool(_workspace_on_disk(tmp_path))
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["artifacts"][0]["validation"]["status"] == "valid"
+        assert result["file_ref"]["validation"]["status"] == "valid"
+        observation = format_tool_result_for_observation("generate_image", result)
+        assert "Validation: format readable" in observation
+        assert "NOT RUN" not in observation
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_generate_image_reports_content_that_is_not_an_image(
+        self, mock_get, tmp_path
+    ):
+        _serve_image(mock_get, b"not an image")
+        tool = _generating_tool(_workspace_on_disk(tmp_path))
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["artifacts"][0]["validation"]["status"] == "invalid"
+        observation = format_tool_result_for_observation("generate_image", result)
+        assert "Validation: INVALID" in observation
+        assert "NOT RUN" not in observation
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    async def test_edit_image_reports_a_readable_png(self, mock_get, tmp_path):
+        _serve_image(mock_get, _png_bytes())
+        model = Mock(spec=BaseImageModel)
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(
+            return_value={"image_url": "https://example.com/edited.png", "usage": {}}
+        )
+        tool = ImageGenerationToolCore(
+            {"model1": model}, {"model1": "Test"}, _workspace_on_disk(tmp_path)
+        )
+
+        result = await tool.edit_image(
+            prompt="Add a hat", image_url="https://example.com/source.png"
+        )
+
+        assert result["artifacts"][0]["validation"]["status"] == "valid"
+        assert result["file_ref"]["validation"]["status"] == "valid"
+        observation = format_tool_result_for_observation("edit_image", result)
+        assert "Validation: format readable" in observation
+        assert "NOT RUN" not in observation
+
+    @pytest.mark.asyncio
+    @patch("aiohttp.ClientSession.get")
+    @patch("xagent.core.tools.core.image_tool.validate_artifact")
+    async def test_a_failed_download_has_nothing_to_validate(
+        self, validate_artifact, mock_get, tmp_path
+    ):
+        # The provider answered with a URL but the download failed, so no file
+        # was saved and no file_id was issued: there is nothing to check.
+        mock_response = Mock()
+        mock_response.status = 404
+        mock_response.headers = {}
+        mock_get.return_value.__aenter__.return_value = mock_response
+        tool = _generating_tool(_workspace_on_disk(tmp_path))
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["success"] is True
+        assert result["image_path"] is None
+        assert result["file_id"] is None
+        assert result["file_ref"] is None
+        assert result["artifacts"] == []
+        assert "validation" not in result
+        validate_artifact.assert_not_called()
+
+
+class TestModelLabelFromModelObject:
+    """The label names the id the model was configured with."""
+
+    @pytest.mark.asyncio
+    async def test_generate_reports_the_models_own_id(self):
+        # The default model is not the instance stored under "gpt-image-x", so
+        # only its own model_id names the model that served the request.
+        served = Mock(spec=BaseImageModel)
+        served.model_id = "platform/gpt-image-x"
+        served.model_name = "gpt-image-x"
+        served.generate_image = AsyncMock(return_value={"image_url": None, "usage": {}})
+        tool = ImageGenerationToolCore(
+            {"gpt-image-x": Mock(spec=BaseImageModel)},
+            {},
+            default_generate_model=served,
+        )
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["success"] is True
+        assert result["model_used"] == "platform/gpt-image-x"
+
+    @pytest.mark.asyncio
+    async def test_failure_reports_the_models_own_id(self):
+        served = Mock(spec=BaseImageModel)
+        served.model_id = "platform/gpt-image-x"
+        served.model_name = "gpt-image-x"
+        served.generate_image = AsyncMock(side_effect=RuntimeError("provider is down"))
+        tool = ImageGenerationToolCore(
+            {"gpt-image-x": Mock(spec=BaseImageModel)},
+            {},
+            default_generate_model=served,
+        )
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["success"] is False
+        assert result["model_used"] == "platform/gpt-image-x"
+
+    @pytest.mark.asyncio
+    async def test_a_mock_model_id_is_not_a_label(self):
+        # An unspecced Mock answers .model_id with a truthy Mock; only a string
+        # may become the label.
+        model = Mock()
+        model.generate_image = AsyncMock(return_value={"image_url": None, "usage": {}})
+        tool = ImageGenerationToolCore({"model1": model}, {})
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["model_used"] == "model1"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_id_falls_back_to_the_model_name(self):
+        served = Mock()
+        served.model_id = ""
+        served.model_name = "gpt-image-x"
+        served.generate_image = AsyncMock(return_value={"image_url": None, "usage": {}})
+        tool = ImageGenerationToolCore({}, {}, default_generate_model=served)
+
+        result = await tool.generate_image("A test prompt")
+
+        assert result["model_used"] == "gpt-image-x"

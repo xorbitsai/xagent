@@ -87,12 +87,12 @@ def _fixture_refs(value: Any) -> Iterator[FixtureRef]:
 
 
 def test_a_probed_connector_gets_its_l3_probe_as_one_read_check() -> None:
-    assert connector_checks_for("slack") == ConnectorChecks(
-        "slack",
+    assert connector_checks_for("stripe") == ConnectorChecks(
+        "stripe",
         reads=(
             ReadCheck(
-                "slack.l3_probe",
-                "slack_list_channels",
+                "stripe.l3_probe",
+                "stripe_list_customers",
                 {"limit": 1},
                 assertions=(L3Envelope(),),
             ),

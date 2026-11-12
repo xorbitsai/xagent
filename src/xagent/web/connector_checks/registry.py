@@ -363,15 +363,19 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
     ),
     # Tier 1 (#3568): the five most called reads, against the test
-    # organization's private read repository, which the seed fills with one
-    # file and the commit that writes it, one issue, one branch and one pull
+    # organization's private read repository, which the seed fills with two
+    # files and the commit that writes each, one issue, one branch and one pull
     # request opened from it. Until the tenant registry records the number
     # GitHub gives the issue or the pull request, the two checks that read them
     # report `skip` and never call their tool; once it does, each compares the
-    # number the tool returns with the one the fixture names.
+    # number the tool returns with the one the fixture names. The probe-derived
+    # `github.l3_probe` stays alongside them, as it does for jira and
+    # google-analytics: it reads no fixture, so a revoked grant that the
+    # fixture-bound checks cannot call still fails a row.
     "github": ConnectorChecks(
         "github",
         reads=(
+            _declared_l3("github"),
             ReadCheck(
                 "github.current_user",
                 "github_get_current_user",

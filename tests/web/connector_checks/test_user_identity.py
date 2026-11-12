@@ -124,6 +124,30 @@ async def test_a_user_is_found_by_email_case_insensitively(
     assert rows(result)[0] == ("github", None, "pass", None, None)
 
 
+async def test_a_github_grant_is_still_judged_where_the_checks_need_fixtures(
+    db_users, monkeypatch
+):
+    """The user identity resolves no fixture, so the five fixture-bound GitHub
+    checks skip without a call; the probe-derived row reads none, so a revoked
+    grant still fails a row instead of the connector reading green."""
+    db, user, _ = db_users
+    _connect_github(db, user)
+    monkeypatch.setattr(LOADER, _Loader(_github_ok()))
+
+    result = await run_checks(UserIdentityAdapter(db, "monitor"))
+
+    fixture_missing = ("skip", "fixture_missing")
+    assert rows(result) == [
+        ("github", None, "pass", None, None),
+        ("github", "github.l3_probe", "pass", None, None),
+        ("github", "github.current_user", *fixture_missing, "github.login"),
+        ("github", "github.read_repository", *fixture_missing, "github.read_repo"),
+        ("github", "github.read_issue", *fixture_missing, "github.read_repo"),
+        ("github", "github.read_commits", *fixture_missing, "github.read_repo"),
+        ("github", "github.read_pull_request", *fixture_missing, "github.read_repo"),
+    ]
+
+
 async def test_the_allow_list_is_matched_on_the_user_found(db_users, monkeypatch):
     """Named by username, allowed by email: one account, one rule
     (``is_connector_probe_user``)."""

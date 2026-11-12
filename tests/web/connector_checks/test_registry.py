@@ -7,6 +7,7 @@ import io
 import json
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
@@ -1678,11 +1679,14 @@ def test_a_google_fixture_check_fails_on_an_error_envelope(
 
 _READ_REPO = "xagent-smoke/smoke-read"
 
-# The read checks, pinned: the tool, its arguments and its assertions. These
-# five tools carry the most of the 89 GitHub calls in the 7-day production-au
-# tool-call volume reported on xorbitsai/xagent-saas#2532, the five read checks
-# a Tier 1 connector declares at most.
+# The read checks, pinned: the tool, its arguments and its assertions. Five of
+# them are the five most called tools of the 89 GitHub calls in the 7-day
+# production-au tool-call volume reported on xorbitsai/xagent-saas#2532, the
+# five read checks a Tier 1 connector declares at most; `github.l3_probe` is
+# the probe-derived one the connector keeps alongside them, so a check that
+# reads no fixture still calls GitHub.
 _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "github.l3_probe": ("github_get_current_user", {}, (L3Envelope(),)),
     "github.current_user": (
         "github_get_current_user",
         {},
@@ -1960,36 +1964,36 @@ class _GitHubResponse:
         return json.loads(self.content)
 
 
-class _FakeGitHub:
-    """``github.py``'s HTTP layer, answering one fixed body per route."""
-
-    def __init__(self) -> None:
-        self.routes: dict[tuple[str, str], _GitHubResponse] = {}
-
-    def route(self, method: str, path: str, body: Any, status: int = 200) -> None:
-        self.routes[(method, path)] = _GitHubResponse(body, status)
-
-    def request(self, **kwargs: Any) -> _GitHubResponse:
-        path = str(kwargs["url"]).removeprefix(github.GITHUB_BASE_URL)
-        try:
-            return self.routes[(kwargs["method"], path)]
-        except KeyError:
-            raise AssertionError(
-                f"unrouted request: {kwargs['method']} {path}"
-            ) from None
-
-
 def _fake_github(
-    monkeypatch: pytest.MonkeyPatch, *routes: tuple[str, str, Any]
-) -> _FakeGitHub:
+    monkeypatch: pytest.MonkeyPatch,
+    *routes: tuple[str, str, Any],
+    status: int = 200,
+) -> dict[tuple[str, str], Any]:
+    """``github.py``'s HTTP layer: one body per route, answered with ``status``,
+    and the query params every request carried. A callable body is answered
+    from the params, for a route whose answer depends on them."""
     # The token the server reads its grant from; the fake transport never sends
     # it anywhere.
     monkeypatch.setenv("GITHUB_ACCESS_TOKEN", "access-token")
-    fake = _FakeGitHub()
-    for method, path, body in routes:
-        fake.route(method, path, body)
-    monkeypatch.setattr(github, "requests", fake)
-    return fake
+    bodies = {(method, path): body for method, path, body in routes}
+    params_of: dict[tuple[str, str], Any] = {}
+
+    def request(**kwargs: Any) -> _GitHubResponse:
+        route = (
+            kwargs["method"],
+            str(kwargs["url"]).removeprefix(github.GITHUB_BASE_URL),
+        )
+        params_of[route] = kwargs.get("params")
+        try:
+            body = bodies[route]
+        except KeyError:
+            raise AssertionError(f"unrouted request: {route[0]} {route[1]}") from None
+        if callable(body):
+            body = body(params_of[route] or {})
+        return _GitHubResponse(body, status)
+
+    monkeypatch.setattr(github, "requests", SimpleNamespace(request=request))
+    return params_of
 
 
 def _github_repository(**overrides: Any) -> dict[str, Any]:
@@ -2070,12 +2074,23 @@ def _github_user(**overrides: Any) -> dict[str, Any]:
     }
 
 
+def _github_declared_output(check_id: str) -> str:
+    """The check's own tool called with the arguments its declaration resolves
+    to: the sample is the call the check makes, not one built from literals."""
+    check = _read_check(check_id)
+    return getattr(github, check.tool)(
+        **resolve_fixtures(dict(check.arguments), _FIXTURES)
+    )
+
+
 def test_github_current_user_output_satisfies_its_declaration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _fake_github(monkeypatch, ("GET", "/user", _github_user()))
 
-    _assert_check_output("github.current_user", github.github_get_current_user())
+    _assert_check_output(
+        "github.current_user", _github_declared_output("github.current_user")
+    )
 
 
 def test_github_current_user_output_fails_on_another_account(
@@ -2100,7 +2115,7 @@ def test_github_repository_output_satisfies_its_declaration(
     )
 
     _assert_check_output(
-        "github.read_repository", github.github_get_repository(_READ_REPO)
+        "github.read_repository", _github_declared_output("github.read_repository")
     )
 
 
@@ -2148,7 +2163,9 @@ def test_github_issue_output_satisfies_its_declaration(
         ("GET", f"/repos/{_READ_REPO}/issues/1", _github_issue()),
     )
 
-    _assert_check_output("github.read_issue", github.github_get_issue(_READ_REPO, 1))
+    _assert_check_output(
+        "github.read_issue", _github_declared_output("github.read_issue")
+    )
 
 
 def test_github_issue_output_fails_on_a_pull_request(
@@ -2188,14 +2205,44 @@ def test_github_issue_output_fails_on_another_number(
 def test_github_commits_output_satisfies_its_declaration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _fake_github(
+    params_of = _fake_github(
         monkeypatch,
         ("GET", f"/repos/{_READ_REPO}/commits", [_github_commit()]),
     )
 
     _assert_check_output(
-        "github.read_commits",
-        github.github_list_commits(_READ_REPO, path="seed.md", limit=1),
+        "github.read_commits", _github_declared_output("github.read_commits")
+    )
+    # The declaration's `path` and `limit` are what GitHub is asked for: a
+    # dropped path would judge the branch head instead of the seed file's
+    # commit.
+    assert params_of[("GET", f"/repos/{_READ_REPO}/commits")] == {
+        "per_page": 1,
+        "page": 1,
+        "path": "seed.md",
+    }
+
+
+def test_github_commits_output_judges_the_seed_files_commit_not_the_branch_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default branch's newest commit is another file's, as the seed leaves
+    it; the check reads the seed file's history, so it still passes."""
+    head = _github_commit(
+        commit={"message": "edit the seed-after file", "author": {"name": "someone"}}
+    )
+    seeded = _github_commit()
+    _fake_github(
+        monkeypatch,
+        (
+            "GET",
+            f"/repos/{_READ_REPO}/commits",
+            lambda params: [seeded] if params.get("path") == "seed.md" else [head],
+        ),
+    )
+
+    _assert_check_output(
+        "github.read_commits", _github_declared_output("github.read_commits")
     )
 
 
@@ -2223,7 +2270,7 @@ def test_github_pull_request_output_satisfies_its_declaration(
     )
 
     _assert_check_output(
-        "github.read_pull_request", github.github_get_pull_request(_READ_REPO, 2)
+        "github.read_pull_request", _github_declared_output("github.read_pull_request")
     )
 
 
@@ -2265,35 +2312,21 @@ def test_github_pull_request_output_fails_on_another_number(
     )
 
 
-class _NoNetwork:
-    @staticmethod
-    def request(**kwargs: Any) -> Any:
-        raise RuntimeError("unauthorized")
-
-
 @pytest.mark.parametrize(
-    ("check_id", "call"),
+    ("check_id", "path"),
     [
-        ("github.current_user", lambda: github.github_get_current_user()),
-        (
-            "github.read_repository",
-            lambda: github.github_get_repository(_READ_REPO),
-        ),
-        ("github.read_issue", lambda: github.github_get_issue(_READ_REPO, 1)),
-        (
-            "github.read_commits",
-            lambda: github.github_list_commits(_READ_REPO, path="seed.md", limit=1),
-        ),
-        (
-            "github.read_pull_request",
-            lambda: github.github_get_pull_request(_READ_REPO, 2),
-        ),
+        ("github.current_user", "/user"),
+        ("github.read_repository", f"/repos/{_READ_REPO}"),
+        ("github.read_issue", f"/repos/{_READ_REPO}/issues/1"),
+        ("github.read_commits", f"/repos/{_READ_REPO}/commits"),
+        ("github.read_pull_request", f"/repos/{_READ_REPO}/pulls/2"),
     ],
 )
-def test_a_github_check_fails_on_an_error_envelope(
-    monkeypatch: pytest.MonkeyPatch, check_id: str, call: Callable[[], str]
+def test_a_github_check_fails_on_a_revoked_grant(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, path: str
 ) -> None:
-    monkeypatch.setenv("GITHUB_ACCESS_TOKEN", "access-token")
-    monkeypatch.setattr(github, "requests", _NoNetwork)
+    # A revoked token is a 401 with this body: the tool raises its API error,
+    # which the check sees as an envelope that is not a success.
+    _fake_github(monkeypatch, ("GET", path, {"message": "Bad credentials"}), status=401)
 
-    _assert_check_fails(check_id, call(), "status_success")
+    _assert_check_fails(check_id, _github_declared_output(check_id), "status_success")

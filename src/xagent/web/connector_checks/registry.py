@@ -80,12 +80,18 @@ _MICROSOFT_365_WRITE_WITHOUT_TENANT_PIN = (
     f"{_MICROSOFT_365_TIER_1}"
 )
 # Teams' five read checks, the cap per connector, carry 39 of its 51 calls
-# (76.5%), and its volume is too small for the 80% cut to mean much. Whether
-# that is accepted is still open on the issue.
+# (76.5%), and its volume is too small for the 80% cut to mean much; #3569
+# accepted that share.
 _TEAMS_READ_UNDER_THE_CAP = (
     "read left unchecked: the cap of five read checks stops the checked tools "
     "at 76.5% of Teams' calls, a volume too small for the 80% cut to be "
-    "meaningful, so whether Teams' other reads get checks is decided in "
+    f"meaningful, as decided in {_MICROSOFT_365_TIER_1}"
+)
+# auth_status and get_current_user read the same /me profile, so #3569 spent
+# the fifth Teams check on list_chats instead.
+_TEAMS_SECOND_PROFILE_READ = (
+    "read left unchecked: it reads the same /me profile as auth_status, which "
+    "is checked, so the check goes to list_chats instead, as decided in "
     f"{_MICROSOFT_365_TIER_1}"
 )
 
@@ -426,7 +432,9 @@ def _onedrive_checks() -> ConnectorChecks:
 def _teams_checks() -> ConnectorChecks:
     """Teams' Tier 1 read checks (#3569), on the read team's one channel,
     which lists the seeded message first. The account belongs to other
-    teams too, so the team list is checked for its shape only."""
+    teams too, so the team list is checked for its shape only, and the seed
+    cannot hold a chat, so the chat list is checked for its shape on an
+    empty list too."""
     team = FixtureRef("teams.seed_team_id")
     channel = FixtureRef("teams.seed_channel_id")
     return ConnectorChecks(
@@ -441,15 +449,6 @@ def _teams_checks() -> ConnectorChecks:
                 ),
             ),
             ReadCheck(
-                "teams.current_user",
-                "get_current_user",
-                assertions=(
-                    StatusSuccess(),
-                    HasKeys(("user",), ("id", "displayName", "userPrincipalName")),
-                    IsType(("user", "id"), "string"),
-                ),
-            ),
-            ReadCheck(
                 "teams.list_teams",
                 "list_teams",
                 assertions=(
@@ -457,6 +456,12 @@ def _teams_checks() -> ConnectorChecks:
                     Length(("teams",), 1),
                     EachHasKeys(("teams",), ("id", "displayName")),
                 ),
+            ),
+            ReadCheck(
+                "teams.list_chats",
+                "list_chats",
+                # Any chat must have an id; an empty list, the seed's, passes.
+                assertions=(StatusSuccess(), EachHasKeys(("chats",), ("id",))),
             ),
             ReadCheck(
                 "teams.list_seed_channels",
@@ -484,8 +489,9 @@ def _teams_checks() -> ConnectorChecks:
         exemptions=(
             *(
                 ToolExemption(tool, _TEAMS_READ_UNDER_THE_CAP)
-                for tool in ("list_chats", "get_chat_messages", "list_team_members")
+                for tool in ("get_chat_messages", "list_team_members")
             ),
+            ToolExemption("get_current_user", _TEAMS_SECOND_PROFILE_READ),
             *_exemptions(
                 issue=_MICROSOFT_365_TIER_1,
                 writes_without_cleanup=("send_channel_message", "send_chat_message"),

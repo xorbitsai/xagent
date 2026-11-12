@@ -491,6 +491,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     setSelectedFiles([])
     setOwnership("personal")
     setUploadProgress(0)
+    setUploadProgressDetail(null)
     setIngestionResults([])
     setWebIngestionResult(null)
     setNewCollectionName("")
@@ -562,6 +563,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           },
           () => setUploadProgressDetail(t("kb.migration.upgrading"))
         )
+        setUploadProgressDetail(null)
 
         const parsed = await parseApiResponse(response)
 
@@ -687,6 +689,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     let failedStatus: number | undefined
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
+    setUploadProgressDetail(null)
 
     const collectionName = trimmedCollectionName
     const teamClaimed = { current: false }
@@ -731,6 +734,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         },
         () => setUploadProgressDetail(t("kb.migration.upgrading"))
       )
+      setUploadProgressDetail(null)
 
       const parsed = await parseApiResponse(response)
 
@@ -815,6 +819,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     setIsCloudConnecting(true)
     let failedStatus: number | undefined
     setIngestionResults([])
+    setUploadProgressDetail(null)
 
     const collectionName = trimmedCollectionName
     const teamClaimed = { current: false }
@@ -868,6 +873,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         },
         body: JSON.stringify(requestBody)
       }, () => setUploadProgressDetail(t("kb.migration.upgrading")))
+      setUploadProgressDetail(null)
 
       const parsed = await parseApiResponse(response)
 

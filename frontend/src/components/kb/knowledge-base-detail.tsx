@@ -439,6 +439,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           },
           () => setUploadProgressDetail(t("kb.migration.upgrading"))
         )
+        setUploadProgressDetail(null)
 
         const parsed = await parseApiResponse(response)
 
@@ -643,6 +644,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         },
         () => setWebIngestionNotice(t("kb.migration.upgrading"))
       )
+      setWebIngestionNotice(null)
 
       const parsed = await parseApiResponse(response)
 

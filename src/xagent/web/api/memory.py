@@ -4,7 +4,8 @@ import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Any, Callable, Iterator, Optional
+from functools import partial
+from typing import Annotated, Any, Callable, Iterator, Optional, ParamSpec, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field, field_validator
@@ -68,6 +69,34 @@ MemoryIdPath = Annotated[
     Path(min_length=1, description="Memory ID, exactly as listed"),
 ]
 MEMORY_ID_ROUTE = "/{memory_id:memory_id}"
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+async def _run_store_call(
+    fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs
+) -> _T:
+    """Run one synchronous :class:`MemoryStore` call off the event loop.
+
+    The management routes are ``async def`` but the store interface is
+    synchronous, and a store may block: a remote store waits on the network
+    (up to its client timeouts) and an embedding store waits on a provider.
+    Called inline, one slow request stalls every other request and WebSocket
+    on the worker. The call runs in a worker thread instead.
+
+    Two properties the routes rely on:
+
+    * The thread runs in a copy of the caller's context, so the enclosing
+      :class:`UserContext` and :func:`usage_scope` bindings (context
+      variables) apply to the store call.
+    * Cancellation is deferred until the call has finished
+      (:func:`run_db_io_cancellation_safe`), so a client disconnect never
+      leaves a write running unobserved after the handler has gone; the
+      cancellation is then raised rather than a result reported.
+    """
+    return await run_db_io_cancellation_safe(partial(fn, *args, **kwargs))
 
 
 @contextmanager
@@ -282,14 +311,17 @@ class MemoryManagementRouter:
                                     usage_source="memory_api",
                                     model_ids=_embedding_model_ids(store),
                                 ):
-                                    memories = store.search(
+                                    memories = await _run_store_call(
+                                        store.search,
                                         query=search,
                                         k=1000,
                                         filters=filters if filters else None,
                                         similarity_threshold=similarity_threshold,
                                     )
                             else:
-                                memories = store.list_all(filters)
+                                memories = await _run_store_call(
+                                    store.list_all, filters
+                                )
                     except HTTPException:
                         raise
                     except Exception:
@@ -342,7 +374,7 @@ class MemoryManagementRouter:
             try:
                 # Set user context for memory operations
                 with UserContext(request_binding.user_id), memory_operation():
-                    response = store.delete(memory_id)
+                    response = await _run_store_call(store.delete, memory_id)
                     if response.success:
                         return {
                             "success": True,
@@ -374,7 +406,7 @@ class MemoryManagementRouter:
                 # Set user context for memory operations
                 with UserContext(request_binding.user_id), memory_operation():
                     # Get existing memory
-                    get_response = store.get(memory_id)
+                    get_response = await _run_store_call(store.get, memory_id)
                     if not get_response.success:
                         raise HTTPException(status_code=404, detail="Memory not found")
 
@@ -415,7 +447,7 @@ class MemoryManagementRouter:
                         usage_source="memory_api",
                         model_ids=_embedding_model_ids(store),
                     ):
-                        response = store.update(updated_memory)
+                        response = await _run_store_call(store.update, updated_memory)
                     if response.success:
                         return {
                             "success": True,
@@ -444,7 +476,7 @@ class MemoryManagementRouter:
             try:
                 # Set user context for memory operations
                 with UserContext(request_binding.user_id), memory_operation():
-                    stats = store.get_stats()
+                    stats = await _run_store_call(store.get_stats)
                     return MemoryStatsResponse(**stats)
             except HTTPException:
                 raise
@@ -488,7 +520,7 @@ class MemoryManagementRouter:
                         usage_source="memory_api",
                         model_ids=_embedding_model_ids(store),
                     ):
-                        response = store.add(memory_note)
+                        response = await _run_store_call(store.add, memory_note)
                     if response.success:
                         return {
                             "success": True,
@@ -556,7 +588,7 @@ class MemoryManagementRouter:
             try:
                 # Set user context for memory operations
                 with UserContext(request_binding.user_id), memory_operation():
-                    response = store.get(memory_id)
+                    response = await _run_store_call(store.get, memory_id)
                     if response.success and response.content:
                         memory = response.content
                         if isinstance(memory, MemoryNote):

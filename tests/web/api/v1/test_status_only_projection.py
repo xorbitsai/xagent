@@ -336,6 +336,8 @@ EXCLUDE = {
     ("DELETE", "/v1/skills/{name}"),
     ("GET", "/v1/mcp-servers"),
     ("GET", "/v1/mcp-servers/{server_id}"),
+    ("POST", "/v1/mcp-servers"),
+    ("GET", "/v1/mcp-servers/{server_id}/tools"),
 }
 
 

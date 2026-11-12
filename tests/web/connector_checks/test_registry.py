@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import io
 import json
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
@@ -12,8 +11,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from docx import Document
-from pptx import Presentation
+from mcp.server.fastmcp.exceptions import ToolError
 
 from xagent.core.tools.adapters.vibe import mcp_adapter
 from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
@@ -59,56 +57,22 @@ from xagent.web.tools.mcp import (
     google_drive,
     google_sheets,
     google_slides,
+    outlook,
+    planner,
     powerpoint,
+    sharepoint,
     word,
     zendesk,
     zoom,
 )
 
-# The three Microsoft document connectors, and the read each one declares: the
-# tool, the one required argument its fixture binds, the fixture key, and the
-# keys only a successful read of the object returns.
-_DOCUMENT_READS: Mapping[str, tuple[str, str, str, tuple[str, ...]]] = {
-    "excel": (
-        "excel_list_worksheets",
-        "file_path",
-        "excel.file_path",
-        ("worksheets", "truncated"),
-    ),
-    "powerpoint": (
-        "powerpoint_list_slides",
-        "file_path",
-        "powerpoint.file_path",
-        ("slides", "etag"),
-    ),
-    "word": (
-        "word_get_document_text",
-        "file_path",
-        "word.file_path",
-        ("text", "generation"),
-    ),
-}
-
+# The three Microsoft document connectors and the module of each. What their
+# checks assert is covered end to end in test_microsoft_365_checks.py.
 _APP_MODULES = {
     "excel": excel,
     "powerpoint": powerpoint,
     "word": word,
 }
-
-
-def _expected_checks(app_id: str) -> ConnectorChecks:
-    tool, argument, fixture_key, assertion_keys = _DOCUMENT_READS[app_id]
-    return ConnectorChecks(
-        app_id,
-        reads=(
-            ReadCheck(
-                f"{app_id}.read_fixture",
-                tool,
-                {argument: FixtureRef(fixture_key)},
-                assertions=(StatusSuccess(), HasKeys((), assertion_keys)),
-            ),
-        ),
-    )
 
 
 def _fixture_refs(value: Any) -> Iterator[FixtureRef]:
@@ -120,82 +84,6 @@ def _fixture_refs(value: Any) -> Iterator[FixtureRef]:
     elif isinstance(value, (list, tuple)):
         for item in value:
             yield from _fixture_refs(item)
-
-
-def _assert_declared_output(app_id: str, result: str) -> None:
-    """The tool's JSON output satisfies its declared assertions.
-
-    The engine that evaluates declarations is a follow-up, so the two
-    assertion kinds the document connectors declare are checked here directly.
-    """
-    checks = CONNECTOR_CHECKS[app_id]
-    payload = json.loads(result)
-    assert len(checks.reads) == 1
-    for assertion in checks.reads[0].assertions:
-        if isinstance(assertion, StatusSuccess):
-            assert payload.get("status") == "success"
-        elif isinstance(assertion, HasKeys):
-            target = payload
-            for segment in assertion.path:
-                target = target[segment]
-            assert isinstance(target, dict)
-            assert set(assertion.keys) <= set(target)
-        else:
-            raise AssertionError(f"unhandled assertion {assertion!r} for {app_id}")
-
-
-class _GraphResponse:
-    """The subset of ``requests.Response`` the Graph tools read."""
-
-    def __init__(
-        self,
-        *,
-        json_data: Any = None,
-        content: bytes = b"",
-        status_code: int = 200,
-    ) -> None:
-        self._json_data = json_data
-        self.content = (
-            json.dumps(json_data).encode("utf-8") if json_data is not None else content
-        )
-        self.status_code = status_code
-        self.headers: dict[str, str] = {}
-        self.text = self.content.decode("utf-8", errors="replace")
-
-    def json(self) -> Any:
-        return self._json_data
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-    def __enter__(self) -> _GraphResponse:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        return None
-
-    def iter_content(self, chunk_size: int = 1) -> Iterator[bytes]:
-        for start in range(0, len(self.content), chunk_size):
-            yield self.content[start : start + chunk_size]
-
-
-def _docx_bytes() -> bytes:
-    document = Document()
-    document.add_paragraph("Fixture document")
-    buffer = io.BytesIO()
-    document.save(buffer)
-    return buffer.getvalue()
-
-
-def _pptx_bytes() -> bytes:
-    presentation = Presentation()
-    presentation.slides.add_slide(presentation.slide_layouts[0])
-    buffer = io.BytesIO()
-    presentation.save(buffer)
-    return buffer.getvalue()
 
 
 def test_a_probed_connector_gets_its_l3_probe_as_one_read_check() -> None:
@@ -321,35 +209,29 @@ def test_declared_v2_checks_are_valid_and_keyed_by_their_app() -> None:
         validate_connector_checks(checks)
 
 
-@pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
-def test_a_document_connector_declares_its_fixture_read(app_id: str) -> None:
-    # Its other tools are exempted; test_tool_coverage.py covers those.
-    assert connector_checks_for(app_id).reads == _expected_checks(app_id).reads
-
-
 def test_every_document_fixture_key_is_namespaced_by_its_app() -> None:
     refs = [
         (app_id, ref)
-        for app_id in _DOCUMENT_READS
+        for app_id in _APP_MODULES
         for check in CONNECTOR_CHECKS[app_id].reads
         if isinstance(check, ReadCheck)
         for ref in _fixture_refs(check.arguments)
     ]
 
     # Every document connector contributes at least one fixture.
-    assert set(_DOCUMENT_READS) <= {app_id for app_id, _ in refs}
+    assert set(_APP_MODULES) <= {app_id for app_id, _ in refs}
     for app_id, ref in refs:
         assert ref.key.startswith(f"{app_id}."), (app_id, ref.key)
 
 
-@pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
+@pytest.mark.parametrize("app_id", sorted(_APP_MODULES))
 def test_the_probe_route_still_needs_a_fixture(app_id: str) -> None:
     assert l3_read_check(app_id) == UnprobeableCheck(
         f"{app_id}.l3_probe", "needs_fixture"
     )
 
 
-@pytest.mark.parametrize("app_id", sorted(_DOCUMENT_READS))
+@pytest.mark.parametrize("app_id", sorted(_APP_MODULES))
 def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
     """The tool is the module attribute of its own name: the in-repo servers
     register each ``@mcp.tool`` function under that name, and the decorator
@@ -375,54 +257,6 @@ def test_the_fixture_is_bound_to_a_required_parameter(app_id: str) -> None:
             and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
         }
         assert required <= set(check.arguments), (check.tool, required)
-
-
-def test_word_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
-    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", "51200")
-    response = _GraphResponse(content=_docx_bytes())
-    monkeypatch.setattr(word.requests, "request", Mock(return_value=response))
-
-    _assert_declared_output("word", word.word_get_document_text("Report.docx"))
-
-
-def test_excel_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
-    response = _GraphResponse(json_data={"value": [{"id": "ws-1", "name": "Sheet1"}]})
-    monkeypatch.setattr(excel.requests, "request", Mock(return_value=response))
-
-    _assert_declared_output("excel", excel.excel_list_worksheets("Book.xlsx"))
-
-
-def test_powerpoint_read_fixture_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
-    content = _pptx_bytes()
-    responses = iter(
-        [
-            _GraphResponse(
-                json_data={
-                    "id": "item-1",
-                    "size": len(content),
-                    "eTag": '"abc"',
-                    "parentReference": {"driveId": "drive-1"},
-                }
-            ),
-            _GraphResponse(content=content),
-        ]
-    )
-    monkeypatch.setattr(
-        powerpoint.requests, "request", Mock(side_effect=lambda **_: next(responses))
-    )
-
-    _assert_declared_output(
-        "powerpoint", powerpoint.powerpoint_list_slides("Deck.pptx")
-    )
 
 
 # The Tier 2 read checks (issue #3573): the tool, its arguments, and every
@@ -492,6 +326,131 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             IsType(("meetings",), "array"),
         ),
     ),
+    # Graph returns only the $select fields an item has (a draft has no
+    # ``from``), so an outlook list item asserts its id alone.
+    "outlook.get_profile": (
+        "outlook_get_profile",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("user",), ("id", "userPrincipalName")),
+            IsType(("user", "id"), "string"),
+        ),
+    ),
+    "outlook.list_messages": (
+        "outlook_list_messages",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("messages", "next_link")),
+            EachHasKeys(("messages",), ("id",)),
+            Length(("messages",), max=1),
+        ),
+    ),
+    "outlook.list_events": (
+        "outlook_list_events",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("events", "next_link")),
+            EachHasKeys(("events",), ("id",)),
+            Length(("events",), max=1),
+        ),
+    ),
+    "outlook.list_contacts": (
+        "outlook_list_contacts",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("contacts", "next_link")),
+            EachHasKeys(("contacts",), ("id",)),
+            Length(("contacts",), max=1),
+        ),
+    ),
+    # A SharePoint read takes a site id; Graph's "root" alias names the
+    # tenant's root site without a fixture.
+    "sharepoint.get_root_site": (
+        "sharepoint_get_root_site",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("site",), ("id", "webUrl")),
+            IsType(("site", "id"), "string"),
+        ),
+    ),
+    "sharepoint.get_site": (
+        "sharepoint_get_site",
+        {"site_id": "root"},
+        (
+            StatusSuccess(),
+            HasKeys(("site",), ("id", "webUrl")),
+            IsType(("site", "id"), "string"),
+        ),
+    ),
+    "sharepoint.list_drives": (
+        "sharepoint_list_drives",
+        {"site_id": "root"},
+        (
+            StatusSuccess(),
+            HasKeys((), ("drives", "truncated")),
+            EachHasKeys(("drives",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "sharepoint.list_items": (
+        "sharepoint_list_items",
+        {"site_id": "root", "top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("items", "truncated")),
+            EachHasKeys(("items",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+            Length(("items",), max=1),
+        ),
+    ),
+    "sharepoint.list_lists": (
+        "sharepoint_list_lists",
+        {"site_id": "root", "top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("lists", "truncated")),
+            EachHasKeys(("lists",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+            Length(("lists",), max=1),
+        ),
+    ),
+    # A Planner list takes no page size and projects a page too large for the
+    # output limit down to each item's id and label (and a plan's web_url).
+    "planner.list_my_plans": (
+        "planner_list_my_plans",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("plans", "next_link", "truncated")),
+            EachHasKeys(("plans",), ("id", "web_url")),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "planner.list_my_tasks": (
+        "planner_list_my_tasks",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("tasks", "next_link", "truncated")),
+            EachHasKeys(("tasks",), ("id",)),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "planner.list_my_groups": (
+        "planner_list_my_groups",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("groups", "next_link", "truncated")),
+            EachHasKeys(("groups",), ("id",)),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
 }
 
 
@@ -537,7 +496,9 @@ def test_a_tier_2_read_check_is_declared_exactly(
     assert check.assertions == assertions
 
 
-@pytest.mark.parametrize("app_id", ["google-ads", "zendesk", "zoom"])
+@pytest.mark.parametrize(
+    "app_id", ["google-ads", "outlook", "planner", "sharepoint", "zendesk", "zoom"]
+)
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)
     assert expected is not None
@@ -672,6 +633,411 @@ def test_google_ads_list_check_fails_on_another_shape(
         FailureClass.ASSERTION_FAILED,
         reason,
     )
+
+
+def _call_declared(check_id: str, tool: Callable[..., str]) -> str:
+    """``tool`` called with the arguments its check declares."""
+    return tool(**_read_check(check_id).arguments)
+
+
+_OUTLOOK_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
+    "outlook.list_messages": ("messages", outlook.outlook_list_messages),
+    "outlook.list_events": ("events", outlook.outlook_list_events),
+    "outlook.list_contacts": ("contacts", outlook.outlook_list_contacts),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_OUTLOOK_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+@pytest.mark.parametrize("next_link", [None, "https://graph.microsoft.com/v1.0/me/x"])
+def test_an_outlook_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+    check_id: str,
+    count: int,
+    next_link: str | None,
+) -> None:
+    _, tool = _OUTLOOK_LISTS[check_id]
+    page: dict[str, Any] = {"value": [{"id": "AAMkAD1"}] * count}
+    if next_link is not None:
+        page["@odata.nextLink"] = next_link
+    monkeypatch.setattr(outlook, "_graph_request", lambda *args, **kwargs: page)
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+
+
+def test_outlook_get_profile_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        outlook,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "userPrincipalName": "qa@example.onmicrosoft.com",
+            "displayName": None,
+        },
+    )
+
+    _assert_check_output(
+        "outlook.get_profile",
+        _call_declared("outlook.get_profile", outlook.outlook_get_profile),
+    )
+
+
+@pytest.mark.parametrize("check_id", sorted(_OUTLOOK_LISTS))
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        # A tool's error envelope, whether or not the tool returns one:
+        # outlook_list_messages raises instead (see the test below).
+        (lambda key: {"status": "error", "message": "403"}, "status_success"),
+        (lambda key: {"status": "success", key: []}, "has_keys"),
+        (
+            lambda key: {"status": "success", key: [{}], "next_link": None},
+            "each_has_keys",
+        ),
+        (
+            lambda key: {
+                "status": "success",
+                key: [{"id": "a"}, {"id": "b"}],
+                "next_link": None,
+            },
+            "length",
+        ),
+    ],
+)
+def test_an_outlook_list_check_fails_on_another_shape(
+    check_id: str, payload: Callable[[str], dict[str, Any]], reason: str
+) -> None:
+    list_key, _ = _OUTLOOK_LISTS[check_id]
+
+    _assert_check_fails(check_id, json.dumps(payload(list_key)), reason)
+
+
+def _graph_fails(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("Graph returned 403")
+
+
+def test_outlook_list_messages_raises_on_a_graph_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP reports the ToolError with its error flag set, so the check fails
+    as a call failure rather than on its assertions."""
+    monkeypatch.setattr(outlook, "_graph_request", _graph_fails)
+
+    with pytest.raises(ToolError):
+        _call_declared("outlook.list_messages", outlook.outlook_list_messages)
+
+
+@pytest.mark.parametrize("check_id", ["outlook.list_events", "outlook.list_contacts"])
+def test_an_outlook_list_error_envelope_fails_its_check(
+    monkeypatch: pytest.MonkeyPatch, check_id: str
+) -> None:
+    _, tool = _OUTLOOK_LISTS[check_id]
+    monkeypatch.setattr(outlook, "_graph_request", _graph_fails)
+
+    _assert_check_fails(check_id, _call_declared(check_id, tool), "status_success")
+
+
+@pytest.mark.parametrize(
+    ("user", "reason"),
+    [
+        ({"userPrincipalName": "qa@x"}, "has_keys"),
+        ({"id": 1, "userPrincipalName": "qa@x"}, "is_type"),
+    ],
+)
+def test_outlook_get_profile_check_fails_on_another_user(
+    user: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(
+        "outlook.get_profile",
+        json.dumps({"status": "success", "user": user}),
+        reason,
+    )
+
+
+def test_outlook_send_message_has_no_cleanup_tool() -> None:
+    assert [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["outlook"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ] == ["outlook_send_message"]
+
+
+_SHAREPOINT_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
+    "sharepoint.list_drives": ("drives", sharepoint.sharepoint_list_drives),
+    "sharepoint.list_items": ("items", sharepoint.sharepoint_list_items),
+    "sharepoint.list_lists": ("lists", sharepoint.sharepoint_list_lists),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_SHAREPOINT_LISTS))
+@pytest.mark.parametrize(
+    ("count", "next_link"),
+    [
+        (0, None),
+        (1, None),
+        # A non-empty library read with top 1: Graph links a next page and
+        # the tool reports truncated=True.
+        (1, "https://graph.microsoft.com/v1.0/sites/root/next"),
+    ],
+)
+def test_a_sharepoint_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int, next_link: str | None
+) -> None:
+    _, tool = _SHAREPOINT_LISTS[check_id]
+    paths: list[str] = []
+    item = {"id": "01ABC", "name": "Documents"}
+
+    def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        paths.append(path)
+        page: dict[str, Any] = {"value": [item] * count}
+        if next_link is not None:
+            page["@odata.nextLink"] = next_link
+        return page
+
+    monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+    # list_drives pages up to 200 items, so it follows the link: the next
+    # page holds one more item and no further link.
+    monkeypatch.setattr(
+        sharepoint, "_graph_get_absolute", lambda *args, **kwargs: {"value": [item]}
+    )
+
+    result = _call_declared(check_id, tool)
+
+    _assert_check_output(check_id, result)
+    assert paths and all(path.startswith("/sites/root/") for path in paths)
+    if next_link is not None and check_id != "sharepoint.list_drives":
+        assert json.loads(result)["truncated"] is True
+
+
+def test_sharepoint_get_root_site_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sharepoint,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "id": "contoso.sharepoint.com,1111,2222",
+            "webUrl": "https://contoso.sharepoint.com",
+            "name": "",
+        },
+    )
+
+    _assert_check_output(
+        "sharepoint.get_root_site",
+        _call_declared("sharepoint.get_root_site", sharepoint.sharepoint_get_root_site),
+    )
+
+
+def test_sharepoint_get_site_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths: list[str] = []
+
+    def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        paths.append(path)
+        return {
+            "id": "contoso.sharepoint.com,1111,2222",
+            "webUrl": "https://contoso.sharepoint.com",
+        }
+
+    monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+
+    _assert_check_output(
+        "sharepoint.get_site",
+        _call_declared("sharepoint.get_site", sharepoint.sharepoint_get_site),
+    )
+    assert paths == ["/sites/root"]
+
+
+def test_a_halved_sharepoint_list_still_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page too large for the output limit is halved down to no items, with
+    a message; the check bounds no lower count and allows extra keys."""
+    monkeypatch.setattr(
+        sharepoint,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "value": [{"id": "b!1", "name": "Documents", "description": "x" * 400}] * 2
+        },
+    )
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 300)
+
+    result = _call_declared("sharepoint.list_drives", sharepoint.sharepoint_list_drives)
+
+    payload = json.loads(result)
+    assert (payload["drives"], payload["truncated"]) == ([], True)
+    assert "message" in payload
+    _assert_check_output("sharepoint.list_drives", result)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "sharepoint.list_drives",
+            {"status": "error", "message": "accessDenied"},
+            "status_success",
+        ),
+        ("sharepoint.list_drives", {"status": "success", "drives": []}, "has_keys"),
+        (
+            "sharepoint.list_drives",
+            {"status": "success", "drives": [{"id": "b!1"}], "truncated": False},
+            "each_has_keys",
+        ),
+        (
+            "sharepoint.list_drives",
+            {"status": "success", "drives": [], "truncated": "false"},
+            "is_type",
+        ),
+        (
+            "sharepoint.list_items",
+            {
+                "status": "success",
+                "items": [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}],
+                "truncated": True,
+            },
+            "length",
+        ),
+        (
+            "sharepoint.list_lists",
+            {
+                "status": "success",
+                "lists": [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}],
+                "truncated": True,
+            },
+            "length",
+        ),
+        (
+            "sharepoint.get_root_site",
+            {"status": "success", "site": {"id": "x"}},
+            "has_keys",
+        ),
+    ],
+)
+def test_a_sharepoint_check_fails_on_another_shape(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
+def test_the_sharepoint_writes_stay_pending() -> None:
+    """An upload's file is a document-library list item, which
+    sharepoint_delete_list_item may be able to delete by a list item id the
+    upload does not return; whether a check can clean up that way is not
+    settled, so no sharepoint write takes the permanent no-cleanup reason."""
+    assert not [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["sharepoint"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ]
+
+
+# Each Planner list check: its list key, its tool, and an item whose last field
+# is long enough to push the page past the output limit.
+_PLANNER_LISTS: Mapping[str, tuple[str, Callable[..., str], dict[str, Any]]] = {
+    "planner.list_my_plans": (
+        "plans",
+        planner.planner_list_my_plans,
+        {"id": "plan-1", "title": "Roadmap", "owner": "group-1"},
+    ),
+    "planner.list_my_tasks": (
+        "tasks",
+        planner.planner_list_my_tasks,
+        {"id": "task-1", "title": "Ship", "planId": "plan-1"},
+    ),
+    "planner.list_my_groups": (
+        "groups",
+        planner.planner_list_my_groups,
+        {"id": "group-1", "displayName": "Team", "description": "Our team"},
+    ),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_PLANNER_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+def test_a_planner_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
+) -> None:
+    _, tool, item = _PLANNER_LISTS[check_id]
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        planner, "_graph_request", lambda *args, **kwargs: {"value": [item] * count}
+    )
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+
+
+@pytest.mark.parametrize("check_id", sorted(_PLANNER_LISTS))
+@pytest.mark.parametrize(
+    ("limit", "projection"), [(3000, "summary_fields"), (1000, "identity_and_label")]
+)
+def test_a_projected_planner_list_still_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, limit: int, projection: str
+) -> None:
+    """A page over the output limit keeps the summary fields, then only each
+    item's id and label: the per-item keys hold at both levels."""
+    list_key, tool, item = _PLANNER_LISTS[check_id]
+    *_, long_field = item
+    oversized = {**item, long_field: "x" * 2000, "notes": "y" * 4000}
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        planner, "_graph_request", lambda *args, **kwargs: {"value": [oversized]}
+    )
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: limit)
+
+    result = _call_declared(check_id, tool)
+
+    payload = json.loads(result)
+    assert payload["projection"] == projection
+    assert len(payload[list_key]) == 1
+    _assert_check_output(check_id, result)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "planner.list_my_groups",
+            {"status": "error", "message": "Planner cannot list the groups"},
+            "status_success",
+        ),
+        (
+            "planner.list_my_tasks",
+            {"status": "success", "tasks": [], "truncated": False},
+            "has_keys",
+        ),
+        (
+            "planner.list_my_plans",
+            {
+                "status": "success",
+                "plans": [{"id": "plan-1"}],
+                "next_link": None,
+                "truncated": False,
+            },
+            "each_has_keys",
+        ),
+        (
+            "planner.list_my_tasks",
+            {"status": "success", "tasks": [], "next_link": None, "truncated": 0},
+            "is_type",
+        ),
+    ],
+)
+def test_a_planner_check_fails_on_another_shape(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
+def test_no_planner_write_is_exempt_as_without_cleanup() -> None:
+    assert not [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["planner"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ]
 
 
 # The Google family (issue #3567): the read checks of the tenant the seed
@@ -1764,9 +2130,9 @@ _GITHUB_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
 }
 
 # The fixture keys the GitHub read checks use, pinned here so that adding or
-# dropping one shows in the diff. The tenant registry records the login and the
-# three ids the seed's layout knows; the two numbers GitHub assigns are
-# recorded from the first `apply` (xorbitsai/xagent-saas#2533).
+# dropping one shows in the diff. The xagent-saas tenant fixtures record the
+# login, the three ids the seed's layout knows, and the two numbers GitHub
+# assigns (xorbitsai/xagent-saas#2533).
 _GITHUB_FIXTURE_KEYS_USED = frozenset(
     {
         "github.issue_number",

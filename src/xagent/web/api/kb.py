@@ -53,7 +53,10 @@ from ...config import (
 )
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
-from ...core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
+from ...core.tools.core.RAG_tools.core.exceptions import (
+    CollectionMigratingError,
+    DatabaseOperationError,
+)
 from ...core.tools.core.RAG_tools.core.parser_registry import (
     get_supported_parsers,
     validate_parser_compatibility,
@@ -88,6 +91,12 @@ from ...core.tools.core.RAG_tools.kb.config_merge import (
 from ...core.tools.core.RAG_tools.kb.models import (
     KBDocumentRowsSnapshot,
     RollbackFailedUploadIngestionRequest,
+)
+from ...core.tools.core.RAG_tools.management.migration_state import (
+    admits_collection,
+    admitted_context_async,
+    ensure_collection_writable_async,
+    run_in_admitted_context,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
@@ -2613,6 +2622,35 @@ class _WebFileLock:
             _WEB_FILE_LOCKS[self._lock_key] = (lock, ref_count - 1)
 
 
+def _admission_collection(
+    collection: Optional[str] = None,
+    file: Optional[UploadFile] = None,
+    **_: Any,
+) -> Optional[str]:
+    """Route param collector for ``admits_collection``; a bad name is left to the handler."""
+    name = collection
+    if not (isinstance(name, str) and name.strip()):
+        filename = getattr(file, "filename", None)
+        if not filename:
+            return None
+        name = Path(Path(filename).name).stem
+        if not name:
+            return None
+    try:
+        return sanitize_path_component(name, "collection")
+    except ValueError:
+        return None
+
+
+def _cloud_admission_collection(
+    request: "CloudIngestRequest", **_: Any
+) -> Optional[str]:
+    try:
+        return sanitize_path_component(request.collection, "collection")
+    except ValueError:
+        return None
+
+
 def handle_kb_exceptions(func: T) -> T:
     """Decorator to handle common exceptions in KB API routes."""
 
@@ -2630,6 +2668,14 @@ def handle_kb_exceptions(func: T) -> T:
             )
         except FileReferenceConflict:
             raise HTTPException(status_code=409, detail=ADMISSION_CONFLICT_MESSAGE)
+        except CollectionMigratingError as e:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "kb_collection_migrating",
+                    "message": e.message,
+                },
+            ) from e
         except RollbackFailureError as e:
             logger.error("KB rollback failure in %s: %s", func.__name__, e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -3366,6 +3412,7 @@ async def _resolve_kb_ingestion_models(
 )
 @with_kb_user_scope
 @handle_kb_exceptions
+@admits_collection(_admission_collection)
 async def ingest(
     collection: str = Form(None),
     file: UploadFile = File(...),
@@ -3470,6 +3517,7 @@ async def ingest(
                 safe_filename,
                 user_id=int(_user.id),
                 collection=safe_collection,
+                create_if_not_exists=False,
                 collection_is_sanitized=True,
             )
         )
@@ -3480,6 +3528,8 @@ async def ingest(
         ) from e
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+
+    ingest_admission = await admitted_context_async(safe_collection)
 
     try:
         get_collection_sync(safe_collection)
@@ -3637,8 +3687,11 @@ async def ingest(
         loop = asyncio.get_running_loop()
         # Billed to the member who uploaded, not the storage tenant. The scope
         # lives in the worker, so a cancelled request still delivers it.
+        # run_in_executor does not carry contextvars; the admission goes in explicitly.
         api_result = await loop.run_in_executor(
             None,
+            run_in_admitted_context,
+            ingest_admission,
             run_in_usage_scope,
             int(actor_user.id),
             "kb_ingest",
@@ -3834,6 +3887,7 @@ async def create_ingest_job(
                 safe_filename,
                 user_id=int(_user.id),
                 collection=safe_collection,
+                create_if_not_exists=False,
                 collection_is_sanitized=True,
             )
         )
@@ -3844,6 +3898,7 @@ async def create_ingest_job(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
     await _ensure_background_job_queue_available_async()
+    await ensure_collection_writable_async(safe_collection)
     # Before the upload is staged; the job resolves and checks again when it
     # runs.
     _, ingest_model_ids = await _resolve_kb_ingestion_models(
@@ -4014,6 +4069,7 @@ async def create_ingest_job(
 
 @kb_router.post("/ingest-cloud", response_model=List[IngestionResult])
 @handle_kb_exceptions
+@admits_collection(_cloud_admission_collection)
 async def ingest_cloud(
     request: CloudIngestRequest,
     db: Session = Depends(get_db),
@@ -4068,6 +4124,7 @@ async def ingest_cloud(
         collection_existed_before = False
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    cloud_ingest_admission = await admitted_context_async(safe_collection)
     # Once access is confirmed and before anything is downloaded; every file
     # is ingested under this resolution and checked again as it starts.
     model_pin, ingest_model_ids = await _resolve_kb_ingestion_models(
@@ -4382,6 +4439,8 @@ async def ingest_cloud(
                         api_result: KBApiOperationResult[
                             IngestionResult
                         ] = await asyncio.to_thread(
+                            run_in_admitted_context,
+                            cloud_ingest_admission,
                             run_in_usage_scope,
                             actor_user_id,
                             "kb_ingest_cloud",
@@ -5095,6 +5154,7 @@ async def search(
 )
 @with_kb_user_scope
 @handle_kb_exceptions
+@admits_collection(_admission_collection)
 async def ingest_web(
     collection: str = Form(..., description="Target collection name"),
     start_url: str = Form(..., description="Starting URL for crawling"),
@@ -5235,6 +5295,7 @@ async def ingest_web(
         )
 
         await _ensure_collection_access(safe_collection, _user, allow_create=True)
+        web_ingest_admission = await admitted_context_async(safe_collection)
 
         url_patterns_list = (
             [p.strip() for p in url_patterns.split(",")] if url_patterns else None
@@ -5512,6 +5573,8 @@ async def ingest_web(
         # tasks.
         api_result = await asyncio.get_running_loop().run_in_executor(
             None,
+            run_in_admitted_context,
+            web_ingest_admission,
             run_in_usage_scope,
             int(actor_user.id),
             "kb_ingest_web",
@@ -5589,6 +5652,8 @@ async def ingest_web(
         raise
     except CollectionConfigSaveError:
         raise
+    except CollectionMigratingError:
+        raise
     except (ValueError, KeyError, TypeError) as e:
         if "collection_existed_before" in locals() and not collection_existed_before:
             await _cleanup_failed_new_collection_metadata(
@@ -5659,6 +5724,7 @@ async def create_ingest_web_job(
     )
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    await ensure_collection_writable_async(safe_collection)
 
     url_patterns_list = (
         [p.strip() for p in url_patterns.split(",")] if url_patterns else None

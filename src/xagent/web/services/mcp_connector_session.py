@@ -11,9 +11,10 @@ GET /api/mcp/servers/{id}/tools route and the connector probe use it.
 
 A caller that checks a connector the way an actor-scoped task loads it (the
 Toby connector probe, #3288) passes the task's actor policy, actor stdio
-adapter, execution identity and governing team through unchanged. An actor
-stdio connection has no ``MCPServer`` row, so it is started by catalog
-``app_id`` through ``list_actor_stdio_connector_tools`` instead.
+adapter, execution identity and governing team through unchanged; one that
+holds a persisted, leased task also passes the task's execution scope
+(#3742). An actor stdio connection has no ``MCPServer`` row, so it is started
+by catalog ``app_id`` through ``list_actor_stdio_connector_tools`` instead.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping, cast
 
 if TYPE_CHECKING:
+    from ...core.execution_scope import ExecutionScope
     from ...core.tools.adapters.vibe.mcp_adapter import MCPLoadResult
     from ...core.tools.core.mcp.sessions import Connection
     from ..tools.config import WebToolConfig
@@ -99,6 +101,7 @@ async def list_connector_tools(
     mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None = None,
     mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     connector_team_id: int | None = None,
+    execution_scope: ExecutionScope | None = None,
 ) -> ConnectorToolsResult:
     """Start ``server_id`` for ``user`` as a task would and list its tools.
 
@@ -117,12 +120,28 @@ async def list_connector_tools(
     A failure to resolve the team scope raises the config's typed
     ``ConnectorRuntimeError``, as a task's would.
 
-    ``connector_team_id`` and the actor policy, adapter and identity carry
-    authorization meaning and are trusted as given: they must come from an
-    agent or turn the caller has already authorized ``user`` to run (the
-    governing agent's owning team, never request input), as ``WebToolConfig``
-    documents for ``connector_team_id``. The team hook does no membership
-    check.
+    ``execution_scope`` is handed to ``WebToolConfig`` as the same object,
+    never a copy, and reaches every consumer a task's MCP config build hands
+    its scope to: the OAuth token resolver hook's ``TokenRequest.scope``, a
+    resolver-owned remote connection and its refresh, and the built-in Slack
+    actor runtime grant, for the first connection and for each call's
+    refresh. The Slack grant is requested only under an actor policy, with
+    ``mcp_actor_execution_identity`` set and no Slack credential stored for
+    the policy's owner, so without the identity the scope never reaches it.
+    It does not lift the ``execution_scoped`` refusal: an app that
+    needs a task's session runtime (chrome-devtools) stays UNSUPPORTED with a
+    scope. Nor does it key the sandbox lease, as a task's scope does through
+    ``sandbox_key_suffix``: the lease stays the per-user ``tools`` one.
+
+    ``connector_team_id``, the actor policy, adapter and identity, and the
+    execution scope carry authorization meaning and are trusted as given:
+    they must come from an agent or turn the caller has already authorized
+    ``user`` to run (the governing agent's owning team, never request input),
+    as ``WebToolConfig`` documents for ``connector_team_id``. The team hook
+    does no membership check. The scope must come from the same task as
+    ``mcp_actor_execution_identity``. Nothing here checks that the two match:
+    the Slack grant resolver is the only consumer that receives both, and the
+    OAuth token resolver hook receives the scope alone.
 
     The sandbox lease is released when this returns, so a caller that goes on
     to call a tool would open a new session on the web host. Such a caller
@@ -159,6 +178,7 @@ async def list_connector_tools(
         mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
         mcp_actor_execution_identity=mcp_actor_execution_identity,
         connector_team_id=connector_team_id,
+        execution_scope=execution_scope,
     )
     try:
         server_config = await tool_config.load_mcp_server_config(server_id)
@@ -339,6 +359,10 @@ def _task_tool_config(
     mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None,
     mcp_actor_execution_identity: MCPActorExecutionIdentity | None,
     connector_team_id: int | None,
+    # Only list_connector_tools takes a scope. The actor stdio entry point
+    # gets its connection from resolve_actor_mcp_stdio_configs, which takes
+    # none, so a scope there would reach nothing.
+    execution_scope: ExecutionScope | None = None,
 ) -> WebToolConfig:
     from ..tools.config import WebToolConfig
 
@@ -352,6 +376,7 @@ def _task_tool_config(
         mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
         mcp_actor_execution_identity=mcp_actor_execution_identity,
         connector_team_id=connector_team_id,
+        execution_scope=execution_scope,
     )
 
 

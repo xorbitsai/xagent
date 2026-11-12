@@ -442,6 +442,50 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1McpTool(BaseModel):
+    """One tool a connector offers."""
+
+    name: str = Field(
+        ...,
+        description=(
+            "Display name as the web app shows it: the prefix "
+            "server_<connector id>_<connector name>_ followed by the tool name, "
+            "with spaces, hyphens and every other character outside ASCII "
+            "letters, digits and underscores turned into underscores. When the "
+            "whole name would be longer than 64 characters the prefix is "
+            "shortened, and a tool name itself longer than 64 characters is cut "
+            "to 64. Not a stable identifier; use mcp_name."
+        ),
+    )
+    mcp_name: str = Field(
+        ...,
+        description="The tool's name on the MCP server, unchanged.",
+    )
+    description: str
+
+
+class V1McpToolLoadFailure(BaseModel):
+    """A load that failed while others may have succeeded."""
+
+    phase: str = Field(..., description="Where the load failed.")
+    attempts: int
+
+
+class V1McpServerTools(BaseModel):
+    """Response of ``GET /v1/mcp-servers/{server_id}/tools``.
+
+    The connector is started the way a task would start it. Waiting for a
+    free slot takes at most one MCP initialization timeout; starting the
+    connector takes at most one more, plus the time to read its settings.
+    ``failures`` is non-empty when some loads failed but at least one tool
+    came back.
+    """
+
+    id: int
+    tools: list[V1McpTool]
+    failures: list[V1McpToolLoadFailure]
+
+
 class V1McpServerAuthorization(BaseModel):
     """Whether the key holder has authorized an OAuth connector.
 
@@ -571,6 +615,68 @@ class V1McpServer(BaseModel):
     )
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+_HeaderName = Annotated[
+    str,
+    StringConstraints(
+        min_length=1, max_length=256, pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+    ),
+]
+# Visible ASCII and tab only: the HTTP client refuses anything else at run time.
+_HeaderValue = Annotated[
+    str, StringConstraints(max_length=4096, pattern=r"^[\x20-\x7e\t]*$")
+]
+
+
+class V1McpServerCreateRequest(BaseModel):
+    """Body for ``POST /v1/mcp-servers``.
+
+    Creates a connector the key holder owns. Only remote connectors can be
+    created. The auth fields ``bearer_token``, ``api_key_value``,
+    ``client_secret`` and ``access_token`` must be strings or null; non-empty
+    values are stored encrypted and returned masked. Header values are stored
+    as sent and returned masked. Other auth values are stored and returned as
+    sent. A new connector has no stored value, so ``********`` is rejected as
+    a header value or as a top-level auth value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, StringConstraints(min_length=1, max_length=100)] = Field(
+        ...,
+        description=(
+            "Unique across all users. Compared case-insensitively, treating "
+            "spaces, hyphens and underscores as the same character."
+        ),
+    )
+    transport: Annotated[str, StringConstraints(min_length=1, max_length=32)] = Field(
+        ..., description="'streamable_http' or 'sse'."
+    )
+    url: Annotated[str, StringConstraints(min_length=1, max_length=500)] = Field(
+        ..., description="Absolute http(s) URL without user info."
+    )
+    description: Optional[Annotated[str, StringConstraints(max_length=10000)]] = None
+    headers: dict[_HeaderName, _HeaderValue] = Field(
+        default_factory=dict,
+        max_length=20,
+        description="Request headers sent to the connector.",
+    )
+    auth: Optional[dict[str, Any]] = Field(
+        None,
+        max_length=30,
+        description=(
+            "Authentication settings. The keys 'app_id', 'provider' and "
+            "'builtin_provenance' mark catalog connectors and are rejected."
+        ),
+    )
+    runtime_input_schema: Optional[dict[str, Any]] = None
+    runtime_bindings: Optional[list[dict[str, Any]]] = None
+    signed_uploads: Optional[list[dict[str, Any]]] = None
+    allow_delegated_authorization: bool = False
+    enabled: bool = Field(
+        True, description="Whether the connector starts switched on for the holder."
+    )
 
 
 class CreateTaskResponse(BaseModel):

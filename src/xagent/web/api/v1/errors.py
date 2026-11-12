@@ -128,7 +128,7 @@ class V1ErrorCode(str, Enum):
     INVALID_INPUT = "invalid_input"
 
     # Emitted when a caller exceeds the v1 SSE stream concurrency caps
-    # (per-task or per-principal).
+    # (per-task or per-principal), or when no MCP tool-listing slot frees up.
     RATE_LIMITED = "rate_limited"
 
     # Monthly execution quota exhausted. 402 Payment Required. Two distinct
@@ -146,6 +146,29 @@ class V1ErrorCode(str, Enum):
     AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
+
+    # The connector's transport is not one the API can create, change or list
+    # tools for (only ``streamable_http`` and ``sse``). 400.
+    TRANSPORT_NOT_SUPPORTED = "transport_not_supported"
+
+    # The connector name is taken by another connector, reserved for a
+    # catalog app, or folds to a taken name. 409. ``details.connector_id``
+    # names the holder's own connector when the exact name is theirs.
+    CONNECTOR_NAME_CONFLICT = "connector_name_conflict"
+
+    # The connector cannot be started from the API. 409.
+    # ``details.reason`` says why: ``team_shared`` or ``disabled`` from the
+    # check made before anything starts; otherwise the connector session's own
+    # reason, such as ``unsupported`` (the connector can only start inside a
+    # task), ``grant_not_allowed_for_task_source`` or ``invalid_configuration``;
+    # ``client_rejected``, without the provider, when the vendor rejected the
+    # platform's own OAuth client; or ``unknown`` when that refusal has no
+    # usable code.
+    CONNECTOR_UNAVAILABLE = "connector_unavailable"
+
+    # The connector was started but did not come up, or came up with no
+    # tools. 502. ``details`` carries a short reason and the load phases.
+    CONNECTOR_TOOLS_UNAVAILABLE = "connector_tools_unavailable"
     INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
     MISSING_RUNTIME_CONTEXT = "missing_runtime_context"
     RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
@@ -240,6 +263,20 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
     V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.TRANSPORT_NOT_SUPPORTED: (
+        "Only the streamable_http and sse transports are supported through the API."
+    ),
+    V1ErrorCode.CONNECTOR_NAME_CONFLICT: (
+        "This connector name is already in use or reserved. Connector names are "
+        "unique across all users and are compared case-insensitively, treating "
+        "spaces, hyphens and underscores as the same character."
+    ),
+    V1ErrorCode.CONNECTOR_UNAVAILABLE: (
+        "This connector cannot be started from the API; details.reason says why."
+    ),
+    V1ErrorCode.CONNECTOR_TOOLS_UNAVAILABLE: (
+        "The connector could not be started or returned no tools."
+    ),
     V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
     V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",
     V1ErrorCode.RUNTIME_CONTEXT_IMMUTABLE: "Connector runtime context cannot change after task creation.",

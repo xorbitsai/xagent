@@ -672,8 +672,7 @@ Restoring vector search is offline work, and it does not happen by itself:
    authority back at the identity the stored vectors were written under, or
    keep the current authority and re-embed the data to match it.
 2. If re-embedding: quiesce all writers, back up the memory LanceDB directory,
-   and re-embed every row offline under the current authority. Do not re-embed
-   in place, and do not start a worker to do it.
+   and run `reembed_memory_table` (below) against the current authority.
 3. Restart every worker together. Confirm `mode` is `vector` and
    `supports_vector_search` is `true`.
 
@@ -681,6 +680,60 @@ Leaving a deployment in `text_only` indefinitely is a supported choice, as long
 as it is a deliberate one: semantic recall stays off until the step above is
 done, and every note written in the meantime will need the same offline
 re-embed before it becomes semantically searchable.
+
+### Re-embedding the memory table into a new vector space
+
+`reembed_memory_table` (`xagent.core.memory.embedding_migration`) is the
+offline step above. Run it with every writer stopped:
+
+```python
+from xagent.core.memory.embedding_migration import reembed_memory_table
+from xagent.core.model.embedding import create_embedding_adapter
+from xagent.providers.vector_store.lancedb import get_connection
+from xagent.web.memory_lifecycle import authority_embedding_config, memory_store_dir
+
+config = authority_embedding_config(snapshot)  # read the global memory authority
+outcome = reembed_memory_table(
+    get_connection(memory_store_dir()),
+    "memories",
+    config,
+    encode=create_embedding_adapter(config).encode,
+)
+```
+
+It recomputes every note into `<table>__migrate_<identity>`, then verifies that
+table against the live one (same ids, same row count, a vector on every row,
+and the target vector space declared in its schema). Only a verified table
+replaces the live one; otherwise the live table keeps serving and the outcome
+says what fell short. A run interrupted by its own failure resumes from the
+staging table and only embeds notes it is still missing.
+
+Two tables are left behind on purpose:
+
+* `memories__pre_migrate_<identity>` holds the previous vectors and the previous
+  declared space.
+* `memories__migrate_<identity>` remains only when the run did not complete, so
+  the next run resumes it; delete it once you have decided not to retry. It is
+  also dropped automatically once the live table already declares the target
+  space or a run swaps it in.
+
+Writers must be stopped. The routine still re-reads the live table at its
+current version, carries notes written before its last version check, and
+refuses to swap while writers keep committing (`not_converged`). A write that
+commits during the swap itself — one table commit — is not carried over, and a
+note deleted in that instant can reappear. Nothing in the memory write path
+takes a lock, so quiescence is what closes that window; do not treat the
+routine as safe next to live writers. Also do not run it next to admission: it
+waits for the same maintenance lock and fails with a lock timeout instead of
+running beside it.
+
+Rolling back: run the same routine with the previous identity and an adapter
+for the previous model. That re-embeds every note, including notes written
+after the migration, so nothing is lost. Restoring
+`memories__pre_migrate_<identity>` with `create_table("memories", data=...,
+mode="overwrite")` also works and is faster, but it discards every note written
+after the migration; use it only when you know there are none. Keep the backup
+until the new space has proven itself in production.
 
 ### Repairing BLOCKED_REPAIR
 

@@ -37,6 +37,7 @@ from .scope_columns import (
 from .storage_admission import AdmittedLanceDBMemoryStore, DormantLanceDBMemoryHandle
 from .vector_compatibility import (
     EmbeddingIdentity,
+    VectorCompatibility,
     _is_fully_admitted,
     classify_vector_compatibility,
 )
@@ -48,6 +49,9 @@ class LanceDBMemoryStore(MemoryStore):
     """LanceDB-based memory store implementation with vector search capabilities."""
 
     _embedding_model: Optional[BaseEmbedding]
+    # The vector space this store was admitted for; ``None`` when the caller
+    # never certified one (the generic constructor).
+    _vector_identity: Optional[EmbeddingIdentity]
     # Rows per backend batch on the streamed text-search path.
     _stream_batch_size: int = DEFAULT_STREAM_BATCH_SIZE
 
@@ -109,6 +113,7 @@ class LanceDBMemoryStore(MemoryStore):
             {},
             ensure_table=False,
         )
+        store._vector_identity = identity
         store._verify_admitted_table(admitted, identity)
         return store
 
@@ -151,6 +156,22 @@ class LanceDBMemoryStore(MemoryStore):
                 "after admission"
             )
 
+    def _table_accepts_vectors(self, table: Any) -> bool:
+        """Whether vectors this store produces may enter or rank this table.
+
+        Admission certifies the table once, at startup. An offline re-embed
+        that swaps the table afterwards leaves this store holding the previous
+        adapter; writing its vectors here, or ranking this table with them,
+        would mix two models that may well share a dimension. Only an admitted
+        store knows its identity, so every other store keeps today's behavior.
+        """
+        if self._vector_identity is None:
+            return True
+        return (
+            classify_vector_compatibility(table.schema, self._vector_identity)
+            is not VectorCompatibility.MISMATCHING
+        )
+
     def _set_up(
         self,
         db_dir: str,
@@ -162,6 +183,7 @@ class LanceDBMemoryStore(MemoryStore):
         ensure_table: bool,
     ) -> None:
         self._collection_name = collection_name
+        self._vector_identity = None
 
         # Handle different types of embedding_model input
         if embedding_model is None:
@@ -646,8 +668,15 @@ class LanceDBMemoryStore(MemoryStore):
                 }
 
                 # Add vector if available
-                if data["vector"]:
+                if data["vector"] and self._table_accepts_vectors(table):
                     record["vector"] = data["vector"]
+                elif data["vector"]:
+                    logger.warning(
+                        "Memory table %r no longer holds this store's vector "
+                        "space; storing memory %r without a vector",
+                        self._collection_name,
+                        data["id"],
+                    )
 
                 # Try to add the record. On a schema mismatch, migrate the
                 # existing table in place (preserving all rows) instead of
@@ -931,7 +960,7 @@ class LanceDBMemoryStore(MemoryStore):
             # Try vector search first
             try:
                 query_embedding = self._get_embedding(query)
-                if query_embedding:
+                if query_embedding and self._table_accepts_vectors(table):
                     # Check if vector column exists and has the right dimension
                     sample_df = table.search().limit(1).to_pandas()
                     if not sample_df.empty and "vector" in sample_df.columns:

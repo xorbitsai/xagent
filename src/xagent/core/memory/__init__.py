@@ -3,6 +3,8 @@ from .access_scope import bind_memory_access_scope as bind_memory_access_scope
 from .base import MemoryStore as MemoryStore
 from .core import MemoryNote as MemoryNote
 from .core import MemoryResponse as MemoryResponse
+from .embedding_migration import MemoryReembedStatus as MemoryReembedStatus
+from .embedding_migration import reembed_memory_table as reembed_memory_table
 from .lancedb import LanceDBMemoryStore as LanceDBMemoryStore
 from .lancedb_maintenance import (
     maintain_lancedb_memory_table as maintain_lancedb_memory_table,

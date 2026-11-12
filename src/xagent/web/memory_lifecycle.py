@@ -133,9 +133,10 @@ OPERATOR_GUIDANCE: dict[MemoryLifecycleState, str] = {
     MemoryLifecycleState.RESTART_REQUIRED: (
         "The global memory embedding authority no longer describes the vector "
         "space the stored memories were written under, or admission left "
-        "maintenance incomplete. Quiesce all writers, re-embed offline if the "
-        "existing vectors must be preserved, then restart every worker "
-        "together. Do not restart one worker into a mixed fleet."
+        "maintenance incomplete. Quiesce all writers, re-embed offline with "
+        "reembed_memory_table if the existing vectors must be preserved, then "
+        "restart every worker together. Do not restart one worker into a mixed "
+        "fleet."
     ),
     MemoryLifecycleState.BLOCKED_REPAIR: (
         "Persistent memory storage holds invalid legacy data or an "

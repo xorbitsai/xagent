@@ -76,7 +76,7 @@ _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
 _GITHUB_READS_BEYOND_THE_FIVE = (
     "read left unchecked: GitHub's 80% cut needs more tools than the five read "
     "checks a Tier 1 connector declares, so the five most called carry the "
-    f"checks, and whether the cap moves for these reads is decided in {_GITHUB_TIER_1}"
+    f"checks, as decided in {_GITHUB_TIER_1}"
 )
 
 

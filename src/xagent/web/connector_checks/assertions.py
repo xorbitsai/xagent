@@ -125,8 +125,8 @@ def resolve_expected(
 def value_at(raw: Any, payload: PayloadSource, path: PayloadPath) -> Any:
     """The value at ``path`` in ``raw``'s ``payload``, or ``MISSING``.
 
-    A write check reads its tenant id and a created object's id this way. A
-    result that is not a mapping, is flagged ``is_error`` or has no such
+    A write check reads its tenant pin's value and a created object's id this
+    way. A result that is not a mapping, is flagged ``is_error`` or has no such
     payload holds no value.
     """
     if not isinstance(raw, Mapping) or raw.get("is_error"):

@@ -344,9 +344,11 @@ async def pin_tenant(
     timeout: float,
     where: str,
 ) -> str | None:
-    """Read the connection's tenant id at ``path`` with ``step``: the
-    ``tenant_mismatch`` reason (``pin_failed``, ``mismatch``), or None when
-    it is ``expected``. The sweeper pins its tenant the same way."""
+    """Read with ``step``, at ``path``, the value only this tenant's account
+    has: its tenant id, or the id of the tenant's own write-area container.
+    Return the ``tenant_mismatch`` reason (``pin_failed``, ``mismatch``), or
+    None when the value is ``expected``. The sweeper pins its tenant the same
+    way."""
     pinned = await call_step(tool, step, timeout)
     raise_if_cancelled()
     if step_fault(pinned, step, where, _PIN) is not None:

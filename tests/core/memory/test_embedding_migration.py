@@ -349,6 +349,148 @@ def test_an_aborted_swap_leaves_no_backup_behind(connection, monkeypatch):
     )
 
 
+def test_a_failure_after_the_swap_keeps_the_backup(connection, monkeypatch):
+    _live(connection, _three_notes())
+
+    def stop(stage, batch=None):
+        if stage == "after_swap":
+            raise RuntimeError("process killed after the swap")
+
+    monkeypatch.setattr(migration, "_checkpoint", stop)
+
+    with pytest.raises(RuntimeError, match="after the swap"):
+        reembed_memory_table(connection, "memories", NEW, encode=Encoder())
+
+    assert all(
+        row["vector"] == pytest.approx([0.9] * 4) for row in _vectors(connection)
+    )
+    backup = _vectors(connection, backup_table_name("memories", NEW))
+    assert len(backup) == 3
+    assert all(row["vector"] == pytest.approx([0.1] * 4) for row in backup)
+
+
+def test_a_failure_once_the_swap_committed_keeps_the_backup(connection, monkeypatch):
+    _live(connection, _three_notes())
+    replace_from = migration._replace_from
+
+    def fail_after_the_commit(connection_, target_name, spilled, schema, **kwargs):
+        replace_from(connection_, target_name, spilled, schema, **kwargs)
+        if target_name == "memories":
+            raise OSError("the spilled file could not be removed")
+
+    monkeypatch.setattr(migration, "_replace_from", fail_after_the_commit)
+
+    with pytest.raises(OSError, match="could not be removed"):
+        reembed_memory_table(connection, "memories", NEW, encode=Encoder())
+
+    assert all(
+        row["vector"] == pytest.approx([0.9] * 4) for row in _vectors(connection)
+    )
+    backup = _vectors(connection, backup_table_name("memories", NEW))
+    assert all(row["vector"] == pytest.approx([0.1] * 4) for row in backup)
+
+
+def test_a_write_overwritten_by_the_swap_is_reported(connection, monkeypatch):
+    _live(connection, _three_notes())
+    replace_from = migration._replace_from
+
+    def write_first(connection_, target_name, spilled, schema, **kwargs):
+        if target_name == "memories":
+            _append(connection, [_row("late", "delta", 3, 0.1)])
+        return replace_from(connection_, target_name, spilled, schema, **kwargs)
+
+    monkeypatch.setattr(migration, "_replace_from", write_first)
+
+    outcome = reembed_memory_table(connection, "memories", NEW, encode=Encoder())
+
+    assert outcome.status is MemoryReembedStatus.SWAPPED_OVER_A_WRITE
+    assert outcome.backup_table == backup_table_name("memories", NEW)
+    assert outcome.backup_table in _names(connection)
+    assert "late" not in {row["id"] for row in _vectors(connection)}
+    live = connection.open_table("memories")
+    try:
+        live.checkout(live.version - 1)
+        assert "late" in {row["id"] for row in live.to_arrow().to_pylist()}
+    finally:
+        _safe_close_table(live)
+
+
+def test_blank_notes_stay_without_a_vector(connection):
+    blank = _row("b", "", 1, 0.1)
+    blank["vector"] = None
+    spaces = _row("c", " \n\t", 2, 0.1)
+    spaces["vector"] = None
+    _live(connection, [_row("a", "alpha", 1, 0.1), blank, spaces])
+    encoder = Encoder()
+
+    outcome = reembed_memory_table(connection, "memories", NEW, encode=encoder)
+
+    assert outcome.status is MemoryReembedStatus.COMPLETE
+    assert outcome.reembedded_rows == 1
+    assert encoder.calls == [["alpha"]]
+    rows = {row["id"]: row["vector"] for row in _vectors(connection)}
+    assert rows["a"] == pytest.approx([0.9] * 4)
+    assert (rows["b"], rows["c"]) == (None, None)
+
+
+def test_a_staged_blank_note_takes_the_source_text_verbatim(connection):
+    _live(connection, [_row("a", "", 1, 0.1)])
+    staging = _staging_table(connection)
+    staged = _staged_row("a", "", 1, None)
+    staged["text"] = None
+    staging.add(pa.Table.from_pylist([staged], schema=staging.schema))
+    _safe_close_table(staging)
+    encoder = Encoder()
+
+    outcome = reembed_memory_table(connection, "memories", NEW, encode=encoder)
+
+    assert outcome.status is MemoryReembedStatus.COMPLETE
+    assert encoder.calls == []
+    row = _vectors(connection)[0]
+    assert (row["text"], row["vector"]) == ("", None)
+
+
+def _target_table_with_a_vectorless_note(connection):
+    missing = _row("b", "beta", 1, 0.1)
+    missing["vector"] = None
+    blank = _row("c", "", 2, 0.1)
+    blank["vector"] = None
+    _live(connection, [_row("a", "alpha", 1, 0.1), missing, blank], identity=NEW)
+
+
+def test_a_table_in_the_target_space_has_vectorless_notes_backfilled(connection):
+    _target_table_with_a_vectorless_note(connection)
+    encoder = Encoder()
+
+    outcome = reembed_memory_table(connection, "memories", NEW, encode=encoder)
+
+    assert outcome.status is MemoryReembedStatus.ALREADY_TARGET
+    assert outcome.reembedded_rows == 1
+    assert encoder.calls == [["beta"]]
+    rows = {row["id"]: row["vector"] for row in _vectors(connection)}
+    assert rows["a"] == pytest.approx([0.1] * 4)
+    assert rows["b"] == pytest.approx([0.9] * 4)
+    assert rows["c"] is None
+
+
+def test_a_backfill_never_overwrites_a_note_edited_meanwhile(connection):
+    _target_table_with_a_vectorless_note(connection)
+
+    def edit_then_encode(texts):
+        table = connection.open_table("memories")
+        try:
+            table.update(where="id = 'b'", values={"text": "edited"})
+        finally:
+            _safe_close_table(table)
+        return [[0.9] * 4 for _ in texts]
+
+    outcome = reembed_memory_table(connection, "memories", NEW, encode=edit_then_encode)
+
+    assert outcome.reembedded_rows == 0
+    row = next(row for row in _vectors(connection) if row["id"] == "b")
+    assert (row["text"], row["vector"]) == ("edited", None)
+
+
 def test_a_write_before_the_swap_joins_the_new_table_with_a_new_vector(
     connection, monkeypatch
 ):

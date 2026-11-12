@@ -702,11 +702,15 @@ outcome = reembed_memory_table(
 ```
 
 It recomputes every note into `<table>__migrate_<identity>`, then verifies that
-table against the live one (same ids, same row count, a vector on every row,
-and the target vector space declared in its schema). Only a verified table
-replaces the live one; otherwise the live table keeps serving and the outcome
-says what fell short. A run interrupted by its own failure resumes from the
-staging table and only embeds notes it is still missing.
+table against the live one (same ids, same row count, a vector on every note
+that has text, and the target vector space declared in its schema). Notes with
+blank text are never encoded, matching how they were written. Only a verified
+table replaces the live one; otherwise the live table keeps serving and the
+outcome says what fell short. A run interrupted by its own failure resumes from
+the staging table and only embeds notes it is still missing. On a table that
+already declares the target space, a run only embeds, in place, notes that
+have text but no vector (`already_target`, with their count in
+`reembedded_rows`).
 
 Two tables are left behind on purpose:
 
@@ -721,7 +725,10 @@ Writers must be stopped. The routine still re-reads the live table at its
 current version, carries notes written before its last version check, and
 refuses to swap while writers keep committing (`not_converged`). A write that
 commits during the swap itself — one table commit — is not carried over, and a
-note deleted in that instant can reappear. Nothing in the memory write path
+note deleted in that instant can reappear. The run detects that case from the
+version the swap committed at and returns `swapped_over_a_write` instead of
+`complete`, keeping the backup; the detail names the live table versions that
+still hold the write (`table.checkout(version)`). Nothing in the memory write path
 takes a lock, so quiescence is what closes that window; do not treat the
 routine as safe next to live writers. Also do not run it next to admission: it
 waits for the same maintenance lock and fails with a lock timeout instead of

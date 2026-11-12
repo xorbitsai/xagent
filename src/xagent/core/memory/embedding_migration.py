@@ -5,14 +5,15 @@ verifies it against the live table, and only then replaces the live table in a
 single atomic overwrite. A config change alone cannot do this: when the old and
 new embeddings share a dimension, nothing else in the store notices.
 
-Invariant: the live table is replaced only by a table whose every row carries a
-vector produced by ``target_identity``, which declares that space, and whose
+Invariant: the live table is replaced only by a table whose every note with
+text carries a vector produced by ``target_identity`` (notes with blank text
+carry none, as on the write path), which declares that space, and whose
 ids and row count match the source. Any shortfall leaves the live table alone;
 the previous vectors stay in the backup table for rollback. Writers must be
 quiesced (``docs/deployment.md``): the routine carries rows written before its
 last version check and refuses to swap while they keep arriving, but a write
-that commits during the swap's own table commit is not carried, and no lock in
-the write path closes that window.
+that commits during the swap's own table commit is not carried: no lock in the
+write path closes that window, so it is detected and reported instead.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ class MemoryReembedStatus(str, Enum):
     EMBEDDING_FAILED = "embedding_failed"
     VERIFICATION_FAILED = "verification_failed"
     NOT_CONVERGED = "not_converged"
+    SWAPPED_OVER_A_WRITE = "swapped_over_a_write"
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,11 @@ def _vectors(texts: list[str], encode: Callable, dimension: int) -> list[list[fl
     return vectors
 
 
+def _blank_text(text: str | None) -> bool:
+    """Whether a note carries no text, and so no vector, by design."""
+    return not (text or "").strip()
+
+
 def _fill_staging(
     source: Any,
     staging: Any,
@@ -178,6 +185,7 @@ def _fill_staging(
             records.append((note_id, record["text"], metadata, owner, scope_dims))
         rows += len(records)
         ids = [record[0] for record in records]
+        blank_ids = {record[0] for record in records if _blank_text(record[1])}
         present: dict[str, tuple] = {}
         staged: set[str] = set()
         for offset in range(0, len(ids), _ID_CHUNK):
@@ -191,13 +199,14 @@ def _fill_staging(
             for row in found.to_pylist():
                 staged.add(row["id"])
                 present[row["id"]] = (
-                    row["text"] or "",
+                    row["text"],
                     row["metadata"],
                     row[USER_ID_COLUMN],
                     row[SCOPE_DIMS_COLUMN],
                 )
             # A staged row with no vector is not reusable however well it
             # matches: only a rewrite can give it one, so it counts as absent.
+            # Blank text carries no vector by contract, so it is exempt.
             missing_vector = (
                 staging.search()
                 .where(f"({sql_string_in('id', chunk)}) AND vector IS NULL")
@@ -205,7 +214,8 @@ def _fill_staging(
                 .to_arrow()
             )
             for row in missing_vector.to_pylist():
-                present.pop(row["id"], None)
+                if row["id"] not in blank_ids:
+                    present.pop(row["id"], None)
         todo = [
             record
             for record in records
@@ -218,7 +228,12 @@ def _fill_staging(
         stale = [record[0] for record in todo if record[0] in staged]
         if stale:
             staging.delete(sql_string_in("id", stale))
-        vectors = _vectors([record[1] or "" for record in todo], encode, dimension)
+        # Blank text is stored without a vector, exactly like the write path.
+        pending = [record for record in todo if not _blank_text(record[1])]
+        encoded = iter(
+            _vectors([record[1] or "" for record in pending], encode, dimension)
+        )
+        vectors = [None if _blank_text(record[1]) else next(encoded) for record in todo]
         staging.add(
             pa.Table.from_pylist(
                 [
@@ -235,7 +250,7 @@ def _fill_staging(
                 schema=staging.schema,
             )
         )
-        embedded += len(todo)
+        embedded += len(pending)
         _checkpoint("batch_filled", index)
     return rows, embedded
 
@@ -288,9 +303,17 @@ def _verify(
                 f"the staging table holds {staging.count_rows()} rows, "
                 f"the source {source_rows}"
             )
-        null_vectors = staging.count_rows("vector IS NULL")
-        if null_vectors:
-            return f"{null_vectors} staged notes carry no vector"
+        # SQL trim keeps newlines and tabs, so blankness is judged like the writer.
+        offenders = sum(
+            not _blank_text(text)
+            for batch in staging.search()
+            .where("vector IS NULL")
+            .select(["text"])
+            .to_batches(batch_size=batch_size)
+            for text in batch.column(0).to_pylist()
+        )
+        if offenders:
+            return f"{offenders} staged notes carry no vector"
         if (
             classify_vector_compatibility(staging.schema, identity)
             is not VectorCompatibility.MATCHING
@@ -317,8 +340,19 @@ def _spill(connection: Any, source_name: str, scratch: str, batch_size: int) -> 
     return staged, schema
 
 
-def _replace_from(connection: Any, target_name: str, spilled: str, schema: Any) -> None:
-    """Atomically replace ``target_name`` with the rows spilled at ``spilled``."""
+def _replace_from(
+    connection: Any,
+    target_name: str,
+    spilled: str,
+    schema: Any,
+    *,
+    on_commit: Callable[[], None] | None = None,
+) -> int:
+    """Replace ``target_name`` with the rows at ``spilled``; return its new version.
+
+    ``on_commit`` runs once the overwrite has committed, before anything below
+    it can fail.
+    """
     with pa.memory_map(spilled, "r") as mapped:
         reader = pa.ipc.open_file(mapped)
 
@@ -336,8 +370,14 @@ def _replace_from(connection: Any, target_name: str, spilled: str, schema: Any) 
         written = connection.create_table(
             target_name, data=data, schema=schema, mode="overwrite"
         )
-        _safe_close_table(written)
+        if on_commit is not None:
+            on_commit()
+        try:
+            version = int(written.version)
+        finally:
+            _safe_close_table(written)
     os.unlink(spilled)
+    return version
 
 
 def _copy_table(
@@ -356,6 +396,47 @@ def _copy_table(
     _replace_from(
         connection, target_name, *_spill(connection, source_name, scratch, batch_size)
     )
+
+
+def _backfill_vectors(
+    connection: Any,
+    table_name: str,
+    encode: Callable,
+    *,
+    batch_size: int,
+    dimension: int,
+) -> int:
+    """Embed in place the notes with text but no vector; return how many."""
+    reader = connection.open_table(table_name)
+    writer = None
+    filled = 0
+    try:
+        writer = connection.open_table(table_name)
+        for batch in (
+            reader.search().where("vector IS NULL").to_batches(batch_size=batch_size)
+        ):
+            rows = [row for row in batch.to_pylist() if not _blank_text(row["text"])]
+            if not rows:
+                continue
+            for row, vector in zip(
+                rows, _vectors([row["text"] for row in rows], encode, dimension)
+            ):
+                row["vector"] = vector
+            # Only rows a writer has not touched since they were read are filled.
+            result = (
+                writer.merge_insert("id")
+                .when_matched_update_all(
+                    where="target.vector IS NULL AND target.text = source.text AND "
+                    "((target.metadata IS NULL AND source.metadata IS NULL) "
+                    "OR target.metadata = source.metadata)"
+                )
+                .execute(pa.Table.from_pylist(rows, schema=reader.schema))
+            )
+            filled += int(result.num_updated_rows)
+    finally:
+        _safe_close_table(reader)
+        _safe_close_table(writer)
+    return filled
 
 
 def _current_version(connection: Any, table_name: str) -> int:
@@ -410,7 +491,9 @@ def reembed_memory_table(
     """Recompute every note's vector under ``target_identity`` and swap it in.
 
     Resumable: the staging table persists across interruptions, and a rerun
-    only embeds notes it is missing or whose text changed. Before the swap it
+    only embeds notes it is missing or whose text changed; on a table already in
+    the target space it only embeds, in place, notes left without a vector.
+    Notes with blank text carry no vector, as on the write path. Before the swap it
     must match the source's ids and row count and declare the target space; on
     any shortfall the live table keeps the vectors it had, and the previous
     table stays behind as a backup for rollback.
@@ -443,12 +526,17 @@ def reembed_memory_table(
     def stop(status: MemoryReembedStatus, **fields: Any) -> MemoryReembedOutcome:
         return MemoryReembedOutcome(status, staging_table=staging_name, **fields)
 
+    swapped = False
+
+    def mark_swapped() -> None:
+        nonlocal swapped
+        swapped = True
+
     source = staging = None
     scratch = ""
-    # A backup only means "the previous table" once the swap completed; any
+    # A backup only means "the previous table" once the swap committed; any
     # other exit drops the one this run wrote, and every abort leaves live intact.
     backup_written = None
-    keep_backup = False
     try:
         if not _lancedb_table_exists(connection, table_name):
             return stop(MemoryReembedStatus.ABSENT)
@@ -458,11 +546,28 @@ def reembed_memory_table(
             is VectorCompatibility.MATCHING
         ):
             rows = source.count_rows()
+            supported = _source_schema_supported(source.schema)
             _safe_close_table(source)
             source = None
             if _lancedb_table_exists(connection, staging_name):
                 connection.drop_table(staging_name)
-            return stop(MemoryReembedStatus.ALREADY_TARGET, source_rows=rows)
+            if not supported:
+                return stop(MemoryReembedStatus.ALREADY_TARGET, source_rows=rows)
+            try:
+                filled = _backfill_vectors(
+                    connection,
+                    table_name,
+                    encode,
+                    batch_size=batch_size,
+                    dimension=identity.dimension,
+                )
+            except _EmbeddingFailed as exc:
+                return stop(MemoryReembedStatus.EMBEDDING_FAILED, detail=str(exc))
+            return stop(
+                MemoryReembedStatus.ALREADY_TARGET,
+                source_rows=rows,
+                reembedded_rows=filled,
+            )
         if not _source_schema_supported(source.schema):
             return stop(
                 MemoryReembedStatus.INCOMPATIBLE_SCHEMA,
@@ -557,7 +662,10 @@ def reembed_memory_table(
             source = None
             _safe_close_table(staging)
             staging = None
-            _replace_from(connection, table_name, spilled, target_schema)
+            written = _replace_from(
+                connection, table_name, spilled, target_schema, on_commit=mark_swapped
+            )
+            _checkpoint("after_swap")
             swapped = connection.open_table(table_name)
             try:
                 verified = (
@@ -572,7 +680,22 @@ def reembed_memory_table(
                     "the swapped-in memory table failed its own verification"
                 )
             connection.drop_table(staging_name)
-            keep_backup = True
+            if written != snapshot + 1:
+                # The overwrite landed on a later version: a write committed after
+                # the last check and is now only in the live table's history.
+                detail = (
+                    f"a write committed during the swap was overwritten; versions "
+                    f"{snapshot + 1}..{written - 1} of {table_name!r} still hold it"
+                )
+                logger.error("Memory table %r: %s", table_name, detail)
+                return stop(
+                    MemoryReembedStatus.SWAPPED_OVER_A_WRITE,
+                    source_rows=source_rows,
+                    reembedded_rows=reembedded,
+                    passes=pass_no,
+                    backup_table=backup_name,
+                    detail=detail,
+                )
             logger.info(
                 "Re-embedded memory table %r into a new vector space (%d rows, "
                 "%d passes); previous table retained as %r",
@@ -601,7 +724,7 @@ def reembed_memory_table(
     finally:
         _safe_close_table(source)
         _safe_close_table(staging)
-        if backup_written and not keep_backup:
+        if backup_written and not swapped:
             try:
                 connection.drop_table(backup_written)
             except Exception:

@@ -11,6 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 from docx import Document
+from mcp.server.fastmcp.exceptions import ToolError
 from pptx import Presentation
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
@@ -52,7 +53,10 @@ from xagent.web.tools.mcp import (
     google_drive,
     google_sheets,
     google_slides,
+    outlook,
+    planner,
     powerpoint,
+    sharepoint,
     word,
     zendesk,
     zoom,
@@ -485,6 +489,131 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             IsType(("meetings",), "array"),
         ),
     ),
+    # Graph returns only the $select fields an item has (a draft has no
+    # ``from``), so an outlook list item asserts its id alone.
+    "outlook.get_profile": (
+        "outlook_get_profile",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("user",), ("id", "userPrincipalName")),
+            IsType(("user", "id"), "string"),
+        ),
+    ),
+    "outlook.list_messages": (
+        "outlook_list_messages",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("messages", "next_link")),
+            EachHasKeys(("messages",), ("id",)),
+            Length(("messages",), max=1),
+        ),
+    ),
+    "outlook.list_events": (
+        "outlook_list_events",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("events", "next_link")),
+            EachHasKeys(("events",), ("id",)),
+            Length(("events",), max=1),
+        ),
+    ),
+    "outlook.list_contacts": (
+        "outlook_list_contacts",
+        {"top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("contacts", "next_link")),
+            EachHasKeys(("contacts",), ("id",)),
+            Length(("contacts",), max=1),
+        ),
+    ),
+    # A SharePoint read takes a site id; Graph's "root" alias names the
+    # tenant's root site without a fixture.
+    "sharepoint.get_root_site": (
+        "sharepoint_get_root_site",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys(("site",), ("id", "webUrl")),
+            IsType(("site", "id"), "string"),
+        ),
+    ),
+    "sharepoint.get_site": (
+        "sharepoint_get_site",
+        {"site_id": "root"},
+        (
+            StatusSuccess(),
+            HasKeys(("site",), ("id", "webUrl")),
+            IsType(("site", "id"), "string"),
+        ),
+    ),
+    "sharepoint.list_drives": (
+        "sharepoint_list_drives",
+        {"site_id": "root"},
+        (
+            StatusSuccess(),
+            HasKeys((), ("drives", "truncated")),
+            EachHasKeys(("drives",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "sharepoint.list_items": (
+        "sharepoint_list_items",
+        {"site_id": "root", "top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("items", "truncated")),
+            EachHasKeys(("items",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+            Length(("items",), max=1),
+        ),
+    ),
+    "sharepoint.list_lists": (
+        "sharepoint_list_lists",
+        {"site_id": "root", "top": 1},
+        (
+            StatusSuccess(),
+            HasKeys((), ("lists", "truncated")),
+            EachHasKeys(("lists",), ("id", "name")),
+            IsType(("truncated",), "boolean"),
+            Length(("lists",), max=1),
+        ),
+    ),
+    # A Planner list takes no page size and projects a page too large for the
+    # output limit down to each item's id and label (and a plan's web_url).
+    "planner.list_my_plans": (
+        "planner_list_my_plans",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("plans", "next_link", "truncated")),
+            EachHasKeys(("plans",), ("id", "web_url")),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "planner.list_my_tasks": (
+        "planner_list_my_tasks",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("tasks", "next_link", "truncated")),
+            EachHasKeys(("tasks",), ("id",)),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
+    "planner.list_my_groups": (
+        "planner_list_my_groups",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("groups", "next_link", "truncated")),
+            EachHasKeys(("groups",), ("id",)),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
 }
 
 
@@ -530,7 +659,9 @@ def test_a_tier_2_read_check_is_declared_exactly(
     assert check.assertions == assertions
 
 
-@pytest.mark.parametrize("app_id", ["google-ads", "zendesk", "zoom"])
+@pytest.mark.parametrize(
+    "app_id", ["google-ads", "outlook", "planner", "sharepoint", "zendesk", "zoom"]
+)
 def test_a_tier_2_l3_check_is_the_probe_derived_one(app_id: str) -> None:
     expected = l3_read_check(app_id)
     assert expected is not None
@@ -665,6 +796,411 @@ def test_google_ads_list_check_fails_on_another_shape(
         FailureClass.ASSERTION_FAILED,
         reason,
     )
+
+
+def _call_declared(check_id: str, tool: Callable[..., str]) -> str:
+    """``tool`` called with the arguments its check declares."""
+    return tool(**_read_check(check_id).arguments)
+
+
+_OUTLOOK_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
+    "outlook.list_messages": ("messages", outlook.outlook_list_messages),
+    "outlook.list_events": ("events", outlook.outlook_list_events),
+    "outlook.list_contacts": ("contacts", outlook.outlook_list_contacts),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_OUTLOOK_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+@pytest.mark.parametrize("next_link", [None, "https://graph.microsoft.com/v1.0/me/x"])
+def test_an_outlook_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+    check_id: str,
+    count: int,
+    next_link: str | None,
+) -> None:
+    _, tool = _OUTLOOK_LISTS[check_id]
+    page: dict[str, Any] = {"value": [{"id": "AAMkAD1"}] * count}
+    if next_link is not None:
+        page["@odata.nextLink"] = next_link
+    monkeypatch.setattr(outlook, "_graph_request", lambda *args, **kwargs: page)
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+
+
+def test_outlook_get_profile_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        outlook,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "userPrincipalName": "qa@example.onmicrosoft.com",
+            "displayName": None,
+        },
+    )
+
+    _assert_check_output(
+        "outlook.get_profile",
+        _call_declared("outlook.get_profile", outlook.outlook_get_profile),
+    )
+
+
+@pytest.mark.parametrize("check_id", sorted(_OUTLOOK_LISTS))
+@pytest.mark.parametrize(
+    ("payload", "reason"),
+    [
+        # A tool's error envelope, whether or not the tool returns one:
+        # outlook_list_messages raises instead (see the test below).
+        (lambda key: {"status": "error", "message": "403"}, "status_success"),
+        (lambda key: {"status": "success", key: []}, "has_keys"),
+        (
+            lambda key: {"status": "success", key: [{}], "next_link": None},
+            "each_has_keys",
+        ),
+        (
+            lambda key: {
+                "status": "success",
+                key: [{"id": "a"}, {"id": "b"}],
+                "next_link": None,
+            },
+            "length",
+        ),
+    ],
+)
+def test_an_outlook_list_check_fails_on_another_shape(
+    check_id: str, payload: Callable[[str], dict[str, Any]], reason: str
+) -> None:
+    list_key, _ = _OUTLOOK_LISTS[check_id]
+
+    _assert_check_fails(check_id, json.dumps(payload(list_key)), reason)
+
+
+def _graph_fails(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("Graph returned 403")
+
+
+def test_outlook_list_messages_raises_on_a_graph_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP reports the ToolError with its error flag set, so the check fails
+    as a call failure rather than on its assertions."""
+    monkeypatch.setattr(outlook, "_graph_request", _graph_fails)
+
+    with pytest.raises(ToolError):
+        _call_declared("outlook.list_messages", outlook.outlook_list_messages)
+
+
+@pytest.mark.parametrize("check_id", ["outlook.list_events", "outlook.list_contacts"])
+def test_an_outlook_list_error_envelope_fails_its_check(
+    monkeypatch: pytest.MonkeyPatch, check_id: str
+) -> None:
+    _, tool = _OUTLOOK_LISTS[check_id]
+    monkeypatch.setattr(outlook, "_graph_request", _graph_fails)
+
+    _assert_check_fails(check_id, _call_declared(check_id, tool), "status_success")
+
+
+@pytest.mark.parametrize(
+    ("user", "reason"),
+    [
+        ({"userPrincipalName": "qa@x"}, "has_keys"),
+        ({"id": 1, "userPrincipalName": "qa@x"}, "is_type"),
+    ],
+)
+def test_outlook_get_profile_check_fails_on_another_user(
+    user: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(
+        "outlook.get_profile",
+        json.dumps({"status": "success", "user": user}),
+        reason,
+    )
+
+
+def test_outlook_send_message_has_no_cleanup_tool() -> None:
+    assert [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["outlook"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ] == ["outlook_send_message"]
+
+
+_SHAREPOINT_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
+    "sharepoint.list_drives": ("drives", sharepoint.sharepoint_list_drives),
+    "sharepoint.list_items": ("items", sharepoint.sharepoint_list_items),
+    "sharepoint.list_lists": ("lists", sharepoint.sharepoint_list_lists),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_SHAREPOINT_LISTS))
+@pytest.mark.parametrize(
+    ("count", "next_link"),
+    [
+        (0, None),
+        (1, None),
+        # A non-empty library read with top 1: Graph links a next page and
+        # the tool reports truncated=True.
+        (1, "https://graph.microsoft.com/v1.0/sites/root/next"),
+    ],
+)
+def test_a_sharepoint_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int, next_link: str | None
+) -> None:
+    _, tool = _SHAREPOINT_LISTS[check_id]
+    paths: list[str] = []
+    item = {"id": "01ABC", "name": "Documents"}
+
+    def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        paths.append(path)
+        page: dict[str, Any] = {"value": [item] * count}
+        if next_link is not None:
+            page["@odata.nextLink"] = next_link
+        return page
+
+    monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+    # list_drives pages up to 200 items, so it follows the link: the next
+    # page holds one more item and no further link.
+    monkeypatch.setattr(
+        sharepoint, "_graph_get_absolute", lambda *args, **kwargs: {"value": [item]}
+    )
+
+    result = _call_declared(check_id, tool)
+
+    _assert_check_output(check_id, result)
+    assert paths and all(path.startswith("/sites/root/") for path in paths)
+    if next_link is not None and check_id != "sharepoint.list_drives":
+        assert json.loads(result)["truncated"] is True
+
+
+def test_sharepoint_get_root_site_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sharepoint,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "id": "contoso.sharepoint.com,1111,2222",
+            "webUrl": "https://contoso.sharepoint.com",
+            "name": "",
+        },
+    )
+
+    _assert_check_output(
+        "sharepoint.get_root_site",
+        _call_declared("sharepoint.get_root_site", sharepoint.sharepoint_get_root_site),
+    )
+
+
+def test_sharepoint_get_site_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths: list[str] = []
+
+    def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        paths.append(path)
+        return {
+            "id": "contoso.sharepoint.com,1111,2222",
+            "webUrl": "https://contoso.sharepoint.com",
+        }
+
+    monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+
+    _assert_check_output(
+        "sharepoint.get_site",
+        _call_declared("sharepoint.get_site", sharepoint.sharepoint_get_site),
+    )
+    assert paths == ["/sites/root"]
+
+
+def test_a_halved_sharepoint_list_still_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page too large for the output limit is halved down to no items, with
+    a message; the check bounds no lower count and allows extra keys."""
+    monkeypatch.setattr(
+        sharepoint,
+        "_graph_request",
+        lambda *args, **kwargs: {
+            "value": [{"id": "b!1", "name": "Documents", "description": "x" * 400}] * 2
+        },
+    )
+    monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 300)
+
+    result = _call_declared("sharepoint.list_drives", sharepoint.sharepoint_list_drives)
+
+    payload = json.loads(result)
+    assert (payload["drives"], payload["truncated"]) == ([], True)
+    assert "message" in payload
+    _assert_check_output("sharepoint.list_drives", result)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "sharepoint.list_drives",
+            {"status": "error", "message": "accessDenied"},
+            "status_success",
+        ),
+        ("sharepoint.list_drives", {"status": "success", "drives": []}, "has_keys"),
+        (
+            "sharepoint.list_drives",
+            {"status": "success", "drives": [{"id": "b!1"}], "truncated": False},
+            "each_has_keys",
+        ),
+        (
+            "sharepoint.list_drives",
+            {"status": "success", "drives": [], "truncated": "false"},
+            "is_type",
+        ),
+        (
+            "sharepoint.list_items",
+            {
+                "status": "success",
+                "items": [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}],
+                "truncated": True,
+            },
+            "length",
+        ),
+        (
+            "sharepoint.list_lists",
+            {
+                "status": "success",
+                "lists": [{"id": "1", "name": "a"}, {"id": "2", "name": "b"}],
+                "truncated": True,
+            },
+            "length",
+        ),
+        (
+            "sharepoint.get_root_site",
+            {"status": "success", "site": {"id": "x"}},
+            "has_keys",
+        ),
+    ],
+)
+def test_a_sharepoint_check_fails_on_another_shape(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
+def test_the_sharepoint_writes_stay_pending() -> None:
+    """An upload's file is a document-library list item, which
+    sharepoint_delete_list_item may be able to delete by a list item id the
+    upload does not return; whether a check can clean up that way is not
+    settled, so no sharepoint write takes the permanent no-cleanup reason."""
+    assert not [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["sharepoint"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ]
+
+
+# Each Planner list check: its list key, its tool, and an item whose last field
+# is long enough to push the page past the output limit.
+_PLANNER_LISTS: Mapping[str, tuple[str, Callable[..., str], dict[str, Any]]] = {
+    "planner.list_my_plans": (
+        "plans",
+        planner.planner_list_my_plans,
+        {"id": "plan-1", "title": "Roadmap", "owner": "group-1"},
+    ),
+    "planner.list_my_tasks": (
+        "tasks",
+        planner.planner_list_my_tasks,
+        {"id": "task-1", "title": "Ship", "planId": "plan-1"},
+    ),
+    "planner.list_my_groups": (
+        "groups",
+        planner.planner_list_my_groups,
+        {"id": "group-1", "displayName": "Team", "description": "Our team"},
+    ),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_PLANNER_LISTS))
+@pytest.mark.parametrize("count", [0, 1])
+def test_a_planner_list_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
+) -> None:
+    _, tool, item = _PLANNER_LISTS[check_id]
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        planner, "_graph_request", lambda *args, **kwargs: {"value": [item] * count}
+    )
+
+    _assert_check_output(check_id, _call_declared(check_id, tool))
+
+
+@pytest.mark.parametrize("check_id", sorted(_PLANNER_LISTS))
+@pytest.mark.parametrize(
+    ("limit", "projection"), [(3000, "summary_fields"), (1000, "identity_and_label")]
+)
+def test_a_projected_planner_list_still_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch, check_id: str, limit: int, projection: str
+) -> None:
+    """A page over the output limit keeps the summary fields, then only each
+    item's id and label: the per-item keys hold at both levels."""
+    list_key, tool, item = _PLANNER_LISTS[check_id]
+    *_, long_field = item
+    oversized = {**item, long_field: "x" * 2000, "notes": "y" * 4000}
+    monkeypatch.delenv("AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        planner, "_graph_request", lambda *args, **kwargs: {"value": [oversized]}
+    )
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: limit)
+
+    result = _call_declared(check_id, tool)
+
+    payload = json.loads(result)
+    assert payload["projection"] == projection
+    assert len(payload[list_key]) == 1
+    _assert_check_output(check_id, result)
+
+
+@pytest.mark.parametrize(
+    ("check_id", "payload", "reason"),
+    [
+        (
+            "planner.list_my_groups",
+            {"status": "error", "message": "Planner cannot list the groups"},
+            "status_success",
+        ),
+        (
+            "planner.list_my_tasks",
+            {"status": "success", "tasks": [], "truncated": False},
+            "has_keys",
+        ),
+        (
+            "planner.list_my_plans",
+            {
+                "status": "success",
+                "plans": [{"id": "plan-1"}],
+                "next_link": None,
+                "truncated": False,
+            },
+            "each_has_keys",
+        ),
+        (
+            "planner.list_my_tasks",
+            {"status": "success", "tasks": [], "next_link": None, "truncated": 0},
+            "is_type",
+        ),
+    ],
+)
+def test_a_planner_check_fails_on_another_shape(
+    check_id: str, payload: dict[str, Any], reason: str
+) -> None:
+    _assert_check_fails(check_id, json.dumps(payload), reason)
+
+
+def test_no_planner_write_is_exempt_as_without_cleanup() -> None:
+    assert not [
+        exemption.tool
+        for exemption in CONNECTOR_CHECKS["planner"].exemptions
+        if exemption.reason == WRITE_WITHOUT_CLEANUP
+    ]
 
 
 # The Google family (issue #3567): the read checks of the tenant the seed

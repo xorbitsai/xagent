@@ -667,6 +667,132 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    # Tier 2 (#3573). Which $select fields Graph returns for every message,
+    # event or contact has not been checked against a live mailbox, so a list
+    # item asserts its id alone.
+    "outlook": ConnectorChecks(
+        "outlook",
+        reads=(
+            _declared_l3("outlook"),
+            ReadCheck(
+                "outlook.get_profile",
+                "outlook_get_profile",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("id", "userPrincipalName")),
+                    IsType(("user", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_messages",
+                "outlook_list_messages",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("messages", "next_link")),
+                    EachHasKeys(("messages",), ("id",)),
+                    Length(("messages",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_events",
+                "outlook_list_events",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("events", "next_link")),
+                    EachHasKeys(("events",), ("id",)),
+                    Length(("events",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "outlook.list_contacts",
+                "outlook_list_contacts",
+                {"top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("contacts", "next_link")),
+                    EachHasKeys(("contacts",), ("id",)),
+                    Length(("contacts",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=("outlook_get_message",),
+            writes=("outlook_create_event", "outlook_delete_event"),
+            in_place_edits=("outlook_update_event",),
+            writes_without_cleanup=("outlook_send_message",),
+        ),
+    ),
+    # Tier 2 (#3573). A list takes no page size, so no check bounds its
+    # length, and a page too large for the output limit is projected down to
+    # each item's id and label (and a plan's web_url), so an item asserts
+    # only the keys that survive that projection.
+    "planner": ConnectorChecks(
+        "planner",
+        reads=(
+            _declared_l3("planner"),
+            ReadCheck(
+                "planner.list_my_plans",
+                "planner_list_my_plans",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("plans", "next_link", "truncated")),
+                    EachHasKeys(("plans",), ("id", "web_url")),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "planner.list_my_tasks",
+                "planner_list_my_tasks",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("tasks", "next_link", "truncated")),
+                    EachHasKeys(("tasks",), ("id",)),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "planner.list_my_groups",
+                "planner_list_my_groups",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("groups", "next_link", "truncated")),
+                    EachHasKeys(("groups",), ("id",)),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "planner_list_plans",
+                "planner_get_plan",
+                "planner_list_buckets",
+                "planner_list_tasks",
+                "planner_get_task",
+                "planner_get_task_details",
+            ),
+            writes=(
+                "planner_create_plan",
+                "planner_delete_plan",
+                "planner_create_bucket",
+                "planner_delete_bucket",
+                "planner_create_task",
+                "planner_delete_task",
+                "planner_add_checklist_item",
+                "planner_delete_checklist_item",
+            ),
+            in_place_edits=(
+                "planner_update_task",
+                "planner_update_task_description",
+                "planner_assign_task",
+                "planner_unassign_task",
+                "planner_set_checklist_item_checked",
+            ),
+        ),
+    ),
     "powerpoint": ConnectorChecks(
         "powerpoint",
         reads=(
@@ -693,6 +819,87 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "powerpoint_delete_slide",
             ),
             writes_without_cleanup=("powerpoint_create_presentation",),
+        ),
+    ),
+    # Tier 2 (#3573). get_site and every list take a site id; Graph's "root"
+    # alias names the tenant's root site, so no fixture is needed. list_drives takes no
+    # page size, so its list has no length bound.
+    "sharepoint": ConnectorChecks(
+        "sharepoint",
+        reads=(
+            _declared_l3("sharepoint"),
+            ReadCheck(
+                "sharepoint.get_root_site",
+                "sharepoint_get_root_site",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("site",), ("id", "webUrl")),
+                    IsType(("site", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.get_site",
+                "sharepoint_get_site",
+                {"site_id": "root"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("site",), ("id", "webUrl")),
+                    IsType(("site", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_drives",
+                "sharepoint_list_drives",
+                {"site_id": "root"},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("drives", "truncated")),
+                    EachHasKeys(("drives",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_items",
+                "sharepoint_list_items",
+                {"site_id": "root", "top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("items", "truncated")),
+                    EachHasKeys(("items",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                    Length(("items",), max=1),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.list_lists",
+                "sharepoint_list_lists",
+                {"site_id": "root", "top": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("lists", "truncated")),
+                    EachHasKeys(("lists",), ("id", "name")),
+                    IsType(("truncated",), "boolean"),
+                    Length(("lists",), max=1),
+                ),
+            ),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "sharepoint_search_sites",
+                "sharepoint_search_files",
+                "sharepoint_get_file_content",
+                "sharepoint_download_file",
+                "sharepoint_list_list_items",
+            ),
+            writes=(
+                "sharepoint_create_list_item",
+                "sharepoint_delete_list_item",
+                "sharepoint_move_item",
+                "sharepoint_upload_text_file",
+                "sharepoint_upload_file",
+            ),
+            in_place_edits=("sharepoint_update_list_item",),
         ),
     ),
     "word": ConnectorChecks(
@@ -865,12 +1072,9 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "mixpanel",
         "myob",
         "onedrive",
-        "outlook",
-        "planner",
         "posthog",
         "rocketlane",
         "salesforce",
-        "sharepoint",
         "shopify",
         "slack",
         "stripe",

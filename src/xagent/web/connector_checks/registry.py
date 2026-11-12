@@ -44,6 +44,11 @@ from .fixtures import FixtureRef
 _GOOGLE_TIER_1 = "#3567"
 _JIRA_TIER_1 = "#3570"
 _MICROSOFT_365_TIER_1 = "#3569"
+_SLACK_TIER_1 = "#3571"
+# Whether Slack gets write checks at all: no tool of its server deletes a
+# message or a file, a reaction is named by an existing emoji, no tool reads
+# the tenant id, and the bot grant only reads.
+_SLACK_WRITE_CHECKS = "#3743"
 # Tier 2 runs structural reads only: no seeded objects and no write checks.
 _TIER_2 = "#3573"
 WRITE_WITHOUT_CLEANUP = (
@@ -338,6 +343,141 @@ def _jira_checks() -> ConnectorChecks:
                 "jira_delete_issue",
                 {"cloud_id": tenant, "issue_key": ItemRef(("key",))},
                 assertions=(StatusSuccess(),),
+            ),
+        ),
+    )
+
+
+def _slack_checks() -> ConnectorChecks:
+    """Slack's Tier 1 checks (#3571).
+
+    Reads only, against the QA workspace's seed: a public channel with a set
+    topic, and one thread in it, a parent with one reply. The thread is
+    posted last, after the bots joined and the topic was set, each of which
+    leaves a message in the channel. The checks cover the tools that carry
+    most of Slack's calls; no write tool was called in the window the tools
+    were picked from.
+
+    A new installation of an app that is not on the Slack Marketplace may call
+    ``conversations.history`` and ``conversations.replies`` once a minute and
+    gets at most 15 messages back, so a run calls each of them once with a
+    small limit. History is read up to the reply, which is exclusive, so a
+    message posted to the channel after the seed shifts nothing the check
+    asserts. A later reply in the thread comes after the one the thread read
+    asserts; the parent's reply count grows with it, so the history read
+    asserts only that the count is there.
+
+    A second run on the same Slack app within about a minute gets a 429 whose
+    ``Retry-After`` exceeds the 30 s the tool waits, so the throttled reads
+    fail as ``assertion_failed`` (``status_success``), as they do when the
+    seed's channel or thread is gone. The QA workspace is on Slack's free
+    plan, which hides messages older than 90 days, so the thread must be
+    re-seeded before then, with its new ``ts`` values in the registry.
+    """
+    channel = FixtureRef("slack.seed.channel_id")
+    thread = FixtureRef("slack.seed.thread_ts")
+    reply = FixtureRef("slack.seed.reply_ts")
+    channel_name = "xagent-smoke-seed"
+    return ConnectorChecks(
+        "slack",
+        reads=(
+            _declared_l3("slack"),
+            ReadCheck(
+                "slack.find_seed_channel",
+                "slack_list_channels",
+                {"name_contains": channel_name, "limit": 10},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("channels", "truncated")),
+                    Length(("channels",), 1, 1),
+                    EachHasKeys(("channels",), ("id", "name", "is_archived")),
+                    Equals(("channels", 0, "id"), channel),
+                    Equals(("channels", 0, "name"), channel_name),
+                ),
+            ),
+            ReadCheck(
+                "slack.read_seed_history",
+                "slack_get_channel_history",
+                {"channel": channel, "latest": reply, "limit": 1},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("messages", "has_more", "next_cursor")),
+                    Length(("messages",), 1, 1),
+                    EachHasKeys(
+                        ("messages",),
+                        ("ts", "user", "text", "thread_ts", "reply_count"),
+                    ),
+                    Equals(("messages", 0, "ts"), thread),
+                    Equals(("messages", 0, "thread_ts"), thread),
+                    Equals(("messages", 0, "text"), "xagent smoke seed thread"),
+                    IsType(("messages", 0, "reply_count"), "number"),
+                ),
+            ),
+            ReadCheck(
+                "slack.read_seed_thread",
+                "slack_get_thread_replies",
+                {"channel": channel, "thread_ts": thread, "limit": 15},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("messages", "has_more", "next_cursor")),
+                    Length(("messages",), 2),
+                    EachHasKeys(("messages",), ("ts", "user", "text")),
+                    Equals(("messages", 0, "ts"), thread),
+                    Equals(("messages", 1, "ts"), reply),
+                    Equals(("messages", 1, "text"), "xagent smoke seed reply"),
+                ),
+            ),
+            ReadCheck(
+                "slack.read_seed_channel",
+                "slack_get_channel_info",
+                {"channel": channel},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(
+                        (),
+                        ("id", "name", "topic", "purpose", "is_archived", "is_private"),
+                    ),
+                    Equals(("id",), channel),
+                    Equals(("name",), channel_name),
+                    Equals(("topic",), "xagent smoke seed topic"),
+                    Equals(("is_archived",), False),
+                    Equals(("is_private",), False),
+                ),
+            ),
+        ),
+        exemptions=(
+            ToolExemption(
+                "slack_search_messages",
+                "read left unchecked: it calls conversations.history and "
+                "conversations.replies again, which a new install of an app not "
+                "on the Slack Marketplace may each call once a minute, after "
+                "slack.read_seed_history and slack.read_seed_thread have; the checked "
+                f"tools carry over 80% of Slack's calls, as decided in {_SLACK_TIER_1}",
+            ),
+            ToolExemption(
+                "slack_list_direct_messages",
+                "read left unchecked: a Toby run's bot grant admits public channels "
+                "only (xorbitsai/xagent-saas#2553), so the listing it sees is empty "
+                "and holds nothing seeded; the checked tools carry over 80% of "
+                f"Slack's calls, as decided in {_SLACK_TIER_1}",
+            ),
+            ToolExemption("slack_post_message", WRITE_WITHOUT_CLEANUP),
+            ToolExemption("slack_upload_file", WRITE_WITHOUT_CLEANUP),
+            ToolExemption(
+                "slack_join_channel",
+                "write that adds the bot to a channel, which no tool of this "
+                "server leaves again, so a write check could not undo it; whether "
+                f"Slack gets write checks is decided in {_SLACK_WRITE_CHECKS}",
+            ),
+            *(
+                ToolExemption(
+                    tool,
+                    "write on a reaction, which is named by an existing emoji, so a "
+                    "write check cannot give it the run-scoped name its create must "
+                    "use; "
+                    f"whether Slack gets write checks is decided in {_SLACK_WRITE_CHECKS}",
+                )
+                for tool in ("slack_add_reaction", "slack_remove_reaction")
             ),
         ),
     )
@@ -1136,6 +1276,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             in_place_edits=("sharepoint_update_list_item",),
         ),
     ),
+    "slack": _slack_checks(),
     "teams": _teams_checks(),
     "word": ConnectorChecks(
         "word",
@@ -1321,7 +1462,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "rocketlane",
         "salesforce",
         "shopify",
-        "slack",
         "stripe",
         "whatsapp",
         "xero",

@@ -148,3 +148,9 @@ class CollectionMigratingError(RagCoreException):
     """Raised when a write targets a collection frozen for embedding migration."""
 
     pass
+
+
+class CollectionNotFrozenError(RagCoreException):
+    """Raised when an embedding switch targets a collection that is not frozen."""
+
+    pass

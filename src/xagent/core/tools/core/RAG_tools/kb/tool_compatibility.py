@@ -317,10 +317,12 @@ class KBToolCompatibilityFacade:
 
         with self._storage_context():
             metadata_store = get_metadata_store()
+            row_existed = True
             try:
                 collection_info = await metadata_store.get_collection(collection)
             except ValueError:
                 collection_info = CollectionInfo(name=collection)
+                row_existed = False
 
             extra_metadata = dict(collection_info.extra_metadata or {})
             if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
@@ -332,5 +334,24 @@ class KBToolCompatibilityFacade:
             updated_collection = collection_info.model_copy(
                 update={"extra_metadata": extra_metadata}
             )
-            await metadata_store.save_collection(updated_collection)
+            if row_existed and callable(
+                getattr(metadata_store, "update_collection_fields", None)
+            ):
+                await metadata_store.update_collection_fields(
+                    updated_collection, ("extra_metadata",)
+                )
+            elif not row_existed and callable(
+                getattr(metadata_store, "save_collection_if_absent", None)
+            ):
+                inserted = await metadata_store.save_collection_if_absent(
+                    updated_collection
+                )
+                if not inserted and callable(
+                    getattr(metadata_store, "update_collection_fields", None)
+                ):
+                    await metadata_store.update_collection_fields(
+                        updated_collection, ("extra_metadata",)
+                    )
+            else:
+                await metadata_store.save_collection(updated_collection)
             return updated_collection

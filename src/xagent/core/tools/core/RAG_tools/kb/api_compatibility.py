@@ -624,17 +624,21 @@ class KBApiCompatibilityFacade:
             return None
 
         collection_info: CollectionInfo | None = None
+        row_existed: bool | None = None
         if _has_store_method(store, "get_collection"):
             try:
                 loaded = store.get_collection(collection)
                 loaded = await maybe_await(loaded)
             except ValueError:
                 collection_info = CollectionInfo(name=collection)
+                row_existed = False
             else:
                 if isinstance(loaded, CollectionInfo):
                     collection_info = loaded
+                    row_existed = True
                 elif loaded is None:
                     collection_info = CollectionInfo(name=collection)
+                    row_existed = False
         else:
             collection_info = CollectionInfo(name=collection)
 
@@ -651,7 +655,24 @@ class KBApiCompatibilityFacade:
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}
         )
-        await maybe_await(store.save_collection(updated_collection))
+        if row_existed is True and _has_store_method(store, "update_collection_fields"):
+            await maybe_await(
+                store.update_collection_fields(updated_collection, ("extra_metadata",))
+            )
+        elif row_existed is False and _has_store_method(
+            store, "save_collection_if_absent"
+        ):
+            inserted = await maybe_await(
+                store.save_collection_if_absent(updated_collection)
+            )
+            if not inserted and _has_store_method(store, "update_collection_fields"):
+                await maybe_await(
+                    store.update_collection_fields(
+                        updated_collection, ("extra_metadata",)
+                    )
+                )
+        else:
+            await maybe_await(store.save_collection(updated_collection))
         return updated_collection
 
     async def get_collection_config(

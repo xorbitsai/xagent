@@ -314,6 +314,37 @@ class MetadataStore(ABC):
         """Create or update collection metadata."""
 
     @abstractmethod
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        """Create the row only when no row with that name exists.
+
+        A writer that decided the row was missing must not overwrite one that
+        appeared since (it may already carry a different binding). Returns
+        whether it inserted.
+        """
+
+    @abstractmethod
+    async def update_collection_fields(
+        self,
+        collection: CollectionInfo,
+        field_names: Iterable[str],
+        *,
+        require_uninitialized: bool = False,
+        expected_model_id: Optional[str] = None,
+    ) -> bool:
+        """Update only ``field_names`` of an existing collection row.
+
+        Whole-row writes let a writer that read before a concurrent change put
+        the old values back. Callers that do not own a column must not write it.
+
+        The binding columns are written only while the guard holds:
+        ``require_uninitialized`` means the row is not fully bound yet,
+        ``expected_model_id`` means it still stores exactly that value (used by
+        the alias-to-canonical rewrite). A guarded update that matches no row
+        returns ``False`` instead of overwriting; an unguarded update raises
+        ``ValueError`` when the row is missing.
+        """
+
+    @abstractmethod
     async def list_collections(
         self,
         user_id: Optional[int] = None,

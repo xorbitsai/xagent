@@ -173,7 +173,12 @@ class KBPipelineCompatibilityFacade:
         updated_collection = collection_info.model_copy(
             update={"extra_metadata": extra_metadata}
         )
-        await metadata_store.save_collection(updated_collection)
+        if callable(getattr(metadata_store, "update_collection_fields", None)):
+            await metadata_store.update_collection_fields(
+                updated_collection, ("extra_metadata",)
+            )
+        else:
+            await metadata_store.save_collection(updated_collection)
         return updated_collection
 
     def ensure_collection_backend_binding(

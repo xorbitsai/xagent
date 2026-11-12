@@ -33,7 +33,7 @@ from xagent.web.connector_checks.registry import CONNECTOR_CHECKS
 from xagent.web.connector_checks.results import RunResult
 from xagent.web.tools.mcp import excel, onedrive, powerpoint, teams, word
 
-from .fakes import FakeAdapter, FakeTool, listed, rows, targets
+from .fakes import FakeAdapter, FakeTool, listed, rows, targets, tool_for
 
 _MODULES: dict[str, ModuleType] = {
     "onedrive": onedrive,
@@ -45,7 +45,9 @@ _MODULES: dict[str, ModuleType] = {
 
 # The seed, as the cross-repo contract of #3569 lays it out.
 SEED_FOLDER = "xagent-smoke-seed"
-NOTE = "xagent-smoke-seed-note.txt"
+# q7k2 appears in no other file's name or content, so a search finds the note
+# alone (contract v2).
+NOTE = "xagent-smoke-seed-note-q7k2.txt"
 NOTE_TEXT = "seeded by the xagent connector smoke check\n"
 DOCX = "xagent-smoke-seed.docx"
 XLSX = "xagent-smoke-seed.xlsx"
@@ -130,10 +132,6 @@ def _pptx(
     return buffer.getvalue()
 
 
-def _column(index: int) -> str:
-    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[index]
-
-
 _CELL = re.compile(r"(?P<column>[A-Z])(?P<row>[0-9]+)")
 
 
@@ -186,6 +184,8 @@ class Tenant:
         self.worksheets: dict[str, list[list[Any]]] = {
             SHEET: [list(row) for row in CELLS]
         }
+        # Cells that carry formatting but no value, by worksheet.
+        self.formatted: dict[str, list[tuple[int, int]]] = {}
         self.teams: list[dict[str, Any]] = [
             {"id": "team-other", "displayName": "Another team", "description": None},
             {"id": TEAM_ID, "displayName": "xagent-smoke-read", "description": None},
@@ -305,12 +305,14 @@ class Tenant:
                 raise LookupError(path)
             return {"value": self.messages[match[2]]}
         if match := re.fullmatch(r"/me/drive/root/search\(q='(.*)'\)", path):
+            # Graph search matches a file's name and its content.
             query = match[1].lower()
             return {
                 "value": [
                     self.listed(item)
                     for item in self.files.values()
                     if query in item["name"].lower()
+                    or query.encode("utf-8") in item["content"].lower()
                 ]
             }
         if match := re.fullmatch(r"/me/drive/items/([^/]+)", path):
@@ -354,15 +356,25 @@ class Tenant:
         match = re.fullmatch(
             r"/worksheets\('(?P<sheet>[^']+)'\)/"
             r"(?:range\(address='(?P<first>[A-Z][0-9]+):(?P<last>[A-Z][0-9]+)'\)"
-            r"|(?P<used>usedRange))",
+            r"|(?P<used>usedRange)(?P<values_only>\(valuesOnly=true\))?)",
             path,
         )
         if match is None or match["sheet"] not in self.worksheets:
             raise LookupError(path)
         grid = self.worksheets[match["sheet"]]
         if match["used"]:
-            rows_, columns = len(grid), max(len(row) for row in grid)
-            first, last = (0, 0), (rows_ - 1, columns - 1)
+            # Graph's used range also spans formatted empty cells, unless
+            # it is asked for valuesOnly.
+            cells = [
+                (row, column)
+                for row, cells_ in enumerate(grid)
+                for column, value in enumerate(cells_)
+                if value != ""
+            ]
+            if not match["values_only"]:
+                cells += self.formatted.get(match["sheet"], [])
+            first = (0, 0)
+            last = (max(r for r, _ in cells), max(c for _, c in cells))
         else:
             start, end = _CELL.fullmatch(match["first"]), _CELL.fullmatch(match["last"])
             assert start and end
@@ -377,8 +389,8 @@ class Tenant:
         ]
         return {
             "address": (
-                f"{match['sheet']}!{_column(first[1])}{first[0] + 1}:"
-                f"{_column(last[1])}{last[0] + 1}"
+                f"{match['sheet']}!{chr(ord('A') + first[1])}{first[0] + 1}:"
+                f"{chr(ord('A') + last[1])}{last[0] + 1}"
             ),
             "rowCount": len(values),
             "columnCount": len(values[0]),
@@ -408,22 +420,9 @@ def _registered(module: ModuleType) -> tuple[str, ...]:
 _REGISTERED = {app_id: _registered(module) for app_id, module in _MODULES.items()}
 
 
-def _tool(module: ModuleType, name: str) -> FakeTool:
-    function: Callable[..., str] = getattr(module, name)
-
-    def respond(args: dict[str, Any]) -> Any:
-        return {
-            "content": [{"type": "text", "text": function(**args)}],
-            "structured_content": None,
-            "is_error": False,
-        }
-
-    return FakeTool(name, respond=respond)
-
-
 def _tools() -> dict[str, dict[str, FakeTool]]:
     return {
-        app_id: {name: _tool(_MODULES[app_id], name) for name in names}
+        app_id: {name: tool_for(_MODULES[app_id], name) for name in names}
         for app_id, names in _REGISTERED.items()
     }
 
@@ -577,17 +576,22 @@ def _extra_file(tenant: Tenant) -> None:
     tenant.add_file("stray.txt", b"stray\n")
 
 
-def _note_copy_first(tenant: Tenant) -> None:
-    # Search ranks a copy of the note above the note itself.
+def _old_note_name_first(tenant: Tenant) -> None:
+    # A file named as the note was before the marker, listed first: the
+    # search for the marker no longer sees it.
     files = tenant.files
     tenant.files = {}
-    tenant.add_file("xagent-smoke-seed-note (1).txt", NOTE_TEXT.encode("utf-8"))
+    tenant.add_file("xagent-smoke-seed-note.txt", NOTE_TEXT.encode("utf-8"))
     tenant.files.update(files)
 
 
+def _marker_in_another_file(tenant: Tenant) -> None:
+    tenant.add_file("stray.txt", b"q7k2\n")
+
+
 def _renamed_note(tenant: Tenant) -> None:
-    # Still found by search, but no longer the seeded name.
-    tenant.files[NOTE]["name"] = "xagent-smoke-seed-note-old.txt"
+    # Still found by the marker, but no longer the seeded name.
+    tenant.files[NOTE]["name"] = "xagent-smoke-seed-note-q7k2-old.txt"
 
 
 def _profile_without_id(tenant: Tenant) -> None:
@@ -625,6 +629,14 @@ def _extra_channel(tenant: Tenant) -> None:
     tenant.channels[TEAM_ID].append(
         {"id": "19:extra@thread.tacv2", "displayName": "Extra"}
     )
+
+
+def _html_message(tenant: Tenant) -> None:
+    # Teams may store a message sent as text with an HTML body.
+    tenant.messages[CHANNEL_ID][0]["body"] = {
+        "contentType": "html",
+        "content": f"<p>{MESSAGE_TEXT}</p>",
+    }
 
 
 def _newer_message(tenant: Tenant) -> None:
@@ -665,6 +677,11 @@ def _other_item(tenant: Tenant) -> None:
     tenant.worksheets[SHEET][2][0] = "gamma"
 
 
+def _formatted_cell_outside(tenant: Tenant) -> None:
+    # A filled or bordered empty cell widens Graph's plain used range.
+    tenant.formatted[SHEET] = [(9, 3)]
+
+
 def _extra_row(tenant: Tenant) -> None:
     tenant.worksheets[SHEET].append(["gamma", 3])
 
@@ -690,7 +707,11 @@ def _speaker_notes(tenant: Tenant) -> None:
     [
         (_edit_note, {"onedrive.read_seed_file"}),
         (_extra_file, {"onedrive.list_seed_folder"}),
-        (_note_copy_first, {"onedrive.list_seed_folder", "onedrive.search_seed_file"}),
+        (_old_note_name_first, {"onedrive.list_seed_folder"}),
+        (
+            _marker_in_another_file,
+            {"onedrive.list_seed_folder", "onedrive.search_seed_file"},
+        ),
         (_renamed_note, {"onedrive.get_seed_file"}),
         (
             _profile_without_id,
@@ -708,6 +729,7 @@ def _speaker_notes(tenant: Tenant) -> None:
         (_extra_channel, {"teams.list_seed_channels"}),
         (_newer_message, {"teams.read_seed_message"}),
         (_edited_message, {"teams.read_seed_message"}),
+        (_html_message, set()),
         (_extra_paragraph, {"word.list_paragraphs"}),
         (_other_first_paragraph, {"word.read_fixture", "word.list_paragraphs"}),
         (_other_paragraph_text, {"word.read_fixture", "word.list_paragraphs"}),
@@ -716,6 +738,7 @@ def _speaker_notes(tenant: Tenant) -> None:
         (_quantity_as_text, {"excel.read_seed_range"}),
         (_other_item, {"excel.read_seed_range"}),
         (_extra_row, {"excel.read_used_range"}),
+        (_formatted_cell_outside, set()),
         (
             _extra_slide,
             {"powerpoint.read_fixture", "powerpoint.read_presentation_text"},
@@ -740,7 +763,7 @@ async def test_a_seed_that_drifted_fails_exactly_the_checks_that_read_it(
 
     failed = {check for check, row in outcomes.items() if row != PASS}
     assert failed == failing
-    assert {outcomes[check][:2] for check in failed} == {("fail", "assertion_failed")}
+    assert all(outcomes[check][:2] == ("fail", "assertion_failed") for check in failed)
 
 
 @pytest.mark.parametrize(
@@ -756,3 +779,18 @@ async def test_each_seeded_cell_is_read_back(
     assert {check for check, row_ in outcomes.items() if row_ != PASS} == {
         "excel.read_seed_range"
     }
+
+
+async def test_a_message_id_fixture_must_be_a_string(tenant: Tenant) -> None:
+    """Graph returns a message id as a string of digits, and Equals compares
+    as JSON does, so a registry that records the id as a number fails the
+    check: ``teams.seed_message_id`` is a string."""
+    fixtures = {**FIXTURES, "teams.seed_message_id": int(MESSAGE_ID)}
+
+    outcomes = _outcomes(await _run(fixtures=fixtures))
+
+    assert outcomes["teams.read_seed_message"] == (
+        "fail",
+        "assertion_failed",
+        "equals",
+    )

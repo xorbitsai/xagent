@@ -364,7 +364,7 @@ def guard_upload_compensation(operation: _Operation) -> _Operation:
 def coordinate_ingest_job(operation: _Operation) -> _Operation:
     @wraps(operation)
     def ingest(db: Session, job: Any) -> Any:
-        from ..jobs.exceptions import BackgroundJobHandlerError
+        from ..jobs.exceptions import BackgroundJobDeferred, BackgroundJobHandlerError
         from .kb_ingest_targets import release_kb_ingest_target_generation
 
         payload = dict(job.payload or {})
@@ -382,6 +382,9 @@ def coordinate_ingest_job(operation: _Operation) -> _Operation:
             result = operation(db, job)
             release = True
             return result
+        except BackgroundJobDeferred:
+            # The job will run again: do not release its reservation.
+            raise
         except BackgroundJobHandlerError as exc:
             release = final_attempt or not exc.retryable
             raise

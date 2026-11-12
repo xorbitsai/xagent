@@ -14,6 +14,7 @@ vi.mock("@/contexts/auth-context", () => ({
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
+  uploadWithCollectionMigrationRetry: apiRequestMock,
   parseApiResponse: async (response: { json: () => Promise<unknown> }) => ({
     data: await response.json(),
     text: null,
@@ -621,6 +622,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
       expect(apiRequestMock).toHaveBeenCalledWith(
         "http://api.local/api/kb/ingest-cloud",
         expect.any(Object),
+        expect.any(Function),
       )
     })
     const cloudCall = apiRequestMock.mock.calls.find(

@@ -2675,6 +2675,7 @@ def handle_kb_exceptions(func: T) -> T:
                     "code": "kb_collection_migrating",
                     "message": e.message,
                 },
+                headers={"Retry-After": "15"},
             ) from e
         except RollbackFailureError as e:
             logger.error("KB rollback failure in %s: %s", func.__name__, e)

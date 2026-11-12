@@ -208,10 +208,36 @@ export function getUploadErrorMessage(response: Response, parsed: ParsedApiRespo
       .filter(Boolean)
     if (validationMessages.length) return validationMessages.join("; ")
   }
+  if (isJsonRecord(parsed.data) && isJsonRecord(parsed.data.detail) && typeof parsed.data.detail.message === "string" && parsed.data.detail.message.trim()) return parsed.data.detail.message
   if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) return parsed.data.message
   if (response.status === 413) return messages.tooLarge
   if (parsed.isHtml) return messages.proxy
   return parsed.text?.trim() ? truncateUploadMessage(parsed.text) : messages.generic
+}
+export const KB_COLLECTION_MIGRATING_CODE = "kb_collection_migrating"
+export const KB_MIGRATION_RETRY_LIMIT = 8
+export const KB_MIGRATION_RETRY_DELAY_MS = 10_000
+function isCollectionMigratingResponse(parsed: ParsedApiResponse): boolean {
+  return isJsonRecord(parsed.data) && isJsonRecord(parsed.data.detail)
+    && parsed.data.detail.code === KB_COLLECTION_MIGRATING_CODE
+}
+/** Retries an upload refused while its collection is frozen for migration. */
+export async function uploadWithCollectionMigrationRetry(
+  url: string,
+  options: RequestInit,
+  onUpgrading?: () => void,
+): Promise<Response> {
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await apiRequest(url, options)
+    if (response.status !== 409 || attempt >= KB_MIGRATION_RETRY_LIMIT) return response
+    if (!isCollectionMigratingResponse(await parseApiResponse(response.clone()))) return response
+    onUpgrading?.()
+    const retryAfterSeconds = Number.parseInt(response.headers.get("Retry-After") ?? "", 10)
+    const delayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? Math.min(retryAfterSeconds, 60) * 1000
+      : KB_MIGRATION_RETRY_DELAY_MS
+    await new Promise(resolve => setTimeout(resolve, delayMs))
+  }
 }
 export interface ClassifiedUploadError {
   errorCode: ClientErrorCode

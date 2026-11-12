@@ -13,7 +13,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES, uploadWithCollectionMigrationRetry } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import {
   getBackgroundJobFailureMessage,
@@ -214,6 +214,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [isWebIngesting, setIsWebIngesting] = useState(false)
   const [webIngestionProgress, setWebIngestionProgress] = useState(0)
   const [webIngestionResult, setWebIngestionResult] = useState<WebIngestionResult | null>(null)
+  const [webIngestionNotice, setWebIngestionNotice] = useState<string | null>(null)
   const [webIngestionConfig, setWebIngestionConfig] = useState({
     start_url: "",
     max_pages: 100,
@@ -430,12 +431,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           normalizeIngestionConfigForFilename(ingestionConfig, file.name)
         )
 
-        const response = await apiRequest(
+        const response = await uploadWithCollectionMigrationRetry(
           `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
           {
             method: "POST",
             body: formData
-          }
+          },
+          () => setUploadProgressDetail(t("kb.migration.upgrading"))
         )
 
         const parsed = await parseApiResponse(response)
@@ -599,6 +601,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setIsWebIngesting(true)
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
+    setWebIngestionNotice(null)
 
     try {
       const apiUrl = getApiUrl()
@@ -632,12 +635,13 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       setWebIngestionProgress(10)
 
-      const response = await apiRequest(
+      const response = await uploadWithCollectionMigrationRetry(
         `${apiUrl}/api/kb/ingest-web${useBackgroundJobs ? "/jobs" : ""}`,
         {
           method: "POST",
           body: formData
-        }
+        },
+        () => setWebIngestionNotice(t("kb.migration.upgrading"))
       )
 
       const parsed = await parseApiResponse(response)
@@ -1568,7 +1572,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                       {isWebIngesting ? (
                          <div className="flex items-center gap-2">
                             <Loader2 className="h-4 w-4 animate-spin" />
-                            {t("kb.dialog.webImport.status.crawling")} ({Math.round(webIngestionProgress)}%)
+                            {webIngestionNotice || t("kb.dialog.webImport.status.crawling")} ({Math.round(webIngestionProgress)}%)
                          </div>
                       ) : (
                          t("kb.index.startImport")

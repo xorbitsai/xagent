@@ -418,6 +418,7 @@ async def test_handle_kb_exceptions_maps_migration_freeze_to_409() -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == _MIGRATION_DETAIL
+    assert exc_info.value.headers == {"Retry-After": "15"}
 
 
 @pytest.mark.asyncio
@@ -453,6 +454,7 @@ async def test_ingest_route_maps_migration_freeze_to_409() -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == _MIGRATION_DETAIL
+    assert exc_info.value.headers == {"Retry-After": "15"}
 
 
 @pytest.mark.asyncio
@@ -483,6 +485,7 @@ async def test_ingest_cloud_route_maps_migration_freeze_to_409() -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == _MIGRATION_DETAIL
+    assert exc_info.value.headers == {"Retry-After": "15"}
 
 
 @pytest.mark.asyncio
@@ -513,6 +516,7 @@ async def test_ingest_web_route_maps_migration_freeze_to_409() -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == _MIGRATION_DETAIL
+    assert exc_info.value.headers == {"Retry-After": "15"}
 
 
 @pytest.mark.asyncio
@@ -552,6 +556,7 @@ async def test_create_ingest_job_maps_migration_freeze_to_409() -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail == _MIGRATION_DETAIL
+    assert exc_info.value.headers == {"Retry-After": "15"}
 
 
 class _FakeRollbackFacade:

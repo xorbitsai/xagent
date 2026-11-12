@@ -7,6 +7,7 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
+  uploadWithCollectionMigrationRetry: apiRequestMock,
 }))
 
 vi.mock("@/lib/utils", () => ({

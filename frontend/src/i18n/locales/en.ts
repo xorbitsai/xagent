@@ -2509,6 +2509,9 @@ Build when you need.`,
     },
   },
   kb: {
+    migration: {
+      upgrading: "Knowledge base is upgrading. The upload retries automatically.",
+    },
     ownership: {
       label: "Ownership",
       personal: "Personal",

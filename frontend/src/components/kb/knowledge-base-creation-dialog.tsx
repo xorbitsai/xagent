@@ -31,7 +31,7 @@ import {
 import { useI18n } from "@/contexts/i18n-context"
 import type { TranslationKey } from "@/i18n/translations"
 import { useAuth } from "@/contexts/auth-context"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES, uploadWithCollectionMigrationRetry } from "@/lib/api-wrapper"
 import { Model } from "@/lib/models"
 import {
   Upload,
@@ -554,12 +554,13 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           normalizeIngestionConfigForFilename(ingestionConfig, file.name)
         )
 
-        const response = await apiRequest(
+        const response = await uploadWithCollectionMigrationRetry(
           `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
           {
             method: "POST",
             body: formData
-          }
+          },
+          () => setUploadProgressDetail(t("kb.migration.upgrading"))
         )
 
         const parsed = await parseApiResponse(response)
@@ -722,12 +723,13 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
 
       setWebIngestionProgress(10)
 
-      const response = await apiRequest(
+      const response = await uploadWithCollectionMigrationRetry(
         `${apiUrl}/api/kb/ingest-web${useBackgroundJobs ? "/jobs" : ""}`,
         {
           method: "POST",
           body: formData
-        }
+        },
+        () => setUploadProgressDetail(t("kb.migration.upgrading"))
       )
 
       const parsed = await parseApiResponse(response)
@@ -859,13 +861,13 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         retry_delay: ingestionConfig.retry_delay
       }
 
-      const response = await apiRequest(`${getApiUrl()}/api/kb/ingest-cloud`, {
+      const response = await uploadWithCollectionMigrationRetry(`${getApiUrl()}/api/kb/ingest-cloud`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
         body: JSON.stringify(requestBody)
-      })
+      }, () => setUploadProgressDetail(t("kb.migration.upgrading")))
 
       const parsed = await parseApiResponse(response)
 

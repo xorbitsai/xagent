@@ -2504,6 +2504,9 @@ const zh = {
     },
   },
   kb: {
+    migration: {
+      upgrading: "知识库升级中，上传将自动重试。",
+    },
     ownership: {
       label: "归属",
       personal: "个人",

@@ -13,12 +13,13 @@ from ..models.background_job import (
 )
 from ..models.database import get_session_local, init_db
 from ..services.background_jobs import (
+    QUEUE_DEFAULT,
     mark_job_failed,
     mark_job_running,
     mark_job_succeeded,
 )
 from .celery_app import celery_app
-from .exceptions import BackgroundJobHandlerError
+from .exceptions import BackgroundJobDeferred, BackgroundJobHandlerError
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,36 @@ def execute_background_job(self: Any, job_id: str) -> dict[str, Any]:
         mark_job_running(db, job)
         try:
             result = _execute_job_handler(db, job)
+        except BackgroundJobDeferred as exc:
+            db.refresh(job)
+            # A deferral is not a failed attempt; give the attempt back so the
+            # job's real retry budget survives a migration window.
+            setattr(job, "attempts", max(0, int(job.attempts or 0) - 1))
+            setattr(job, "status", BackgroundJobStatus.ENQUEUED.value)
+            setattr(job, "error_message", None)
+            setattr(
+                job,
+                "progress",
+                {"message": str(exc), "completed": 0, "total": 1},
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            if not celery_app.conf.task_always_eager:
+                try:
+                    async_result = execute_background_job.apply_async(
+                        args=[job.id],
+                        queue=str(job.queue or QUEUE_DEFAULT),
+                        countdown=exc.delay_seconds,
+                    )
+                except Exception:  # noqa: BLE001
+                    # The stale sweep is the safety net; the row stays recoverable.
+                    logger.exception("Failed to reschedule deferred job %s", job.id)
+                else:
+                    setattr(job, "celery_task_id", async_result.id)
+                    db.add(job)
+                    db.commit()
+            return {"status": "deferred"}
         except BackgroundJobHandlerError as exc:
             db.refresh(job)
             if exc.retryable and int(job.attempts or 0) < int(job.max_attempts or 1):

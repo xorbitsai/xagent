@@ -671,7 +671,10 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
         BackgroundJobDeferred,
         BackgroundJobHandlerError,
     )
-    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY, _MIGRATION_GIVE_UP_MESSAGE
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        _MIGRATION_GIVE_UP_MESSAGE,
+    )
 
     _, _, user, session_local = test_env
     file_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

@@ -221,16 +221,28 @@ function isCollectionMigratingResponse(parsed: ParsedApiResponse): boolean {
   return isJsonRecord(parsed.data) && isJsonRecord(parsed.data.detail)
     && parsed.data.detail.code === KB_COLLECTION_MIGRATING_CODE
 }
-/** Retries an upload refused while its collection is frozen for migration. */
+const SESSION_LINEAGE_STATUSES = new Set([
+  "exact", "profile_advanced", "credentials_advanced", "credentials_and_profile_advanced",
+])
+function isSameSessionLineage(captured: AuthSessionSnapshot): boolean {
+  return SESSION_LINEAGE_STATUSES.has(compareAuthSession(captured).status)
+}
+/** Retries an upload refused while its collection is frozen, staying with the initiating user. */
 export async function uploadWithCollectionMigrationRetry(
   url: string,
   options: RequestInit,
   onUpgrading?: () => void,
 ): Promise<Response> {
+  const initiatingSession = readAuthSessionSnapshot()
+  const boundToSession = Boolean(initiatingSession.sessionId)
+  let refusal = new Response(null, { status: 409 })
   for (let attempt = 0; ; attempt += 1) {
+    // Another tab may have signed in as someone else while this one waited.
+    if (attempt > 0 && boundToSession && !isSameSessionLineage(initiatingSession)) return refusal
     const response = await apiRequest(url, options)
     if (response.status !== 409 || attempt >= KB_MIGRATION_RETRY_LIMIT) return response
     if (!isCollectionMigratingResponse(await parseApiResponse(response.clone()))) return response
+    refusal = response
     onUpgrading?.()
     const retryAfterSeconds = Number.parseInt(response.headers.get("Retry-After") ?? "", 10)
     const delayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0

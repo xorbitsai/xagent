@@ -355,6 +355,67 @@ describe("api-wrapper collection migration retry", () => {
     }
   })
 
+  it("stops retrying when another sign-in replaces the initiating session", async () => {
+    vi.useFakeTimers()
+    try {
+      writeAuthCache({ id: "1", username: "alice" }, "token-a")
+      const fetchMock = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(5))
+      const onUpgrading = vi.fn()
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+        onUpgrading,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      writeAuthCache({ id: "2", username: "bob" }, "token-b")
+      await vi.advanceTimersByTimeAsync(5_000)
+
+      const response = await pending
+      expect(response.status).toBe(409)
+      // A's body must never be resent with B's session.
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(onUpgrading).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("keeps retrying after a credential refresh within the initiating session", async () => {
+    vi.useFakeTimers()
+    try {
+      writeAuthCache({ id: "1", username: "alice" }, "token-a")
+      const cached = readAuthCache()
+      if (!cached) throw new Error("auth cache missing")
+      const fetchMock = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(5))
+        .mockResolvedValueOnce(successResponse())
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+        ...cached,
+        credentialRevision: cached.credentialRevision + 1,
+        token: "token-a-refreshed",
+      }))
+      await vi.advanceTimersByTimeAsync(5_000)
+
+      const response = await pending
+      expect(response.status).toBe(200)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
   it("does not retry a 409 that is not a migration refusal", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({

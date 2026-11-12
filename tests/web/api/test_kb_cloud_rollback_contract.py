@@ -624,3 +624,82 @@ def test_frozen_job_refuses_before_model_resolution(
         db.close()
 
     assert resolved == []
+
+
+@pytest.mark.parametrize("frozen", [True, False])
+def test_final_attempt_refusal_does_not_compensate_an_existing_document(
+    test_env, tmp_path, monkeypatch, frozen
+) -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+    from xagent.core.tools.core.RAG_tools.management.migration_state import (
+        FROZEN,
+        CollectionMigrationState,
+        clear_migration_state,
+        write_migration_state,
+    )
+    from xagent.core.tools.core.RAG_tools.management.status import (
+        load_ingestion_status,
+        write_ingestion_status,
+    )
+    from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+        generate_deterministic_doc_id,
+    )
+
+    _, _, user, session_local = test_env
+    file_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    doc_id = generate_deterministic_doc_id("existing-kb", file_id)
+    write_ingestion_status("existing-kb", doc_id, status="success", user_id=user.id)
+    staged = tmp_path / "stage" / "doc.txt"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("replacement", encoding="utf-8")
+    compensated: list[str] = []
+
+    async def _rollback(**kwargs: Any) -> None:
+        compensated.append(str(kwargs["collection_name"]))
+
+    def _ingest(**_kw: Any) -> IngestionResult:
+        raise RuntimeError("ingest blew up")
+
+    monkeypatch.setattr("xagent.web.jobs.kb_tasks.run_document_ingestion", _ingest)
+    db = session_local()
+    if frozen:
+        write_migration_state("existing-kb", CollectionMigrationState(state=FROZEN))
+    try:
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "existing-kb",
+                "source_path": str(staged),
+                "target_path": str(tmp_path / "canonical" / "doc.txt"),
+                "file_id": file_id,
+                "filename": "doc.txt",
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+                "document_existed_before": True,
+            },
+            max_attempts=1,
+        )
+        job.attempts = 1
+        with (
+            patch(
+                "xagent.web.api.kb._rollback_failed_cloud_ingestion",
+                side_effect=_rollback,
+            ),
+            pytest.raises(CollectionMigratingError if frozen else RuntimeError),
+        ):
+            handle_kb_ingest_document(db, job)
+    finally:
+        clear_migration_state("existing-kb")
+        db.close()
+
+    # The unfrozen run is the positive control: this payload does reach compensation.
+    assert compensated == ([] if frozen else ["existing-kb"])
+    if frozen:
+        rows = load_ingestion_status("existing-kb", doc_id, user_id=user.id)
+        assert [r["status"] for r in rows] == ["success"]

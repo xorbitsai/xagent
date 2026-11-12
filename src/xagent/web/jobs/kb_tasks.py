@@ -250,9 +250,10 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         if not _is_staged_document_generation_latest(db, payload):
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
+    # Before model resolution, which rewrites the collection's metadata row, and
+    # outside the try: a job refused here was never admitted and must not compensate.
+    ensure_collection_writable(str(payload["collection"]))
     try:
-        # Before model resolution, which rewrites the collection's metadata row.
-        ensure_collection_writable(str(payload["collection"]))
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not
         # the storage tenant in payload["user_id"].
@@ -440,8 +441,8 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
             db_session.close()
 
     update_job_progress(db, job, message="Crawling website")
+    ensure_collection_writable(collection)
     try:
-        ensure_collection_writable(collection)
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         with (
             usage_scope(

@@ -5,10 +5,15 @@ and every step calls the real tool function in
 ``web/tools/mcp/google_drive.py``. Only Drive's API is replaced, by an
 in-memory drive laid out like the test tenant's seed: a closed seed folder
 holding the seed document, and the write folder the write check creates in.
+The Composio tests replace Composio's two calls as well, so the create runs
+through ``google_drive_composio.create_file`` as it does on a production
+grant: stage the content, run ``GOOGLEDRIVE_CREATE_FILE``, read the new file
+back through the proxy.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -19,7 +24,12 @@ import pytest
 from xagent.web.connector_checks.engine import run_checks
 from xagent.web.connector_checks.results import RunResult
 from xagent.web.connector_checks.sweeper import run_sweep
-from xagent.web.tools.mcp import google_drive
+from xagent.web.tools.mcp import (
+    composio_proxy,
+    composio_tools,
+    google_drive,
+    google_drive_composio,
+)
 
 from .fakes import FakePolicyAdapter, FakeTool, listed, rows, targets
 
@@ -41,11 +51,22 @@ FIXTURES = {
 # member who did not install the connector.
 VERDICTS = {"google_drive_create_file": "allow", "google_drive_delete_file": "allow"}
 NAMED = re.compile(r"xagent-smoke-[0-9]{12}-[0-9a-f]{6}-drive-file")
+# The tenant pin's search: the write folder, by the seed's own name rule.
+PIN_QUERY = (
+    "name = 'xagent-smoke-write' and "
+    f"mimeType = '{FOLDER_MIME}' and "
+    "'root' in parents and "
+    "trashed = false"
+)
 _NAME_QUERY = re.compile(
     r"name = '(?P<name>[^']*)' and mimeType = '(?P<mime_type>[^']*)'"
     r"(?: and '(?P<root>root)' in parents)? and trashed = false"
 )
 _PARENT_QUERY = re.compile(r"'(?P<parent>[^']*)' in parents and trashed = false")
+# The lookup a create whose answer was lost makes: by name and parent.
+_SAME_NAME_QUERY = re.compile(
+    r"name = '(?P<name>[^']*)' and trashed = false and '(?P<parent>[^']*)' in parents"
+)
 
 
 def _in_parent(item: dict[str, Any], parent: str | None) -> bool:
@@ -116,13 +137,26 @@ class Drive:
                 and _in_parent(item, by_name["root"])
             ]
         else:
-            by_parent = _PARENT_QUERY.fullmatch(query)
-            assert by_parent, query
-            found = [
-                item
-                for item in self.items.values()
-                if by_parent["parent"] in item["parents"]
-            ]
+            same_name = _SAME_NAME_QUERY.fullmatch(query)
+            if same_name is not None:
+                found = [
+                    {
+                        "id": item["id"],
+                        "name": item["name"],
+                        "createdTime": item["modifiedTime"],
+                    }
+                    for item in self.items.values()
+                    if item["name"] == same_name["name"]
+                    and same_name["parent"] in item["parents"]
+                ]
+            else:
+                by_parent = _PARENT_QUERY.fullmatch(query)
+                assert by_parent, query
+                found = [
+                    item
+                    for item in self.items.values()
+                    if by_parent["parent"] in item["parents"]
+                ]
         return {"files": found[:page_size]}
 
     def create(self, body: dict[str, Any], media: Any) -> dict[str, Any]:
@@ -158,7 +192,17 @@ class Drive:
         self.requests.append(("get", file_id))
         if file_id not in self.items:
             raise RuntimeError("404 Client Error: Not Found")
-        return self.items[file_id]
+        item = self.items[file_id]
+        if item["mimeType"] == FOLDER_MIME:
+            return item
+        # What Drive reports for a stored file, and what a Composio create's
+        # read-back and a proxied download are checked against.
+        data = self.contents[file_id]
+        return {
+            **item,
+            "size": str(len(data)),
+            "md5Checksum": hashlib.md5(data, usedforsecurity=False).hexdigest(),
+        }
 
     def media(self, file_id: str) -> _Media:
         self.refused()
@@ -257,6 +301,77 @@ def drive(monkeypatch: pytest.MonkeyPatch) -> Drive:
         google_drive, "_download_media", lambda request: drive.contents[request.file_id]
     )
     return drive
+
+
+class Composio:
+    """Composio's two calls a Drive create makes, on the fake drive.
+
+    ``stage_file`` keeps the bytes under a made-up key, and ``execute_tool``
+    has ``GOOGLEDRIVE_CREATE_FILE`` create the file in Drive the way the
+    tool does: named as the arguments say, in the folder its ``parents``
+    names. ``fail_status`` loses the answer after the tool ran (a 5xx), the
+    case where the file exists but the call reports it as unconfirmed.
+    """
+
+    def __init__(self, drive: Drive, *, fail_status: int | None = None) -> None:
+        self.drive = drive
+        self.fail_status = fail_status
+        self.staged: dict[str, tuple[bytes, str]] = {}
+        self.executed: list[tuple[str, dict[str, Any]]] = []
+
+    def stage_file(
+        self,
+        *,
+        toolkit_slug: str,
+        tool_slug: str,
+        filename: str,
+        mimetype: str,
+        md5: str,
+        data: Any,
+        length: int,
+        on_dedup: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
+        key = f"s3key-{len(self.staged) + 1}"
+        body = bytes(data)
+        assert hashlib.md5(body, usedforsecurity=False).hexdigest() == md5
+        assert len(body) == length
+        self.staged[key] = (body, mimetype)
+        return {"name": filename, "mimetype": mimetype, "s3key": key}
+
+    def execute_tool(
+        self, tool_slug: str, arguments: dict[str, Any], *, toolkit: str
+    ) -> composio_tools.ToolResult:
+        self.executed.append((tool_slug, dict(arguments)))
+        body, _ = self.staged[arguments["file_to_upload"]["s3key"]]
+        (parent,) = arguments.get("parents") or [None]
+        file_id = self.drive.add(
+            f"file-{len(self.drive.items) + 1}",
+            arguments["name"],
+            arguments["mimeType"],
+            parent=parent,
+            content=body,
+        )
+        self.drive.created.append(
+            {"id": file_id, "name": arguments["name"], "parent": parent}
+        )
+        if self.fail_status is not None:
+            raise composio_tools.ComposioToolError(
+                "bad gateway", status=self.fail_status
+            )
+        return composio_tools.ToolResult(
+            successful=True, data={"id": file_id}, error=None
+        )
+
+
+@pytest.fixture()
+def composio(drive: Drive, monkeypatch: pytest.MonkeyPatch) -> Composio:
+    """A Composio-backed grant: Drive's calls stay on the fake drive, and the
+    create stages and runs Composio's tool instead of Drive's files.create."""
+    monkeypatch.setenv(composio_proxy.COMPOSIO_CONNECTED_ACCOUNT_ID_ENV, "ca_test")
+    composio = Composio(drive)
+    monkeypatch.setattr(composio_tools, "stage_file", composio.stage_file)
+    monkeypatch.setattr(composio_tools, "execute_tool", composio.execute_tool)
+    return composio
 
 
 @pytest.fixture()
@@ -407,6 +522,120 @@ async def test_a_same_named_folder_outside_the_root_does_not_fail_the_pin(
         None,
     )
     assert len(drive.created) == 1
+
+
+@pytest.mark.usefixtures("writes_on")
+async def test_a_write_folder_the_connection_cannot_read_refuses_the_write(
+    drive: Drive,
+) -> None:
+    # A native `drive.file` grant, or a connection to another account, cannot
+    # see the write folder the seed made: the pin's search finds no such
+    # folder and nothing is written.
+    seeded = dict(drive.items)
+    del drive.items[WRITE_FOLDER]
+    del seeded[WRITE_FOLDER]
+
+    result = await run_checks(
+        _adapter(),
+        checks=["google-drive.file_round_trip"],
+        check_timeout=5.0,
+        total_timeout=60.0,
+    )
+
+    assert _check_rows(result)["google-drive.file_round_trip"] == (
+        "fail",
+        "tenant_mismatch",
+        "pin_failed",
+    )
+    assert not drive.created
+    assert drive.items == seeded
+
+
+# A Composio-backed grant, the connection production actually serves
+
+
+@pytest.mark.usefixtures("writes_on", "composio")
+async def test_a_composio_grant_creates_reads_and_deletes_the_file(
+    drive: Drive, composio: Composio
+) -> None:
+    seeded = dict(drive.items)
+
+    result = await _run(_adapter())
+
+    assert _check_rows(result) == {
+        "session": ("pass", None, None),
+        **{check: ("pass", None, None) for check in _CHECKS},
+    }
+    # The pin read the write folder before the create, and the create ran
+    # Composio's tool with the file staged in that folder.
+    assert ("list", PIN_QUERY) in drive.requests
+    ((slug, arguments),) = composio.executed
+    assert slug == google_drive_composio.GOOGLEDRIVE_CREATE_FILE
+    assert arguments["parents"] == [WRITE_FOLDER]
+    assert arguments["mimeType"] == "text/plain"
+    assert arguments["file_to_upload"]["mimetype"] == "text/plain"
+    assert NAMED.fullmatch(arguments["name"])
+    # One file was created and deleted, through the same Drive API calls.
+    assert len(drive.created) == 1
+    assert len([kind for kind, _ in drive.requests if kind == "delete"]) == 1
+    assert drive.items == seeded
+
+
+@pytest.mark.usefixtures("writes_on", "composio")
+async def test_a_composio_create_whose_answer_is_lost_leaves_the_file_to_the_sweep(
+    drive: Drive, composio: Composio
+) -> None:
+    seeded = dict(drive.items)
+    composio.fail_status = 502
+
+    result = await _run(_adapter())
+
+    # The tool ran, so the file exists; with no id in the answer the create
+    # fails its status assertion and nothing is deleted.
+    assert _check_rows(result)["google-drive.file_round_trip"] == (
+        "fail",
+        "assertion_failed",
+        "create:status_success",
+    )
+    (created,) = set(drive.items) - set(seeded)
+    assert drive.items[created]["parents"] == [WRITE_FOLDER]
+    assert not [kind for kind, _ in drive.requests if kind == "delete"]
+
+    # The next sweep finds it in the write folder and deletes it by id.
+    later = datetime.now(timezone.utc) + timedelta(hours=3)
+    swept = await run_sweep(
+        _adapter(), call_timeout=5.0, total_timeout=60.0, now=lambda: later
+    )
+    (row,) = swept.to_document()["rows"]
+    assert (row["outcome"], row["found"], row["deleted"]) == ("pass", 1, 1)
+    assert drive.items == seeded
+
+
+@pytest.mark.usefixtures("writes_on", "composio")
+async def test_a_composio_grant_that_cannot_read_the_write_folder_writes_nothing(
+    drive: Drive, composio: Composio
+) -> None:
+    # The grant reaches Drive (the reads answer) but not the seed's write
+    # folder: a search for it finds nothing, so the pin fails and no create
+    # runs.
+    del drive.items[WRITE_FOLDER]
+    seeded = dict(drive.items)
+
+    result = await run_checks(
+        _adapter(),
+        checks=["google-drive.file_round_trip"],
+        check_timeout=5.0,
+        total_timeout=60.0,
+    )
+
+    assert _check_rows(result)["google-drive.file_round_trip"] == (
+        "fail",
+        "tenant_mismatch",
+        "pin_failed",
+    )
+    assert not composio.executed
+    assert not drive.created
+    assert drive.items == seeded
 
 
 @pytest.mark.usefixtures("writes_on")

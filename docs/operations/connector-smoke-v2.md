@@ -176,6 +176,7 @@ A path is a tuple of object keys and list indexes into the payload; `()` is the 
 ### Fixture keys
 
 A fixture key is `<namespace>.<name>`, at most 80 characters: the namespace is kebab-case, by convention the app id of the connector or tenant family that owns the value, and the name is one or more dot-separated snake_case parts (`google-docs.document_id`, `jira.seed.project_key`). The identity adapter resolves keys from server-side configuration, per environment and identity (`fixtures.FixtureResolver`). An unresolved key reports the check as `skip` with `fixture_missing` and the key as the row's `reason`. Errors and results name the key, never its value. The document, Google, GitHub and Microsoft 365 connectors' read checks use these keys; the probe route does not take fixtures yet (#3284).
+
 ### Today's L3 probes
 
 A connector that has not adopted V2 keeps `web/connector_probes.py` as its single source (`registry.connector_checks_for`):

@@ -4086,6 +4086,9 @@ class TestModelAPI:
         class FakeResponse:
             status = 200
 
+            def raise_for_status(self):
+                pass
+
             async def __aenter__(self):
                 return self
 
@@ -4100,6 +4103,17 @@ class TestModelAPI:
                             "model_name": "Wan2.1-1.3B",
                             "model_type": "video",
                             "model_ability": ["text_to_video"],
+                        },
+                        {
+                            "id": "h3/fast",
+                            "model_name": "MiniMax-H3",
+                            "model_type": "video",
+                            "lightning_inference_steps": 8,
+                        },
+                        {
+                            "id": "h3/base",
+                            "model_name": "MiniMax-H3",
+                            "model_type": "video",
                         },
                         {
                             "id": "chat-model",
@@ -4129,7 +4143,7 @@ class TestModelAPI:
                 return FakeResponse()
 
         monkeypatch.setattr(
-            "xagent.web.services.model_list_service.aiohttp.ClientSession",
+            "xagent.core.model.video.xinference.aiohttp.ClientSession",
             FakeClientSession,
         )
 
@@ -4145,8 +4159,8 @@ class TestModelAPI:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["count"] == 1
-        assert data["models"] == [
+        assert data["count"] == 3
+        assert data["models"][:1] == [
             {
                 "id": "Wan2.1-1.3B",
                 "model_uid": "wan-video",
@@ -4157,6 +4171,10 @@ class TestModelAPI:
                 "description": "",
             }
         ]
+        assert {
+            model["model_uid"]: model.get("lightning_inference_steps")
+            for model in data["models"][1:]
+        } == {"h3/fast": 8, "h3/base": None}
         assert FakeClientSession.created_timeouts[0].total == 30.0
 
     def test_fetch_xinference_video_provider_models_handles_unexpected_response(
@@ -4164,6 +4182,9 @@ class TestModelAPI:
     ):
         class FakeResponse:
             status = 200
+
+            def raise_for_status(self):
+                pass
 
             async def __aenter__(self):
                 return self
@@ -4190,7 +4211,7 @@ class TestModelAPI:
                 return FakeResponse()
 
         monkeypatch.setattr(
-            "xagent.web.services.model_list_service.aiohttp.ClientSession",
+            "xagent.core.model.video.xinference.aiohttp.ClientSession",
             FakeClientSession,
         )
 

@@ -2534,8 +2534,10 @@ def test_admission_clears_the_migration_anchor_so_a_later_freeze_waits(
         CollectionMigratingError,
     )
     from xagent.web.jobs.exceptions import BackgroundJobDeferred
-    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
-    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        handle_kb_ingest_document,
+    )
 
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
@@ -2618,8 +2620,10 @@ def test_admission_clears_the_migration_anchor_so_a_later_freeze_waits(
 
 
 def test_kb_web_job_clears_the_anchor_once_admitted(tmp_path, monkeypatch):
-    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
-    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        handle_kb_ingest_web,
+    )
 
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
@@ -2663,9 +2667,11 @@ def test_kb_web_job_clears_the_anchor_once_admitted(tmp_path, monkeypatch):
 
 def test_kb_web_job_gives_up_with_a_terminal_message(tmp_path, monkeypatch):
     from xagent.web.jobs.exceptions import BackgroundJobHandlerError
-    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
-    from xagent.web.jobs.kb_tasks import _MIGRATION_GIVE_UP_MESSAGE
-    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        _MIGRATION_GIVE_UP_MESSAGE,
+        handle_kb_ingest_web,
+    )
 
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)

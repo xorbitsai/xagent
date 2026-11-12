@@ -10,6 +10,10 @@ from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
+from ...config import (
+    get_kb_migration_defer_budget_seconds,
+    get_kb_migration_defer_delay_seconds,
+)
 from ...core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from ...core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
@@ -37,10 +41,6 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
 from ...core.tools.core.RAG_tools.utils.config_utils import IngestionConfigInput
 from ...core.tools.core.RAG_tools.utils.model_resolution_pin import ModelResolutionPin
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
-from ...config import (
-    get_kb_migration_defer_budget_seconds,
-    get_kb_migration_defer_delay_seconds,
-)
 from ..config import get_upload_path
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local, release_db_connection_if_clean

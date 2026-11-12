@@ -30,7 +30,6 @@ from xagent.core.tools.core.RAG_tools.management.migration_state import (
     admitted_context_async,
     clear_migration_state,
     ensure_collection_writable,
-    move_migration_state,
     pending_collection,
     read_migration_state,
     run_in_admitted_context,
@@ -313,22 +312,6 @@ def test_clear_migration_state_removes_row() -> None:
     assert read_migration_state("kb").state == IDLE
 
 
-def test_move_migration_state_rekeys_row() -> None:
-    _freeze("old-kb")
-
-    move_migration_state("old-kb", "new-kb")
-
-    assert "old-kb" not in _migration_names()
-    assert "new-kb" in _migration_names()
-    assert read_migration_state("new-kb").state == FROZEN
-
-
-def test_move_migration_state_noop_when_row_absent() -> None:
-    move_migration_state("absent-kb", "other-kb")
-
-    assert "other-kb" not in _migration_names()
-
-
 class _FakeCollectionHandle:
     def list_collection_documents(self, **kwargs: object) -> list[str]:
         return []
@@ -350,39 +333,6 @@ class _FakeCollectionHandle:
 
     async def rename_collection_metadata(self, *args: object, **kwargs: object) -> None:
         return None
-
-
-@pytest.mark.asyncio
-async def test_delete_collection_clears_migration_row() -> None:
-    write_migration_state("kb", CollectionMigrationState(state=IDLE))
-    coordinator = KBCoordinator()
-
-    with patch.object(
-        coordinator,
-        "open_collection",
-        new=AsyncMock(return_value=_FakeCollectionHandle()),
-    ):
-        await coordinator.delete_collection("kb", user_id=None, is_admin=True)
-
-    assert "kb" not in _migration_names()
-
-
-@pytest.mark.asyncio
-async def test_rename_collection_moves_migration_row() -> None:
-    write_migration_state("old-kb", CollectionMigrationState(state=IDLE))
-    coordinator = KBCoordinator()
-
-    with patch.object(
-        coordinator,
-        "open_collection",
-        new=AsyncMock(return_value=_FakeCollectionHandle()),
-    ):
-        await coordinator.rename_collection(
-            "old-kb", "new-kb", user_id=None, is_admin=True
-        )
-
-    assert "old-kb" not in _migration_names()
-    assert "new-kb" in _migration_names()
 
 
 # --- Single admission per operation -----------------------------------------
@@ -569,8 +519,9 @@ async def test_rename_inside_admission_completes_after_a_freeze() -> None:
 
     assert warnings == []
     assert handle.renames == ["data", "status", "metadata"]
-    assert read_migration_state("kb-new").state == FROZEN
-    assert read_migration_state("kb").state == IDLE
+    # Rename never moves the row; the migration job owns its lifecycle.
+    assert read_migration_state("kb").state == FROZEN
+    assert read_migration_state("kb-new").state == IDLE
 
 
 @pytest.mark.asyncio
@@ -611,10 +562,7 @@ async def test_run_in_admitted_context_supports_overlapping_workers() -> None:
         await holder
 
 
-class _MultiTenantHandle(_FakeCollectionHandle):
-    def __init__(self, remaining_documents: int) -> None:
-        self.remaining_documents = remaining_documents
-
+class _TenantHandle(_RecordingHandle):
     def list_collection_documents(self, **kwargs: object) -> list[str]:
         return ["doc-a"]
 
@@ -623,52 +571,24 @@ class _MultiTenantHandle(_FakeCollectionHandle):
     ) -> dict[str, int]:
         return {"documents": len(doc_ids)}
 
-    def count_documents(self, **kwargs: object) -> int:
-        return self.remaining_documents
-
-
-class _TenantRenameHandle(_RecordingHandle):
-    def __init__(self, remaining_documents: int) -> None:
-        super().__init__()
-        self.remaining_documents = remaining_documents
-
-    def count_documents(self, **kwargs: object) -> int:
-        return self.remaining_documents
-
 
 @pytest.mark.asyncio
-async def test_tenant_delete_keeps_the_global_freeze_when_others_remain() -> None:
+async def test_delete_and_rename_leave_the_migration_row_untouched() -> None:
     write_migration_state("kb", CollectionMigrationState(state=IDLE))
     coordinator = KBCoordinator()
-    handle = _MultiTenantHandle(remaining_documents=2)
 
     with patch.object(
-        coordinator, "open_collection", new=AsyncMock(return_value=handle)
+        coordinator,
+        "open_collection",
+        new=AsyncMock(return_value=_TenantHandle()),
     ):
         async with admitted_async("kb"):
             _freeze("kb")
             await coordinator.delete_collection("kb", user_id=7, is_admin=False)
-
-    assert read_migration_state("kb").state == FROZEN
-    with pytest.raises(CollectionMigratingError):
-        ensure_collection_writable("kb")
-
-
-@pytest.mark.asyncio
-async def test_tenant_rename_keeps_the_old_name_freeze_when_others_remain() -> None:
-    write_migration_state("old-kb", CollectionMigrationState(state=IDLE))
-    coordinator = KBCoordinator()
-    handle = _TenantRenameHandle(remaining_documents=2)
-
-    with patch.object(
-        coordinator, "open_collection", new=AsyncMock(return_value=handle)
-    ):
-        async with admitted_async("old-kb"):
-            _freeze("old-kb")
-            warnings = await coordinator.rename_collection(
-                "old-kb", "new-kb", user_id=7, is_admin=False
+            await coordinator.rename_collection(
+                "kb", "kb-new", user_id=7, is_admin=False
             )
 
-    assert warnings == []
-    assert read_migration_state("old-kb").state == FROZEN
-    assert read_migration_state("new-kb").state == IDLE
+    assert "kb" in _migration_names()
+    assert read_migration_state("kb").state == FROZEN
+    assert read_migration_state("kb-new").state == IDLE

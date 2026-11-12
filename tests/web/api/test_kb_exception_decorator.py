@@ -1110,6 +1110,99 @@ async def test_ingest_cloud_rollback_delete_runs_after_a_mid_flight_freeze(
 
 
 @pytest.mark.asyncio
+async def test_ingest_cloud_runs_overlapping_workers(tmp_path) -> None:
+    """Two concurrent file workers share one admission without entering it twice."""
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+    from xagent.web.api.kb import CloudFile, CloudIngestRequest, ingest_cloud
+
+    user, db, access = _migration_mocks()
+    facade = _FakeRollbackFacade()
+    pin = SimpleNamespace(run=lambda fn, *args, **kwargs: fn(*args, **kwargs))
+    barrier = threading.Barrier(2)
+
+    service = MagicMock()
+    service.files.return_value.get.return_value.execute.return_value = {
+        "name": "a.pdf",
+        "mimeType": "application/pdf",
+        "size": "4",
+    }
+    service.files.return_value.get_media.return_value.headers = {}
+
+    class _Downloader:
+        def __init__(self, output, request):
+            self._output = output
+
+        def next_chunk(self):
+            self._output.write(b"data")
+            return None, True
+
+    def _ingest(**kwargs: object) -> KBApiOperationResult:
+        barrier.wait(timeout=10)
+        return KBApiOperationResult(
+            result=IngestionResult(status="success", message="ok", doc_id="d")
+        )
+
+    (tmp_path / "uploads").mkdir(parents=True)
+    request = CloudIngestRequest(
+        files=[
+            CloudFile(provider="google-drive", fileId="f1", fileName="a.pdf"),
+            CloudFile(provider="google-drive", fileId="f2", fileName="b.pdf"),
+        ],
+        collection="kb",
+    )
+
+    with (
+        patch(
+            "xagent.web.api.kb._effective_knowledge_base_user",
+            return_value=(user, access),
+        ),
+        patch("xagent.web.api.kb._ensure_collection_access", new=AsyncMock()),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError()),
+        patch("xagent.web.api.kb._enforce_storage_gate"),
+        patch("xagent.web.api.kb.sessionmaker"),
+        patch("xagent.web.api.kb._load_google_credentials", return_value=object()),
+        patch("xagent.web.api.kb.build", return_value=service),
+        patch("xagent.web.api.kb.MediaIoBaseDownload", _Downloader),
+        patch(
+            "xagent.web.api.kb._resolve_kb_ingestion_models",
+            new=AsyncMock(return_value=(pin, ("m",))),
+        ),
+        patch("xagent.web.api.kb.check_standalone_gate_async", new=AsyncMock()),
+        patch(
+            "xagent.web.api.kb._document_existed_before_ingest",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "xagent.web.api.kb.get_upload_path",
+            side_effect=lambda filename, **_: tmp_path / "uploads" / filename,
+        ),
+        patch(
+            "xagent.web.api.kb._upsert_uploaded_file_record",
+            return_value=MagicMock(file_id="f1"),
+        ),
+        patch(
+            "xagent.web.api.kb.run_document_ingestion_with_outcome",
+            side_effect=_ingest,
+        ),
+        patch(
+            "xagent.web.api.kb._save_collection_config_after_ingest",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.kb._get_api_compatibility_facade",
+            return_value=facade,
+        ),
+    ):
+        results = await ingest_cloud(request=request, _user=user, db=db)
+
+    assert [result.status for result in results] == ["success", "success"]
+
+
+@pytest.mark.asyncio
 async def test_delete_route_authorizes_before_the_freeze_check() -> None:
     """A non-owner must not learn a foreign collection is migrating."""
     from unittest.mock import patch
@@ -1147,7 +1240,7 @@ async def test_rename_route_authorizes_before_the_freeze_check() -> None:
 @pytest.mark.asyncio
 async def test_guessed_frozen_name_returns_404_in_standalone_mode() -> None:
     """The default tenant resolver's 404 must win over the freeze 409."""
-    from unittest.mock import patch
+    from unittest.mock import MagicMock, patch
 
     from xagent.core.tools.core.RAG_tools.management.migration_state import (
         clear_migration_state,
@@ -1157,6 +1250,13 @@ async def test_guessed_frozen_name_returns_404_in_standalone_mode() -> None:
     user, db, access = _migration_mocks()
     user.is_admin = False
     user.id = 2
+    vector_store = MagicMock()
+    vector_store.count_documents_grouped_by_collection.side_effect = [
+        {"guessed": 1},
+        {"guessed": 0},
+        {"guessed": 1},
+        {"guessed": 0},
+    ]
     _freeze_state("guessed")
     try:
         with (
@@ -1165,11 +1265,14 @@ async def test_guessed_frozen_name_returns_404_in_standalone_mode() -> None:
                 return_value=(user, access),
             ),
             patch(
-                "xagent.web.api.kb._get_collection_document_counts",
-                return_value=(1, 0),
+                "xagent.web.api.kb.get_vector_index_store",
+                return_value=vector_store,
+            ),
+            patch(
+                "xagent.web.api.kb.delete_collection_metadata_sync",
+                return_value={"config_rows": 0, "metadata_rows": 0},
             ),
             patch("xagent.web.api.kb.notify_knowledge_base_deleted"),
-            patch("xagent.web.api.kb._perform_kb_collection_delete") as perform,
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await delete_collection_api(
@@ -1179,4 +1282,4 @@ async def test_guessed_frozen_name_returns_404_in_standalone_mode() -> None:
         clear_migration_state("guessed")
 
     assert exc_info.value.status_code == 404
-    perform.assert_not_called()
+    assert "knowledge base list" in str(exc_info.value.detail)

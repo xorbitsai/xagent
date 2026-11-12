@@ -30,12 +30,8 @@ from ..core.schemas import (
     RegisterDocumentResponse,
     SparseSearchResponse,
 )
-from ..management.migration_state import (
-    clear_migration_state,
-    ensure_collection_writable_async,
-    move_migration_state,
-)
-from ..storage.factory import StorageFactory, get_metadata_store
+from ..management.migration_state import ensure_collection_writable_async
+from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
 from .async_utils import maybe_await
@@ -116,16 +112,6 @@ def _merge_positive_counts(
         if count <= 0:
             continue
         target[str(key)] = target.get(str(key), 0) + count
-
-
-def _remaining_config_owners(collection_name: str) -> Optional[set[int]]:
-    """Return config owners left under ``collection_name``; None when unreadable."""
-    try:
-        return set(
-            get_metadata_store().list_collection_config_owner_ids(collection_name)
-        )
-    except Exception:  # noqa: BLE001 - keep the freeze when we cannot tell
-        return None
 
 
 class KBCoordinator:
@@ -1121,8 +1107,6 @@ class KBCoordinator:
                 if isinstance(raw_counts, dict):
                     _merge_positive_counts(deleted_counts, raw_counts)
 
-        remaining: Optional[int] = None
-        config_globally_removed = False
         if delete_orphaned_metadata and data_error is None:
             # Always remove the current tenant's config row so it does not
             # become orphaned when other tenants still have documents.
@@ -1142,7 +1126,6 @@ class KBCoordinator:
                 if is_admin and remaining == 0:
                     # Admin caller + collection fully empty: remove all tenant rows.
                     await handle.delete_collection_config()
-                    config_globally_removed = True
                 else:
                     # Non-admin caller, or other tenants still have data: only remove
                     # the current tenant's config row to preserve tenant isolation.
@@ -1199,23 +1182,6 @@ class KBCoordinator:
         # such warnings accompany an actual deletion, report ``partial_success`` so
         # the caller is not told the operation fully succeeded — mirroring the
         # legacy ``_delete_collection_impl`` status semantics.
-        owners = _remaining_config_owners(collection)
-        if (
-            is_admin
-            and delete_orphaned_metadata
-            and data_error is None
-            and remaining == 0
-            and config_globally_removed
-            and owners is not None
-            and not owners
-        ):
-            try:
-                await run_blocking(clear_migration_state, collection)
-            except Exception as exc:  # noqa: BLE001 - best-effort
-                warnings.append(
-                    f"clear_migration_state for {collection!r} failed: {exc}"
-                )
-
         something_deleted = bool(deleted_counts) or bool(affected_doc_ids)
         status = "partial_success" if warnings and something_deleted else "success"
         message = (
@@ -1306,24 +1272,6 @@ class KBCoordinator:
             warnings.append(
                 f"rename_collection_metadata for {old_name!r} → {new_name!r} failed: {exc}"
             )
-
-        remaining_docs: Optional[int] = None
-        owners: Optional[set[int]] = None
-        if is_admin:
-            try:
-                remaining_docs = await run_blocking(
-                    handle.count_documents, user_id=None, is_admin=True
-                )
-            except Exception:  # noqa: BLE001 - keep the freeze when unreadable
-                remaining_docs = None
-            owners = _remaining_config_owners(old_name)
-        if is_admin and remaining_docs == 0 and owners is not None and not owners:
-            try:
-                await run_blocking(move_migration_state, old_name, new_name)
-            except Exception as exc:  # noqa: BLE001 - best-effort
-                warnings.append(
-                    f"move_migration_state for {old_name!r} → {new_name!r} failed: {exc}"
-                )
 
         return warnings
 

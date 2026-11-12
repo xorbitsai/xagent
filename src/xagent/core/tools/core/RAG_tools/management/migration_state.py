@@ -169,24 +169,6 @@ def clear_migration_state(collection_name: str) -> None:
         _safe_close_table(table)
 
 
-def move_migration_state(old_name: str, new_name: str) -> None:
-    """Re-key an existing row from ``old_name`` to ``new_name``."""
-    if old_name == new_name:
-        return
-    row = _read_row(old_name)
-    if row is None:
-        return
-    write_migration_state(
-        new_name,
-        CollectionMigrationState(
-            state=_row_state(row),
-            source_model_id=row.get("source_model_id"),
-            target_model_id=row.get("target_model_id"),
-        ),
-    )
-    clear_migration_state(old_name)
-
-
 def _admit(collection: str) -> None:
     _ADMITTED.set(_ADMITTED.get() | {collection})
 

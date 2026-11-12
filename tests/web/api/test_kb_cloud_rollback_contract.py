@@ -671,7 +671,7 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
         BackgroundJobDeferred,
         BackgroundJobHandlerError,
     )
-    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
+    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY, _MIGRATION_GIVE_UP_MESSAGE
 
     _, _, user, session_local = test_env
     file_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
@@ -739,6 +739,7 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
 
     if frozen and give_up:
         assert raised.value.retryable is False
+        assert str(raised.value) == _MIGRATION_GIVE_UP_MESSAGE
     # The unfrozen run is the positive control: this payload does reach compensation.
     assert compensated == ([] if frozen else ["existing-kb"])
     # A deferred job still needs the staged copy; giving up or failing does not.

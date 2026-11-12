@@ -59,6 +59,8 @@ from xagent.config import (
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
     KB_COLLECTIONS_TIMEOUT_SECONDS,
+    KB_MIGRATION_DEFER_BUDGET_SECONDS,
+    KB_MIGRATION_DEFER_DELAY_SECONDS,
     KB_MILVUS_CLEANUP_ENABLED,
     KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
     KB_SEARCH_TIMEOUT_SECONDS,
@@ -146,6 +148,8 @@ from xagent.config import (
     get_db_pool_size,
     get_db_pool_timeout_seconds,
     get_deepdoc_xinference_api_key,
+    get_kb_migration_defer_budget_seconds,
+    get_kb_migration_defer_delay_seconds,
     get_deepdoc_xinference_model_uid,
     get_deepdoc_xinference_password,
     get_deepdoc_xinference_timeout_seconds,
@@ -523,6 +527,14 @@ class TestEnvironmentVariableConstants:
             BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS
             == "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
         )
+        assert (
+            KB_MIGRATION_DEFER_DELAY_SECONDS
+            == "XAGENT_KB_MIGRATION_DEFER_DELAY_SECONDS"
+        )
+        assert (
+            KB_MIGRATION_DEFER_BUDGET_SECONDS
+            == "XAGENT_KB_MIGRATION_DEFER_BUDGET_SECONDS"
+        )
         assert TRIGGER_DISPATCHER_ENABLED == "XAGENT_TRIGGER_DISPATCHER_ENABLED"
         assert (
             TRIGGER_DISPATCHER_INTERVAL_SECONDS
@@ -880,6 +892,18 @@ class TestCeleryBackgroundJobConfig:
         assert get_background_job_max_retries() == 3
         assert get_background_job_stale_seconds() == 7200
         assert get_background_job_sweep_interval_seconds() == 300
+
+    def test_kb_migration_defer_defaults(self, monkeypatch):
+        monkeypatch.delenv(KB_MIGRATION_DEFER_DELAY_SECONDS, raising=False)
+        monkeypatch.delenv(KB_MIGRATION_DEFER_BUDGET_SECONDS, raising=False)
+        assert get_kb_migration_defer_delay_seconds() == 15
+        assert get_kb_migration_defer_budget_seconds() == 600
+
+    def test_kb_migration_defer_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(KB_MIGRATION_DEFER_DELAY_SECONDS, "20")
+        monkeypatch.setenv(KB_MIGRATION_DEFER_BUDGET_SECONDS, "1200")
+        assert get_kb_migration_defer_delay_seconds() == 20
+        assert get_kb_migration_defer_budget_seconds() == 1200
 
     def test_kb_milvus_cleanup_interval_default(self, monkeypatch):
         monkeypatch.delenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, raising=False)

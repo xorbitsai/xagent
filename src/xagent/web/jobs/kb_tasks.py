@@ -37,6 +37,10 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
 from ...core.tools.core.RAG_tools.utils.config_utils import IngestionConfigInput
 from ...core.tools.core.RAG_tools.utils.model_resolution_pin import ModelResolutionPin
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+from ...config import (
+    get_kb_migration_defer_budget_seconds,
+    get_kb_migration_defer_delay_seconds,
+)
 from ..config import get_upload_path
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local, release_db_connection_if_clean
@@ -54,13 +58,12 @@ logger = logging.getLogger(__name__)
 
 _SUPERSEDED_STAGED_INGEST_MESSAGE = "KB ingest job superseded by a newer upload"
 
-# A frozen collection is upgraded for about a minute, so wait it out in short
-# hops; past the wall-clock budget the document path removes its staged input.
-_KB_MIGRATION_DEFER_DELAY_SECONDS = 15
-_KB_MIGRATION_DEFER_BUDGET_SECONDS = 10 * 60
-# Writes the first deferral under an internal payload key: created_at also
-# covers queue wait and stale requeues, so it cannot anchor the wait budget.
+# created_at also covers queue wait and stale requeues, so it cannot anchor
+# the wait budget; a deferred job carries its first refusal here instead.
 _MIGRATION_DEFERRED_AT_KEY = "_migration_deferred_at"
+_MIGRATION_GIVE_UP_MESSAGE = (
+    "Gave up waiting for the knowledge base upgrade; please re-submit."
+)
 
 
 class StagedDocumentIngestSuperseded(RuntimeError):
@@ -92,14 +95,25 @@ def _defer_collection_migration(
         first_at = datetime.fromisoformat(str(first_deferral))
         if first_at.tzinfo is None:
             first_at = first_at.replace(tzinfo=timezone.utc)
-    remaining = _KB_MIGRATION_DEFER_BUDGET_SECONDS - int(
+    remaining = get_kb_migration_defer_budget_seconds() - int(
         (now - first_at).total_seconds()
     )
     if remaining <= 0:
         return None
     return BackgroundJobDeferred(
-        str(exc), delay_seconds=min(_KB_MIGRATION_DEFER_DELAY_SECONDS, remaining)
+        str(exc),
+        delay_seconds=min(get_kb_migration_defer_delay_seconds(), remaining),
     )
+
+
+def _clear_migration_deferral(db: Session, job: BackgroundJob) -> None:
+    payload = dict(job.payload or {})
+    if _MIGRATION_DEFERRED_AT_KEY not in payload:
+        return
+    payload.pop(_MIGRATION_DEFERRED_AT_KEY)
+    setattr(job, "payload", payload)
+    db.add(job)
+    db.commit()
 
 
 def _collection_existed_before(payload: dict[str, Any]) -> bool:
@@ -295,7 +309,10 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         if deferred is not None:
             raise deferred from exc
         _cleanup_staged_document_input(payload)
-        raise BackgroundJobHandlerError(str(exc), retryable=False) from exc
+        raise BackgroundJobHandlerError(
+            _MIGRATION_GIVE_UP_MESSAGE, retryable=False
+        ) from exc
+    _clear_migration_deferral(db, job)
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not
@@ -490,7 +507,10 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
         deferred = _defer_collection_migration(db, job, exc)
         if deferred is not None:
             raise deferred from exc
-        raise BackgroundJobHandlerError(str(exc), retryable=False) from exc
+        raise BackgroundJobHandlerError(
+            _MIGRATION_GIVE_UP_MESSAGE, retryable=False
+        ) from exc
+    _clear_migration_deferral(db, job)
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         with (

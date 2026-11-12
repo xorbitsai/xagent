@@ -2238,6 +2238,7 @@ def test_kb_document_job_gives_up_when_migration_budget_is_spent(tmp_path, monke
     from xagent.web.jobs.exceptions import BackgroundJobHandlerError
     from xagent.web.jobs.kb_tasks import (
         _MIGRATION_DEFERRED_AT_KEY,
+        _MIGRATION_GIVE_UP_MESSAGE,
         handle_kb_ingest_document,
     )
     from xagent.web.services.kb_ingest_targets import admit_kb_ingest_target
@@ -2300,6 +2301,7 @@ def test_kb_document_job_gives_up_when_migration_budget_is_spent(tmp_path, monke
             handle_kb_ingest_document(db, job)
 
         assert raised.value.retryable is False
+        assert str(raised.value) == _MIGRATION_GIVE_UP_MESSAGE
         # Giving up follows the terminal path: staged input removed, reservation
         # released so a later upload can take the target.
         assert not staged_file.exists()
@@ -2523,3 +2525,179 @@ def test_deferred_job_survives_a_failed_reschedule(tmp_path, monkeypatch):
         assert refreshed.attempts == 0
     finally:
         verify_db.close()
+
+
+def test_admission_clears_the_migration_anchor_so_a_later_freeze_waits(
+    tmp_path, monkeypatch
+):
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+    from xagent.web.jobs.exceptions import BackgroundJobDeferred
+    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_document
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    frozen = {"on": True}
+
+    def guard(_collection: str) -> None:
+        if frozen["on"]:
+            raise CollectionMigratingError("Knowledge base is being upgraded")
+
+    monkeypatch.setattr("xagent.web.jobs.kb_tasks.ensure_collection_writable", guard)
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks.run_document_ingestion",
+        lambda **kwargs: IngestionResult(
+            status="success",
+            doc_id="doc-1",
+            chunk_count=1,
+            message="ok",
+            completed_steps=[
+                {"name": "register_document", "metadata": {"created": True}}
+            ],
+        ),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "kb-anchor-cleared.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-anchor-cleared")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged content", encoding="utf-8")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": "66666666-6666-4666-8666-666666666666",
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+
+        with pytest.raises(BackgroundJobDeferred):
+            handle_kb_ingest_document(db, job)
+        db.refresh(job)
+        assert job.payload[_MIGRATION_DEFERRED_AT_KEY]
+
+        # The first refusal happened long ago; if the anchor survived admission,
+        # the next freeze would give up instead of waiting.
+        payload = dict(job.payload)
+        payload[_MIGRATION_DEFERRED_AT_KEY] = (
+            datetime.now(timezone.utc) - timedelta(minutes=11)
+        ).isoformat()
+        setattr(job, "payload", payload)
+        db.commit()
+
+        frozen["on"] = False
+        handle_kb_ingest_document(db, job)
+        db.refresh(job)
+        assert _MIGRATION_DEFERRED_AT_KEY not in job.payload
+
+        frozen["on"] = True
+        with pytest.raises(BackgroundJobDeferred) as raised:
+            handle_kb_ingest_document(db, job)
+        assert raised.value.delay_seconds == 15
+    finally:
+        db.close()
+
+
+def test_kb_web_job_clears_the_anchor_once_admitted(tmp_path, monkeypatch):
+    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks._resolve_job_ingestion_models",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("stop after admission")
+        ),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "web-anchor-cleared.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-anchor-cleared")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "web-kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": False,
+                _MIGRATION_DEFERRED_AT_KEY: (
+                    datetime.now(timezone.utc) - timedelta(minutes=11)
+                ).isoformat(),
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="stop after admission"):
+            handle_kb_ingest_web(db, job)
+        db.refresh(job)
+        assert _MIGRATION_DEFERRED_AT_KEY not in job.payload
+    finally:
+        db.close()
+
+
+def test_kb_web_job_gives_up_with_a_terminal_message(tmp_path, monkeypatch):
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import _MIGRATION_DEFERRED_AT_KEY
+    from xagent.web.jobs.kb_tasks import _MIGRATION_GIVE_UP_MESSAGE
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    _freeze_collection(monkeypatch)
+
+    SessionLocal = _init_test_db(tmp_path / "web-give-up-message.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-give-up-message")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": True,
+                _MIGRATION_DEFERRED_AT_KEY: (
+                    datetime.now(timezone.utc) - timedelta(minutes=11)
+                ).isoformat(),
+            },
+        )
+
+        with pytest.raises(BackgroundJobHandlerError) as raised:
+            handle_kb_ingest_web(db, job)
+
+        assert raised.value.retryable is False
+        assert str(raised.value) == _MIGRATION_GIVE_UP_MESSAGE
+    finally:
+        db.close()

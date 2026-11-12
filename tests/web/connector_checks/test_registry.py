@@ -541,6 +541,15 @@ _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] =
             IsType(("site", "id"), "string"),
         ),
     ),
+    "sharepoint.get_site": (
+        "sharepoint_get_site",
+        {"site_id": "root"},
+        (
+            StatusSuccess(),
+            HasKeys(("site",), ("id", "webUrl")),
+            IsType(("site", "id"), "string"),
+        ),
+    ),
     "sharepoint.list_drives": (
         "sharepoint_list_drives",
         {"site_id": "root"},
@@ -868,44 +877,29 @@ def test_an_outlook_list_check_fails_on_another_shape(
     _assert_check_fails(check_id, json.dumps(payload(list_key)), reason)
 
 
-@pytest.mark.parametrize(
-    ("check_id", "raises"),
-    [
-        ("outlook.list_messages", True),
-        ("outlook.list_events", False),
-        ("outlook.list_contacts", False),
-    ],
-)
-def test_an_outlook_list_failure_fails_its_check(
-    monkeypatch: pytest.MonkeyPatch, check_id: str, raises: bool
+def _graph_fails(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("Graph returned 403")
+
+
+def test_outlook_list_messages_raises_on_a_graph_failure(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """list_messages raises ToolError, which MCP reports with its error flag
-    set (a call failure); the other two return their error envelope."""
+    """MCP reports the ToolError with its error flag set, so the check fails
+    as a call failure rather than on its assertions."""
+    monkeypatch.setattr(outlook, "_graph_request", _graph_fails)
+
+    with pytest.raises(ToolError):
+        _call_declared("outlook.list_messages", outlook.outlook_list_messages)
+
+
+@pytest.mark.parametrize("check_id", ["outlook.list_events", "outlook.list_contacts"])
+def test_an_outlook_list_error_envelope_fails_its_check(
+    monkeypatch: pytest.MonkeyPatch, check_id: str
+) -> None:
     _, tool = _OUTLOOK_LISTS[check_id]
+    monkeypatch.setattr(outlook, "_graph_request", _graph_fails)
 
-    def _graph_request(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("Graph returned 403")
-
-    monkeypatch.setattr(outlook, "_graph_request", _graph_request)
-    check = _read_check(check_id)
-    if raises:
-        with pytest.raises(ToolError):
-            _call_declared(check_id, tool)
-        raw = {
-            "content": [{"type": "text", "text": "Graph returned 403"}],
-            "structured_content": None,
-            "is_error": True,
-        }
-        expected = (FailureClass.CALL_FAILED, "tool_error")
-    else:
-        raw = {
-            "content": [{"type": "text", "text": _call_declared(check_id, tool)}],
-            "structured_content": None,
-            "is_error": False,
-        }
-        expected = (FailureClass.ASSERTION_FAILED, "status_success")
-
-    assert judge_result(raw, check.payload, check.assertions) == expected
+    _assert_check_fails(check_id, _call_declared(check_id, tool), "status_success")
 
 
 @pytest.mark.parametrize(
@@ -941,21 +935,43 @@ _SHAREPOINT_LISTS: Mapping[str, tuple[str, Callable[..., str]]] = {
 
 
 @pytest.mark.parametrize("check_id", sorted(_SHAREPOINT_LISTS))
-@pytest.mark.parametrize("count", [0, 1])
+@pytest.mark.parametrize(
+    ("count", "next_link"),
+    [
+        (0, None),
+        (1, None),
+        # A non-empty library read with top 1: Graph links a next page and
+        # the tool reports truncated=True.
+        (1, "https://graph.microsoft.com/v1.0/sites/root/next"),
+    ],
+)
 def test_a_sharepoint_list_output_satisfies_its_declaration(
-    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int
+    monkeypatch: pytest.MonkeyPatch, check_id: str, count: int, next_link: str | None
 ) -> None:
     _, tool = _SHAREPOINT_LISTS[check_id]
     paths: list[str] = []
+    item = {"id": "01ABC", "name": "Documents"}
 
     def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         paths.append(path)
-        return {"value": [{"id": "01ABC", "name": "Documents"}] * count}
+        page: dict[str, Any] = {"value": [item] * count}
+        if next_link is not None:
+            page["@odata.nextLink"] = next_link
+        return page
 
     monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+    # list_drives pages up to 200 items, so it follows the link: the next
+    # page holds one more item and no further link.
+    monkeypatch.setattr(
+        sharepoint, "_graph_get_absolute", lambda *args, **kwargs: {"value": [item]}
+    )
 
-    _assert_check_output(check_id, _call_declared(check_id, tool))
+    result = _call_declared(check_id, tool)
+
+    _assert_check_output(check_id, result)
     assert paths and all(path.startswith("/sites/root/") for path in paths)
+    if next_link is not None and check_id != "sharepoint.list_drives":
+        assert json.loads(result)["truncated"] is True
 
 
 def test_sharepoint_get_root_site_output_satisfies_its_declaration(
@@ -975,6 +991,27 @@ def test_sharepoint_get_root_site_output_satisfies_its_declaration(
         "sharepoint.get_root_site",
         _call_declared("sharepoint.get_root_site", sharepoint.sharepoint_get_root_site),
     )
+
+
+def test_sharepoint_get_site_output_satisfies_its_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths: list[str] = []
+
+    def _graph_request(method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        paths.append(path)
+        return {
+            "id": "contoso.sharepoint.com,1111,2222",
+            "webUrl": "https://contoso.sharepoint.com",
+        }
+
+    monkeypatch.setattr(sharepoint, "_graph_request", _graph_request)
+
+    _assert_check_output(
+        "sharepoint.get_site",
+        _call_declared("sharepoint.get_site", sharepoint.sharepoint_get_site),
+    )
+    assert paths == ["/sites/root"]
 
 
 def test_a_halved_sharepoint_list_still_satisfies_its_declaration(
@@ -1158,7 +1195,7 @@ def test_a_planner_check_fails_on_another_shape(
     _assert_check_fails(check_id, json.dumps(payload), reason)
 
 
-def test_every_planner_write_has_a_cleanup_tool() -> None:
+def test_no_planner_write_is_exempt_as_without_cleanup() -> None:
     assert not [
         exemption.tool
         for exemption in CONNECTOR_CHECKS["planner"].exemptions

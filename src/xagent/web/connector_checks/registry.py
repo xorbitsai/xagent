@@ -821,8 +821,8 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("powerpoint_create_presentation",),
         ),
     ),
-    # Tier 2 (#3573). Every list takes a site id; Graph's "root" alias names
-    # the tenant's root site, so no fixture is needed. list_drives takes no
+    # Tier 2 (#3573). get_site and every list take a site id; Graph's "root"
+    # alias names the tenant's root site, so no fixture is needed. list_drives takes no
     # page size, so its list has no length bound.
     "sharepoint": ConnectorChecks(
         "sharepoint",
@@ -831,6 +831,16 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ReadCheck(
                 "sharepoint.get_root_site",
                 "sharepoint_get_root_site",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("site",), ("id", "webUrl")),
+                    IsType(("site", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "sharepoint.get_site",
+                "sharepoint_get_site",
+                {"site_id": "root"},
                 assertions=(
                     StatusSuccess(),
                     HasKeys(("site",), ("id", "webUrl")),
@@ -877,7 +887,6 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             issue=_TIER_2,
             reads=(
                 "sharepoint_search_sites",
-                "sharepoint_get_site",
                 "sharepoint_search_files",
                 "sharepoint_get_file_content",
                 "sharepoint_download_file",

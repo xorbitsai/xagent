@@ -225,6 +225,15 @@ def gmail_search_messages(
                 "max_results",
                 unit="message requests (plus the list request)",
             )
+            if label_ids and len(label_ids) > 1:
+                raise ValueError(
+                    "on a Composio-backed grant one search takes at most one "
+                    "label id; Gmail returns only the messages that carry "
+                    "every label given, so splitting the labels into separate "
+                    "searches would return more than asked. Write the other "
+                    "labels or conditions into query instead, for example "
+                    "'label:<name>' or 'is:unread'."
+                )
         service = get_gmail_service()
         kwargs = {"userId": "me", "maxResults": max_results}
         if query:

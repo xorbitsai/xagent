@@ -276,8 +276,11 @@ def test_search_reads_subjects_from_every_header_on_a_composio_grant(
 def test_a_composio_search_with_two_label_ids_is_refused_before_sending(
     proxy, monkeypatch
 ):
-    """Two label ids are the same query name twice: the proxy appears to keep
-    only one value, which would quietly widen the search."""
+    """The tool refuses a second label id itself and points at ``query``: on a
+    Composio grant a search takes one label id, and Gmail returns only the
+    messages that carry every label given, so one search per label would
+    merge into a wider result. The shared client's refusal stays as a
+    backstop."""
     proxy.answer("/messages", 200, {"messages": []})
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
 
@@ -286,8 +289,29 @@ def test_a_composio_search_with_two_label_ids_is_refused_before_sending(
     )
 
     assert result["status"] == "error"
-    assert "labelIds" in result["message"]
+    assert "one label id" in result["message"]
+    assert "query" in result["message"]
     assert proxy.calls == []
+
+
+def test_a_composio_search_with_one_label_id_carries_it_once(proxy, monkeypatch):
+    """The ``gmail.search_seed_message`` smoke check searches by a single label
+    id on this path: the list request carries that one ``labelIds``
+    parameter."""
+    proxy.answer("/messages", 200, {"messages": []})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result = json.loads(
+        gmail.gmail_search_messages(label_ids=["INBOX"], max_results=10)
+    )
+
+    assert result["status"] == "success"
+    (list_call,) = proxy.calls
+    assert list_call["endpoint"] == (
+        "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+    )
+    label_ids = [item for item in list_call["parameters"] if item["name"] == "labelIds"]
+    assert label_ids == [{"name": "labelIds", "value": "INBOX", "type": "query"}]
 
 
 def test_search_with_no_messages_sends_only_the_list_request(proxy, monkeypatch):

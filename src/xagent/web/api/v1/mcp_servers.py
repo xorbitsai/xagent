@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path
 
 from ....core.tools.core.mcp.http import _origin as mcp_endpoint_origin
-from ....core.tools.core.mcp.model import MASKED_SECRET_VALUE
+from ....core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ....core.utils.public_http_transport import UnsafePublicHttpTarget
 from ...schemas.v1 import V1McpServer, V1McpServerCreateRequest
 from ...services.connector_name_policy import (
@@ -244,6 +244,14 @@ def _reject_invalid_create(request: V1McpServerCreateRequest) -> None:
             "auth cannot set app_id, provider or builtin_provenance; these mark "
             "catalog connectors.",
         )
+    # The web code encrypts a non-empty value in these fields and fails unless
+    # it is a string; a falsy non-string skips encryption and is stored as sent.
+    for key in SENSITIVE_AUTH_FIELDS:
+        value = (request.auth or {}).get(key)
+        if value is not None and not isinstance(value, str):
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT, 400, f"auth.{key} must be a string or null."
+            )
     if MASKED_SECRET_VALUE in [
         *request.headers.values(),
         *(request.auth or {}).values(),

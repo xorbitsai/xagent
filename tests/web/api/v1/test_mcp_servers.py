@@ -1487,6 +1487,22 @@ _INPUT_RULE_CELLS: dict[str, tuple[dict[str, Any], str]] = {
         {"auth": {"type": "bearer", "bearer_token": MASKED_SECRET_VALUE}},
         "A new connector has no stored value for '********'; send the real value.",
     ),
+    "auth_secret_is_a_number": (
+        {"auth": {"type": "bearer", "bearer_token": 123}},
+        "auth.bearer_token must be a string or null.",
+    ),
+    "auth_secret_is_false": (
+        {"auth": {"type": "api_key", "api_key_name": "X-Key", "api_key_value": False}},
+        "auth.api_key_value must be a string or null.",
+    ),
+    "auth_secret_is_a_list": (
+        {"auth": {"type": "oauth2", "client_secret": ["s"]}},
+        "auth.client_secret must be a string or null.",
+    ),
+    "auth_secret_is_an_object": (
+        {"auth": {"type": "oauth2", "access_token": {"v": "s"}}},
+        "auth.access_token must be a string or null.",
+    ),
 }
 
 
@@ -1496,13 +1512,28 @@ _INPUT_RULE_CELLS: dict[str, tuple[dict[str, Any], str]] = {
     ids=list(_INPUT_RULE_CELLS),
 )
 def test_create_input_rules(bob, fields, message):
-    assert len(_INPUT_RULE_CELLS) == 12
+    assert len(_INPUT_RULE_CELLS) == 16
     before = _store()
 
     error = _error(_create(bob, **fields), 400, "invalid_input")
 
     assert error["message"] == message
     _assert_nothing_written(before)
+
+
+def test_create_keeps_null_secrets_and_other_auth_values(bob):
+    auth = {
+        "type": "bearer",
+        "bearer_token": None,
+        "token_type": "Bearer",
+        "extra": 123,
+        "nested": {"k": [1, 2]},
+    }
+
+    resp = _create(bob, auth=auth)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["auth"] == auth
 
 
 _SHAPE_CELLS: dict[str, dict[str, Any]] = {

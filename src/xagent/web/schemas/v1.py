@@ -590,11 +590,11 @@ class V1McpServerCreateRequest(BaseModel):
 
     Creates a connector the key holder owns. Only remote connectors can be
     created. The auth fields ``bearer_token``, ``api_key_value``,
-    ``client_secret`` and ``access_token`` are stored encrypted and returned
-    masked. Header values are stored as sent and returned masked. Other auth
-    values are stored and returned as sent. A new connector has no stored
-    value, so ``********`` is rejected as a header value or as a top-level auth
-    value.
+    ``client_secret`` and ``access_token`` must be strings or null; non-empty
+    values are stored encrypted and returned masked. Header values are stored
+    as sent and returned masked. Other auth values are stored and returned as
+    sent. A new connector has no stored value, so ``********`` is rejected as
+    a header value or as a top-level auth value.
     """
 
     model_config = ConfigDict(extra="forbid")

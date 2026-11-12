@@ -33,14 +33,11 @@ THREAD = "1762905600.000100"
 THREAD_TEXT = "xagent smoke seed thread"
 REPLY = "1762905601.000200"
 REPLY_TEXT = "xagent smoke seed reply"
-BOT_JOINED = "1762905500.000100"
 FIXTURES = {
     "slack.seed.channel_id": CHANNEL,
     "slack.seed.thread_ts": THREAD,
     "slack.seed.reply_ts": REPLY,
 }
-# Slack allows a new non-Marketplace installation one call a minute to each.
-_THROTTLED = ("conversations.history", "conversations.replies")
 
 
 class _Response:
@@ -72,7 +69,7 @@ class Workspace:
         self.messages: dict[str, list[dict[str, Any]]] = {
             CHANNEL: [
                 {
-                    "ts": BOT_JOINED,
+                    "ts": "1762905500.000100",
                     "user": "U0BOT000001",
                     "subtype": "channel_join",
                     "text": "<@U0BOT000001> has joined the channel",
@@ -152,20 +149,21 @@ class Workspace:
             parents = [m for m in self.messages[channel] if m["ts"] == params["ts"]]
             if not parents:
                 return {"ok": False, "error": "thread_not_found"}
+            found = [*parents, *self.replies.get(params["ts"], [])]
+            limit = int(params["limit"])
             return {
                 "ok": True,
-                "messages": [*parents, *self.replies.get(params["ts"], [])],
-                "has_more": False,
+                "messages": found[:limit],
+                "has_more": len(found) > limit,
             }
         raise AssertionError(api)
 
     def _history(self, channel: str, params: dict[str, Any]) -> dict[str, Any]:
-        # Newest first; ``latest`` and ``oldest`` are exclusive by default.
+        # Newest first; ``latest`` is exclusive by default.
         found = [
             message
             for message in reversed(self.messages[channel])
             if float(message["ts"]) < float(params.get("latest") or "inf")
-            and float(message["ts"]) > float(params.get("oldest") or 0)
         ]
         limit = int(params["limit"])
         return {"ok": True, "messages": found[:limit], "has_more": len(found) > limit}
@@ -298,8 +296,10 @@ async def test_every_check_passes_on_the_seeded_workspace_and_writes_nothing(
 async def test_a_run_calls_each_throttled_method_once(workspace: Workspace) -> None:
     await _run(_adapter())
 
+    # Slack allows a new non-Marketplace installation one call a minute to each.
     called = Counter(api for _, api in workspace.calls)
-    assert {api: called[api] for api in _THROTTLED} == {api: 1 for api in _THROTTLED}
+    assert called["conversations.history"] == 1
+    assert called["conversations.replies"] == 1
 
 
 async def test_every_check_passes_under_the_bot_grants_read_policy(
@@ -384,6 +384,26 @@ async def test_a_seeded_object_that_drifted_fails_its_read(
     workspace: Workspace, key: str, value: str, check: str
 ) -> None:
     result = await _run(_adapter({**FIXTURES, key: value}))
+
+    outcome, failure_class, _ = _check_rows(result)[check]
+    assert (outcome, failure_class) == ("fail", "assertion_failed")
+
+
+@pytest.mark.parametrize(
+    ("key", "check"),
+    [
+        ("slack.seed.thread_ts", "slack.read_seed_history"),
+        ("slack.seed.reply_ts", "slack.read_seed_thread"),
+    ],
+)
+async def test_a_ts_fixture_recorded_as_a_number_fails_its_read(
+    workspace: Workspace, key: str, check: str
+) -> None:
+    # A registry that records a ts unquoted loads it as a float. Here it only
+    # reaches an Equals, which never matches the string the tools return. As
+    # a tool argument (thread_ts, latest) FastMCP refuses it before the call,
+    # which this fake, calling the functions directly, does not model.
+    result = await _run(_adapter({**FIXTURES, key: float(FIXTURES[key])}))
 
     outcome, failure_class, _ = _check_rows(result)[check]
     assert (outcome, failure_class) == ("fail", "assertion_failed")

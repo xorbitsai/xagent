@@ -323,6 +323,13 @@ def _slack_checks() -> ConnectorChecks:
     asserts. A later reply in the thread comes after the one the thread read
     asserts; the parent's reply count grows with it, so the history read
     asserts only that the count is there.
+
+    A second run on the same Slack app within about a minute gets a 429 whose
+    ``Retry-After`` exceeds the 30 s the tool waits, so the throttled reads
+    fail as ``assertion_failed`` (``status_success``), as they do when the
+    seed's channel or thread is gone. The QA workspace is on Slack's free
+    plan, which hides messages older than 90 days, so the thread must be
+    re-seeded before then, with its new ``ts`` values in the registry.
     """
     channel = FixtureRef("slack.seed.channel_id")
     thread = FixtureRef("slack.seed.thread_ts")

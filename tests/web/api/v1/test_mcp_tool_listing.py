@@ -2,12 +2,12 @@
 
 import asyncio
 import gc
+import logging
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from fastapi import HTTPException
 from sqlalchemy.exc import OperationalError
 
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
@@ -63,8 +63,16 @@ def _tools(holder: Holder, server_id: int):
     return client.get(f"/v1/mcp-servers/{server_id}/tools", headers=holder.headers)
 
 
-def _tool(name: str = "search", description: str = "Search things") -> Any:
-    return SimpleNamespace(name=name, description=description)
+def _tool(
+    name: str = "search",
+    description: str = "Search things",
+    mcp_name: str | None = None,
+) -> Any:
+    return SimpleNamespace(
+        name=name,
+        description=description,
+        mcp_tool=SimpleNamespace(name=mcp_name or name),
+    )
 
 
 def _loaded(*tools: Any, failures: tuple[Any, ...] = ()) -> MCPLoadResult:
@@ -104,26 +112,10 @@ def _stub_session_listing(monkeypatch, result: ConnectorToolsResult):
     return calls
 
 
-def _stub_web_function(
-    monkeypatch, *, result: Any = None, error: Exception | None = None
-):
-    calls: list[dict[str, Any]] = []
-
-    async def web_tools(server_id, current_user, db):
-        calls.append({"server_id": server_id, "user_id": int(current_user.id)})
-        if error is not None:
-            raise error
-        return result
-
-    monkeypatch.setattr(web_mcp, "get_mcp_server_tools", web_tools)
-    return calls
-
-
-WEB_OK = {
-    "server_name": "n",
-    "tool_count": 1,
-    "tools": [{"name": "server_1_search", "description": "Search"}],
-}
+def _ok_listing() -> ConnectorToolsResult:
+    return ConnectorToolsResult(
+        ConnectorToolsOutcome.OK, 1, "n", load_result=_loaded(_tool())
+    )
 
 
 # ===== success =====
@@ -139,14 +131,26 @@ def test_listing_returns_the_tools_a_task_would_get(bob, monkeypatch):
     assert resp.json() == {
         "id": server_id,
         "tools": [
-            {"name": "a", "description": "Search things"},
-            {"name": "b", "description": "Second"},
+            {"name": "a", "mcp_name": "a", "description": "Search things"},
+            {"name": "b", "mcp_name": "b", "description": "Second"},
         ],
         "failures": [],
     }
     assert len(calls) == 1
     assert calls[0]["name_prefix"] == f"server_{server_id}_"
     assert calls[0]["connections"]["records"]["url"] == CONNECTOR_URL
+
+
+def test_the_mcp_name_is_the_name_on_the_server(bob, monkeypatch):
+    server_id = _seed("records", owner=bob)
+    display = f"server_{server_id}_records_coding_start"
+    _stub_loader(monkeypatch, _loaded(_tool(display, "Start", mcp_name="coding.start")))
+
+    body = _tools(bob, server_id).json()
+
+    assert body["tools"] == [
+        {"name": display, "mcp_name": "coding.start", "description": "Start"}
+    ]
 
 
 def test_partial_failures_are_listed_without_diagnostics(bob, monkeypatch):
@@ -182,27 +186,26 @@ def test_precheck_refuses_before_any_listing(bob, carol, monkeypatch, cell):
         "own_disabled": _own_disabled,
         "team_shared": _team_shared,
     }[cell](bob, carol)
-    web_calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_session_listing(monkeypatch, _ok_listing())
 
     error = _error(_tools(bob, server_id), status, "connector_unavailable")
 
     assert error["details"] == {"reason": reason}
     assert error["message"] == (
-        "This connector cannot be started from the API right now; "
-        "details.reason says why."
+        "This connector cannot be started from the API; details.reason says why."
     )
-    assert web_calls == []
+    assert calls == []
 
 
 @pytest.mark.parametrize("cell", ["someone_elses", "missing"])
 def test_precheck_hides_connectors_the_holder_cannot_see(bob, carol, monkeypatch, cell):
     server_id = _seed("carols", owner=carol) if cell == "someone_elses" else 987654
-    web_calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_session_listing(monkeypatch, _ok_listing())
 
     error = _error(_tools(bob, server_id), 404, "connector_not_found")
 
     assert "details" not in error
-    assert web_calls == []
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -215,7 +218,7 @@ def test_precheck_hides_connectors_the_holder_cannot_see(bob, carol, monkeypatch
 )
 def test_only_remote_transports_can_be_listed(bob, monkeypatch, transport, url):
     server_id = _seed("local", owner=bob, transport=transport, url=url)
-    web_calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_session_listing(monkeypatch, _ok_listing())
 
     error = _error(_tools(bob, server_id), 400, "transport_not_supported")
 
@@ -223,7 +226,7 @@ def test_only_remote_transports_can_be_listed(bob, monkeypatch, transport, url):
         "Listing tools through the API supports only streamable_http and sse "
         "connectors."
     )
-    assert web_calls == []
+    assert calls == []
 
 
 def test_a_team_shared_local_connector_is_refused_for_its_transport(
@@ -231,16 +234,16 @@ def test_a_team_shared_local_connector_is_refused_for_its_transport(
 ):
     server_id = _seed("shared-local", owner=carol, transport="stdio", url=None)
     _share_with_team(server_id)
-    web_calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_session_listing(monkeypatch, _ok_listing())
 
     _error(_tools(bob, server_id), 400, "transport_not_supported")
 
-    assert web_calls == []
+    assert calls == []
 
 
 def test_a_failing_visibility_hook_is_a_plain_500(bob, carol, monkeypatch):
     server_id = _seed("carols", owner=carol)
-    web_calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_session_listing(monkeypatch, _ok_listing())
 
     def failing(_db, _user_id):
         raise RuntimeError(SECRET)
@@ -250,12 +253,12 @@ def test_a_failing_visibility_hook_is_a_plain_500(bob, carol, monkeypatch):
     resp = _tools(bob, server_id)
 
     _error(resp, 500, "internal_error")
-    assert SECRET not in resp.text and web_calls == []
+    assert SECRET not in resp.text and calls == []
 
 
 def test_a_failing_precheck_query_is_a_plain_500(bob, monkeypatch):
     server_id = _seed("records", owner=bob)
-    web_calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_session_listing(monkeypatch, _ok_listing())
     engine = get_engine()
 
     def fail(conn, cursor, statement, parameters, context, executemany):
@@ -269,7 +272,7 @@ def test_a_failing_precheck_query_is_a_plain_500(bob, monkeypatch):
         sa.event.remove(engine, "before_cursor_execute", fail)
 
     _error(resp, 500, "internal_error")
-    assert SECRET not in resp.text and web_calls == []
+    assert SECRET not in resp.text and calls == []
 
 
 def test_a_connector_linked_by_the_holder_and_shared_is_listed_as_own(
@@ -283,13 +286,7 @@ def test_a_connector_linked_by_the_holder_and_shared_is_listed_as_own(
     assert _tools(bob, server_id).status_code == 200
 
 
-# ===== translating the web function's failures =====
-
-
-def _web_tools_error(monkeypatch, bob, error: HTTPException):
-    server_id = _seed("records", owner=bob)
-    _stub_web_function(monkeypatch, error=error)
-    return _tools(bob, server_id)
+# ===== mapping the connector session's outcome =====
 
 
 def _credential_row(reason: str):
@@ -316,7 +313,9 @@ def test_credential_failures_are_authorization_failures(bob, monkeypatch, reason
 
 _OTHER_400 = {
     "unsupported": (
-        ConnectorToolsResult(ConnectorToolsOutcome.UNSUPPORTED, 1, "n", reason="x"),
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.UNSUPPORTED, 1, "n", reason="execution_scoped"
+        ),
         "unsupported",
     ),
     "invalid_configuration": (
@@ -329,25 +328,41 @@ _OTHER_400 = {
         ),
         "invalid_configuration",
     ),
-    "code_that_is_not_a_plain_word": (
+    "reason_that_is_not_a_plain_word": (
         ConnectorToolsResult(
             ConnectorToolsOutcome.FAILED_TO_START,
             1,
             "n",
-            reason="x",
-            diagnostic={"code": "Bad Code!" + SECRET, "message": SECRET},
+            reason="Bad Code!" + SECRET,
+            diagnostic={"code": "x", "message": SECRET},
         ),
         "unknown",
     ),
-    "code_that_is_not_a_string": (
+    "reason_that_is_not_a_string": (
         ConnectorToolsResult(
             ConnectorToolsOutcome.FAILED_TO_START,
             1,
             "n",
-            reason="x",
-            diagnostic={"code": 7, "message": SECRET},
+            reason=7,  # type: ignore[arg-type]
+            diagnostic={"code": "x", "message": SECRET},
         ),
         "unknown",
+    ),
+    "the_reason_is_passed_on_not_the_diagnostic_code": (
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.FAILED_TO_START,
+            1,
+            "n",
+            reason="runtime_connection_failed",
+            diagnostic={"code": "other_word", "message": SECRET},
+        ),
+        "runtime_connection_failed",
+    ),
+    "platform_client_rejected": (
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.NOT_CONNECTED, 1, "n", reason="client_rejected"
+        ),
+        "client_rejected",
     ),
     "platform_client_rejected_for_a_provider": (
         ConnectorToolsResult(
@@ -375,20 +390,33 @@ def test_other_rejections_are_connector_unavailable(bob, monkeypatch, cell):
     assert SECRET not in resp.text
 
 
-def test_a_non_dict_rejection_is_connector_unavailable(bob, monkeypatch):
-    resp = _web_tools_error(monkeypatch, bob, HTTPException(400, SECRET))
-
-    error = _error(resp, 409, "connector_unavailable")
-    assert error["details"] == {"reason": "unknown"}
-    assert SECRET not in resp.text
-
-
 _BAD_GATEWAY = {
     "failure_reason_from_the_start": (
         ConnectorToolsResult(
             ConnectorToolsOutcome.FAILED_TO_START, 1, "n", reason="config_load_failed"
         ),
         "config_load_failed",
+    ),
+    "failure_reason_invalid_config": (
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.FAILED_TO_START, 1, "n", reason="invalid_config"
+        ),
+        "invalid_config",
+    ),
+    "failure_reason_sandbox_unavailable": (
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.FAILED_TO_START, 1, "n", reason="sandbox_unavailable"
+        ),
+        "sandbox_unavailable",
+    ),
+    "unavailable_config_without_a_diagnostic": (
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.FAILED_TO_START,
+            1,
+            "n",
+            reason="runtime_connection_failed",
+        ),
+        "runtime_connection_failed",
     ),
     "failure_reason_that_is_not_a_plain_word": (
         ConnectorToolsResult(
@@ -435,28 +463,83 @@ def test_a_connector_that_returns_no_tools_is_a_bad_gateway(bob, monkeypatch):
     assert "SecretLeakingError" not in resp.text
 
 
+def test_a_listing_with_no_tools_in_the_loader_result_is_a_bad_gateway(
+    bob, monkeypatch
+):
+    server_id = _seed("records", owner=bob)
+    _stub_session_listing(
+        monkeypatch,
+        ConnectorToolsResult(
+            ConnectorToolsOutcome.NO_TOOLS,
+            1,
+            "n",
+            reason="no_tools_returned",
+            load_result=_loaded(),
+        ),
+    )
+
+    error = _error(_tools(bob, server_id), 502, "connector_tools_unavailable")
+
+    assert error["details"] == {"reason": "no_tools", "failures": []}
+
+
 @pytest.mark.parametrize(
-    "error",
+    ("outcome", "reason", "phase"),
     [
-        HTTPException(502, SECRET),
-        HTTPException(500, SECRET),
-        HTTPException(503, {"code": "x", "message": SECRET}),
+        (ConnectorToolsOutcome.NOT_CONNECTED, "auth_rejected", "auth_rejected"),
+        (ConnectorToolsOutcome.TIMED_OUT, "initialize", "initialize"),
     ],
-    ids=["bad_gateway_text", "internal_text", "unexpected_status"],
 )
-def test_other_web_failures_are_plain_500s(bob, monkeypatch, error):
-    resp = _web_tools_error(monkeypatch, bob, error)
+def test_a_loader_result_without_tools_is_a_bad_gateway_whatever_its_outcome(
+    bob, monkeypatch, outcome, reason, phase
+):
+    server_id = _seed("records", owner=bob)
+    _stub_session_listing(
+        monkeypatch,
+        ConnectorToolsResult(
+            outcome,
+            1,
+            "n",
+            reason=reason,
+            load_result=_loaded(failures=(_failure(MCPFailurePhase(phase), 3),)),
+        ),
+    )
+
+    error = _error(_tools(bob, server_id), 502, "connector_tools_unavailable")
+
+    assert error["details"] == {
+        "reason": "no_tools",
+        "failures": [{"phase": phase, "attempts": 3}],
+    }
+
+
+def test_a_session_listing_that_finds_no_connector_is_not_found(bob, monkeypatch):
+    server_id = _seed("records", owner=bob)
+    _stub_session_listing(
+        monkeypatch, ConnectorToolsResult(ConnectorToolsOutcome.NOT_FOUND, server_id)
+    )
+
+    resp = _tools(bob, server_id)
+
+    error = _error(resp, 404, "connector_not_found")
+    assert "details" not in error
+
+
+def test_a_session_listing_that_raises_is_a_plain_500(bob, monkeypatch, caplog):
+    server_id = _seed("records", owner=bob)
+
+    async def raising(db, **kwargs):
+        raise RuntimeError(SECRET)
+
+    monkeypatch.setattr(mcp_connector_session, "list_connector_tools", raising)
+
+    with caplog.at_level(logging.DEBUG):
+        resp = _tools(bob, server_id)
 
     _error(resp, 500, "internal_error")
     assert SECRET not in resp.text
-
-
-def test_a_web_404_after_the_precheck_is_not_found(bob, monkeypatch):
-    resp = _web_tools_error(
-        monkeypatch, bob, HTTPException(404, "MCP server not found")
-    )
-
-    _error(resp, 404, "connector_not_found")
+    assert "RuntimeError" in caplog.text
+    assert SECRET not in caplog.text
 
 
 def test_a_loader_that_raises_is_a_plain_500(bob, monkeypatch):
@@ -515,7 +598,7 @@ def _gate_cell_web_gate_full(bob, monkeypatch):
         web_mcp, "_mcp_connection_test_gate", lambda: asyncio.Semaphore(0)
     )
     _use_timeout(monkeypatch, 0.05)
-    calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    calls = _stub_loader(monkeypatch, _loaded(_tool()))
     server_id = _seed("records", owner=bob)
 
     assert _tools(bob, server_id).status_code == 200
@@ -524,19 +607,21 @@ def _gate_cell_web_gate_full(bob, monkeypatch):
 
 def _gate_cell_own_gate_full(bob, monkeypatch):
     monkeypatch.setattr(routes, "_v1_tool_listing_gate", lambda: asyncio.Semaphore(0))
-    _use_timeout(monkeypatch, 0.05)
-    calls = _stub_web_function(monkeypatch, result=WEB_OK)
+    _use_timeout(monkeypatch, 1.2)
+    calls = _stub_loader(monkeypatch, _loaded(_tool()))
     server_id = _seed("records", owner=bob)
 
-    error = _error(_tools(bob, server_id), 429, "rate_limited")
+    resp = _tools(bob, server_id)
 
+    error = _error(resp, 429, "rate_limited")
     assert error["message"] == BUSY
+    assert resp.headers["Retry-After"] == "2"
     assert calls == []
 
 
 def _gate_cell_normal_call(bob, monkeypatch):
     gates = _recording_gates(monkeypatch)
-    _stub_web_function(monkeypatch, result=WEB_OK)
+    _stub_loader(monkeypatch, _loaded(_tool()))
     server_id = _seed("records", owner=bob)
 
     assert _tools(bob, server_id).status_code == 200
@@ -545,10 +630,12 @@ def _gate_cell_normal_call(bob, monkeypatch):
     assert routes._v1_tool_listing_loads == set()
 
 
-def _gate_cell_web_function_error(bob, monkeypatch):
+def _gate_cell_session_listing_not_found(bob, monkeypatch):
     gates = _recording_gates(monkeypatch)
-    _stub_web_function(monkeypatch, error=HTTPException(404, "MCP server not found"))
     server_id = _seed("records", owner=bob)
+    _stub_session_listing(
+        monkeypatch, ConnectorToolsResult(ConnectorToolsOutcome.NOT_FOUND, server_id)
+    )
 
     _error(_tools(bob, server_id), 404, "connector_not_found")
 
@@ -569,12 +656,13 @@ async def _cancel_a_listing(monkeypatch, timeout: float) -> dict[str, Any]:
         except asyncio.CancelledError:
             state["load_cancelled"] = True
             raise
-        return WEB_OK
+        return _ok_listing()
 
     monkeypatch.setattr(routes, "_list_saved_connector_tools", blocked)
     request = asyncio.create_task(routes._run_tool_listing(1, 1))
     await asyncio.wait_for(entered.wait(), 5)
     gate = routes._v1_tool_listing_gate()
+    state["value_while_running"] = gate._value
     request.cancel()
     with pytest.raises(asyncio.CancelledError):
         await request
@@ -604,6 +692,7 @@ def _gate_cell_cancelled_with_a_deadline(bob, monkeypatch):
 def _gate_cell_cancelled_without_a_deadline(bob, monkeypatch):
     state = asyncio.run(_cancel_a_listing(monkeypatch, 0))
 
+    assert state["value_while_running"] == 3
     assert state["load_cancelled"] is True
     assert state["value_after_cancel"] == 4
     assert state["loads_at_end"] == set()
@@ -649,10 +738,12 @@ def test_an_abandoned_listing_that_fails_has_its_error_retrieved(monkeypatch):
 
 
 def _gate_cell_one_gate_per_loop(bob, monkeypatch):
-    async def gate():
-        return routes._v1_tool_listing_gate()
+    async def gates():
+        return routes._v1_tool_listing_gate(), routes._v1_tool_listing_gate()
 
-    assert asyncio.run(gate()) is not asyncio.run(gate())
+    first, again = asyncio.run(gates())
+    assert first is again
+    assert first is not asyncio.run(gates())[0]
 
 
 _GATE_CELLS = {
@@ -666,3 +757,13 @@ _GATE_CELLS = {
 def test_tool_listing_has_its_own_gate(bob, monkeypatch, cell):
     assert len(_GATE_CELLS) == 7
     _GATE_CELLS[cell](bob, monkeypatch)
+
+
+def test_a_holder_deleted_before_the_listing_is_unauthorized():
+    with pytest.raises(routes.V1ApiError) as raised:
+        asyncio.run(routes._list_saved_connector_tools(1, 2**31 - 1))
+
+    assert (raised.value.code, raised.value.http_status) == (
+        routes.V1ErrorCode.INVALID_API_KEY,
+        401,
+    )

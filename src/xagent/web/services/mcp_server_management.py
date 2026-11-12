@@ -543,11 +543,11 @@ class McpServerManagementRuntime:
     async def require_listable(self, *, user_id: int, server_id: int) -> None:
         """Raise unless the holder may have this connector's tools listed.
 
-        Read-only. The web function only checks that the holder can see the
-        connector and has it enabled, and answers 404 when either fails; it
-        does not look at the transport. Checking here keeps a local connector
-        from being started and tells a team-shared or disabled connector apart
-        from a missing one.
+        Read-only. The connector session starts only a connector the holder
+        links to and has switched on, and reports any other one as not found;
+        it does not look at the transport. Checking here keeps a local
+        connector from being started and tells a team-shared or disabled
+        connector apart from a missing one.
         """
         # Imported here for the reason given in ``_load_holder``.
         from ..api.v1.errors import V1ApiError, V1ErrorCode

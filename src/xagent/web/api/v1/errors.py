@@ -128,7 +128,7 @@ class V1ErrorCode(str, Enum):
     INVALID_INPUT = "invalid_input"
 
     # Emitted when a caller exceeds the v1 SSE stream concurrency caps
-    # (per-task or per-principal).
+    # (per-task or per-principal), or when no MCP tool-listing slot frees up.
     RATE_LIMITED = "rate_limited"
 
     # Monthly execution quota exhausted. 402 Payment Required. Two distinct
@@ -147,8 +147,8 @@ class V1ErrorCode(str, Enum):
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
 
-    # The connector's transport is not one the API can create or change
-    # (only ``streamable_http`` and ``sse``). 400.
+    # The connector's transport is not one the API can create, change or list
+    # tools for (only ``streamable_http`` and ``sse``). 400.
     TRANSPORT_NOT_SUPPORTED = "transport_not_supported"
 
     # The connector name is taken by another connector, reserved for a
@@ -156,10 +156,10 @@ class V1ErrorCode(str, Enum):
     # names the holder's own connector when the exact name is theirs.
     CONNECTOR_NAME_CONFLICT = "connector_name_conflict"
 
-    # The connector cannot be started from the API right now. 409.
+    # The connector cannot be started from the API. 409.
     # ``details.reason`` says why: ``team_shared`` or ``disabled`` from the
-    # check made before anything starts; otherwise the web app's own refusal
-    # code, such as ``unsupported`` (the connector can only start inside a
+    # check made before anything starts; otherwise the connector session's own
+    # reason, such as ``unsupported`` (the connector can only start inside a
     # task), ``grant_not_allowed_for_task_source`` or ``invalid_configuration``;
     # ``client_rejected``, without the provider, when the vendor rejected the
     # platform's own OAuth client; or ``unknown`` when that refusal has no
@@ -272,8 +272,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "spaces, hyphens and underscores as the same character."
     ),
     V1ErrorCode.CONNECTOR_UNAVAILABLE: (
-        "This connector cannot be started from the API right now; "
-        "details.reason says why."
+        "This connector cannot be started from the API; details.reason says why."
     ),
     V1ErrorCode.CONNECTOR_TOOLS_UNAVAILABLE: (
         "The connector could not be started or returned no tools."

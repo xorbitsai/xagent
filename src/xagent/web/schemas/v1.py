@@ -454,8 +454,12 @@ class V1McpTool(BaseModel):
             "letters, digits and underscores turned into underscores. When the "
             "whole name would be longer than 64 characters the prefix is "
             "shortened, and a tool name itself longer than 64 characters is cut "
-            "to 64. Not a stable identifier."
+            "to 64. Not a stable identifier; use mcp_name."
         ),
+    )
+    mcp_name: str = Field(
+        ...,
+        description="The tool's name on the MCP server, unchanged.",
     )
     description: str
 
@@ -471,9 +475,10 @@ class V1McpServerTools(BaseModel):
     """Response of ``GET /v1/mcp-servers/{server_id}/tools``.
 
     The connector is started the way a task would start it. Waiting for a
-    free slot takes at most one MCP initialization timeout and listing at most
-    one more, so a request can take about twice that. ``failures`` is non-empty
-    when some loads failed but at least one tool came back.
+    free slot takes at most one MCP initialization timeout; starting the
+    connector takes at most one more, plus the time to read its settings.
+    ``failures`` is non-empty when some loads failed but at least one tool
+    came back.
     """
 
     id: int

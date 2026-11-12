@@ -149,6 +149,19 @@ def _successful_ingestion_result(doc_id: str = "doc-ok") -> IngestionResult:
     )
 
 
+@pytest.fixture(autouse=True)
+def _collections_not_frozen(monkeypatch):
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+
+    monkeypatch.setattr(
+        state_module,
+        "read_migration_state",
+        lambda _name: state_module.CollectionMigrationState(),
+    )
+
+
 def _fake_db_generator(db):
     try:
         yield db
@@ -1484,3 +1497,76 @@ async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
         if entry.name == logger_name and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
     ]
     assert outage_lines == [], "permanent corruption must not read as an outage"
+
+
+@pytest.mark.parametrize("frozen_at_start", [True, False])
+@pytest.mark.asyncio
+async def test_create_kb_from_file_admits_once_for_all_files(
+    tmp_path, monkeypatch, frozen_at_start
+):
+    from xagent.core.tools.core.RAG_tools.management import (
+        migration_state as state_module,
+    )
+
+    state = {"value": state_module.FROZEN if frozen_at_start else state_module.IDLE}
+    monkeypatch.setattr(
+        state_module,
+        "read_migration_state",
+        lambda _name: state_module.CollectionMigrationState(state=state["value"]),
+    )
+    records = []
+    for name in ("a.txt", "b.txt"):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        records.append(
+            SimpleNamespace(
+                user_id=7, filename=name, storage_path=str(path), file_id=f"f-{name}"
+            )
+        )
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = records
+    db = MagicMock()
+    db.query.return_value = query
+
+    def fake_get_db():
+        yield from _fake_db_generator(db)
+
+    def fake_run_ingestion(*, collection: str, file_id: str, **_: object):
+        # Stands in for the pipeline's own guard; the freeze lands after the first file.
+        state_module.ensure_collection_writable(collection)
+        state["value"] = state_module.FROZEN
+        return _successful_ingestion_result(doc_id=f"doc-{file_id}")
+
+    service = MagicMock()
+    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.publish_collection = AsyncMock()
+    service.collection_exists = AsyncMock(return_value=True)
+    service.cleanup_failed_collection = AsyncMock()
+    run_ingestion = Mock(side_effect=fake_run_ingestion)
+
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+            return_value=service,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
+            new=run_ingestion,
+        ),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["f-a.txt", "f-b.txt"], "collection_name": "agent_file_kb"}
+        )
+
+    if frozen_at_start:
+        assert result["success"] is False
+        assert "being upgraded" in result["message"]
+        assert run_ingestion.call_count == 0
+        service.publish_collection.assert_not_awaited()
+    else:
+        assert result["success"] is True
+        assert result["files_ingested"] == 2
+        service.publish_collection.assert_awaited_once()

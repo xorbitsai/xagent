@@ -129,6 +129,14 @@ async def _create_knowledge_base_from_file_impl(
     user_id: int,
     is_admin: bool = False,
 ) -> Any:
+    from ...core.RAG_tools.core.exceptions import CollectionMigratingError
+    from ...core.RAG_tools.management.migration_state import (
+        admitted_context_async,
+        run_in_admitted_context,
+    )
+
+    collection_name = ""
+    ingested_count = 0
     try:
         from sqlalchemy.orm import Session
 
@@ -193,6 +201,8 @@ async def _create_knowledge_base_from_file_impl(
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if every file fails.
         collection_existed_before = await kb_service.collection_exists(collection_name)
+        # One admission for every file, so a freeze between files cannot strand a partial.
+        admission = await admitted_context_async(collection_name)
 
         ingested_count = 0
         errors = []
@@ -247,7 +257,9 @@ async def _create_knowledge_base_from_file_impl(
                 file_id=str(record.file_id),
             )
             try:
-                result = await run_blocking(func)
+                result = await run_blocking(run_in_admitted_context, admission, func)
+            except CollectionMigratingError:
+                raise
             except Exception:
                 # Deliberately does NOT interpolate the exception, for the same
                 # reason as the durable arm above: this string is joined into the
@@ -320,6 +332,19 @@ async def _create_knowledge_base_from_file_impl(
             files_ingested=ingested_count,
         ).model_dump()
 
+    except CollectionMigratingError:
+        logger.warning(
+            "Knowledge base %s is frozen for embedding migration", collection_name
+        )
+        return CreateKnowledgeBaseFromFileResult(
+            success=False,
+            collection_name=collection_name,
+            message=(
+                "The knowledge base is being upgraded to a new embedding model. "
+                "Retry shortly."
+            ),
+            files_ingested=ingested_count,
+        ).model_dump()
     except Exception as e:
         logger.exception("Error creating knowledge base from file: %s", e)
         return CreateKnowledgeBaseFromFileResult(

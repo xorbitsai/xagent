@@ -142,3 +142,9 @@ class ProgressPersistenceError(RagCoreException):
     """
 
     pass
+
+
+class CollectionMigratingError(RagCoreException):
+    """Raised when a write targets a collection frozen for embedding migration."""
+
+    pass

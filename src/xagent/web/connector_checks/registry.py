@@ -640,10 +640,12 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
     whether the file lands there rests on the create's parent, which no step
     reads. The query is the seed's own uniqueness rule, so a folder with that
     name outside the root, such as one in a shared drive, does not make the pin
-    fail. The check creates a text file in that folder, reads it back (the same
-    read guards the cleanup) and deletes it. The sweep lists the folder with
-    the registry's query fixture, since Drive's search takes the whole query,
-    and deletes leftovers by id.
+    fail. The check creates a text file in that folder, reads it back to
+    confirm its run-scoped name and its content, and deletes it; the cleanup
+    guard makes the same read but asserts the name alone, so content that did
+    not land as sent does not keep the file from being deleted. The sweep lists
+    the folder with the registry's query fixture, since Drive's search takes
+    the whole query, and deletes leftovers by id.
     """
     pin = TenantPin(
         ToolStep(
@@ -664,7 +666,10 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
     )
     name = RunScopedName("drive-file")
     created = CreatedRef(("file", "id"))
-    read_back = ToolStep(
+    probe = "xagent smoke write probe"
+    # The guard asserts the name alone, so a file whose content did not land
+    # as sent is still deleted.
+    guard = ToolStep(
         "google_drive_get_file_content",
         {"file_id": created},
         assertions=(StatusSuccess(), Equals(("file", "name"), name)),
@@ -675,19 +680,27 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
             "google_drive_create_file",
             {
                 "name": name,
-                "content": "xagent smoke write probe",
+                "content": probe,
                 "mime_type": "text/plain",
                 "parent_id": FixtureRef("google-drive.write_folder_id"),
             },
             assertions=(StatusSuccess(), HasKeys(("file",), ("id",))),
         ),
-        verify=read_back,
+        verify=ToolStep(
+            "google_drive_get_file_content",
+            {"file_id": created},
+            assertions=(
+                StatusSuccess(),
+                Equals(("file", "name"), name),
+                Equals(("content",), probe),
+            ),
+        ),
         cleanup=ToolStep(
             "google_drive_delete_file",
             {"file_id": created},
             assertions=(StatusSuccess(),),
         ),
-        cleanup_guard=read_back,
+        cleanup_guard=guard,
         tenant_pin=pin,
         # Toby withholds a write tool from a member who did not install the
         # connector, and classifies only Jira's writes today, so neither Drive

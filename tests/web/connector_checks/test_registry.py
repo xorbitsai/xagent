@@ -1373,7 +1373,10 @@ def test_google_drive_declares_its_write_check() -> None:
     )
     name = RunScopedName("drive-file")
     created = CreatedRef(("file", "id"))
-    read_back = ToolStep(
+    probe = "xagent smoke write probe"
+    # The guard asserts the name alone, so content that did not land as sent
+    # still lets the cleanup delete the file.
+    guard = ToolStep(
         "google_drive_get_file_content",
         {"file_id": created},
         assertions=(StatusSuccess(), Equals(("file", "name"), name)),
@@ -1386,19 +1389,27 @@ def test_google_drive_declares_its_write_check() -> None:
                 "google_drive_create_file",
                 {
                     "name": name,
-                    "content": "xagent smoke write probe",
+                    "content": probe,
                     "mime_type": "text/plain",
                     "parent_id": FixtureRef("google-drive.write_folder_id"),
                 },
                 assertions=(StatusSuccess(), HasKeys(("file",), ("id",))),
             ),
-            verify=read_back,
+            verify=ToolStep(
+                "google_drive_get_file_content",
+                {"file_id": created},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("file", "name"), name),
+                    Equals(("content",), probe),
+                ),
+            ),
             cleanup=ToolStep(
                 "google_drive_delete_file",
                 {"file_id": created},
                 assertions=(StatusSuccess(),),
             ),
-            cleanup_guard=read_back,
+            cleanup_guard=guard,
             tenant_pin=pin,
             # Toby classifies only Jira's writes, so it withholds neither
             # Drive tool from a member.

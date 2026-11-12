@@ -645,6 +645,33 @@ async def test_a_file_that_lost_its_run_scoped_name_is_not_deleted(
 
 
 @pytest.mark.usefixtures("writes_on")
+async def test_a_file_whose_content_did_not_land_as_sent_fails_verify_and_is_deleted(
+    drive: Drive,
+) -> None:
+    seeded = dict(drive.items)
+    original = drive.create
+
+    def store_other(body: dict[str, Any], media: Any) -> dict[str, Any]:
+        file = original(body, media)
+        drive.contents[file["id"]] = b"not the probe text"
+        return file
+
+    drive.create = store_other  # type: ignore[method-assign]
+
+    result = await _run(_adapter())
+
+    # `verify` reads the content back and finds another, which fails the
+    # check; the guard asserts the name alone, so the file is still deleted.
+    assert _check_rows(result)["google-drive.file_round_trip"] == (
+        "fail",
+        "assertion_failed",
+        "verify:equals",
+    )
+    assert len([kind for kind, _ in drive.requests if kind == "delete"]) == 1
+    assert drive.items == seeded
+
+
+@pytest.mark.usefixtures("writes_on")
 async def test_a_create_that_returns_an_error_is_not_cleaned_up(
     drive: Drive,
 ) -> None:

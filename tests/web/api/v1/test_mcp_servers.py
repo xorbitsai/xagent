@@ -234,12 +234,14 @@ def _own_routes() -> list[tuple[str, str]]:
         ("GET", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}"),
         ("POST", "/v1/mcp-servers"),
+        ("GET", "/v1/mcp-servers/{server_id}/tools"),
     ],
 )
 def test_mcp_routes_accept_only_personal_keys(method, path, kind):
     assert _own_routes() == [
         ("GET", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}"),
+        ("GET", "/v1/mcp-servers/{server_id}/tools"),
         ("POST", "/v1/mcp-servers"),
     ]
     resp = client.request(

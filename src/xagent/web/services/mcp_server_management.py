@@ -540,6 +540,47 @@ class McpServerManagementRuntime:
 
         return await run_db_io_cancellation_safe(run)
 
+    async def require_listable(self, *, user_id: int, server_id: int) -> None:
+        """Raise unless the holder may have this connector's tools listed.
+
+        Read-only. The web function only checks that the holder can see the
+        connector and has it enabled, and answers 404 when either fails; it
+        does not look at the transport. Checking here keeps a local connector
+        from being started and tells a team-shared or disabled connector apart
+        from a missing one.
+        """
+        # Imported here for the reason given in ``_load_holder``.
+        from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+        def run() -> None:
+            with get_session_local()() as db:
+                _load_holder(db, user_id)
+                row = resolve_holder_connector(db, user_id, server_id)
+                if row is None:
+                    raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
+                server, link = row
+                if server.transport not in _REMOTE_TRANSPORTS:
+                    raise V1ApiError(
+                        V1ErrorCode.TRANSPORT_NOT_SUPPORTED,
+                        400,
+                        "Listing tools through the API supports only "
+                        "streamable_http and sse connectors.",
+                    )
+                if link is None:
+                    raise V1ApiError(
+                        V1ErrorCode.CONNECTOR_UNAVAILABLE,
+                        409,
+                        details={"reason": "team_shared"},
+                    )
+                if not link.is_active:
+                    raise V1ApiError(
+                        V1ErrorCode.CONNECTOR_UNAVAILABLE,
+                        409,
+                        details={"reason": "disabled"},
+                    )
+
+        await run_db_io_cancellation_safe(run)
+
     async def owned_connector_id(self, *, user_id: int, name: str) -> Optional[int]:
         """The id of the connector named exactly ``name`` that the holder owns."""
 

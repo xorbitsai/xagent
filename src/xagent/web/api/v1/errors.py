@@ -155,6 +155,20 @@ class V1ErrorCode(str, Enum):
     # catalog app, or folds to a taken name. 409. ``details.connector_id``
     # names the holder's own connector when the exact name is theirs.
     CONNECTOR_NAME_CONFLICT = "connector_name_conflict"
+
+    # The connector cannot be started from the API right now. 409.
+    # ``details.reason`` says why: ``team_shared`` or ``disabled`` from the
+    # check made before anything starts; otherwise the web app's own refusal
+    # code, such as ``unsupported`` (the connector can only start inside a
+    # task), ``grant_not_allowed_for_task_source`` or ``invalid_configuration``;
+    # ``client_rejected``, without the provider, when the vendor rejected the
+    # platform's own OAuth client; or ``unknown`` when that refusal has no
+    # usable code.
+    CONNECTOR_UNAVAILABLE = "connector_unavailable"
+
+    # The connector was started but did not come up, or came up with no
+    # tools. 502. ``details`` carries a short reason and the load phases.
+    CONNECTOR_TOOLS_UNAVAILABLE = "connector_tools_unavailable"
     INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
     MISSING_RUNTIME_CONTEXT = "missing_runtime_context"
     RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
@@ -256,6 +270,13 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "This connector name is already in use or reserved. Connector names are "
         "unique across all users and are compared case-insensitively, treating "
         "spaces, hyphens and underscores as the same character."
+    ),
+    V1ErrorCode.CONNECTOR_UNAVAILABLE: (
+        "This connector cannot be started from the API right now; "
+        "details.reason says why."
+    ),
+    V1ErrorCode.CONNECTOR_TOOLS_UNAVAILABLE: (
+        "The connector could not be started or returned no tools."
     ),
     V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
     V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",

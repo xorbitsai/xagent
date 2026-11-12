@@ -337,6 +337,7 @@ EXCLUDE = {
     ("GET", "/v1/mcp-servers"),
     ("GET", "/v1/mcp-servers/{server_id}"),
     ("POST", "/v1/mcp-servers"),
+    ("GET", "/v1/mcp-servers/{server_id}/tools"),
 }
 
 

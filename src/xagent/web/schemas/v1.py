@@ -442,6 +442,45 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1McpTool(BaseModel):
+    """One tool a connector offers."""
+
+    name: str = Field(
+        ...,
+        description=(
+            "Display name as the web app shows it: the prefix "
+            "server_<connector id>_<connector name>_ followed by the tool name, "
+            "with spaces, hyphens and every other character outside ASCII "
+            "letters, digits and underscores turned into underscores. When the "
+            "whole name would be longer than 64 characters the prefix is "
+            "shortened, and a tool name itself longer than 64 characters is cut "
+            "to 64. Not a stable identifier."
+        ),
+    )
+    description: str
+
+
+class V1McpToolLoadFailure(BaseModel):
+    """A load that failed while others may have succeeded."""
+
+    phase: str = Field(..., description="Where the load failed.")
+    attempts: int
+
+
+class V1McpServerTools(BaseModel):
+    """Response of ``GET /v1/mcp-servers/{server_id}/tools``.
+
+    The connector is started the way a task would start it. Waiting for a
+    free slot takes at most one MCP initialization timeout and listing at most
+    one more, so a request can take about twice that. ``failures`` is non-empty
+    when some loads failed but at least one tool came back.
+    """
+
+    id: int
+    tools: list[V1McpTool]
+    failures: list[V1McpToolLoadFailure]
+
+
 class V1McpServerAuthorization(BaseModel):
     """Whether the key holder has authorized an OAuth connector.
 

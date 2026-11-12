@@ -1,27 +1,46 @@
 """SDK endpoints for the MCP connectors the key holder can see and create."""
 
+import asyncio
 import logging
+import re
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, NoReturn, Optional, Sequence
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path
 
+from ....config import get_mcp_tool_init_timeout_seconds
+from ....core.tools.adapters.vibe.config import (
+    CLIENT_REJECTED_REASON,
+    is_client_rejected_reason,
+)
 from ....core.tools.core.mcp.http import _origin as mcp_endpoint_origin
 from ....core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ....core.utils.public_http_transport import UnsafePublicHttpTarget
-from ...schemas.v1 import V1McpServer, V1McpServerCreateRequest
+from ...models.database import get_session_local
+from ...models.user import User
+from ...schemas.v1 import (
+    V1McpServer,
+    V1McpServerCreateRequest,
+    V1McpServerTools,
+    V1McpTool,
+    V1McpToolLoadFailure,
+)
 from ...services.connector_name_policy import (
     catalog_app_name_detail,
     folded_name_conflict_detail,
     has_unfoldable_edge_whitespace,
     unfoldable_edge_whitespace_detail,
 )
+from ...services.mcp_connector_session import _CREDENTIAL_REASONS
 from ...services.mcp_server_management import (
+    _AUTHORIZATION_MESSAGE,
     _CATALOG_AUTH_KEYS,
     _REMOTE_TRANSPORTS,
     McpServerManagementRuntime,
 )
+from .. import mcp as mcp_api
 from .deps import (
     PersonalApiKeySnapshot,
     UserPrincipalSnapshot,
@@ -35,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 _INVALID_CONFIGURATION_PREFIX = "Invalid configuration: "
 _MAX_PASSED_THROUGH_CHARS = 1000
+_REASON_PATTERN = re.compile(r"[a-z_]{1,64}")
 
 
 def _summarize_invalid_configuration(detail: str) -> str:
@@ -336,3 +356,192 @@ async def create_mcp_server(
             secrets=_request_secrets(request),
             owned_connector_id=owned,
         )
+
+
+# ===== listing a connector's tools =====
+
+_V1_TOOL_LISTING_MAX_INFLIGHT = 4
+_TOOL_LISTING_BUSY_MESSAGE = (
+    "Too many connector tool listings are running; retry shortly."
+)
+
+# Keyed by loop, weakly, like the web connection-test gate: a semaphore binds
+# to the loop it first waits on, and a finished loop must not pin it. This gate
+# is independent of the web one, so the two never queue behind each other.
+_v1_tool_listing_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+# Listings that hold a slot. The done-callback gives the slot back; this set
+# keeps the task referenced until then.
+_v1_tool_listing_loads: "set[asyncio.Task[Any]]" = set()
+
+
+def _v1_tool_listing_gate() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    gate = _v1_tool_listing_gates.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(_V1_TOOL_LISTING_MAX_INFLIGHT)
+        _v1_tool_listing_gates[loop] = gate
+    return gate
+
+
+async def _list_saved_connector_tools(server_id: int, user_id: int) -> Any:
+    # The session belongs to the listing task, not to the request: a cancelled
+    # request must not close a session the listing still uses.
+    with get_session_local()() as db:
+        user = db.get(User, user_id)
+        if user is None:
+            raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+        return await mcp_api.get_mcp_server_tools(server_id, current_user=user, db=db)
+
+
+def _consume_abandoned_listing(task: "asyncio.Task[Any]") -> None:
+    # The request stopped waiting for this listing, so nothing else will
+    # retrieve its outcome; do it here so a late failure is not reported as an
+    # exception that was never retrieved.
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("abandoned MCP tool listing finished with %s", type(exc).__name__)
+
+
+async def _run_tool_listing(server_id: int, user_id: int) -> Any:
+    """List a saved connector's tools under this module's own concurrency cap.
+
+    * At most ``_V1_TOOL_LISTING_MAX_INFLIGHT`` listings run per event loop,
+      shared by every key holder in the process.
+    * Waiting for a slot is bounded by the MCP initialization timeout; a
+      listing that cannot get one answers 429 ``rate_limited``.
+    * With a timeout above 0 a slot is given back when the listing returns,
+      never earlier: a cancelled request leaves the listing running. The
+      listing is bounded by about one more initialization timeout, so a
+      request can take about twice the timeout in all.
+    * A timeout of 0 means no deadline: wait for a slot as long as it takes,
+      await the listing directly, and let cancellation reach it, so a hung
+      listing cannot keep a slot forever.
+    """
+    gate = _v1_tool_listing_gate()
+    timeout = get_mcp_tool_init_timeout_seconds()
+    if timeout <= 0:
+        await gate.acquire()
+        try:
+            return await _list_saved_connector_tools(server_id, user_id)
+        finally:
+            gate.release()
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout)
+    except TimeoutError:
+        raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429, _TOOL_LISTING_BUSY_MESSAGE)
+    load = asyncio.ensure_future(_list_saved_connector_tools(server_id, user_id))
+    _v1_tool_listing_loads.add(load)
+
+    def _give_back(task: "asyncio.Task[Any]") -> None:
+        _v1_tool_listing_loads.discard(task)
+        gate.release()
+
+    load.add_done_callback(_give_back)
+    try:
+        await asyncio.wait({load})
+    except asyncio.CancelledError:
+        load.add_done_callback(_consume_abandoned_listing)
+        raise
+    return load.result()
+
+
+def _reason_of(code: Any) -> str:
+    return code if isinstance(code, str) and _REASON_PATTERN.fullmatch(code) else ""
+
+
+def _load_failures(detail: dict[str, Any]) -> list[dict[str, Any]]:
+    """The phase and attempt count of each failure; nothing else is shown."""
+    failures = detail.get("failures")
+    if not isinstance(failures, list):
+        return []
+    return [
+        {"phase": entry["phase"], "attempts": entry["attempts"]}
+        for entry in failures
+        if isinstance(entry, dict)
+        and isinstance(entry.get("phase"), str)
+        and _REASON_PATTERN.fullmatch(entry["phase"])
+        and type(entry.get("attempts")) is int
+    ]
+
+
+def _raise_v1_from_mcp_tools_error(exc: HTTPException) -> NoReturn:
+    """Translate an ``HTTPException`` from the web tool-listing function.
+
+    Only a short reason and the load phases are passed on; the web messages
+    and diagnostics can carry server names, issuers and exception text.
+    """
+    detail = exc.detail
+    if exc.status_code == 404:
+        raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404) from exc
+    if exc.status_code == 400:
+        code = detail.get("code") if isinstance(detail, dict) else None
+        if isinstance(code, str) and code in _CREDENTIAL_REASONS:
+            raise V1ApiError(
+                V1ErrorCode.MCP_OAUTH_AUTHORIZATION_FAILED,
+                409,
+                _AUTHORIZATION_MESSAGE,
+                {"reason": code},
+            ) from exc
+        # A refresh the vendor rejects for the platform's own OAuth client may
+        # name the provider after a colon; the provider is not passed on.
+        reason = (
+            CLIENT_REJECTED_REASON
+            if is_client_rejected_reason(code)
+            else _reason_of(code) or "unknown"
+        )
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_UNAVAILABLE, 409, details={"reason": reason}
+        ) from exc
+    if exc.status_code == 502 and isinstance(detail, dict):
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_TOOLS_UNAVAILABLE,
+            502,
+            details={
+                "reason": _reason_of(detail.get("reason")) or "no_tools",
+                "failures": _load_failures(detail),
+            },
+        ) from exc
+    # The web detail can carry exception text, so only its status is logged.
+    logger.error("personal key mcp tool listing failed: status=%s", exc.status_code)
+    raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500) from exc
+
+
+@router.get("/{server_id}/tools", response_model=V1McpServerTools)
+async def list_mcp_server_tools(
+    server_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1McpServerTools:
+    """Start one of the holder's remote connectors and list its tools.
+
+    The connector is started exactly as a task would start it. The request
+    first waits for a free slot (at most one MCP initialization timeout) and
+    then lists the tools (at most one more), so it can take about twice the
+    MCP initialization timeout. A connector the holder has
+    switched off, one shared by the team, or one that is not remote is
+    refused before anything starts. Authorization is done in the web app: an
+    unauthorized OAuth connector answers 409 ``mcp_oauth_authorization_failed``.
+    """
+    user, _key = authed
+    user_id = int(user.id)
+    await McpServerManagementRuntime().require_listable(
+        user_id=user_id, server_id=server_id
+    )
+    try:
+        listing = await _run_tool_listing(server_id, user_id)
+    except HTTPException as exc:
+        _raise_v1_from_mcp_tools_error(exc)
+    return V1McpServerTools(
+        id=server_id,
+        tools=[
+            V1McpTool(name=str(tool["name"]), description=str(tool["description"]))
+            for tool in listing["tools"]
+        ],
+        failures=[
+            V1McpToolLoadFailure(**failure) for failure in _load_failures(listing)
+        ],
+    )

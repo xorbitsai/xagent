@@ -1283,3 +1283,18 @@ async def test_guessed_frozen_name_returns_404_in_standalone_mode() -> None:
 
     assert exc_info.value.status_code == 404
     assert "knowledge base list" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize("collection", [None, "", "   "])
+def test_admission_collection_derives_the_handler_name_from_the_filename(
+    collection,
+) -> None:
+    from types import SimpleNamespace
+
+    from xagent.web.api.kb import _admission_collection
+
+    upload = SimpleNamespace(filename="../nested/report-v2.pdf")
+
+    assert _admission_collection(collection=collection, file=upload) == "report-v2"
+    assert _admission_collection(collection="explicit", file=upload) == "explicit"
+    assert _admission_collection(collection=None, file=None) is None

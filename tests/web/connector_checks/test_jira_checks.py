@@ -10,7 +10,6 @@ project for the write check.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import unquote
@@ -23,7 +22,7 @@ from xagent.web.connector_checks.results import RunResult
 from xagent.web.connector_checks.sweeper import run_sweep
 from xagent.web.tools.mcp import jira
 
-from .fakes import FakePolicyAdapter, FakeTool, listed, rows, targets
+from .fakes import FakePolicyAdapter, FakeTool, listed, rows, targets, tool_for
 
 SITE = "site-1"
 READ_PROJECT = "SMOKER"
@@ -137,19 +136,6 @@ class Site:
         raise AssertionError((method, path))
 
 
-def _tool(name: str) -> FakeTool:
-    function: Callable[..., str] = getattr(jira, name)
-
-    def respond(args: dict[str, Any]) -> Any:
-        return {
-            "content": [{"type": "text", "text": function(**args)}],
-            "structured_content": None,
-            "is_error": False,
-        }
-
-    return FakeTool(name, respond=respond)
-
-
 # Every tool the server registers, so the session lists what production does.
 _TOOLS = (
     "jira_list_accessible_sites",
@@ -182,7 +168,7 @@ def writes_on(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _tools() -> dict[str, FakeTool]:
-    return {name: _tool(name) for name in _TOOLS}
+    return {name: tool_for(jira, name) for name in _TOOLS}
 
 
 def _adapter(

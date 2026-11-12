@@ -351,8 +351,16 @@ class LanceDBMetadataStore(MetadataStore):
     ) -> bool:
         from ..LanceDB.schema_manager import _safe_close_table
 
+        if require_uninitialized and expected_model_id is not None:
+            raise ValueError(
+                "Pass either require_uninitialized or expected_model_id, not both"
+            )
         stored = collection.to_storage()
-        payload = {name: stored[name] for name in field_names}
+        payload: dict[str, Any] = {}
+        for name in field_names:
+            if name == "name" or name not in stored:
+                raise ValueError(f"Cannot update collection_metadata field '{name}'")
+            payload[name] = stored[name]
         payload["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
 
         conn = await self._get_connection()

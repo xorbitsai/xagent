@@ -77,6 +77,25 @@ class _FakeMetadataStore:
         self.saved_collections.append(collection)
         self.collection = collection
 
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        if self.collection is not None and self.collection.name == collection.name:
+            return False
+        self.collection = collection
+        return True
+
+    async def update_collection_fields(
+        self, collection: CollectionInfo, field_names: object, **_: object
+    ) -> bool:
+        if self.collection is None or self.collection.name != collection.name:
+            raise ValueError(f"Collection '{collection.name}' not found")
+        update = {
+            name: getattr(collection, name)
+            for name in field_names
+            if hasattr(self.collection, name)
+        }
+        self.collection = self.collection.model_copy(update=update)
+        return True
+
     async def delete_collection_metadata(
         self,
         *,
@@ -178,6 +197,8 @@ async def test_agent_kb_service_prepare_collection_sanitizes_without_writing():
         side_effect=ValueError("Collection 'agent url kb' not found")
     )
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
 
     with patch(
@@ -201,6 +222,8 @@ async def test_agent_kb_service_publish_collection_preserves_existing_backend_bi
     metadata_store.save_collection_config = AsyncMock()
     metadata_store.get_collection = AsyncMock(return_value=existing)
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
     ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
 
@@ -224,6 +247,8 @@ async def test_agent_kb_service_publish_collection_persists_config():
         side_effect=ValueError("Collection 'agent url kb' not found")
     )
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
     ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
 
@@ -234,7 +259,8 @@ async def test_agent_kb_service_publish_collection_persists_config():
         await service.publish_collection("agent url kb", ingest_config)
 
     metadata_store.save_collection_config.assert_awaited_once()
-    metadata_store.save_collection.assert_awaited_once()
+    metadata_store.save_collection_if_absent.assert_awaited_once()
+    metadata_store.save_collection.assert_not_awaited()
     _, save_kwargs = metadata_store.save_collection_config.await_args
     assert save_kwargs["collection"] == "agent url kb"
     assert save_kwargs["user_id"] == 71
@@ -253,6 +279,8 @@ async def test_agent_kb_service_publish_collection_raises_on_config_save_failure
         side_effect=ValueError("Collection 'agent kb' not found")
     )
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
     ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
 
@@ -722,8 +750,9 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     # leave it alone; the cleanup of a collection the import created is covered
     # by test_cleanup_failed_agent_collection_* below.
     assert metadata_store.deleted_collections == []
-    assert metadata_store.saved_collections[-1].owners == []
-    assert metadata_store.saved_collections[-1].extra_metadata["kb_storage"] == {
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.owners == []
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
 
@@ -974,9 +1003,9 @@ async def test_create_kb_from_url_partial_failure_preserves_pipeline_policy(
     }
     assert metadata_store.saved_configs[-1]["collection"] == "agent_url_kb"
     assert metadata_store.saved_configs[-1]["user_id"] == 71
-    assert metadata_store.saved_collections
-    assert metadata_store.saved_collections[-1].owners == []
-    assert metadata_store.saved_collections[-1].extra_metadata["kb_storage"] == {
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.owners == []
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
 
@@ -1005,6 +1034,8 @@ async def test_agent_publish_keeps_settings_changed_during_the_crawl():
         side_effect=ValueError("Collection 'agent url kb' not found")
     )
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
 
     with patch(
@@ -1272,6 +1303,8 @@ async def test_agent_publish_keeps_settings_when_the_config_read_fails():
         return_value=CollectionInfo(name="agent url kb")
     )
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
 
     with patch(
@@ -1299,6 +1332,8 @@ async def test_agent_publish_of_a_new_collection_survives_a_config_read_failure(
         side_effect=ValueError("Collection 'agent url kb' not found")
     )
     metadata_store.save_collection = AsyncMock()
+    metadata_store.save_collection_if_absent = AsyncMock(return_value=True)
+    metadata_store.update_collection_fields = AsyncMock(return_value=True)
     service = AgentKnowledgeBaseService(user_id=71)
 
     with patch(

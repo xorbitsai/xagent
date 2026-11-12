@@ -171,3 +171,33 @@ def test_missing_row_raises_unless_require_uninitialized() -> None:
         )
     )
     assert applied is False
+
+
+def test_both_guards_are_rejected() -> None:
+    _save(name="kb")
+
+    with pytest.raises(ValueError, match="not both"):
+        asyncio.run(
+            get_metadata_store().update_collection_fields(
+                CollectionInfo(
+                    name="kb", embedding_model_id="m", embedding_dimension=1
+                ),
+                ("embedding_model_id", "embedding_dimension"),
+                require_uninitialized=True,
+                expected_model_id="m",
+            )
+        )
+
+
+def test_unknown_or_key_fields_are_rejected() -> None:
+    _save(name="kb")
+
+    for field in ("name", "not_a_column"):
+        with pytest.raises(ValueError, match="Cannot update"):
+            asyncio.run(
+                get_metadata_store().update_collection_fields(
+                    CollectionInfo(name="kb", documents=1), (field,)
+                )
+            )
+
+    assert _row().documents == 0

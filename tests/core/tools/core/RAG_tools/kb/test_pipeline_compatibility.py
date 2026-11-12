@@ -48,6 +48,25 @@ class _FakeMetadataStore:
         self.saved.append(collection)
         self.collection = collection
 
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        if self.collection is not None and self.collection.name == collection.name:
+            return False
+        self.collection = collection
+        return True
+
+    async def update_collection_fields(
+        self, collection: CollectionInfo, field_names: object, **_: object
+    ) -> bool:
+        if self.collection is None or self.collection.name != collection.name:
+            raise ValueError(f"Collection '{collection.name}' not found")
+        update = {
+            name: getattr(collection, name)
+            for name in field_names
+            if hasattr(self.collection, name)
+        }
+        self.collection = self.collection.model_copy(update=update)
+        return True
+
 
 class _FakeStorageShim:
     def __init__(self, metadata_store: _FakeMetadataStore) -> None:
@@ -67,7 +86,10 @@ def test_ensure_collection_backend_binding_sets_lancedb_when_missing() -> None:
 
     assert updated is not None
     assert updated.extra_metadata["kb_storage"] == {"backend": "lancedb"}
-    assert metadata_store.saved == [updated]
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
 
 
 @pytest.mark.asyncio
@@ -83,7 +105,10 @@ async def test_ensure_collection_backend_binding_async_sets_lancedb_when_missing
 
     assert updated is not None
     assert updated.extra_metadata["kb_storage"] == {"backend": "lancedb"}
-    assert metadata_store.saved == [updated]
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
 
 
 def test_ensure_collection_backend_binding_preserves_existing_binding() -> None:
@@ -187,7 +212,7 @@ def test_process_document_binds_collection_after_first_ingest(
     assert metadata_store.collection.extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
-    assert metadata_store.saved == [metadata_store.collection]
+    assert metadata_store.saved == []
 
 
 @pytest.mark.parametrize(
@@ -514,7 +539,9 @@ async def test_web_ingestion_zero_success_reports_incomplete_rollback_outcome(
 
 
 class _FailingSaveMetadataStore(_FakeMetadataStore):
-    async def save_collection(self, collection: CollectionInfo) -> None:
+    async def update_collection_fields(
+        self, collection: CollectionInfo, field_names: object, **_: object
+    ) -> bool:
         raise RuntimeError("save failed")
 
 

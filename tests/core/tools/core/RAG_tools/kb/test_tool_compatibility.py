@@ -38,6 +38,25 @@ class _FakeMetadataStore:
         self.saved.append(collection)
         self.collection = collection
 
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        if self.collection is not None and self.collection.name == collection.name:
+            return False
+        self.collection = collection
+        return True
+
+    async def update_collection_fields(
+        self, collection: CollectionInfo, field_names: object, **_: object
+    ) -> bool:
+        if self.collection is None or self.collection.name != collection.name:
+            raise ValueError(f"Collection '{collection.name}' not found")
+        update = {
+            name: getattr(collection, name)
+            for name in field_names
+            if hasattr(self.collection, name)
+        }
+        self.collection = self.collection.model_copy(update=update)
+        return True
+
     async def delete_collection_metadata(
         self,
         *,
@@ -173,7 +192,10 @@ async def test_ensure_agent_collection_backend_binding_creates_missing_metadata(
     assert updated.name == "demo"
     assert updated.owners == []
     assert updated.extra_metadata["kb_storage"] == {"backend": "lancedb"}
-    assert metadata_store.saved == [updated]
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
+        "backend": "lancedb"
+    }
 
 
 @pytest.mark.asyncio
@@ -229,8 +251,9 @@ async def test_publish_agent_collection_binds_backend_with_the_config(monkeypatc
     )
 
     assert published == [7]
-    assert metadata_store.saved[-1].owners == []
-    assert metadata_store.saved[-1].extra_metadata["kb_storage"] == {
+    assert metadata_store.collection is not None
+    assert metadata_store.collection.owners == []
+    assert metadata_store.collection.extra_metadata["kb_storage"] == {
         "backend": "lancedb"
     }
 

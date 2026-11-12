@@ -15,7 +15,6 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from .async_utils import has_async_method
 from .collection_handle import deployment_kb_backend, ingest_scope
 from .operation_compatibility import (
     KBOperation,
@@ -168,19 +167,15 @@ class KBPipelineCompatibilityFacade:
         if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
             return collection_info
 
-        extra_metadata[KB_STORAGE_METADATA_KEY] = {
-            "backend": deployment_kb_backend().value
-        }
-        updated_collection = collection_info.model_copy(
-            update={"extra_metadata": extra_metadata}
+        from ..management.collection_manager import merge_collection_extra_metadata
+
+        return await merge_collection_extra_metadata(
+            metadata_store,
+            collection_info,
+            KB_STORAGE_METADATA_KEY,
+            {"backend": deployment_kb_backend().value},
+            row_existed=True,
         )
-        if has_async_method(metadata_store, "update_collection_fields"):
-            await metadata_store.update_collection_fields(
-                updated_collection, ("extra_metadata",)
-            )
-        else:
-            await metadata_store.save_collection(updated_collection)
-        return updated_collection
 
     def ensure_collection_backend_binding(
         self, collection: str

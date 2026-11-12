@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..core.schemas import CollectionInfo, IngestionConfig
-from .async_utils import has_async_method, maybe_await
+from .async_utils import maybe_await
 from .collection_handle import deployment_kb_backend
 from .pipeline_compatibility import KB_STORAGE_METADATA_KEY
 
@@ -324,34 +324,14 @@ class KBToolCompatibilityFacade:
                 collection_info = CollectionInfo(name=collection)
                 row_existed = False
 
-            extra_metadata = dict(collection_info.extra_metadata or {})
-            if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
-                return collection_info
-
-            extra_metadata[KB_STORAGE_METADATA_KEY] = {
-                "backend": deployment_kb_backend().value
-            }
-            updated_collection = collection_info.model_copy(
-                update={"extra_metadata": extra_metadata}
+            from ..management.collection_manager import (
+                merge_collection_extra_metadata,
             )
-            if row_existed and has_async_method(
-                metadata_store, "update_collection_fields"
-            ):
-                await metadata_store.update_collection_fields(
-                    updated_collection, ("extra_metadata",)
-                )
-            elif not row_existed and has_async_method(
-                metadata_store, "save_collection_if_absent"
-            ):
-                inserted = await metadata_store.save_collection_if_absent(
-                    updated_collection
-                )
-                if not inserted and has_async_method(
-                    metadata_store, "update_collection_fields"
-                ):
-                    await metadata_store.update_collection_fields(
-                        updated_collection, ("extra_metadata",)
-                    )
-            else:
-                await metadata_store.save_collection(updated_collection)
-            return updated_collection
+
+            return await merge_collection_extra_metadata(
+                metadata_store,
+                collection_info,
+                KB_STORAGE_METADATA_KEY,
+                {"backend": deployment_kb_backend().value},
+                row_existed=row_existed,
+            )

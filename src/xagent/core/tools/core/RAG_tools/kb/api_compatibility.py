@@ -32,7 +32,7 @@ from ..core.schemas import (
     WebCrawlConfig,
     WebIngestionResult,
 )
-from .async_utils import has_async_method, maybe_await
+from .async_utils import maybe_await
 from .collection_handle import deployment_kb_backend
 from .operation_compatibility import (
     KBOperationOutcome,
@@ -624,7 +624,7 @@ class KBApiCompatibilityFacade:
             return None
 
         collection_info: CollectionInfo | None = None
-        row_existed: bool | None = None
+        row_existed = False
         if _has_store_method(store, "get_collection"):
             try:
                 loaded = store.get_collection(collection)
@@ -641,39 +641,20 @@ class KBApiCompatibilityFacade:
                     row_existed = False
         else:
             collection_info = CollectionInfo(name=collection)
+            row_existed = False
 
         if collection_info is None:
             return None
 
-        extra_metadata = dict(collection_info.extra_metadata or {})
-        if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
-            return collection_info
+        from ..management.collection_manager import merge_collection_extra_metadata
 
-        extra_metadata[KB_STORAGE_METADATA_KEY] = {
-            "backend": deployment_kb_backend().value
-        }
-        updated_collection = collection_info.model_copy(
-            update={"extra_metadata": extra_metadata}
+        return await merge_collection_extra_metadata(
+            store,
+            collection_info,
+            KB_STORAGE_METADATA_KEY,
+            {"backend": deployment_kb_backend().value},
+            row_existed=row_existed,
         )
-        if row_existed is True and has_async_method(store, "update_collection_fields"):
-            await maybe_await(
-                store.update_collection_fields(updated_collection, ("extra_metadata",))
-            )
-        elif row_existed is False and has_async_method(
-            store, "save_collection_if_absent"
-        ):
-            inserted = await maybe_await(
-                store.save_collection_if_absent(updated_collection)
-            )
-            if not inserted and has_async_method(store, "update_collection_fields"):
-                await maybe_await(
-                    store.update_collection_fields(
-                        updated_collection, ("extra_metadata",)
-                    )
-                )
-        else:
-            await maybe_await(store.save_collection(updated_collection))
-        return updated_collection
 
     async def get_collection_config(
         self,

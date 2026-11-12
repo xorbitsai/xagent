@@ -8,7 +8,10 @@ from typing import Any, Optional
 
 import pytest
 
-from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionNotFrozenError
+from xagent.core.tools.core.RAG_tools.core.exceptions import (
+    CollectionNotFrozenError,
+    EmbeddingAdapterError,
+)
 from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
 from xagent.core.tools.core.RAG_tools.kb import (
     KBApiCompatibilityFacade,
@@ -19,6 +22,7 @@ from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
 from xagent.core.tools.core.RAG_tools.management import (
     collections,
 )
+from xagent.core.tools.core.RAG_tools.management import embedding_switch as es
 from xagent.core.tools.core.RAG_tools.management.embedding_switch import (
     switch_collection_embedding_model,
 )
@@ -40,19 +44,20 @@ def _bind_models(monkeypatch: pytest.MonkeyPatch) -> None:
     models = {
         "old": (OLD_MODEL, OLD_DIM),
         "new": (NEW_MODEL, NEW_DIM),
-        "new-alias": (NEW_MODEL, NEW_DIM),
+        OLD_MODEL: (OLD_MODEL, OLD_DIM),
+        NEW_MODEL: (NEW_MODEL, NEW_DIM),
     }
 
     def _resolve(model_id: str, **_: Any) -> tuple[SimpleNamespace, object]:
         model, dimension = models[model_id]
         return SimpleNamespace(id=model, dimension=dimension), object()
 
+    def _load(model_id: str, *_: Any) -> SimpleNamespace:
+        model, dimension = models[model_id]
+        return SimpleNamespace(id=model, dimension=dimension)
+
     monkeypatch.setattr(cm, "resolve_embedding_adapter", _resolve)
-    monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.management.embedding_switch."
-        "resolve_embedding_adapter",
-        _resolve,
-    )
+    monkeypatch.setattr(es, "_load_model_from_hub", _load)
 
 
 async def _save(
@@ -77,7 +82,7 @@ def _switch(monkeypatch: pytest.MonkeyPatch, name: str = "kb") -> None:
     _save_sync(name)
     _freeze(name)
     _bind_models(monkeypatch)
-    switch_collection_embedding_model(name, "new")
+    switch_collection_embedding_model(name, NEW_MODEL)
 
 
 def _binding(name: str = "kb") -> tuple[Optional[str], Optional[int]]:
@@ -92,7 +97,7 @@ def test_switch_sets_both_binding_fields_and_records_the_transition(
     _freeze()
     _bind_models(monkeypatch)
 
-    result = switch_collection_embedding_model("kb", "new-alias")
+    result = switch_collection_embedding_model("kb", NEW_MODEL)
 
     assert _binding() == (NEW_MODEL, NEW_DIM)
     assert asyncio.run(cm.collection_manager.get_collection("kb")).documents == 3
@@ -111,17 +116,21 @@ def test_switch_writes_only_the_binding_columns(
     _bind_models(monkeypatch)
     store = get_metadata_store()
     real_update = store.update_collection_fields
-    seen: list[tuple[str, ...]] = []
+    seen: list[tuple[tuple[str, ...], dict[str, Any]]] = []
 
     async def _spy(collection: CollectionInfo, field_names: Any, **kw: Any) -> bool:
-        seen.append(tuple(field_names))
+        seen.append((tuple(field_names), kw))
         return await real_update(collection, field_names, **kw)
 
     monkeypatch.setattr(store, "update_collection_fields", _spy)
 
-    switch_collection_embedding_model("kb", "new")
+    switch_collection_embedding_model("kb", NEW_MODEL)
 
-    assert seen == [("embedding_model_id", "embedding_dimension")]
+    assert [fields for fields, _ in seen] == [
+        ("embedding_model_id", "embedding_dimension")
+    ]
+    assert seen[0][1]["expected_model_id"] == OLD_MODEL
+    assert seen[0][1]["require_uninitialized"] is False
 
 
 def test_switch_refuses_a_collection_that_is_not_frozen(
@@ -131,7 +140,7 @@ def test_switch_refuses_a_collection_that_is_not_frozen(
     _bind_models(monkeypatch)
 
     with pytest.raises(CollectionNotFrozenError):
-        switch_collection_embedding_model("kb", "new")
+        switch_collection_embedding_model("kb", NEW_MODEL)
 
     assert _binding() == (OLD_MODEL, OLD_DIM)
 
@@ -144,7 +153,7 @@ def test_switch_refuses_an_idle_migration_record(
     _bind_models(monkeypatch)
 
     with pytest.raises(CollectionNotFrozenError):
-        switch_collection_embedding_model("kb", "new")
+        switch_collection_embedding_model("kb", NEW_MODEL)
 
     assert _binding() == (OLD_MODEL, OLD_DIM)
 
@@ -155,13 +164,13 @@ def test_switch_refuses_a_model_without_a_dimension(
     _save_sync()
     _freeze()
     monkeypatch.setattr(
-        "xagent.core.tools.core.RAG_tools.management.embedding_switch."
-        "resolve_embedding_adapter",
-        lambda model_id, **_: (SimpleNamespace(id=model_id, dimension=None), object()),
+        es,
+        "_load_model_from_hub",
+        lambda model_id, *_: SimpleNamespace(id=model_id, dimension=None),
     )
 
     with pytest.raises(ValueError, match="no dimension"):
-        switch_collection_embedding_model("kb", "new")
+        switch_collection_embedding_model("kb", NEW_MODEL)
 
     assert _binding() == (OLD_MODEL, OLD_DIM)
     assert read_migration_state("kb").target_model_id is None
@@ -175,11 +184,124 @@ def test_switch_refuses_a_missing_collection(monkeypatch: pytest.MonkeyPatch) ->
         switch_collection_embedding_model("ghost", "new")
 
 
+def test_switch_refuses_a_model_the_hub_does_not_configure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    _freeze()
+    _bind_models(monkeypatch)
+
+    def _missing(*_: Any) -> None:
+        raise EmbeddingAdapterError("model not found in hub")
+
+    monkeypatch.setattr(es, "_load_model_from_hub", _missing)
+
+    with pytest.raises(EmbeddingAdapterError):
+        switch_collection_embedding_model("kb", NEW_MODEL)
+
+    assert _binding() == (OLD_MODEL, OLD_DIM)
+    assert read_migration_state("kb").target_model_id is None
+
+
+def test_switch_refuses_an_alias_instead_of_binding_another_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    _freeze()
+    _bind_models(monkeypatch)
+    monkeypatch.setattr(
+        es,
+        "_load_model_from_hub",
+        lambda *_: SimpleNamespace(id=NEW_MODEL, dimension=NEW_DIM),
+    )
+
+    with pytest.raises(ValueError, match="configured model id"):
+        switch_collection_embedding_model("kb", "new-alias")
+
+    assert _binding() == (OLD_MODEL, OLD_DIM)
+    assert read_migration_state("kb").target_model_id is None
+
+
+def test_switch_raises_when_the_binding_moves_under_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    _freeze()
+    _bind_models(monkeypatch)
+
+    async def _lost(*_: Any, **__: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(get_metadata_store(), "update_collection_fields", _lost)
+
+    with pytest.raises(ValueError, match="changed while switching"):
+        switch_collection_embedding_model("kb", NEW_MODEL)
+
+    assert _binding() == (OLD_MODEL, OLD_DIM)
+
+
+def test_switch_refuses_a_collection_unfrozen_while_switching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    _freeze()
+    _bind_models(monkeypatch)
+    real_get = es.get_collection_sync
+
+    def _unfreeze_during_read(name: str) -> CollectionInfo:
+        row = real_get(name)
+        write_migration_state(name, CollectionMigrationState(state=IDLE))
+        return row
+
+    monkeypatch.setattr(es, "get_collection_sync", _unfreeze_during_read)
+
+    with pytest.raises(CollectionNotFrozenError, match="unfrozen"):
+        switch_collection_embedding_model("kb", NEW_MODEL)
+
+    assert _binding() == (OLD_MODEL, OLD_DIM)
+    assert read_migration_state("kb").state == IDLE
+
+
+def test_binding_write_refuses_an_unfrozen_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    _bind_models(monkeypatch)
+
+    with pytest.raises(CollectionNotFrozenError):
+        cm.write_collection_binding_sync("kb", NEW_MODEL, NEW_DIM)
+
+    assert _binding() == (OLD_MODEL, OLD_DIM)
+
+
+def test_stats_update_persists_the_migrated_schema_version() -> None:
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(name="kb", schema_version="0.0.0", documents=2)
+        )
+    )
+
+    cm.update_collection_stats_sync("kb", documents_delta=1)
+
+    from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import (
+        _safe_close_table,
+    )
+
+    conn = get_metadata_store().get_raw_connection()
+    table = conn.open_table("collection_metadata")
+    try:
+        rows = table.search().where("name = 'kb'").to_arrow().to_pylist()
+    finally:
+        _safe_close_table(table)
+    assert rows[0]["schema_version"] == "1.0.0"
+    assert rows[0]["documents"] == 3
+
+
 def test_rollback_is_the_same_call_with_the_previous_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _switch(monkeypatch)
-    switch_collection_embedding_model("kb", "old")
+    switch_collection_embedding_model("kb", OLD_MODEL)
 
     assert _binding() == (OLD_MODEL, OLD_DIM)
     state = read_migration_state("kb")
@@ -420,12 +542,28 @@ def test_reapplying_a_switch_keeps_the_rollback_origin(
 ) -> None:
     _switch(monkeypatch)
 
-    result = switch_collection_embedding_model("kb", "new")
+    result = switch_collection_embedding_model("kb", NEW_MODEL)
 
     assert result.source_model_id == OLD_MODEL
     state = read_migration_state("kb")
     assert state.source_model_id == OLD_MODEL
     assert state.target_model_id == NEW_MODEL
+
+
+def test_reapplying_a_switch_with_an_unbound_origin_keeps_it_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(cm.collection_manager.save_collection(CollectionInfo(name="kb")))
+    _freeze()
+    _bind_models(monkeypatch)
+
+    first = switch_collection_embedding_model("kb", NEW_MODEL)
+    second = switch_collection_embedding_model("kb", NEW_MODEL)
+
+    assert first.source_model_id is None
+    assert second.source_model_id is None
+    assert read_migration_state("kb").source_model_id is None
+    assert _binding() == (NEW_MODEL, NEW_DIM)
 
 
 def test_missing_row_update_is_not_retried(
@@ -524,7 +662,7 @@ def test_backend_binding_keeps_an_existing_binding() -> None:
 def test_api_binding_does_not_overwrite_a_row_that_appeared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _save_sync(name="demo")
+    _save_sync(name="demo", extra_metadata={"other": "kept"})
     store = get_metadata_store()
     real_get = store.get_collection
     calls = {"n": 0}
@@ -544,15 +682,15 @@ def test_api_binding_does_not_overwrite_a_row_that_appeared(
     )
 
     assert _binding("demo") == (OLD_MODEL, OLD_DIM)
-    assert asyncio.run(real_get("demo")).extra_metadata["kb_storage"] == {
-        "backend": "lancedb"
-    }
+    extra = asyncio.run(real_get("demo")).extra_metadata
+    assert extra["other"] == "kept"
+    assert extra["kb_storage"] == {"backend": "lancedb"}
 
 
 def test_tool_binding_does_not_overwrite_a_row_that_appeared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _save_sync(name="demo")
+    _save_sync(name="demo", extra_metadata={"other": "kept"})
     store = get_metadata_store()
     real_get = store.get_collection
     calls = {"n": 0}
@@ -570,9 +708,9 @@ def test_tool_binding_does_not_overwrite_a_row_that_appeared(
     )
 
     assert _binding("demo") == (OLD_MODEL, OLD_DIM)
-    assert asyncio.run(real_get("demo")).extra_metadata["kb_storage"] == {
-        "backend": "lancedb"
-    }
+    extra = asyncio.run(real_get("demo")).extra_metadata
+    assert extra["other"] == "kept"
+    assert extra["kb_storage"] == {"backend": "lancedb"}
 
 
 def test_metadata_rebuild_creation_cannot_clear_a_switch(
@@ -609,7 +747,7 @@ def test_metadata_rebuild_creation_cannot_clear_a_switch(
     assert _binding() == (NEW_MODEL, NEW_DIM)
 
 
-def test_metadata_rebuild_does_not_unbind_a_switched_kb(
+def test_metadata_rebuild_does_not_unbind_a_frozen_kb(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _switch(monkeypatch)

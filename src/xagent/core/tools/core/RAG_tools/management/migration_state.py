@@ -146,6 +146,43 @@ def write_migration_state(
     return stamped
 
 
+def update_migration_state_if_frozen(
+    collection_name: str,
+    state: CollectionMigrationState,
+) -> bool:
+    """Write ``state`` only while the stored row is still frozen.
+
+    Returns ``False`` when an unfreeze landed after the caller's read, so a
+    migration step cannot put a frozen row back over it.
+    """
+    if state.state not in (IDLE, FROZEN):
+        raise ValueError(f"Unsupported migration state: {state.state!r}")
+    stamped = replace(
+        state,
+        updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    conn = get_metadata_store().get_raw_connection()
+    _ensure_table(conn)
+    where = f"name = '{escape_lancedb_string(collection_name)}' AND state = '{FROZEN}'"
+    for attempt in range(WRITE_MAX_RETRIES - 1):
+        try:
+            return _update_row(conn, where, stamped.to_row())
+        except Exception as exc:
+            logger.warning(
+                "Retrying migration state update for %s: %s", collection_name, exc
+            )
+            time.sleep(0.1 * (2**attempt))
+    return _update_row(conn, where, stamped.to_row())
+
+
+def _update_row(conn: Any, where: str, values: Dict[str, Any]) -> bool:
+    table = conn.open_table(MIGRATION_TABLE)
+    try:
+        return bool(table.update(where, values).rows_updated)
+    finally:
+        _safe_close_table(table)
+
+
 def _merge_row(conn: Any, row: dict[str, Any]) -> None:
     _ensure_table(conn)
     table = conn.open_table(MIGRATION_TABLE)

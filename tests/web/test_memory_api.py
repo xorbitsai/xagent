@@ -18,7 +18,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.memory.base import MemoryStore
-from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.storage_admission import (
@@ -1393,3 +1393,143 @@ def test_a_lancedb_store_reports_the_id_its_embeddings_are_billed_under(
 
     store._embedding_model = None
     assert store.embedding_usage_model_id == ""
+
+
+class TestMemoryApiRunsStoreCallsOffTheEventLoop:
+    """The store interface is synchronous; a blocking store must not stall the loop."""
+
+    @pytest.fixture
+    def blocking_app(self, mock_memory_store, test_db, auth_headers):
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        seen: dict[str, Any] = {}
+
+        def block(*_args, **_kwargs):
+            from xagent.core.model.chat.token_context import token_context
+            from xagent.core.user_context import current_user_id
+
+            seen["user_id"] = current_user_id.get()
+            seen["usage_bound"] = token_context.get(None) is not None
+            entered.set()
+            # Bounded so a regression fails the assertions instead of hanging.
+            release.wait(timeout=10)
+            return MemoryResponse(success=True, memory_id="m1")
+
+        mock_memory_store.add.side_effect = block
+        app = FastAPI()
+        app.include_router(auth_router)
+        app.include_router(
+            MemoryManagementRouter(lambda: mock_memory_store).get_router()
+        )
+
+        @app.get("/api/unrelated/health")
+        async def health() -> dict:
+            return {"ok": True}
+
+        app.dependency_overrides[get_db] = override_get_db
+        return app, entered, release, seen, auth_headers
+
+    async def _wait_entered(self, entered) -> None:
+        import asyncio
+
+        for _ in range(500):
+            if entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the store call never started")
+
+    async def test_unrelated_requests_progress_while_a_store_call_blocks(
+        self, blocking_app, test_db
+    ):
+        import asyncio
+        import threading
+
+        import httpx
+
+        app, entered, release, seen, headers = blocking_app
+        # Frees the worker if the loop itself is wedged, so a regression fails
+        # the assertions below rather than hanging the suite.
+        watchdog = threading.Timer(3, release.set)
+        watchdog.start()
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                slow = asyncio.create_task(
+                    client.post("/api/memory", json={"content": "x"}, headers=headers)
+                )
+                await self._wait_entered(entered)
+                health = await asyncio.wait_for(
+                    client.get("/api/unrelated/health"), timeout=1
+                )
+                still_blocked = not release.is_set()
+                release.set()
+                response = await slow
+        finally:
+            watchdog.cancel()
+            release.set()
+
+        assert health.status_code == 200
+        assert still_blocked, "the event loop was stalled by the store call"
+        assert response.status_code == 200
+        # Context variables reach the worker thread.
+        assert seen["user_id"] == test_db.id
+        assert seen["usage_bound"] is True
+
+    async def test_cancelled_request_waits_for_the_store_call_to_finish(
+        self, blocking_app, mock_memory_store
+    ):
+        import asyncio
+        import threading
+
+        import httpx
+
+        app, entered, release, _seen, headers = blocking_app
+        finished = threading.Event()
+        inner = mock_memory_store.add.side_effect
+
+        def tracked(*args, **kwargs):
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                finished.set()
+
+        mock_memory_store.add.side_effect = tracked
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            slow = asyncio.create_task(
+                client.post("/api/memory", json={"content": "x"}, headers=headers)
+            )
+            await self._wait_entered(entered)
+            slow.cancel()
+            await asyncio.sleep(0.1)
+            # Cancellation is deferred, not abandoned: the write is still running
+            # and the request is not yet reported as anything.
+            assert not slow.done()
+            assert not finished.is_set()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await slow
+        assert finished.is_set()
+
+    def test_revocation_mid_operation_is_still_a_503_through_the_thread(
+        self, client, mock_memory_store, auth_headers
+    ):
+        from xagent.web.memory_lifecycle import (
+            MemoryLifecycleState,
+            MemoryLifecycleStatus,
+            MemoryUnavailableError,
+        )
+
+        status = MemoryLifecycleStatus(MemoryLifecycleState.RESTART_REQUIRED)
+        mock_memory_store.list_all.side_effect = MemoryUnavailableError(status)
+
+        response = client.get("/api/memory/list", headers=auth_headers)
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == status.detail

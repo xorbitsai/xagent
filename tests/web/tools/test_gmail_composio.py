@@ -247,8 +247,8 @@ def test_search_reads_subjects_from_every_header_on_a_composio_grant(
 ):
     """A metadata read that names no header returns every header. Asking for
     ``metadataHeaders`` twice puts the same query name twice in one request,
-    which the proxy appears to reduce to its last value, so only From would
-    survive and every subject would read "No Subject"."""
+    and the proxy appears to keep one value of it (replies carried From but
+    not Subject), so every subject read "No Subject"."""
     proxy.answer("/messages/m1", 200, _METADATA_MESSAGE)
     proxy.answer("/messages", 200, {"messages": [{"id": "m1"}]})
     monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())

@@ -348,8 +348,8 @@ class GoogleApiProxyHttp:
         body: str | bytes | None = None,
         headers: Mapping[str, str] | None = None,
     ) -> None:
-        """Refuse one request the proxy would reject for its JSON body size,
-        without sending it.
+        """Refuse one request the proxy would reject for its JSON body size
+        or a query name that appears more than once, without sending it.
 
         Sending several requests in one tool call (one message each) checks
         every request first, so an oversized later one cannot leave the
@@ -371,7 +371,7 @@ class GoogleApiProxyHttp:
 
 def precheck_body_size(request: Any) -> None:
     """Refuse one googleapiclient request the proxy would reject for its body
-    size, before it is sent.
+    size or a query name that appears more than once, before it is sent.
 
     A request on the native transport is left alone, so the native path is
     unchanged.

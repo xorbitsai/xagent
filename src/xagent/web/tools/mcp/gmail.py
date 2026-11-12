@@ -212,10 +212,10 @@ def gmail_search_messages(
     Search and list Gmail messages with optional query and label filters.
     Use query parameter for Gmail search syntax (e.g. 'is:unread', 'from:example@test.com').
     On a Composio-backed grant at most 100 messages are read in one call (the
-    batch fallback sends one proxy request per message, plus the list request);
-    ask for more in smaller calls. On a Composio-backed grant at most one id
-    goes in label_ids; write any other condition into query (for example
-    'is:unread').
+    batch fallback sends one proxy request per message, plus the list request),
+    so ask for more in smaller calls; pass at most one label id there, and
+    write any other condition into query (for example 'is:unread' or
+    'label:<name>').
     """
     try:
         composio_grant = composio_proxy.serves_composio_grant()

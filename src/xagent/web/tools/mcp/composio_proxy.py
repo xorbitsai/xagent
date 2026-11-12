@@ -929,7 +929,8 @@ def check_json_body_size(
     max_body_bytes: int | None = None,
 ) -> None:
     """Refuse a proxy call whose JSON payload is above
-    ``MAX_JSON_BODY_BYTES``, before anything is sent.
+    ``MAX_JSON_BODY_BYTES``, before anything is sent; a query name that
+    appears more than once is refused too.
 
     ``proxy_request`` performs the same check. A connector that sends several
     calls in one tool invocation (one message each) calls this for each of

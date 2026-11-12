@@ -340,6 +340,7 @@ EXCLUDE = {
     ("GET", "/v1/mcp-servers/{server_id}/tools"),
     ("DELETE", "/v1/mcp-servers/{server_id}"),
     ("PUT", "/v1/mcp-servers/{server_id}/enabled"),
+    ("PATCH", "/v1/mcp-servers/{server_id}"),
 }
 
 

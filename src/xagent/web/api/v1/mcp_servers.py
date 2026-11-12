@@ -27,6 +27,7 @@ from ...schemas.v1 import (
     V1McpServerDeleteResponse,
     V1McpServerEnabledRequest,
     V1McpServerTools,
+    V1McpServerUpdateRequest,
     V1McpTool,
     V1McpToolLoadFailure,
 )
@@ -140,6 +141,10 @@ def _has_status(
     return lambda exc, _name, _secrets: exc.status_code == status_code
 
 
+# The web update answers this when the caller's account disappears while it
+# waits for the definition row lock.
+_ACCOUNT_GONE_DETAIL = "Requesting user account no longer exists"
+
 _MANAGED_ELSEWHERE_MESSAGE = (
     "This connector has connections managed outside your account; remove it in "
     "the web app."
@@ -195,6 +200,15 @@ _MCP_WRITE_ERROR_ROWS: tuple[_WriteErrorRow, ...] = (
         _has_status(403),
         403,
         V1ErrorCode.CONNECTOR_FORBIDDEN,
+        _no_message,
+    ),
+    _WriteErrorRow(
+        "account_gone",
+        lambda exc, _n, _s: (
+            exc.status_code == 404 and exc.detail == _ACCOUNT_GONE_DETAIL
+        ),
+        401,
+        V1ErrorCode.INVALID_API_KEY,
         _no_message,
     ),
     _WriteErrorRow(
@@ -275,36 +289,43 @@ def _string_values(value: Any) -> list[str]:
     return []
 
 
-def _request_secrets(request: V1McpServerCreateRequest) -> list[str]:
+def _request_secrets(
+    request: V1McpServerCreateRequest | V1McpServerUpdateRequest,
+) -> list[str]:
     return [*_string_values(request.headers), *_string_values(request.auth)]
 
 
-def _reject_invalid_create(request: V1McpServerCreateRequest) -> None:
-    """Refuse a create body the web code would store wrongly or not reject."""
-    if request.transport not in _REMOTE_TRANSPORTS:
-        raise V1ApiError(V1ErrorCode.TRANSPORT_NOT_SUPPORTED, 400)
-    # The web name rules reject a blank name too; this gives a clearer answer.
-    if request.name.strip() == "":
-        raise V1ApiError(
-            V1ErrorCode.INVALID_INPUT, 400, "Connector name cannot be blank."
-        )
-    # The web name check lets a trailing line break through and then stores the
-    # trimmed name under a row it cannot find again.
-    if has_unfoldable_edge_whitespace(request.name):
-        raise V1ApiError(
-            V1ErrorCode.INVALID_INPUT, 400, unfoldable_edge_whitespace_detail()
-        )
-    try:
-        mcp_endpoint_origin(request.url)
-    except (UnsafePublicHttpTarget, ValueError, httpx.InvalidURL) as exc:
-        raise V1ApiError(
-            V1ErrorCode.INVALID_INPUT,
-            400,
-            "url must be an absolute http(s) URL without user info.",
-        ) from exc
+def _reject_invalid_fields(
+    *, name: Optional[str], url: Optional[str], auth: Optional[dict[str, Any]]
+) -> None:
+    """Refuse a name, URL or auth the web code would store wrongly or not reject.
+
+    ``None`` means the field is not being set.
+    """
+    if name is not None:
+        # The web name rules reject a blank name too; this gives a clearer answer.
+        if name.strip() == "":
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT, 400, "Connector name cannot be blank."
+            )
+        # The web name check lets a trailing line break through and then stores
+        # the trimmed name under a row it cannot find again.
+        if has_unfoldable_edge_whitespace(name):
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT, 400, unfoldable_edge_whitespace_detail()
+            )
+    if url is not None:
+        try:
+            mcp_endpoint_origin(url)
+        except (UnsafePublicHttpTarget, ValueError, httpx.InvalidURL) as exc:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                "url must be an absolute http(s) URL without user info.",
+            ) from exc
     # A catalog marker in ``auth`` would make the connector pass for a
     # platform app.
-    if request.auth and any(key in request.auth for key in _CATALOG_AUTH_KEYS):
+    if auth and any(key in auth for key in _CATALOG_AUTH_KEYS):
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT,
             400,
@@ -314,11 +335,18 @@ def _reject_invalid_create(request: V1McpServerCreateRequest) -> None:
     # The web code encrypts a non-empty value in these fields and fails unless
     # it is a string; a falsy non-string skips encryption and is stored as sent.
     for key in SENSITIVE_AUTH_FIELDS:
-        value = (request.auth or {}).get(key)
+        value = (auth or {}).get(key)
         if value is not None and not isinstance(value, str):
             raise V1ApiError(
                 V1ErrorCode.INVALID_INPUT, 400, f"auth.{key} must be a string or null."
             )
+
+
+def _reject_invalid_create(request: V1McpServerCreateRequest) -> None:
+    """Refuse a create body the web code would store wrongly or not reject."""
+    if request.transport not in _REMOTE_TRANSPORTS:
+        raise V1ApiError(V1ErrorCode.TRANSPORT_NOT_SUPPORTED, 400)
+    _reject_invalid_fields(name=request.name, url=request.url, auth=request.auth)
     if MASKED_SECRET_VALUE in [
         *request.headers.values(),
         *(request.auth or {}).values(),
@@ -328,6 +356,44 @@ def _reject_invalid_create(request: V1McpServerCreateRequest) -> None:
             400,
             f"A new connector has no stored value for '{MASKED_SECRET_VALUE}'; "
             "send the real value.",
+        )
+
+
+# Sent as null these are cleared; every other field must be omitted to keep
+# its stored value.
+_CLEARABLE_UPDATE_FIELDS = frozenset(
+    {"runtime_input_schema", "runtime_bindings", "signed_uploads"}
+)
+
+
+def _reject_invalid_update(request: V1McpServerUpdateRequest) -> None:
+    """Refuse an update body the web code would store wrongly or not reject."""
+    sent = request.model_fields_set
+    for field in V1McpServerUpdateRequest.model_fields:
+        if (
+            field in sent
+            and field not in _CLEARABLE_UPDATE_FIELDS
+            and getattr(request, field) is None
+        ):
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                f"{field} cannot be null; omit it to keep the stored value.",
+            )
+    if "transport" in sent and request.transport not in _REMOTE_TRANSPORTS:
+        raise V1ApiError(V1ErrorCode.TRANSPORT_NOT_SUPPORTED, 400)
+    _reject_invalid_fields(name=request.name, url=request.url, auth=request.auth)
+    # Only the secret fields keep a stored value; the web code would store the
+    # mask itself in any other.
+    if any(
+        value == MASKED_SECRET_VALUE and key not in SENSITIVE_AUTH_FIELDS
+        for key, value in (request.auth or {}).items()
+    ):
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            400,
+            f"Only secret auth fields can keep their stored value with "
+            f"'{MASKED_SECRET_VALUE}'.",
         )
 
 
@@ -400,6 +466,54 @@ async def create_mcp_server(
             exc,
             action="create",
             requested_name=request.name,
+            secrets=_request_secrets(request),
+            owned_connector_id=owned,
+        )
+
+
+@router.patch("/{server_id}", response_model=V1McpServer)
+async def update_mcp_server(
+    request: V1McpServerUpdateRequest,
+    server_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1McpServer:
+    """Change the fields of one of the key holder's remote connectors.
+
+    Only the fields present in the body change; an empty body changes nothing.
+    A connector the holder cannot see answers 404; one seen only through the
+    team answers 403 ``connector_forbidden``; a catalog app connection answers
+    409 ``connector_not_editable``; one with another transport answers 400
+    ``transport_not_supported``. A holder who may not edit the shared
+    configuration answers 403 when the change moves ``url``,
+    ``auth.issuer`` or ``auth.resource_metadata_url``. When the holder may
+    edit and other accounts hold authorizations that such a change would keep,
+    it answers 409 ``connector_not_editable``: make that change in the web app.
+    Otherwise the authorizations team members made for themselves are removed
+    and they must authorize again.
+    """
+    user, key = authed
+    try:
+        return await McpServerManagementRuntime().update_server(
+            user_id=int(user.id),
+            key_prefix=key.key_prefix,
+            server_id=server_id,
+            request=request,
+            validate=_reject_invalid_update,
+        )
+    except HTTPException as exc:
+        owned = (
+            await McpServerManagementRuntime().owned_connector_id(
+                user_id=int(user.id), name=request.name
+            )
+            if request.name is not None and _is_exact_name_conflict(exc, request.name)
+            else None
+        )
+        _raise_v1_from_mcp_write_error(
+            exc,
+            action="update",
+            requested_name=request.name or "",
             secrets=_request_secrets(request),
             owned_connector_id=owned,
         )

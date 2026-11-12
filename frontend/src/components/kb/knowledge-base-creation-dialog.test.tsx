@@ -623,6 +623,7 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
         "http://api.local/api/kb/ingest-cloud",
         expect.any(Object),
         expect.any(Function),
+        expect.any(Object),
       )
     })
     const cloudCall = apiRequestMock.mock.calls.find(

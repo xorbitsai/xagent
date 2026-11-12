@@ -162,6 +162,15 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
   const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
   const [completedUploadCount, setCompletedUploadCount] = useState(0)
+  const uploadAbortRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      uploadAbortRef.current?.abort()
+    }
+  }, [])
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false)
   const [activeAddSourceMode, setActiveAddSourceMode] = useState<"web" | "file" | null>(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -406,8 +415,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setSelectedFiles(prev => prev.filter((_, i) => i !== index))
   }
 
+  const beginAbortableUpload = () => {
+    uploadAbortRef.current?.abort()
+    const controller = new AbortController()
+    uploadAbortRef.current = controller
+    return controller
+  }
+
   const doUpload = async () => {
     if (selectedFiles.length === 0) return
+    const controller = beginAbortableUpload()
 
     setIsUploading(true)
     setUploadProgress(0)
@@ -437,9 +454,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
             method: "POST",
             body: formData
           },
-          () => setUploadProgressDetail(t("kb.migration.upgrading"))
+          () => setUploadProgressDetail(t("kb.migration.upgrading")),
+          controller.signal
         )
         setUploadProgressDetail(null)
+        if (controller.signal.aborted) return
 
         const parsed = await parseApiResponse(response)
 
@@ -536,9 +555,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         description: toastContent.description,
       })
     } finally {
-      setIsUploading(false)
-      setCurrentUploadFileName(null)
-      setUploadProgressDetail(null)
+      if (mountedRef.current) {
+        setIsUploading(false)
+        setCurrentUploadFileName(null)
+        setUploadProgressDetail(null)
+      }
     }
   }
 
@@ -603,6 +624,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
     setWebIngestionNotice(null)
+    const controller = beginAbortableUpload()
 
     try {
       const apiUrl = getApiUrl()
@@ -642,9 +664,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           method: "POST",
           body: formData
         },
-        () => setWebIngestionNotice(t("kb.migration.upgrading"))
+        () => setWebIngestionNotice(t("kb.migration.upgrading")),
+        controller.signal
       )
       setWebIngestionNotice(null)
+      if (controller.signal.aborted) return
 
       const parsed = await parseApiResponse(response)
 
@@ -736,8 +760,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         description: toastContent.description,
       })
     } finally {
-      setIsWebIngesting(false)
-      setWebIngestionProgress(0)
+      if (mountedRef.current) {
+        setIsWebIngesting(false)
+        setWebIngestionProgress(0)
+      }
     }
   }
 

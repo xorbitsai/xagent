@@ -385,6 +385,55 @@ describe("api-wrapper collection migration retry", () => {
     }
   })
 
+  it("stops retrying when the signal aborts during the wait", async () => {
+    vi.useFakeTimers()
+    try {
+      writeAuthCache({ id: "1", username: "alice" }, "token-a")
+      const controller = new AbortController()
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(15))
+      const onUpgrading = vi.fn()
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+        onUpgrading,
+        controller.signal,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(0)
+
+      const response = await pending
+      expect(response.status).toBe(409)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(onUpgrading).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("sends no request at all when the signal is already aborted", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+
+    const response = await uploadWithCollectionMigrationRetry(
+      "/api/kb/ingest/jobs",
+      { method: "POST", body: new FormData() },
+      undefined,
+      controller.signal,
+    )
+
+    expect(response.status).toBe(409)
+    expect(fetchMock).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
+  })
+
   it("sends the credential from the snapshot it checked, not a later storage read", async () => {
     writeAuthCache({ id: "1", username: "alice" }, "token-a")
     const cacheA = localStorage.getItem(AUTH_CACHE_KEY)

@@ -343,6 +343,42 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
     }, { timeout: 5000 })
     expect(screen.queryByText(/kb\.migration\.upgrading/)).toBeNull()
   })
+
+  it("aborts the pending upload retry when the page unmounts", async () => {
+    const previous = apiRequestMock.getMockImplementation()!
+    let signal: AbortSignal | undefined
+    apiRequestMock.mockImplementation(
+      (
+        url: string,
+        options?: RequestInit,
+        _onUpgrading?: () => void,
+        captured?: AbortSignal
+      ) => {
+        if (url === "http://api.local/api/kb/ingest-web/jobs") {
+          signal = captured
+          return new Promise(() => {})
+        }
+        return previous(url, options)
+      }
+    )
+
+    const { unmount } = render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.detail.files.addSource")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.detail.files.addSource"))
+    fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+    fireEvent.change(screen.getByLabelText("kb.dialog.webImport.basic.startUrl *"), {
+      target: { value: "https://example.com/docs" },
+    })
+    fireEvent.click(screen.getByText("kb.index.startImport"))
+
+    await waitFor(() => expect(signal).toBeDefined())
+    unmount()
+    expect(signal?.aborted).toBe(true)
+  })
 })
 
 describe("KnowledgeBaseDetailContent config save", () => {

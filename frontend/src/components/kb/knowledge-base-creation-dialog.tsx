@@ -236,6 +236,15 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
   const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
   const [isDragging, setIsDragging] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const uploadAbortRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      uploadAbortRef.current?.abort()
+    }
+  }, [])
   const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
   const [currentUploadCollection, setCurrentUploadCollection] = useState<string | null>(null)
   const [completedUploadCount, setCompletedUploadCount] = useState(0)
@@ -487,7 +496,15 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     toast.warning(t("kb.ownership.releaseFailed", { name: collection }))
   }
 
+  const beginAbortableUpload = () => {
+    uploadAbortRef.current?.abort()
+    const controller = new AbortController()
+    uploadAbortRef.current = controller
+    return controller
+  }
+
   const resetState = () => {
+    uploadAbortRef.current?.abort()
     setSelectedFiles([])
     setOwnership("personal")
     setUploadProgress(0)
@@ -522,6 +539,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       toast.error(t("kb.errors.uploadFileRequired"))
       return
     }
+    const controller = beginAbortableUpload()
 
     setIsUploading(true)
     // Classify on the status code, not on the backend's English wording.
@@ -561,9 +579,11 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
             method: "POST",
             body: formData
           },
-          () => setUploadProgressDetail(t("kb.migration.upgrading"))
+          () => setUploadProgressDetail(t("kb.migration.upgrading")),
+          controller.signal
         )
         setUploadProgressDetail(null)
+        if (controller.signal.aborted) return
 
         const parsed = await parseApiResponse(response)
 
@@ -672,10 +692,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         onSuccess?.(successfulCollections)
       }
     } finally {
-      setIsUploading(false)
-      setCurrentUploadFileName(null)
-      setCurrentUploadCollection(null)
-      setUploadProgressDetail(null)
+      if (mountedRef.current) {
+        setIsUploading(false)
+        setCurrentUploadFileName(null)
+        setCurrentUploadCollection(null)
+        setUploadProgressDetail(null)
+      }
     }
   }
 
@@ -684,6 +706,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       toast.error(t("kb.errors.startUrlRequired"))
       return
     }
+    const controller = beginAbortableUpload()
 
     setIsWebIngesting(true)
     let failedStatus: number | undefined
@@ -732,9 +755,11 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           method: "POST",
           body: formData
         },
-        () => setUploadProgressDetail(t("kb.migration.upgrading"))
+        () => setUploadProgressDetail(t("kb.migration.upgrading")),
+        controller.signal
       )
       setUploadProgressDetail(null)
+      if (controller.signal.aborted) return
 
       const parsed = await parseApiResponse(response)
 
@@ -808,13 +833,16 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
       })
       if (teamClaimed.current) void releaseTeamName(collectionName)
     } finally {
-      setIsWebIngesting(false)
-      setWebIngestionProgress(0)
+      if (mountedRef.current) {
+        setIsWebIngesting(false)
+        setWebIngestionProgress(0)
+      }
     }
   }
 
   const handleCloudIngest = async () => {
     if (totalCloudFiles === 0) return
+    const controller = beginAbortableUpload()
 
     setIsCloudConnecting(true)
     let failedStatus: number | undefined
@@ -872,8 +900,9 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
           "Content-Type": "application/json"
         },
         body: JSON.stringify(requestBody)
-      }, () => setUploadProgressDetail(t("kb.migration.upgrading")))
+      }, () => setUploadProgressDetail(t("kb.migration.upgrading")), controller.signal)
       setUploadProgressDetail(null)
+      if (controller.signal.aborted) return
 
       const parsed = await parseApiResponse(response)
 
@@ -943,7 +972,7 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
         void releaseTeamName(collectionName)
       }
     } finally {
-      setIsCloudConnecting(false)
+      if (mountedRef.current) setIsCloudConnecting(false)
     }
   }
 

@@ -229,16 +229,31 @@ function isCollectionMigratingResponse(parsed: ParsedApiResponse): boolean {
 function isSameSessionLineage(captured: AuthSessionSnapshot, current: AuthSessionSnapshot): boolean {
   return compareAuthSessionLineage(captured, current) === "same"
 }
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal?.aborted) { resolve(); return }
+    let timer: ReturnType<typeof setTimeout>
+    const done = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", done)
+      resolve()
+    }
+    timer = setTimeout(done, ms)
+    signal?.addEventListener("abort", done, { once: true })
+  })
+}
 /** Retries an upload refused while its collection is frozen, staying with the initiating user. */
 export async function uploadWithCollectionMigrationRetry(
   url: string,
   options: RequestInit,
   onUpgrading?: () => void,
+  signal?: AbortSignal,
 ): Promise<Response> {
   let initiatingSession: AuthSessionSnapshot | null = null
   let boundToSession = false
   let refusal = new Response(null, { status: 409 })
   for (let attempt = 0; ; attempt += 1) {
+    if (signal?.aborted) return refusal
     // One read per attempt: the checked snapshot is the one whose credential is sent.
     const attemptSession = readAuthSessionSnapshot()
     if (initiatingSession === null) {
@@ -252,12 +267,13 @@ export async function uploadWithCollectionMigrationRetry(
     if (response.status !== 409 || attempt >= KB_MIGRATION_RETRY_LIMIT) return response
     if (!isCollectionMigratingResponse(await parseApiResponse(response.clone()))) return response
     refusal = response
-    onUpgrading?.()
     const retryAfterSeconds = Number.parseInt(response.headers.get("Retry-After") ?? "", 10)
     const delayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
       ? Math.min(retryAfterSeconds, 60) * 1000
       : KB_MIGRATION_RETRY_DELAY_MS
-    await new Promise(resolve => setTimeout(resolve, delayMs))
+    if (signal?.aborted) return refusal
+    onUpgrading?.()
+    await waitForRetry(delayMs, signal)
   }
 }
 export interface ClassifiedUploadError {

@@ -487,25 +487,29 @@ def _teams_checks() -> ConnectorChecks:
         ),
     )
 
+
 def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
     """Google Drive's write check and sweep (#3567), sharing one tenant pin.
 
-    Drive has no tool that returns the Workspace customer id, so the pin reads
-    the seed folder instead: the one folder the seed names ``xagent-smoke-seed``
-    in the account's My Drive root, and only this tenant's account can see. The
-    query is the seed's own uniqueness rule, so a folder with that name outside
-    the root, such as one in a shared drive, does not make the pin fail. The
-    check creates a text file in the registry's write folder, reads it back
-    (the same read guards the cleanup) and deletes it. The sweep lists that
-    folder with the registry's query fixture, since Drive's search takes the
-    whole query, and deletes leftovers by id.
+    Drive has no tool that returns the Workspace customer id, so #3567 pins
+    the write check and the sweep to their own write-area container instead:
+    the one folder the seed names ``xagent-smoke-write`` in the account's My
+    Drive root and keeps unshared, which a connection to any other account
+    therefore cannot read. The same read shows both that the connection is the
+    test account and that its writes reach the isolated area. The query is the
+    seed's own uniqueness rule, so a folder with that name outside the root,
+    such as one in a shared drive, does not make the pin fail. The check
+    creates a text file in that folder, reads it back (the same read guards
+    the cleanup) and deletes it. The sweep lists the folder with the
+    registry's query fixture, since Drive's search takes the whole query, and
+    deletes leftovers by id.
     """
     pin = TenantPin(
         ToolStep(
             "google_drive_search",
             {
                 "query": (
-                    "name = 'xagent-smoke-seed' and "
+                    "name = 'xagent-smoke-write' and "
                     "mimeType = 'application/vnd.google-apps.folder' and "
                     "'root' in parents and "
                     "trashed = false"
@@ -515,7 +519,7 @@ def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
             assertions=(Length(("files",), 1, 1),),
         ),
         path=("files", 0, "id"),
-        expected=FixtureRef("google-drive.seed_folder_id"),
+        expected=FixtureRef("google-drive.write_folder_id"),
     )
     name = RunScopedName("drive-file")
     created = CreatedRef(("file", "id"))

@@ -363,23 +363,19 @@ async def test_a_revoked_grant_fails_every_check_and_writes_nothing(
 
 
 @pytest.mark.usefixtures("writes_on")
-async def test_a_pin_that_reads_another_seed_folder_refuses_the_write(
+async def test_a_pin_that_reads_another_write_folder_refuses_the_write(
     drive: Drive,
 ) -> None:
     seeded = dict(drive.items)
 
     result = await _run(
-        _adapter({**FIXTURES, "google-drive.seed_folder_id": "folder-2"})
+        _adapter({**FIXTURES, "google-drive.write_folder_id": "folder-2"})
     )
 
     checks = _check_rows(result)
-    # The same search backs the read check, which compares the id it found,
-    # and the pin, which compares the id it read.
-    assert checks["google-drive.search_seed_folder"] == (
-        "fail",
-        "assertion_failed",
-        "equals",
-    )
+    # The read checks keep to the seed, so they still pass; the pin reads the
+    # write folder and requires the registry's id, so it refuses the write.
+    assert checks["google-drive.search_seed_folder"] == ("pass", None, None)
     assert checks["google-drive.file_round_trip"] == (
         "fail",
         "tenant_mismatch",
@@ -394,9 +390,9 @@ async def test_a_same_named_folder_outside_the_root_does_not_fail_the_pin(
     drive: Drive,
 ) -> None:
     # The seed's own uniqueness rule counts folders in My Drive's root only,
-    # so the pin's search does too: a folder with the seed's name deeper in
-    # the tree is not a second seed folder.
-    drive.add("folder-nested", "xagent-smoke-seed", FOLDER_MIME, parent=SEED_FOLDER)
+    # so the pin's search does too: a folder with the write folder's name
+    # deeper in the tree is not a second write folder.
+    drive.add("folder-nested", "xagent-smoke-write", FOLDER_MIME, parent=SEED_FOLDER)
 
     result = await run_checks(
         _adapter(),

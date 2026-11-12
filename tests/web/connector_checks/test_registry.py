@@ -1355,7 +1355,7 @@ def test_google_drive_declares_its_write_check() -> None:
             "google_drive_search",
             {
                 "query": (
-                    "name = 'xagent-smoke-seed' and "
+                    "name = 'xagent-smoke-write' and "
                     "mimeType = 'application/vnd.google-apps.folder' and "
                     "'root' in parents and "
                     "trashed = false"
@@ -1366,9 +1366,10 @@ def test_google_drive_declares_its_write_check() -> None:
         ),
         path=("files", 0, "id"),
         # Drive has no tool that returns the tenant's customer id, so the pin
-        # reads the seed folder only this tenant's account can see, found by
-        # the seed's own rule: its name, its type and the root as its parent.
-        expected=FixtureRef("google-drive.seed_folder_id"),
+        # reads the write-area container (#3567): the folder the seed keeps
+        # unshared, found by the seed's own rule - its name, its type and the
+        # root as its parent - and required to be the registry's id.
+        expected=FixtureRef("google-drive.write_folder_id"),
     )
     name = RunScopedName("drive-file")
     created = CreatedRef(("file", "id"))

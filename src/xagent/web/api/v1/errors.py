@@ -146,6 +146,15 @@ class V1ErrorCode(str, Enum):
     AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
+
+    # The connector's transport is not one the API can create or change
+    # (only ``streamable_http`` and ``sse``). 400.
+    TRANSPORT_NOT_SUPPORTED = "transport_not_supported"
+
+    # The connector name is taken by another connector, reserved for a
+    # catalog app, or folds to a taken name. 409. ``details.connector_id``
+    # names the holder's own connector when the exact name is theirs.
+    CONNECTOR_NAME_CONFLICT = "connector_name_conflict"
     INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
     MISSING_RUNTIME_CONTEXT = "missing_runtime_context"
     RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
@@ -240,6 +249,14 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
     V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.TRANSPORT_NOT_SUPPORTED: (
+        "Only the streamable_http and sse transports are supported through the API."
+    ),
+    V1ErrorCode.CONNECTOR_NAME_CONFLICT: (
+        "This connector name is already in use or reserved. Connector names are "
+        "unique across all users and are compared case-insensitively, treating "
+        "spaces, hyphens and underscores as the same character."
+    ),
     V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
     V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",
     V1ErrorCode.RUNTIME_CONTEXT_IMMUTABLE: "Connector runtime context cannot change after task creation.",

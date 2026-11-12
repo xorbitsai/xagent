@@ -53,13 +53,11 @@ _PINNED_LEGACY = frozenset(
         "meta-ads",
         "mixpanel",
         "myob",
-        "onedrive",
         "posthog",
         "rocketlane",
         "salesforce",
         "shopify",
         "stripe",
-        "teams",
         "whatsapp",
         "xero",
     }

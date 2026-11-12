@@ -73,6 +73,17 @@ _SLIDE_THUMBNAIL_WITHOUT_SLIDE_ID = (
     "seed deck holds Google's default slide, but no fixture names it, so "
     "whether a check is added is decided in #3567"
 )
+# The registry pins a Microsoft 365 connection by microsoft-365.tenant_id,
+# the Entra tenant id, and no tool of the OneDrive, Excel or PowerPoint
+# servers returns one, so their write checks would have no tenant pin to run
+# before they write. Teams' writes are blocked by cleanup instead: its
+# server has no tool that deletes a message.
+_MICROSOFT_365_WRITE_WITHOUT_TENANT_PIN = (
+    "write; its write check waits on a tenant pin: the registry pins "
+    "microsoft-365.tenant_id, the Entra tenant id, and no tool of this server "
+    "returns a tenant id, so whether it gets a write check is decided in "
+    f"{_MICROSOFT_365_TIER_1}"
+)
 
 
 def _exemptions(
@@ -110,6 +121,38 @@ def _exemptions(
         *(
             ToolExemption(tool, WRITE_WITHOUT_CLEANUP)
             for tool in writes_without_cleanup
+        ),
+    )
+
+
+def _microsoft_365_exemptions(
+    name: str,
+    *,
+    reads: tuple[str, ...] = (),
+    writes: tuple[str, ...] = (),
+    in_place_edits: tuple[str, ...] = (),
+    writes_without_cleanup: tuple[str, ...] = (),
+) -> tuple[ToolExemption, ...]:
+    """A Microsoft 365 connector's exemptions (#3569): it runs read checks
+    only, which carry over 80% of ``name``'s calls."""
+    possessive = f"{name}'" if name.endswith("s") else f"{name}'s"
+    return (
+        *(
+            ToolExemption(
+                tool,
+                "read left unchecked: the checked tools carry over 80% of "
+                f"{possessive} calls, as decided in {_MICROSOFT_365_TIER_1}",
+            )
+            for tool in reads
+        ),
+        *(
+            ToolExemption(tool, _MICROSOFT_365_WRITE_WITHOUT_TENANT_PIN)
+            for tool in writes
+        ),
+        *_exemptions(
+            issue=_MICROSOFT_365_TIER_1,
+            in_place_edits=in_place_edits,
+            writes_without_cleanup=writes_without_cleanup,
         ),
     )
 
@@ -440,6 +483,151 @@ def _slack_checks() -> ConnectorChecks:
     )
 
 
+def _onedrive_checks() -> ConnectorChecks:
+    """OneDrive's Tier 1 read checks (#3569), on the closed seed folder of
+    the test account's drive and the text note in it."""
+    note_id = FixtureRef("onedrive.seed_file_id")
+    return ConnectorChecks(
+        "onedrive",
+        reads=(
+            ReadCheck(
+                "onedrive.list_seed_folder",
+                "onedrive_list_items",
+                {"folder_path": FixtureRef("onedrive.seed_folder_path")},
+                assertions=(
+                    StatusSuccess(),
+                    # The note and the Word, Excel and PowerPoint seed files.
+                    Length(("items",), 4, 4),
+                ),
+            ),
+            ReadCheck(
+                "onedrive.search_seed_file",
+                "onedrive_search_files",
+                # q7k2 is in the note's name and in no other seeded file's
+                # name or content, so the search finds the note alone. It
+                # spans the whole drive: no other object may carry q7k2.
+                {"query": "q7k2"},
+                assertions=(
+                    StatusSuccess(),
+                    Length(("items",), 1, 1),
+                    Equals(("items", 0, "id"), note_id),
+                ),
+            ),
+            ReadCheck(
+                "onedrive.current_user",
+                "onedrive_get_profile",
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys(("user",), ("id", "displayName", "userPrincipalName")),
+                    IsType(("user", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "onedrive.get_seed_file",
+                "onedrive_get_item",
+                {"item_id": note_id},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("item", "name"), "xagent-smoke-seed-note-q7k2.txt"),
+                ),
+            ),
+            ReadCheck(
+                "onedrive.read_seed_file",
+                "onedrive_get_file_content",
+                {"file_path": FixtureRef("onedrive.seed_file_path")},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(
+                        ("text_content",),
+                        "seeded by the xagent connector smoke check\n",
+                    ),
+                ),
+            ),
+        ),
+        exemptions=_microsoft_365_exemptions(
+            "OneDrive",
+            reads=("onedrive_download_file",),
+            writes=(
+                "onedrive_upload_text_file",
+                "onedrive_upload_file",
+                "onedrive_create_folder",
+                "onedrive_rename_item",
+                "onedrive_move_item",
+                "onedrive_delete_item",
+            ),
+        ),
+    )
+
+
+def _teams_checks() -> ConnectorChecks:
+    """Teams' Tier 1 read checks (#3569), on the read team's one channel,
+    which lists the seeded message first. The account belongs to other
+    teams too, so the team list is checked for its shape only, and the seed
+    cannot hold a chat, so the chat list is checked for its shape on an
+    empty list too. The probe-derived L3 row, which reads get_current_user,
+    is kept beside the five reads and takes no slot (#3568, #3569)."""
+    team = FixtureRef("teams.seed_team_id")
+    channel = FixtureRef("teams.seed_channel_id")
+    return ConnectorChecks(
+        "teams",
+        reads=(
+            _declared_l3("teams"),
+            ReadCheck(
+                "teams.auth_status",
+                "auth_status",
+                assertions=(
+                    StatusSuccess(),
+                    IsType(("user", "id"), "string"),
+                ),
+            ),
+            ReadCheck(
+                "teams.list_teams",
+                "list_teams",
+                assertions=(
+                    StatusSuccess(),
+                    Length(("teams",), 1),
+                    EachHasKeys(("teams",), ("id", "displayName")),
+                ),
+            ),
+            ReadCheck(
+                "teams.list_chats",
+                "list_chats",
+                # Any chat must have an id; an empty list, the seed's, passes.
+                assertions=(StatusSuccess(), EachHasKeys(("chats",), ("id",))),
+            ),
+            ReadCheck(
+                "teams.list_seed_channels",
+                "list_channels",
+                {"team_id": team},
+                assertions=(
+                    StatusSuccess(),
+                    Length(("channels",), 1, 1),
+                    Equals(("channels", 0, "id"), channel),
+                ),
+            ),
+            ReadCheck(
+                "teams.read_seed_message",
+                "get_channel_messages",
+                {"team_id": team, "channel_id": channel},
+                assertions=(
+                    StatusSuccess(),
+                    # Graph's message id is a string of digits, so the
+                    # registry records the fixture as a string.
+                    Equals(("messages", 0, "id"), FixtureRef("teams.seed_message_id")),
+                    Contains(
+                        ("messages", 0, "body", "content"), "xagent smoke seed message"
+                    ),
+                ),
+            ),
+        ),
+        exemptions=_microsoft_365_exemptions(
+            "Teams",
+            reads=("get_chat_messages", "list_team_members"),
+            writes_without_cleanup=("send_channel_message", "send_chat_message"),
+        ),
+    )
+
+
 # Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
 # connector has a check or an exemption (#3565, tests/web/connector_checks/
 # test_tool_coverage.py); a remote one declares the checks it has.
@@ -465,27 +653,57 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 {"file_path": FixtureRef("excel.file_path")},
                 assertions=(
                     StatusSuccess(),
-                    HasKeys((), ("worksheets", "truncated")),
+                    Length(("worksheets",), 1, 1),
+                    Equals(("worksheets", 0, "name"), "seed"),
+                ),
+            ),
+            ReadCheck(
+                "excel.read_seed_range",
+                "excel_get_range",
+                {
+                    "file_path": FixtureRef("excel.file_path"),
+                    "worksheet": "seed",
+                    "address": "A1:B3",
+                },
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("range", "values", 0, 0), "item"),
+                    Equals(("range", "values", 0, 1), "quantity"),
+                    Equals(("range", "values", 1, 0), "alpha"),
+                    Equals(("range", "values", 1, 1), 1),
+                    Equals(("range", "values", 2, 0), "beta"),
+                    Equals(("range", "values", 2, 1), 2),
+                ),
+            ),
+            ReadCheck(
+                "excel.read_used_range",
+                "excel_get_used_range",
+                # Formatting outside A1:B3 must not widen the address.
+                {
+                    "file_path": FixtureRef("excel.file_path"),
+                    "worksheet": "seed",
+                    "values_only": True,
+                },
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("range", "address"), "seed!A1:B3"),
                 ),
             ),
         ),
-        exemptions=_exemptions(
-            issue=_MICROSOFT_365_TIER_1,
+        exemptions=_microsoft_365_exemptions(
+            "Excel",
             reads=(
-                "excel_get_range",
-                "excel_get_used_range",
                 "excel_count_values",
                 "excel_find_rows",
                 "excel_list_tables",
                 "excel_list_table_rows",
             ),
-            writes=(
-                "excel_add_worksheet",
-                "excel_delete_worksheet",
+            writes=("excel_add_worksheet", "excel_delete_worksheet"),
+            in_place_edits=(
                 "excel_update_range",
+                "excel_clear_range",
                 "excel_delete_columns",
                 "excel_delete_rows",
-                "excel_clear_range",
                 "excel_add_table_rows",
                 "excel_delete_table_row",
             ),
@@ -807,6 +1025,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             ),
         ),
     ),
+    "onedrive": _onedrive_checks(),
     # Tier 2 (#3573). Which $select fields Graph returns for every message,
     # event or contact has not been checked against a live mailbox, so a list
     # item asserts its id alone.
@@ -940,24 +1159,39 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "powerpoint.read_fixture",
                 "powerpoint_list_slides",
                 {"file_path": FixtureRef("powerpoint.file_path")},
+                assertions=(StatusSuccess(), Equals(("total_count",), 1)),
+            ),
+            ReadCheck(
+                "powerpoint.read_slide_text",
+                "powerpoint_get_slide_text",
+                {"file_path": FixtureRef("powerpoint.file_path"), "slide_index": 0},
                 assertions=(
                     StatusSuccess(),
-                    HasKeys((), ("slides", "etag")),
+                    # The slide's one text box.
+                    Equals(("total_count",), 1),
+                    Equals(("shapes", 0, "text"), "xagent smoke seed presentation"),
+                ),
+            ),
+            ReadCheck(
+                "powerpoint.read_presentation_text",
+                "powerpoint_get_presentation_text",
+                {"file_path": FixtureRef("powerpoint.file_path")},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("total_count",), 1),
+                    Length(("slides", 0, "shapes"), 1, 1),
+                    Equals(
+                        ("slides", 0, "shapes", 0), "xagent smoke seed presentation"
+                    ),
+                    Equals(("slides", 0, "notes"), None),
                 ),
             ),
         ),
-        exemptions=_exemptions(
-            issue=_MICROSOFT_365_TIER_1,
-            reads=(
-                "powerpoint_get_presentation_text",
-                "powerpoint_get_slide_text",
-                "powerpoint_list_slide_layouts",
-            ),
-            writes=(
-                "powerpoint_set_shape_text",
-                "powerpoint_add_slide",
-                "powerpoint_delete_slide",
-            ),
+        exemptions=_microsoft_365_exemptions(
+            "PowerPoint",
+            reads=("powerpoint_list_slide_layouts",),
+            writes=("powerpoint_add_slide", "powerpoint_delete_slide"),
+            in_place_edits=("powerpoint_set_shape_text",),
             writes_without_cleanup=("powerpoint_create_presentation",),
         ),
     ),
@@ -1043,6 +1277,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
         ),
     ),
     "slack": _slack_checks(),
+    "teams": _teams_checks(),
     "word": ConnectorChecks(
         "word",
         reads=(
@@ -1052,14 +1287,25 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 {"file_path": FixtureRef("word.file_path")},
                 assertions=(
                     StatusSuccess(),
-                    HasKeys((), ("text", "generation")),
+                    Contains(("text",), "xagent smoke seed document"),
+                    Contains(("text",), "second seeded paragraph"),
+                ),
+            ),
+            ReadCheck(
+                "word.list_paragraphs",
+                "word_list_paragraphs",
+                {"file_path": FixtureRef("word.file_path")},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("total_paragraphs",), 2),
+                    Equals(("paragraphs", 0, "text"), "xagent smoke seed document"),
+                    Equals(("paragraphs", 1, "text"), "second seeded paragraph"),
                 ),
             ),
         ),
-        exemptions=_exemptions(
-            issue=_MICROSOFT_365_TIER_1,
-            reads=("word_list_paragraphs",),
-            writes=(
+        exemptions=_microsoft_365_exemptions(
+            "Word",
+            in_place_edits=(
                 "word_set_paragraph_text",
                 "word_append_paragraph",
                 "word_add_heading",
@@ -1212,13 +1458,11 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "meta-ads",
         "mixpanel",
         "myob",
-        "onedrive",
         "posthog",
         "rocketlane",
         "salesforce",
         "shopify",
         "stripe",
-        "teams",
         "whatsapp",
         "xero",
     }

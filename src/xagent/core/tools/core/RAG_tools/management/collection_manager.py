@@ -288,6 +288,14 @@ def _get_collection_lock(collection_name: str) -> asyncio.Lock:
         return _collection_locks[lock_key]
 
 
+def _is_deterministic_write_error(exc: Exception) -> bool:
+    """Errors a retry cannot fix: missing row, malformed call, unknown column."""
+    return isinstance(exc, ValueError) and any(
+        marker in str(exc)
+        for marker in ("not found", "not both", "Cannot update collection_metadata")
+    )
+
+
 async def _with_retry(
     operation: Callable[[], Awaitable[T]],
     *,
@@ -446,9 +454,7 @@ class CollectionManager:
                     expected_model_id=expected_model_id,
                 ),
                 description=f"field update of collection {collection.name}",
-                deterministic=lambda exc: (
-                    isinstance(exc, ValueError) and "not found" in str(exc)
-                ),
+                deterministic=_is_deterministic_write_error,
             )
         except ValueError as exc:
             if not (recreate_missing and "not found" in str(exc)):
@@ -1094,9 +1100,6 @@ def write_collection_binding_sync(
         embedding_model_id=embedding_model_id,
         embedding_dimension=embedding_dimension,
     )
-    if require_uninitialized:
-        # The store rejects both guards; unbound is the stronger statement here.
-        expected_model_id = None
     applied = _sync_wrapper(collection_manager.update_collection_fields)(
         target,
         _BINDING_FIELDS,

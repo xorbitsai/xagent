@@ -114,7 +114,9 @@ def switch_collection_embedding_model(
         collection_name,
         canonical_model_id,
         dimension,
-        expected_model_id=observed_model_id,
+        # Exactly one guard: the store rejects both, and an unbound row is not
+        # matched by an exact-value compare-and-set.
+        expected_model_id=observed_model_id if observed is not None else None,
         require_uninitialized=observed is None,
     )
     if not applied:

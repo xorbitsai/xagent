@@ -856,14 +856,16 @@ def test_an_ingest_scope_resolves_each_collection_and_kb_id_once(
     monkeypatch.setattr(
         collection_handle,
         "ensure_milvus_collection",
-        lambda client, model, dimension: ensured.append((model, dimension))
-        or f"{model}-{dimension}",
+        lambda client, model, dimension: (
+            ensured.append((model, dimension)) or f"{model}-{dimension}"
+        ),
     )
     monkeypatch.setattr(
         collection_handle,
         "get_or_create_kb_id",
-        lambda conn, collection, user_id: owners.append((collection, user_id))
-        or f"{collection}-{user_id}",
+        lambda conn, collection, user_id: (
+            owners.append((collection, user_id)) or f"{collection}-{user_id}"
+        ),
     )
     handle, _ledger, connections = _handle()
     other = MilvusCollectionHandle(
@@ -1143,6 +1145,55 @@ async def test_metadata_rebuild_keeps_the_model_without_lancedb_vectors(
 
     assert store.method_calls == []
     saved.assert_awaited_once_with(listed)
+
+
+async def test_metadata_rebuild_writes_counts_only_for_a_bound_row(
+    milvus_deployment: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listed = CollectionInfo(
+        name="kb", embeddings=3, embedding_model_id="m", embedding_dimension=3
+    )
+    stored = CollectionInfo(
+        name="kb", embeddings=3, embedding_model_id="m", embedding_dimension=3
+    )
+    monkeypatch.setattr(
+        collections,
+        "list_collections",
+        AsyncMock(return_value=SimpleNamespace(status="success", collections=[listed])),
+    )
+    monkeypatch.setattr(
+        collections,
+        "_resolve_coordinator",
+        lambda _coordinator: SimpleNamespace(
+            aggregate_collection_stats_sync=lambda **_: {
+                "kb": {"documents": 2, "parses": 2, "chunks": 3, "embeddings": 3}
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        collection_manager, "get_vector_index_store", lambda: MagicMock()
+    )
+    monkeypatch.setattr(
+        collection_manager,
+        "_read_stored_collection",
+        AsyncMock(return_value=stored),
+    )
+    insert = AsyncMock()
+    update = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        collection_manager.collection_manager, "save_collection_if_absent", insert
+    )
+    monkeypatch.setattr(
+        collection_manager.collection_manager, "update_collection_fields", update
+    )
+
+    await collection_manager._rebuild_collection_metadata_impl()
+
+    insert.assert_not_awaited()
+    fields = update.await_args.args[1]
+    assert fields == collection_manager._COUNT_FIELDS + ("schema_version",)
+    written = update.await_args.args[0]
+    assert (written.embedding_model_id, written.embedding_dimension) == ("m", 3)
 
 
 def test_file_statuses_skip_the_legacy_indexed_fallback(

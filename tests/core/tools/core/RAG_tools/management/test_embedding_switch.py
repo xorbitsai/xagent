@@ -695,6 +695,36 @@ def test_reapplying_a_switch_with_an_unbound_origin_keeps_it_none(
     assert _binding() == (NEW_MODEL, NEW_DIM)
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        "Pass either require_uninitialized or expected_model_id, not both",
+        "Cannot update collection_metadata field 'name'",
+    ],
+)
+def test_deterministic_store_errors_are_not_retried(
+    monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    _save_sync()
+    store = get_metadata_store()
+    calls = {"n": 0}
+
+    async def _reject(*_: Any, **__: Any) -> bool:
+        calls["n"] += 1
+        raise ValueError(error)
+
+    monkeypatch.setattr(store, "update_collection_fields", _reject)
+
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(
+            cm.collection_manager.update_collection_fields(
+                CollectionInfo(name="kb", documents=1), ("documents",)
+            )
+        )
+
+    assert calls["n"] == 1
+
+
 def test_missing_row_update_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from functools import partial
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from typing import Annotated, Any, Callable, Iterator, Optional, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query

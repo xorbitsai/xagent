@@ -16,9 +16,11 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    Iterable,
     Iterator,
     Optional,
     TypeVar,
+    Union,
     cast,
 )
 
@@ -178,9 +180,9 @@ def _is_admitted(collection: str) -> bool:
 
 
 @contextmanager
-def pending_collection(collection: str) -> Iterator[None]:
-    """Open a scope whose first guard call decides admission for the collection."""
-    token = _PENDING.set(_PENDING.get() | {collection})
+def pending_collection(*collections: str) -> Iterator[None]:
+    """Open a scope whose first guard call per collection decides its admission."""
+    token = _PENDING.set(_PENDING.get() | set(collections))
     admitted_token = _ADMITTED.set(_ADMITTED.get())
     try:
         yield
@@ -214,20 +216,29 @@ async def admitted_context_async(collection: str) -> Context:
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 S = TypeVar("S", bound=Callable[..., Any])
+Names = Union[str, Iterable[str], None]
+
+
+def _as_names(value: Names) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
 
 
 def admits_collection(
-    get_name: Callable[..., Optional[str]],
+    get_name: Callable[..., Names],
 ) -> Callable[[F], F]:
     """Open a pending admission for the handler; its first guard call checks."""
 
     def decorate(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            name = get_name(*args, **kwargs)
-            if name is None:
+            names = _as_names(get_name(*args, **kwargs))
+            if not names:
                 return await func(*args, **kwargs)
-            with pending_collection(name):
+            with pending_collection(*names):
                 return await func(*args, **kwargs)
 
         return cast(F, wrapper)

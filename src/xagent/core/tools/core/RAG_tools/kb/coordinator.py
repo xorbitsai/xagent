@@ -30,6 +30,7 @@ from ..core.schemas import (
     RegisterDocumentResponse,
     SparseSearchResponse,
 )
+from ..management.migration_state import ensure_collection_writable_async
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
@@ -1023,6 +1024,8 @@ class KBCoordinator:
         """
         int_user_id = _normalize_user_id(user_id)
 
+        await ensure_collection_writable_async(collection)
+
         handle = await self.open_collection(
             KBContextRequest(
                 collection=collection,
@@ -1218,6 +1221,10 @@ class KBCoordinator:
             A list of warning strings (empty on full success).
         """
         int_user_id = _normalize_user_id(user_id)
+
+        # Both names: a frozen row can outlive its collection, so an absent target may be frozen.
+        await ensure_collection_writable_async(old_name)
+        await ensure_collection_writable_async(new_name)
 
         handle = await self.open_collection(
             KBContextRequest(

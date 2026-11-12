@@ -17,7 +17,7 @@ from urllib import parse
 
 from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, parse_file_id_ref
-from ...model.image.base import BaseImageModel
+from ...model.image.base import BaseImageModel, resolve_requested_size
 from ...utils.media_download import (
     describe_media_download_error,
     download_public_media,
@@ -27,6 +27,34 @@ from ...workspace import ExternalUploadStagingError, TaskWorkspace
 from .media_errors import media_failure_fields
 
 logger = logging.getLogger(__name__)
+
+
+def _requested_size_for_generate(
+    model: BaseImageModel,
+    size: str,
+    *,
+    resolution: Optional[str],
+    width: Optional[int],
+    height: Optional[int],
+    aspect_ratio: Optional[str],
+) -> str:
+    """The size a generate call asked the provider for.
+
+    The adapters differ on what a ratio means. DashScope, OpenAI and Xinference
+    keep ``size`` as the pixel size they send and ignore
+    ``resolution``/``width``+``height``; Gemini converts the request to a ratio
+    plus a 1K/2K/4K bucket and still derives that bucket from the other size
+    fields. ``keeps_size_with_aspect_ratio`` says which one this model does, so
+    a hint is computed from the size the provider was actually given.
+    """
+    keeps_size = getattr(model, "keeps_size_with_aspect_ratio", True)
+    return resolve_requested_size(
+        size,
+        resolution=resolution,
+        width=width,
+        height=height,
+        aspect_ratio=aspect_ratio if keeps_size else None,
+    )
 
 
 class ImageGenerationToolCore:
@@ -98,11 +126,11 @@ transparent-background support):
 
 Parameters:
 - prompt (required): optimized image description with visual details
-- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024"). Defaults to a square when omitted, so for ads, posters, and social graphics always pass the placement's real dimensions or aspect_ratio explicitly instead of relying on the default.
+- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1088*1360"). Prefer a width and height that are both multiples of 16; some models reject other values. Defaults to a square when omitted, so for ads, posters, and social graphics pass the placement's dimensions rounded up to multiples of 16 instead of relying on the default.
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
-- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1088x1360"), with the same multiple-of-16 guidance as size
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - honoured by Gemini; DashScope, OpenAI and Xinference send size only and ignore aspect_ratio, resolution and width/height when aspect_ratio is passed.
 - images (optional): source/reference image path/URL/file_id or list of images. If provided, this request is handled as image editing instead of pure text-to-image generation.
 - negative_prompt (optional): brief, quality-focused exclusions; follow the prompt guidance above
 - transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background. Only models marked ◻ support it; the call fails on any other model. Asking for a transparent background in the prompt text does NOT work -- without this parameter the image always comes back opaque.
@@ -110,16 +138,17 @@ Parameters:
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
 - Different models have different size capabilities and constraints
-- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
-- **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
+- **Size alignment**: several models accept only a size whose width and height are both multiples of 16. If the user names a pixel size, round each dimension up to the nearest multiple of 16 before passing it.
+- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket; aspect_ratio is honoured. Output dimensions may vary from requested dimensions.
+- **OpenAI models**: gpt-image-2 and gpt-image-2.5 models accept any "WIDTHxHEIGHT" whose width and height are both divisible by 16, with an aspect ratio between 1:3 and 3:1 and a maximum of 3840x2160. Older OpenAI models accept only preset sizes (256x256, 512x512, 1024x1024, etc.).
 - **DashScope models**: Support limited size options
 - **Xinference models**: Based on Stable Diffusion, may support more flexible dimensions
 
 Size parameter priority (highest to lowest):
-1. aspect_ratio + size (aspect_ratio determines ratio, size determines resolution bucket)
+1. resolution (alternative dimension format)
 2. width + height (desired dimensions, will be approximated to closest supported values)
-3. resolution (alternative dimension format)
-4. size (simple format)
+3. size (simple format)
+On Gemini, aspect_ratio replaces the ratio these dimensions imply; DashScope, OpenAI and Xinference send size only and ignore aspect_ratio, resolution and width/height when aspect_ratio is passed.
 
 Images are automatically saved to workspace.
     """.strip()
@@ -164,25 +193,26 @@ Parameters:
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
 - transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene. Only models marked ◻ support it; the call fails on any other model. Asking for it in the prompt text does NOT work.
-- size (optional): image resolution in "width*height" format (e.g. "1080*1350", "1080*1920", "1920*1080", "1024*1024")
+- size (optional): image resolution in "width*height" format (e.g. "1024*1024", "1088*1360"). Prefer a width and height that are both multiples of 16; some models reject other values.
 - width (optional): image width in pixels (use with height for desired dimensions)
 - height (optional): image height in pixels (use with width for desired dimensions)
-- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1920x1080")
-- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - overrides calculated aspect ratio from size
+- resolution (optional): image resolution in "WIDTHxHEIGHT" format (e.g. "1088x1360"), with the same multiple-of-16 guidance as size
+- aspect_ratio (optional): aspect ratio (e.g. "4:5", "9:16", "16:9", "1:1") - honoured by Gemini; DashScope, OpenAI and Xinference ignore it and keep size as the pixel size.
 - model_id (optional): model name from the list above. Omit to use the default model marked with ⭐[DEFAULT].
 
 **IMPORTANT NOTES ON IMAGE SIZES:**
 - Different models have different size capabilities and constraints
-- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket. Output dimensions may vary from requested dimensions.
-- **OpenAI models**: Support only specific preset sizes (256x256, 512x512, 1024x1024, etc.)
+- **Size alignment**: several models accept only a size whose width and height are both multiples of 16. If the user names a pixel size, round each dimension up to the nearest multiple of 16 before passing it.
+- **Gemini models**: Use aspect ratio + size bucket system (1K/2K/4K). Exact pixel dimensions are converted to the closest supported ratio and bucket; aspect_ratio is honoured. Output dimensions may vary from requested dimensions.
+- **OpenAI models**: gpt-image-2 and gpt-image-2.5 models accept any "WIDTHxHEIGHT" whose width and height are both divisible by 16, with an aspect ratio between 1:3 and 3:1 and a maximum of 3840x2160. Older OpenAI models accept only preset sizes (256x256, 512x512, 1024x1024, etc.).
 - **DashScope models**: Support limited size options
 - **Xinference models**: Based on Stable Diffusion, may support more flexible dimensions
 
 Size parameter priority (highest to lowest):
-1. aspect_ratio + size (aspect_ratio determines ratio, size determines resolution bucket)
+1. resolution (alternative dimension format)
 2. width + height (desired dimensions, will be approximated to closest supported values)
-3. resolution (alternative dimension format)
-4. size (simple format)
+3. size (simple format)
+On Gemini, aspect_ratio replaces the ratio these dimensions imply; DashScope, OpenAI and Xinference keep size as the pixel size and ignore aspect_ratio.
 
 Images are automatically saved to workspace.
     """.strip()
@@ -722,7 +752,7 @@ Images are automatically saved to workspace.
             model_id: Specific model ID to use (optional, uses default if not provided)
             width: Image width in pixels (alternative to size)
             height: Image height in pixels (alternative to size)
-            resolution: Image resolution (e.g., "1920x1080")
+            resolution: Image resolution (e.g., "1088x1360")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
             images: Optional source/reference image(s). When provided, delegate to edit_image.
             transparent_background: Return a PNG with a real alpha channel.
@@ -806,6 +836,14 @@ Images are automatically saved to workspace.
                         logger=logger,
                         action="Image generation failed",
                         model=image_model,
+                        requested_size=_requested_size_for_generate(
+                            image_model,
+                            size,
+                            resolution=resolution,
+                            width=width,
+                            height=height,
+                            aspect_ratio=aspect_ratio,
+                        ),
                     ),
                     "image_path": None,
                     "model_used": self._resolve_model_label(image_model, model_id),
@@ -902,7 +940,7 @@ Images are automatically saved to workspace.
             size: Image size in format "width*height" (e.g., "1024*1024")
             width: Image width in pixels (alternative to size)
             height: Image height in pixels (alternative to size)
-            resolution: Image resolution (e.g., "1920x1080")
+            resolution: Image resolution (e.g., "1088x1360")
             aspect_ratio: Aspect ratio (e.g., "3:2", "16:9")
             transparent_background: Return a PNG with a real alpha channel, e.g.
                 to cut the subject out of its scene. Only models whose provider
@@ -982,6 +1020,12 @@ Images are automatically saved to workspace.
                         logger=logger,
                         action="Image editing failed",
                         model=image_model,
+                        # Edits fold resolution/width+height into size and
+                        # drop aspect_ratio, so the resolution precedence is
+                        # the size the adapter sends.
+                        requested_size=resolve_requested_size(
+                            size, resolution=resolution, width=width, height=height
+                        ),
                     ),
                     "image_path": None,
                     "model_used": self._resolve_model_label(image_model, model_id),

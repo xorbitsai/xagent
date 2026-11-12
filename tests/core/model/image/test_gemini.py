@@ -121,6 +121,59 @@ class TestGeminiImageModel:
         assert model.base_url == "https://generativelanguage.googleapis.com/v1beta"
         assert model.timeout == 300.0
 
+    @pytest.mark.asyncio
+    async def test_generate_uses_resolution_for_the_bucket_with_aspect_ratio(self):
+        """Gemini keeps the resolution precedence for its 1K/2K/4K bucket and
+        applies aspect_ratio on top, so a size hint has to read resolution."""
+        model = GeminiImageModel(
+            model_name="gemini-3-pro-image-preview-2k",
+            api_key="test_key",
+        )
+
+        with patch("httpx.AsyncClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value.__aenter__.return_value = mock_client
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "inlineData": {
+                                        "mimeType": "image/png",
+                                        "data": "aW1hZ2U=",
+                                    }
+                                }
+                            ]
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 100,
+                    "candidatesTokenCount": 50,
+                    "totalTokenCount": 150,
+                },
+            }
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            result = await model.generate_image(
+                "A product shot",
+                size="1080*1350",
+                resolution="1500x1000",
+                aspect_ratio="4:5",
+            )
+
+        assert result["image_url"] == "data:image/png;base64,aW1hZ2U="
+        request_body = mock_client.post.call_args.kwargs["json"]
+        assert request_body["generationConfig"]["imageConfig"] == {
+            "aspectRatio": "4:5",
+            "imageSize": "2K",
+        }
+
     def test_generate_image_with_custom_base_url(self):
         """Test image generation with custom base URL (non-official API)."""
         model = GeminiImageModel(

@@ -232,6 +232,12 @@ class GeminiImageModel(BaseImageModel):
     Image editing is supported for models with "3-pro" in the name by default.
     """
 
+    # Gemini does not send a pixel size: it converts the request to an aspect
+    # ratio plus a 1K/2K/4K bucket, and the bucket still comes from
+    # resolution/width+height when aspect_ratio is also set. A size hint has to
+    # be computed from those fields, not from the size string the ratio sits on.
+    keeps_size_with_aspect_ratio = False
+
     def __init__(
         self,
         model_name: str = "gemini-2.5-flash-image",

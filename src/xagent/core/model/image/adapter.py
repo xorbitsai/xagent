@@ -130,6 +130,11 @@ class ImageModelAdapter(BaseImageModel):
     def __init__(self, model_config: ImageModelConfig):
         self.model_config = model_config
         self._image_model = create_image_model(model_config)
+        # Read by the image tool when it computes a size hint: the answer
+        # belongs to the wrapped adapter, not to this delegation layer.
+        self.keeps_size_with_aspect_ratio = (
+            self._image_model.keeps_size_with_aspect_ratio
+        )
 
     @property
     def abilities(self) -> List[str]:

@@ -29,7 +29,7 @@ from requests.structures import CaseInsensitiveDict
 
 from xagent.core.utils import public_requests
 from xagent.web.connector_checks.engine import run_checks
-from xagent.web.connector_checks.registry import CONNECTOR_CHECKS
+from xagent.web.connector_checks.registry import CONNECTOR_CHECKS, l3_read_check
 from xagent.web.connector_checks.results import RunResult
 from xagent.web.tools.mcp import excel, onedrive, powerpoint, teams, word
 
@@ -45,8 +45,8 @@ _MODULES: dict[str, ModuleType] = {
 
 # The seed, as the cross-repo contract of #3569 lays it out.
 SEED_FOLDER = "xagent-smoke-seed"
-# q7k2 appears in no other file's name or content, so a search finds the note
-# alone (contract v2).
+# q7k2 appears in no other seeded file's name or content, so a search finds
+# the note alone (contract v2).
 NOTE = "xagent-smoke-seed-note-q7k2.txt"
 NOTE_TEXT = "seeded by the xagent connector smoke check\n"
 DOCX = "xagent-smoke-seed.docx"
@@ -86,6 +86,8 @@ CHECKS: dict[str, tuple[str, ...]] = {
         "onedrive.read_seed_file",
     ),
     "teams": (
+        # The L3 row, kept beside the five reads, takes no slot (#3568).
+        "teams.l3_probe",
         "teams.auth_status",
         "teams.list_teams",
         "teams.list_chats",
@@ -464,15 +466,34 @@ def _called(tools: dict[str, dict[str, FakeTool]]) -> set[str]:
 
 
 def test_the_family_declares_its_reads_and_no_write_check() -> None:
-    """Five reads at most per connector, and no write check or sweep: the
-    OneDrive, Excel and PowerPoint writes wait on a tenant pin none of their
-    tools can read, and Teams has no tool that deletes a message."""
+    """Five reads at most per connector beside a kept L3 row, which takes no
+    slot (#3568), and no write check or sweep: the OneDrive, Excel and
+    PowerPoint writes wait on a tenant pin none of their tools can read, and
+    Teams has no tool that deletes a message."""
     for app_id, check_ids in CHECKS.items():
         checks = CONNECTOR_CHECKS[app_id]
         assert tuple(check.id for check in checks.reads) == check_ids
-        assert len(checks.reads) <= 5
+        assert len([c for c in checks.reads if c.id != f"{app_id}.l3_probe"]) <= 5
         assert not checks.writes
         assert checks.sweep is None
+
+
+def test_teams_keeps_its_l3_probe_and_meets_the_cut() -> None:
+    """The kept L3 row calls get_current_user, so that tool is checked, and
+    the checked tools carry over 80% of Teams' calls: the reads left over
+    take the ordinary reason."""
+    checks = CONNECTOR_CHECKS["teams"]
+    assert checks.reads[0] == l3_read_check("teams")
+    assert "get_current_user" in checks.checked_tools()
+    assert {
+        e.tool: e.reason for e in checks.exemptions if e.reason.startswith("read")
+    } == {
+        tool: (
+            "read left unchecked: the checked tools carry over 80% of Teams' "
+            "calls, as decided in #3569"
+        )
+        for tool in ("get_chat_messages", "list_team_members")
+    }
 
 
 # A run against the seeded tenant
@@ -494,8 +515,6 @@ async def test_every_check_passes_on_the_seeded_tenant_and_only_reads(
         tool for app_id in CHECKS for tool in CONNECTOR_CHECKS[app_id].checked_tools()
     }
     assert {method for method, _ in tenant.requests} == {"GET"}
-    # auth_status already reads /me; the second /me read is exempt (#3569).
-    assert "get_current_user" not in _called(tools)
 
 
 @pytest.mark.parametrize("chats", [0, 2])
@@ -794,3 +813,18 @@ async def test_a_message_id_fixture_must_be_a_string(tenant: Tenant) -> None:
         "assertion_failed",
         "equals",
     )
+
+
+async def test_the_checks_without_a_fixture_run_with_none(tenant: Tenant) -> None:
+    """The L3 row and the shape guards take no fixture, so they run even in
+    an environment that records none."""
+    outcomes = _outcomes(await _run(fixtures={}))
+
+    assert {check for check, row in outcomes.items() if row == PASS} == {
+        *(f"{app_id}.session" for app_id in _MODULES),
+        "onedrive.current_user",
+        "teams.l3_probe",
+        "teams.auth_status",
+        "teams.list_teams",
+        "teams.list_chats",
+    }

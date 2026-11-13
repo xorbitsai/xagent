@@ -492,14 +492,17 @@ class V1AgentConnectorsUpdateRequest(BaseModel):
     holder cannot see it, and ``unresolved`` in the response lists it. A
     connector the key holder has disabled for themselves can be added to a
     personal agent; it is stored and listed as resolved, and tasks load it
-    only once it is enabled again.
+    only once it is enabled again. A connector the key holder sees only
+    because their team shares it is also accepted and listed as resolved,
+    but a task takes team connectors from the team that owns the agent, so a
+    task of a personal agent runs without it.
 
-    For an agent that belongs to a team, every connector the new list selects
-    must be shared with that team, otherwise the request fails with
-    ``connector_not_shared``. Sending ``all_connectors=true`` for such an
-    agent is therefore refused unless every connector the key holder can see
-    is shared with the team; list the connectors you want and send ``false``.
-    An agent that uses the default tool set is refused with
+    For an agent that belongs to a team, the new list, with the category that
+    selects every connector when ``all_connectors`` is true, is checked by the
+    team connector validator the deployment installs. A list it refuses fails
+    with ``connector_not_shared``; whether ``all_connectors=true`` is accepted
+    is also its decision. With no validator installed, this check refuses
+    nothing. An agent that uses the default tool set is refused with
     ``agent_tools_unconfigured``.
 
     New tasks use the new selection at once. An existing task keeps using the
@@ -519,7 +522,7 @@ class V1AgentConnectorsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     connectors: list[
-        Annotated[str, StringConstraints(min_length=1, max_length=100)]
+        Annotated[str, StringConstraints(min_length=1, max_length=100, pattern=r"\S")]
     ] = Field(
         ...,
         max_length=100,

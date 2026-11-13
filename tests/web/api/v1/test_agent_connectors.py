@@ -321,16 +321,6 @@ _REPLACE = [
         {},
     ),
     (
-        "blank_name",
-        ["basic_tools", "mcp:crm"],
-        ["crm", "   "],
-        False,
-        400,
-        ["basic_tools", "mcp:crm"],
-        0,
-        {"code": "invalid_input", "message": "Connector names cannot be blank."},
-    ),
-    (
         "unassignable_category_is_dropped",
         ["basic_tools", "other"],
         ["crm"],
@@ -419,7 +409,7 @@ def test_replacement_keeps_order_and_checks_only_added_names(
     alice,
     monkeypatch,
 ):
-    assert len(_REPLACE) == 16
+    assert len(_REPLACE) == 15
     agent_id = _seed_agent("alice", before)
     write_calls = _count_writes(monkeypatch)
 
@@ -440,8 +430,8 @@ def test_replacement_keeps_order_and_checks_only_added_names(
 
 @pytest.mark.parametrize(
     "names",
-    [[f"c{i}" for i in range(101)], ["x" * 101], [""]],
-    ids=["over_100_items", "name_over_100_chars", "empty_name"],
+    [[f"c{i}" for i in range(101)], ["x" * 101], [""], ["   "]],
+    ids=["over_100_items", "name_over_100_chars", "empty_name", "blank_name"],
 )
 def test_oversized_or_empty_names_are_refused(names, alice):
     agent_id = _seed_agent("alice", ["basic_tools"])
@@ -580,6 +570,20 @@ _REFUSALS = [
         _refusal([{"name": "crm-off", "reason": "unresolved"}], "'crm-off'"),
     ),
     (
+        "disabled_but_the_team_shares_the_same_server",
+        lambda *_: [{"type": "mcp", "name": "crm-off", "reason": "unresolved"}],
+        ["crm-off"],
+        False,
+        _refusal([{"name": "crm-off", "reason": "unresolved"}], "'crm-off'"),
+    ),
+    (
+        "disabled_but_the_team_shares_the_same_custom_api",
+        lambda *_: [{"type": "custom_api", "name": "Off API", "reason": "unresolved"}],
+        ["Off API"],
+        False,
+        _refusal([{"name": "Off API", "reason": "unresolved"}], "'Off API'"),
+    ),
+    (
         "unknown_reason_reads_as_not_shared",
         lambda *_: [{"type": "mcp", "name": "x", "reason": "something_new"}],
         [],
@@ -605,8 +609,8 @@ _REFUSALS = [
 def test_team_agent_refusal_lists_each_connector_with_a_reason(
     cell, validator, names, all_connectors, expect, alice
 ):
-    assert len(_REFUSALS) == 6
-    _seed("crm-off", owner=alice, is_active=False)
+    assert len(_REFUSALS) == 8
+    own_off_id = _seed("crm-off", owner=alice, is_active=False)
     if cell == "disabled_but_enabled_under_a_folded_twin":
         _seed("CRM_off", owner=alice)
     if cell == "disabled_but_shared_by_the_team":
@@ -615,6 +619,37 @@ def test_team_agent_refusal_lists_each_connector_with_a_reason(
             visibility=lambda _db, _user_id: {
                 "mcp": {shared_id},
                 "custom_api": set(),
+            }
+        )
+    if cell == "disabled_but_the_team_shares_the_same_server":
+        connector_team_scope.set_connector_team_hooks(
+            visibility=lambda _db, _user_id: {
+                "mcp": {own_off_id},
+                "custom_api": set(),
+            }
+        )
+    if cell == "disabled_but_the_team_shares_the_same_custom_api":
+        db = _direct_db_session()
+        try:
+            api = CustomApi(name="Off API")
+            db.add(api)
+            db.flush()
+            db.add(
+                UserCustomApi(
+                    user_id=alice.user_id,
+                    custom_api_id=api.id,
+                    is_owner=True,
+                    is_active=False,
+                )
+            )
+            db.commit()
+            own_off_api_id = int(api.id)
+        finally:
+            db.close()
+        connector_team_scope.set_connector_team_hooks(
+            visibility=lambda _db, _user_id: {
+                "mcp": set(),
+                "custom_api": {own_off_api_id},
             }
         )
     seen: list[list[str]] = []
@@ -731,22 +766,34 @@ def test_a_failing_team_validator_writes_nothing(alice, monkeypatch):
     assert _stored(agent_id) == ["basic_tools", "mcp:crm"]
 
 
-@pytest.mark.parametrize("outcome", ["written", "unchanged", "refused"])
+@pytest.mark.parametrize("outcome", ["written", "unchanged", "refused", "not_shared"])
+@pytest.mark.usefixtures("_clear_agent_team_hooks")
 def test_a_write_logs_one_line_without_names(outcome, alice, caplog):
     _seed("zz-secret-conn", owner=alice)
     _seed("zz-other-conn", owner=alice)
-    agent_id = _seed_agent("alice", ["basic_tools", "mcp:crm", "mcp:ops"])
+    before = ["basic_tools", "mcp:crm", "mcp:ops"]
+    if outcome == "not_shared":
+        agent_id = _team_agent(
+            alice,
+            lambda *_: [{"type": "mcp", "id": 2, "name": "zz-secret-conn"}],
+            before=before,
+        )
+    else:
+        agent_id = _seed_agent("alice", before)
     names = {
         "written": ["ops", "zz-secret-conn", "zz-other-conn"],
         "unchanged": ["crm", "ops"],
         "refused": ["zz-unseen-conn"],
+        "not_shared": ["crm", "ops", "zz-secret-conn"],
     }[outcome]
     caplog.clear()
 
     with caplog.at_level(logging.INFO):
         resp = _put(alice, agent_id, names)
 
-    assert resp.status_code == (400 if outcome == "refused" else 200), resp.text
+    assert resp.status_code == (400 if outcome in ("refused", "not_shared") else 200), (
+        resp.text
+    )
     lines = [
         r.getMessage()
         for r in caplog.records

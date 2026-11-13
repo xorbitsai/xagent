@@ -1430,8 +1430,6 @@ class AgentManagementRuntime:
             )
             if current is None:
                 raise AgentToolsUnconfiguredError()
-            if any(not name.strip() for name in connectors):
-                raise InvalidAgentConnectorsError("Connector names cannot be blank.")
             requested = list(dict.fromkeys(connectors))
             selected = list(dict.fromkeys(_selected_connector_names(current)))
             if requested == selected and all_connectors == (

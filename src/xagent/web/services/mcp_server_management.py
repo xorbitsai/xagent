@@ -173,8 +173,8 @@ class HolderConnectorNames:
 
     ``visible`` is every name the holder can see. ``own_active`` and
     ``own_inactive`` are the names of the holder's own links, enabled and
-    disabled. ``team_keys`` are the names seen only because the team shares
-    them.
+    disabled. ``team_keys`` are the names of every connector the team shares,
+    including one the holder also links.
     """
 
     visible: frozenset[str]
@@ -195,12 +195,10 @@ def holder_connector_names(db: Any, user_id: int) -> HolderConnectorNames:
     team_keys: set[str] = set()
     for server, link in rows:
         key = normalize_mcp_server_name(str(server.name))
-        if link is None:
+        if link is None or int(server.id) in team_shared["mcp"]:
             team_keys.add(key)
-        elif link.is_active:
-            own_active.add(key)
-        else:
-            own_inactive.add(key)
+        if link is not None:
+            (own_active if link.is_active else own_inactive).add(key)
 
     own_apis = (
         db.query(CustomApi.id, CustomApi.name, UserCustomApi.is_active)
@@ -212,7 +210,7 @@ def holder_connector_names(db: Any, user_id: int) -> HolderConnectorNames:
         (own_active if is_active else own_inactive).add(
             normalize_mcp_server_name(str(name))
         )
-    team_api_ids = team_shared["custom_api"] - {int(row[0]) for row in own_apis}
+    team_api_ids = team_shared["custom_api"]
     if team_api_ids:
         for (name,) in db.query(CustomApi.name).filter(CustomApi.id.in_(team_api_ids)):
             team_keys.add(normalize_mcp_server_name(str(name)))

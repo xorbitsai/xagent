@@ -11,6 +11,7 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
 from urllib.parse import urlparse
@@ -4536,6 +4537,70 @@ def _oauth_success_response(
     )
 
 
+def _google_refresh_token_covers_scopes(
+    *,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    requested_scopes: Sequence[str],
+) -> bool:
+    """Ask Google whether a stored refresh token still yields the requested scopes.
+
+    Google issues a refresh token only on the first consent, so an incremental
+    authorization often has none of its own and the callback would reuse the
+    stored one. Whether that token covers the new scopes is Google's to say: the
+    ``scope`` of a refresh response lists what the access token it mints is
+    allowed to do. Anything short of a clear yes (a revoked token, an outage, a
+    response without scopes) counts as no, which sends the user through the
+    consent page, where Google issues a token for the whole request.
+    """
+    from ..services.google_oauth_grants import (
+        google_connector_scopes,
+        normalize_google_oauth_scopes,
+    )
+
+    required = google_connector_scopes(requested_scopes)
+    if not required:
+        return True
+    try:
+        response = requests.post(
+            token_url,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=10.0,
+        )
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        logger.warning("Google refresh check failed: no usable response")
+        return False
+    if response.status_code != 200 or not isinstance(payload, dict):
+        logger.warning(
+            "Google refresh check failed: status=%s error=%s",
+            response.status_code,
+            str(payload.get("error", "unknown"))[:_OAUTH_ERROR_MESSAGE_LIMIT]
+            if isinstance(payload, dict)
+            else "unparsable",
+        )
+        return False
+    missing = required - normalize_google_oauth_scopes(payload.get("scope"))
+    if missing:
+        logger.warning(
+            "Stored Google refresh token does not cover %d requested scope(s)",
+            len(missing),
+        )
+        return False
+    return True
+
+
 def generic_oauth_callback(
     provider: str,
     request: Request,
@@ -6034,8 +6099,34 @@ def generic_oauth_callback(
                 from ..services.google_oauth_grants import (
                     GoogleOAuthRefreshTokenRequired,
                     GoogleOAuthScopeConsentRequired,
+                    stored_google_refresh_token_for_callback,
                     write_google_shared_oauth_callback,
                 )
+
+                # No refresh token of its own means the stored one would be
+                # reused, so it must first prove it covers this request.
+                stored_refresh_scopes_verified = False
+                if not token_data.get("refresh_token"):
+                    stored_refresh_token = stored_google_refresh_token_for_callback(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                        oauth_client_id=client_id,
+                        google_subject=str(provider_user_id),
+                        legacy_oauth_account=oauth_account,
+                    )
+                    if stored_refresh_token:
+                        stored_refresh_scopes_verified = (
+                            _google_refresh_token_covers_scopes(
+                                token_url=token_url,
+                                client_id=client_id,
+                                client_secret=client_secret,
+                                refresh_token=stored_refresh_token,
+                                requested_scopes=cast(
+                                    list[str], google_shared_scopes_claim
+                                ),
+                            )
+                        )
 
                 try:
                     _shared_account, oauth_account, _association = (
@@ -6060,6 +6151,9 @@ def generic_oauth_callback(
                             token_type=str(token_data.get("token_type", "Bearer")),
                             expires_at=cast(datetime | None, oauth_account.expires_at),
                             legacy_oauth_account=oauth_account,
+                            stored_refresh_scopes_verified=(
+                                stored_refresh_scopes_verified
+                            ),
                         )
                     )
                     if resource_owner_key is None:

@@ -73,6 +73,25 @@ def normalize_google_oauth_scopes(scopes: str | Iterable[str] | None) -> frozens
     return frozenset(normalized)
 
 
+# Every Google authorization carries these for the sign-in itself. Google may
+# spell them differently in a refresh response, and none of them gates a
+# connector, so the refresh check below ignores them.
+_GOOGLE_IDENTITY_SCOPES = frozenset(
+    {
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    }
+)
+
+
+def google_connector_scopes(scopes: str | Iterable[str] | None) -> frozenset[str]:
+    """Return the requested scopes that a connector's tools depend on."""
+    return normalize_google_oauth_scopes(scopes) - _GOOGLE_IDENTITY_SCOPES
+
+
 def google_oauth_grant_covers_scopes(
     oauth_account: UserOAuth, required_scopes: str | Iterable[str] | None
 ) -> bool:
@@ -584,6 +603,68 @@ def _remove_stale_legacy_associations(
         _delete_orphaned_google_grants(db, grant_ids=grant_ids)
 
 
+def stored_google_refresh_token_for_callback(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    oauth_client_id: str,
+    google_subject: str,
+    legacy_oauth_account: UserOAuth,
+) -> str | None:
+    """Return the stored refresh token a callback without a new one would reuse.
+
+    This mirrors the resolution in ``write_google_shared_oauth_callback`` without
+    taking locks, so the caller can ask Google whether that token still covers
+    the requested scopes before the writer runs. It returns None whenever the
+    writer would not reuse a stored token (a rotated OAuth client, an ambiguous
+    identity) or has none to reuse.
+    """
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    subject = _normalized_nonempty(google_subject, field="Google subject")
+    client_fingerprint = google_oauth_client_fingerprint(oauth_client_id)
+    identity_grants = (
+        db.query(GoogleOAuthGrant)
+        .filter(
+            GoogleOAuthGrant.user_id == int(user_id),
+            GoogleOAuthGrant.google_subject == subject,
+            _grant_owner_clause(owner_key),
+        )
+        .order_by(GoogleOAuthGrant.id)
+        .all()
+    )
+    exact_grants = [
+        grant
+        for grant in identity_grants
+        if grant.oauth_client_fingerprint == client_fingerprint
+    ]
+    shared_account: UserOAuth | None
+    if exact_grants:
+        if len(exact_grants) > 1:
+            return None
+        shared_account = db.get(UserOAuth, int(exact_grants[0].oauth_account_id))
+    elif identity_grants:
+        # Another client's grant: the writer migrates it only on a fresh token.
+        return None
+    else:
+        shared_account = (
+            db.query(UserOAuth)
+            .filter(
+                UserOAuth.user_id == int(user_id),
+                user_oauth_owner_clause(owner_key),
+                UserOAuth.provider == GOOGLE_SHARED_OAUTH_PROVIDER,
+                UserOAuth.provider_user_id == subject,
+            )
+            .one_or_none()
+        )
+    stored = (
+        shared_account.refresh_token if shared_account is not None else None
+    ) or legacy_oauth_account.refresh_token
+    if not stored or is_undecryptable_oauth_token(stored):
+        return None
+    return str(stored)
+
+
 def write_google_shared_oauth_callback(
     db: Session,
     *,
@@ -600,12 +681,21 @@ def write_google_shared_oauth_callback(
     token_type: str,
     expires_at: datetime | None,
     legacy_oauth_account: UserOAuth,
+    stored_refresh_scopes_verified: bool = False,
 ) -> tuple[UserOAuth, UserOAuth, GoogleOAuthAppAssociation]:
     """Persist a shared callback while retaining one rollback-compatible row.
 
     Existing shared credentials are updated in place. The app-specific legacy
     row mirrors the same token material so disabling the rollout flag takes
     effect immediately and does not require another Google authorization.
+
+    Google returns a refresh token only on the first consent, so an incremental
+    authorization often answers without one. The stored token may then be
+    reused only when the caller has asked Google and been told it still covers
+    the requested scopes (``stored_refresh_scopes_verified``). Otherwise the
+    callback would store the new access token's scopes next to a token that
+    refreshes to the old ones, and the new app would lose access at the first
+    refresh while the row claimed it had it.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
@@ -738,6 +828,8 @@ def write_google_shared_oauth_callback(
     if not resolved_refresh_token or is_undecryptable_oauth_token(
         resolved_refresh_token
     ):
+        raise GoogleOAuthRefreshTokenRequired
+    if not refresh_token and not stored_refresh_scopes_verified:
         raise GoogleOAuthRefreshTokenRequired
 
     scopes = set(normalize_google_oauth_scopes(granted_scopes))

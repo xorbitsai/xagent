@@ -31,9 +31,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
     StringConstraints,
+    model_serializer,
 )
 
 from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
@@ -482,6 +484,101 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
             "holder can see. They are stored anyway, because a task loads the "
             "skills of the user who runs it, and that user may have a skill "
             "with this name."
+        ),
+    )
+
+
+class V1AgentConnectorsResponse(BaseModel):
+    """Response of ``GET`` and ``PUT /v1/agents/{agent_id}/connectors``."""
+
+    agent_id: int
+    connectors: list[str] = Field(
+        ...,
+        description=(
+            "The connector names the agent selects, as stored: in stored "
+            "order, a repeated name repeated. An agent that uses the default "
+            "tool set selects none."
+        ),
+    )
+    all_connectors: bool = Field(
+        ...,
+        description=(
+            "True when the agent uses the default tool set, or its tool list "
+            "has the category that selects every MCP connector."
+        ),
+    )
+    unresolved: list[str] = Field(
+        ...,
+        description=(
+            "Names in ``connectors`` that are not among the connectors the key "
+            "holder can see through this API. This is computed for the key "
+            "holder and can differ from the set a task loads when it runs."
+        ),
+    )
+
+
+class V1AgentConnectorsUpdateRequest(BaseModel):
+    """Body for ``PUT /v1/agents/{agent_id}/connectors``.
+
+    The agent's connector selection is replaced as a whole, so read it with
+    ``GET`` first and send it back with your change. Entries of the agent's
+    tool list that do not select a connector keep their relative order, and
+    the connector entries follow them in the order given here. Sending back
+    exactly what ``GET`` returned changes nothing and writes nothing.
+
+    Only names this request adds are checked: each must be a connector the key
+    holder can see. A name already on the agent is kept even when the key
+    holder cannot see it, and ``unresolved`` in the response lists it. A
+    connector the key holder has disabled for themselves can be added to a
+    personal agent; it is stored and listed as resolved, and tasks load it
+    only once it is enabled again. A connector the key holder sees only
+    because their team shares it is also accepted and listed as resolved,
+    but a task takes team connectors from the team that owns the agent, so a
+    task of a personal agent runs without it.
+
+    For an agent that belongs to a team, the new list, with the category that
+    selects every connector when ``all_connectors`` is true, is checked by the
+    team connector validator the deployment installs. A list it refuses fails
+    with ``connector_not_shared``; whether ``all_connectors=true`` is accepted
+    is also its decision. With no validator installed, this check refuses
+    nothing. An agent that uses the default tool set is refused with
+    ``agent_tools_unconfigured``.
+
+    New tasks use the new selection at once. An existing task keeps using the
+    previous one while its cached agent runtime is alive; each server process
+    has its own cache, and how long a runtime stays cached depends on the
+    task's state. If the agent is the manager or an enabled worker of a
+    workforce and its tool list now differs, other than in order, from the
+    list it had when an ongoing workforce conversation started, that
+    conversation is rejected with ``workforce_config_changed`` on its next
+    turn; a preview conversation in the workforce builder is not checked.
+
+    A selection with more than 100 names, or a name that is empty, blank or
+    longer than 100 characters, cannot be sent back unchanged. There is no
+    conflict detection: of two concurrent replacements the later one wins.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connectors: list[
+        Annotated[str, StringConstraints(min_length=1, max_length=100, pattern=r"\S")]
+    ] = Field(
+        ...,
+        max_length=100,
+        description=(
+            "The complete new list of connector names; a name repeated "
+            "exactly is kept once, at its first position. Names that fold "
+            "to the same identity, such as 'Foo' and 'foo', are both kept."
+        ),
+    )
+    all_connectors: bool = Field(
+        ...,
+        description=(
+            "False selects only the connectors listed: the category that "
+            "selects every connector is removed. True keeps that category, "
+            "adding it when the agent lacks it, so the list does not narrow "
+            "which connectors the agent can use; it still decides which "
+            "Custom APIs are selected."
         ),
     )
 
@@ -1294,7 +1391,8 @@ class TaskInfoResponse(BaseModel):
     Returns a snapshot of the task's current state from the ``tasks``
     row. ``input`` / ``output`` / ``error`` reflect the **latest** turn
     only -- full transcript history is queryable via the ``/steps``
-    endpoint's ``message`` type steps.
+    endpoint's ``message`` type steps. The ``completion_outcome`` key is
+    present only when the task's response format sets accept_partial.
     """
 
     task_id: int
@@ -1442,6 +1540,31 @@ class TaskInfoResponse(BaseModel):
             "otherwise."
         ),
     )
+    completion_outcome: Optional[str] = Field(
+        None,
+        description=(
+            "How the agent rated the run shown in this response: completed, "
+            "partial or blocked. Present only when the task's response format "
+            "sets accept_partial; the key is absent otherwise. When present, "
+            "null unless the task is completed and the run recorded a rating. "
+            "Whether a structured result is complete is told by "
+            "structured_output_status, not by this field."
+        ),
+    )
+
+    # Responses for a task without accept_partial must stay byte-identical to
+    # those of servers that predate this field, so the key is dropped unless
+    # the response was built or updated with it. No return annotation: any
+    # annotation, Any included, replaces this model's serialization schema in
+    # the OpenAPI document.
+    @model_serializer(mode="wrap")
+    def _omit_unreported_completion_outcome(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        data = handler(self)
+        if "completion_outcome" not in self.model_fields_set:
+            data.pop("completion_outcome", None)
+        return data
 
 
 # ``PublicStep.type`` is the public surface for what was internally one

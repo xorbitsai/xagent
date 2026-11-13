@@ -106,6 +106,8 @@ NO_STRUCTURED_OUTPUT = {
     "structured_output_record": None,
     "format_configured": False,
     "error_code": None,
+    "completion_outcome": None,
+    "accept_partial": False,
 }
 NULL_STRUCTURED_OUTPUT_FIELDS = {
     "error_code": None,

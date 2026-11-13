@@ -339,6 +339,8 @@ EXCLUDE = {
     ("DELETE", "/v1/agents/{agent_id}/api-keys/{key_id}"),
     ("GET", "/v1/agents/{agent_id}/skills"),
     ("PUT", "/v1/agents/{agent_id}/skills"),
+    ("GET", "/v1/agents/{agent_id}/connectors"),
+    ("PUT", "/v1/agents/{agent_id}/connectors"),
     ("GET", "/v1/skills"),
     ("GET", "/v1/skills/{name}"),
     ("POST", "/v1/skills"),

@@ -1533,10 +1533,10 @@ async def cancel_chat_task(
         V1ApiError 404: task missing, not owned by the key, or not SDK-created.
         V1ApiError 409: ``task_not_cancellable`` for a task that already
             ended without being cancelled, including one whose run ended
-            on its own while the cancel was being applied; ``task_busy``
-            when the task
-            cannot be cancelled in its current state or changed state while
-            the cancel was applied -- retry.
+            on its own, or was replaced by another turn, while the cancel
+            was being applied; ``task_busy`` when the task cannot be
+            cancelled in its current state or changed state while the
+            cancel was applied -- retry.
         V1ApiError 410: ``task_expired`` for a retention-expired task.
         V1ApiError 503: the cancel could not be applied; retry.
     """

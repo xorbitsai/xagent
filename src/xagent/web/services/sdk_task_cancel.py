@@ -243,6 +243,9 @@ def _prepare_cancel_sync(
                 f"A task that is {task.status.value} cannot be cancelled yet."
             )
         target_state_version = int(task.state_version or 0)
+        # Read before the insert commits and expires ``task``: this is the
+        # run the command targets.
+        aimed_run_id = _task_run_id(task)
         try:
             enqueued = _enqueue_cancel(db, task, target_state_version)
         except TaskCommandTaskMissing as exc:
@@ -255,7 +258,7 @@ def _prepare_cancel_sync(
         if enqueued.status == COMMAND_FAILED:
             retry_failed_task_command(db, enqueued.command_id)
         return _CancelCommand(
-            command_db_id=enqueued.command_id, aimed_run_id=_task_run_id(task)
+            command_db_id=enqueued.command_id, aimed_run_id=aimed_run_id
         )
 
 
@@ -550,9 +553,10 @@ def _finalize_sdk_cancel_sync(
     """Persist cancellation for one exact target; return whether this wrote it.
 
     Raises ``StaleTaskRunError`` before any write, or after a rollback, when
-    the target is neither still running as read nor already settled. Either
-    way it fills ``terminal_event_state`` with the control snapshot the
-    terminal broadcast carries, once the row is durable. The task's cached
+    the target is neither still running as read nor already settled. When
+    the target is settled or written here, it fills ``terminal_event_state``
+    with the control snapshot the terminal broadcast carries, once the row
+    is durable. The task's cached
     read is invalidated after this call's own commit.
     """
 

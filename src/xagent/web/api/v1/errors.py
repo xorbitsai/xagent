@@ -217,7 +217,9 @@ class V1ErrorCode(str, Enum):
     TASK_NOT_WAITING = "task_not_waiting"
 
     # ``POST /v1/chat/tasks/{id}/cancel`` was called on a task that already
-    # ended without being cancelled (completed, or failed on its own). 409,
+    # ended without being cancelled (completed, or failed on its own), or
+    # whose run the cancel was aimed at ended while the cancel was being
+    # applied and another turn took its place. 409,
     # not retryable -- a task that can be cancelled later answers
     # ``task_busy`` instead.
     TASK_NOT_CANCELLABLE = "task_not_cancellable"

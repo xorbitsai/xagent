@@ -999,7 +999,7 @@ A running task created through `/v1` can now be cancelled. The cancelled task re
 ### Client-visible changes
 
 - `POST /v1/chat/tasks/{task_id}/cancel` answers 200 once the task is cancelled, including when an earlier call already cancelled it, and 202 when the cancel is recorded but not applied yet. If a new turn has started by the time 200 is returned, `status` and `run_id` describe the new turn and `cancelled_run_id` names the cancelled one.
-- 409 `task_not_cancellable` means the run ended without being cancelled, including one that ended on its own while the cancel was being applied. 409 `task_busy` means retry: the task is waiting for an answer, paused, has a turn queued to start, or changed state while the cancel was applied. 503 means the cancel could not be applied; retry.
+- 409 `task_not_cancellable` means the run ended without being cancelled, including one that ended on its own, or was replaced by another turn, while the cancel was being applied. 409 `task_busy` means retry: the task is waiting for an answer, paused, has a turn queued to start, or changed state while the cancel was applied. 503 means the cancel could not be applied; retry.
 - `GET /v1/chat/tasks/{task_id}` and the `task.completed` frame of `GET /v1/chat/tasks/{task_id}/events` carry `error_code`, `task_cancelled` for a cancelled task and `null` otherwise.
 
 ### Deployment impact

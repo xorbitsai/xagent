@@ -541,6 +541,32 @@ def test_a_run_that_ended_on_its_own_is_never_reported_as_busy_or_accepted(
     assert len(_cancel_commands(task_id)) == 1
 
 
+def test_a_run_that_ended_on_its_own_with_a_turn_queued_behind_it_is_not_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A turn queued after the aimed run ended does not hide that the aimed
+    run ended without a cancel."""
+    task_id, _agent_id, key = _running_task()
+
+    async def ended_then_a_turn_was_queued(**_kwargs: Any) -> None:
+        _update(
+            task_id,
+            **_ENDED_ROWS["completed"],
+            runner_id=None,
+            lease_expires_at=None,
+        )
+        _queue_start(task_id)
+        raise TaskCommandRejected("moved", reason="stale_run")
+
+    _replace_cancel_core(monkeypatch, ended_then_a_turn_was_queued)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    assert len(_cancel_commands(task_id)) == 1
+
+
 def test_a_cancel_that_settled_as_paused_is_still_reported_busy(
     monkeypatch: pytest.MonkeyPatch,
 ):

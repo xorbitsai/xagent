@@ -1103,19 +1103,23 @@ class CancelQuestionResponse(BaseModel):
 class CancelTaskResponse(BaseModel):
     """``POST /v1/chat/tasks/{task_id}/cancel`` -> 200 / 202 response.
 
-    200: the task is cancelled -- it reads ``failed`` with
-    ``error_code='task_cancelled'`` -- whether this call did it or an
-    earlier one already had. 202: the cancel was recorded but not applied
-    yet; ``status`` is still the task's current one and ``cancelled_run_id``
-    is null. Calling again reaches the same request.
+    200: the run named by ``cancelled_run_id`` is cancelled, whether this
+    call did it or an earlier one already had. The other fields describe
+    the task now: it reads ``failed`` with ``error_code='task_cancelled'``
+    unless a new turn has started since, in which case ``status``,
+    ``run_id``, ``state_version`` and ``error_code`` describe that turn.
+    202: the cancel was recorded but not applied yet; ``status`` is still
+    the task's current one and ``cancelled_run_id`` is null. Calling again
+    reaches the same request.
     """
 
     task_id: int = Field(..., description="Existing task primary key.")
     status: str = Field(
         ...,
         description=(
-            "Task status as stored: 'failed' once cancelled, otherwise the "
-            "status the cancel is still being applied to."
+            "Task status as stored: 'failed' once cancelled, the status of a "
+            "turn that started after the cancel, or, on 202, the status the "
+            "cancel is still being applied to."
         ),
     )
     run_id: Optional[str] = Field(..., description="Current execution run identity.")
@@ -1131,8 +1135,9 @@ class CancelTaskResponse(BaseModel):
     error_code: Optional[str] = Field(
         ...,
         description=(
-            "'task_cancelled' once the task is cancelled, null before; the "
-            "same value GET /v1/chat/tasks/{task_id} reports."
+            "'task_cancelled' while the task reads as cancelled, otherwise "
+            "null (before the cancel is applied, or once a later turn has "
+            "started); the same value GET /v1/chat/tasks/{task_id} reports."
         ),
     )
 

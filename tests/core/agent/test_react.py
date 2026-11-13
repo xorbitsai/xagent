@@ -1306,6 +1306,9 @@ class MemoryNote:
 
 
 class FakeMemoryStore:
+    def can_delete_current_scope(self) -> bool:
+        return False
+
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
 
@@ -9160,6 +9163,9 @@ async def test_react_pattern_runtime_injected_from_runner_style_traces_events() 
 
 class MemoryToolStore:
     """Fake memory store with both search (retrieval/dedup) and add (store)."""
+
+    def can_delete_current_scope(self) -> bool:
+        return False
 
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []

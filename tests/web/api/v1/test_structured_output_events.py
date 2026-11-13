@@ -8,22 +8,33 @@ from typing import Any
 
 import pytest
 
+from xagent.core.agent.result import COMPLETION_OUTCOMES
 from xagent.web.api.v1 import _events_stream as es
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.task import TaskStatus
 from xagent.web.services import structured_output_projection
+from xagent.web.services.hot_path_cache import (
+    InMemoryTTLCache,
+    set_cache_backend_for_testing,
+)
 
 from ..conftest import client
 from .structured_output_shared import (
     COLUMN,
+    EFFECTIVE_STATES,
     FORMAT_CONFIG,
     NEW_KEYS,
     RECORD,
+    SWITCH_OFF_CONFIGS,
+    SWITCH_ON_CONFIG,
+    TODAY_COMPLETED_FRAME_KEYS,
+    TODAY_TASK_INFO_KEYS,
     bearer,
     create_agent_with_key,
     insert_task,
     recorded_statements,
     task_selects,
+    with_snapshot,
 )
 from .test_events_stream import _principal_for
 
@@ -182,7 +193,197 @@ def test_the_stream_reads_the_record_with_the_row_in_one_select():
 
 
 def test_a_frame_built_without_fields_carries_null_for_each():
-    frame = es.completed_frame(status=TaskStatus.FAILED.value, output=None, error="x")
+    frame = es.completed_frame(
+        status=TaskStatus.FAILED.value, output=None, error="x", error_code=None
+    )
 
     data = json.loads(frame.split("data: ", 1)[1])
     assert [data[name] for name in NEW_KEYS] == [None, None, None]
+
+
+def _incomplete_record(code: str, **extra: Any) -> dict[str, Any]:
+    reason: dict[str, Any] = {"code": code}
+    if code == "information_missing":
+        reason["missing_fields"] = ["/g"]
+    if code == "value_not_expressible":
+        reason["unexpressible_fields"] = ["/g"]
+    return {
+        "run_id": "run-1",
+        "status": "incomplete",
+        "output": None,
+        "reason": reason,
+        **extra,
+    }
+
+
+PARTIAL = {"name": "x", "g": None}
+RETURNED_RECORDS = {
+    "gap-code-with-values": _incomplete_record(
+        "information_missing", partial_output=PARTIAL
+    ),
+    "agent-partial-with-values": _incomplete_record(
+        "agent_partial", partial_output=PARTIAL
+    ),
+    "agent-partial-with-values-and-lists": _incomplete_record(
+        "agent_partial",
+        partial_output=PARTIAL,
+        partial_gaps={"missing_fields": ["/g"], "unexpressible_fields": ["/n"]},
+    ),
+    "agent-blocked-with-values": _incomplete_record(
+        "agent_blocked", partial_output=PARTIAL
+    ),
+    "agent-blocked-with-values-and-lists": _incomplete_record(
+        "agent_blocked",
+        partial_output=PARTIAL,
+        partial_gaps={"missing_fields": ["/g"]},
+    ),
+    "incomplete-without-values": _incomplete_record("agent_partial"),
+    "ready": RECORD,
+}
+
+
+@pytest.mark.parametrize("name", list(RETURNED_RECORDS))
+def test_the_response_and_the_frame_return_the_same_result_and_reason(name):
+    record = RETURNED_RECORDS[name]
+    assert len(RETURNED_RECORDS) == 7
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(agent_id, record=record, agent_config=FORMAT_CONFIG)
+
+    data, _raw = completed_data(key, task_id)
+    response = client.get(f"/v1/chat/tasks/{task_id}", headers=bearer(key)).json()
+
+    assert {k: data[k] for k in NEW_KEYS} == {k: response[k] for k in NEW_KEYS}
+    expected = record.get("partial_output", record["output"])
+    assert response["structured_output"] == expected
+    assert response["structured_output_status"] == record["status"]
+    if record["reason"] is not None:
+        assert response["structured_output_reason"]["code"] == record["reason"]["code"]
+
+
+# --- the completion_outcome key -------------------------------------------------
+
+SURFACES = ["get-miss", "get-hit", "sse-attach", "sse-watchdog"]
+# A queued start has no conclusion frame, so only GET shows that state.
+CASES = [
+    pytest.param(surface, rating, changes, id=f"{surface}-{name}")
+    for surface in SURFACES
+    for name, rating, changes in EFFECTIVE_STATES
+    if surface.startswith("get") or "start_queued" not in changes
+]
+
+
+async def _watchdog_frame(key: str, task_id: int) -> dict[str, Any]:
+    principal = _principal_for(key)
+    sink = es.V1EventStreamSink(
+        task_id=task_id,
+        principal_key_prefix=principal.key.key_prefix,
+        initial_status="running",
+    )
+    closed = await es.watchdog_check_once(
+        sink,
+        task_id,
+        principal,
+        read_task_snapshot=lambda tid, p: v1_tasks.effective_task_snapshot(
+            v1_tasks._load_task_info_snapshot(tid, p)
+        ),
+    )
+    assert closed is True
+    frame, _is_close = sink.queue.get_nowait()
+    return json.loads(frame.split("data: ", 1)[1])
+
+
+async def _read(surface: str, key: str, task_id: int, request) -> dict[str, Any]:
+    """The parsed body of a GET response or of a conclusion frame."""
+    if surface == "sse-attach":
+        return completed_data(key, task_id)[0]
+    if surface == "sse-watchdog":
+        return await _watchdog_frame(key, task_id)
+    if surface == "get-hit":
+        set_cache_backend_for_testing(InMemoryTTLCache())
+        request.addfinalizer(lambda: set_cache_backend_for_testing(None))
+        client.get(f"/v1/chat/tasks/{task_id}", headers=bearer(key))
+    return client.get(f"/v1/chat/tasks/{task_id}", headers=bearer(key)).json()
+
+
+def _today_keys(surface: str) -> tuple[str, ...]:
+    return (
+        TODAY_TASK_INFO_KEYS
+        if surface.startswith("get")
+        else TODAY_COMPLETED_FRAME_KEYS
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "rating", "changes"), CASES)
+@pytest.mark.parametrize("config", SWITCH_OFF_CONFIGS.values(), ids=SWITCH_OFF_CONFIGS)
+async def test_switch_off_responses_have_no_completion_outcome(
+    config, surface, rating, changes, monkeypatch, request
+):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(agent_id, agent_config=config, completion_outcome=rating)
+    with_snapshot(monkeypatch, **changes)
+
+    body = await _read(surface, key, task_id, request)
+
+    assert tuple(body) == _today_keys(surface)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("surface", "rating", "changes"), CASES)
+async def test_switch_on_responses_end_with_the_reported_outcome(
+    surface, rating, changes, monkeypatch, request
+):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(
+        agent_id, agent_config=SWITCH_ON_CONFIG, completion_outcome=rating
+    )
+    with_snapshot(monkeypatch, **changes)
+
+    body = await _read(surface, key, task_id, request)
+
+    assert tuple(body) == (*_today_keys(surface), "completion_outcome")
+    assert body["completion_outcome"] == (rating if not changes else None)
+
+
+@pytest.mark.parametrize("rating", [*sorted(COMPLETION_OUTCOMES), None])
+def test_the_response_and_the_frame_return_the_same_completion_outcome(rating):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(
+        agent_id,
+        record=RECORD,
+        agent_config=SWITCH_ON_CONFIG,
+        completion_outcome=rating,
+    )
+
+    data, _raw = completed_data(key, task_id)
+    response = client.get(f"/v1/chat/tasks/{task_id}", headers=bearer(key)).json()
+
+    assert data["completion_outcome"] == response["completion_outcome"] == rating
+
+
+@pytest.mark.parametrize(
+    ("reported", "snapshot_total_steps", "expected_tail"),
+    [
+        (None, None, ()),
+        (
+            {"completion_outcome": "partial"},
+            3,
+            ("completion_outcome", "snapshot_truncated", "snapshot_total_steps"),
+        ),
+    ],
+    ids=["not-given", "before-the-truncation-marker"],
+)
+def test_the_completion_outcome_key_of_a_built_frame(
+    reported, snapshot_total_steps, expected_tail
+):
+    frame = es.completed_frame(
+        status=TaskStatus.COMPLETED.value,
+        output="x",
+        error=None,
+        error_code=None,
+        reported_outcome=reported,
+        snapshot_total_steps=snapshot_total_steps,
+    )
+
+    data = json.loads(frame.split("data: ", 1)[1])
+    assert tuple(data) == (*TODAY_COMPLETED_FRAME_KEYS, *expected_tail)

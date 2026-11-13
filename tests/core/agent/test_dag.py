@@ -293,6 +293,9 @@ class MemoryNote:
 
 
 class FakeMemoryStore:
+    def can_delete_current_scope(self) -> bool:
+        return False
+
     def __init__(self) -> None:
         self.searches: list[dict[str, Any]] = []
         self.added: list[Any] = []
@@ -3015,6 +3018,9 @@ async def test_dag_compaction_resume_keeps_request_text_out_of_memory_metadata()
     None
 ):
     class CrudMemoryStore:
+        def can_delete_current_scope(self) -> bool:
+            return False
+
         def __init__(self) -> None:
             self.notes = {
                 "existing": StoredMemoryNote(

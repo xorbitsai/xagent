@@ -36,6 +36,7 @@ def steps(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     for name in (
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",
@@ -74,6 +75,7 @@ async def test_retire_writers_stops_every_writer_once_and_is_idempotent(steps):
     assert first == [
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",
@@ -1078,6 +1080,7 @@ async def test_a_failed_channel_stop_leaves_the_retire_unpublished(
     for name in (
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",

@@ -7,6 +7,7 @@ import time
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
@@ -22,6 +23,7 @@ from ...config import (
 from ...core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
+from ...core.agent.context.memory_tool import build_memory_tools
 from ...core.agent.service import AgentService
 from ...core.agent.structured_output import StructuredOutputFormat
 from ...core.execution_scope import (
@@ -39,6 +41,7 @@ from ...core.memory.access_scope import (
 )
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
+from ...core.memory.provenance import MemoryProvenance
 from ...core.model.chat.basic.adapter import attach_chat_retry_wrapper
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
@@ -326,11 +329,20 @@ def _optional_task_int(task: Any, field: str) -> int | None:
 
 def _adapt_memory_tools_factory(
     factory: MemoryToolFactory | None,
+    *,
+    provenance: MemoryProvenance | None,
 ) -> Callable[..., list[Any]] | None:
-    """Adapt the public frozen request contract to the core runtime callback."""
+    """Adapt the public frozen request contract to the core runtime callback.
+
+    Without a host factory, provenance is bound onto core's default
+    ``build_memory_tools``; with neither, ``None`` keeps the pattern on its
+    built-in default path exactly as before provenance existed.
+    """
 
     if factory is None:
-        return None
+        if provenance is None:
+            return None
+        return partial(build_memory_tools, provenance=provenance)
 
     def build_tools(
         *,
@@ -345,6 +357,9 @@ def _adapt_memory_tools_factory(
                 task=task,
                 runtime=runtime,
                 context=context,
+                # A plain dict: host factories may serialize or store it,
+                # which a read-only mapping proxy would not survive.
+                provenance=None if provenance is None else dict(provenance),
             )
         )
         if isinstance(tools, (str, bytes)) or not isinstance(tools, Sequence):
@@ -369,6 +384,7 @@ def _compose_memory_binding(
     policy_scope: MemoryAccessScope | None,
     enabled: bool,
     availability_reason: str | None,
+    provenance: MemoryProvenance | None,
 ) -> AgentServiceMemoryPolicy:
     """Combine backend selection with the legacy eligibility authority.
 
@@ -407,7 +423,9 @@ def _compose_memory_binding(
         memory_access_scope=selected_scope,
         backend_identity=binding.backend_identity,
         route_generation=binding.route_generation,
-        memory_tools_factory=_adapt_memory_tools_factory(binding.memory_tools_factory),
+        memory_tools_factory=_adapt_memory_tools_factory(
+            binding.memory_tools_factory, provenance=provenance
+        ),
     )
 
 
@@ -466,12 +484,14 @@ def resolve_agent_service_memory_policy(
         return _inert_memory_policy(MEMORY_BINDING_RESOLUTION_FAILURE_REASON)
 
     policy_scope = override.memory_access_scope if override is not None else None
+    provenance = override.memory_provenance if override is not None else None
     if binding is not None:
         return _compose_memory_binding(
             binding=binding,
             policy_scope=policy_scope,
             enabled=enabled,
             availability_reason=None if override is None else override.reason,
+            provenance=provenance,
         )
 
     try:
@@ -511,6 +531,7 @@ def resolve_agent_service_memory_policy(
         memory_available=True if override is None else override.available,
         memory_availability_reason=None if override is None else override.reason,
         memory_access_scope=access_scope,
+        memory_tools_factory=_adapt_memory_tools_factory(None, provenance=provenance),
     )
 
 

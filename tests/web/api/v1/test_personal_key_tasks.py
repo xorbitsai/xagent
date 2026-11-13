@@ -264,6 +264,8 @@ def _call(route: str, task_id: int, full_key: str, owner: dict):
         )
     if route == "cancel":
         return client.post(f"/v1/chat/tasks/{task_id}/cancel-question", headers=headers)
+    if route == "cancel_task":
+        return client.post(f"/v1/chat/tasks/{task_id}/cancel", headers=headers)
     if route == "delete":
         return client.delete(f"/v1/chat/tasks/{task_id}", headers=headers)
     raise AssertionError(route)
@@ -388,8 +390,16 @@ def test_credential_kind_column_mapping(world) -> None:
 
 
 # The write routes that start work on the task re-check that the holder can
-# still run its agent; reading, cancelling a question and deleting do not.
-ALLOWED = {"append": 202, "reply": 409, "cancel": 409, "delete": 200, "get": 200}
+# still run its agent; reading, cancelling a question, cancelling the task and
+# deleting do not.
+ALLOWED = {
+    "append": 202,
+    "reply": 409,
+    "cancel": 409,
+    "cancel_task": 409,
+    "delete": 200,
+    "get": 200,
+}
 
 
 @pytest.mark.parametrize("reachable", [True, False], ids=["in_team", "removed"])

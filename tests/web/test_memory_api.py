@@ -3,8 +3,9 @@
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -122,6 +123,21 @@ def auth_headers(test_db):
     }
     token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def new_york_tz() -> Iterator[None]:
+    """Pin the server timezone so naive legacy timestamps have a known
+    instant (EST is UTC-5 in January) regardless of the CI host's zone."""
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    yield
+    if previous is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = previous
+    time.tzset()
 
 
 @pytest.fixture
@@ -363,6 +379,53 @@ class TestMemoryListEndpoint:
         # Ensure context field is not present
         assert "context" not in memory
 
+    def test_list_and_get_surface_provenance_and_utc_timestamp(
+        self, client, mock_memory_store, auth_headers, new_york_tz
+    ):
+        """Provenance lives in metadata and is returned verbatim; every
+        timestamp, including a naive legacy one, is serialized as aware UTC."""
+        provenance = {"channel_kind": "dm", "channel_id": "D123", "task_id": "9"}
+        aware = MemoryNote(
+            id=MEMORY_ID_1,
+            content="User prefers concise replies.",
+            category="react_memory",
+            metadata={
+                "kind": "user_preference",
+                "source": "store_memory",
+                "provenance": provenance,
+            },
+            timestamp=datetime(2026, 11, 13, 8, 30, tzinfo=timezone.utc),
+        )
+        legacy = MemoryNote(
+            id=MEMORY_ID_2,
+            content="Legacy note.",
+            timestamp=datetime(2026, 1, 1, 8, 30),
+        )
+        mock_memory_store.list_all.return_value = [aware, legacy]
+        mock_memory_store.get.return_value = Mock(
+            success=True, memory_id=MEMORY_ID_1, content=aware
+        )
+
+        listed = client.get("/api/memory/list", headers=auth_headers).json()
+        fetched = client.get(f"/api/memory/{MEMORY_ID_1}", headers=auth_headers)
+
+        first, second = listed["memories"]
+        assert first["metadata"]["provenance"] == provenance
+        # Both the aware row and the naive legacy row are emitted as aware
+        # UTC, so browsers never reinterpret a legacy row in viewer-local time:
+        # naive 08:30 written by a New York (EST, UTC-5) server is 13:30 UTC.
+        first_ts = datetime.fromisoformat(first["timestamp"])
+        assert first_ts == datetime(2026, 11, 13, 8, 30, tzinfo=timezone.utc)
+        assert first_ts.utcoffset() == timedelta(0)
+        legacy_ts = datetime.fromisoformat(second["timestamp"])
+        assert legacy_ts == datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc)
+        assert legacy_ts.utcoffset() == timedelta(0)
+        assert fetched.status_code == 200
+        assert fetched.json()["metadata"]["provenance"] == provenance
+        assert datetime.fromisoformat(fetched.json()["timestamp"]) == datetime(
+            2026, 11, 13, 8, 30, tzinfo=timezone.utc
+        )
+
     def test_list_memories_with_category_filter(
         self, client, mock_memory_store, auth_headers
     ):
@@ -576,6 +639,29 @@ class TestMemoryCreateEndpoint:
         assert isinstance(call_args, MemoryNote)
         assert call_args.content == "New test memory"
         assert call_args.category == "general"
+
+    def test_create_memory_drops_client_supplied_provenance(
+        self, client, mock_memory_store, auth_headers
+    ):
+        """Provenance is server-owned: a client cannot claim where a
+        hand-written memory was learned."""
+        mock_memory_store.add.return_value = Mock(success=True, memory_id="new-1")
+
+        response = client.post(
+            "/api/memory/",
+            json={
+                "content": "Forged origin",
+                "metadata": {
+                    "source": "test",
+                    "provenance": {"channel_kind": "dm", "channel_id": "D-forged"},
+                },
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        note = mock_memory_store.add.call_args[0][0]
+        assert note.metadata == {"source": "test"}
 
     def test_create_memory_with_defaults(self, client, mock_memory_store, auth_headers):
         """Test memory creation with default values."""

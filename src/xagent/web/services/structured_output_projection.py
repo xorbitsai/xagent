@@ -1,10 +1,14 @@
 """A pure projection shared by every read path, including a downstream embedder's; it performs no database reads.
 
 The structured result of a run is stored on ``tasks.structured_output_record``
-as ``{"run_id", "status", "output", "reason"}``. :func:`build_record` makes that
-record from the result of a run when the run is settled as COMPLETED, and
-:func:`project_structured_output` turns the stored record into the three
-fields a task response carries.
+as ``{"run_id", "status", "output", "reason"}``, plus ``"partial_output"`` and
+``"partial_gaps"`` when the task's format sets accept_partial and the run is
+incomplete: ``output`` is then still null, ``partial_output`` holds the
+extracted values, and for agent_partial and agent_blocked ``partial_gaps``
+holds the field lists that ``reason`` carries for the other incomplete codes.
+:func:`build_record` makes that record from the result of a run when the run is
+settled as COMPLETED, and :func:`project_structured_output` turns the stored
+record into the three fields a task response carries.
 """
 
 from __future__ import annotations
@@ -19,7 +23,8 @@ from .response_format import RESPONSE_FORMAT_CONFIG_KEY
 logger = logging.getLogger(__name__)
 
 # The message of each reason code. A response carries the text of its code
-# from this table and never text from a record.
+# from this table (or from REASON_MESSAGES_WITH_RESULT) and never text from a
+# record.
 REASON_MESSAGES: dict[str, str] = {
     "agent_partial": (
         "The agent completed only part of the task, "
@@ -59,11 +64,31 @@ REASON_MESSAGES: dict[str, str] = {
         "Structured result extraction failed because of an internal error."
     ),
 }
+# The message of agent_partial and agent_blocked when the response also holds
+# the values extracted from the answer.
+REASON_MESSAGES_WITH_RESULT: dict[str, str] = {
+    "agent_partial": (
+        "The agent completed only part of the task. structured_output holds the "
+        "values extracted from its answer, with null where a value is missing "
+        "or cannot be written; missing_fields and unexpressible_fields list up "
+        "to 20 such positions each."
+    ),
+    "agent_blocked": (
+        "The agent stopped without completing the task. structured_output holds "
+        "the values extracted from its answer, with null where a value is "
+        "missing or cannot be written; missing_fields and unexpressible_fields "
+        "list up to 20 such positions each."
+    ),
+}
 # The codes a record may store, by the status that owns them. ``not_produced``
 # is never stored: only the projection reports it.
 _INCOMPLETE_CODES = frozenset(
     {"agent_partial", "agent_blocked", "information_missing", "value_not_expressible"}
 )
+# The incomplete codes whose field lists live in ``reason``, and those of a run
+# the agent rated partial or blocked, whose lists live in ``partial_gaps``.
+_GAP_CODES = frozenset({"information_missing", "value_not_expressible"})
+_SELF_RATED_CODES = frozenset({"agent_partial", "agent_blocked"})
 _FAILED_CODES = frozenset(
     {
         "schema_mismatch",
@@ -100,10 +125,14 @@ def build_record(run_id: str | None, structured_output: Any) -> dict[str, Any] |
     structured result.
 
     ``structured_output`` is the value of the run result's ``structured_output``
-    key: a mapping with ``status``, ``output`` and ``reason``. A value that is
-    neither None nor a mapping is a server-side internal error: it is stored
-    as a failed record with code ``internal_error``, and only its type name
-    is logged, never the value.
+    key: a mapping with ``status``, ``output`` and ``reason``, and for an
+    incomplete result that holds extracted values also ``partial_output`` and,
+    for agent_partial and agent_blocked, ``partial_gaps``. Those two are stored
+    under their own keys when they are mappings, ``output`` stays null, and
+    each stored list is cut to :data:`MAX_REASON_FIELDS`; a result without them
+    gives the record it always gave. A value that is neither None nor a mapping
+    is a server-side internal error: it is stored as a failed record with code
+    ``internal_error``, and only its type name is logged, never the value.
     """
     if structured_output is None:
         return None
@@ -120,12 +149,23 @@ def build_record(run_id: str | None, structured_output: Any) -> dict[str, Any] |
             "output": None,
             "reason": {"code": "internal_error"},
         }
-    return {
+    record = {
         "run_id": run_id,
         "status": structured_output.get("status"),
         "output": structured_output.get("output"),
         "reason": _stored_reason(structured_output.get("reason")),
     }
+    partial_output = structured_output.get("partial_output")
+    if isinstance(partial_output, dict):
+        record["partial_output"] = partial_output
+    partial_gaps = structured_output.get("partial_gaps")
+    if isinstance(partial_gaps, dict):
+        record["partial_gaps"] = {
+            key: partial_gaps[key][:MAX_REASON_FIELDS]
+            for key in _REASON_LIST_KEYS
+            if isinstance(partial_gaps.get(key), list) and partial_gaps[key]
+        }
+    return record
 
 
 @dataclass(frozen=True)
@@ -156,11 +196,25 @@ def response_format_configured(agent_config: Any) -> bool:
     )
 
 
+def response_format_accepts_partial(agent_config: Any) -> bool:
+    """Whether the stored format of ``agent_config`` sets accept_partial: the
+    format is a dict whose accept_partial is exactly True."""
+    if type(agent_config) is not dict:
+        return False
+    stored = agent_config.get(RESPONSE_FORMAT_CONFIG_KEY)
+    return type(stored) is dict and stored.get("accept_partial") is True
+
+
 def _reason_fields(
-    code: str, lists: dict[str, list[str]] | None = None
+    code: str,
+    lists: dict[str, list[str]] | None = None,
+    *,
+    with_result: bool = False,
 ) -> dict[str, Any]:
-    """A reason: the code, its fixed message, then the lists the record carried."""
-    return {"code": code, "message": REASON_MESSAGES[code], **(lists or {})}
+    """A reason: the code, its fixed message (the one for a response that holds
+    values when ``with_result``), then the lists the record carried."""
+    messages = REASON_MESSAGES_WITH_RESULT if with_result else REASON_MESSAGES
+    return {"code": code, "message": messages[code], **(lists or {})}
 
 
 def _is_field_list(value: Any) -> bool:
@@ -215,6 +269,47 @@ def _record_problem(record: dict[str, Any]) -> str | None:
     return _reason_problem(reason.get("code"), status, reason)
 
 
+def _partial_gaps_problem(gaps: Any) -> bool:
+    """Whether ``partial_gaps`` is not a dict of one or both field lists."""
+    return (
+        type(gaps) is not dict
+        or not gaps
+        or any(key not in _REASON_LIST_KEYS for key in gaps)
+        or not all(_is_field_list(value) for value in gaps.values())
+    )
+
+
+def _partial_problem(record: dict[str, Any]) -> str | None:
+    """What is wrong with the ``partial_output`` and ``partial_gaps`` of a
+    record that passed :func:`_record_problem`, if anything.
+
+    A record without either key is the stored shape of every task whose format
+    does not set accept_partial. ``partial_output`` is a dict and belongs to an
+    incomplete record only; ``partial_gaps`` belongs to a ``partial_output``
+    whose code is agent_partial or agent_blocked, where it holds one or both
+    field lists, and is absent for the other incomplete codes, whose lists are
+    in ``reason``. Pure: it returns the name of the fault and never raises.
+    """
+    has_output = "partial_output" in record
+    has_gaps = "partial_gaps" in record
+    if not has_output and not has_gaps:
+        return None
+    if not has_output:
+        return "partial_gaps"
+    if type(record["partial_output"]) is not dict:
+        return "partial_output"
+    if record["status"] != "incomplete":
+        return "partial_output"
+    code = record["reason"]["code"]
+    if code in _GAP_CODES:
+        return "partial_gaps" if has_gaps else None
+    if code in _SELF_RATED_CODES:
+        if has_gaps and _partial_gaps_problem(record["partial_gaps"]):
+            return "partial_gaps"
+        return None
+    return "reason code"
+
+
 def _not_produced(format_configured: bool) -> StructuredOutputFields:
     if not format_configured:
         return _NO_FIELDS
@@ -255,6 +350,11 @@ def project_structured_output(
     when a format is configured, as nothing otherwise, and is logged. The
     run is compared first, so the shape of another run's record is not
     examined.
+
+    An incomplete record that holds ``partial_output`` reports it as
+    ``structured_output``; for agent_partial and agent_blocked the reason then
+    carries the message for a response with values and the lists of
+    ``partial_gaps``.
     """
     if status is not TaskStatus.COMPLETED:
         return _NO_FIELDS
@@ -264,13 +364,23 @@ def project_structured_output(
         return _malformed(run_id, "run_id", format_configured)
     if record["run_id"] != run_id:
         return _not_produced(format_configured)
-    problem = _record_problem(record)
+    problem = _record_problem(record) or _partial_problem(record)
     if problem is not None:
         return _malformed(run_id, problem, format_configured)
     if record["status"] == "ready":
         return StructuredOutputFields(record["output"], "ready", None)
     reason = record["reason"]
+    code = reason["code"]
+    partial = record.get("partial_output")
+    if partial is not None and code in _SELF_RATED_CODES:
+        gaps = record.get("partial_gaps") or {}
+        lists = {key: list(gaps[key]) for key in _REASON_LIST_KEYS if key in gaps}
+        return StructuredOutputFields(
+            partial,
+            record["status"],
+            _reason_fields(code, lists, with_result=True),
+        )
     lists = {key: list(reason[key]) for key in _REASON_LIST_KEYS if key in reason}
     return StructuredOutputFields(
-        None, record["status"], _reason_fields(reason["code"], lists)
+        partial, record["status"], _reason_fields(code, lists)
     )

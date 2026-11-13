@@ -126,7 +126,7 @@ from ...context.execution import (
     snapshot_container,
     tool_evidence_state,
 )
-from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
+from ...context.memory_tool import build_memory_tools, mark_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...deferred_tools import (
     AVAILABLE_NAMES_SUFFIX,
@@ -1041,8 +1041,7 @@ class ReActPattern(AgentPattern):
                     context=context,
                 )
             )
-            if extra_tools and hasattr(context, "metadata"):
-                context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
+            mark_memory_tools(context, extra_tools)
         skill_tool = await build_load_skill_tool(
             skill_manager=skill_manager,
             context=context,

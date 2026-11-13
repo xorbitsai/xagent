@@ -44,6 +44,7 @@ from sqlalchemy import cast as sa_cast
 from sqlalchemy import literal, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from ...config import (
     get_app_base_url,
@@ -104,6 +105,7 @@ from ..services.mcp_oauth import (
     MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
+    OAUTH_TOKEN_PAYLOAD_EXCLUDED_METADATA_KEYS,
     MCPOAuthDiscoveryError,
     SafeOAuthAsyncHTTPTransport,
     _canonical_issuer,
@@ -2436,6 +2438,7 @@ def _upsert_mcp_oauth_grant(
         .filter(
             MCPOAuthGrant.lookup_hash == lookup_hash,
         )
+        .with_for_update()
         .first()
     )
     grant = existing or MCPOAuthGrant(
@@ -2469,7 +2472,7 @@ def _upsert_mcp_oauth_grant(
         {
             key: value
             for key, value in token_data.items()
-            if key not in {"access_token", "refresh_token"}
+            if key not in OAUTH_TOKEN_PAYLOAD_EXCLUDED_METADATA_KEYS
         },
     )
     setattr(grant, "expires_at", oauth_token_expires_at(token_data))
@@ -7868,4 +7871,8 @@ async def delete_mcp_oauth_grant(
         )
     setattr(grant, "status", "revoked")
     setattr(grant, "revoked_at", _utc_now())
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError:
+        # A runtime refresh deleted the row while the provider revoke ran.
+        db.rollback()

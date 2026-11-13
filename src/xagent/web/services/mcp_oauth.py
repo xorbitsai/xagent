@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
@@ -34,6 +36,24 @@ MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH = 100
 MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH = 50
 MCP_OAUTH_CLIENT_REGISTRATION_MAX_RESPONSE_BYTES = 64 * 1024
+# A refresh cannot outlive the deadline below, so a rotation that started
+# before this rejection has committed well before the retire window closes.
+MCP_OAUTH_INVALID_GRANT_RETIRE_SECONDS = 60
+# Kept below the retire window so one slow response cannot straddle both strikes.
+MCP_OAUTH_REFRESH_DEADLINE_SECONDS = 30
+# Long enough for a rarely used dead grant to collect two strikes, short
+# enough to bound how long a spurious strike can arm a delete.
+MCP_OAUTH_INVALID_GRANT_MARKER_TTL_SECONDS = 86400
+MCP_OAUTH_INVALID_GRANT_AT_KEY = "invalid_grant_at"
+MCP_OAUTH_INVALID_GRANT_TOKEN_KEY = "invalid_grant_token_sha256"
+OAUTH_TOKEN_PAYLOAD_EXCLUDED_METADATA_KEYS = frozenset(
+    {
+        "access_token",
+        "refresh_token",
+        MCP_OAUTH_INVALID_GRANT_AT_KEY,
+        MCP_OAUTH_INVALID_GRANT_TOKEN_KEY,
+    }
+)
 OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500
 OAUTH_LOG_PAYLOAD_MAX_LENGTH = 2000
 OAUTH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -68,6 +88,10 @@ class _RetryRuntimeGrantSelection(RuntimeError):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class _InvalidGrantRefreshError(MCPOAuthRuntimeError):
+    """The token endpoint answered ``invalid_grant`` for the grant being refreshed."""
 
 
 @dataclass(frozen=True)
@@ -808,15 +832,80 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
         )
         refresh_db.rollback()
 
-        token_data = await _refresh_mcp_oauth_grant(
-            oauth_client_snapshot,
-            refresh_token=refresh_token,
-            resource=refresh_resource,
-            client=client,
-            credential_provider=_platform_credential_provider(
-                oauth_client_snapshot.client_id
-            ),
-        )
+        try:
+            token_data = await _refresh_mcp_oauth_grant(
+                oauth_client_snapshot,
+                refresh_token=refresh_token,
+                resource=refresh_resource,
+                client=client,
+                credential_provider=_platform_credential_provider(
+                    oauth_client_snapshot.client_id
+                ),
+            )
+        except _InvalidGrantRefreshError as exc:
+            # Same lock as the success path, so a refresh that rotated the
+            # grant while this request ran is never overwritten.
+            retire_grant = False
+            try:
+                with refresh_db.begin():
+                    rejected_grant: Any = (
+                        refresh_db.query(MCPOAuthGrant)
+                        .filter(MCPOAuthGrant.id == grant_id)
+                        .with_for_update()
+                        .first()
+                    )
+                    if (
+                        rejected_grant is None
+                        or rejected_grant.status != "active"
+                        or str(rejected_grant.refresh_token) != encrypted_refresh_token
+                        or not _grant_needs_refresh(rejected_grant.expires_at)
+                    ):
+                        raise _RetryRuntimeGrantSelection(
+                            "authorization_required",
+                            "MCP OAuth grant changed while preparing runtime "
+                            "authorization",
+                        )
+                    metadata = (
+                        dict(rejected_grant.metadata_json)
+                        if isinstance(rejected_grant.metadata_json, dict)
+                        else {}
+                    )
+                    token_digest = hashlib.sha256(
+                        encrypted_refresh_token.encode("utf-8")
+                    ).hexdigest()
+                    marked_for_seconds = _invalid_grant_marker_age_seconds(
+                        metadata, token_digest
+                    )
+                    if (
+                        marked_for_seconds is None
+                        or marked_for_seconds
+                        >= MCP_OAUTH_INVALID_GRANT_MARKER_TTL_SECONDS
+                    ):
+                        metadata[MCP_OAUTH_INVALID_GRANT_AT_KEY] = (
+                            _utc_now().isoformat()
+                        )
+                        metadata[MCP_OAUTH_INVALID_GRANT_TOKEN_KEY] = token_digest
+                        rejected_grant.metadata_json = metadata
+                    elif marked_for_seconds >= MCP_OAUTH_INVALID_GRANT_RETIRE_SECONDS:
+                        refresh_db.delete(rejected_grant)
+                        retire_grant = True
+            except SQLAlchemyError as db_exc:
+                refresh_db.rollback()
+                raise MCPOAuthRuntimeError(
+                    "token_refresh_failed",
+                    "MCP OAuth grant rejection could not be recorded",
+                ) from db_exc
+            if retire_grant:
+                logger.warning(
+                    "MCP OAuth grant %s for server %s was rejected twice; deleted",
+                    grant_id,
+                    server_id,
+                )
+                raise _RetryRuntimeGrantSelection(
+                    "authorization_required",
+                    "MCP OAuth grant changed while preparing runtime authorization",
+                )
+            raise MCPOAuthRuntimeError("token_refresh_failed", exc.message) from exc
 
         with refresh_db.begin():
             locked_grant: Any = (
@@ -894,7 +983,7 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
             locked_grant.metadata_json = {
                 key: value
                 for key, value in token_data.items()
-                if key not in {"access_token", "refresh_token"}
+                if key not in OAUTH_TOKEN_PAYLOAD_EXCLUDED_METADATA_KEYS
             }
             locked_grant.expires_at = oauth_token_expires_at(token_data)
             runtime_auth = MCPOAuthRuntimeAuth(
@@ -1357,6 +1446,16 @@ async def _refresh_mcp_oauth_grant(
     affects every user of the server. Any other client, a user's custom
     static client or a per-user registered one, keeps
     ``token_refresh_failed``.
+
+    A 400/401 answer whose error is ``invalid_grant`` raises
+    ``_InvalidGrantRefreshError`` instead. ``web/tools/config.py`` does not
+    trust that code generically, but here the grant is bound to one
+    ``MCPOAuthClient`` row, and the caller deletes the grant only after the
+    same refresh token is answered this way twice, at least
+    ``MCP_OAUTH_INVALID_GRANT_RETIRE_SECONDS`` apart and within
+    ``MCP_OAUTH_INVALID_GRANT_MARKER_TTL_SECONDS``. The whole request is
+    bounded by ``MCP_OAUTH_REFRESH_DEADLINE_SECONDS``. 5xx, network errors
+    and every other code stay transient.
     """
     data = {
         "grant_type": "refresh_token",
@@ -1382,30 +1481,35 @@ async def _refresh_mcp_oauth_grant(
         )
 
     try:
-        request_kwargs: dict[str, Any] = {
-            "data": data,
-            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-        }
-        if auth is not None:
-            request_kwargs["auth"] = auth
-        if client is not None:
-            response = await oauth_post(
-                str(oauth_client.token_endpoint),
-                client=client,
-                resolve_dns_for_url_policy=False,
-                **request_kwargs,
-            )
-        else:
-            async with create_mcp_oauth_http_client(
-                timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
-            ) as owned_client:
+        async with asyncio.timeout(MCP_OAUTH_REFRESH_DEADLINE_SECONDS):
+            request_kwargs: dict[str, Any] = {
+                "data": data,
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            }
+            if auth is not None:
+                request_kwargs["auth"] = auth
+            if client is not None:
                 response = await oauth_post(
                     str(oauth_client.token_endpoint),
-                    client=owned_client,
+                    client=client,
                     resolve_dns_for_url_policy=False,
                     **request_kwargs,
                 )
-        payload = response.json()
+            else:
+                async with create_mcp_oauth_http_client(
+                    timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+                ) as owned_client:
+                    response = await oauth_post(
+                        str(oauth_client.token_endpoint),
+                        client=owned_client,
+                        resolve_dns_for_url_policy=False,
+                        **request_kwargs,
+                    )
+            payload = response.json()
+    except TimeoutError as exc:
+        raise MCPOAuthRuntimeError(
+            "token_refresh_failed", "MCP OAuth refresh timed out"
+        ) from exc
     except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
         raise MCPOAuthRuntimeError(
             "token_refresh_failed",
@@ -1441,6 +1545,15 @@ async def _refresh_mcp_oauth_grant(
             raise MCPOAuthRuntimeError(
                 client_rejected_reason(credential_provider),
                 "The OAuth provider rejected the platform's client",
+            )
+        if (
+            response.status_code in {400, 401}
+            and isinstance(payload, dict)
+            and payload.get("error") == "invalid_grant"
+        ):
+            raise _InvalidGrantRefreshError(
+                "token_refresh_failed",
+                oauth_error_message(payload, "MCP OAuth refresh failed"),
             )
         raise MCPOAuthRuntimeError(
             "token_refresh_failed",
@@ -1648,6 +1761,27 @@ def _grant_needs_refresh(expires_at: Any) -> bool:
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     return bool(expires_at <= _utc_now() + timedelta(minutes=5))
+
+
+def _invalid_grant_marker_age_seconds(
+    metadata: dict[str, Any], token_digest: str
+) -> float | None:
+    """Seconds since this token's ``invalid_grant`` marker.
+
+    ``None`` when absent, for another token, or unusable.
+    """
+    if metadata.get(MCP_OAUTH_INVALID_GRANT_TOKEN_KEY) != token_digest:
+        return None
+    value = metadata.get(MCP_OAUTH_INVALID_GRANT_AT_KEY)
+    if not isinstance(value, str):
+        return None
+    try:
+        marked_at = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if marked_at.tzinfo is None:
+        marked_at = marked_at.replace(tzinfo=timezone.utc)
+    return (_utc_now() - marked_at).total_seconds()
 
 
 def _utc_now() -> datetime:

@@ -30,6 +30,7 @@ from xagent.web.services.task_command_transport import (
 )
 from xagent.web.services.task_execution_controller import TaskControlState
 from xagent.web.services.task_start import SdkTaskScope
+from xagent.web.services.task_start_protocol import TaskStartPayload
 
 from ..conftest import (
     _admin_headers,
@@ -143,19 +144,34 @@ def _cancel_commands(task_id: int) -> list[TaskExecutionCommand]:
 QUEUED_RUN = "run-queued"
 
 
-def _queue_start(task_id: int) -> None:
-    """Leave an accepted START that no executor has handed off yet."""
+def _queue_start(
+    task_id: int, *, run_id: str = QUEUED_RUN, turn_id: str = "turn-queued"
+) -> None:
+    """Leave an accepted START that no executor has handed off yet.
+
+    Its payload is the one the acceptance writes: the run and version the row
+    holds now, which is what the START consumer compares the row with.
+    """
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).one()
+        start = TaskStartPayload(
+            version=1,
+            run_id=run_id,
+            state_version=int(task.state_version or 0),
+            expected_run_id=task.run_id,
+            turn_id=turn_id,
+            kind="create" if task.status == TaskStatus.PENDING else "append",
+            message="hello",
+        )
         stage_task_command(
             db,
             task_id=task_id,
             actor_user_id=int(task.user_id),
-            command_id="turn-queued",
+            command_id=start.turn_id,
             kind=TaskCommandKind.START,
-            payload={},
-            target_run_id=QUEUED_RUN,
+            payload=start.model_dump(mode="json"),
+            target_run_id=start.run_id,
         )
         db.commit()
     finally:
@@ -398,13 +414,16 @@ def test_a_queued_new_task_cancelled_by_its_command_answers_for_the_queued_run(
     before = _row(task_id)
 
     # A cancel is dispatched past a START only while that START waits for
-    # admission; this stands in for that dispatch and for the core's write.
+    # admission; this stands in for that dispatch. The core's write is the
+    # terminal row, and the dispatcher's settlement of the cancelled
+    # admissions then fails the START.
     async def cancelled_as_a_row(_executor: Any, *, command_db_id: int) -> bool:
         _update(
             task_id,
             state_version=before["state_version"] + 1,
             **_cancelled_row_values(),
         )
+        _stop_queued_start(task_id)
         _settle_cancel_command(command_db_id, status="completed")
         return True
 
@@ -415,15 +434,20 @@ def test_a_queued_new_task_cancelled_by_its_command_answers_for_the_queued_run(
     response = _cancel(task_id, key)
 
     assert response.status_code == 200, response.text
-    task_read = _get(task_id, key)
     assert response.json() == {
         "task_id": task_id,
-        "status": task_read["status"],
+        "status": "failed",
         "run_id": None,
         "state_version": before["state_version"] + 1,
         "cancelled_run_id": QUEUED_RUN,
-        "error_code": task_read["error_code"],
+        "error_code": "task_cancelled",
     }
+    task_read = _get(task_id, key)
+    assert (task_read["status"], task_read["error_code"]) == (
+        "failed",
+        "task_cancelled",
+    )
+    assert task_read["run_id"] is None
 
 
 def test_a_queued_turn_whose_cancel_went_stale_while_it_waits_is_busy(
@@ -1047,3 +1071,302 @@ def test_the_wait_is_timed_from_before_the_command_is_dispatched(
 
     assert response.status_code == 202, response.text
     assert len(polls) == 1
+
+
+# ----- a cancel repeated after it withdrew a queued turn -----
+
+_PREVIOUS_RUNS = {
+    "previous_run_completed": {
+        "status": TaskStatus.COMPLETED,
+        "control_state": TaskControlState.COMPLETED.value,
+        "output": "done",
+    },
+    "previous_run_cancelled": {
+        "status": TaskStatus.FAILED,
+        "control_state": TaskControlState.FAILED.value,
+        "error_message": SDK_CANCEL_ERROR_MESSAGE,
+    },
+    "previous_run_paused": {
+        "status": TaskStatus.PAUSED,
+        "control_state": TaskControlState.PAUSED.value,
+    },
+    "new_task": {"status": TaskStatus.PENDING, "control_state": "idle", "run_id": None},
+}
+
+
+def _dispatch_through_the_core(monkeypatch: pytest.MonkeyPatch, agent_id: int) -> None:
+    """Apply each cancel command with the real core, as its owner would.
+
+    A cancel is dispatched past a queued START only while that START waits for
+    admission, which these tests do not set up; the core and the settlement it
+    leaves behind are the real ones.
+    """
+
+    async def apply(_executor: Any, *, command_db_id: int) -> bool:
+        db = _direct_db_session()
+        try:
+            command = db.get(TaskExecutionCommand, command_db_id)
+            task_id = int(command.task_id)
+            run_id = command.target_run_id
+            version = int(command.target_state_version)
+            queued_run_id = command.payload.get("queued_run_id")
+        finally:
+            db.close()
+        await sdk_task_cancel.cancel_sdk_task_unserialized(
+            task_id=task_id,
+            agent_id=agent_id,
+            expected_run_id=run_id,
+            expected_state_version=version,
+            queued_run_id=queued_run_id,
+        )
+        # A new task's START is settled by the dispatcher once the cancel
+        # has cancelled the row; an appended turn's was stopped by the core.
+        db = _direct_db_session()
+        try:
+            db.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == TaskCommandKind.START.value,
+                TaskExecutionCommand.status == "pending",
+            ).update(
+                {
+                    "status": "failed",
+                    "result": {"rejection_reason": "cancelled_before_admission"},
+                }
+            )
+            db.commit()
+        finally:
+            db.close()
+        _settle_cancel_command(command_db_id, status="completed")
+        return True
+
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", apply)
+
+
+@pytest.mark.parametrize("previous", list(_PREVIOUS_RUNS))
+def test_a_repeated_cancel_answers_for_the_turn_the_first_one_withdrew(
+    monkeypatch: pytest.MonkeyPatch, previous: str
+):
+    """The withdrawn turn leaves the row on the turn before it, so the repeat
+    cannot read the turn from the row: it is answered from the record of the
+    withdrawal, identically, and adds no second command."""
+    task_id, agent_id, key = _running_task()
+    _update(task_id, runner_id=None, lease_expires_at=None, **_PREVIOUS_RUNS[previous])
+    _queue_start(task_id)
+    _dispatch_through_the_core(monkeypatch, agent_id)
+
+    first = _cancel(task_id, key)
+    again = _cancel(task_id, key)
+
+    assert first.status_code == 200, first.text
+    assert first.json()["cancelled_run_id"] == QUEUED_RUN
+    if previous != "new_task":
+        # The row still shows the turn before the withdrawn one.
+        assert first.json()["run_id"] not in (None, QUEUED_RUN)
+    assert again.status_code == 200, again.text
+    assert again.json() == first.json()
+    assert len(_cancel_commands(task_id)) == 1
+
+
+@pytest.mark.parametrize(
+    "start_outcome",
+    [
+        {"status": "failed", "result": {"rejection_reason": "invalid_start"}},
+        # Stopped by a control other than this endpoint's cancel.
+        {
+            "status": "failed",
+            "result": {"rejection_reason": "cancelled_before_admission"},
+        },
+        "cancel_command_not_completed",
+    ],
+    ids=["failed_itself", "stopped_by_another_control", "cancel_not_completed"],
+)
+def test_a_start_that_no_completed_cancel_withdrew_is_not_a_cancellation(
+    start_outcome,
+):
+    """The newest START failed and the row shows the completed turn before
+    it. Without a completed SDK cancel aimed at that START's run the failure
+    is not a cancellation, so the call is refused as it would be on arrival."""
+    task_id, agent_id, key = _running_task()
+    _update(
+        task_id,
+        runner_id=None,
+        lease_expires_at=None,
+        **_PREVIOUS_RUNS["previous_run_completed"],
+    )
+    _queue_start(task_id)
+    stopped = {
+        "status": "failed",
+        "result": {"rejection_reason": "cancelled_before_admission"},
+    }
+    db = _direct_db_session()
+    try:
+        outcome = stopped if isinstance(start_outcome, str) else start_outcome
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.kind == TaskCommandKind.START.value,
+        ).update(outcome)
+        if isinstance(start_outcome, str):
+            task = db.get(Task, task_id)
+            sdk_task_cancel._enqueue_cancel(
+                db, task, int(task.state_version), queued_run_id=QUEUED_RUN
+            )
+        db.commit()
+    finally:
+        db.close()
+    commands_before = len(_cancel_commands(task_id))
+    before = _row(task_id)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    assert _row(task_id) == before
+    assert len(_cancel_commands(task_id)) == commands_before
+
+
+def test_a_cancel_after_a_withdrawn_turn_and_a_newer_started_one_answers_for_the_row(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A turn was withdrawn, then another was appended and is running: the
+    newest START is the row's own run, so the cancel aims at the running
+    turn and is not answered with the withdrawal."""
+    task_id, agent_id, key = _running_task()
+    _update(
+        task_id,
+        runner_id=None,
+        lease_expires_at=None,
+        **_PREVIOUS_RUNS["previous_run_completed"],
+    )
+    _queue_start(task_id)
+    _dispatch_through_the_core(monkeypatch, agent_id)
+    assert _cancel(task_id, key).status_code == 200
+    _queue_start(task_id, run_id="run-second", turn_id="turn-second")
+    _update(
+        task_id,
+        status=TaskStatus.RUNNING,
+        control_state=TaskControlState.RUNNING.value,
+        run_id="run-second",
+    )
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == "turn-second",
+        ).update({"status": "completed"})
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", AsyncMock())
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 202, response.text
+    assert response.json()["run_id"] == "run-second"
+    assert response.json()["cancelled_run_id"] is None
+    commands = _cancel_commands(task_id)
+    assert len(commands) == 2
+    assert commands[-1].target_run_id == "run-second"
+
+
+# ----- a queued START that can no longer hand off is not the target -----
+
+
+@pytest.mark.parametrize(
+    "moved",
+    ["running_on_another_run", "waiting_on_another_run"],
+)
+def test_a_queued_start_that_can_no_longer_hand_off_is_not_the_cancel_target(
+    monkeypatch: pytest.MonkeyPatch, moved: str
+):
+    """The row was moved to another run after the START was accepted (an
+    automatic resume won the race), so the START never opens its run. A
+    running row is cancelled as the running run it is; one waiting for an
+    answer is refused as busy, as it would be with no START at all."""
+    task_id, _agent_id, key = _running_task()
+    _update(
+        task_id,
+        runner_id=None,
+        lease_expires_at=None,
+        **_PREVIOUS_RUNS["previous_run_completed"],
+    )
+    _queue_start(task_id)
+    row_values: dict[str, Any] = {
+        "run_id": "run-first",
+        "state_version": _row(task_id)["state_version"] + 1,
+    }
+    if moved == "running_on_another_run":
+        row_values.update(
+            status=TaskStatus.RUNNING, control_state=TaskControlState.RUNNING.value
+        )
+    else:
+        row_values.update(
+            status=TaskStatus.WAITING_FOR_USER,
+            control_state=TaskControlState.WAITING_FOR_USER.value,
+        )
+    _update(task_id, **row_values)
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", AsyncMock())
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+    before = _row(task_id)
+
+    response = _cancel(task_id, key)
+
+    assert _row(task_id) == before
+    if moved == "waiting_on_another_run":
+        assert response.status_code == 409, response.text
+        assert _error(response) == "task_busy"
+        assert _cancel_commands(task_id) == []
+        return
+    assert response.status_code == 202, response.text
+    assert response.json()["run_id"] == "run-first"
+    (command,) = _cancel_commands(task_id)
+    assert "queued_run_id" not in command.payload
+    assert command.target_run_id == "run-first"
+
+
+# ----- how the wait ends for a queued turn -----
+
+
+def test_a_cancel_whose_queued_turn_started_before_the_deadline_is_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """At the deadline the START has been handed off and the row shows the
+    turn running on the aimed run: the command is not applied yet, so the
+    answer is 202 for the running turn, not "already ended"."""
+    task_id, _agent_id, key = _running_task()
+    _update(
+        task_id,
+        runner_id=None,
+        lease_expires_at=None,
+        **_PREVIOUS_RUNS["previous_run_completed"],
+    )
+    _queue_start(task_id)
+
+    async def handed_off(_executor: Any, *, command_db_id: int) -> bool:
+        _update(
+            task_id,
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id=QUEUED_RUN,
+            state_version=_row(task_id)["state_version"] + 1,
+        )
+        db = _direct_db_session()
+        try:
+            db.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == TaskCommandKind.START.value,
+            ).update({"status": "completed"})
+            db.commit()
+        finally:
+            db.close()
+        return False
+
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", handed_off)
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "running"
+    assert response.json()["run_id"] == QUEUED_RUN
+    assert response.json()["cancelled_run_id"] is None

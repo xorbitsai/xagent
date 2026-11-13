@@ -22,6 +22,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.services import a2a_task_cancel as a2a_cancel_service
@@ -55,6 +56,7 @@ from xagent.web.services.task_execution_controller import (
     TaskControlState,
 )
 from xagent.web.services.task_orchestrator import TaskTurnPayload
+from xagent.web.services.task_start_protocol import TaskStartPayload
 
 from .conftest import _admin_headers, _direct_db_session, client
 
@@ -926,16 +928,30 @@ def _stage_start(
     turn_id: str = "turn-queued",
     **columns: Any,
 ) -> int:
-    """An accepted START for ``run_id`` with its pending user message."""
+    """An accepted START for ``run_id`` with its pending user message.
+
+    Its payload is the one the acceptance writes: the run and version the row
+    holds now, which is what the START consumer compares the row with.
+    """
     db = _direct_db_session()
     try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        start = TaskStartPayload(
+            version=1,
+            run_id=run_id,
+            state_version=int(task.state_version or 0),
+            expected_run_id=task.run_id,
+            turn_id=turn_id,
+            kind="create" if task.status == TaskStatus.PENDING else "append",
+            message="hello",
+        )
         staged = stage_task_command(
             db,
             task_id=task_id,
             actor_user_id=owner_user_id,
             command_id=turn_id,
             kind=TaskCommandKind.START,
-            payload={},
+            payload=start.model_dump(mode="json"),
             target_run_id=run_id,
         )
         db.commit()
@@ -1221,26 +1237,211 @@ async def test_a_queued_cancel_read_without_its_queued_run_is_rejected_unwritten
 
 
 @pytest.mark.asyncio
-async def test_an_sdk_cancel_reaches_its_core_whatever_run_the_row_holds(
+async def test_an_sdk_cancel_aimed_at_a_queued_turn_reaches_its_core_past_the_row_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The command was recorded against the run before the queued one, so
-    the dispatcher's own run comparison must not reject it."""
-    task_id, agent_id, _owner = _create_task(run_id=QUEUED_RUN)
+    """The row holds the run before the queued one while the command targets
+    the queued turn's run, as ``_enqueue_cancel`` records it, so the
+    dispatcher's own run comparison must not reject it."""
+    task_id, agent_id, _owner = _create_task(run_id="run-before")
     _broadcast_manager(monkeypatch)
     sdk_core = AsyncMock()
     monkeypatch.setattr(
         command_execution_service, "cancel_sdk_task_unserialized", sdk_core
     )
-
-    await command_execution_service._execute_durable_task_command(
-        _cancel_command(task_id, agent_id, scope="sdk", queued_run_id=QUEUED_RUN)
+    command = replace(
+        _cancel_command(task_id, agent_id, scope="sdk", queued_run_id=QUEUED_RUN),
+        target_run_id=QUEUED_RUN,
     )
+
+    await command_execution_service._execute_durable_task_command(command)
 
     sdk_core.assert_awaited_once_with(
         task_id=task_id,
         agent_id=agent_id,
-        expected_run_id="run-sdk",
+        expected_run_id=QUEUED_RUN,
         expected_state_version=4,
         queued_run_id=QUEUED_RUN,
     )
+
+
+def _update_row(task_id: int, **values: Any) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(values)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _wait_for_admission(start_id: int, task_id: int) -> None:
+    """Give the START an unclaimed admission ticket: it waits for capacity."""
+    db = _direct_db_session()
+    try:
+        if db.get(TaskAdmissionBucket, "test-bucket") is None:
+            db.add(TaskAdmissionBucket(key="test-bucket", capacity=1, max_pending=10))
+            db.flush()
+        db.add(
+            TaskAdmissionTicket(
+                command_id=start_id, task_id=task_id, bucket_key="test-bucket"
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("attempts", "ticket", "stopped"),
+    [
+        # Sent back to the admission queue after an attempt: still waiting.
+        (1, True, True),
+        # Held below the capacity cap before any attempt.
+        (0, False, True),
+        # Claimed before and holding no ticket: it may already have had an
+        # effect, and nothing says it still waits.
+        (1, False, False),
+    ],
+    ids=["returned_to_the_admission_queue", "never_attempted", "claimed_before"],
+)
+async def test_a_queued_start_is_stopped_only_while_a_cancel_can_overtake_it(
+    monkeypatch: pytest.MonkeyPatch, attempts: int, ticket: bool, stopped: bool
+) -> None:
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id="run-before", status=TaskStatus.COMPLETED, control_state="completed"
+    )
+    start_id = _stage_start(task_id, owner_user_id, attempt_count=attempts)
+    if ticket:
+        _wait_for_admission(start_id, task_id)
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    if stopped:
+        await _cancel_queued(task_id, agent_id)
+        assert _start(start_id) == ("failed", STOPPED_BEFORE_START)
+    else:
+        with pytest.raises(TaskCommandRejected) as raised:
+            await _cancel_queued(task_id, agent_id)
+        assert raised.value.reason == "stale_run"
+        assert _start(start_id) == ("pending", None)
+    assert _row(task_id) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "moved_row",
+    [
+        {
+            "status": TaskStatus.RUNNING,
+            "control_state": "running",
+            "run_id": "run-first",
+            "state_version": 5,
+        },
+        {
+            "status": TaskStatus.WAITING_FOR_USER,
+            "control_state": "waiting_for_user",
+            "run_id": "run-first",
+            "state_version": 5,
+        },
+        # The same run, one version on: the START was accepted at the older one.
+        {
+            "status": TaskStatus.COMPLETED,
+            "control_state": "completed",
+            "state_version": 5,
+        },
+    ],
+    ids=["running_on_another_run", "waiting_on_another_run", "version_moved"],
+)
+async def test_a_queued_start_that_can_no_longer_hand_off_is_not_withdrawn(
+    monkeypatch: pytest.MonkeyPatch, moved_row: dict[str, Any]
+) -> None:
+    """The row moved after the START was accepted, so the consumer would
+    reject the START and the turn never starts. Withdrawing it would answer
+    that the turn was cancelled while the run the row holds goes on: the
+    command is rejected, with the START and the row as they were."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id="run-before",
+        state_version=4,
+        status=TaskStatus.COMPLETED,
+        control_state="completed",
+    )
+    start_id = _stage_start(task_id, owner_user_id)
+    _update_row(task_id, **moved_row)
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await _cancel_queued(task_id, agent_id)
+
+    assert raised.value.reason == "stale_run"
+    assert _row(task_id) == before
+    assert _start(start_id) == ("pending", None)
+    assert _delivery_status(task_id, "turn-queued") == DELIVERY_PENDING
+
+
+@pytest.mark.asyncio
+async def test_a_new_task_whose_row_moved_is_not_cancelled_for_its_queued_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id, agent_id, owner_user_id = _create_task(
+        status=TaskStatus.PENDING,
+        control_state="idle",
+        run_id=None,
+        state_version=0,
+    )
+    start_id = _stage_start(task_id, owner_user_id)
+    _update_row(task_id, state_version=1)
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await _cancel_queued(task_id, agent_id)
+
+    assert raised.value.reason == "stale_run"
+    assert _row(task_id) == before
+    assert _start(start_id) == ("pending", None)
+
+
+def test_a_start_handed_off_while_it_was_being_stopped_is_cancelled_as_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The START is handed off between the read and the write that stops it:
+    the second pass finds the turn running on the queued run and targets it
+    at the version read then."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id="run-before", status=TaskStatus.COMPLETED, control_state="completed"
+    )
+    start_id = _stage_start(task_id, owner_user_id)
+    stops: list[int] = []
+
+    def handed_off_first(_db: Any, _task_id: int, start: Any) -> bool:
+        stops.append(int(start.id))
+        other = _direct_db_session()
+        try:
+            other.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.id == start.id
+            ).update({"status": "completed", "attempt_count": 1})
+            other.query(Task).filter(Task.id == task_id).update(
+                {
+                    "status": TaskStatus.RUNNING,
+                    "control_state": "running",
+                    "run_id": QUEUED_RUN,
+                    "state_version": 7,
+                }
+            )
+            other.commit()
+        finally:
+            other.close()
+        return False
+
+    monkeypatch.setattr(
+        sdk_task_cancel, "_stop_queued_start_no_commit", handed_off_first
+    )
+
+    target = sdk_task_cancel._resolve_queued_cancel_target_sync(
+        task_id=task_id, agent_id=agent_id, queued_run_id=QUEUED_RUN
+    )
+
+    assert stops == [start_id]
+    assert target == sdk_task_cancel._CancelTarget(QUEUED_RUN, 7, TaskStatus.RUNNING)

@@ -20,7 +20,12 @@ A turn still queued to start is a target of its own: until its START is
 handed off the task row shows the turn before it, so the request names the
 queued run and the core judges that run, not the row. Cancelling it before
 it starts fails its START and, for an appended turn, leaves the row -- the
-previous turn's result -- untouched.
+previous turn's result -- untouched. A queued START is a target only while
+it can still hand off (``start_can_hand_off``): one the START consumer would
+reject because the row moved on is treated as absent, and the row is judged
+as it stands. A repeat of a cancel that withdrew the newest turn is answered
+again for that turn (``_withdrawn_run_of_last_start``), since the row no
+longer shows it.
 
 Besides a queued turn only a RUNNING task is cancelled here. One waiting
 for the caller's answer and a paused one are refused as busy, without a
@@ -35,7 +40,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, update
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session
 
 from ..models.chat_message import TaskChatMessage
@@ -58,6 +63,7 @@ from .task_command_transport import (
     load_task_command,
     retry_failed_task_command,
 )
+from .task_execution_admission import waiting_admission
 from .task_execution_controller import (
     StaleTaskRunError,
     TaskControlState,
@@ -104,10 +110,8 @@ _AIMED_RUN_ENDED_MESSAGE = "The run this cancel was aimed at has already ended."
 
 _TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
 
-# How a START stopped before it began records why, shared with every other
-# control that stops one.
-_STOPPED_BEFORE_START_REASON = "cancelled_before_admission"
-_STOPPED_BEFORE_START_ERROR = "Task stopped before execution started."
+STOPPED_BEFORE_START_REASON = "cancelled_before_admission"
+STOPPED_BEFORE_START = "Task stopped before execution started."
 
 
 def is_sdk_cancelled(status: object, error_message: object) -> bool:
@@ -196,7 +200,26 @@ def _task_run_id(task: Task) -> str | None:
     return str(run_id) if run_id is not None else None
 
 
+def _paused_reads_failed(db: Session, task: Task) -> bool:
+    """Whether the task read reports this PAUSED row as ``failed``.
+
+    The row stays PAUSED; automatic resume gave up, or the turn appended to
+    it could not be started, and ``status_only_terminal_view`` is what the
+    read surface derives ``failed`` from.
+    """
+
+    from .task_auto_resume import status_only_terminal_view
+
+    if (
+        task.status != TaskStatus.PAUSED
+        or task.control_state != TaskControlState.PAUSED.value
+    ):
+        return False
+    return status_only_terminal_view(db, int(task.id)) is not None
+
+
 def _result(
+    db: Session,
     task: Task,
     *,
     cancelled: bool,
@@ -206,17 +229,24 @@ def _result(
     """The task row as the cancel response reports it.
 
     ``cancelled`` is the caller's verdict on the run it was asked about,
-    which is not always the run the row holds. ``queued`` says a START is
-    waiting: a completed or failed row then reads as ``pending`` with no
-    code, by the task read's own rule (``QUEUED_START_STATUSES``).
+    which is not always the run the row holds. The status is the one the task
+    read reports: a completed or failed row reads as ``pending`` with no code
+    while a START is waiting (``queued``; ``QUEUED_START_STATUSES``), and a
+    paused row reads as ``failed`` when ``_paused_reads_failed``.
     """
 
     from .task_start_protocol import QUEUED_START_STATUSES
 
     shown_pending = queued and task.status in QUEUED_START_STATUSES
+    if shown_pending:
+        status = TaskStatus.PENDING.value
+    elif _paused_reads_failed(db, task):
+        status = TaskStatus.FAILED.value
+    else:
+        status = task.status.value
     return SdkTaskCancelResult(
         task_id=int(task.id),
-        status=TaskStatus.PENDING.value if shown_pending else task.status.value,
+        status=status,
         run_id=_task_run_id(task),
         state_version=int(task.state_version or 0),
         cancelled_run_id=cancelled_run_id if cancelled else None,
@@ -229,18 +259,20 @@ def _result(
     )
 
 
-def _row_result(task: Task, *, queued: bool = False) -> SdkTaskCancelResult:
+def _row_result(db: Session, task: Task) -> SdkTaskCancelResult:
     """The result for a command aimed at the run the row holds."""
 
-    cancelled = not queued and is_sdk_cancelled(task.status, task.error_message)
     return _result(
-        task, cancelled=cancelled, cancelled_run_id=_task_run_id(task), queued=queued
+        db,
+        task,
+        cancelled=is_sdk_cancelled(task.status, task.error_message),
+        cancelled_run_id=_task_run_id(task),
     )
 
 
 def _queued_start(db: Session, task_id: int) -> TaskExecutionCommand | None:
-    """The START of ``task_id`` not handed off yet (``has_queued_start``'s
-    predicate; at most one exists)."""
+    """The START of ``task_id`` not handed off yet, as ``has_queued_start``
+    counts it (at most one exists)."""
 
     return (
         db.query(TaskExecutionCommand)
@@ -252,6 +284,57 @@ def _queued_start(db: Session, task_id: int) -> TaskExecutionCommand | None:
         .order_by(TaskExecutionCommand.id.desc())
         .first()
     )
+
+
+def _withdrawn_run_of_last_start(db: Session, task: Task) -> str | None:
+    """The run of the task's newest START when an SDK cancel withdrew it.
+
+    The cancel that withdrew a queued turn left the task row on the turn
+    before it, so a repeat of that cancel finds no queued START and a row
+    that says nothing of the withdrawn run. The START itself is the record:
+    it is the newest one, it opens a run the row does not show, and a
+    completed SDK cancel command was aimed at exactly that run. Stopped
+    STARTs alone do not say so: other controls stop STARTs with the same
+    reason, and only a completed cancel command of this endpoint was
+    answered as a cancellation.
+    """
+
+    last = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == int(task.id),
+            TaskExecutionCommand.kind == TaskCommandKind.START.value,
+        )
+        .order_by(TaskExecutionCommand.id.desc())
+        .populate_existing()
+        .first()
+    )
+    if last is None or last.target_run_id is None:
+        return None
+    run_id = str(last.target_run_id)
+    if run_id == _task_run_id(task):
+        return None
+    cancels = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == int(task.id),
+            TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
+            TaskExecutionCommand.status == COMMAND_COMPLETED,
+            TaskExecutionCommand.target_run_id == run_id,
+        )
+        .populate_existing()
+        .all()
+    )
+    for cancel in cancels:
+        payload: dict[str, Any] = (
+            cancel.payload if isinstance(cancel.payload, dict) else {}
+        )
+        if (
+            payload.get("scope") == SDK_COMMAND_SCOPE
+            and payload.get("queued_run_id") == run_id
+        ):
+            return run_id
+    return None
 
 
 def _start_of_run(
@@ -280,36 +363,33 @@ def _start_was_stopped(start: TaskExecutionCommand | None) -> bool:
     if start is None or start.status != COMMAND_FAILED:
         return False
     result: dict[str, Any] = start.result if isinstance(start.result, dict) else {}
-    return bool(result.get("rejection_reason") == _STOPPED_BEFORE_START_REASON)
+    return bool(result.get("rejection_reason") == STOPPED_BEFORE_START_REASON)
 
 
 def _ended_without_cancel(db: Session, task: Task) -> bool:
     """Whether the task's run ended and was not an SDK cancellation.
 
     Covers a COMPLETED or FAILED row and a paused row the read surface
-    reports as failed because automatic resume gave up.
+    reports as failed (``_paused_reads_failed``).
     """
-
-    from .task_auto_resume import status_only_terminal_view
 
     if is_sdk_cancelled(task.status, task.error_message):
         return False
-    if task.status in _TERMINAL_STATUSES:
-        return True
-    if (
-        task.status == TaskStatus.PAUSED
-        and task.control_state == TaskControlState.PAUSED.value
-    ):
-        return status_only_terminal_view(db, int(task.id)) is not None
-    return False
+    return task.status in _TERMINAL_STATUSES or _paused_reads_failed(db, task)
 
 
 def _prepare_cancel_sync(
     *, task_id: int, scope: SdkTaskScope
 ) -> SdkTaskCancelResult | _CancelCommand:
-    """Authorize, classify the target and persist its command, in one read."""
+    """Authorize, classify the target and persist its command, in one read.
+
+    The target is the queued START that can still hand off, else the row. A
+    repeat of a cancel that already withdrew the newest turn finds neither
+    and is answered from the record of that withdrawal.
+    """
 
     from .task_start import resolve_sdk_task
+    from .task_start_protocol import start_can_hand_off
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -319,6 +399,10 @@ def _prepare_cancel_sync(
         # about.
         queued = _queued_start(db, task_id)
         task = resolve_sdk_task(task_id, scope, db)
+        if queued is not None and not start_can_hand_off(queued, task):
+            # Never starts: the row moved on after the START was accepted,
+            # so the turn it would open is not what a cancel can reach.
+            queued = None
         if queued is not None:
             if queued.target_run_id is None:
                 raise SdkTaskCancelBusy(
@@ -326,8 +410,13 @@ def _prepare_cancel_sync(
                     "cancelled yet; retry once it is running."
                 )
             return _stage_cancel(db, task, queued_run_id=str(queued.target_run_id))
+        # A cancel that withdrew the newest turn is answered again for that
+        # turn, not for whatever the row shows of the turn before it.
+        withdrawn_run_id = _withdrawn_run_of_last_start(db, task)
+        if withdrawn_run_id is not None:
+            return _result(db, task, cancelled=True, cancelled_run_id=withdrawn_run_id)
         if is_sdk_cancelled(task.status, task.error_message):
-            return _row_result(task)
+            return _row_result(db, task)
         if _ended_without_cancel(db, task):
             raise SdkTaskNotCancellable
         if task.status != TaskStatus.RUNNING:
@@ -381,7 +470,8 @@ def _enqueue_cancel(
     # Keyed on the state read here: a repeat against the same state is the
     # same command, and a repeat after the state moved is a new one aimed at
     # the new state. An appended turn does not move the row while it is
-    # queued, so its run is part of the key.
+    # queued, so its run is part of the key. Once such a turn is withdrawn a
+    # repeat is answered from that record and never reaches this key.
     command_id = f"cancel:{task_id}:{target_state_version}"
     payload: dict[str, Any] = {
         "agent_id": int(task.agent_id),
@@ -425,7 +515,8 @@ def _load_result_sync(
     - a turn queued to start is not on the row until its START is handed
       off. While its START waits the command is still pending; a START
       stopped before it began is that turn cancelled; any other START
-      outcome means the turn is over.
+      outcome means the turn is over. A START the row moved away from is
+      not stopped by the command (``stale_run``), and reads as over.
     - a row that shows another run means the aimed one is over, and
       retrying would aim at the new one, so it raises
       ``SdkTaskNotCancellable`` with ``_AIMED_RUN_ENDED_MESSAGE``.
@@ -433,8 +524,9 @@ def _load_result_sync(
       exactly as the request would have on arrival, whether or not a later
       turn is queued behind it.
 
-    A START waiting for a later turn reads as ``pending`` with no code, as
-    on the task read.
+    A START waiting for a later turn reads as ``pending`` with no code, and
+    a paused row that has stopped for good reads as ``failed``, as on the
+    task read.
     """
 
     from .task_start import resolve_sdk_task
@@ -446,13 +538,14 @@ def _load_result_sync(
         task = resolve_sdk_task(task_id, scope, db)
         if command_completed:
             return _result(
-                task, cancelled=True, cancelled_run_id=aimed_run_id, queued=queued
+                db, task, cancelled=True, cancelled_run_id=aimed_run_id, queued=queued
             )
         if _task_run_id(task) != aimed_run_id:
             if aimed_at_queued_turn and aimed_run_id is not None:
                 start = _start_of_run(db, task_id, aimed_run_id)
                 if _start_was_stopped(start):
                     return _result(
+                        db,
                         task,
                         cancelled=True,
                         cancelled_run_id=aimed_run_id,
@@ -462,11 +555,12 @@ def _load_result_sync(
                     COMMAND_PENDING,
                     COMMAND_PROCESSING,
                 }:
-                    return _result(task, cancelled=False, queued=queued)
+                    return _result(db, task, cancelled=False, queued=queued)
             raise SdkTaskNotCancellable(_AIMED_RUN_ENDED_MESSAGE)
         if _ended_without_cancel(db, task):
             raise SdkTaskNotCancellable
         return _result(
+            db,
             task,
             cancelled=is_sdk_cancelled(task.status, task.error_message),
             cancelled_run_id=aimed_run_id,
@@ -488,8 +582,9 @@ async def request_sdk_task_cancel(
     task's state.
 
     Returns ``cancelled=True`` once the task is the outcome of a
-    cancellation, including when it already was, and once the command that
-    cancelled the aimed run completed (``cancelled_run_id``). Returns
+    cancellation, including when it already was, once the command that
+    cancelled the aimed run completed (``cancelled_run_id``), and when an
+    earlier call's command withdrew the newest turn, which names that turn. Returns
     ``cancelled=False`` when the command was persisted but not applied
     within ``SDK_CANCEL_REQUEST_WAIT_SECONDS``; calling again reaches the
     same command. Raises ``SdkTaskNotCancellable`` when the aimed run ended
@@ -892,9 +987,14 @@ def _stop_queued_start_no_commit(
 ) -> bool:
     """Fail a START that no executor has claimed, leaving the task row alone.
 
-    An append's failure belongs to its command: the row keeps the previous
-    turn's result. The turn's delivery row and runtime values are released
-    by the START's own settlement. Returns False when the START moved first.
+    Stopped while it is pending and either never attempted or waiting for an
+    admission ticket, the same START a cancel is dispatched past
+    (``waiting_admission``): one sent back to the admission queue after an
+    attempt is still stopped, one an executor claimed and may have acted on
+    is not. An append's failure belongs to its command: the row keeps the
+    previous turn's result. The turn's delivery row and runtime values are
+    released by the START's own settlement. Returns False when the START
+    moved first.
     """
 
     from .task_command_terminal_events import (
@@ -915,13 +1015,16 @@ def _stop_queued_start_no_commit(
         .where(
             TaskExecutionCommand.id == start.id,
             TaskExecutionCommand.status == COMMAND_PENDING,
-            TaskExecutionCommand.attempt_count == 0,
+            or_(
+                TaskExecutionCommand.attempt_count == 0,
+                waiting_admission(TaskExecutionCommand.id),
+            ),
         )
         .values(
             status=COMMAND_FAILED,
-            error=_STOPPED_BEFORE_START_ERROR,
+            error=STOPPED_BEFORE_START,
             completed_at=func.now(),
-            result={"rejection_reason": _STOPPED_BEFORE_START_REASON},
+            result={"rejection_reason": STOPPED_BEFORE_START_REASON},
         )
         .returning(TaskExecutionCommand.id)
         .execution_options(synchronize_session=False)
@@ -946,10 +1049,13 @@ def _resolve_queued_cancel_target_sync(
     Returns the task-row target to cancel, or ``None`` when nothing is left
     to do: the turn was already cancelled, or its START was stopped before
     it began (by this call, for an appended turn). Raises
-    ``TaskCommandRejected`` when the turn ended on its own or never
-    started, and ``TaskCommandDeferred`` while its START is being handed
-    off.
+    ``TaskCommandRejected`` when the turn ended on its own or never started,
+    including when its START can no longer hand off because the row moved
+    after it was accepted (checked before anything is written), and
+    ``TaskCommandDeferred`` while its START is being handed off.
     """
+
+    from .task_start_protocol import start_can_hand_off
 
     stale = TaskCommandRejected(
         f"queued run {queued_run_id} of task {task_id} is no longer cancellable",
@@ -981,6 +1087,11 @@ def _resolve_queued_cancel_target_sync(
                     f"START of run {queued_run_id} is being handed off"
                 )
             if start.status == COMMAND_PENDING:
+                if not start_can_hand_off(start, task):
+                    # The row moved on after the START was accepted, so the
+                    # START will never open this run and there is nothing
+                    # of the turn to cancel. Nothing is written.
+                    raise stale
                 if task.status == TaskStatus.PENDING:
                     # A new task that never ran: the row itself is cancelled
                     # and the completed command settles the START.

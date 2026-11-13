@@ -41,6 +41,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import channel_delivery
 from xagent.web.services.connector_runtime import prepare_append_connector_runtime
+from xagent.web.services.task_command_transport import COMMAND_PENDING
 from xagent.web.services.task_deletion import purge_task_rows, redact_task_rows
 from xagent.web.services.task_file_lifecycle import lock_attachment_task
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
@@ -282,6 +283,75 @@ def test_redaction_discards_the_pending_channel_delivery(sessions) -> None:
     with sessions() as db:
         [delivery] = db.query(TaskChannelDelivery).all()
         assert (delivery.status, delivery.claim_token) == ("discarded", None)
+
+
+@pytest.mark.parametrize("lease_live", [True, False])
+def test_a_claimed_delivery_is_left_to_its_sender_while_the_lease_is_live(
+    sessions, lease_live: bool
+) -> None:
+    """A sender holding a live claim already read the reply and settles it;
+    an expired claim would be re-claimed against the blanked payload."""
+    with sessions() as db:
+        task_id, _, _ = _seed(db)
+        db.query(TaskChannelDelivery).update(
+            {
+                "claim_token": "sender",
+                "available_at": NOW + timedelta(minutes=1 if lease_live else -1),
+            }
+        )
+        db.commit()
+
+    _redact(sessions, task_id, NOW)
+
+    with sessions() as db:
+        [delivery] = db.query(TaskChannelDelivery).all()
+        assert (delivery.status, delivery.claim_token) == (
+            ("pending", "sender") if lease_live else ("discarded", None)
+        )
+
+
+def test_a_command_still_owed_execution_keeps_its_payload(sessions) -> None:
+    """On SQLite the quiescence check and the redaction are not atomic, so a
+    command can be enqueued in between; it must not run with ``{}``."""
+    with sessions() as db:
+        task_id, _, _ = _seed(db)
+        db.add(
+            TaskExecutionCommand(
+                task_id=task_id,
+                command_id="queued",
+                kind="message",
+                payload={"content": "queued"},
+                status=COMMAND_PENDING,
+            )
+        )
+        db.commit()
+
+    _redact(sessions, task_id, NOW)
+
+    with sessions() as db:
+        payloads = {
+            command.command_id: command.payload
+            for command in db.query(TaskExecutionCommand).filter_by(task_id=task_id)
+        }
+        assert payloads == {"turn-1": {}, "queued": {"content": "queued"}}
+
+
+def test_a_task_without_a_trace_keeps_traces_expired_at_null(sessions) -> None:
+    with sessions() as db:
+        user = User(username="traceless", password_hash="unused")
+        db.add(user)
+        db.flush()
+        task = Task(user_id=user.id, title="secret", status=TaskStatus.COMPLETED)
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+
+    _redact(sessions, task_id, NOW)
+
+    with sessions() as db:
+        task = db.get(Task, task_id)
+        assert task is not None
+        assert (task.title, task.traces_expired_at) == ("", None)
 
 
 def test_purge_task_rows_still_deletes_the_task_and_detaches_files(sessions) -> None:

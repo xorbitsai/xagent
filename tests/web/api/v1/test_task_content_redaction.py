@@ -30,6 +30,7 @@ from xagent.web.api.chat import chat_router
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_db
+from xagent.web.models.kb_ingest_target import KBIngestTarget
 from xagent.web.models.task import (
     DAGExecution,
     Task,
@@ -45,6 +46,7 @@ from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.task_runtime_secret import TaskRuntimeSecret
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.models.uploaded_file_cleanup_fence import UploadedFileCleanupFence
 from xagent.web.services import task_content_redaction, task_deletion
 from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
@@ -279,6 +281,36 @@ def _seed_content(task_id: int, uploads: Path) -> tuple[str, Path, Path]:
     return storage_key, local, workspace
 
 
+def _add_file(task_id: int, uploads: Path, name: str) -> Path:
+    """One more uploaded file bound to ``task_id``; returns its local path."""
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Task.user_id).filter(Task.id == task_id).one()[0])
+        local = uploads / f"user_{owner_id}" / "uploads" / f"{name}-{task_id}.txt"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text("secret file")
+        UploadedFileStore(db).create_from_local_path(
+            local_path=local, user_id=owner_id, task_id=task_id
+        )
+        db.commit()
+        return local
+    finally:
+        db.close()
+
+
+def _file_ids(task_id: int) -> list[str]:
+    db = _direct_db_session()
+    try:
+        return [
+            str(file_id)
+            for (file_id,) in db.query(UploadedFile.file_id)
+            .filter(UploadedFile.task_id == task_id)
+            .order_by(UploadedFile.id)
+        ]
+    finally:
+        db.close()
+
+
 def _content_counts(task_id: int) -> dict[str, int]:
     db = _direct_db_session()
     try:
@@ -320,6 +352,7 @@ def test_redaction_removes_content_and_keeps_the_task_and_its_usage(
     bystander_id = _settled_task(full_key, agent_id)
     storage_key, local, workspace = _seed_content(task_id, _roots)
     _seed_content(bystander_id, _roots)
+    [file_id] = _file_ids(task_id)
 
     report = _redact([task_id, task_id, 9_000_001])
 
@@ -331,6 +364,8 @@ def test_redaction_removes_content_and_keeps_the_task_and_its_usage(
     assert not workspace.exists()
     db = _direct_db_session()
     try:
+        # The deleted file's id is fenced so a later KB ingest cannot adopt it.
+        assert db.get(UploadedFileCleanupFence, file_id) is not None
         # Non-secret routing input the next turn is validated against.
         assert (
             db.query(TaskConnectorRuntimeContext)
@@ -542,6 +577,98 @@ def test_a_file_a_knowledge_base_references_is_detached_not_deleted(
         assert (kept.task_id, kept.detached_reason) == (None, "task_deleted")
     finally:
         db.close()
+
+
+def test_a_partial_storage_failure_is_reported_and_a_rerun_finishes(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure on the second file rolls the rows back, but the first
+    file's bytes are already gone: the task is partially cleaned."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _, first_local, _ = _seed_content(task_id, _roots)
+    second_local = _add_file(task_id, _roots, "second")
+    first_id, second_id = _file_ids(task_id)
+    delete = UploadedFileStore.delete
+
+    def fail_second(self: UploadedFileStore, record: Any, **kwargs: Any) -> None:
+        if str(record.file_id) == second_id:
+            raise OSError("object storage unavailable")
+        delete(self, record, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(UploadedFileStore, "delete", fail_second)
+        report = _redact([task_id])
+
+    assert report == TaskContentRedactionReport(failed=(task_id,))
+    assert _file_ids(task_id) == [first_id, second_id]
+    assert not first_local.exists()
+    assert second_local.exists()
+
+    assert _redact([task_id]) == TaskContentRedactionReport(redacted=(task_id,))
+    assert _file_ids(task_id) == []
+    assert not second_local.exists()
+
+
+def test_a_file_a_live_kb_ingest_targets_is_detached_not_deleted(
+    _roots: Path,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    storage_key, local, _ = _seed_content(task_id, _roots)
+    [file_id] = _file_ids(task_id)
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Task.user_id).filter(Task.id == task_id).one()[0])
+        db.add(
+            KBIngestTarget(
+                user_id=owner_id,
+                collection="kb",
+                target_path="attachment.txt",
+                file_id=file_id,
+                latest_file_sha256="0" * 64,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    assert _redact([task_id]) == TaskContentRedactionReport(redacted=(task_id,))
+
+    assert local.exists()
+    assert _object_exists(owner_id, storage_key)
+    db = _direct_db_session()
+    try:
+        kept = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        assert (kept.task_id, kept.detached_reason) == (None, "task_deleted")
+        assert db.get(UploadedFileCleanupFence, file_id) is None
+    finally:
+        db.close()
+
+
+def test_an_unresolvable_workspace_scope_still_evicts_the_cached_agent(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    cached_agent = MagicMock()
+    manager._agents[task_id] = cached_agent
+
+    def unresolvable(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("execution scope did not resolve")
+
+    monkeypatch.setattr(
+        task_content_redaction, "capture_workspace_cleanup_target", unresolvable
+    )
+
+    report = _redact([task_id])
+
+    assert report == TaskContentRedactionReport(cleanup_failed=(task_id,))
+    assert task_id not in manager._agents
+    cached_agent.cleanup_workspace.assert_called_once()
+    assert set(_content_counts(task_id).values()) == {0}
 
 
 #: Task states the redaction must refuse. The parked ones (paused, waiting

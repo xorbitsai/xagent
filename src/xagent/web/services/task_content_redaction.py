@@ -26,12 +26,19 @@ Per task, in order
    and commits. The uploaded files' stored objects are deleted inside this
    transaction, so the row lock is held across that object-storage I/O (see
    ``task_deletion._delete_task_files`` for why); the task is quiescent, so
-   nothing else is waiting on it. A failure here rolls back that task alone
-   and reports it ``failed``.
+   nothing else is waiting on it. A failure here rolls back that task's rows
+   and reports it ``failed``; the stored files it had already deleted stay
+   deleted, so a ``failed`` task is partially cleaned and must be re-run.
 2. After the commit, the read caches are invalidated, the ephemeral
    connector values dropped, the cached agent runtime evicted and the
    workspace directory removed -- unless a turn that started after the
    commit already owns the runtime (see :func:`_release_task_runtime`).
+
+Eviction is process-local. ``remove_agent`` drops the agent this process
+has cached; a host running several agent worker processes must evict the
+task's cached agent on every other one itself, or a follow-up turn there
+can reuse the pre-redaction conversation the agent holds in memory and
+write it back. Task deletion has the same limit.
 
 The workspace goes after the commit because a directory cannot be restored
 by a rollback; it is found from the row, which still exists, so unlike task
@@ -64,7 +71,10 @@ from .hot_path_cache import invalidate_task_cache
 from .task_deletion import redact_task_rows
 from .task_file_lifecycle import lock_attachment_task
 from .task_retention import retention_quiescent_condition
-from .task_workspace_cleanup import capture_workspace_cleanup_target
+from .task_workspace_cleanup import (
+    WorkspaceCleanupTarget,
+    capture_workspace_cleanup_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +87,11 @@ class TaskContentRedactionReport:
     gone either way. ``cleanup_failed`` tasks had their rows redacted and
     committed, but removing the workspace or cached runtime raised, or was
     skipped because a later turn already owns the runtime; re-run the
-    redaction for them once they settle. ``failed`` tasks raised in their
-    row redaction and were rolled back, so nothing of theirs changed.
+    redaction for them once they settle; any other process's cached agent
+    is never evicted here (see the module docstring). ``failed`` tasks raised
+    in their row redaction and were rolled back, but the stored files deleted
+    before the failure stay deleted: they are partially cleaned, their file
+    rows may name missing bytes, and they must be re-run.
     ``busy`` tasks are not settled and were left untouched -- see the module
     docstring for the states the host must cancel first; ``missing`` ones do
     not exist.
@@ -167,23 +180,40 @@ def _release_task_runtime(task_id: int, runtime: _RedactedRuntime) -> bool:
 
     A scope that will not resolve raises rather than degrading to the
     unscoped candidates: a redaction that cannot find the workspace must not
-    report success.
+    report success. The cached agent is evicted regardless, since it holds
+    the conversation in memory.
+
+    Process-local: another worker process's cached agent is the host's to
+    evict (see the module docstring).
     """
 
     # In-memory state first: a workspace failure below must not leave the
     # caches serving the content the commit already removed.
     drop_ephemeral_runtime_values_for_task(task_id)
     invalidate_task_cache(task_id)
-    target = capture_workspace_cleanup_target(
-        task_id, runtime.owner_id, prefer_active_scope=False
-    )
-    return get_agent_manager().remove_agent(
-        task_id,
-        runtime.owner_id,
-        expected_run_id=runtime.run_id,
-        expected_run_generation=runtime.run_generation,
-        workspace_target=target,
-    )
+    manager = get_agent_manager()
+
+    def evict(target: WorkspaceCleanupTarget | None) -> bool:
+        return manager.remove_agent(
+            task_id,
+            runtime.owner_id,
+            expected_run_id=runtime.run_id,
+            expected_run_generation=runtime.run_generation,
+            workspace_target=target,
+        )
+
+    try:
+        target = capture_workspace_cleanup_target(
+            task_id, runtime.owner_id, prefer_active_scope=False
+        )
+    except Exception:
+        # The cached agent still holds the conversation: evict it anyway. A
+        # cached agent removes its own workspace without a target; with none
+        # cached the eviction re-captures and fails the same way. Either way
+        # the task is reported ``cleanup_failed``.
+        evict(None)
+        raise
+    return evict(target)
 
 
 def redact_task_content(
@@ -202,6 +232,14 @@ def redact_task_content(
     Only settled tasks are redacted: PAUSED, WAITING_FOR_USER and
     command-less PENDING tasks come back ``busy`` on every call until the
     host cancels or settles them (see the module docstring).
+
+    ``db`` must be clean -- no pending changes and no open transaction the
+    caller still needs: each task commits or rolls back this session, so
+    caller work would be committed by the first redacted task or discarded
+    by the first busy or missing one.
+
+    Eviction of the cached agent is process-local; a host with several agent
+    worker processes evicts it on the others itself.
 
     Blocking (database, object storage and filesystem I/O); async callers
     run it in a worker thread.

@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
@@ -34,6 +34,7 @@ from .task_file_lifecycle import (
     lock_attachment_task,
 )
 from .task_interaction_schema import interaction_requests_table_exists
+from .task_retention import RETENTION_LIVE_COMMAND_STATUSES
 from .task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 from .uploaded_file_store import UploadedFileStore, UploadedFileVersionConflict
 
@@ -295,12 +296,15 @@ def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
     Command rows are blanked rather than deleted: their identity is the
     resend dedupe key, and a deleted row would let a client's retry of an
     old command execute it again. A retry now conflicts on the blank payload
-    instead of replaying. Their pending channel deliveries are discarded in
-    the same step: the delivery worker reads the destination channel out of
-    the command payload, so a pending delivery of a blanked command could
-    never be claimed and would sit at the head of its channel's queue
-    forever -- and the reply it would carry belongs to the deleted
-    conversation anyway.
+    instead of replaying. Only settled commands are blanked; one still owed
+    execution keeps its payload. Their pending channel deliveries are
+    discarded in the same step: the delivery worker reads the destination
+    channel out of the command payload, so a pending delivery of a blanked
+    command could never be claimed and would sit at the head of its
+    channel's queue forever -- and the reply it would carry belongs to the
+    deleted conversation anyway. A delivery a sender has claimed under a
+    live lease is left to it: that send has already read the reply and may
+    still post it after the redaction commits.
 
     Idempotent: a second run finds nothing to delete and rewrites the same
     blank values.
@@ -321,6 +325,13 @@ def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
     db.query(TaskChannelDelivery).filter(
         TaskChannelDelivery.command_id.in_(task_commands),
         TaskChannelDelivery.status == "pending",
+        # Not a delivery a sender holds under a live lease: that sender has
+        # already read the reply and settles it itself. An expired claim is
+        # discarded, since the next claim would read the blanked payload.
+        or_(
+            TaskChannelDelivery.claim_token.is_(None),
+            TaskChannelDelivery.available_at <= now,
+        ),
     ).update(
         {
             TaskChannelDelivery.status: "discarded",
@@ -329,7 +340,12 @@ def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
         synchronize_session=False,
     )
     db.query(TaskExecutionCommand).filter(
-        TaskExecutionCommand.task_id == task_id
+        TaskExecutionCommand.task_id == task_id,
+        # A command still owed execution keeps its payload. The caller's
+        # quiescence check already refuses such a task, but on SQLite, where
+        # ``FOR UPDATE`` is a no-op, one can be enqueued in between, and it
+        # must not then execute an empty payload.
+        TaskExecutionCommand.status.not_in(RETENTION_LIVE_COMMAND_STATUSES),
     ).update(
         {
             TaskExecutionCommand.payload: {},

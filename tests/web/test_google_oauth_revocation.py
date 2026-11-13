@@ -85,6 +85,7 @@ def test_resolve_maps_an_app_key_to_a_google_revocation(db):
         provider="gmail",
         access_token="access",
         provider_user_id="sub-1",
+        user_id=1,
         refresh_token="refresh",
     )
 
@@ -94,6 +95,7 @@ def test_resolve_maps_an_app_key_to_a_google_revocation(db):
         client_id="",
         client_secret="",
         provider_user_id="sub-1",
+        user_id=1,
         refresh_token="refresh",
     )
 
@@ -107,6 +109,7 @@ def test_resolve_skips_a_composio_backed_row(db):
             provider="gmail",
             access_token="ca_composio-account",
             provider_user_id="sub-1",
+            user_id=1,
             token_type=COMPOSIO_TOKEN_TYPE,
         )
         is None
@@ -120,6 +123,7 @@ def test_revocation_repr_redacts_the_refresh_token():
         client_id="",
         client_secret="",
         provider_user_id="sub-1",
+        user_id=1,
         refresh_token="the-refresh-token",
     )
 
@@ -135,6 +139,7 @@ def test_revoke_prefers_the_refresh_token(db, post):
         provider="google-drive",
         access_token="access",
         provider_user_id="sub-1",
+        user_id=1,
         refresh_token="refresh",
     )
 
@@ -143,7 +148,11 @@ def test_revoke_prefers_the_refresh_token(db, post):
 
 def test_revoke_falls_back_to_the_access_token(db, post):
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="google", access_token="access", provider_user_id="sub-1"
+        db,
+        provider="google",
+        access_token="access",
+        provider_user_id="sub-1",
+        user_id=1,
     )
 
     _assert_revoked_with(post, "access")
@@ -168,6 +177,7 @@ def test_revoke_skips_while_a_sibling_google_app_is_connected(db, post):
         provider="gmail",
         access_token="access",
         provider_user_id="sub-1",
+        user_id=1,
         refresh_token="refresh",
     )
 
@@ -192,10 +202,126 @@ def test_a_composio_sibling_does_not_block_the_revoke(db, post):
         provider="gmail",
         access_token="access",
         provider_user_id="sub-1",
+        user_id=1,
         refresh_token="refresh",
     )
 
     _assert_revoked_with(post, "refresh")
+
+
+def test_a_google_row_without_an_upstream_id_is_never_revoked(db, post):
+    """Disconnecting a legacy row that recorded no Google account id can't
+    prove no other connection shares its grant, so it must not revoke."""
+    user = _user(db)
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="google-drive",
+            provider_user_id="sub-1",
+            access_token="drive-access",
+        )
+    )
+    db.commit()
+
+    auth_api.revoke_builtin_oauth_grant(
+        db,
+        provider="gmail",
+        access_token="access",
+        provider_user_id=None,
+        user_id=int(user.id),
+        refresh_token="refresh",
+    )
+
+    post.assert_not_called()
+
+
+def test_a_same_user_google_row_without_an_upstream_id_blocks_the_revoke(db, post):
+    """The legacy Gmail row may hold the very grant that disconnecting Drive
+    would revoke, so it counts as a live reference."""
+    user = _user(db)
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="gmail",
+            provider_user_id=None,
+            access_token="legacy-gmail-access",
+        )
+    )
+    db.commit()
+
+    auth_api.revoke_builtin_oauth_grant(
+        db,
+        provider="google-drive",
+        access_token="access",
+        provider_user_id="sub-1",
+        user_id=int(user.id),
+        refresh_token="refresh",
+    )
+
+    post.assert_not_called()
+
+
+def test_another_users_google_row_without_an_upstream_id_does_not_block(db, post):
+    user = _user(db)
+    other = _user(db, "bob")
+    db.add(
+        UserOAuth(
+            user_id=int(other.id),
+            provider="gmail",
+            provider_user_id=None,
+            access_token="bobs-legacy-access",
+        )
+    )
+    db.commit()
+
+    auth_api.revoke_builtin_oauth_grant(
+        db,
+        provider="google-drive",
+        access_token="access",
+        provider_user_id="sub-1",
+        user_id=int(user.id),
+        refresh_token="refresh",
+    )
+
+    _assert_revoked_with(post, "refresh")
+
+
+def test_a_rejected_access_token_is_logged_as_not_revoked(monkeypatch, caplog):
+    """Google answers an expired access token with invalid_token without
+    revoking the grant behind it: that must not read as success."""
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse(400, '{"error": "invalid_token"}')),
+    )
+
+    with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
+        auth_api._revoke_google_oauth_token("access", kind="access_token")
+
+    assert "not revoked" in caplog.text
+
+
+def test_an_unknown_provider_record_is_skipped_not_sent_to_github(monkeypatch, caplog):
+    delete = Mock()
+    post = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+    monkeypatch.setattr(auth_api.requests, "post", post)
+
+    with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
+        auth_api.revoke_resolved_builtin_oauth_grant(
+            auth_api.BuiltinOAuthRevocation(
+                provider="slack",
+                access_token="tok",
+                client_id="cid",
+                client_secret="secret",
+                provider_user_id="42",
+                user_id=1,
+            )
+        )
+
+    delete.assert_not_called()
+    post.assert_not_called()
+    assert "no revoke implementation" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -214,7 +340,7 @@ def test_revoke_google_token_logs_only_genuine_failures(
     monkeypatch.setattr(auth_api.requests, "post", Mock(return_value=response))
 
     with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
-        auth_api._revoke_google_oauth_token("tok")
+        auth_api._revoke_google_oauth_token("tok", kind="refresh_token")
 
     assert bool(caplog.records) is warned
 
@@ -228,7 +354,9 @@ def test_revoke_google_token_swallows_a_failure_without_leaking_it(monkeypatch, 
 
     with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
         # Must not raise.
-        auth_api._revoke_google_oauth_token("secret-refresh-token")
+        auth_api._revoke_google_oauth_token(
+            "secret-refresh-token", kind="refresh_token"
+        )
 
     assert "RuntimeError" in caplog.text
     assert "secret-refresh-token" not in caplog.text

@@ -1378,6 +1378,7 @@ def test_revoke_builtin_oauth_grant_deletes_github_grant_with_decrypted_secret(
         provider="github",
         access_token="live-access-token",
         provider_user_id="42",
+        user_id=1,
     )
 
     delete.assert_called_once()
@@ -1400,7 +1401,7 @@ def test_revoke_builtin_oauth_grant_ignores_providers_without_a_revoke(
     monkeypatch.setattr(auth_api.requests, "post", post)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="slack", access_token="tok", provider_user_id="99"
+        db, provider="slack", access_token="tok", provider_user_id="99", user_id=1
     )
 
     delete.assert_not_called()
@@ -1427,6 +1428,7 @@ def test_revoke_builtin_oauth_grant_swallows_network_failure(
             provider="github",
             access_token="the-live-access-token",
             provider_user_id="42",
+            user_id=1,
         )
 
     delete.assert_called_once()
@@ -1451,7 +1453,7 @@ def test_revoke_builtin_oauth_grant_treats_404_as_success_without_a_warning(
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, provider="github", access_token="tok", provider_user_id="42", user_id=1
     )
 
     delete.assert_called_once()
@@ -1472,7 +1474,7 @@ def test_revoke_builtin_oauth_grant_logs_422_as_a_real_failure(db_session, monke
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, provider="github", access_token="tok", provider_user_id="42", user_id=1
     )
 
     delete.assert_called_once()
@@ -1490,7 +1492,7 @@ def test_revoke_builtin_oauth_grant_is_noop_without_a_provider_row(
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, provider="github", access_token="tok", provider_user_id="42", user_id=1
     )
 
     delete.assert_not_called()
@@ -1524,7 +1526,11 @@ def test_revoke_builtin_oauth_grant_skips_when_another_user_shares_the_account(
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="alices-old-token", provider_user_id="42"
+        db,
+        provider="github",
+        access_token="alices-old-token",
+        provider_user_id="42",
+        user_id=1,
     )
 
     delete.assert_not_called()
@@ -1544,6 +1550,7 @@ def test_resolve_builtin_oauth_revocation_decrypts_credentials(db_session):
         provider="github",
         access_token="live-access-token",
         provider_user_id="42",
+        user_id=1,
     )
 
     assert resolved == auth_api.BuiltinOAuthRevocation(
@@ -1552,6 +1559,7 @@ def test_resolve_builtin_oauth_revocation_decrypts_credentials(db_session):
         client_id="github-client-id",
         client_secret="github-client-secret",
         provider_user_id="42",
+        user_id=1,
     )
 
 
@@ -1562,19 +1570,19 @@ def test_resolve_builtin_oauth_revocation_is_none_when_nothing_to_revoke(db_sess
 
     assert (
         auth_api.resolve_builtin_oauth_revocation(
-            db, provider="slack", access_token="tok", provider_user_id="42"
+            db, provider="slack", access_token="tok", provider_user_id="42", user_id=1
         )
         is None
     )
     assert (
         auth_api.resolve_builtin_oauth_revocation(
-            db, provider="github", access_token="", provider_user_id="42"
+            db, provider="github", access_token="", provider_user_id="42", user_id=1
         )
         is None
     )
     assert (
         auth_api.resolve_builtin_oauth_revocation(
-            db, provider="github", access_token="tok", provider_user_id="42"
+            db, provider="github", access_token="tok", provider_user_id="42", user_id=1
         )
         is None
     )  # no OAuthProvider row seeded yet
@@ -1592,7 +1600,7 @@ def test_resolve_builtin_oauth_revocation_warns_on_missing_provider_row(
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     auth_api.resolve_builtin_oauth_revocation(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, provider="github", access_token="tok", provider_user_id="42", user_id=1
     )
 
     warning.assert_called_once()
@@ -1625,7 +1633,7 @@ def test_resolve_builtin_oauth_revocation_warns_on_unresolvable_secret(
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     result = auth_api.resolve_builtin_oauth_revocation(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, provider="github", access_token="tok", provider_user_id="42", user_id=1
     )
 
     assert result is None
@@ -1649,7 +1657,7 @@ def test_has_other_builtin_oauth_reference_true_for_a_live_sibling_row(db_sessio
 
     assert (
         auth_api.has_other_builtin_oauth_reference(
-            db, provider="github", provider_user_id="42"
+            db, provider="github", provider_user_id="42", user_id=1
         )
         is True
     )
@@ -1660,7 +1668,7 @@ def test_has_other_builtin_oauth_reference_false_without_a_sibling_row(db_sessio
 
     assert (
         auth_api.has_other_builtin_oauth_reference(
-            db, provider="github", provider_user_id="42"
+            db, provider="github", provider_user_id="42", user_id=1
         )
         is False
     )
@@ -1675,7 +1683,7 @@ def test_has_other_builtin_oauth_reference_false_when_id_is_unknown(db_session):
 
     assert (
         auth_api.has_other_builtin_oauth_reference(
-            db, provider="github", provider_user_id=None
+            db, provider="github", provider_user_id=None, user_id=1
         )
         is False
     )
@@ -1695,6 +1703,7 @@ def test_revoke_resolved_github_oauth_grant_calls_github_directly(monkeypatch):
             client_id="cid",
             client_secret="secret",
             provider_user_id="42",
+            user_id=1,
         )
     )
 
@@ -1733,6 +1742,7 @@ def test_revoke_builtin_oauth_grant_if_unreferenced_skips_with_a_live_sibling(
             client_id="cid",
             client_secret="secret",
             provider_user_id="42",
+            user_id=1,
         ),
     )
 
@@ -1755,6 +1765,7 @@ def test_revoke_builtin_oauth_grant_if_unreferenced_revokes_without_a_sibling(
             client_id="cid",
             client_secret="secret",
             provider_user_id="42",
+            user_id=1,
         ),
     )
 
@@ -1789,6 +1800,7 @@ def test_revoke_builtin_oauth_grant_if_unreferenced_rolls_back_a_failed_check():
             client_id="cid",
             client_secret="secret",
             provider_user_id="42",
+            user_id=1,
         ),
     )
 
@@ -1812,6 +1824,7 @@ def test_revoke_resolved_github_oauth_grant_swallows_a_non_request_exception(
             client_id="cid",
             client_secret="secret",
             provider_user_id="42",
+            user_id=1,
         )
     )
 
@@ -1827,6 +1840,7 @@ def test_builtin_oauth_revocation_repr_redacts_the_secrets():
         client_id="github-client-id",
         client_secret="the-live-client-secret",
         provider_user_id="42",
+        user_id=1,
     )
 
     text = repr(revocation)

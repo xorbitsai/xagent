@@ -936,6 +936,7 @@ async def delete_connected_account(
             if account.provider_user_id is not None
             else None
         ),
+        user_id=cast(int, user.id),
         refresh_token=cast(str | None, account.refresh_token),
         token_type=cast(str | None, account.token_type),
     )

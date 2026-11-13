@@ -5,6 +5,7 @@ from .agent_api_key import AgentApiKey
 from .api_idempotency_key import ApiIdempotencyKey
 from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
+from .browser_session import BrowserSession
 from .chat_message import TaskChatMessage
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
@@ -115,6 +116,7 @@ __all__ = [
     "AutoModelConfig",
     "AutoModelCandidate",
     "BackgroundJob",
+    "BrowserSession",
     "BackgroundJobStatus",
     "BackgroundJobType",
     "GmailWatchState",

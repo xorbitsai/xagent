@@ -30,6 +30,7 @@ from ..config import (
     get_public_entries,
     normalize_public_origin,
 )
+from . import browser_idle
 from .models.database import get_db
 from .models.user import User
 from .public_entries import request_public_entry
@@ -129,6 +130,7 @@ def issue_handoff(
     entry = request_public_entry(request)
     claims = {
         **user_session_claims(user),
+        **browser_idle.request_session_claims(user),
         "type": "regional_oauth_launch",
         "purpose": kind,
         "product": context.product,
@@ -262,6 +264,7 @@ def redeem_handoff(
         user is None
         or user.username != claims.get("sub")
         or not auth.matches_user_session(user, claims)
+        or browser_idle.session_rejected(db, user, claims)
     ):
         reject()
     resource = claims.get("resource")

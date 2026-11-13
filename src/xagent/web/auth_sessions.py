@@ -10,6 +10,9 @@ from typing import Any, cast
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from . import browser_idle
+from . import jwt_codec as jwt
+from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from .models.user import User
 
 
@@ -119,7 +122,9 @@ def commit_refresh_credentials(
 ) -> None:
     """Publish credentials only if their authenticated snapshot is still current.
 
-    ``refresh_token`` is the issued JWT; only its digest is stored.
+    ``refresh_token`` is the issued JWT; only its digest is stored. The same
+    transaction records which browser login holds it and, when the token
+    carries a ``sid`` claim, creates that login's row (see browser_idle.py).
 
     Discard pending ORM writes and the read transaction before the conditional
     write (also avoiding SQLite read-to-write snapshot upgrades). A password
@@ -132,6 +137,8 @@ def commit_refresh_credentials(
     }
     if upgraded_password_hash is not None:
         values[User.password_hash] = upgraded_password_hash
+    sid = token_browser_session_id(refresh_token)
+    values[User.browser_session_id] = sid
     changed = (
         db.query(User)
         .filter(
@@ -146,4 +153,20 @@ def commit_refresh_credentials(
         raise HTTPException(
             status_code=401, detail="Credentials changed; sign in again"
         )
+    if sid is not None:
+        browser_idle.add_browser_session(db, user_id, sid)
     db.commit()
+
+
+def token_browser_session_id(token: str) -> str | None:
+    """The browser ``sid`` claim of a token signed by this deployment, if any."""
+    try:
+        claims = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_sub": False, "verify_exp": False},
+        )
+    except jwt.JWTError:
+        return None
+    return browser_idle.claimed_session_id(claims)

@@ -85,7 +85,6 @@ def test_resolve_maps_an_app_key_to_a_google_revocation(db):
         provider="gmail",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=1,
         refresh_token="refresh",
     )
 
@@ -95,7 +94,6 @@ def test_resolve_maps_an_app_key_to_a_google_revocation(db):
         client_id="",
         client_secret="",
         provider_user_id="sub-1",
-        user_id=1,
         refresh_token="refresh",
     )
 
@@ -109,7 +107,6 @@ def test_resolve_skips_a_composio_backed_row(db):
             provider="gmail",
             access_token="ca_composio-account",
             provider_user_id="sub-1",
-            user_id=1,
             token_type=COMPOSIO_TOKEN_TYPE,
         )
         is None
@@ -123,7 +120,6 @@ def test_revocation_repr_redacts_the_refresh_token():
         client_id="",
         client_secret="",
         provider_user_id="sub-1",
-        user_id=1,
         refresh_token="the-refresh-token",
     )
 
@@ -139,7 +135,6 @@ def test_revoke_prefers_the_refresh_token(db, post):
         provider="google-drive",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=1,
         refresh_token="refresh",
     )
 
@@ -152,7 +147,6 @@ def test_revoke_falls_back_to_the_access_token(db, post):
         provider="google",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=1,
     )
 
     _assert_revoked_with(post, "access")
@@ -177,7 +171,6 @@ def test_revoke_skips_while_a_sibling_google_app_is_connected(db, post):
         provider="gmail",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=1,
         refresh_token="refresh",
     )
 
@@ -202,7 +195,6 @@ def test_a_composio_sibling_does_not_block_the_revoke(db, post):
         provider="gmail",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=1,
         refresh_token="refresh",
     )
 
@@ -228,7 +220,6 @@ def test_a_google_row_without_an_upstream_id_is_never_revoked(db, post):
         provider="gmail",
         access_token="access",
         provider_user_id=None,
-        user_id=int(user.id),
         refresh_token="refresh",
     )
 
@@ -254,15 +245,17 @@ def test_a_same_user_google_row_without_an_upstream_id_blocks_the_revoke(db, pos
         provider="google-drive",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=int(user.id),
         refresh_token="refresh",
     )
 
     post.assert_not_called()
 
 
-def test_another_users_google_row_without_an_upstream_id_does_not_block(db, post):
-    user = _user(db)
+def test_another_users_google_row_without_an_upstream_id_blocks_the_revoke(db, post):
+    """Bob's legacy Gmail row may be a connection to the same Google account
+    Alice is disconnecting Drive from; nothing proves it isn't, so Alice's
+    disconnect must not revoke the grant Bob may still use."""
+    _user(db)
     other = _user(db, "bob")
     db.add(
         UserOAuth(
@@ -279,7 +272,42 @@ def test_another_users_google_row_without_an_upstream_id_does_not_block(db, post
         provider="google-drive",
         access_token="access",
         provider_user_id="sub-1",
-        user_id=int(user.id),
+        refresh_token="refresh",
+    )
+
+    post.assert_not_called()
+
+
+def test_a_tokenless_or_composio_google_row_without_an_upstream_id_does_not_block(
+    db, post
+):
+    """Only a row that could still use our grant counts: a disconnected
+    tombstone holds no token, and a Composio row's grant is Composio's."""
+    user = _user(db)
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                provider_user_id=None,
+                access_token="",
+            ),
+            UserOAuth(
+                user_id=int(user.id),
+                provider="google",
+                provider_user_id=None,
+                access_token="ca_composio-account",
+                token_type=COMPOSIO_TOKEN_TYPE,
+            ),
+        ]
+    )
+    db.commit()
+
+    auth_api.revoke_builtin_oauth_grant(
+        db,
+        provider="google-drive",
+        access_token="access",
+        provider_user_id="sub-1",
         refresh_token="refresh",
     )
 
@@ -315,7 +343,6 @@ def test_an_unknown_provider_record_is_skipped_not_sent_to_github(monkeypatch, c
                 client_id="cid",
                 client_secret="secret",
                 provider_user_id="42",
-                user_id=1,
             )
         )
 

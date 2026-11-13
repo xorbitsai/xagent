@@ -33,7 +33,7 @@ from pydantic import (
     StrictStr,
     field_validator,
 )
-from sqlalchemy import and_, or_, text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse
@@ -3760,9 +3760,7 @@ class BuiltinOAuthRevocation(NamedTuple):
     unauthenticated, so they are empty for Google. ``refresh_token`` is only
     used for Google, where it is the token revoked whenever it is present:
     an access token may already have expired, and Google rejects an expired
-    access token without revoking the grant behind it. ``user_id`` is the
-    xagent user the deleted row belonged to: the Google reference check also
-    counts that user's rows whose upstream identity was never recorded.
+    access token without revoking the grant behind it.
     """
 
     provider: str
@@ -3770,7 +3768,6 @@ class BuiltinOAuthRevocation(NamedTuple):
     client_id: str
     client_secret: str
     provider_user_id: str | None
-    user_id: int
     refresh_token: str | None = None
 
     def __repr__(self) -> str:
@@ -3783,7 +3780,7 @@ class BuiltinOAuthRevocation(NamedTuple):
             f"access_token=<redacted>, client_id={self.client_id!r}, "
             f"client_secret=<redacted>, "
             f"provider_user_id={self.provider_user_id!r}, "
-            f"user_id={self.user_id!r}, refresh_token=<redacted>)"
+            f"refresh_token=<redacted>)"
         )
 
 
@@ -3829,7 +3826,6 @@ def resolve_builtin_oauth_revocation(
     provider: str,
     access_token: str,
     provider_user_id: str | None,
-    user_id: int,
     refresh_token: str | None = None,
     token_type: str | None = None,
 ) -> BuiltinOAuthRevocation | None:
@@ -3881,7 +3877,6 @@ def resolve_builtin_oauth_revocation(
             client_id="",
             client_secret="",
             provider_user_id=provider_user_id,
-            user_id=user_id,
             refresh_token=refresh_token or None,
         )
     if oauth_provider != "github" or not access_token:
@@ -3926,12 +3921,11 @@ def resolve_builtin_oauth_revocation(
         client_id=client_id,
         client_secret=client_secret,
         provider_user_id=provider_user_id,
-        user_id=user_id,
     )
 
 
 def has_other_builtin_oauth_reference(
-    db: Session, *, provider: str, provider_user_id: str | None, user_id: int
+    db: Session, *, provider: str, provider_user_id: str | None
 ) -> bool:
     """True if any current ``UserOAuth`` row -- any local user, any owner
     namespace, any key ``provider``'s grants are stored under -- still
@@ -3948,10 +3942,14 @@ def has_other_builtin_oauth_reference(
     upstream account would silently lose their own, still-active token.
     Composio-backed rows don't count: they hold a Composio connected-account
     id for a grant issued to Composio's OAuth app, which a revoke through
-    this deployment's own client never touches. For Google, ``user_id``'s own
-    rows with no recorded ``provider_user_id`` (legacy rows) count too: they
-    may hold the very grant this revoke would kill, and nothing can prove
-    they don't.
+    this deployment's own client never touches. For Google, every row with
+    no recorded ``provider_user_id`` (legacy rows) counts too, whichever
+    user or owner namespace holds it: it may be a connection to the very
+    Google account whose whole grant this revoke would kill -- the same
+    user's Gmail, or another xagent user's -- and nothing can prove it
+    isn't. That keeps Google revocation off while any such row survives,
+    which is the safe failure: a grant left alive, never another
+    connection cut off.
 
     This must be checked with a fresh read taken as late as possible (right
     before the network call, never at snapshot/pre-commit time): the row
@@ -3989,7 +3987,7 @@ def has_other_builtin_oauth_reference(
     if provider == "google":
         same_identity = or_(
             same_identity,
-            and_(UserOAuth.user_id == user_id, UserOAuth.provider_user_id.is_(None)),
+            UserOAuth.provider_user_id.is_(None),
         )
     candidates = (
         db.query(UserOAuth)
@@ -4093,7 +4091,6 @@ def revoke_builtin_oauth_grant_if_unreferenced(
             db,
             provider=revocation.provider,
             provider_user_id=revocation.provider_user_id,
-            user_id=revocation.user_id,
         ):
             logger.info(
                 "Skipping %s OAuth grant revocation: another local "
@@ -4118,7 +4115,6 @@ def revoke_builtin_oauth_grant(
     provider: str,
     access_token: str,
     provider_user_id: str | None,
-    user_id: int,
     refresh_token: str | None = None,
     token_type: str | None = None,
 ) -> None:
@@ -4143,7 +4139,6 @@ def revoke_builtin_oauth_grant(
         provider=provider,
         access_token=access_token,
         provider_user_id=provider_user_id,
-        user_id=user_id,
         refresh_token=refresh_token,
         token_type=token_type,
     )
@@ -4181,7 +4176,6 @@ async def revoke_builtin_oauth_grants(
                 db,
                 provider=revocation.provider,
                 provider_user_id=revocation.provider_user_id,
-                user_id=revocation.user_id,
             ):
                 logger.info(
                     "Skipping %s OAuth grant revocation (%s): another "

@@ -5936,7 +5936,6 @@ def _snapshot_builtin_oauth_revocations(
                 if account.provider_user_id is not None
                 else None
             ),
-            user_id=user_id,
             refresh_token=cast(str | None, account.refresh_token),
             token_type=cast(str | None, account.token_type),
         )

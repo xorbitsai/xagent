@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Type
 from pydantic import BaseModel, Field
 
 from ...core.exa_web_search import ExaWebSearchCore
+from ...core.media_usage import record_web_search_usage
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 
@@ -112,5 +113,6 @@ class ExaWebSearchTool(AbstractBaseTool):
             start_published_date=search_args.start_published_date,
             end_published_date=search_args.end_published_date,
         )
+        record_web_search_usage("platform/exa-search")
 
         return ExaWebSearchResult(results=results).model_dump()

@@ -247,3 +247,16 @@ def record_media_seconds(
         model=model,
         model_id=model_id,
     )
+
+
+def record_web_search_usage(model_id: str) -> None:
+    """Record one web search the search provider answered.
+
+    Call it after the provider call returns: a search that raised -- a missing
+    key, a timeout, an HTTP error -- never reached the provider's bill, so it
+    records nothing. Every returned search is one ``requests``-billed call.
+    ``model_id`` is the provider's platform identity (``platform/<provider>``)
+    rather than a user-configured model, because the platform's own search key
+    pays for it.
+    """
+    record_media_usage(MediaCallType.WEB_SEARCH, 1, model_id=model_id)

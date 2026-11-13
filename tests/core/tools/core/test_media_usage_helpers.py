@@ -6,20 +6,34 @@ unusable if the same model sometimes reports "seconds" and sometimes
 "requests".
 """
 
+from typing import Any
+from unittest.mock import AsyncMock
+
 import pytest
 
+from xagent.core.model.chat import token_context
 from xagent.core.model.chat.token_context import (
     MediaCallType,
     MediaUnit,
     TokenContextManager,
     aggregate_media_usage_by_model,
+    get_token_usage,
 )
+from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
+from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
+from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
+from xagent.core.tools.adapters.vibe.zhipu_web_search import ZhipuWebSearchTool
+from xagent.core.tools.core.exa_web_search import ExaWebSearchCore
 from xagent.core.tools.core.media_usage import (
     coerce_duration,
     record_media_seconds,
     record_media_usage,
+    record_web_search_usage,
     resolve_billing_model,
 )
+from xagent.core.tools.core.tavily_web_search import TavilyWebSearchCore
+from xagent.core.tools.core.web_search import WebSearchCore
+from xagent.core.tools.core.zhipu_web_search import ZhipuWebSearchCore
 
 
 @pytest.mark.parametrize(
@@ -286,3 +300,99 @@ def test_record_media_seconds_leaves_empty_call_types_to_the_primitive(empty) ->
 
         # Swallowed, not raised, and no half-written row left behind.
         assert manager.get_usage().details == []
+
+
+# --- Web search: one row per search the provider answered ---------------------
+
+# Every registered search tool, the core class it calls and the identity its
+# rows carry. The platform's own search key pays the provider, so the identity
+# is the provider itself rather than a user-configured model.
+WEB_SEARCH_PROVIDERS = [
+    (TavilyWebSearchTool, TavilyWebSearchCore, "platform/tavily-search"),
+    (ZhipuWebSearchTool, ZhipuWebSearchCore, "platform/zhipu-web-search"),
+    (ExaWebSearchTool, ExaWebSearchCore, "platform/exa-search"),
+    (WebSearchTool, WebSearchCore, "platform/google-custom-search"),
+]
+WEB_SEARCH_PROVIDER_IDS = ["tavily", "zhipu", "exa", "google"]
+
+
+def _provider_answer(core_class: Any) -> Any:
+    """A success payload in the shape ``core_class.search`` really returns."""
+    if core_class is ZhipuWebSearchCore:
+        # Zhipu answers one response object, which the tool normalises itself.
+        return {"search_result": [{"title": "t", "link": "https://example.com"}]}
+    return [{"title": "t", "link": "https://example.com", "snippet": "s"}]
+
+
+def test_record_web_search_usage_records_the_provider_identity() -> None:
+    with TokenContextManager() as manager:
+        record_web_search_usage("platform/exa-search")
+        details = manager.get_usage().details
+
+    assert len(details) == 1
+    assert details[0]["call_type"] == MediaCallType.WEB_SEARCH
+    assert details[0]["unit"] == "requests"
+    assert details[0]["quantity"] == 1.0
+    assert details[0]["model_id"] == "platform/exa-search"
+
+
+@pytest.mark.parametrize(
+    ("tool_class", "core_class", "model_id"),
+    WEB_SEARCH_PROVIDERS,
+    ids=WEB_SEARCH_PROVIDER_IDS,
+)
+@pytest.mark.asyncio
+async def test_each_provider_search_records_exactly_one_row(
+    monkeypatch, tool_class, core_class, model_id
+) -> None:
+    monkeypatch.setattr(
+        core_class, "search", AsyncMock(return_value=_provider_answer(core_class))
+    )
+
+    with TokenContextManager() as manager:
+        await tool_class().run_json_async({"query": "xagent"})
+        details = manager.get_usage().details
+
+    assert len(details) == 1
+    assert details[0]["call_type"] == "web_search"
+    assert details[0]["unit"] == "requests"
+    assert details[0]["quantity"] == 1.0
+    assert details[0]["model_id"] == model_id
+
+
+@pytest.mark.parametrize(
+    ("tool_class", "core_class", "model_id"),
+    WEB_SEARCH_PROVIDERS,
+    ids=WEB_SEARCH_PROVIDER_IDS,
+)
+@pytest.mark.asyncio
+async def test_a_failed_search_records_nothing(
+    monkeypatch, tool_class, core_class, model_id
+) -> None:
+    # A missing key, a timeout or an HTTP error means the provider never billed
+    # the request, so there is no call to record. The tool still reports the
+    # failure to the model exactly as it did before metering existed.
+    monkeypatch.setattr(
+        core_class, "search", AsyncMock(side_effect=ValueError("search failed"))
+    )
+
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError, match="search failed"):
+            await tool_class().run_json_async({"query": "xagent"})
+        details = manager.get_usage().details
+
+    assert details == []
+
+
+def test_search_metering_without_a_run_context_does_not_raise() -> None:
+    # A search can run with nothing bound to report its usage. The row then goes
+    # to the unbound usage, which is what every other media producer does, and
+    # the search itself is unaffected.
+    token_context.token_context.set(None)
+    try:
+        record_web_search_usage("platform/tavily-search")
+        usage = get_token_usage()
+    finally:
+        token_context.token_context.set(None)
+
+    assert usage.media_calls == 1

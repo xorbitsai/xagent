@@ -347,6 +347,38 @@ def test_enum_members_are_accepted() -> None:
     assert isinstance(entry["unit"], str)
 
 
+def test_web_search_and_composio_bill_in_requests() -> None:
+    # Both are hosted calls paid for by the platform's own keys and grants, and
+    # neither has a finer billable dimension, so a call is one request.
+    for call_type in (MediaCallType.WEB_SEARCH, MediaCallType.COMPOSIO):
+        assert call_type.unit is MediaUnit.REQUESTS
+
+
+@pytest.mark.parametrize(
+    ("call_type", "model_id"),
+    [
+        # The plain string the search tools pass, and the member itself.
+        ("web_search", "platform/tavily-search"),
+        (MediaCallType.COMPOSIO, "platform/composio"),
+    ],
+)
+def test_platform_request_rows_carry_the_provider_identity(call_type, model_id) -> None:
+    usage = TokenUsage()
+    usage.record_media_call(call_type, 1, model_id=model_id)
+
+    assert usage.media_calls == 1
+    entry = usage.details[0]
+    assert entry["type"] == "media"
+    assert entry["call_type"] == call_type
+    assert entry["unit"] == "requests"
+    assert entry["quantity"] == 1.0
+    # The identity is the platform provider id, not a user-configured model
+    # name, so `model` stays empty and rows group on `model_id` alone.
+    assert entry["model"] == ""
+    assert entry["model_id"] == model_id
+    assert entry["provider_tokens"] == 0
+
+
 def test_legacy_positional_construction_still_binds_the_same_fields() -> None:
     # media_calls must NOT be inserted into the historical positional sequence.
     # An existing TokenUsage(input, output, llm_calls, tool_calls, details) call

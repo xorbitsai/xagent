@@ -4226,6 +4226,11 @@ class WebToolConfig(BaseToolConfig):
                         composio_user_id=instance_url,
                     )
                 )
+                # The subprocess runs on Composio's grant, so its tool calls are
+                # billed to Composio rather than to the provider directly. The
+                # MCP adapter reads this to record one row per call; no env var
+                # carries it because nothing in the subprocess acts on it.
+                transport_config["composio"] = True
             else:
                 for env_key, token_type in env_mapping.items():
                     if token_type == "access_token":

@@ -25,6 +25,7 @@ from xagent.core.model.chat.basic.gemini import (
     _flatten_json_schema,
     _sanitize_schema_for_gemini,
 )
+from xagent.core.model.chat.token_context import TokenContextManager
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
@@ -8271,3 +8272,140 @@ def test_google_slides_thumbnail_download_registration(server_name, expected):
     )
     assert adapter._workspace_download_field == expected
     assert ("durable file_ref" in adapter.description) == (expected is not None)
+
+
+# --- Composio metering -------------------------------------------------------
+
+_COMPOSIO_CONNECTION = {
+    "transport": "stdio",
+    "command": "python",
+    "args": [],
+    # Set by the server config for a connector whose subprocess runs on a
+    # Composio grant; every other server's config omits it.
+    "composio": True,
+}
+
+
+def _composio_adapter(connection: Optional[dict[str, Any]] = None) -> MCPToolAdapter:
+    return MCPToolAdapter(
+        mcp_tool=_mcp_tool(),
+        connection=dict(connection or _COMPOSIO_CONNECTION),
+        name_prefix="mcp_Gmail_",
+        source_server="gmail",
+    )
+
+
+def _session_returning(text: str = "ok"):
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[TextContent(type="text", text=text)])
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    return _fake_create_session
+
+
+@pytest.mark.asyncio
+async def test_composio_backed_call_records_one_composio_request(monkeypatch):
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _session_returning())
+    adapter = _composio_adapter()
+
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is False
+    assert len(details) == 1
+    assert details[0]["call_type"] == "composio"
+    assert details[0]["unit"] == "requests"
+    assert details[0]["quantity"] == 1.0
+    assert details[0]["model_id"] == "platform/composio"
+
+
+@pytest.mark.asyncio
+async def test_a_native_connector_call_records_nothing(monkeypatch):
+    # A connector holding its own provider token runs natively: it reaches the
+    # provider directly and is not billed to Composio.
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _session_returning())
+    native_connection = {
+        key: value for key, value in _COMPOSIO_CONNECTION.items() if key != "composio"
+    }
+    adapter = _composio_adapter(native_connection)
+
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is False
+    assert details == []
+
+
+@pytest.mark.asyncio
+async def test_a_composio_call_that_raises_records_nothing(monkeypatch):
+    class _FailingSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            raise RuntimeError("connector failed")
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FailingSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+    adapter = _composio_adapter()
+
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is True
+    assert details == []
+
+
+@pytest.mark.asyncio
+async def test_a_retried_composio_call_is_still_one_request(monkeypatch):
+    """One model-chosen call is one row, however many times it was sent.
+
+    An authorization failure retries the call once with a refreshed connection;
+    the row must not double up for a single tool call.
+    """
+    calls: list[int] = []
+
+    async def _failing_then_retried(_self, connection, tool_args, tool_meta):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("first attempt failed")
+        return {"content": [{"text": "ok"}], "is_error": False}
+
+    monkeypatch.setattr(MCPToolAdapter, "_execute_mcp_call", _failing_then_retried)
+    monkeypatch.setattr(
+        MCPToolAdapter,
+        "_retry_after_authorization_failure",
+        AsyncMock(return_value={"content": [{"text": "ok"}], "is_error": False}),
+    )
+    adapter = _composio_adapter()
+
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is False
+    assert len(calls) == 1
+    assert len(details) == 1
+
+
+@pytest.mark.asyncio
+async def test_composio_metering_without_a_run_context_does_not_raise(monkeypatch):
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _session_returning())
+    adapter = _composio_adapter()
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is False

@@ -50,6 +50,7 @@ from ....file_ref import (
     parse_file_id_ref,
     sanitize_file_ref_for_context,
 )
+from ....model.chat.token_context import MediaCallType
 from ....utils.egress_proxy import get_trusted_proxy_url
 from ....utils.public_http_transport import (
     PublicHttpTransport,
@@ -63,6 +64,7 @@ from ...core.mcp.sessions import (
     create_session,
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
+from ...core.media_usage import record_media_usage
 from .base import AbstractBaseTool, ToolVisibility
 from .config import is_http_status_code
 from .connector_runtime import (
@@ -2394,6 +2396,11 @@ class MCPToolAdapter(AbstractBaseTool):
         runtime_config = connection if isinstance(connection, Mapping) else {}
         self._runtime_bindings = runtime_bindings_from_config(runtime_config)
         self._connector_runtime = connector_runtime_from_config(runtime_config)
+        # Set by the server config only for a connector whose subprocess runs on
+        # a Composio grant, so a call that returns is metered as one Composio
+        # action. Absent for every native connector and every other server,
+        # which are not billed to Composio.
+        self._composio_backed = runtime_config.get("composio") is True
         self._signed_upload = self._usable_signed_upload(signed_upload)
         from .base import ToolCategory
 
@@ -3701,6 +3708,15 @@ class MCPToolAdapter(AbstractBaseTool):
                         if retry_result is None:
                             raise
                         result = retry_result
+                    if self._composio_backed:
+                        # The provider already answered, so the action is billed
+                        # even when a local check below fails it. One row per
+                        # model-chosen tool call: a retry above re-sent the same
+                        # call, and the subprocess may have issued several HTTP
+                        # requests for it.
+                        record_media_usage(
+                            MediaCallType.COMPOSIO, 1, model_id="platform/composio"
+                        )
                     if (
                         self._workspace is not None
                         and self._workspace_download_field is not None

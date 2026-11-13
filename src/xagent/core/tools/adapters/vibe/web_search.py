@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Type
 
 from pydantic import BaseModel, Field
 
+from ...core.media_usage import record_web_search_usage
 from ...core.web_search import WebSearchCore
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -80,5 +81,6 @@ class WebSearchTool(AbstractBaseTool):
             num_results=search_args.num_results,
             include_content=search_args.include_content,
         )
+        record_web_search_usage("platform/google-custom-search")
 
         return WebSearchResult(results=results).model_dump()

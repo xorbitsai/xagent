@@ -30,6 +30,7 @@ from .structured_output_shared import (
     MOMENT,
     NEW_KEYS,
     RECORD,
+    TODAY_TASK_INFO_KEYS,
     bearer,
     create_agent_with_key,
     insert_task,
@@ -99,6 +100,7 @@ def test_the_response_models_new_fields_all_default_to_none():
     assert response.structured_output is None
     assert response.structured_output_status is None
     assert response.structured_output_reason is None
+    assert response.completion_outcome is None
 
 
 def test_a_ready_record_of_the_current_run_is_returned_in_stored_key_order():

@@ -140,3 +140,24 @@ BASELINE_TASKS: list[dict[str, Any]] = [
     {"status": TaskStatus.COMPLETED, "output": "\u00e9 \u4e2d\u6587 \U0001f600"},
 ]
 NEW_KEYS = ("structured_output", "structured_output_status", "structured_output_reason")
+
+# The keys of a GET task response and of a task.completed frame for a task
+# without accept_partial, in order.
+TODAY_TASK_INFO_KEYS = (
+    "task_id",
+    "agent_id",
+    "workforce_id",
+    "status",
+    "run_id",
+    "state_version",
+    "control_state",
+    "input",
+    "output",
+    "error",
+    "error_code",
+    "created_at",
+    "completed_at",
+    "pending_interaction",
+    *NEW_KEYS,
+)
+TODAY_COMPLETED_FRAME_KEYS = ("status", "output", "error", "error_code", *NEW_KEYS)

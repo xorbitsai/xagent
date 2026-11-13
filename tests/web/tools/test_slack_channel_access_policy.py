@@ -242,6 +242,61 @@ def test_listings_filter_out_of_policy_conversations(
     assert request.call_args.kwargs["params"]["types"] == types
 
 
+def test_policy_lists_an_allowed_channel_the_bot_is_not_in(monkeypatch) -> None:
+    # The policy decides which channels may be read; membership decides which
+    # can be read right now. An allowed channel the bot has not joined stays
+    # in the listing, marked, so the agent can ask for the bot to be added.
+    _install_policy(monkeypatch)
+    response = Mock(
+        status_code=200,
+        json=Mock(
+            return_value={
+                "ok": True,
+                "channels": [
+                    {"id": ALLOWED, "name": "allowed", "is_member": False},
+                    {"id": DENIED, "name": "denied", "is_member": True},
+                ],
+            }
+        ),
+        raise_for_status=Mock(),
+    )
+    monkeypatch.setattr(slack.requests, "request", Mock(return_value=response))
+
+    result = json.loads(slack.slack_list_channels())
+
+    assert [(c["id"], c["is_member"]) for c in result["channels"]] == [(ALLOWED, False)]
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda: slack.slack_get_channel_history(ALLOWED),
+        lambda: slack.slack_get_thread_replies(ALLOWED, "1700000000.000100"),
+        lambda: slack.slack_get_channel_info(ALLOWED),
+        lambda: slack.slack_search_messages(ALLOWED, "deploy"),
+    ],
+    ids=["history", "thread_replies", "channel_info", "search"],
+)
+def test_not_a_member_error_under_a_policy_asks_for_invite_not_join(
+    monkeypatch, read
+) -> None:
+    # A policy server drops slack_join_channel at startup, so the error must
+    # not send the agent to it; adding the bot is left to a channel member.
+    _install_policy(monkeypatch)
+    response = Mock(
+        status_code=200,
+        json=Mock(return_value={"ok": False, "error": "not_in_channel"}),
+        raise_for_status=Mock(),
+    )
+    monkeypatch.setattr(slack.requests, "request", Mock(return_value=response))
+
+    result = json.loads(read())
+
+    assert result["status"] == "error"
+    assert "/invite" in result["message"]
+    assert "slack_join_channel" not in result["message"]
+
+
 def test_policy_absence_preserves_legacy_user_id_posting(monkeypatch) -> None:
     response = Mock(
         status_code=200,

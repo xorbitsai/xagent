@@ -69,6 +69,13 @@ def _write_tool(fn: Callable[..., str]) -> Callable[..., str]:
     return mcp.tool()(fn)
 
 
+def _runtime_policy_installed() -> bool:
+    """Whether a runtime policy is installed; the server then offers no write
+    tools, slack_join_channel included."""
+
+    return os.environ.get(_CHANNEL_ACCESS_POLICY_ENV_VAR) is not None
+
+
 def _drop_tools_the_policy_forbids() -> None:
     """Hide the write tools from a server started under a runtime policy.
 
@@ -79,7 +86,7 @@ def _drop_tools_the_policy_forbids() -> None:
     each write tool remains the enforcement; this only stops offering them.
     """
 
-    if os.environ.get(_CHANNEL_ACCESS_POLICY_ENV_VAR) is None:
+    if not _runtime_policy_installed():
         return
     for name in sorted(_WRITE_TOOL_NAMES):
         mcp.remove_tool(name)
@@ -544,7 +551,8 @@ def _request_requiring_membership(
     joining changes the channel's member list, which is visible to everyone
     in it, so the calling agent should check with the user first and only
     then call slack_join_channel — never silently, just because a call
-    failed.
+    failed. Under a runtime policy slack_join_channel is not offered, so the
+    error asks for a channel member to `/invite` the bot instead.
     """
     not_a_member_codes = _NOT_A_MEMBER_CODES_BY_PATH.get(
         path, _DEFAULT_NOT_A_MEMBER_CODES
@@ -576,13 +584,23 @@ def _request_requiring_membership(
             # not_in_channel is unambiguous per Slack's own docs — no need
             # to hedge.
             cause = "because the bot isn't a member of it"
+        if _runtime_policy_installed():
+            # slack_join_channel is not offered under a policy (see
+            # _drop_tools_the_policy_forbids), so only a member can add it.
+            advice = (
+                "tell the user the bot has to be added first — a member of "
+                "the channel needs to run `/invite @<this app's bot name>`."
+            )
+        else:
+            advice = (
+                "ask the user whether to add the bot to it; if they agree, "
+                "call slack_join_channel (only works for a public channel) — "
+                "for a private channel or DM, a member needs to run "
+                "`/invite @<this app's bot name>` instead."
+            )
         raise _SlackNotAMemberError(
-            f"{e.code}: the bot cannot access this channel — {cause}. If "
-            "the channel is genuinely there: ask the user whether to add "
-            "the bot to it; if they agree, call slack_join_channel (only "
-            "works for a public channel) — for a private channel or DM, "
-            "a member needs to run `/invite @<this app's bot name>` "
-            "instead."
+            f"{e.code}: the bot cannot access this channel — {cause}. If the "
+            f"channel is genuinely there: {advice}"
         ) from None
 
 
@@ -667,7 +685,12 @@ def slack_list_channels(
     limit: int = MAX_CHANNELS,
 ) -> str:
     """
-    List public channels in the connected Slack workspace (id, name, is_archived).
+    List public channels in the connected Slack workspace (id, name,
+    is_archived, is_member).
+    is_member: whether this connector's bot is in the channel — true or
+    false as Slack reports it, null when Slack did not say (unknown, not
+    false). Before reading a listed channel, apply
+    slack_get_channel_history's membership rule.
     Use this to resolve a channel name to an id before posting, or to build
     the option list for an ask_user_question when the user has not named a
     channel. The list is discovery, not permission: do not read every
@@ -727,6 +750,10 @@ def slack_list_channels(
                         "id": channel.get("id"),
                         "name": channel.get("name"),
                         "is_archived": channel.get("is_archived", False),
+                        # None when Slack omits it: unknown, not "not a
+                        # member" — a wrong False would make the agent refuse
+                        # a channel it can read.
+                        "is_member": channel.get("is_member"),
                     }
                 )
                 if len(channels) >= max_channels:
@@ -815,11 +842,20 @@ def slack_get_channel_history(
     Each message includes its "ts" (needed for slack_get_thread_replies,
     slack_add_reaction, and replying via slack_post_message's thread_ts) and,
     when it starts a thread, "thread_ts" and "reply_count".
-    If the bot isn't a member of the channel yet, you'll get an actionable
-    error instead of an empty/opaque failure: check with the user before
-    calling slack_join_channel to add the bot (only works for a public
-    channel), or ask a member to `/invite` the bot for a private channel or
-    DM.
+    Membership rule: this connector reads with a bot token, and a bot can
+    read a public channel only while it is a member. A public channel that
+    slack_list_channels returned with is_member false cannot be read yet:
+    do not call slack_get_channel_history, slack_get_thread_replies or
+    slack_search_messages on it — tell the user the bot has to be added
+    first (a member of the channel runs `/invite @<this app's bot name>`).
+    An archived channel cannot be joined or invited into; say so instead.
+    When slack_join_channel is available, you may instead offer to add the
+    bot with it, and call it only once the user agrees. If the user says the
+    bot has since been added, list the channels again or read once: an
+    earlier listing may be stale. For a conversation the listing does not
+    cover (a private channel, a DM, an id passed directly, or a channel
+    named without listing first), just read it: if the bot cannot, the read
+    fails with an error that says what to do, not an empty result.
     Scope rule: read only conversations the user asked for — named in this
     request, described unambiguously as a set by its membership (e.g. "every
     channel whose name starts with support-"), or selected in a previous
@@ -884,11 +920,8 @@ def slack_get_thread_replies(
     thread_ts: the parent message's "ts".
     cursor: pass the next_cursor from a previous call's response to fetch
     the next page of replies.
-    If the bot isn't a member of the channel yet, you'll get an actionable
-    error instead of an empty/opaque failure: check with the user before
-    calling slack_join_channel to add the bot (only works for a public
-    channel), or ask a member to `/invite` the bot for a private channel or
-    DM.
+    If the bot isn't a member of the channel, see
+    slack_get_channel_history's membership rule.
     """
     try:
         channel_id = _resolve_channel_id(channel)
@@ -930,11 +963,8 @@ def slack_get_channel_info(channel: str) -> str:
     """
     Get metadata for a channel, private channel, or DM — including its
     topic, purpose, member count, and archived/private flags.
-    If the bot isn't a member of the channel yet, you'll get an actionable
-    error instead of an empty/opaque failure: check with the user before
-    calling slack_join_channel to add the bot (only works for a public
-    channel), or ask a member to `/invite` the bot for a private channel or
-    DM.
+    If the bot isn't a member of the channel, see
+    slack_get_channel_history's membership rule.
     """
     try:
         channel_id = _resolve_channel_id(channel)
@@ -1069,10 +1099,7 @@ def slack_search_messages(
     Search a channel, private channel, or DM's recent history (and, by
     default, its threads' replies) for messages containing `query`
     (case-insensitive substring match). If the bot isn't a member of the
-    channel yet, you'll get an actionable error instead of an empty/opaque
-    failure: check with the user before calling slack_join_channel to add
-    the bot (only works for a public channel), or ask a member to `/invite`
-    the bot for a private channel or DM.
+    channel, see slack_get_channel_history's membership rule.
     limit: max matching messages to return (default 50, capped at 1000).
     scan_limit: max messages to scan from the conversation's history to look
     for matches in (default 200, capped at 1000) — distinct from `limit`,
@@ -1185,7 +1212,7 @@ def slack_search_messages(
                     # gap distinct from threads never attempted at all
                     # (below) — it must still flag truncated even though
                     # threads_scanned already counts the attempt for budget
-                    # purposes. An actionable "call slack_join_channel"
+                    # purposes. An actionable not-a-member or missing-scope
                     # message always wins over a later transient one (rate
                     # limit, etc.) or over the history-pagination failure
                     # above, so a membership problem is never masked by an

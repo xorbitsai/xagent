@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
-from ...core.agent.result import normalize_tool_failure_code
+from ...core.agent.result import COMPLETION_OUTCOMES, normalize_tool_failure_code
 from ..models.task import TaskStatus
 from .assistant_history_safety import (
     ASSISTANT_RESPONSE_MESSAGE_TYPE,
@@ -60,10 +60,28 @@ def completion_outcome_for_status(
         return None
     outcome = result.get("completion_outcome")
     return (
-        outcome
-        if isinstance(outcome, str) and outcome in {"completed", "partial", "blocked"}
-        else None
+        outcome if isinstance(outcome, str) and outcome in COMPLETION_OUTCOMES else None
     )
+
+
+def reported_completion_outcome(status: TaskStatus, stored: Any) -> str | None:
+    """The completion outcome a task response reports: the stored value when
+    the effective status is COMPLETED and the value is a known outcome, else None."""
+    if status is not TaskStatus.COMPLETED:
+        return None
+    return stored if type(stored) is str and stored in COMPLETION_OUTCOMES else None
+
+
+def completion_outcome_fields(
+    status: TaskStatus, stored: Any, *, accept_partial: bool
+) -> dict[str, str | None]:
+    """The ``completion_outcome`` key of a task response, as a dict to merge in:
+    empty unless the task's format sets accept_partial, so a response for any
+    other task carries no such key; otherwise the reported outcome, which may
+    be None."""
+    if not accept_partial:
+        return {}
+    return {"completion_outcome": reported_completion_outcome(status, stored)}
 
 
 def execution_result_diagnostic_error(result: Mapping[str, Any]) -> str:

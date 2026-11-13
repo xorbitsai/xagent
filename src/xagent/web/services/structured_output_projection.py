@@ -196,6 +196,15 @@ def response_format_configured(agent_config: Any) -> bool:
     )
 
 
+def response_format_accepts_partial(agent_config: Any) -> bool:
+    """Whether the stored format of ``agent_config`` sets accept_partial: the
+    format is a dict whose accept_partial is exactly True."""
+    if type(agent_config) is not dict:
+        return False
+    stored = agent_config.get(RESPONSE_FORMAT_CONFIG_KEY)
+    return type(stored) is dict and stored.get("accept_partial") is True
+
+
 def _reason_fields(
     code: str,
     lists: dict[str, list[str]] | None = None,

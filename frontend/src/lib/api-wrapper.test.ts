@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { IDBDatabase } from "fake-indexeddb"
+import "fake-indexeddb/auto"
 
 import {
   apiRequest,
@@ -370,6 +372,35 @@ describe("api-wrapper auth refresh", () => {
     expect(readAuthCache()).toMatchObject({ token: "new-access", refreshToken: "new-refresh" })
   })
 
+  it("uses one refresh request across isolated module realms without Web Locks", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      access_token: "new-access",
+      refresh_token: "new-refresh",
+      expires_in: 120,
+      refresh_expires_in: 240,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))
+
+    vi.resetModules()
+    const firstCache = await import("@/lib/auth-cache")
+    const firstApi = await import("@/lib/api-wrapper")
+    const snapshot = firstCache.readAuthSessionSnapshot()
+    vi.resetModules()
+    const secondApi = await import("@/lib/api-wrapper")
+
+    const [first, second] = await Promise.all([
+      firstApi.refreshStoredAccessToken(snapshot),
+      secondApi.refreshStoredAccessToken(snapshot),
+    ])
+
+    expect(first).toMatchObject({ status: "refreshed", accessToken: "new-access" })
+    expect(second).toMatchObject({ status: "advanced", accessToken: "new-access" })
+    expect(vi.mocked(globalThis.fetch).mock.calls.filter(([input]) => String(input).endsWith("/api/auth/refresh"))).toHaveLength(1)
+    expect(readAuthCache()).toMatchObject({ token: "new-access", refreshToken: "new-refresh" })
+  })
+
   it("allows logout to acquire the mutation lock while refresh HTTP is pending", async () => {
     writeAuthCache(user, "old-access", "old-refresh", 120, 240)
     mockQueuedNavigatorLocks()
@@ -394,14 +425,106 @@ describe("api-wrapper auth refresh", () => {
     expect(readAuthCache()).toBeNull()
   })
 
-  it("does not issue a conditional refresh without Web Locks while explicit logout remains available", async () => {
+  it("refreshes and logs out without Web Locks", async () => {
     writeAuthCache(user, "old-access", "old-refresh", 120, 240)
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
-    const fetchMock = vi.spyOn(globalThis, "fetch")
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      access_token: "new-access",
+      refresh_token: "new-refresh",
+      expires_in: 120,
+      refresh_expires_in: 240,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))
 
-    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "unavailable", accessToken: null, reason: "coordination_unavailable" })
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toMatchObject({ status: "refreshed", accessToken: "new-access" })
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(readAuthCache()).toBeNull()
+  })
+
+  it("does not restore a no-lock session after logout wins during refresh", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    const refreshStarted = deferred<void>()
+    const refreshResponse = deferred<Response>()
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      if (!String(input).endsWith("/api/auth/refresh")) throw new Error("expected refresh request")
+      refreshStarted.resolve()
+      return refreshResponse.promise
+    })
+    const refresh = refreshStoredAccessToken(readAuthSessionSnapshot())
+    await refreshStarted.promise
+
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+    expect(readAuthCache()).toBeNull()
+    refreshResponse.resolve(new Response(JSON.stringify({
+      success: true,
+      access_token: "late-access",
+      refresh_token: "late-refresh",
+      expires_in: 120,
+      refresh_expires_in: 240,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))
+
+    await expect(refresh).resolves.toEqual({ status: "not_current", accessToken: null })
+    expect(readAuthCache()).toBeNull()
+  })
+
+  it("keeps the winning no-lock refresh when an aborted lock lets a peer receive 401", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    const originalTransaction = IDBDatabase.prototype.transaction
+    let firstRefreshTransaction: IDBTransaction | null = null
+    vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (this: IDBDatabase, ...args) {
+      const transaction = Reflect.apply(originalTransaction, this, args) as IDBTransaction
+      if (!firstRefreshTransaction && transaction.objectStoreNames.contains("auth-refreshes")) firstRefreshTransaction = transaction
+      return transaction
+    })
+    const firstRefreshStarted = deferred<void>()
+    const secondRefreshStarted = deferred<void>()
+    const releaseFirstRefresh = deferred<void>()
+    let refreshRequests = 0
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).endsWith("/api/auth/refresh")) {
+        refreshRequests += 1
+        if (refreshRequests === 1) {
+          firstRefreshStarted.resolve()
+          await releaseFirstRefresh.promise
+          return new Response(JSON.stringify({
+            success: true,
+            access_token: "new-access",
+            refresh_token: "new-refresh",
+            expires_in: 120,
+            refresh_expires_in: 240,
+          }), { status: 200, headers: { "Content-Type": "application/json" } })
+        }
+        secondRefreshStarted.resolve()
+        return new Response(null, { status: 401 })
+      }
+      const authorization = new Headers(options?.headers).get("Authorization")
+      return authorization === "Bearer new-access"
+        ? new Response(null, { status: 200 })
+        : new Response(null, { status: 401, headers: { "Error-Type": "TokenExpired" } })
+    })
+
+    vi.resetModules()
+    const firstCache = await import("@/lib/auth-cache")
+    const firstApi = await import("@/lib/api-wrapper")
+    const snapshot = firstCache.readAuthSessionSnapshot()
+    const firstRefresh = firstApi.refreshStoredAccessToken(snapshot)
+    await firstRefreshStarted.promise
+    expect(firstRefreshTransaction).not.toBeNull()
+    firstRefreshTransaction!.abort()
+
+    vi.resetModules()
+    const secondApi = await import("@/lib/api-wrapper")
+    const peerRequest = secondApi.apiRequest("http://api.local/protected")
+    await secondRefreshStarted.promise
+    releaseFirstRefresh.resolve()
+
+    await expect(firstRefresh).resolves.toMatchObject({ status: "refreshed", accessToken: "new-access" })
+    await expect(peerRequest).resolves.toMatchObject({ status: 200 })
+    expect(refreshRequests).toBe(2)
+    expect(readAuthCache()).toMatchObject({ token: "new-access", refreshToken: "new-refresh" })
   })
 
   it("returns rejected without making a refresh request when the captured session has no refresh credential", async () => {

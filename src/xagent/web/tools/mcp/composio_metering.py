@@ -36,9 +36,12 @@ class ComposioMeteringFastMCP(FastMCP):
         if isinstance(result, CallToolResult):
             result.meta = {**(result.meta or {}), **meta}
             return result
-        content, structured = result
-        tool_result = CallToolResult(
-            content=list(content), structuredContent=structured
-        )
+        if isinstance(result, tuple):
+            content, structured = result
+            tool_result = CallToolResult(
+                content=list(content), structuredContent=structured
+            )
+        else:
+            tool_result = CallToolResult(content=list(result))
         tool_result.meta = meta
         return tool_result

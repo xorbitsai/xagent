@@ -34,6 +34,11 @@ def _server() -> ComposioMeteringFastMCP:
     def accepted_nothing() -> str:
         return "ok"
 
+    @mcp.tool(structured_output=False)
+    def accepted_without_an_output_schema() -> str:
+        composio_proxy.record_accepted_request()
+        return "ok"
+
     return mcp
 
 
@@ -57,6 +62,23 @@ async def test_a_call_that_accepts_nothing_reports_zero() -> None:
 
     assert result.isError is False
     assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 0}
+
+
+@pytest.mark.asyncio
+async def test_a_tool_without_an_output_schema_still_reports_its_count() -> None:
+    """A tool that declares no output schema gets only a content list back.
+
+    FastMCP returns ``(content, structured)`` only when the tool declares an
+    output schema and returns the bare content list otherwise, so both shapes
+    have to come back as a result carrying the count.
+    """
+    async with create_connected_server_and_client_session(
+        _server()._mcp_server
+    ) as session:
+        result = await session.call_tool("accepted_without_an_output_schema", {})
+
+    assert result.isError is False
+    assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 1}
 
 
 @pytest.mark.asyncio

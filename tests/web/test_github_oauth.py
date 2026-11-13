@@ -1387,25 +1387,24 @@ def test_revoke_builtin_oauth_grant_deletes_github_grant_with_decrypted_secret(
     assert kwargs["json"] == {"access_token": "live-access-token"}
 
 
-def test_revoke_builtin_oauth_grant_ignores_non_github_providers(
+def test_revoke_builtin_oauth_grant_ignores_providers_without_a_revoke(
     db_session, monkeypatch
 ):
-    """Only GitHub needs this today; every other provider is a no-op and
-    must not even query the database, let alone call out to it."""
+    """Only GitHub and Google have a revoke implementation; every other
+    provider is a no-op and must not call out to anything."""
     db, _user = db_session
 
-    class ExplodingQuery:
-        def query(self, *args, **kwargs):
-            raise AssertionError("non-github provider must not query the database")
-
     delete = Mock()
+    post = Mock()
     monkeypatch.setattr(auth_api.requests, "delete", delete)
+    monkeypatch.setattr(auth_api.requests, "post", post)
 
     auth_api.revoke_builtin_oauth_grant(
-        ExplodingQuery(), provider="slack", access_token="tok", provider_user_id="99"
+        db, provider="slack", access_token="tok", provider_user_id="99"
     )
 
     delete.assert_not_called()
+    post.assert_not_called()
 
 
 def test_revoke_builtin_oauth_grant_swallows_network_failure(

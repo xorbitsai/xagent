@@ -2,7 +2,7 @@
 
 ``POST /v1/chat/tasks/{task_id}/cancel`` is split in two halves that live
 here. The request half authorizes the caller, refuses a target that cannot
-be cancelled, persists a CANCEL command and waits a bounded time for it.
+be cancelled, persists a CANCEL command and polls a bounded time for it.
 The execution half runs wherever that command is applied -- the process
 that owns the task -- and is the SDK counterpart of the A2A and external
 cores, which load their targets by ``Task.source`` and so cannot reach an
@@ -292,27 +292,25 @@ def _load_result_sync(
     ``aimed_run_id`` is the run the command was persisted against. A
     completed command cancelled that run, so the answer names it as
     ``cancelled_run_id`` while every other field describes the row now,
-    which may already show a later run. Otherwise the row's outcome is
-    reported only when it belongs to the aimed run: one that ended on its
-    own raises ``SdkTaskNotCancellable``, exactly as the request would have
-    on arrival. A turn queued since then is not described by the row, so
-    that check is skipped for it.
+    which may already show a later run. Otherwise the answer is about the
+    aimed run only. A row that shows another run means the aimed one is
+    over, and retrying would aim at the new one, so it raises
+    ``SdkTaskNotCancellable`` with ``_AIMED_RUN_ENDED_MESSAGE``. An aimed
+    run that ended on its own raises ``SdkTaskNotCancellable`` exactly as
+    the request would have on arrival, whether or not a later turn is
+    queued behind it.
     """
 
     from .task_start import resolve_sdk_task
-    from .task_start_protocol import has_queued_start
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        queued = has_queued_start(db, task_id)
         task = resolve_sdk_task(task_id, scope, db)
         if command_completed:
             return replace(_result(task), cancelled=True, cancelled_run_id=aimed_run_id)
-        if (
-            not queued
-            and _task_run_id(task) == aimed_run_id
-            and _ended_without_cancel(db, task)
-        ):
+        if _task_run_id(task) != aimed_run_id:
+            raise SdkTaskNotCancellable(_AIMED_RUN_ENDED_MESSAGE)
+        if _ended_without_cancel(db, task):
             raise SdkTaskNotCancellable
         return _result(task)
 
@@ -320,7 +318,10 @@ def _load_result_sync(
 async def request_sdk_task_cancel(
     *, task_id: int, scope: SdkTaskScope
 ) -> SdkTaskCancelResult:
-    """Authorize and cancel one SDK task, waiting a bounded time for it.
+    """Authorize and cancel one SDK task, polling a bounded time for it.
+
+    The poll is bounded; a cancel applied in this process first waits for
+    the cancelled run to stop, which has no upper bound.
 
     ``scope`` is the calling key's ``SdkTaskScope``. A task outside it, a
     missing one and a non-SDK one raise the same ``TaskStartRejected`` the
@@ -368,16 +369,11 @@ async def request_sdk_task_cancel(
             )
             if command_completed:
                 return result
-            stale = stored.rejection_reason == "stale_run"
-            if stale and result.run_id != aimed_run_id:
-                # The aimed run is over and the row shows another one;
-                # retrying would cancel that one instead.
-                raise SdkTaskNotCancellable(_AIMED_RUN_ENDED_MESSAGE)
             # The row decides, not the command: a command that lost to
             # another cancel of the same run still finds the task cancelled.
             if result.cancelled:
                 return result
-            if stale:
+            if stored.rejection_reason == "stale_run":
                 raise SdkTaskCancelBusy(
                     "The task changed state while the cancel was applied; retry."
                 )

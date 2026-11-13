@@ -599,6 +599,34 @@ def test_a_cancel_aimed_at_a_run_that_was_replaced_is_not_cancellable(
     assert len(_cancel_commands(task_id)) == 1
 
 
+def test_a_cancel_still_pending_when_its_run_was_replaced_is_not_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The wait ends with the command still queued and the row already on
+    another run: the aimed run is over, so the answer is not an accepted 202
+    that a retry would turn into a cancel of the new run."""
+    task_id, _agent_id, key = _running_task()
+
+    async def replaced_while_nothing_applies(*_args: Any, **_kwargs: Any) -> bool:
+        _update(task_id, run_id="run-next", state_version=50)
+        return False
+
+    monkeypatch.setattr(
+        sdk_task_cancel, "dispatch_one_task_command", replaced_while_nothing_applies
+    )
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    assert (
+        response.json()["error"]["message"]
+        == "The run this cancel was aimed at has already ended."
+    )
+    assert _row(task_id)["run_id"] == "run-next"
+
+
 def test_a_turn_queued_while_the_cancel_was_applied_still_reports_the_cancel(
     monkeypatch: pytest.MonkeyPatch,
 ):

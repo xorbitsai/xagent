@@ -65,6 +65,7 @@ from ...services.api_idempotency import IdempotencyClaim
 from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
+from ...services.execution_result_projection import completion_outcome_fields
 from ...services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -86,6 +87,7 @@ from ...services.response_format import (
 from ...services.sdk_task_cancel import sdk_cancel_error_code
 from ...services.structured_output_projection import (
     project_structured_output,
+    response_format_accepts_partial,
     response_format_configured,
 )
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
@@ -596,6 +598,11 @@ class _TaskInfoSnapshot:
     # request, ``None`` for every other row. Cleared like ``error`` wherever
     # the status shown is not the stored one.
     error_code: str | None = None
+    # Read from the same row: the stored completion rating and whether the
+    # task's stored format sets accept_partial, which decides if the response
+    # carries a completion_outcome key at all.
+    completion_outcome: Any = None
+    accept_partial: bool = False
 
 
 # Terminal statuses an append is accepted from. With shared execution the row
@@ -875,6 +882,8 @@ def _load_task_info_snapshot(
             error_code=sdk_cancel_error_code(
                 task.status, cast(str | None, task.error_message)
             ),
+            completion_outcome=task.completion_outcome,
+            accept_partial=response_format_accepts_partial(task.agent_config),
         )
 
 
@@ -1021,7 +1030,8 @@ def _get_chat_task_sync(
     current. The cached body holds the stored values; the view is applied
     to the response after every cache read or write. A queued START is
     applied the same way, for the same reason. So are the structured output
-    fields: the cached body holds them as null.
+    fields and the completion_outcome key: the cached body holds the fields
+    as null and has no such key.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -1064,6 +1074,15 @@ def _get_chat_task_sync(
             record=task.structured_output_record,
             format_configured=task.format_configured,
         ).as_dict()
+    )
+    # The key is absent unless the stored format sets accept_partial, so it is
+    # only ever added here, never passed to the cached response.
+    overlay.update(
+        completion_outcome_fields(
+            effective_task_snapshot(task).status,
+            task.completion_outcome,
+            accept_partial=task.accept_partial,
+        )
     )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)

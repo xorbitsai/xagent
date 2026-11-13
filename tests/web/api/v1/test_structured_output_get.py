@@ -35,6 +35,7 @@ from .structured_output_shared import (
     create_agent_with_key,
     insert_task,
     recorded_statements,
+    stored_format_config,
     task_selects,
 )
 
@@ -255,3 +256,97 @@ def test_the_message_of_a_reason_is_the_fixed_text_of_its_code(code):
         assert "missing_fields" not in resp.text
     if code not in ("information_missing", "value_not_expressible"):
         assert "unexpressible_fields" not in resp.text
+
+
+# --- the completion_outcome key -------------------------------------------------
+
+SWITCH_OFF_CONFIGS = {
+    "no-format": None,
+    "no-switch": stored_format_config(),
+    "switch-false": stored_format_config(accept_partial=False),
+}
+SWITCH_ON_CONFIG = stored_format_config(accept_partial=True)
+TERMINAL_VIEW = TerminalView(
+    state="stopped", error="stopped", stopped_at=MOMENT, reason="x"
+)
+
+# (id, rating stored on the row, snapshot changes that make the effective state)
+EFFECTIVE_STATES = [
+    ("completed-completed", "completed", {}),
+    ("completed-partial", "partial", {}),
+    ("completed-blocked", "blocked", {}),
+    ("completed-unrated", None, {}),
+    ("pending", "partial", {"start_queued": True}),
+    ("failed-view", "partial", {"view": TERMINAL_VIEW}),
+]
+
+
+def _get_body(key, task_id, cached: bool, request):
+    if cached:
+        request.getfixturevalue("task_cache")
+        get(key, task_id)
+    return get(key, task_id)
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["miss", "hit"])
+@pytest.mark.parametrize(
+    ("rating", "changes"),
+    [state[1:] for state in EFFECTIVE_STATES],
+    ids=[state[0] for state in EFFECTIVE_STATES],
+)
+@pytest.mark.parametrize("config", SWITCH_OFF_CONFIGS.values(), ids=SWITCH_OFF_CONFIGS)
+def test_switch_off_responses_have_no_completion_outcome(
+    config, rating, changes, cached, monkeypatch, request
+):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(
+        agent_id, agent_config=config, completion_outcome=rating, moment=MOMENT
+    )
+    _with_snapshot(monkeypatch, **changes)
+
+    body = json.loads(_get_body(key, task_id, cached, request).text)
+
+    assert tuple(body) == TODAY_TASK_INFO_KEYS
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["miss", "hit"])
+@pytest.mark.parametrize(
+    ("rating", "changes"),
+    [state[1:] for state in EFFECTIVE_STATES],
+    ids=[state[0] for state in EFFECTIVE_STATES],
+)
+def test_switch_on_response_ends_with_the_reported_outcome(
+    rating, changes, cached, monkeypatch, request
+):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(
+        agent_id, agent_config=SWITCH_ON_CONFIG, completion_outcome=rating
+    )
+    _with_snapshot(monkeypatch, **changes)
+
+    body = json.loads(_get_body(key, task_id, cached, request).text)
+
+    reported = rating if not changes else None
+    assert tuple(body) == (*TODAY_TASK_INFO_KEYS, "completion_outcome")
+    assert body["completion_outcome"] == reported
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{}, {"start_queued": True}, {"view": TERMINAL_VIEW}],
+    ids=["none", "start-queued", "view"],
+)
+def test_the_cache_body_never_holds_completion_outcome(
+    changes, monkeypatch, task_cache
+):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(
+        agent_id, agent_config=SWITCH_ON_CONFIG, completion_outcome="partial"
+    )
+    _with_snapshot(monkeypatch, **changes)
+
+    first = get(key, task_id)
+    second = get(key, task_id)
+
+    assert "completion_outcome" not in cache_get(task_snapshot_key(task_id))["response"]
+    assert second.text == first.text

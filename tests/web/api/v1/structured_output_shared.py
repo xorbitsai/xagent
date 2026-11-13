@@ -56,6 +56,7 @@ def insert_task(
     error: str | None = None,
     title: str = "structured output task",
     moment: datetime | None = None,
+    completion_outcome: str | None = None,
 ) -> int:
     """One SDK task row, with its structured output record and agent_config."""
     db = _direct_db_session()
@@ -74,6 +75,7 @@ def insert_task(
             run_id=run_id,
             agent_config=agent_config,
             error_message=error,
+            completion_outcome=completion_outcome,
         )
         if moment is not None:
             task.created_at = moment
@@ -115,6 +117,22 @@ def task_selects(statements: list[str]) -> list[str]:
 
 
 FORMAT_CONFIG = {"response_format": {"type": "json_schema", "name": "answer"}}
+
+
+def stored_format_config(**switch: bool) -> dict[str, Any]:
+    """The agent_config of a task whose stored format is complete, with the
+    accept_partial switch stored as given (not stored when not given)."""
+    return {
+        "response_format": {
+            "type": "json_schema",
+            "name": "answer",
+            "schema": {"type": "object", "properties": {}},
+            "description": None,
+            **switch,
+        }
+    }
+
+
 MOMENT = datetime(2026, 11, 1, 8, 30, tzinfo=timezone.utc)
 RECORD = {
     "run_id": "run-1",

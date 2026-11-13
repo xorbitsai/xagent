@@ -13,6 +13,7 @@ import pytest
 
 from xagent.core.agent import structured_output as so
 from xagent.core.agent import structured_schema as ss
+from xagent.core.agent.result import COMPLETION_OUTCOMES
 from xagent.core.agent.trace import SYSTEM_INFO
 from xagent.core.model.chat.basic.call_boundary import ProviderCallError
 from xagent.core.model.chat.exceptions import LLMRetryableError, LLMToolProtocolError
@@ -33,11 +34,12 @@ def _obj(properties: dict[str, Any], **extra: Any) -> dict[str, Any]:
     return node
 
 
-def _fmt(schema: dict[str, Any] | None = None) -> Any:
+def _fmt(schema: dict[str, Any] | None = None, accept_partial: bool = False) -> Any:
     return so.StructuredOutputFormat(
         name="shape",
         description=None,
         schema=schema or _obj({"a": STRING, "b": NULLABLE_STRING}),
+        accept_partial=accept_partial,
     )
 
 
@@ -899,7 +901,9 @@ async def test_the_shape_check_going_over_its_limit_is_the_same_outcome(
     monkeypatch, caplog
 ):
     monkeypatch.setattr(
-        so, "judge_instance", lambda compiled, value: ss.TooComplex("r1", 200_001, 0, 0)
+        so,
+        "judge_instance",
+        lambda compiled, value, **kwargs: ss.TooComplex("r1", 200_001, 0, 0),
     )
     llm = ScriptedModel([_args_reply(GOOD)])
     with caplog.at_level(logging.WARNING):
@@ -1426,6 +1430,9 @@ EVENT_KEYS = {
     "answer_chars",
     "duration_ms",
     "text_only_replies",
+    "accept_partial",
+    "agent_outcome",
+    "partial_output",
 }
 
 
@@ -1456,6 +1463,9 @@ async def test_the_event_holds_the_routing_keys_and_only_counts_and_fixed_names(
         "answer_chars": len("Bo is here"),
         "duration_ms": data["duration_ms"],
         "text_only_replies": 1,
+        "accept_partial": False,
+        "agent_outcome": "completed",
+        "partial_output": False,
     }
     assert type(data["duration_ms"]) is int and data["duration_ms"] >= 0
 
@@ -1563,24 +1573,231 @@ def test_settled_partial_output_only_incomplete() -> None:
         "reason": {"code": "information_missing"},
         "partial_output": partial,
     }
-    assert "partial_output" not in so._settled("incomplete", "information_missing")
-    assert "partial_output" not in so._settled("failed", "model_error")
-    assert "partial_output" not in so._settled("ready", output={"a": "x"})
 
 
-def test_a_verdict_with_a_value_settles_with_that_value_under_its_own_key() -> None:
-    compiled = ss.compile_schema(_obj({"a": STRING, "g": STRING}))
-    verdict = ss.judge_instance(compiled, {"a": "x", "g": None}, keep_output=True)
+# --- accept_partial ------------------------------------------------------------------
 
-    settled = so._settled_from_verdict(verdict)
+_GAP_SHAPE = _obj({"a": STRING, "g": STRING})
+_WITH_GAP = {"a": "x", "g": None}
+_COMPLETE = {"a": "x", "g": "y"}
 
-    assert settled["status"] == "incomplete" and settled["output"] is None
-    assert settled["reason"] == {
+
+def _eligibility_cells() -> list[Any]:
+    """``(outcome, switch, empty answer, expected)`` for every cell of the
+    eligibility table that accept_partial changes or leaves alone."""
+    empty = _settled("incomplete", "information_missing", missing_fields=["/a", "/g"])
+    cells: list[Any] = []
+    for outcome in [*sorted(COMPLETION_OUTCOMES), None]:
+        for switch in (False, True):
+            for blank in (False, True):
+                if blank:
+                    expected: Any = empty
+                elif outcome in EXPECTED_SELF_RATED and not switch:
+                    expected = _settled("incomplete", EXPECTED_SELF_RATED[outcome])
+                else:
+                    expected = so.EXTRACT
+                if blank and outcome in EXPECTED_SELF_RATED and not switch:
+                    expected = _settled("incomplete", EXPECTED_SELF_RATED[outcome])
+                cells.append((outcome, switch, blank, expected))
+    return cells
+
+
+EXPECTED_SELF_RATED = {"partial": "agent_partial", "blocked": "agent_blocked"}
+
+
+def test_eligibility_accept_partial_matrix() -> None:
+    cells = _eligibility_cells()
+    for outcome, switch, blank, expected in cells:
+        result = _result(
+            completion_outcome=outcome, output="" if blank else "The answer."
+        )
+        got = so.structured_output_eligibility(result, _fmt(_GAP_SHAPE, switch))
+        assert got == expected, (outcome, switch, blank)
+    invalid_cells = 0
+    for outcome in EXPECTED_SELF_RATED:
+        got = so.structured_output_eligibility(
+            _result(completion_outcome=outcome), so.StructuredOutputFormat.INVALID
+        )
+        assert got == _settled("failed", "invalid_stored_format")
+        invalid_cells += 1
+    assert len(cells) + invalid_cells == 18
+    # An empty answer is judged the same whatever the switch says.
+    by_cell = {cell[:3]: cell[3] for cell in cells}
+    for outcome in ("completed", None):
+        assert by_cell[(outcome, True, True)] == by_cell[(outcome, False, True)]
+
+
+_OUTCOME_BEFORE: list[Any] = [
+    ("ready", _settled("ready", output={"a": "x", "g": "y"})),
+    (
+        "missing-with-values",
+        {
+            **_settled("incomplete", "information_missing", missing_fields=["/g"]),
+            "partial_output": _WITH_GAP,
+        },
+    ),
+    (
+        "unexpressible-with-values",
+        {
+            **_settled(
+                "incomplete", "value_not_expressible", unexpressible_fields=["/g"]
+            ),
+            "partial_output": _WITH_GAP,
+        },
+    ),
+    (
+        "missing-without-values",
+        _settled("incomplete", "information_missing", missing_fields=["/a"]),
+    ),
+    (
+        "unexpressible-without-values",
+        _settled("incomplete", "value_not_expressible", unexpressible_fields=["/a"]),
+    ),
+]
+
+
+def _failed_codes_to_label() -> list[str]:
+    from xagent.web.services.structured_output_projection import _FAILED_CODES
+
+    return sorted(_FAILED_CODES - {"invalid_stored_format"})
+
+
+@pytest.mark.parametrize("code", ["agent_partial", "agent_blocked"])
+def test_label_self_rated_run(code: str) -> None:
+    failed = [(f"failed-{c}", _settled("failed", c)) for c in _failed_codes_to_label()]
+    cells = [*_OUTCOME_BEFORE, *failed]
+    assert len(cells) == 10
+    for name, before in cells:
+        frozen = copy.deepcopy(before)
+        labeled = so._label_self_rated_run(before, code)
+        assert before == frozen, name
+        base = _settled("incomplete", code)
+        if before["status"] == "ready":
+            assert labeled == {**base, "partial_output": before["output"]}, name
+        elif "partial_output" in before:
+            reason = before["reason"]
+            gaps = {
+                key: reason[key]
+                for key in ("missing_fields", "unexpressible_fields")
+                if key in reason
+            }
+            assert labeled == {
+                **base,
+                "partial_output": before["partial_output"],
+                "partial_gaps": gaps,
+            }, name
+            assert gaps, name
+        else:
+            assert labeled == base, name
+
+
+async def test_extract_passes_keep_output(monkeypatch, caplog) -> None:
+    seen: list[Any] = []
+    real = so.judge_instance
+
+    def spy(compiled: Any, instance: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(compiled, instance, **kwargs)
+
+    monkeypatch.setattr(so, "judge_instance", spy)
+
+    async def run(switch: bool, limit: int | None) -> tuple[Any, list[str]]:
+        seen.clear()
+        caplog.clear()
+        with monkeypatch.context() as scoped:
+            if limit is not None:
+                scoped.setattr(ss, "MAX_RESULT_BYTES", limit)
+            with caplog.at_level(logging.WARNING):
+                outcome = await _step(
+                    ScriptedModel([_args_reply(_WITH_GAP)]),
+                    _fmt(_GAP_SHAPE, switch),
+                )
+        dropped = [m for m in _warnings(caplog) if "partial result was dropped" in m]
+        return outcome, dropped
+
+    off, off_logs = await run(False, None)
+    assert seen == [{"keep_output": False}]
+    assert "partial_output" not in off and off_logs == []
+
+    kept, kept_logs = await run(True, None)
+    assert seen == [{"keep_output": True}]
+    assert kept["partial_output"] == _WITH_GAP and kept_logs == []
+
+    dropped, logs = await run(True, 1)
+    assert dropped["status"] == "incomplete" and "partial_output" not in dropped
+    assert dropped["reason"] == {
         "code": "information_missing",
         "missing_fields": ["/g"],
     }
-    assert settled["partial_output"] == {"a": "x", "g": None}
-    without = so._settled_from_verdict(
-        ss.judge_instance(compiled, {"a": "x", "g": None})
+    (message,) = logs
+    assert message == (
+        "Structured output partial result was dropped for size. task_id=t-1 "
+        "run_id=r-1 missing_count=1 unexpressible_count=0 r1_steps=3 "
+        "expansion_nodes=0 output_bytes=%d" % (len('{"a":"x","g":null}'))
     )
-    assert "partial_output" not in without
+
+
+_EXTRACTIONS = {
+    "ready": ([_args_reply(_COMPLETE)], None, "ready", False),
+    "incomplete-kept": ([_args_reply(_WITH_GAP)], None, "incomplete", True),
+    "incomplete-dropped": ([_args_reply(_WITH_GAP)], 1, "incomplete", False),
+    "failed": ([_text_reply()] * 3, None, "failed", False),
+}
+_RATINGS: list[Any] = [*sorted(COMPLETION_OUTCOMES), None, "other", ["list"]]
+_SELF_RATED = {"partial", "blocked"}
+
+
+async def _traced(
+    monkeypatch: Any, rating: Any, switch: bool, name: str
+) -> dict[str, Any]:
+    script, limit, _, _ = _EXTRACTIONS[name]
+    tracer = RecordingTracer()
+    with monkeypatch.context() as scoped:
+        if limit is not None:
+            scoped.setattr(ss, "MAX_RESULT_BYTES", limit)
+        await _attach(
+            _result(completion_outcome=rating),
+            _fmt(_GAP_SHAPE, switch),
+            ScriptedModel(list(script)),
+            tracer,
+        )
+    (event,) = tracer.events
+    return event["data"]
+
+
+# With the switch on, every rating meets every way an extraction can end;
+# with it off, the two ratings an extraction can see meet a ready result.
+_TRACED_CELLS = [
+    (True, rating, name) for name in _EXTRACTIONS for rating in _RATINGS
+] + [(False, rating, "ready") for rating in ("completed", None)]
+assert len(_RATINGS) == 6 and len(_TRACED_CELLS) == 26
+
+
+@pytest.mark.parametrize(
+    ("switch", "rating", "name"),
+    _TRACED_CELLS,
+    ids=[f"{'on' if s else 'off'}-{r!r}-{n}" for s, r, n in _TRACED_CELLS],
+)
+async def test_event_traces_accept_partial_fields(
+    monkeypatch, switch: bool, rating: Any, name: str
+) -> None:
+    data = await _traced(monkeypatch, rating, switch, name)
+    _, _, status, kept = _EXTRACTIONS[name]
+
+    assert data["accept_partial"] is switch
+    assert data["status"] == status
+    assert data["agent_outcome"] == (
+        rating if type(rating) is str and rating in COMPLETION_OUTCOMES else None
+    )
+    expected_partial = switch and (
+        kept or (name == "ready" and type(rating) is str and rating in _SELF_RATED)
+    )
+    assert data["partial_output"] is expected_partial
+
+
+async def test_a_skipped_self_rated_run_is_not_labeled() -> None:
+    result = _result(completion_outcome="blocked", success=False)
+
+    out = await _attach(result, _fmt(_GAP_SHAPE, True), Unused())
+
+    assert "structured_output" not in out

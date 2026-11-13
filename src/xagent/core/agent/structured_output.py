@@ -36,7 +36,7 @@ from ..model.chat.exceptions import LLMToolProtocolError
 from ..model.chat.tool_protocol import get_tool_protocol_error
 from ..model.chat.types import PROVIDER_STATE_METADATA_KEY
 from .context.execution import provider_safe_tool_name
-from .result import NO_OUTPUT_PLACEHOLDER
+from .result import COMPLETION_OUTCOMES, NO_OUTPUT_PLACEHOLDER
 from .structured_schema import (
     Err,
     Incomplete,
@@ -105,11 +105,14 @@ class StructuredOutputFormat:
 
     The schema is a shared reference and is only read. ``INVALID`` stands for a
     stored format that failed its checks; it is compared with ``is``.
+    ``accept_partial`` keeps the values extracted from a run the agent rated
+    partial or blocked, and from an incomplete result. ``INVALID`` never has it.
     """
 
     name: str
     description: str | None
     schema: dict[str, Any]
+    accept_partial: bool = False
 
     INVALID: ClassVar[StructuredOutputFormat]
 
@@ -153,10 +156,16 @@ def _settled(
     output: Any = None,
     missing: Any = (),
     unexpressible: Any = (),
+    partial_output: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """An outcome in the shape every read path accepts: a ready result holds
     its output and no reason; the others hold a reason code, with the field
-    lists only when they are not empty."""
+    lists only when they are not empty. ``output`` of a status other than ready
+    is always None. An incomplete outcome may also carry ``partial_output``, the
+    values extracted despite the gaps, under its own key; any other status
+    given one raises ``ValueError``."""
+    if partial_output is not None and status != "incomplete":
+        raise ValueError("only an incomplete outcome can hold a partial output")
     if status == "ready":
         return {"status": "ready", "output": output, "reason": None}
     reason: dict[str, Any] = {"code": code}
@@ -164,7 +173,10 @@ def _settled(
         reason["missing_fields"] = list(missing)
     if unexpressible:
         reason["unexpressible_fields"] = list(unexpressible)
-    return {"status": status, "output": None, "reason": reason}
+    outcome: dict[str, Any] = {"status": status, "output": None, "reason": reason}
+    if partial_output is not None:
+        outcome["partial_output"] = partial_output
+    return outcome
 
 
 def _settled_from_verdict(
@@ -184,7 +196,46 @@ def _settled_from_verdict(
         code,
         missing=verdict.missing_fields,
         unexpressible=verdict.unexpressible_fields,
+        partial_output=verdict.output,
     )
+
+
+def _self_rated_code(result: dict[str, Any]) -> str | None:
+    """The reason code of a run the agent rated partial or blocked, else None."""
+    outcome = result.get("completion_outcome")
+    if outcome == "partial":
+        return "agent_partial"
+    if outcome == "blocked":
+        return "agent_blocked"
+    return None
+
+
+def _label_self_rated_run(outcome: dict[str, Any], code: str) -> dict[str, Any]:
+    """The outcome of a run the agent rated partial or blocked: always
+    incomplete with ``code`` (agent_partial or agent_blocked), keeping the
+    values extracted from its answer when there are any, so such a run never
+    reads as ready."""
+    labeled = _settled("incomplete", code)
+    if outcome["status"] == "ready":
+        labeled["partial_output"] = outcome["output"]
+        return labeled
+    partial = outcome.get("partial_output")
+    if outcome["status"] == "incomplete" and type(partial) is dict:
+        labeled["partial_output"] = partial
+        reason = outcome["reason"]
+        labeled["partial_gaps"] = {
+            key: reason[key]
+            for key in ("missing_fields", "unexpressible_fields")
+            if reason.get(key)
+        }
+    return labeled
+
+
+def _traced_agent_outcome(result: dict[str, Any]) -> str | None:
+    """The agent's own rating of the run for the trace event: one of
+    :data:`COMPLETION_OUTCOMES`, else None."""
+    outcome = result.get("completion_outcome")
+    return outcome if type(outcome) is str and outcome in COMPLETION_OUTCOMES else None
 
 
 def structured_output_eligibility(
@@ -195,7 +246,8 @@ def structured_output_eligibility(
 
     The rows are taken from the top and the first that matches decides: no
     format, a run that did not finish normally, an invalid stored
-    format, a partial or blocked run, and an empty answer.
+    format, a partial or blocked run when the format does not set
+    accept_partial, and an empty answer.
     """
     if fmt is None:
         return SKIP
@@ -207,11 +259,9 @@ def structured_output_eligibility(
         return SKIP
     if fmt is StructuredOutputFormat.INVALID:
         return _settled("failed", "invalid_stored_format")
-    outcome = result.get("completion_outcome")
-    if outcome == "partial":
-        return _settled("incomplete", "agent_partial")
-    if outcome == "blocked":
-        return _settled("incomplete", "agent_blocked")
+    code = _self_rated_code(result)
+    if code is not None and not fmt.accept_partial:
+        return _settled("incomplete", code)
     text = answer_text(result).strip()
     if text == "" or text == NO_OUTPUT_PLACEHOLDER:
         return _settled_from_verdict(judge_empty_answer(compile_schema(fmt.schema)))
@@ -544,7 +594,9 @@ async def _extract(
             last = _LastFailure("invalid_arguments", reason=parsed.reason)
             text = f"Invalid arguments: {parsed.reason}."
         else:
-            verdict = judge_instance(compiled, parsed.value)
+            verdict = judge_instance(
+                compiled, parsed.value, keep_output=fmt.accept_partial
+            )
             if isinstance(verdict, TooComplex):
                 logger.warning(
                     "Structured output is too large. task_id=%s run_id=%s "
@@ -561,6 +613,20 @@ async def _extract(
                 stats.missing_count = verdict.missing_count
                 stats.unexpressible_count = verdict.unexpressible_count
                 stats.blank_as_null_count = verdict.blank_as_null_count
+                if isinstance(verdict, Incomplete) and verdict.output_dropped:
+                    logger.warning(
+                        "Structured output partial result was dropped for size. "
+                        "task_id=%s run_id=%s missing_count=%d "
+                        "unexpressible_count=%d r1_steps=%d expansion_nodes=%d "
+                        "output_bytes=%d",
+                        task_id,
+                        run_id,
+                        verdict.missing_count,
+                        verdict.unexpressible_count,
+                        verdict.r1_steps,
+                        verdict.expansion_nodes,
+                        verdict.output_bytes,
+                    )
                 return _settled_from_verdict(verdict)
             last = _LastFailure(
                 verdict.rule, path=verdict.path, extra_count=verdict.extra_count
@@ -631,10 +697,16 @@ async def _emit_extraction_event(
     *,
     answer_chars: int,
     duration_ms: int,
+    accept_partial: bool,
+    agent_outcome: str | None,
+    partial_output: bool,
 ) -> None:
     """Record the counts of one extraction. The event holds counts and fixed
-    names only. It is best effort: a failure to write it is logged by type and
-    never changes the outcome."""
+    names only. ``status`` and ``reason_code`` are those of the extraction
+    itself, before a partial or blocked run is relabeled; ``partial_output``
+    tells whether the outcome finally reported holds extracted values. It is
+    best effort: a failure to write it is logged by type and never changes the
+    outcome."""
     if tracer is None:
         return
     reason = outcome.get("reason")
@@ -655,6 +727,9 @@ async def _emit_extraction_event(
                 "answer_chars": answer_chars,
                 "duration_ms": duration_ms,
                 "text_only_replies": stats.text_only_replies,
+                "accept_partial": accept_partial,
+                "agent_outcome": agent_outcome,
+                "partial_output": partial_output,
             },
         )
     except Exception as exc:
@@ -680,10 +755,13 @@ async def _attach_structured_output(
     untouched, and any other ``Exception`` becomes ``failed`` /
     ``internal_error``, logged by its type and traceback only, because its
     message may hold text of the answer. A
-    missing result or format comes back as it is. The trace event is written
-    after the outcome is settled and outside the guarded part, and only when the
-    extraction was started (the eligibility check chose to extract), whether or
-    not the model was reached.
+    missing result or format comes back as it is. With accept_partial, a run
+    the agent rated partial or blocked is extracted and then reported as
+    incomplete with agent_partial or agent_blocked, keeping the extracted
+    values; the trace event keeps the extraction's own status. The trace event
+    is written after the outcome is settled and outside the guarded part, and
+    only when the extraction was started (the eligibility check chose to
+    extract), whether or not the model was reached.
     """
     if result is None or fmt is None:
         return result
@@ -713,7 +791,9 @@ async def _attach_structured_output(
             "".join(traceback.format_tb(exc.__traceback__)),
         )
         outcome = _settled("failed", "internal_error")
-    result[STRUCTURED_OUTPUT_RESULT_KEY] = outcome
+    code = _self_rated_code(result) if fmt.accept_partial else None
+    final = outcome if code is None else _label_self_rated_run(outcome, code)
+    result[STRUCTURED_OUTPUT_RESULT_KEY] = final
     if extracted:
         await _emit_extraction_event(
             tracer,
@@ -722,6 +802,9 @@ async def _attach_structured_output(
             stats,
             answer_chars=answer_chars,
             duration_ms=int((time.monotonic() - started) * 1000),
+            accept_partial=fmt.accept_partial,
+            agent_outcome=_traced_agent_outcome(result),
+            partial_output="partial_output" in final,
         )
     return result
 

@@ -21,7 +21,11 @@ from .interruption import (
 )
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
-from .result import NO_OUTPUT_PLACEHOLDER, normalize_tool_failure_code
+from .result import (
+    COMPLETION_OUTCOMES,
+    NO_OUTPUT_PLACEHOLDER,
+    normalize_tool_failure_code,
+)
 from .runner import AgentRunner, UserMessageInjectionOutcome
 from .tracing import TraceEventCallback
 
@@ -510,7 +514,7 @@ class AgentExecutionAdapter:
             if isinstance(error_code, str):
                 normalized["error_code"] = error_code
         completion_outcome = result.get("completion_outcome")
-        if completion_outcome in {"completed", "partial", "blocked"}:
+        if completion_outcome in COMPLETION_OUTCOMES:
             normalized["completion_outcome"] = completion_outcome
             normalized["metadata"]["completion_outcome"] = completion_outcome
         termination_reason = result.get("termination_reason")

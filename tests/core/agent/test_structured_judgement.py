@@ -1392,3 +1392,334 @@ def test_an_extra_property_counts_the_keys_beyond_the_schema() -> None:
     assert result.extra_count == 3
     assert _judge(schema, {**instance, "o": {"b": "y"}, "z": 1}).extra_count == 1
     assert _judge(schema, {"a": 5, "o": None}).extra_count == 0
+
+
+# --- keeping the value of an incomplete result ----------------------------------
+
+_NEW_INCOMPLETE_FIELDS = {"output", "output_bytes", "output_dropped"}
+
+
+def _without_new_fields(result: Any) -> Any:
+    return dataclasses.replace(
+        result, output=None, output_bytes=0, output_dropped=False
+    )
+
+
+def test_keep_output_changes_only_partial_fields() -> None:
+    incomplete = 0
+    for entry in INSTANCES:
+        compiled = _compile(entry["schema"])
+        plain = ss.judge_instance(compiled, entry["instance"])
+        kept = ss.judge_instance(compiled, entry["instance"], keep_output=True)
+        assert type(kept) is type(plain)
+        if isinstance(plain, ss.Incomplete):
+            incomplete += 1
+            assert plain.output is None and plain.output_bytes == 0
+            assert plain.output_dropped is False
+            assert _without_new_fields(kept) == plain
+        else:
+            assert kept == plain
+    assert incomplete > 0
+
+
+def _walk_nulls(node: Any, value: Any, pointer: str = "") -> Any:
+    """Every ``(pointer, node)`` at which ``value`` holds null, read from the
+    node tree built straight from the schema."""
+    if value is None:
+        yield pointer, node
+    elif node.kind == "object":
+        for name, child in node.props:
+            yield from _walk_nulls(
+                child,
+                value[name],
+                pointer + "/" + name.replace("~", "~0").replace("/", "~1"),
+            )
+    elif node.kind == "array":
+        for position, item in enumerate(value):
+            yield from _walk_nulls(node.items, item, f"{pointer}/{position}")
+
+
+def _is_null_or_below_null(output: Any, path: str) -> bool:
+    current = output
+    for segment in path.split("/")[1:]:
+        if current is None:
+            return True
+        current = (
+            current[int(segment)]
+            if isinstance(current, list)
+            else current[segment.replace("~1", "/").replace("~0", "~")]
+        )
+    return current is None
+
+
+def _kept_cases(random_cases: Any) -> Any:
+    """``(schema, rnode, compiled, instance)`` of every corpus instance and
+    every random instance that judges to an incomplete result with a value."""
+    rng = random.Random(11)
+    for entry in INSTANCES:
+        compiled = _compile(entry["schema"])
+        yield entry["schema"], root_rnode(entry["schema"]), compiled, entry["instance"]
+    for schema, compiled, _, rnode in random_cases:
+        for _ in range(8):
+            yield schema, rnode, compiled, gen_instance(rng, rnode, p_bad=0)
+
+
+def test_partial_output_gap_paths_size_and_nulls(
+    random_cases: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checked = 0
+    for schema, rnode, compiled, instance in _kept_cases(random_cases):
+        result = ss.judge_instance(compiled, instance, keep_output=True)
+        if not isinstance(result, ss.Incomplete) or result.output is None:
+            continue
+        checked += 1
+        output = result.output
+        # Every listed path is null, or lies below a null.
+        for path in result.missing_fields + result.unexpressible_fields:
+            assert _is_null_or_below_null(output, path), (schema, instance, path)
+        # The size is that of the canonical JSON of the value.
+        assert ss.canonical_json_size(output) == result.output_bytes
+        # A null sits where the schema allows null, or at a gap, listed or not.
+        with monkeypatch.context() as patched:
+            patched.setattr(ss, "MAX_LISTED_FIELDS", 10**6)
+            every = ss.judge_instance(
+                ss.compile_schema(schema), instance, keep_output=True
+            )
+        assert isinstance(every, ss.Incomplete)
+        assert every.output == output
+        gaps = every.missing_fields + every.unexpressible_fields
+        for pointer, node in _walk_nulls(rnode, output):
+            assert node.nullable or any(
+                gap == pointer or gap.startswith(pointer + "/") for gap in gaps
+            ), (schema, instance, pointer)
+    assert checked > 100
+
+
+_ITEM = _obj(
+    {
+        "key": STRING,
+        "level": {"type": "string", "enum": ["low", "high"]},
+        "note": _nullable(STRING),
+    }
+)
+_ITEMS = _obj({"items": {"type": "array", "items": _ITEM}})
+_FULL = {"key": "k", "level": "low", "note": None}
+_GAP_SCHEMA = _obj(
+    {
+        "a": STRING,
+        "g": STRING,
+        "n": _nullable(STRING),
+        "o": _obj({"p": STRING, "q": STRING}),
+        "t": _obj({"x": _nullable(STRING)}),
+        "k": {"type": "string", "enum": ["only"]},
+        "l": {"type": "array", "items": STRING},
+        "m": {"type": "string"},
+        "i": {"type": "integer"},
+    }
+)
+_GAP_BASE = {
+    "a": "w",
+    "g": None,
+    "n": None,
+    "o": {"p": "p", "q": "q"},
+    "t": {"x": "x"},
+    "k": "only",
+    "l": ["s"],
+    "m": "m",
+    "i": 3,
+}
+
+# (id, schema, instance, whether the root is a gap). One cell per row of the
+# table of positions in ``_decide``, then the shapes around them.
+_PARTIAL_CELLS: list[tuple[str, dict[str, Any], Any, bool]] = [
+    ("empty-nullable", _GAP_SCHEMA, _GAP_BASE, False),
+    ("empty-object-with-missing-values", _GAP_SCHEMA, {**_GAP_BASE, "o": None}, False),
+    (
+        "empty-object-without-missing-values",
+        _GAP_SCHEMA,
+        {**_GAP_BASE, "t": None},
+        False,
+    ),
+    ("empty-with-one-allowed-value", _GAP_SCHEMA, {**_GAP_BASE, "k": None}, False),
+    (
+        "empty-scalar-and-list",
+        _GAP_SCHEMA,
+        {**_GAP_BASE, "m": None, "l": None},
+        False,
+    ),
+    ("marker", _GAP_SCHEMA, {**_GAP_BASE, "m": MARKER}, False),
+    (
+        "object-and-list-of-values",
+        _GAP_SCHEMA,
+        {**_GAP_BASE, "l": ["s", "u"]},
+        False,
+    ),
+    ("integer-written-as-float", _GAP_SCHEMA, {**_GAP_BASE, "i": 3.0}, False),
+    (
+        "nested-list",
+        _ITEMS,
+        {"items": [_FULL, {"key": "k", "level": None, "note": "n"}, _FULL]},
+        False,
+    ),
+    ("root-empty", _ITEMS, {"items": None}, True),
+    (
+        "root-with-another-property",
+        _obj({"batch": STRING, "items": {"type": "array", "items": _ITEM}}),
+        {"batch": "b", "items": None},
+        False,
+    ),
+    (
+        "one-allowed-value-in-a-list-item",
+        _obj(
+            {
+                "items": {
+                    "type": "array",
+                    "items": _obj(
+                        {
+                            "kind": {"type": "string", "enum": ["a"]},
+                            "v": STRING,
+                            "w": STRING,
+                        }
+                    ),
+                }
+            }
+        ),
+        {
+            "items": [
+                {"kind": None, "v": "y", "w": "w"},
+                {"kind": "a", "v": None, "w": "w"},
+            ]
+        },
+        False,
+    ),
+    (
+        "template-in-a-list-item",
+        _obj(
+            {
+                "items": {
+                    "type": "array",
+                    "items": _obj(
+                        {"v": STRING, "extra": _obj({"n": _nullable(STRING)})}
+                    ),
+                }
+            }
+        ),
+        {"items": [{"v": "y", "extra": None}, {"v": None, "extra": {"n": "z"}}]},
+        False,
+    ),
+]
+assert len(_PARTIAL_CELLS) == 13
+
+
+@pytest.mark.parametrize(
+    ("schema", "instance", "root_is_gap"),
+    [cell[1:] for cell in _PARTIAL_CELLS],
+    ids=[cell[0] for cell in _PARTIAL_CELLS],
+)
+def test_partial_output_matches_filled_ready(
+    schema: dict[str, Any], instance: Any, root_is_gap: bool
+) -> None:
+    compiled = _compile(schema)
+    result = ss.judge_instance(compiled, instance, keep_output=True)
+
+    assert isinstance(result, ss.Incomplete)
+    assert result.output_dropped is False
+    if root_is_gap:
+        assert result.output is None and result.output_bytes == 0
+        return
+    assert result.output is not None
+    gaps = result.missing_fields + result.unexpressible_fields
+    rnode = root_rnode(schema)
+    filled = ss.judge_instance(compiled, _repair(instance, gaps, rnode))
+    assert isinstance(filled, ss.Ready)
+
+    def same_outside_gaps(kept: Any, whole: Any, pointer: str) -> None:
+        if kept is None:
+            below = any(g == pointer or g.startswith(pointer + "/") for g in gaps)
+            assert below or whole is None, pointer
+        elif isinstance(kept, dict):
+            for name in kept:
+                same_outside_gaps(kept[name], whole[name], f"{pointer}/{name}")
+        elif isinstance(kept, list):
+            assert len(kept) == len(whole)
+            for position, item in enumerate(kept):
+                same_outside_gaps(item, whole[position], f"{pointer}/{position}")
+        else:
+            assert kept == whole and type(kept) is type(whole), pointer
+
+    same_outside_gaps(result.output, filled.output, "")
+
+
+_TEMPLATED = _obj({"e": _obj({"n": _nullable(STRING)}), "w": STRING})
+
+
+def _padded_schema() -> dict[str, Any]:
+    return _obj(
+        {
+            "pad": STRING,
+            "g": STRING,
+            "es": {"type": "array", "items": _TEMPLATED},
+            "xs": {"type": "array", "items": {"type": "integer"}},
+        }
+    )
+
+
+def _padded(pad: int, templated: int, filler: int) -> dict[str, Any]:
+    return {
+        "pad": "x" * pad,
+        "g": None,
+        "es": [{"e": None, "w": "x"}] * templated,
+        "xs": [1] * filler,
+    }
+
+
+def _lists_of_gaps(count: int, marker: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+    schema = _obj({"a": STRING, **{f"f{i}": STRING for i in range(count)}})
+    instance: dict[str, Any] = {"a": "w"}
+    instance.update({f"f{i}": MARKER if marker else None for i in range(count)})
+    return schema, instance
+
+
+def test_partial_output_keep_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    schema = _padded_schema()
+    compiled = _compile(schema)
+    probe = ss.judge_instance(compiled, _padded(1, 1, 0), keep_output=True)
+    assert isinstance(probe, ss.Incomplete) and probe.output is not None
+    pad = ss.MAX_RESULT_BYTES - probe.output_bytes + 1
+    # A templated element costs steps and expansion nodes; plain integers
+    # (one step each) make up what is left to reach the limit exactly.
+    two = ss.judge_instance(compiled, _padded(1, 2, 0), keep_output=True)
+    cost = (two.r1_steps + two.expansion_nodes) - (
+        probe.r1_steps + probe.expansion_nodes
+    )
+    spare = ss.MAX_JUDGED_STEPS - (probe.r1_steps + probe.expansion_nodes)
+    templated = 1 + spare // cost
+    filler = spare % cost
+
+    cells = [
+        ("bytes-at-limit", _padded(pad, 1, 0), False),
+        ("bytes-over-limit", _padded(pad + 1, 1, 0), True),
+        ("nodes-at-limit", _padded(1, templated, filler), False),
+        ("nodes-over-limit", _padded(1, templated, filler + 1), True),
+    ]
+    for name, instance, dropped in cells:
+        kept = ss.judge_instance(compiled, instance, keep_output=True)
+        plain = ss.judge_instance(compiled, instance)
+        assert isinstance(kept, ss.Incomplete), name
+        assert kept.output_dropped is dropped, name
+        assert (kept.output is None) is dropped, name
+        assert _without_new_fields(kept) == plain, name
+        assert (kept.missing_count, kept.missing_fields) == (
+            plain.missing_count,
+            plain.missing_fields,
+        )
+    over = ss.judge_instance(compiled, _padded(pad + 1, 1, 0), keep_output=True)
+    assert over.output_bytes == ss.MAX_RESULT_BYTES + 1
+
+    for marker in (False, True):
+        many_schema, many = _lists_of_gaps(21, marker)
+        kept = ss.judge_instance(_compile(many_schema), many, keep_output=True)
+        listed = kept.unexpressible_fields if marker else kept.missing_fields
+        counted = kept.unexpressible_count if marker else kept.missing_count
+        assert (len(listed), counted) == (20, 21)
+        assert kept.output is not None and kept.output_dropped is False

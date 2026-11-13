@@ -44,6 +44,7 @@ from sqlalchemy import cast as sa_cast
 from sqlalchemy import literal, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from ...config import (
     get_app_base_url,
@@ -2437,6 +2438,7 @@ def _upsert_mcp_oauth_grant(
         .filter(
             MCPOAuthGrant.lookup_hash == lookup_hash,
         )
+        .with_for_update()
         .first()
     )
     grant = existing or MCPOAuthGrant(
@@ -7869,4 +7871,8 @@ async def delete_mcp_oauth_grant(
         )
     setattr(grant, "status", "revoked")
     setattr(grant, "revoked_at", _utc_now())
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError:
+        # A runtime refresh deleted the row while the provider revoke ran.
+        db.rollback()

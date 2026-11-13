@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query, sessionmaker
 
 from xagent.core.utils.encryption import decrypt_value, encrypt_value
@@ -174,6 +176,20 @@ def _assert_unavailable_runtime_config(
     assert "runtime_bindings" not in config
     assert "allow_delegated_authorization" not in config
     assert "connector_runtime" not in config
+
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def _mock_token_endpoint(monkeypatch, handler) -> None:
+    def async_client_factory(*args, **kwargs):
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler))
+
+    async def skip_url_policy(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
 
 
 def test_effective_mcp_oauth_resource_prefers_selector_verbatim(db_session):
@@ -906,7 +922,6 @@ async def test_mcp_oauth_runtime_records_a_first_invalid_grant_without_retiring(
     )
     grant.metadata_json = {"token_type": "Bearer"}
     db.commit()
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -914,14 +929,7 @@ async def test_mcp_oauth_runtime_records_a_first_invalid_grant_without_retiring(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 
@@ -964,7 +972,6 @@ async def test_mcp_oauth_runtime_deletes_a_grant_rejected_twice(
     )
     grant_id = grant.id
     encrypted_refresh_token = str(grant.refresh_token)
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -972,14 +979,7 @@ async def test_mcp_oauth_runtime_deletes_a_grant_rejected_twice(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     _first_configs, first_cfg = await _load_configs(db, user)
     assert first_cfg.get_mcp_oauth_diagnostics()[0]["code"] == "token_refresh_failed"
@@ -1025,7 +1025,7 @@ async def test_mcp_oauth_runtime_deletes_a_grant_rejected_twice(
 
 
 @pytest.mark.asyncio
-async def test_mcp_oauth_runtime_keeps_a_grant_rejected_twice_within_a_minute(
+async def test_mcp_oauth_runtime_re_marks_a_stale_marker(
     db_session,
     monkeypatch,
 ):
@@ -1040,7 +1040,14 @@ async def test_mcp_oauth_runtime_keeps_a_grant_rejected_twice_within_a_minute(
         refresh_token="refresh-token-123",
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
-    real_async_client = httpx.AsyncClient
+    token_digest = hashlib.sha256(str(grant.refresh_token).encode("utf-8")).hexdigest()
+    grant.metadata_json = {
+        "invalid_grant_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=86401)
+        ).isoformat(),
+        "invalid_grant_token_sha256": token_digest,
+    }
+    db.commit()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1048,18 +1055,7 @@ async def test_mcp_oauth_runtime_keeps_a_grant_rejected_twice_within_a_minute(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
-
-    _first_configs, first_cfg = await _load_configs(db, user)
-    assert first_cfg.get_mcp_oauth_diagnostics()[0]["code"] == "token_refresh_failed"
-
+    _mock_token_endpoint(monkeypatch, handler)
     configs, cfg = await _load_configs(db, user)
 
     assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "token_refresh_failed"
@@ -1067,10 +1063,209 @@ async def test_mcp_oauth_runtime_keeps_a_grant_rejected_twice_within_a_minute(
     db.refresh(grant)
     assert grant.status == "active"
     assert grant.revoked_at is None
-    assert (
-        grant.metadata_json["invalid_grant_token_sha256"]
-        == hashlib.sha256(str(grant.refresh_token).encode("utf-8")).hexdigest()
+    assert grant.metadata_json["invalid_grant_token_sha256"] == token_digest
+    marked_at = datetime.fromisoformat(grant.metadata_json["invalid_grant_at"])
+    assert abs((datetime.now(timezone.utc) - marked_at).total_seconds()) < 30
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["foreign_digest", "malformed", "number", "naive", "hours_old"]
+)
+async def test_mcp_oauth_runtime_reader_handles_unusable_markers(
+    db_session,
+    monkeypatch,
+    case,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
+    grant_id = grant.id
+    token_digest = hashlib.sha256(str(grant.refresh_token).encode("utf-8")).hexdigest()
+    marked_at = datetime.now(timezone.utc) - timedelta(seconds=61)
+    grant.metadata_json = {
+        "foreign_digest": {
+            "invalid_grant_at": marked_at.isoformat(),
+            "invalid_grant_token_sha256": "0" * 64,
+        },
+        "malformed": {
+            "invalid_grant_at": "garbage",
+            "invalid_grant_token_sha256": token_digest,
+        },
+        "number": {
+            "invalid_grant_at": 12345,
+            "invalid_grant_token_sha256": token_digest,
+        },
+        "naive": {
+            "invalid_grant_at": marked_at.replace(tzinfo=None).isoformat(),
+            "invalid_grant_token_sha256": token_digest,
+        },
+        "hours_old": {
+            "invalid_grant_at": (
+                datetime.now(timezone.utc) - timedelta(hours=3)
+            ).isoformat(),
+            "invalid_grant_token_sha256": token_digest,
+        },
+    }[case]
+    db.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
+        )
+
+    _mock_token_endpoint(monkeypatch, handler)
+    configs, cfg = await _load_configs(db, user)
+
+    if case in {"naive", "hours_old"}:
+        assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "authorization_required"
+        assert len(configs) == 1
+        db.expire_all()
+        assert db.get(MCPOAuthGrant, grant_id) is None
+        return
+    assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "token_refresh_failed"
+    assert len(configs) == 1
+    db.refresh(grant)
+    assert grant.status == "active"
+    assert grant.metadata_json["invalid_grant_token_sha256"] == token_digest
+    re_marked_at = datetime.fromisoformat(grant.metadata_json["invalid_grant_at"])
+    assert abs((datetime.now(timezone.utc) - re_marked_at).total_seconds()) < 30
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refresh_deadline_is_transient(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    async def slow_oauth_post(*args, **kwargs):
+        await asyncio.sleep(0.2)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "slow-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "records.read",
+            },
+        )
+
+    monkeypatch.setattr(mcp_oauth_service, "MCP_OAUTH_REFRESH_DEADLINE_SECONDS", 0.01)
+    monkeypatch.setattr(mcp_oauth_service, "oauth_post", slow_oauth_post)
+
+    configs, cfg = await _load_configs(db, user)
+
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert diagnostics[0]["message"] == "MCP OAuth refresh timed out"
+    assert len(configs) == 1
+    db.refresh(grant)
+    assert grant.status == "active"
+    assert decrypt_value(grant.access_token) == "expired-access-token"
+    assert "invalid_grant_at" not in (grant.metadata_json or {})
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_lock_failure_is_transient(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
+        )
+
+    _mock_token_endpoint(monkeypatch, handler)
+
+    def raise_lock_failure(*args, **kwargs):
+        raise SQLAlchemyError("database is locked")
+
+    monkeypatch.setattr(Query, "with_for_update", raise_lock_failure)
+
+    configs, cfg = await _load_configs(db, user)
+
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert diagnostics[0]["message"] == (
+        "MCP OAuth grant rejection could not be recorded"
+    )
+    assert len(configs) == 1
+    db.refresh(grant)
+    assert grant.status == "active"
+    assert "invalid_grant_at" not in (grant.metadata_json or {})
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_does_not_store_marker_keys_from_a_token_payload(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "records.read",
+                "invalid_grant_at": "2020-01-01T00:00:00+00:00",
+                "invalid_grant_token_sha256": "deadbeef",
+            },
+        )
+
+    _mock_token_endpoint(monkeypatch, handler)
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    db.refresh(grant)
+    assert "invalid_grant_at" not in grant.metadata_json
+    assert "invalid_grant_token_sha256" not in grant.metadata_json
 
 
 @pytest.mark.asyncio
@@ -1090,7 +1285,6 @@ async def test_mcp_oauth_runtime_keeps_the_first_strike_timestamp(
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     grant_id = grant.id
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1098,14 +1292,7 @@ async def test_mcp_oauth_runtime_keeps_the_first_strike_timestamp(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
     started_at = datetime.now(timezone.utc)
     clock = {"now": started_at}
     monkeypatch.setattr(mcp_oauth_service, "_utc_now", lambda: clock["now"])
@@ -1115,6 +1302,7 @@ async def test_mcp_oauth_runtime_keeps_the_first_strike_timestamp(
     db.refresh(grant)
     first_marker = dict(grant.metadata_json)
     assert "invalid_grant_at" in first_marker
+    assert grant.revoked_at is None
 
     clock["now"] = started_at + timedelta(seconds=30)
     configs, cfg = await _load_configs(db, user)
@@ -1151,7 +1339,6 @@ async def test_mcp_oauth_runtime_keeps_a_replaced_token_after_a_late_rejection(
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     grant_id = grant.id
-    real_async_client = httpx.AsyncClient
 
     def invalid_grant_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1159,14 +1346,7 @@ async def test_mcp_oauth_runtime_keeps_a_replaced_token_after_a_late_rejection(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def invalid_grant_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(invalid_grant_handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", invalid_grant_factory)
+    _mock_token_endpoint(monkeypatch, invalid_grant_handler)
 
     # B is answered invalid_grant first, so it records a strike on T1.
     _first_configs, first_cfg = await _load_configs(db, user)
@@ -1187,10 +1367,7 @@ async def test_mcp_oauth_runtime_keeps_a_replaced_token_after_a_late_rejection(
             },
         )
 
-    def rotated_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(rotated_handler))
-
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", rotated_factory)
+    _mock_token_endpoint(monkeypatch, rotated_handler)
     configs, cfg = await _load_configs(db, user)
 
     assert cfg.get_mcp_oauth_diagnostics() == []
@@ -1235,12 +1412,8 @@ async def test_mcp_oauth_runtime_keeps_a_replaced_token_after_a_late_rejection(
             },
         )
 
-    def stale_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(stale_handler))
-
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", stale_factory)
+    _mock_token_endpoint(monkeypatch, stale_handler)
     configs, cfg = await _load_configs(db, user)
-
     assert cfg.get_mcp_oauth_diagnostics() == []
     assert configs[0]["config"]["headers"]["Authorization"] == (
         "Bearer third-access-token"
@@ -1268,7 +1441,6 @@ async def test_mcp_oauth_runtime_retries_when_the_grant_disappears_mid_refresh(
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     grant_id = grant.id
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         other_db = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)()
@@ -1282,14 +1454,7 @@ async def test_mcp_oauth_runtime_retries_when_the_grant_disappears_mid_refresh(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 
@@ -1316,7 +1481,6 @@ async def test_mcp_oauth_runtime_retries_when_the_grant_is_no_longer_active(
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     grant_id = grant.id
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         other_db = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)()
@@ -1332,14 +1496,7 @@ async def test_mcp_oauth_runtime_retries_when_the_grant_is_no_longer_active(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 
@@ -1369,7 +1526,6 @@ async def test_mcp_oauth_runtime_keeps_a_reconnect_that_kept_the_refresh_token(
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     grant_id = grant.id
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         other_db = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)()
@@ -1384,14 +1540,7 @@ async def test_mcp_oauth_runtime_keeps_a_reconnect_that_kept_the_refresh_token(
             json={"error": "invalid_grant", "error_description": "OAuth grant revoked"},
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 
@@ -1444,7 +1593,6 @@ async def test_mcp_oauth_runtime_reselects_another_grant_after_retiring_one(
     db.commit()
     first_grant_id = first_grant.id
     second_grant_id = second_grant.id
-    real_async_client = httpx.AsyncClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         sent_token = parse_qs(request.content.decode())["refresh_token"][0]
@@ -1467,14 +1615,7 @@ async def test_mcp_oauth_runtime_reselects_another_grant_after_retiring_one(
             },
         )
 
-    def async_client_factory(*args, **kwargs):
-        return real_async_client(transport=httpx.MockTransport(handler))
-
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
-    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+    _mock_token_endpoint(monkeypatch, handler)
 
     configs, cfg = await _load_configs(db, user)
 

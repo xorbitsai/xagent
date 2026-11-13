@@ -7,14 +7,17 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import event
 
+from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.services.task_auto_resume import TerminalView
 
 from ..conftest import _admin_headers, _direct_db_session, client
 
@@ -179,3 +182,34 @@ TODAY_TASK_INFO_KEYS = (
     *NEW_KEYS,
 )
 TODAY_COMPLETED_FRAME_KEYS = ("status", "output", "error", "error_code", *NEW_KEYS)
+
+SWITCH_OFF_CONFIGS = {
+    "no-format": None,
+    "no-switch": stored_format_config(),
+    "switch-false": stored_format_config(accept_partial=False),
+}
+SWITCH_ON_CONFIG = stored_format_config(accept_partial=True)
+TERMINAL_VIEW = TerminalView(
+    state="stopped", error="stopped", stopped_at=MOMENT, reason="x"
+)
+
+# (id, rating stored on the row, snapshot changes that make the effective state)
+EFFECTIVE_STATES = [
+    ("completed-completed", "completed", {}),
+    ("completed-partial", "partial", {}),
+    ("completed-blocked", "blocked", {}),
+    ("completed-unrated", None, {}),
+    ("pending", "partial", {"start_queued": True}),
+    ("failed-view", "partial", {"view": TERMINAL_VIEW}),
+]
+
+
+def with_snapshot(monkeypatch, **changes) -> None:
+    """Make the v1 task snapshot reader return the row's snapshot with
+    ``changes`` applied."""
+    real = v1_tasks._load_task_info_snapshot
+    monkeypatch.setattr(
+        v1_tasks,
+        "_load_task_info_snapshot",
+        lambda task_id, principal: replace(real(task_id, principal), **changes),
+    )

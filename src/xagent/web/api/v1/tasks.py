@@ -1749,7 +1749,11 @@ async def stream_chat_task_events(
       - ``task.completed``: ``{status, output, error, structured_output,
         structured_output_status, structured_output_reason}``. The three
         structured fields carry the same values as the fields of the
-        same name on ``GET /v1/chat/tasks/{task_id}``. A failed task
+        same name on ``GET /v1/chat/tasks/{task_id}``. A
+        ``completion_outcome`` key follows them only when the task's
+        response format sets accept_partial; its value is completed,
+        partial or blocked, or null (null unless the task is completed
+        and the run recorded a rating). A failed task
         also ends the stream with this event rather than a separate
         one -- ``status`` is ``"failed"`` and ``error`` is set.
       - ``task.input_required``: ``{task_id, prompt}``. ``prompt`` is the

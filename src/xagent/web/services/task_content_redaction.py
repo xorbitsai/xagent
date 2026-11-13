@@ -25,7 +25,7 @@ Per task, in order
    deletes the content rows and uploaded files, blanks the content columns,
    and commits. The uploaded files' stored objects are deleted inside this
    transaction, so the row lock is held across that object-storage I/O (see
-   ``task_deletion._delete_task_files`` for why); the task is quiescent, so
+   ``task_deletion.delete_task_files`` for why); the task is quiescent, so
    nothing else is waiting on it. A failure here rolls back that task's rows
    and reports it ``failed``; the stored files it had already deleted stay
    deleted, so a ``failed`` task is partially cleaned and must be re-run.
@@ -60,7 +60,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, cast
+from typing import Callable, Literal, TypeVar, cast
 
 from sqlalchemy.orm import Session
 
@@ -68,7 +68,7 @@ from ..models.task import Task
 from .agent_service_manager import get_agent_manager
 from .connector_runtime import drop_ephemeral_runtime_values_for_task
 from .hot_path_cache import invalidate_task_cache
-from .task_deletion import redact_task_rows
+from .task_deletion import delete_task_files, redact_task_rows
 from .task_file_lifecycle import lock_attachment_task
 from .task_retention import retention_quiescent_condition
 from .task_workspace_cleanup import (
@@ -77,6 +77,8 @@ from .task_workspace_cleanup import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -118,20 +120,24 @@ class _RedactedRuntime:
     run_generation: int | None
 
 
-def _redact_rows_if_quiescent(
-    db: Session, task_id: int, *, now: datetime
-) -> _RedactedRuntime | Literal["busy", "missing"]:
-    """Run one task's row redaction in its own transaction.
+def _run_on_quiescent_task(
+    db: Session,
+    task_id: int,
+    action: Callable[[Task], _T],
+    *,
+    now: datetime,
+) -> _T | Literal["busy", "missing"]:
+    """Run ``action`` on one locked, settled task in its own transaction.
 
-    Returns the runtime identity of the redacted task, ``"busy"`` when the
-    task is not settled (nothing is changed; PAUSED, WAITING_FOR_USER and a
-    command-less PENDING task stay busy until the host settles them), or
-    ``"missing"``. The quiescence check reads the row under the ``FOR
-    UPDATE`` lock the redaction runs under, so a command insert (whose
-    foreign key takes ``FOR KEY SHARE``) cannot slip in between on
+    Returns what ``action`` returned once its work is committed, ``"busy"``
+    when the task is not settled (nothing is changed; PAUSED,
+    WAITING_FOR_USER and a command-less PENDING task stay busy until the
+    host settles them), or ``"missing"``. The quiescence check reads the row
+    under the ``FOR UPDATE`` lock ``action`` runs under, so a command insert
+    (whose foreign key takes ``FOR KEY SHARE``) cannot slip in between on
     PostgreSQL; ``FOR UPDATE`` is a no-op on SQLite, where the check and the
-    redaction are not atomic. Raises whatever the redaction raises, after
-    rolling back.
+    action are not atomic. Raises whatever ``action`` raises, after rolling
+    back.
     """
 
     committed = False
@@ -150,19 +156,25 @@ def _redact_rows_if_quiescent(
         )
         if quiescent is None:
             return "busy"
-        runtime = _RedactedRuntime(
-            owner_id=int(task.user_id),
-            run_id=cast(str | None, task.run_id),
-            run_generation=get_agent_manager().current_run_generation(task_id),
-        )
-        redact_task_rows(db, task, now=now)
+        result = action(task)
         db.commit()
         committed = True
-        return runtime
+        return result
     finally:
         # Releases the row lock on every exit that did not commit.
         if not committed:
             db.rollback()
+
+
+def _redact_rows(db: Session, task: Task, *, now: datetime) -> _RedactedRuntime:
+    """Redact one locked task's rows; return what its cleanup needs."""
+    runtime = _RedactedRuntime(
+        owner_id=int(task.user_id),
+        run_id=cast(str | None, task.run_id),
+        run_generation=get_agent_manager().current_run_generation(int(task.id)),
+    )
+    redact_task_rows(db, task, now=now)
+    return runtime
 
 
 def _release_task_runtime(task_id: int, runtime: _RedactedRuntime) -> bool:
@@ -253,7 +265,9 @@ def redact_task_content(
     missing: list[int] = []
     for task_id in dict.fromkeys(task_ids):
         try:
-            outcome = _redact_rows_if_quiescent(db, task_id, now=now)
+            outcome = _run_on_quiescent_task(
+                db, task_id, lambda task: _redact_rows(db, task, now=now), now=now
+            )
         except Exception:
             logger.exception(
                 "Task %s content redaction failed and was rolled back", task_id
@@ -282,6 +296,77 @@ def redact_task_content(
     return TaskContentRedactionReport(
         redacted=tuple(redacted),
         cleanup_failed=tuple(cleanup_failed),
+        failed=tuple(failed),
+        busy=tuple(busy),
+        missing=tuple(missing),
+    )
+
+
+@dataclass(frozen=True)
+class TaskFileDeletionReport:
+    """Which of the requested tasks ended in which state.
+
+    ``deleted`` tasks have no uploaded files left bound to them (including
+    tasks that had none). ``failed`` tasks raised and were rolled back, but
+    the stored files deleted before the failure stay deleted: they are
+    partially cleaned and must be re-run. ``busy`` and ``missing`` mean what
+    they mean for :class:`TaskContentRedactionReport`.
+    """
+
+    deleted: tuple[int, ...] = ()
+    failed: tuple[int, ...] = ()
+    busy: tuple[int, ...] = ()
+    missing: tuple[int, ...] = ()
+
+
+def delete_task_content_files(
+    db: Session, task_ids: Sequence[int]
+) -> TaskFileDeletionReport:
+    """Delete each task's uploaded files and keep everything else.
+
+    The files-only sibling of :func:`redact_task_content`, with the same
+    contract: one transaction per settled task, the same ``busy`` refusal
+    (the host settles parked tasks first), per-task ``failed`` reporting,
+    a clean ``db`` required, idempotent re-runs. The file semantics are
+    :func:`task_deletion.delete_task_files`: a file a knowledge base still
+    uses is detached rather than deleted, each deleted file is fenced
+    against KB reuse, and a file another cleanup owner claimed is left to it.
+
+    The transcript, trace, task columns, cached agent and workspace
+    directory are untouched -- the task keeps talking about files it no
+    longer has, which is what a files-only deletion asks for. Read caches
+    are invalidated after each commit.
+
+    Blocking (database, object storage and filesystem I/O); async callers
+    run it in a worker thread.
+    """
+
+    now = datetime.now(timezone.utc)
+    deleted: list[int] = []
+    failed: list[int] = []
+    busy: list[int] = []
+    missing: list[int] = []
+    for task_id in dict.fromkeys(task_ids):
+        try:
+            outcome = _run_on_quiescent_task(
+                db, task_id, lambda task: delete_task_files(db, task), now=now
+            )
+        except Exception:
+            logger.exception(
+                "Task %s file deletion failed and was rolled back", task_id
+            )
+            failed.append(task_id)
+            continue
+        match outcome:
+            case "busy":
+                busy.append(task_id)
+            case "missing":
+                missing.append(task_id)
+            case None:
+                invalidate_task_cache(task_id)
+                deleted.append(task_id)
+    return TaskFileDeletionReport(
+        deleted=tuple(deleted),
         failed=tuple(failed),
         busy=tuple(busy),
         missing=tuple(missing),

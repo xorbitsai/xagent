@@ -58,6 +58,8 @@ from xagent.web.services.task_command_transport import (
 )
 from xagent.web.services.task_content_redaction import (
     TaskContentRedactionReport,
+    TaskFileDeletionReport,
+    delete_task_content_files,
     redact_task_content,
 )
 from xagent.web.services.uploaded_file_store import (
@@ -761,3 +763,58 @@ def test_read_surfaces_answer_for_a_redacted_task(_roots: Path) -> None:
     log = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
     assert log.status_code == 200, log.text
     assert log.json()["log"]["title"] == ""
+
+
+def test_files_only_deletion_removes_files_and_keeps_the_conversation(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    busy_id = _settled_task(full_key, agent_id)
+    storage_key, local, workspace = _seed_content(task_id, _roots)
+    kb_local = _add_file(task_id, _roots, "kb-source")
+    _seed_content(busy_id, _roots)
+    deleted_id, kb_file_id = _file_ids(task_id)
+    monkeypatch.setattr(
+        task_deletion,
+        "find_referenced_file_ids",
+        lambda file_ids: {kb_file_id} & set(file_ids),
+    )
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Task.user_id).filter(Task.id == task_id).one()[0])
+        db.query(Task).filter(Task.id == busy_id).update({"status": TaskStatus.PAUSED})
+        db.commit()
+    finally:
+        db.close()
+    before = _content_counts(task_id)
+
+    db = _direct_db_session()
+    try:
+        first = delete_task_content_files(db, [task_id, busy_id, 9_000_001])
+        second = delete_task_content_files(db, [task_id])
+    finally:
+        db.close()
+
+    assert first == TaskFileDeletionReport(
+        deleted=(task_id,), busy=(busy_id,), missing=(9_000_001,)
+    )
+    assert second == TaskFileDeletionReport(deleted=(task_id,))
+    assert _content_counts(task_id) == {
+        **before,
+        UploadedFile.__tablename__: 0,
+    }
+    assert not local.exists()
+    assert not _object_exists(owner_id, storage_key)
+    assert kb_local.exists()
+    assert workspace.exists()
+    db = _direct_db_session()
+    try:
+        assert db.get(UploadedFileCleanupFence, deleted_id) is not None
+        kept = db.query(UploadedFile).filter(UploadedFile.file_id == kb_file_id).one()
+        assert (kept.task_id, kept.detached_reason) == (None, "task_deleted")
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.title == CONTENT_COLUMNS["title"]
+        assert len(_file_ids(busy_id)) == 1
+    finally:
+        db.close()

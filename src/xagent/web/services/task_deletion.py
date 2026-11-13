@@ -185,8 +185,15 @@ def purge_task_rows(
     return True
 
 
-def _delete_task_files(db: Session, task_id: int) -> None:
-    """Delete the task's uploaded files: rows, durable objects and local bytes.
+def delete_task_files(db: Session, task: Task) -> None:
+    """Delete one task's uploaded files in a caller-owned transaction.
+
+    Rows, durable objects and local bytes. ``task`` must already be locked in
+    this transaction through :func:`lock_attachment_task` with
+    ``deleting=True``, which fences new attachments, and the caller must have
+    established that it is not executing. The rest of the task -- transcript,
+    trace, workspace, columns -- is untouched; :func:`redact_task_rows` calls
+    this as its file step. Idempotent: a second run finds no files.
 
     Unlike :func:`detach_task_files`, nothing is retained -- except a file a
     knowledge base still uses. A chat attachment can back a KB document (KB
@@ -211,6 +218,7 @@ def _delete_task_files(db: Session, task_id: int) -> None:
     every resource it names, as in ``kb_file_service``.
     """
 
+    task_id = int(task.id)
     records = (
         db.query(UploadedFile)
         .filter(
@@ -273,7 +281,7 @@ def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
 
     What goes: every row :func:`_delete_task_content_rows` removes, the chat
     transcript and execution events, the task's uploaded files (rows *and*
-    stored bytes, see :func:`_delete_task_files`), the payload, result and
+    stored bytes, see :func:`delete_task_files`), the payload, result and
     error of its execution commands, the payload snapshots of the trigger
     runs that started it, the content keys of ``agent_config``
     (:data:`_REDACTED_AGENT_CONFIG_KEYS`), and every content-bearing ``Task``
@@ -286,7 +294,7 @@ def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
     keys, channel and source fields, the connector runtime context and
     selected refs (non-secret routing input a later turn is validated
     against), uploads a knowledge base still uses (detached instead, see
-    :func:`_delete_task_files`), the trigger run rows themselves, and the
+    :func:`delete_task_files`), the trigger run rows themselves, and the
     event sequence counter, so a later turn keeps numbering monotonically.
     ``updated_at`` is pinned (see :func:`_delete_task_content_rows`).
     ``traces_expired_at`` is stamped with ``now`` when there was a trace to
@@ -311,7 +319,7 @@ def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
     """
 
     task_id = int(task.id)
-    _delete_task_files(db, task_id)
+    delete_task_files(db, task)
     had_trace = _delete_task_content_rows(db, task_id)
     db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).delete(
         synchronize_session=False

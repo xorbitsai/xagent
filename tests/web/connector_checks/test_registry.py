@@ -21,17 +21,24 @@ from xagent.web.connector_checks.declarations import (
     Assertion,
     ConnectorChecks,
     Contains,
+    CreatedRef,
     DeclarationError,
     EachHasKeys,
     Equals,
     FixtureRef,
     HasKeys,
     IsType,
+    ItemRef,
     L3Envelope,
     Length,
     ReadCheck,
+    RunScopedName,
     StatusSuccess,
+    Sweep,
+    TenantPin,
+    ToolStep,
     UnprobeableCheck,
+    WriteCheck,
     validate_connector_checks,
 )
 from xagent.web.connector_checks.fixtures import FixtureValue, resolve_fixtures
@@ -1388,7 +1395,7 @@ _GOOGLE_APP_MODULES = {
     "google-slides": google_slides,
 }
 
-# The fixture keys the Google read checks use, pinned here so that adding or
+# The fixture keys the Google checks use, pinned here so that adding or
 # dropping one shows in the diff. The tenant registry
 # (xorbitsai/xagent-saas#2627) records each of them for the Google seed layout.
 _GOOGLE_FIXTURE_KEYS_USED = frozenset(
@@ -1397,6 +1404,8 @@ _GOOGLE_FIXTURE_KEYS_USED = frozenset(
         "google-analytics.property_id",
         "google-docs.document_id",
         "google-drive.seed_folder_id",
+        "google-drive.write_folder_id",
+        "google-drive.write_sweep_query",
         "google-sheets.spreadsheet_id",
         "google-slides.presentation_id",
     }
@@ -1417,6 +1426,10 @@ class _Fixtures:
         "google-analytics.property_id": "563334905",
         "google-docs.document_id": "doc-1",
         "google-drive.seed_folder_id": "folder-1",
+        "google-drive.write_folder_id": "folder-write",
+        "google-drive.write_sweep_query": (
+            "'folder-write' in parents and trashed = false"
+        ),
         "google-sheets.spreadsheet_id": "sheet-1",
         "google-slides.presentation_id": "deck-1",
     }
@@ -1428,11 +1441,35 @@ class _Fixtures:
 _FIXTURES = _Fixtures()
 
 
-def _fixture_keys(check: ReadCheck) -> Iterator[FixtureRef]:
-    yield from _fixture_refs(check.arguments)
-    for assertion in check.assertions:
+def _fixture_keys(step: ReadCheck | ToolStep) -> Iterator[FixtureRef]:
+    yield from _fixture_refs(step.arguments)
+    for assertion in step.assertions:
         if isinstance(assertion, Equals):
             yield from _fixture_refs(assertion.value)
+
+
+def _google_fixture_keys() -> Iterator[FixtureRef]:
+    """Every fixture key a Google declaration names: a read check's, a write
+    check's (its pin's expected included), and its sweep's."""
+    for app_id in _GOOGLE_APP_MODULES:
+        checks = CONNECTOR_CHECKS[app_id]
+        for read in checks.reads:
+            if isinstance(read, ReadCheck):
+                yield from _fixture_keys(read)
+        for write in checks.writes:
+            yield from _fixture_refs(write.tenant_pin.expected)
+            for step in (
+                write.create,
+                write.verify,
+                write.cleanup,
+                write.cleanup_guard,
+            ):
+                if step is not None:
+                    yield from _fixture_keys(step)
+        if checks.sweep is not None:
+            yield from _fixture_refs(checks.sweep.tenant_pin.expected)
+            yield from _fixture_keys(checks.sweep.find)
+            yield from _fixture_keys(checks.sweep.delete)
 
 
 @pytest.mark.parametrize(("check_id", "expected"), sorted(_GOOGLE_READS.items()))
@@ -1495,14 +1532,8 @@ def test_a_google_document_probe_still_needs_a_fixture(app_id: str) -> None:
     )
 
 
-def test_the_google_read_checks_use_exactly_these_fixture_keys() -> None:
-    keys = {
-        ref.key
-        for app_id in _GOOGLE_APP_MODULES
-        for check in CONNECTOR_CHECKS[app_id].reads
-        if isinstance(check, ReadCheck)
-        for ref in _fixture_keys(check)
-    }
+def test_the_google_checks_use_exactly_these_fixture_keys() -> None:
+    keys = {ref.key for ref in _google_fixture_keys()}
 
     assert keys == _GOOGLE_FIXTURE_KEYS_USED
 
@@ -1532,15 +1563,111 @@ def test_a_google_fixture_is_bound_to_a_parameter_of_its_tool(app_id: str) -> No
         assert required <= set(check.arguments), (check.tool, required)
 
 
+def test_google_drive_declares_its_write_check() -> None:
+    """The pin, the create, the read-back that also guards the cleanup, and
+    the verdicts, pinned so that changing a step shows in the diff."""
+    pin = TenantPin(
+        ToolStep(
+            "google_drive_search",
+            {
+                "query": (
+                    "name = 'xagent-smoke-write' and "
+                    "mimeType = 'application/vnd.google-apps.folder' and "
+                    "'root' in parents and "
+                    "trashed = false"
+                ),
+                "max_results": 10,
+            },
+            assertions=(Length(("files",), 1, 1),),
+        ),
+        path=("files", 0, "id"),
+        # Drive has no tool that returns the tenant's customer id, so the pin
+        # reads the write-area container (#3567): the folder the seed keeps
+        # unshared, found by the seed's own rule - its name, its type and the
+        # root as its parent - and required to be the registry's id.
+        expected=FixtureRef("google-drive.write_folder_id"),
+    )
+    name = RunScopedName("drive-file")
+    created = CreatedRef(("file", "id"))
+    probe = "xagent smoke write probe"
+    # The guard asserts the name alone, so content that did not land as sent
+    # still lets the cleanup delete the file.
+    guard = ToolStep(
+        "google_drive_get_file_content",
+        {"file_id": created},
+        assertions=(StatusSuccess(), Equals(("file", "name"), name)),
+    )
+
+    assert CONNECTOR_CHECKS["google-drive"].writes == (
+        WriteCheck(
+            "google-drive.file_round_trip",
+            create=ToolStep(
+                "google_drive_create_file",
+                {
+                    "name": name,
+                    "content": probe,
+                    "mime_type": "text/plain",
+                    "parent_id": FixtureRef("google-drive.write_folder_id"),
+                },
+                assertions=(StatusSuccess(), HasKeys(("file",), ("id",))),
+            ),
+            verify=ToolStep(
+                "google_drive_get_file_content",
+                {"file_id": created},
+                assertions=(
+                    StatusSuccess(),
+                    Equals(("file", "name"), name),
+                    Equals(("content",), probe),
+                ),
+            ),
+            cleanup=ToolStep(
+                "google_drive_delete_file",
+                {"file_id": created},
+                assertions=(StatusSuccess(),),
+            ),
+            cleanup_guard=guard,
+            tenant_pin=pin,
+            # Toby classifies only Jira's writes, so it withholds neither
+            # Drive tool from a member.
+            expected_verdicts={
+                "google_drive_create_file": "allow",
+                "google_drive_delete_file": "allow",
+            },
+        ),
+    )
+
+
+def test_google_drive_declares_its_sweep() -> None:
+    checks = CONNECTOR_CHECKS["google-drive"]
+
+    assert checks.sweep == Sweep(
+        tenant_pin=checks.writes[0].tenant_pin,
+        find=ToolStep(
+            "google_drive_search",
+            {
+                "query": FixtureRef("google-drive.write_sweep_query"),
+                "max_results": 100,
+            },
+            assertions=(StatusSuccess(), HasKeys((), ("files",))),
+        ),
+        items=("files",),
+        name=("name",),
+        delete=ToolStep(
+            "google_drive_delete_file",
+            {"file_id": ItemRef(("id",))},
+            assertions=(StatusSuccess(),),
+        ),
+    )
+
+
 def test_a_cleanable_write_keeps_a_pending_exemption() -> None:
-    """The writes whose own cleanup tool can delete what they create wait for
-    round two (#3567); none carries the permanent no-cleanup reason."""
+    """The writes whose own cleanup tool can delete what they create still
+    wait for a later check (#3567); none carries the permanent no-cleanup
+    reason."""
     cleanable = (
         "google_calendar_create_events",
         "google_calendar_delete_events",
-        "google_drive_create_file",
         "google_drive_create_folder",
-        "google_drive_delete_file",
         "google_sheets_add_sheet",
         "google_sheets_delete_sheet",
         "google_slides_add_slide",

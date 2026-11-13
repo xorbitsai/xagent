@@ -638,6 +638,112 @@ def _teams_checks() -> ConnectorChecks:
     )
 
 
+def _google_drive_write_checks() -> tuple[WriteCheck, Sweep]:
+    """Google Drive's write check and sweep (#3567), sharing one tenant pin.
+
+    Drive has no tool that returns the Workspace customer id, so #3567 pins
+    the write check and the sweep to their own write-area container instead:
+    the one folder the seed names ``xagent-smoke-write`` in the account's My
+    Drive root and keeps unshared, which a connection to any other account
+    therefore cannot read. The same read shows that the connection is the test
+    account and that the container the create targets is that account's;
+    whether the file lands there rests on the create's parent, which no step
+    reads. The query is the seed's own uniqueness rule, so a folder with that
+    name outside the root, such as one in a shared drive, does not make the pin
+    fail. The check creates a text file in that folder, reads it back to
+    confirm its run-scoped name and its content, and deletes it; the cleanup
+    guard makes the same read but asserts the name alone, so content that did
+    not land as sent does not keep the file from being deleted. The sweep lists
+    the folder with the registry's query fixture, since Drive's search takes
+    the whole query, and deletes leftovers by id.
+    """
+    pin = TenantPin(
+        ToolStep(
+            "google_drive_search",
+            {
+                "query": (
+                    "name = 'xagent-smoke-write' and "
+                    "mimeType = 'application/vnd.google-apps.folder' and "
+                    "'root' in parents and "
+                    "trashed = false"
+                ),
+                "max_results": 10,
+            },
+            assertions=(Length(("files",), 1, 1),),
+        ),
+        path=("files", 0, "id"),
+        expected=FixtureRef("google-drive.write_folder_id"),
+    )
+    name = RunScopedName("drive-file")
+    created = CreatedRef(("file", "id"))
+    probe = "xagent smoke write probe"
+    # The guard asserts the name alone, so a file whose content did not land
+    # as sent is still deleted.
+    guard = ToolStep(
+        "google_drive_get_file_content",
+        {"file_id": created},
+        assertions=(StatusSuccess(), Equals(("file", "name"), name)),
+    )
+    write = WriteCheck(
+        "google-drive.file_round_trip",
+        create=ToolStep(
+            "google_drive_create_file",
+            {
+                "name": name,
+                "content": probe,
+                "mime_type": "text/plain",
+                "parent_id": FixtureRef("google-drive.write_folder_id"),
+            },
+            assertions=(StatusSuccess(), HasKeys(("file",), ("id",))),
+        ),
+        verify=ToolStep(
+            "google_drive_get_file_content",
+            {"file_id": created},
+            assertions=(
+                StatusSuccess(),
+                Equals(("file", "name"), name),
+                Equals(("content",), probe),
+            ),
+        ),
+        cleanup=ToolStep(
+            "google_drive_delete_file",
+            {"file_id": created},
+            assertions=(StatusSuccess(),),
+        ),
+        cleanup_guard=guard,
+        tenant_pin=pin,
+        # Toby withholds a write tool from a member who did not install the
+        # connector, and classifies only Jira's writes today, so neither Drive
+        # tool is withheld. Classifying Drive's writes turns this red.
+        expected_verdicts={
+            "google_drive_create_file": "allow",
+            "google_drive_delete_file": "allow",
+        },
+    )
+    sweep = Sweep(
+        tenant_pin=pin,
+        find=ToolStep(
+            "google_drive_search",
+            {
+                "query": FixtureRef("google-drive.write_sweep_query"),
+                "max_results": 100,
+            },
+            assertions=(StatusSuccess(), HasKeys((), ("files",))),
+        ),
+        items=("files",),
+        name=("name",),
+        delete=ToolStep(
+            "google_drive_delete_file",
+            {"file_id": ItemRef(("id",))},
+            assertions=(StatusSuccess(),),
+        ),
+    )
+    return write, sweep
+
+
+_GOOGLE_DRIVE_WRITE, _GOOGLE_DRIVE_SWEEP = _google_drive_write_checks()
+
+
 # Connectors that have adopted V2, by catalog app id. Each tool of an in-repo
 # connector has a check or an exemption (#3565, tests/web/connector_checks/
 # test_tool_coverage.py); a remote one declares the checks it has.
@@ -1019,9 +1125,7 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             issue=_GOOGLE_TIER_1,
             reads=("google_drive_download_file", "google_drive_list_permissions"),
             writes=(
-                "google_drive_create_file",
                 "google_drive_create_folder",
-                "google_drive_delete_file",
                 "google_drive_move_file",
                 "google_drive_remove_permission",
                 "google_drive_rename_file",
@@ -1031,6 +1135,8 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
                 "google_drive_upload_file",
             ),
         ),
+        writes=(_GOOGLE_DRIVE_WRITE,),
+        sweep=_GOOGLE_DRIVE_SWEEP,
     ),
     "google-sheets": ConnectorChecks(
         "google-sheets",

@@ -255,8 +255,10 @@ class ToolStep:
 
 @dataclass(frozen=True)
 class TenantPin:
-    """Before any write, ``step`` reads the connection's tenant id at
-    ``path``; it must equal the registry's id, ``expected``."""
+    """Before any write, ``step`` reads, at ``path``, a value only this
+    tenant's account has: its tenant id where a tool of the connector returns
+    one, or the id of the tenant's own write-area container, which the seed
+    keeps unshared. It must equal the registry's value, ``expected``."""
 
     step: ToolStep
     path: PayloadPath

@@ -243,6 +243,12 @@ async def test_standby_preloads_channel_modules_but_only_activation_starts_them(
     )
     # Undo the stub modules _patch_startup installed; the finder serves fresh ones.
     for name in _CHANNEL_MODULES:
+        package_name, _, attribute = name.rpartition(".")
+        package = importlib.import_module(package_name)
+        # The fake import rebinds the name on the parent package as well;
+        # restoring sys.modules alone would leave that binding behind.
+        previous = getattr(package, attribute, None)
+        monkeypatch.setattr(package, attribute, previous, raising=False)
         monkeypatch.setitem(sys.modules, name, None)
         del sys.modules[name]
     for task_name in ("telegram_task", "feishu_task", "slack_task"):

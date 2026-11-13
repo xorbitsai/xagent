@@ -1580,130 +1580,15 @@ def _resolve_effective_embedding_model_sync_impl(
     collection_name: str, config_model_id: Optional[str] = None
 ) -> str:
     """Implementation for resolve_effective_embedding_model_sync."""
-
-    # Treat empty/whitespace-only IDs and the tool-layer "none" placeholder as missing.
     config_model_id = _normalize_model_id(config_model_id)
     try:
+        # Deliberate side effects of the *search* path, kept byte-identical:
+        # the access mark, and persisting an inferred binding below.
         mark_collection_accessed_sync(collection_name)
         collection_info = get_collection_sync(collection_name)
-
-        bound_model_id = _normalize_model_id(collection_info.embedding_model_id)
-        indexed_model_id = _normalize_model_id(
-            collection_info.ingestion_config.embedding_model_id
-            if collection_info.ingestion_config is not None
-            else None
+        return _effective_model_from_info(
+            collection_name, collection_info, config_model_id, persist=True
         )
-
-        if collection_info.is_initialized and bound_model_id:
-            if config_model_id and config_model_id != bound_model_id:
-                logger.warning(
-                    "Config embedding_model_id '%s' overridden by "
-                    "collection '%s' bound model '%s'",
-                    config_model_id,
-                    collection_name,
-                    bound_model_id,
-                )
-            return bound_model_id
-
-        if indexed_model_id:
-            if config_model_id and config_model_id != indexed_model_id:
-                logger.warning(
-                    "Config embedding_model_id '%s' overridden by "
-                    "collection '%s' ingestion config model '%s'",
-                    config_model_id,
-                    collection_name,
-                    indexed_model_id,
-                )
-            logger.info(
-                "Collection '%s' using ingestion config embedding_model_id '%s'",
-                collection_name,
-                indexed_model_id,
-            )
-            return indexed_model_id
-
-        inferred_model_id: Optional[str] = None
-        inferred_dimension: Optional[int] = None
-        if collection_info.embeddings > 0:
-            try:
-                from ..utils.migration_utils import (
-                    _infer_embedding_config_from_collection,
-                )
-
-                inferred_model_id, inferred_dimension = (
-                    _infer_embedding_config_from_collection(collection_name)
-                )
-                inferred_model_id = _normalize_model_id(inferred_model_id)
-            except Exception as exc:
-                logger.warning(
-                    "Embedding inference failed for collection '%s': %s",
-                    collection_name,
-                    exc,
-                )
-
-        if inferred_model_id:
-            logger.info(
-                "Collection '%s' inferred embedding_model_id '%s' from existing embedding tables",
-                collection_name,
-                inferred_model_id,
-            )
-            try:
-                candidate = collection_info.model_copy(
-                    update={
-                        "embedding_model_id": inferred_model_id,
-                        "embedding_dimension": inferred_dimension
-                        if inferred_dimension is not None
-                        else collection_info.embedding_dimension,
-                    }
-                )
-                applied = _sync_wrapper(collection_manager.update_collection_fields)(
-                    candidate, _BINDING_FIELDS, require_uninitialized=True
-                )
-                if not applied:
-                    fresh = get_collection_sync(collection_name)
-                    # Inferring is slow enough for a switch to land meanwhile; it wins.
-                    bound = _normalize_model_id(fresh.embedding_model_id)
-                    if bound:
-                        logger.info(
-                            "Collection '%s' was bound to '%s' while inferring",
-                            collection_name,
-                            bound,
-                        )
-                        return bound
-                    if fresh.embedding_model_id is not None:
-                        # A whitespace-only id reads as unbound but the unbound
-                        # clause does not match it: repair it by exact value.
-                        _sync_wrapper(collection_manager.update_collection_fields)(
-                            candidate,
-                            _BINDING_FIELDS,
-                            expected_model_id=fresh.embedding_model_id,
-                        )
-                        # Losing that compare-and-set means a switch won: use it.
-                        stored = _normalize_model_id(
-                            get_collection_sync(collection_name).embedding_model_id
-                        )
-                        if stored:
-                            return stored
-            except Exception as save_error:
-                logger.warning(
-                    "Failed to persist inferred embedding metadata for collection '%s': %s",
-                    collection_name,
-                    save_error,
-                )
-            return inferred_model_id
-
-        if config_model_id:
-            logger.info(
-                "Collection '%s' not initialized, using config embedding_model_id '%s'",
-                collection_name,
-                config_model_id,
-            )
-            return config_model_id
-
-        raise ValueError(
-            f"Collection '{collection_name}' is not initialized with an embedding model. "
-            "Please ingest documents first or specify embedding_model_id in config."
-        )
-
     except ValueError as e:
         if "not found" in str(e):
             if config_model_id:
@@ -1712,6 +1597,183 @@ def _resolve_effective_embedding_model_sync_impl(
                 f"Collection '{collection_name}' not found and no model ID provided."
             )
         raise
+
+
+def resolve_effective_embedding_model_read_only(
+    collection_name: str, config_model_id: Optional[str] = None
+) -> Optional[str]:
+    """The model search resolves for ``collection_name``, writing nothing.
+
+    Same precedence as :func:`resolve_effective_embedding_model_sync` — bound
+    model, ingestion config, table inference, config — but without the access
+    mark and without persisting an inferred binding, so a migration report or a
+    dry run leaves ``collection_metadata`` untouched. ``None`` when nothing
+    resolves.
+    """
+    config_model_id = _normalize_model_id(config_model_id)
+    try:
+        collection_info = get_collection_sync(collection_name)
+    except ValueError as e:
+        if "not found" in str(e):
+            return config_model_id
+        raise
+    try:
+        return _effective_model_from_info(
+            collection_name, collection_info, config_model_id, persist=False
+        )
+    except ValueError:
+        return None
+
+
+def _effective_model_from_info(
+    collection_name: str,
+    collection_info: Any,
+    config_model_id: Optional[str],
+    *,
+    persist: bool,
+) -> str:
+    """Pick the effective model from ``collection_info``; raise when none exists.
+
+    ``persist`` is the search path's behaviour: write an inferred binding back
+    (with the race handling below). Callers that must stay read-only pass
+    ``False``.
+    """
+    bound_model_id = _normalize_model_id(collection_info.embedding_model_id)
+    indexed_model_id = _normalize_model_id(
+        collection_info.ingestion_config.embedding_model_id
+        if collection_info.ingestion_config is not None
+        else None
+    )
+
+    if collection_info.is_initialized and bound_model_id:
+        if config_model_id and config_model_id != bound_model_id:
+            logger.warning(
+                "Config embedding_model_id '%s' overridden by "
+                "collection '%s' bound model '%s'",
+                config_model_id,
+                collection_name,
+                bound_model_id,
+            )
+        return bound_model_id
+
+    if indexed_model_id:
+        if config_model_id and config_model_id != indexed_model_id:
+            logger.warning(
+                "Config embedding_model_id '%s' overridden by "
+                "collection '%s' ingestion config model '%s'",
+                config_model_id,
+                collection_name,
+                indexed_model_id,
+            )
+        logger.info(
+            "Collection '%s' using ingestion config embedding_model_id '%s'",
+            collection_name,
+            indexed_model_id,
+        )
+        return indexed_model_id
+
+    inferred_model_id: Optional[str] = None
+    inferred_dimension: Optional[int] = None
+    if collection_info.embeddings > 0:
+        try:
+            from ..utils.migration_utils import (
+                _infer_embedding_config_from_collection,
+            )
+
+            inferred_model_id, inferred_dimension = (
+                _infer_embedding_config_from_collection(collection_name)
+            )
+            inferred_model_id = _normalize_model_id(inferred_model_id)
+        except Exception as exc:
+            logger.warning(
+                "Embedding inference failed for collection '%s': %s",
+                collection_name,
+                exc,
+            )
+
+    if inferred_model_id:
+        logger.info(
+            "Collection '%s' inferred embedding_model_id '%s' from existing embedding tables",
+            collection_name,
+            inferred_model_id,
+        )
+        if persist:
+            stored = _persist_inferred_binding(
+                collection_name, collection_info, inferred_model_id, inferred_dimension
+            )
+            if stored:
+                return stored
+        return inferred_model_id
+
+    if config_model_id:
+        logger.info(
+            "Collection '%s' not initialized, using config embedding_model_id '%s'",
+            collection_name,
+            config_model_id,
+        )
+        return config_model_id
+
+    raise ValueError(
+        f"Collection '{collection_name}' is not initialized with an embedding model. "
+        "Please ingest documents first or specify embedding_model_id in config."
+    )
+
+
+def _persist_inferred_binding(
+    collection_name: str,
+    collection_info: Any,
+    inferred_model_id: str,
+    inferred_dimension: Optional[int],
+) -> Optional[str]:
+    """Write back a binding inferred from the tables; a lost race uses the winner.
+
+    Returns the winner's model when a concurrent write bound the collection
+    while the repair was attempted, otherwise ``None``.
+    """
+    try:
+        candidate = collection_info.model_copy(
+            update={
+                "embedding_model_id": inferred_model_id,
+                "embedding_dimension": inferred_dimension
+                if inferred_dimension is not None
+                else collection_info.embedding_dimension,
+            }
+        )
+        applied = _sync_wrapper(collection_manager.update_collection_fields)(
+            candidate, _BINDING_FIELDS, require_uninitialized=True
+        )
+        if not applied:
+            fresh = get_collection_sync(collection_name)
+            # Inferring is slow enough for a switch to land meanwhile; it wins.
+            bound = _normalize_model_id(fresh.embedding_model_id)
+            if bound:
+                logger.info(
+                    "Collection '%s' was bound to '%s' while inferring",
+                    collection_name,
+                    bound,
+                )
+                return bound
+            if fresh.embedding_model_id is not None:
+                # A whitespace-only id reads as unbound but the unbound
+                # clause does not match it: repair it by exact value.
+                _sync_wrapper(collection_manager.update_collection_fields)(
+                    candidate,
+                    _BINDING_FIELDS,
+                    expected_model_id=fresh.embedding_model_id,
+                )
+                # Losing that compare-and-set means a switch won: use it.
+                stored = _normalize_model_id(
+                    get_collection_sync(collection_name).embedding_model_id
+                )
+                if stored:
+                    return stored
+    except Exception as save_error:
+        logger.warning(
+            "Failed to persist inferred embedding metadata for collection '%s': %s",
+            collection_name,
+            save_error,
+        )
+    return None
 
 
 async def rebuild_collection_metadata() -> None:

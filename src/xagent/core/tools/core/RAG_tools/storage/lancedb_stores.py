@@ -1150,10 +1150,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..core.exceptions import DatabaseOperationError
         from ..LanceDB.model_tag_utils import (
             embeddings_table_candidates,
-            to_model_tag,
+            legacy_embeddings_table_name,
             written_embeddings_table_name,
         )
-        from ..utils.model_resolver import resolve_embedding_adapter
 
         conn = self._get_connection()
         candidate_table_names = embeddings_table_candidates(model_tag)
@@ -1167,12 +1166,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 last_error = candidate_exc
 
         # Try legacy fallback
-        legacy_table_name: Optional[str] = None
-        try:
-            cfg, _ = resolve_embedding_adapter(model_tag)
-            legacy_table_name = f"embeddings_{to_model_tag(cfg.model_name)}"
-        except Exception:
-            legacy_table_name = None
+        legacy_table_name: Optional[str] = legacy_embeddings_table_name(model_tag)
 
         if legacy_table_name and legacy_table_name not in tried_table_names:
             tried_table_names.append(legacy_table_name)

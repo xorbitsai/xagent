@@ -736,3 +736,27 @@ class TestRebuildCollectionMetadata:
         assert result.name == "rebuild_test_collection"
         assert result.documents == 5
         assert result.processed_documents == 3
+
+
+def test_the_search_resolver_marks_access_and_the_read_only_one_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(name="kb", embedding_model_id="m1", embedding_dimension=2)
+        )
+    )
+    marked: list = []
+    monkeypatch.setattr(cm, "mark_collection_accessed_sync", marked.append)
+
+    assert cm.resolve_effective_embedding_model_sync("kb") == "m1"
+    assert marked == ["kb"]
+
+    marked.clear()
+    assert cm.resolve_effective_embedding_model_read_only("kb") == "m1"
+    assert marked == []

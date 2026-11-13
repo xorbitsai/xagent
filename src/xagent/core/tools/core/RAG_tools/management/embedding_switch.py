@@ -43,6 +43,11 @@ class CollectionEmbeddingSwitch:
     target_dimension: int
 
 
+def resolve_configured_model(target_model_id: str) -> tuple[str, int]:
+    """Public alias: migrations resolve their target through this one rule."""
+    return _resolve_configured_model(target_model_id)
+
+
 def _resolve_configured_model(target_model_id: str) -> tuple[str, int]:
     """Return the hub config for ``target_model_id``, never an env fallback.
 

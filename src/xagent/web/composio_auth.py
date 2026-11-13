@@ -67,7 +67,13 @@ on by default (``XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS``): it only
 reads the grants this database stores and clears their local tokens, deleting
 nothing in Composio. The row stays, with its token cleared, so the grant no
 longer counts as connected and the user is offered to connect again. Every
-other answer, including any other 404, leaves the row alone.
+other answer, including any other 404, leaves the row alone. A pass clears a
+few missing accounts, up to a fixed number of lookups, and resumes where the
+previous pass stopped in this process. When at least three lookups answer missing
+and more than half of the pass's lookups do, it writes nothing and logs a
+warning: a key that cannot see the accounts does not clear them, but neither
+does a mass deletion, which needs an operator. With fewer than three grants
+the breaker cannot trip.
 
 Disconnect: deleting a grant through ``delete_scoped_user_oauth_accounts``
 schedules its Composio account for deletion once the caller's outermost
@@ -851,9 +857,13 @@ _RECONCILE_PAGE_SIZE = 100
 # Only this slug proves the account is gone; another 404 may mean something
 # else Composio answers the same way.
 _MISSING_ACCOUNT_SLUG = "ConnectedAccount_ResourceNotFound"
-# One pass checks at most this many grants remotely. The cursor carried between
-# passes keeps rows past the cap from being starved by a fixed prefix.
+# One pass checks at most this many grants remotely. The cursor is per process,
+# starts over on restart, and keeps rows past the cap from being starved.
 _MISSING_ACCOUNT_LOOKUP_LIMIT = 200
+# At least this many missing answers, and more than this share of the pass's
+# lookups, is a broken view of the accounts rather than deletions.
+_MISSING_ACCOUNT_BREAKER_MIN = 3
+_MISSING_ACCOUNT_BREAKER_RATIO = 0.5
 _missing_account_cursor = 0
 
 
@@ -981,11 +991,11 @@ def reconcile_orphan_accounts(
     return deleted
 
 
-def _rows_to_check(rows: list[Any]) -> list[Any]:
-    """One pass's share of ``rows`` (ordered by id), after the last checked."""
+def _rows_in_cursor_order(rows: list[Any]) -> list[Any]:
+    """Every row once (rows are ordered by id), after the last handled one."""
     ids = [int(row[0]) for row in rows]
     start = bisect.bisect_right(ids, _missing_account_cursor)
-    return (rows[start:] + rows[:start])[:_MISSING_ACCOUNT_LOOKUP_LIMIT]
+    return rows[start:] + rows[:start]
 
 
 def tombstone_missing_composio_accounts(
@@ -999,12 +1009,15 @@ def tombstone_missing_composio_accounts(
     Composio's side would keep its grant looking connected. Only a 404 whose
     body's error slug is exactly ``_MISSING_ACCOUNT_SLUG`` proves it is gone.
     The row is kept with its token cleared, so the grant no longer counts as
-    connected and the user is offered to connect again. A stored grant that
-    cannot be decrypted is skipped (its token is already unusable), and a
-    reconnect that lands between lookup and write is not undone. Returns how
-    many grants were tombstoned.
+    connected and the user is offered to connect again. A pass makes at most
+    ``_MISSING_ACCOUNT_LOOKUP_LIMIT`` lookups, resumes where the previous pass
+    stopped in this process, and writes nothing when the breaker trips. A
+    stored grant that cannot be decrypted is skipped (its token is already
+    unusable), and a reconnect that lands between lookup and write is not
+    undone. Returns how many grants were tombstoned.
     """
     from .models.user_oauth import UserOAuth
+    from .tools.mcp.composio_proxy import _composio_refusal
 
     global _missing_account_cursor
 
@@ -1025,28 +1038,64 @@ def tombstone_missing_composio_accounts(
     stored = [
         (row_id, str(provider), str(token)) for row_id, provider, token in rows if token
     ]
-    tombstoned = 0
-    for row_id, provider, account_id in _rows_to_check(stored):
+    lookups_made = 0
+    missing: list[tuple[int, str]] = []
+    ended = False
+    for row_id, provider, account_id in _rows_in_cursor_order(stored):
         if stopping():
+            ended = True
             break
-        _missing_account_cursor = row_id
         config = configs.get(provider)
         if config is None or _valid_account_id(account_id) is None:
             continue
+        if lookups_made >= _MISSING_ACCOUNT_LOOKUP_LIMIT:
+            break
         try:
             status, payload = _call(
                 config.api_key, "GET", f"/connected_accounts/{account_id}"
             )
         except ComposioError:
-            # Unreachable Composio: the next pass retries, as the orphan pass.
+            # Unreachable Composio: the next pass retries this row first.
+            ended = True
             break
+        lookups_made += 1
+        if 500 <= status < 600:
+            # A record that keeps answering 5xx must not pin every row after it.
+            _missing_account_cursor = row_id
+            ended = True
+            break
+        if status in (401, 403, 429):
+            # The key is unusable: stop before writing anything.
+            ended = True
+            break
+        _missing_account_cursor = row_id
         if status != 404:
             continue
-        from .tools.mcp.composio_proxy import _composio_refusal
-
         _, slug = _composio_refusal("Composio account lookup", status, payload)
         if slug != _MISSING_ACCOUNT_SLUG:
+            logger.warning(
+                "Composio account lookup answered HTTP %s (slug=%s); leaving the grant",
+                status,
+                slug,
+            )
             continue
+        missing.append((row_id, account_id))
+    if ended:
+        return 0
+    if (
+        len(missing) >= _MISSING_ACCOUNT_BREAKER_MIN
+        and len(missing) > lookups_made * _MISSING_ACCOUNT_BREAKER_RATIO
+    ):
+        logger.warning(
+            "Composio missing-account pass skipped: %d of %d lookups answered missing",
+            len(missing),
+            lookups_made,
+        )
+        return 0
+    tombstoned = 0
+    for row_id, account_id in missing:
+        if stopping():
+            break
         # Lock and re-read: the reconnect that replaced this account since the
         # scan must not be undone.
         reread = db.query(UserOAuth).filter(UserOAuth.id == row_id).populate_existing()

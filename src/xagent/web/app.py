@@ -912,9 +912,15 @@ def start_composio_missing_account_task(
 
     Runs by default whenever an app's Composio config is complete; each pass
     looks up the accounts this database's grants name and clears the grant
-    when Composio answers 404 ConnectedAccount_ResourceNotFound. It reads
-    only this database's grants and deletes nothing in Composio, so it does
-    not need the orphan cleanup's opt-in.
+    when Composio answers 404 ConnectedAccount_ResourceNotFound. A pass clears
+    a few missing accounts, up to a fixed number of lookups, and resumes where
+    the previous pass stopped in this process. When at least three lookups answer
+    missing and more than half of the pass's lookups do, it writes nothing and
+    logs a warning: a key that cannot see the accounts does not clear them, but
+    neither does a mass deletion, which needs an operator. With fewer than three
+    grants the breaker cannot trip. It reads only this database's grants and
+    deletes nothing in Composio, so it does not need the orphan cleanup's
+    opt-in.
     """
     from .composio_auth import _configured_apps, run_missing_account_loop
 
@@ -2538,7 +2544,7 @@ async def _start_commands_and_channels() -> None:
 
 
 async def _start_late_tasks() -> None:
-    """Temp-file cleanup and Composio reconcile, deliberately started last."""
+    """Temp-file cleanup and the Composio loops, deliberately started last."""
     auto_migrate = _lancedb_auto_migrate()
     # Kept under the same migration toggle as the uploaded-files reconcile above;
     # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.

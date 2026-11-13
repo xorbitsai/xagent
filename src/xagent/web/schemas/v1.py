@@ -137,9 +137,13 @@ class CreateTaskRequest(BaseModel):
             "Output format of the task. Omitted, null or "
             '``{"type": "text"}`` means no format; a ``json_schema`` object '
             "(``name``, ``schema`` and optionally ``strict`` set to true and "
-            "``description``) sets it for this and later turns. An invalid "
-            "value is rejected with 422 ``invalid_input``; the message starts "
-            "with the rule id and the JSON path of the offending value."
+            "``description``) sets it for this and later turns. A "
+            "``json_schema`` object may also carry ``accept_partial`` (true or "
+            "false, default false), a switch that keeps the values extracted "
+            "from a run the agent rated partial or blocked, and from an "
+            "incomplete result; it is not accepted with ``type`` ``text``. An "
+            "invalid value is rejected with 422 ``invalid_input``; the message "
+            "starts with the rule id and the JSON path of the offending value."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
@@ -793,10 +797,15 @@ class AppendMessageRequest(BaseModel):
             'format as it is; ``{"type": "text"}`` clears it; a '
             "``json_schema`` object (``name``, ``schema`` and optionally "
             "``strict`` set to true and ``description``) sets it for this and "
-            "later turns. An invalid value is rejected with 422 "
-            "``invalid_input``; the message starts with the rule id and the "
-            "JSON path of the offending value. Not accepted with a workforce "
-            "key (422)."
+            "later turns. A new ``json_schema`` object replaces the stored one "
+            "as a whole, including ``accept_partial``: send ``accept_partial`` "
+            "again to keep it. ``accept_partial`` (true or false, default "
+            "false) keeps the values extracted from a run the agent rated "
+            "partial or blocked, and from an incomplete result; it is not "
+            "accepted with ``type`` ``text``. An invalid value is rejected "
+            "with 422 ``invalid_input``; the message starts with the rule id "
+            "and the JSON path of the offending value. Not accepted with a "
+            "workforce key (422)."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(

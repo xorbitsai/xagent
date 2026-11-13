@@ -105,11 +105,14 @@ class StructuredOutputFormat:
 
     The schema is a shared reference and is only read. ``INVALID`` stands for a
     stored format that failed its checks; it is compared with ``is``.
+    ``accept_partial`` keeps the values extracted from a run the agent rated
+    partial or blocked, and from an incomplete result. ``INVALID`` never has it.
     """
 
     name: str
     description: str | None
     schema: dict[str, Any]
+    accept_partial: bool = False
 
     INVALID: ClassVar[StructuredOutputFormat]
 

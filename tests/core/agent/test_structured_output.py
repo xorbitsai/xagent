@@ -1668,9 +1668,9 @@ def test_label_self_rated_run(code: str) -> None:
     cells = [*_OUTCOME_BEFORE, *failed]
     assert len(cells) == 10
     for name, before in cells:
-        frozen = copy.deepcopy(before)
+        snapshot = copy.deepcopy(before)
         labeled = so._label_self_rated_run(before, code)
-        assert before == frozen, name
+        assert before == snapshot, name
         base = _settled("incomplete", code)
         if before["status"] == "ready":
             assert labeled == {**base, "partial_output": before["output"]}, name

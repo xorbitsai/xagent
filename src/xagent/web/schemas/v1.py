@@ -1250,8 +1250,13 @@ class TaskInfoResponse(BaseModel):
     structured_output: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "The structured result of the run shown in this response, when "
-            "structured_output_status is 'ready'; null otherwise."
+            "The structured result of the run shown in this response. When "
+            "structured_output_status is 'ready', the complete result. When "
+            "it is 'incomplete' and the format sets accept_partial, the "
+            "values that were extracted, with null where a value is missing "
+            "or cannot be written (structured_output_reason lists up to 20 "
+            "such positions of each kind); null when nothing could be kept. "
+            "Null otherwise."
         ),
     )
     structured_output_status: Optional[str] = Field(
@@ -1265,11 +1270,14 @@ class TaskInfoResponse(BaseModel):
     structured_output_reason: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "Why there is no structured result when structured_output_status "
-            "is 'incomplete' or 'failed': an object with code and message, "
-            "and missing_fields or unexpressible_fields (at most 20 paths "
-            "each) when the result lacks or cannot express values. A key with "
-            "no value is absent. code is one of: agent_partial / "
+            "Why the structured result is missing or partial when "
+            "structured_output_status is 'incomplete' or 'failed': an object "
+            "with code and message, and missing_fields or "
+            "unexpressible_fields (at most 20 paths each) when the result "
+            "lacks or cannot express values. With accept_partial, "
+            "agent_partial and agent_blocked may also carry missing_fields "
+            "and unexpressible_fields. A key with no value is absent. code "
+            "is one of: agent_partial / "
             "agent_blocked / information_missing / value_not_expressible / "
             "not_produced (status incomplete); schema_mismatch / "
             "result_too_large / model_error / invalid_stored_format / "

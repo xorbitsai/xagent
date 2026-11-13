@@ -71,6 +71,7 @@ def _seed_key(
     paused: bool = False,
     revoked_at: datetime | None = None,
     created_at: datetime | None = None,
+    last_used_at: datetime | None = None,
 ) -> _Key:
     db = _direct_db_session()
     try:
@@ -83,6 +84,7 @@ def _seed_key(
             key_hash=key_hash,
             paused_at=datetime.now(timezone.utc) if paused else None,
             revoked_at=revoked_at,
+            last_used_at=last_used_at,
         )
         if created_at is not None:
             row.created_at = created_at
@@ -212,6 +214,42 @@ def test_lists_keys_of_own_agent():
     assert body[1]["status"] == "active"
     assert body[1]["last_used_at"] is None
     assert body[1]["revoked_at"] is None
+
+
+def test_list_orders_keys_created_together_by_descending_id():
+    key = _personal_key()
+    agent_id = _seed_agent()
+    created = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    first = _seed_key(agent_id, created_at=created)
+    second = _seed_key(agent_id, created_at=created)
+    third = _seed_key(agent_id, created_at=created)
+
+    resp = _list(key, agent_id)
+
+    assert resp.status_code == 200, resp.text
+    assert [item["id"] for item in resp.json()] == [third.id, second.id, first.id]
+
+
+def test_list_reports_timestamps_as_aware_utc_values():
+    key = _personal_key()
+    agent_id = _seed_agent()
+    created = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    used = created + timedelta(hours=1)
+    revoked = created + timedelta(hours=2)
+    _seed_key(agent_id, created_at=created, last_used_at=used, revoked_at=revoked)
+
+    resp = _list(key, agent_id, include_revoked=True)
+
+    assert resp.status_code == 200, resp.text
+    (item,) = resp.json()
+    for field, expected in (
+        ("created_at", created),
+        ("last_used_at", used),
+        ("revoked_at", revoked),
+    ):
+        reported = datetime.fromisoformat(item[field])
+        assert reported.tzinfo is not None, field
+        assert reported == expected, field
 
 
 def test_agent_without_keys_lists_empty():

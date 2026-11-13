@@ -440,6 +440,15 @@ class AgentApiKeyService:
         that was already revoked is reported with ``revoked=False`` and its
         original timestamp.
 
+        Known window: because an already revoked key is left untouched, this
+        does not turn a rotation's revocation into an explicit one. If a
+        rotation revoked the key and is later compensated (its new key could
+        not be delivered), the compensation restores every replaced key whose
+        ``revoked_at`` still equals the rotation timestamp, including a key
+        for which this method reported ``revoked=False`` in between. A caller
+        that must be certain should list the agent's keys again once the
+        rotation has settled.
+
         Raises :class:`AgentRuntimeKeyNotFoundError` when ``agent_id`` has no
         key with this id.
         """

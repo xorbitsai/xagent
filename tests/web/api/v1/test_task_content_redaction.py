@@ -10,7 +10,7 @@ a redacted task rather than failing on missing content.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 from unittest.mock import MagicMock, patch
@@ -45,7 +45,7 @@ from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.task_runtime_secret import TaskRuntimeSecret
 from xagent.web.models.uploaded_file import UploadedFile
-from xagent.web.services import task_content_redaction
+from xagent.web.services import task_content_redaction, task_deletion
 from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
@@ -58,7 +58,10 @@ from xagent.web.services.task_content_redaction import (
     TaskContentRedactionReport,
     redact_task_content,
 )
-from xagent.web.services.uploaded_file_store import UploadedFileStore
+from xagent.web.services.uploaded_file_store import (
+    UploadedFileStore,
+    UploadedFileVersionConflict,
+)
 
 from ...services.task_interaction_schema_shared import make_row
 from ..conftest import _admin_headers, _direct_db_session, _override_get_db, client
@@ -290,7 +293,6 @@ def _content_counts(task_id: int) -> dict[str, int]:
                 DAGExecution,
                 TaskChatMessage,
                 TaskExecutionEvent,
-                TaskConnectorRuntimeContext,
                 TaskRuntimeSecret,
                 TaskAutoRecovery,
                 TaskRecoveryEvent,
@@ -327,6 +329,17 @@ def test_redaction_removes_content_and_keeps_the_task_and_its_usage(
     assert set(_content_counts(task_id).values()) == {0}
     assert not local.exists()
     assert not workspace.exists()
+    db = _direct_db_session()
+    try:
+        # Non-secret routing input the next turn is validated against.
+        assert (
+            db.query(TaskConnectorRuntimeContext)
+            .filter(TaskConnectorRuntimeContext.task_id == task_id)
+            .count()
+            == 1
+        )
+    finally:
+        db.close()
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).one()
@@ -389,10 +402,10 @@ def test_a_cleanup_failure_is_reported_and_the_batch_continues(
     manager = get_agent_manager()
     remove_agent = manager.remove_agent
 
-    def flaky_remove_agent(task_id: int, *args: Any, **kwargs: Any) -> None:
+    def flaky_remove_agent(task_id: int, *args: Any, **kwargs: Any) -> bool:
         if task_id == failing_id:
             raise OSError("workspace is busy")
-        remove_agent(task_id, *args, **kwargs)
+        return remove_agent(task_id, *args, **kwargs)
 
     monkeypatch.setattr(manager, "remove_agent", flaky_remove_agent)
 
@@ -436,7 +449,11 @@ def test_cleanup_spares_a_runtime_a_later_turn_acquired(
 
     report = _redact([task_id])
 
-    assert report == TaskContentRedactionReport(redacted=(task_id,))
+    if new_turn_after_commit:
+        # The workspace keeps pre-redaction files: the host must re-run.
+        assert report == TaskContentRedactionReport(cleanup_failed=(task_id,))
+    else:
+        assert report == TaskContentRedactionReport(redacted=(task_id,))
     if new_turn_after_commit:
         assert manager._agents[task_id] is cached_agent
         cached_agent.cleanup_workspace.assert_not_called()
@@ -448,17 +465,106 @@ def test_cleanup_spares_a_runtime_a_later_turn_acquired(
     manager._agent_run_generations.pop(task_id, None)
 
 
-@pytest.mark.parametrize("state", ["running", "pending_command"])
+def test_a_storage_failure_rolls_back_that_task_and_the_batch_continues(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    failing_id = _settled_task(full_key, agent_id)
+    next_id = _settled_task(full_key, agent_id)
+    _seed_content(failing_id, _roots)
+    _seed_content(next_id, _roots)
+    before = _content_counts(failing_id)
+    delete = UploadedFileStore.delete
+
+    def flaky_delete(self: UploadedFileStore, record: Any, **kwargs: Any) -> None:
+        if record.task_id == failing_id:
+            raise OSError("object storage unavailable")
+        delete(self, record, **kwargs)
+
+    monkeypatch.setattr(UploadedFileStore, "delete", flaky_delete)
+
+    report = _redact([failing_id, next_id])
+
+    assert report == TaskContentRedactionReport(
+        redacted=(next_id,), failed=(failing_id,)
+    )
+    assert _content_counts(failing_id) == before
+    assert set(_content_counts(next_id).values()) == {0}
+
+
+def test_a_file_claimed_by_another_owner_is_left_to_it(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A version conflict means a cleanup claimant owns the file now."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _seed_content(task_id, _roots)
+
+    def claimed(self: UploadedFileStore, record: Any, **kwargs: Any) -> None:
+        raise UploadedFileVersionConflict("claimed before deletion")
+
+    monkeypatch.setattr(UploadedFileStore, "delete", claimed)
+
+    report = _redact([task_id])
+
+    assert report == TaskContentRedactionReport(redacted=(task_id,))
+    counts = _content_counts(task_id)
+    assert counts.pop(UploadedFile.__tablename__) == 1
+    assert set(counts.values()) == {0}
+
+
+def test_a_file_a_knowledge_base_references_is_detached_not_deleted(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    storage_key, local, _ = _seed_content(task_id, _roots)
+    db = _direct_db_session()
+    try:
+        record = db.query(UploadedFile).filter(UploadedFile.task_id == task_id).one()
+        file_id, owner_id = str(record.file_id), int(record.user_id)
+    finally:
+        db.close()
+    monkeypatch.setattr(
+        task_deletion,
+        "find_referenced_file_ids",
+        lambda file_ids: {file_id} & set(file_ids),
+    )
+
+    report = _redact([task_id])
+
+    assert report == TaskContentRedactionReport(redacted=(task_id,))
+    assert local.exists()
+    assert _object_exists(owner_id, storage_key)
+    db = _direct_db_session()
+    try:
+        kept = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        assert (kept.task_id, kept.detached_reason) == (None, "task_deleted")
+    finally:
+        db.close()
+
+
+#: Task states the redaction must refuse. The parked ones (paused, waiting
+#: for the user, pending with nothing queued) never settle by themselves; the
+#: host cancels them first.
+BUSY_STATES: dict[str, dict[str, Any]] = {
+    "running": {"status": TaskStatus.RUNNING},
+    "paused": {"status": TaskStatus.PAUSED},
+    "waiting_for_user": {"status": TaskStatus.WAITING_FOR_USER},
+    "pending_without_command": {"status": TaskStatus.PENDING},
+    "live_lease": {"lease_expires_at": datetime.now(UTC) + timedelta(hours=1)},
+}
+
+
+@pytest.mark.parametrize("state", [*BUSY_STATES, "pending_command"])
 def test_redaction_leaves_a_busy_task_untouched(_roots: Path, state: str) -> None:
     agent_id, full_key = _create_agent_with_key()
     task_id = _settled_task(full_key, agent_id)
     _seed_content(task_id, _roots)
     db = _direct_db_session()
     try:
-        if state == "running":
-            db.query(Task).filter(Task.id == task_id).update(
-                {"status": TaskStatus.RUNNING}
-            )
+        if state in BUSY_STATES:
+            db.query(Task).filter(Task.id == task_id).update(BUSY_STATES[state])
         else:
             db.add(
                 TaskExecutionCommand(

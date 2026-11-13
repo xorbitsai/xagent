@@ -3982,13 +3982,17 @@ class AgentServiceManager:
         expected_run_id: Optional[str] = None,
         expected_run_generation: Optional[int] = None,
         workspace_target: Optional[WorkspaceCleanupTarget] = None,
-    ) -> None:
+    ) -> bool:
         """Clean a task runtime only for the run that scheduled cleanup.
 
         ``workspace_target`` is used only when no agent is cached: a cached one
         knows its own workspace path and needs no capture. Deletion callers
         pass a target captured before the task row was deleted, because the
         path is no longer derivable once the row is gone.
+
+        Returns ``False`` when the run fence skipped the cleanup -- a later
+        acquisition owns the runtime, so neither it nor the workspace was
+        touched -- and ``True`` once the runtime was removed.
         """
         current_run_id = self._agent_run_ids.get(task_id)
         current_generation = self._agent_run_generations.get(task_id)
@@ -4009,7 +4013,7 @@ class AgentServiceManager:
                 expected_run_generation,
                 current_generation,
             )
-            return
+            return False
         if expected_run_id is not None and (
             (current_run_id is not None and current_run_id != expected_run_id)
             or (build_lock is not None and build_lock.locked())
@@ -4020,7 +4024,7 @@ class AgentServiceManager:
                 expected_run_id,
                 current_run_id,
             )
-            return
+            return False
 
         agent = self._agents.get(task_id)
         cleanup_user_id = user_id
@@ -4073,6 +4077,7 @@ class AgentServiceManager:
             if build_lock is not None and not build_lock.locked():
                 self._agent_build_locks.pop(task_id, None)
             logger.info("Removed AgentService runtime for task %s", task_id)
+        return True
 
     async def execute_task(
         self,

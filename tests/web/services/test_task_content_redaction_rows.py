@@ -21,9 +21,11 @@ from tests.web.services.task_interaction_schema_shared import make_row
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import (
     DAGExecution,
     Task,
+    TaskConnectorRuntimeContext,
     TaskStatus,
     TraceCheckpointBlob,
     TraceEvent,
@@ -38,6 +40,7 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.user_channel import UserChannel
 from xagent.web.services import channel_delivery
+from xagent.web.services.connector_runtime import prepare_append_connector_runtime
 from xagent.web.services.task_deletion import purge_task_rows, redact_task_rows
 from xagent.web.services.task_file_lifecycle import lock_attachment_task
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
@@ -294,3 +297,87 @@ def test_purge_task_rows_still_deletes_the_task_and_detaches_files(sessions) -> 
         assert all(_count(db, model, task_id) == 0 for model in CONTENT_TABLES)
         [file] = db.query(UploadedFile).filter(UploadedFile.user_id == owner_id).all()
         assert (file.task_id, file.detached_reason) == (None, "task_deleted")
+
+
+def test_a_redacted_connector_bound_task_can_take_another_turn(sessions) -> None:
+    """The connector runtime context survives: the next turn is checked
+    against it, and without it a required context key could never be
+    satisfied again (resending it is refused as a change)."""
+    with sessions() as db:
+        owner = User(username="connector-owner", password_hash="unused")
+        db.add(owner)
+        db.flush()
+        server = MCPServer(
+            name="runtime",
+            description="runtime",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/mcp",
+            runtime_input_schema={
+                "context": {"account_id": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "mcp_meta", "key": "account_id"},
+                }
+            ],
+        )
+        agent = Agent(
+            user_id=owner.id,
+            name="connector agent",
+            instructions="Use tools.",
+            tool_categories=["mcp"],
+        )
+        db.add_all([server, agent])
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=owner.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        ref = {"connector_type": "mcp", "connector_id": int(server.id)}
+        task = Task(
+            user_id=owner.id,
+            agent_id=agent.id,
+            title="secret",
+            source="sdk",
+            status=TaskStatus.COMPLETED,
+            connector_runtime_selected_refs=[ref],
+        )
+        db.add(task)
+        db.flush()
+        db.add(
+            TaskConnectorRuntimeContext(
+                task_id=task.id,
+                connector_type="mcp",
+                connector_id=server.id,
+                context={"account_id": "acct-1"},
+            )
+        )
+        db.commit()
+        task_id, owner_id, agent_id = int(task.id), int(owner.id), int(agent.id)
+
+    _redact(sessions, task_id, NOW)
+
+    with sessions() as db:
+        task = db.get(Task, task_id)
+        agent = db.get(Agent, agent_id)
+        assert task is not None and agent is not None
+        for payload_items in (
+            None,
+            [{"connector_ref": ref, "context": {"account_id": "acct-1"}}],
+        ):
+            plan = prepare_append_connector_runtime(
+                db=db,
+                agent=agent,
+                task=task,
+                connector_user_id=owner_id,
+                payload_items=payload_items,
+            )
+            assert plan.ephemeral_by_ref == {}

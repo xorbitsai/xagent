@@ -112,6 +112,8 @@ def switch_collection_embedding_model(
             state=FROZEN,
             source_model_id=source_model_id,
             target_model_id=canonical_model_id,
+            owner=state.owner,
+            mode=state.mode,
         ),
     ):
         raise CollectionNotFrozenError(

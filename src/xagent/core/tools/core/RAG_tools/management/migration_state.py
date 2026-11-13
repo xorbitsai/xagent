@@ -73,6 +73,8 @@ _SCHEMA = pa.schema(
         ("source_model_id", pa.string()),
         ("target_model_id", pa.string()),
         ("updated_at", pa.timestamp("us")),
+        ("owner", pa.string()),
+        ("mode", pa.string()),
     ]
 )
 
@@ -85,6 +87,8 @@ class CollectionMigrationState:
     source_model_id: Optional[str] = None
     target_model_id: Optional[str] = None
     updated_at: Optional[datetime] = None
+    owner: Optional[str] = None
+    mode: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         return {
@@ -92,6 +96,8 @@ class CollectionMigrationState:
             "source_model_id": self.source_model_id,
             "target_model_id": self.target_model_id,
             "updated_at": self.updated_at,
+            "owner": self.owner,
+            "mode": self.mode,
         }
 
 
@@ -105,12 +111,38 @@ def _row_state(row: Dict[str, Any]) -> str:
 
 def _ensure_table(conn: Any) -> None:
     if MIGRATION_TABLE in list_table_names(conn):
+        _ensure_columns(conn)
         return
     try:
         conn.create_table(MIGRATION_TABLE, schema=_SCHEMA)
     except Exception:
         if MIGRATION_TABLE not in list_table_names(conn):
             raise
+
+
+def _ensure_columns(conn: Any) -> None:
+    """Add the columns a table created by an older version lacks."""
+    table = conn.open_table(MIGRATION_TABLE)
+    try:
+        schema = table.schema
+        # An earlier version added these as ``null``-typed, which rejects every
+        # later string write; they can only hold nulls, so re-add them typed.
+        broken = [f.name for f in schema if pa.types.is_null(f.type)]
+        if broken:
+            table.drop_columns(broken)
+        present = set(schema.names) - set(broken)
+        missing = [f for f in _SCHEMA if f.name not in present]
+        if missing:
+            table.add_columns({f.name: _null_cast(f.type) for f in missing})
+    finally:
+        _safe_close_table(table)
+
+
+def _null_cast(field_type: Any) -> str:
+    """A null of the column's own type: a string cast would break ``updated_at``."""
+    if pa.types.is_timestamp(field_type):
+        return "cast(null as timestamp)"
+    return "cast(null as string)"
 
 
 def _read_row(
@@ -140,6 +172,8 @@ def read_migration_state(
         source_model_id=row.get("source_model_id"),
         target_model_id=row.get("target_model_id"),
         updated_at=row.get("updated_at"),
+        owner=row.get("owner"),
+        mode=row.get("mode"),
     )
 
 
@@ -216,6 +250,123 @@ def _merge_row(conn: Any, row: dict[str, Any]) -> None:
         ).when_matched_update_all().when_not_matched_insert_all().execute([row])
     finally:
         _safe_close_table(table)
+
+
+def read_raw_state(collection_name: str) -> Optional[Dict[str, Any]]:
+    """The stored row as written, for a byte-exact restore."""
+    row = _read_row(collection_name)
+    return None if row is None else dict(row)
+
+
+def restore_state(collection_name: str, row: Optional[Dict[str, Any]]) -> None:
+    """Put ``row`` back exactly, or remove the collection's row when it was absent."""
+    if row is None:
+        clear_migration_state(collection_name)
+        return
+    conn = get_metadata_store().get_raw_connection()
+    _merge_row(conn, dict(row))
+
+
+def claim_freeze(
+    collection_name: str,
+    *,
+    source_model_id: str,
+    target_model_id: str,
+    mode: str,
+    owner: str,
+    stale_after_seconds: float,
+) -> str:
+    """Freeze the collection for this run, or say why it cannot.
+
+    Returns ``"claimed"`` for a fresh freeze, ``"resumed"`` for a window that is
+    ours or whose owner stopped heartbeating, and ``"busy"`` otherwise. The write
+    is conditional on the row read here, and the owner is re-read afterwards.
+    """
+    previous = _read_row(collection_name)
+    requested = replace(
+        CollectionMigrationState(
+            state=FROZEN,
+            source_model_id=source_model_id,
+            target_model_id=target_model_id,
+            mode=mode,
+            owner=owner,
+        ),
+        updated_at=_now(),
+    )
+    conn = get_metadata_store().get_raw_connection()
+    if previous is None:
+        _ensure_table(conn)
+        table = conn.open_table(MIGRATION_TABLE)
+        try:
+            table.merge_insert(["name"]).when_not_matched_insert_all().execute(
+                [{"name": collection_name, **requested.to_row()}]
+            )
+        finally:
+            _safe_close_table(table)
+        outcome = "claimed"
+    else:
+        stored_state = previous.get("state")
+        stored_owner = previous.get("owner")
+        if stored_state == FROZEN:
+            if stored_owner != owner and (
+                _age_seconds(previous.get("updated_at")) < stale_after_seconds
+            ):
+                return "busy"
+            outcome = "resumed"
+        elif stored_state == IDLE:
+            outcome = "claimed"
+        else:
+            return "busy"
+        _ensure_table(conn)
+        where = (
+            f"name = '{escape_lancedb_string(collection_name)}' "
+            f"AND state = '{stored_state}' AND {_owner_predicate(stored_owner)}"
+        )
+        for attempt in range(WRITE_MAX_RETRIES - 1):
+            try:
+                if not _update_row(conn, where, requested.to_row()):
+                    return "busy"
+                break
+            except Exception as exc:
+                logger.warning(
+                    "Retrying migration state claim for %s: %s", collection_name, exc
+                )
+                time.sleep(0.1 * (2**attempt))
+        else:
+            if not _update_row(conn, where, requested.to_row()):
+                return "busy"
+    stored = read_migration_state(collection_name)
+    if stored.state != FROZEN or stored.owner != owner:
+        return "busy"
+    return outcome
+
+
+def heartbeat_freeze(collection_name: str, owner: str) -> bool:
+    """Renew the window's row; ``False`` means this run no longer owns it."""
+    conn = get_metadata_store().get_raw_connection()
+    where = (
+        f"name = '{escape_lancedb_string(collection_name)}' "
+        f"AND state = '{FROZEN}' AND {_owner_predicate(owner)}"
+    )
+    return _update_row(conn, where, {"updated_at": _now()})
+
+
+def _owner_predicate(owner: Optional[str]) -> str:
+    if owner is None:
+        return "owner IS NULL"
+    return f"owner = '{escape_lancedb_string(owner)}'"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _age_seconds(stamp: Any) -> float:
+    if not isinstance(stamp, datetime):
+        return 0.0
+    current = datetime.now(timezone.utc)
+    value = stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (current - value).total_seconds())
 
 
 def clear_migration_state(collection_name: str) -> None:

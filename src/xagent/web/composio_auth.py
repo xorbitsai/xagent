@@ -60,6 +60,13 @@ only after its Composio grants are gone and a pass has started after
 accounts from sign-ins begun before the switch are past the TTL plus grace
 (see ``example.env``).
 
+A stored grant whose connected account Composio answers 404
+``ConnectedAccount_ResourceNotFound`` for is tombstoned by the same pass
+(``tombstone_missing_composio_accounts``): the row stays, with its token
+cleared, so the grant no longer counts as connected and the user is offered
+to connect again. Every other answer, including any other 404, leaves the
+row alone.
+
 Disconnect: deleting a grant through ``delete_scoped_user_oauth_accounts``
 schedules its Composio account for deletion once the caller's outermost
 transaction commits (``schedule_account_deletions``); a rolled-back SAVEPOINT
@@ -72,6 +79,7 @@ Composio user id or a ``session_uri``.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import hmac
 import logging
@@ -86,7 +94,7 @@ from urllib.parse import urlencode, urlsplit
 
 from cryptography.fernet import InvalidToken
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import event
+from sqlalchemy import event, text
 
 from ..config import COMPOSIO_CALLBACK_URL as COMPOSIO_CALLBACK_URL_ENV
 from ..config import get_composio_callback_url
@@ -838,6 +846,13 @@ _XAGENT_USER_ID_PREFIX = "xagent-"
 # committed after the grace period could lose its account to a pass.
 _RECONCILE_GRACE_SECONDS = 30 * 60
 _RECONCILE_PAGE_SIZE = 100
+# Only this slug proves the account is gone; another 404 may mean something
+# else Composio answers the same way.
+_MISSING_ACCOUNT_SLUG = "ConnectedAccount_ResourceNotFound"
+# One pass checks at most this many grants remotely. The cursor carried between
+# passes keeps rows past the cap from being starved by a fixed prefix.
+_MISSING_ACCOUNT_LOOKUP_LIMIT = 200
+_missing_account_cursor = 0
 
 
 def _created_at(value: object) -> datetime | None:
@@ -964,6 +979,96 @@ def reconcile_orphan_accounts(
     return deleted
 
 
+def _rows_to_check(rows: list[Any]) -> list[Any]:
+    """One pass's share of ``rows`` (ordered by id), after the last checked."""
+    ids = [int(row[0]) for row in rows]
+    start = bisect.bisect_right(ids, _missing_account_cursor)
+    return (rows[start:] + rows[:start])[:_MISSING_ACCOUNT_LOOKUP_LIMIT]
+
+
+def tombstone_missing_composio_accounts(
+    db: Session,
+    *,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Tombstone stored grants whose connected account Composio no longer has.
+
+    The connector subprocess has no database access, so an account deleted on
+    Composio's side would keep its grant looking connected. Only a 404 whose
+    body's error slug is exactly ``_MISSING_ACCOUNT_SLUG`` proves it is gone.
+    The row is kept with its token cleared, so the grant no longer counts as
+    connected and the user is offered to connect again. A stored grant that
+    cannot be decrypted is skipped (its token is already unusable), and a
+    reconnect that lands between lookup and write is not undone. Returns how
+    many grants were tombstoned.
+    """
+    from .models.user_oauth import UserOAuth
+
+    global _missing_account_cursor
+
+    configs = _configured_apps()
+    if not configs:
+        return 0
+
+    def stopping() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    rows = (
+        db.query(UserOAuth.id, UserOAuth.provider, UserOAuth.access_token)
+        .filter(UserOAuth.token_type == COMPOSIO_TOKEN_TYPE)
+        .order_by(UserOAuth.id)
+        .all()
+    )
+    db.rollback()
+    stored = [
+        (row_id, str(provider), str(token)) for row_id, provider, token in rows if token
+    ]
+    tombstoned = 0
+    for row_id, provider, account_id in _rows_to_check(stored):
+        if stopping():
+            break
+        _missing_account_cursor = row_id
+        config = configs.get(provider)
+        if config is None or _valid_account_id(account_id) is None:
+            continue
+        try:
+            status, payload = _call(
+                config.api_key, "GET", f"/connected_accounts/{account_id}"
+            )
+        except ComposioError:
+            # Unreachable Composio: the next pass retries, as the orphan pass.
+            break
+        if status != 404:
+            continue
+        from .tools.mcp.composio_proxy import _composio_refusal
+
+        _, slug = _composio_refusal("Composio account lookup", status, payload)
+        if slug != _MISSING_ACCOUNT_SLUG:
+            continue
+        # Lock and re-read: the reconnect that replaced this account since the
+        # scan must not be undone.
+        reread = db.query(UserOAuth).filter(UserOAuth.id == row_id).populate_existing()
+        if db.get_bind().dialect.name == "sqlite":
+            # SQLite has no row locks; the no-op write takes its write lock.
+            db.execute(
+                text("UPDATE user_oauth SET id = id WHERE id = :id"), {"id": row_id}
+            )
+        else:
+            reread = reread.with_for_update()
+        row = cast(Any, reread.one_or_none())
+        if row is None or str(row.access_token or "") != account_id:
+            db.rollback()
+            continue
+        row.access_token = ""
+        row.refresh_token = None
+        row.expires_at = None
+        db.commit()
+        tombstoned += 1
+    if tombstoned:
+        logger.info("Tombstoned %d Composio grants whose account is gone", tombstoned)
+    return tombstoned
+
+
 def reconcile_orphan_accounts_isolated(
     session_factory: Callable[[], Session] | None = None,
     *,
@@ -975,7 +1080,9 @@ def reconcile_orphan_accounts_isolated(
 
         session_factory = get_session_local()
     with session_factory() as db:
-        return reconcile_orphan_accounts(db, stop_event=stop_event)
+        deleted = reconcile_orphan_accounts(db, stop_event=stop_event)
+        tombstone_missing_composio_accounts(db, stop_event=stop_event)
+        return deleted
 
 
 async def run_reconcile_loop(

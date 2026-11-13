@@ -1167,6 +1167,45 @@ def test_a_repeated_cancel_answers_for_the_turn_the_first_one_withdrew(
     assert len(_cancel_commands(task_id)) == 1
 
 
+def test_a_withdrawal_does_not_answer_once_the_turn_before_runs_again(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """After the withdrawal the turn before it was resumed and runs again on
+    a newer version. The record of the withdrawal no longer describes the
+    row, so the cancel aims at the running turn instead of answering that
+    the withdrawn one is cancelled while the running one goes on."""
+    task_id, agent_id, key = _running_task()
+    _update(
+        task_id,
+        runner_id=None,
+        lease_expires_at=None,
+        status=TaskStatus.PAUSED,
+        control_state=TaskControlState.PAUSED.value,
+    )
+    _queue_start(task_id)
+    _dispatch_through_the_core(monkeypatch, agent_id)
+    assert _cancel(task_id, key).status_code == 200
+    resumed = _row(task_id)
+    _update(
+        task_id,
+        status=TaskStatus.RUNNING,
+        control_state=TaskControlState.RUNNING.value,
+        state_version=resumed["state_version"] + 1,
+    )
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", AsyncMock())
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "running"
+    assert response.json()["run_id"] == resumed["run_id"]
+    assert response.json()["cancelled_run_id"] is None
+    commands = _cancel_commands(task_id)
+    assert len(commands) == 2
+    assert commands[-1].target_run_id == resumed["run_id"]
+
+
 @pytest.mark.parametrize(
     "start_outcome",
     [

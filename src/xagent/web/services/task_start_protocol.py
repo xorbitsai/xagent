@@ -217,22 +217,29 @@ def has_queued_start(db: Session, task_id: int) -> bool:
 def start_can_hand_off(command: TaskExecutionCommand, task: Task) -> bool:
     """Whether the START ``command`` can still begin its run on ``task``.
 
-    The task-row conditions the START consumer applies before it hands a
-    START off: the command's own version and the payload's agree, the row is
-    still the run and version the START was accepted against, nothing is
-    running, and a CREATE finds its task still pending. A START that fails
-    them is rejected when it is claimed and never starts, so a control that
-    aims at it would be aimed at nothing. A payload that does not decode is
-    rejected by the consumer too. ``command_identity_matches_task`` is not
-    part of this: it compares the command's owner and agent with the task's,
-    which a lookup by task id does not change.
+    The conditions the START consumer applies before it hands a START off
+    that depend on the command and the task row: the payload decodes and
+    matches its command's envelope (``read_task_start_command``), the
+    command's own version and the payload's agree, the row is still the run
+    and version the START was accepted against, nothing is running, and a
+    CREATE finds its task still pending. A START that fails them is rejected
+    when it is claimed and never starts, so a control that aims at it would
+    be aimed at nothing.
+
+    Two consumer checks are not repeated here. ``command_identity_matches_task``
+    re-validates the issuing user's access, and a single-process consumer
+    refuses a START that is not ``existing``. A START either of them rejects
+    never starts either, so treating it as one that can still start only
+    lets a cancel withdraw a turn that would not have run.
     """
     try:
         start = TaskStartPayload.model_validate(command.payload)
     except ValueError:
         return False
     return not (
-        command.target_state_version != start.state_version
+        start.run_id != command.target_run_id
+        or start.turn_id != command.command_id
+        or command.target_state_version != start.state_version
         or task.run_id != start.expected_run_id
         or task.state_version != start.state_version
         or task.status == TaskStatus.RUNNING

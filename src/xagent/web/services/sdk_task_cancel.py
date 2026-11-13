@@ -296,6 +296,13 @@ def _withdrawn_run_of_last_start(db: Session, task: Task) -> str | None:
     STARTs alone do not say so: other controls stop STARTs with the same
     reason, and only a completed cancel command of this endpoint was
     answered as a cancellation.
+
+    The record answers only while the row is still as that cancel left it:
+    withdrawing an appended turn does not move the row, so the cancel's
+    version is still the row's. A row that moved since -- for example the
+    turn before was resumed and runs again -- is answered from the row, as
+    any other call would be. A new task is the exception: its cancel wrote
+    the row itself, which then holds no run and reads as cancelled.
     """
 
     last = (
@@ -313,17 +320,20 @@ def _withdrawn_run_of_last_start(db: Session, task: Task) -> str | None:
     run_id = str(last.target_run_id)
     if run_id == _task_run_id(task):
         return None
-    cancels = (
-        db.query(TaskExecutionCommand)
-        .filter(
-            TaskExecutionCommand.task_id == int(task.id),
-            TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
-            TaskExecutionCommand.status == COMMAND_COMPLETED,
-            TaskExecutionCommand.target_run_id == run_id,
-        )
-        .populate_existing()
-        .all()
+    filters = [
+        TaskExecutionCommand.task_id == int(task.id),
+        TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
+        TaskExecutionCommand.status == COMMAND_COMPLETED,
+        TaskExecutionCommand.target_run_id == run_id,
+    ]
+    cancelled_new_task = _task_run_id(task) is None and is_sdk_cancelled(
+        task.status, task.error_message
     )
+    if not cancelled_new_task:
+        filters.append(
+            TaskExecutionCommand.target_state_version == int(task.state_version or 0)
+        )
+    cancels = db.query(TaskExecutionCommand).filter(*filters).populate_existing().all()
     for cancel in cancels:
         payload: dict[str, Any] = (
             cancel.payload if isinstance(cancel.payload, dict) else {}
@@ -515,7 +525,9 @@ def _load_result_sync(
       off. While its START waits the command is still pending; a START
       stopped before it began is that turn cancelled; any other START
       outcome means the turn is over. A START the row moved away from is
-      not stopped by the command (``stale_run``), and reads as over.
+      not stopped by the command (``stale_run``): while it is still pending
+      the call answers busy, or 202 at the deadline, and once its consumer
+      rejects it the turn reads as over.
     - a row that shows another run means the aimed one is over, and
       retrying would aim at the new one, so it raises
       ``SdkTaskNotCancellable`` with ``_AIMED_RUN_ENDED_MESSAGE``.

@@ -1522,8 +1522,9 @@ async def cancel_chat_task(
     finished or paused task it only withdraws that turn: the task keeps
     reading as the turn before it, and ``cancelled_run_id`` names the
     withdrawn run. A queued turn that can no longer start, because the
-    task has moved to another run, is not the target: the running run is
-    cancelled, and any other state is answered as if no turn were queued.
+    task has moved since it was queued (another run, or a newer version of
+    the same one), is not the target: a running run is cancelled, and any
+    other state is answered as if no turn were queued.
 
     A task that is waiting for an answer or paused, with no turn queued to
     start, answers 409 ``task_busy`` and is left untouched.

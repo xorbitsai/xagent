@@ -134,9 +134,15 @@ async def _create_knowledge_base_from_file_impl(
         admitted_context_async,
         run_in_admitted_context,
     )
+    from ...core.RAG_tools.management.write_leases import (
+        LeaseSet,
+        acquire_lease_async,
+        release_leases_async,
+    )
 
     collection_name = ""
     ingested_count = 0
+    lease_set = LeaseSet()
     try:
         from sqlalchemy.orm import Session
 
@@ -202,6 +208,11 @@ async def _create_knowledge_base_from_file_impl(
         # the collection is ours to clean up if every file fails.
         collection_existed_before = await kb_service.collection_exists(collection_name)
         # One admission for every file, so a freeze between files cannot strand a partial.
+        # The lease goes in first and spans the same work, so a migration waits
+        # for this tool too.
+        lease_set.add(
+            await acquire_lease_async(collection_name, "agent-file-ingestion")
+        )
         admission = await admitted_context_async(collection_name)
 
         ingested_count = 0
@@ -255,6 +266,9 @@ async def _create_knowledge_base_from_file_impl(
                 user_id=user_id,
                 is_admin=is_admin,
                 file_id=str(record.file_id),
+                # Before every write: a lease lost to a stalled process means a
+                # migration may already have started switching this collection.
+                commit_gate=lease_set.verify,
             )
             try:
                 result = await run_blocking(run_in_admitted_context, admission, func)
@@ -353,3 +367,5 @@ async def _create_knowledge_base_from_file_impl(
             message=str(e),
             files_ingested=0,
         ).model_dump()
+    finally:
+        await release_leases_async(lease_set.stop())

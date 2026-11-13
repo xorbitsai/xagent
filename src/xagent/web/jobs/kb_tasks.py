@@ -29,6 +29,7 @@ from ...core.tools.core.RAG_tools.kb import (
 from ...core.tools.core.RAG_tools.management.migration_state import (
     admits_collection_sync,
     ensure_collection_writable,
+    verify_active_leases,
 )
 from ...core.tools.core.RAG_tools.pipelines.document_ingestion import (
     resolve_ingestion_model_ids,
@@ -447,6 +448,7 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             retryable=False,
         ) from exc
     # Reaching here means exactly one document landed, so publish the config.
+    verify_active_leases(str(payload["collection"]))
     _save_job_collection_config_after_ingest(
         db,
         payload,
@@ -578,6 +580,7 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
             result=result_payload,
             retryable=not crawled_nothing,
         )
+    verify_active_leases(collection)
     return result_payload
 
 

@@ -29,7 +29,7 @@ from ..core.schemas import (
     WebIngestionResult,
 )
 from ..kb.operation_compatibility import _close_awaitable_if_possible
-from ..management.migration_state import admitted_async
+from ..management.migration_state import admitted_async, verify_active_leases
 from ..progress import get_progress_manager
 from ..utils.config_utils import coerce_ingestion_config
 from ..utils.string_utils import sanitize_for_doc_id
@@ -863,6 +863,9 @@ async def _run_web_ingestion_body(
         side_effects_may_remain=bool(rollback_failed_urls),
     )
 
+    # The crawl is long: a lease lost while it ran must fail it here, at its
+    # own commit point, not only at the per-document gates below it.
+    verify_active_leases(collection)
     logger.info(
         "Web ingestion completed: %s, %s documents, %sms",
         result.status,

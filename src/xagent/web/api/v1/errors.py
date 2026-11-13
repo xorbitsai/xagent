@@ -147,6 +147,15 @@ class V1ErrorCode(str, Enum):
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
 
+    # A team agent would select connectors its team cannot use. 400.
+    # ``details.connectors`` lists each one as ``{"name", "reason"}`` with
+    # ``reason`` one of ``not_shared``, ``disabled`` or ``unresolved``.
+    CONNECTOR_NOT_SHARED = "connector_not_shared"
+
+    # The agent has never had its tools chosen and uses the default tool
+    # set, so there is no selection to read connectors from or replace. 409.
+    AGENT_TOOLS_UNCONFIGURED = "agent_tools_unconfigured"
+
     # The connector's transport is not one the API can create, change or list
     # tools for (only ``streamable_http`` and ``sse``). 400.
     TRANSPORT_NOT_SUPPORTED = "transport_not_supported"
@@ -286,6 +295,12 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
     V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.CONNECTOR_NOT_SHARED: (
+        "The agent would select connectors its team cannot use."
+    ),
+    V1ErrorCode.AGENT_TOOLS_UNCONFIGURED: (
+        "This agent uses the default tool set; choose its tools in the web app first."
+    ),
     V1ErrorCode.TRANSPORT_NOT_SUPPORTED: (
         "Only the streamable_http and sse transports are supported through the API."
     ),

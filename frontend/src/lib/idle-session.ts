@@ -112,6 +112,7 @@ export function readIdleSessionRecord(storage: Storage, sessionId: string | null
  */
 export function writeIdleSessionRecord(storage: Storage, sessionId: string, policy: IdleSessionPolicy, now = Date.now()): IdleSessionRecord {
   const previous = readIdleSessionRecord(storage, sessionId)
+  if (previous && isOutOfOrder(previous, policy, now)) return previous
   const record: IdleSessionRecord = {
     ...policy,
     schemaVersion: IDLE_SESSION_SCHEMA_VERSION,
@@ -121,6 +122,23 @@ export function writeIdleSessionRecord(storage: Storage, sessionId: string, poli
   }
   storage.setItem(IDLE_SESSION_STORAGE_KEY, JSON.stringify(record))
   return record
+}
+
+/** Window in which two responses for the same login may arrive out of order. */
+const OUT_OF_ORDER_WINDOW_MS = 60_000
+
+/**
+ * The server deadline of one login only moves forward (activity) until it
+ * expires (a 401, not a policy). A response that arrives shortly after a newer
+ * one and implies an earlier deadline was produced before it, so it is ignored.
+ * Outside that short window, for example after a clock change, the newest
+ * response wins.
+ */
+function isOutOfOrder(previous: IdleSessionRecord, policy: IdleSessionPolicy, now: number): boolean {
+  if (previous.sid !== policy.sid || previous.enforced !== policy.enforced) return false
+  const age = now - previous.observedAt
+  if (age < 0 || age > OUT_OF_ORDER_WINDOW_MS) return false
+  return now + policy.idleExpiresIn * 1000 < previous.observedAt + previous.idleExpiresIn * 1000 - 1_000
 }
 
 export function markIdleActivityReported(storage: Storage, sessionId: string, now = Date.now()): void {

@@ -262,6 +262,19 @@ describe("IdleSessionManager revalidation", () => {
     await waitFor(() => expect(verifyCalls()).toHaveLength(1))
   })
 
+  it("does not mistake background-tab timer throttling for a clock jump", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" })
+    // A hidden tab's timers run about once a minute.
+    vi.setSystemTime(Date.now() + 60_000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(verifyCalls()).toHaveLength(0)
+  })
+
   it("leaves servers without idle support alone", async () => {
     writeAuthCache()
     render(<AuthProvider><CheckProbe /></AuthProvider>)
@@ -298,6 +311,8 @@ describe("IdleSessionManager expiry warning", () => {
     const dialog = await screen.findByRole("alertdialog")
     expect(dialog).toHaveTextContent("session_idle.warning_title")
     expect(dialog).toHaveTextContent("session_idle.warning_description")
+    // The safe choice has focus, so Enter keeps the session.
+    expect(document.activeElement).toHaveTextContent("session_idle.continue")
     fireEvent.click(screen.getByRole("button", { name: "session_idle.continue" }))
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull())
     expect(activityCalls().length).toBeGreaterThan(0)

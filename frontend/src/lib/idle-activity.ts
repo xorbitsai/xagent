@@ -8,6 +8,13 @@ import type { IdleSessionRecord } from "@/lib/idle-session"
  */
 export const IDLE_ACTIVITY_EVENTS = ["keydown", "pointerdown", "wheel"] as const
 
+/**
+ * A trailing or retried report must stand for input that happened within
+ * about one interval. Anything older (the device slept, the network was down,
+ * the server failed) is dropped: an overdue timer must never renew the login.
+ */
+const STALE_INPUT_TOLERANCE_MS = 5_000
+
 export function isUserActivityEvent(event: Event): boolean {
   return event.isTrusted
 }
@@ -36,6 +43,7 @@ export interface IdleActivityReporter {
 export function startIdleActivityReporter(options: IdleActivityReporterOptions): IdleActivityReporter {
   const isUserEvent = options.isUserEvent ?? isUserActivityEvent
   let pending = false
+  let lastInputAt = Number.NEGATIVE_INFINITY
   let inFlight: Promise<void> | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
   let stopped = false
@@ -63,7 +71,15 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
       pending = false
       return
     }
-    const wait = (record.lastReportAt ?? 0) + record.activityMinIntervalSeconds * 1000 - Date.now()
+    const intervalMs = record.activityMinIntervalSeconds * 1000
+    const now = Date.now()
+    if (now - lastInputAt > intervalMs + STALE_INPUT_TOLERANCE_MS) {
+      pending = false
+      return
+    }
+    // A report time in the future means the clock moved backwards; ignore it.
+    const lastReportAt = record.lastReportAt !== null && record.lastReportAt <= now ? record.lastReportAt : 0
+    const wait = lastReportAt + intervalMs - now
     if (wait > 0) {
       timer = setTimeout(() => { timer = null; schedule() }, wait)
       return
@@ -72,6 +88,7 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
   }
   const onEvent = (event: Event) => {
     if (!isUserEvent(event)) return
+    lastInputAt = Date.now()
     pending = true
     schedule()
   }

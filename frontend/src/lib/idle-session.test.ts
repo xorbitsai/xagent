@@ -134,17 +134,35 @@ describe("idle session state bound to one login", () => {
     expect(readCurrentIdleSession()).toBeNull()
   })
 
-  it("does not record a response without idle_session, and records best effort when storage refuses", async () => {
+  it("ignores an unreadable response body, and records best effort when storage refuses", async () => {
     const snapshot = await login({ idle_session: idle() })
-    expect(recordIdleSessionIfCurrent(snapshot, { success: true })).toBeNull()
+    expect(recordIdleSessionIfCurrent(snapshot, null)).toBeNull()
     const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => { throw new Error("quota") })
     try {
-      expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 5 }) })).toBeNull()
+      expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 1800 }) })).toBeNull()
       expect(() => markIdleActivityReportedIfCurrent(snapshot)).not.toThrow()
     } finally {
       setItem.mockRestore()
     }
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1734)
+  })
+
+  it("forgets the idle state when a successful response says the server no longer supports it", async () => {
+    const snapshot = await login({ idle_session: idle() })
+    expect(recordIdleSessionIfCurrent(snapshot, { success: true })).toBeNull()
+    expect(readCurrentIdleSession()).toBeNull()
+    const again = await login({ idle_session: idle() })
+    await commitAuthSessionRefresh(again, refreshBody())
+    expect(readCurrentIdleSession()).toBeNull()
+  })
+
+  it("does not let a late response move the deadline back for the same server login", async () => {
+    const snapshot = await login({ idle_session: idle({ idle_expires_in: 1800 }) })
+    // A verify sent before the activity report arrives after it.
+    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 300 }) })?.idleExpiresIn).toBe(1800)
+    expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
+    // A later deadline, or a change of switch state, is taken as is.
+    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 1790, enforced: false }) })?.enforced).toBe(false)
   })
 
   it("does not hand the stored idle state to a different browser login", async () => {
@@ -159,9 +177,9 @@ describe("idle session state bound to one login", () => {
     const snapshot = await login({ idle_session: idle() })
     markIdleActivityReportedIfCurrent(snapshot)
     const reportedAt = readCurrentIdleSession()!.lastReportAt
-    const result = await commitAuthSessionRefresh(snapshot, refreshBody({ idle_session: idle({ idle_expires_in: 900 }) }))
+    const result = await commitAuthSessionRefresh(snapshot, refreshBody({ idle_session: idle({ idle_expires_in: 1800 }) }))
     expect(result.status).toBe("updated")
-    expect(readCurrentIdleSession()).toMatchObject({ idleExpiresIn: 900, lastReportAt: reportedAt })
+    expect(readCurrentIdleSession()).toMatchObject({ idleExpiresIn: 1800, lastReportAt: reportedAt })
   })
 
   it("starts a fresh report history when a legacy login receives its first server login id", async () => {
@@ -177,7 +195,7 @@ describe("idle session state bound to one login", () => {
     expect(recordIdleSessionIfCurrent(first, { idle_session: idle({ idle_expires_in: 5 }) })).toBeNull()
     markIdleActivityReportedIfCurrent(first)
     expect(readCurrentIdleSession()).toMatchObject({ sessionId: second.sessionId, sid: "sid-b", lastReportAt: null })
-    expect(recordIdleSessionIfCurrent(second, { idle_session: idle({ sid: "sid-b", idle_expires_in: 5 }) })?.idleExpiresIn).toBe(5)
+    expect(recordIdleSessionIfCurrent(second, { idle_session: idle({ sid: "sid-b", idle_expires_in: 1800 }) })?.idleExpiresIn).toBe(1800)
   })
 
   it.each([

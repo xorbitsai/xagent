@@ -572,7 +572,11 @@ export async function commitAuthSessionRefresh(captured: AuthSessionSnapshot, va
     if (!payload) return { status: "invalid" as const }
     const result = advanceExact(storage, comparison.projection!.cache, payload, markAuthUpdated)
     const idle = parseIdleSession(value)
-    if (result.status === "updated" && idle) writeIdleSessionRecord(storage, result.projection.snapshot.sessionId!, idle)
+    if (result.status === "updated") {
+      // A refresh without idle_session comes from a server without the feature.
+      if (idle) writeIdleSessionRecord(storage, result.projection.snapshot.sessionId!, idle)
+      else storage.removeItem(IDLE_SESSION_STORAGE_KEY)
+    }
     return result
   })
   return result.status === "completed" ? result.value : unavailable(result.reason)
@@ -644,10 +648,15 @@ export function readCurrentIdleSession(): IdleSessionRecord | null {
  */
 export function recordIdleSessionIfCurrent(captured: AuthSessionSnapshot, body: unknown): IdleSessionRecord | null {
   const storage = getAuthStorage()
-  const idle = parseIdleSession(body)
-  if (!storage || !idle || !captured.sessionId) return null
+  if (!storage || !captured.sessionId || typeof body !== "object" || body === null) return null
   if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return null
-  try { return writeIdleSessionRecord(storage, captured.sessionId, idle) } catch { return null }
+  const idle = parseIdleSession(body)
+  try {
+    if (idle) return writeIdleSessionRecord(storage, captured.sessionId, idle)
+    // A successful response without idle_session: the server no longer has the feature.
+    storage.removeItem(IDLE_SESSION_STORAGE_KEY)
+  } catch { /* best effort */ }
+  return null
 }
 export function markIdleActivityReportedIfCurrent(captured: AuthSessionSnapshot): void {
   const storage = getAuthStorage()

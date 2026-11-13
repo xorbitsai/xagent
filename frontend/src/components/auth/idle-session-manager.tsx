@@ -85,7 +85,9 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
       const now = Date.now()
       const jumped = now < lastTick || now - lastTick > DEADLINE_TICK_MS + CLOCK_JUMP_TOLERANCE_MS
       lastTick = now
-      if (jumped) revalidate(true)
+      // Hidden tabs have throttled timers, so a long gap there is expected;
+      // they revalidate when they become visible again.
+      if (jumped && document.visibilityState !== "hidden") revalidate(true)
       else checkDeadline()
     }
     const onWake = () => {

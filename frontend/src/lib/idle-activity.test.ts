@@ -108,6 +108,35 @@ describe("idle activity reporting", () => {
     reporter.stop()
   })
 
+  it("drops a trailing report when the device slept past the interval", async () => {
+    const { reporter, report, fire } = setup()
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(10_000)
+    fire("keydown")
+    // The device sleeps for 20 minutes before the trailing timer can run.
+    vi.setSystemTime(Date.now() + 20 * 60_000)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(report).toHaveBeenCalledTimes(1)
+    reporter.stop()
+  })
+
+  it("stops retrying a failed report once the input behind it is stale", async () => {
+    const report = vi.fn(async () => false)
+    const { reporter, fire } = setup(record(), { report })
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(40 * 60_000)
+    expect(report.mock.calls.length).toBeLessThanOrEqual(2)
+    reporter.stop()
+  })
+
+  it("is not held back by a report time left in the future by a clock moved backwards", async () => {
+    const { reporter, report, fire } = setup(record({ lastReportAt: Date.now() + 60 * 60_000 }))
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
+    expect(report).toHaveBeenCalledTimes(1)
+    reporter.stop()
+  })
+
   it("treats a report that throws like one that did not reach the server", async () => {
     const report = vi.fn(async () => { throw new Error("offline") })
     const { reporter, fire } = setup(record(), { report })

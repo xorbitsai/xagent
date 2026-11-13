@@ -30,7 +30,12 @@ from ..core.config import (
     MAIN_POINTERS_NO_MATCH_FILTER,
     IndexPolicy,
 )
-from ..core.schemas import CollectionInfo, IndexResult
+from ..core.schemas import (
+    LANCEDB_NULL_INT_SENTINEL,
+    LANCEDB_NULL_STR_SENTINEL,
+    CollectionInfo,
+    IndexResult,
+)
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import (
     build_fts_query,
@@ -315,6 +320,74 @@ class LanceDBMetadataStore(MetadataStore):
             ).when_matched_update_all().when_not_matched_insert_all().execute([data])
         finally:
             _safe_close_table(table)
+
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+
+        data = collection.to_storage()
+        data["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        table = conn.open_table("collection_metadata")
+        try:
+            result = (
+                table.merge_insert(["name"])
+                .when_not_matched_insert_all()
+                .execute([data])
+            )
+        finally:
+            _safe_close_table(table)
+        return bool(result.num_inserted_rows)
+
+    async def update_collection_fields(
+        self,
+        collection: CollectionInfo,
+        field_names: Iterable[str],
+        *,
+        require_uninitialized: bool = False,
+        expected_model_id: Optional[str] = None,
+    ) -> bool:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        if require_uninitialized and expected_model_id is not None:
+            raise ValueError(
+                "Pass either require_uninitialized or expected_model_id, not both"
+            )
+        stored = collection.to_storage()
+        payload: dict[str, Any] = {}
+        for name in field_names:
+            if name == "name" or name not in stored:
+                raise ValueError(f"Cannot update collection_metadata field '{name}'")
+            payload[name] = stored[name]
+        payload["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        conn = await self._get_connection()
+        await self.ensure_collection_metadata_table()
+        where = f"name = '{escape_lancedb_string(collection.name)}'"
+        if require_uninitialized:
+            where += (
+                " AND (embedding_model_id IS NULL"
+                f" OR embedding_model_id = '{LANCEDB_NULL_STR_SENTINEL}'"
+                " OR embedding_dimension IS NULL"
+                f" OR embedding_dimension = {LANCEDB_NULL_INT_SENTINEL})"
+            )
+        elif expected_model_id is not None:
+            where += (
+                " AND embedding_model_id = "
+                f"'{escape_lancedb_string(expected_model_id)}'"
+            )
+        table = conn.open_table("collection_metadata")
+        try:
+            updated = table.update(where, payload)
+        finally:
+            _safe_close_table(table)
+        if updated.rows_updated:
+            return True
+        if require_uninitialized or expected_model_id is not None:
+            return False
+        raise ValueError(f"Collection '{collection.name}' not found")
 
     async def list_collections(
         self,

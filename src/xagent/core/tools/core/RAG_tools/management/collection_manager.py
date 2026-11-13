@@ -24,6 +24,7 @@ from typing import (
 
 import pyarrow as pa  # type: ignore
 
+from ..core.exceptions import CollectionNotFrozenError
 from ..core.parser_registry import get_supported_parsers, validate_parser_compatibility
 from ..core.schemas import CollectionInfo
 from ..LanceDB.schema_manager import _safe_close_table
@@ -33,6 +34,7 @@ from ..utils.lancedb_query_utils import list_table_names
 from ..utils.model_resolution_pin import pinned_resolution
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.tag_mapping import register_tag_mapping
+from .migration_state import FROZEN, read_migration_state
 
 if TYPE_CHECKING:
     from ..kb import (
@@ -43,6 +45,8 @@ if TYPE_CHECKING:
     )
 
 T = TypeVar("T")
+
+WRITE_MAX_RETRIES = 3
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +112,20 @@ def reset_locks_for_testing() -> None:
 def _normalize_collection_config_user_id(user_id: Optional[int]) -> int:
     """Normalize legacy collection_config ownership scope."""
     return 0 if user_id is None else int(user_id)
+
+
+# Columns the stats paths own. Binding columns are deliberately absent: they are
+# written only through the guarded binding paths or first-time initialization.
+_STATS_FIELDS = (
+    "documents",
+    "processed_documents",
+    "parses",
+    "chunks",
+    "embeddings",
+    "last_accessed_at",
+)
+_COUNT_FIELDS = _STATS_FIELDS[:-1]
+_BINDING_FIELDS = ("embedding_model_id", "embedding_dimension")
 
 
 def _normalize_model_id(model_id: Optional[str]) -> Optional[str]:
@@ -270,6 +288,41 @@ def _get_collection_lock(collection_name: str) -> asyncio.Lock:
         return _collection_locks[lock_key]
 
 
+def _is_deterministic_write_error(exc: Exception) -> bool:
+    """Errors a retry cannot fix: missing row, malformed call, unknown column."""
+    return isinstance(exc, ValueError) and any(
+        marker in str(exc)
+        for marker in ("not found", "not both", "Cannot update collection_metadata")
+    )
+
+
+async def _with_retry(
+    operation: Callable[[], Awaitable[T]],
+    *,
+    description: str,
+    deterministic: Optional[Callable[[Exception], bool]] = None,
+) -> T:
+    """Run ``operation``, backing off unless ``deterministic`` calls the error final."""
+    for attempt in range(WRITE_MAX_RETRIES):
+        try:
+            return await operation()
+        except Exception as exc:
+            final = deterministic(exc) if deterministic else False
+            if final or attempt == WRITE_MAX_RETRIES - 1:
+                logger.error(
+                    "Failed to run %s after %s attempts: %s",
+                    description,
+                    attempt + 1,
+                    exc,
+                )
+                raise
+            logger.warning(
+                "Attempt %s of %s failed, retrying: %s", attempt + 1, description, exc
+            )
+            await asyncio.sleep(0.1 * (2**attempt))
+    raise AssertionError("unreachable")
+
+
 class CollectionManager:
     """Manager for collection metadata operations with LanceDB storage.
 
@@ -317,10 +370,10 @@ class CollectionManager:
         """Save collection metadata to storage with retry mechanism.
 
         Takes the cross-thread guard as well as the asyncio lock: this does a
-        full-row overwrite and is reachable from the concurrent ingestion hot
-        path (the legacy-migration branch of resolve_effective_embedding_model_sync),
-        so without it a stale-read overwrite could clobber a concurrent
-        stats/embedding-init write on the same collection.
+        full-row overwrite, so without the lock a stale-read overwrite could
+        clobber a concurrent stats or binding write on the same collection.
+        Callers that only mean to create a row must use
+        ``save_collection_if_absent`` instead.
 
         Args:
             collection: CollectionInfo to save
@@ -329,6 +382,130 @@ class CollectionManager:
 
         async with lock, _collection_thread_guard(collection.name):
             await self._save_collection_with_retry(collection)
+
+    async def save_collection_if_absent(self, collection: CollectionInfo) -> bool:
+        """Create the row only if no row with that name exists; never overwrites."""
+        lock = _get_collection_lock(collection.name)
+
+        async with lock, _collection_thread_guard(collection.name):
+            return await self._save_collection_if_absent_with_retry(collection)
+
+    async def _save_collection_if_absent_with_retry(
+        self, collection: CollectionInfo
+    ) -> bool:
+        return await _with_retry(
+            lambda: self._get_metadata_store().save_collection_if_absent(collection),
+            description=f"creation of collection {collection.name}",
+        )
+
+    async def update_collection_fields(
+        self,
+        collection: CollectionInfo,
+        field_names: tuple[str, ...],
+        *,
+        require_uninitialized: bool = False,
+        expected_model_id: Optional[str] = None,
+        store: Optional[MetadataStore] = None,
+        recreate_missing: bool = False,
+    ) -> bool:
+        """Write only ``field_names`` of an existing row, under the collection locks.
+
+        ``store`` targets a store other than the factory's (duck-typed facades
+        pass their own). ``recreate_missing`` re-inserts a row that disappeared
+        between the caller's read and this write instead of raising.
+        """
+        lock = _get_collection_lock(collection.name)
+
+        async with lock, _collection_thread_guard(collection.name):
+            return await self._update_fields_with_retry(
+                collection,
+                field_names,
+                require_uninitialized=require_uninitialized,
+                expected_model_id=expected_model_id,
+                store=store,
+                recreate_missing=recreate_missing,
+            )
+
+    async def _update_fields_with_retry(
+        self,
+        collection: CollectionInfo,
+        field_names: tuple[str, ...],
+        *,
+        require_uninitialized: bool = False,
+        expected_model_id: Optional[str] = None,
+        store: Optional[MetadataStore] = None,
+        recreate_missing: bool = False,
+    ) -> bool:
+        """Partial write with the same commit-conflict retry as ``save_collection``.
+
+        A retried compare-and-set re-evaluates its guard, so a concurrent switch
+        still wins and the call returns ``False``. A missing row is re-raised
+        immediately (search/ingestion resolve the model before the row exists, and
+        retrying would stall that path), unless ``recreate_missing`` asks for the
+        row to be re-inserted like the whole-row save it replaced.
+        """
+        target = store if store is not None else self._get_metadata_store()
+        try:
+            return await _with_retry(
+                lambda: target.update_collection_fields(
+                    collection,
+                    field_names,
+                    require_uninitialized=require_uninitialized,
+                    expected_model_id=expected_model_id,
+                ),
+                description=f"field update of collection {collection.name}",
+                deterministic=_is_deterministic_write_error,
+            )
+        except ValueError as exc:
+            if not (recreate_missing and "not found" in str(exc)):
+                raise
+            # Insert unbound: the row was deleted, so its stale binding must not
+            # come back (a switch may have landed after the read).
+            blank = collection.model_copy(
+                update={"embedding_model_id": None, "embedding_dimension": None}
+            )
+            created = await _with_retry(
+                lambda: target.save_collection_if_absent(blank),
+                description=f"re-creation of collection {collection.name}",
+            )
+            if created:
+                return True
+            # Another writer created the row in the meantime: update it.
+            return await self._update_fields_with_retry(
+                collection,
+                field_names,
+                require_uninitialized=require_uninitialized,
+                expected_model_id=expected_model_id,
+                store=target,
+            )
+
+    async def _write_initial_binding(
+        self,
+        collection_name: str,
+        updated: CollectionInfo,
+        *,
+        requested_model_id: str,
+        require_uninitialized: bool = False,
+        expected_model_id: Optional[str] = None,
+    ) -> CollectionInfo:
+        """Apply a first/canonical binding only if the stored one did not move first."""
+        applied = await self._update_fields_with_retry(
+            updated,
+            _BINDING_FIELDS + ("schema_version",),
+            require_uninitialized=require_uninitialized,
+            expected_model_id=expected_model_id,
+        )
+        if applied:
+            return updated
+        fresh = await self.get_collection(collection_name)
+        if _normalize_model_id(fresh.embedding_model_id) == _normalize_model_id(
+            updated.embedding_model_id
+        ):
+            return fresh
+        raise ValueError(
+            f"Collection '{collection_name}' already initialized with "
+            f"model '{fresh.embedding_model_id}'. Cannot change to '{requested_model_id}'."
+        )
 
     async def delete_collection_metadata(
         self,
@@ -348,43 +525,12 @@ class CollectionManager:
                 delete_orphaned_metadata=delete_orphaned_metadata,
             )
 
-    async def _save_collection_with_retry(
-        self, collection: CollectionInfo, max_retries: int = 3
-    ) -> None:
-        """Save collection with retry mechanism for concurrent updates.
-
-        Args:
-            collection: CollectionInfo to save
-            max_retries: Maximum number of retry attempts
-
-        Raises:
-            Exception: If all retry attempts fail
-        """
-        for attempt in range(max_retries):
-            try:
-                await self._get_metadata_store().save_collection(collection)
-                return
-
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logger.error(
-                        "Failed to save collection %s after %s attempts: %s",
-                        collection.name,
-                        max_retries,
-                        e,
-                    )
-                    raise
-
-                # Exponential backoff
-                wait_time = 0.1 * (2**attempt)
-                logger.warning(
-                    "Save attempt %s failed for %s, retrying in %ss: %s",
-                    attempt + 1,
-                    collection.name,
-                    wait_time,
-                    e,
-                )
-                await asyncio.sleep(wait_time)
+    async def _save_collection_with_retry(self, collection: CollectionInfo) -> None:
+        """Save collection with retry mechanism for concurrent updates."""
+        await _with_retry(
+            lambda: self._get_metadata_store().save_collection(collection),
+            description=f"save of collection {collection.name}",
+        )
 
     async def _ensure_metadata_table(self) -> None:
         """Ensure collection_metadata table exists in LanceDB.
@@ -486,9 +632,11 @@ class CollectionManager:
             # Get current state
             try:
                 collection = await self.get_collection(collection_name)
+                row_exists = True
             except ValueError:
                 # Collection doesn't exist, create it
                 collection = CollectionInfo(name=collection_name)
+                row_exists = False
 
             # Check if already initialized
             if collection.is_initialized:
@@ -526,14 +674,19 @@ class CollectionManager:
                                 ),
                             }
                         )
-                        await self._save_collection_with_retry(updated_collection)
+                        migrated = await self._write_initial_binding(
+                            collection_name,
+                            updated_collection,
+                            requested_model_id=embedding_model_id,
+                            expected_model_id=collection.embedding_model_id,
+                        )
                         logger.info(
                             "Migrated collection '%s' embedding model from '%s' to canonical ID '%s'",
                             collection_name,
                             existing_model_id,
                             canonical_model_id,
                         )
-                        return updated_collection
+                        return migrated
 
                     raise ValueError(
                         f"Collection '{collection_name}' already initialized with "
@@ -558,8 +711,24 @@ class CollectionManager:
                 }
             )
 
-            # Save to storage
-            await self._save_collection_with_retry(updated_collection)
+            if row_exists:
+                updated_collection = await self._write_initial_binding(
+                    collection_name,
+                    updated_collection,
+                    requested_model_id=embedding_model_id,
+                    require_uninitialized=True,
+                )
+            else:
+                inserted = await self._save_collection_if_absent_with_retry(
+                    updated_collection
+                )
+                if not inserted:
+                    updated_collection = await self._write_initial_binding(
+                        collection_name,
+                        updated_collection,
+                        requested_model_id=embedding_model_id,
+                        require_uninitialized=True,
+                    )
 
             logger.info(
                 "Initialized collection '%s' with embedding model '%s'",
@@ -602,7 +771,7 @@ class CollectionManager:
                 # Auto-create collection if it doesn't exist
                 collection = CollectionInfo(name=collection_name)
                 # Save the newly created collection to storage
-                await self._save_collection_with_retry(collection)
+                await self._save_collection_if_absent_with_retry(collection)
             # Update statistics
             updated_data = {
                 "documents": collection.documents + documents_delta,
@@ -623,7 +792,18 @@ class CollectionManager:
                 updated_data["document_names"] = new_document_names
 
             updated_collection = collection.model_copy(update=updated_data)
-            await self._save_collection_with_retry(updated_collection)
+            # Persist the version read-side migration applied, or a legacy row is
+            # re-migrated on every read and its counts reset from zero.
+            fields = (
+                _STATS_FIELDS
+                + (("document_names",) if "document_names" in updated_data else ())
+                + ("schema_version",)
+            )
+            # The read and this write are not atomic: the old whole-row save
+            # recreated a row deleted in between, and stats must keep working then.
+            await self._update_fields_with_retry(
+                updated_collection, fields, recreate_missing=True
+            )
 
             return updated_collection
 
@@ -681,22 +861,21 @@ class CollectionManager:
     async def mark_collection_accessed(self, collection_name: str) -> None:
         """Update last_accessed_at.
 
-        Takes the same lock as the other stat RMW sites: the write is a full-row
-        overwrite, so a stale read here would clobber a concurrent stat increment
-        on the per-page hot path.
+        Only that column is written, so a stale read here cannot clobber a
+        concurrent stat increment or a completed model switch.
         """
         lock = _get_collection_lock(collection_name)
         try:
             async with lock, _collection_thread_guard(collection_name):
-                collection = await self.get_collection(collection_name)
-                updated = collection.model_copy(
-                    update={
-                        "last_accessed_at": datetime.now(timezone.utc).replace(
+                await self._update_fields_with_retry(
+                    CollectionInfo(
+                        name=collection_name,
+                        last_accessed_at=datetime.now(timezone.utc).replace(
                             tzinfo=None
-                        )
-                    }
+                        ),
+                    ),
+                    ("last_accessed_at",),
                 )
-                await self._save_collection_with_retry(updated)
         except Exception as e:
             logger.debug(
                 "Failed to update last_accessed_at for %s: %s", collection_name, e
@@ -851,6 +1030,92 @@ def mark_collection_accessed_sync(collection_name: str) -> None:
     """
     _get_maintenance_compatibility_facade().mark_collection_accessed_sync(
         collection_name
+    )
+
+
+async def merge_collection_extra_metadata(
+    store: MetadataStore,
+    collection_info: CollectionInfo,
+    key: str,
+    value: Any,
+    *,
+    row_existed: bool,
+) -> CollectionInfo:
+    """Add ``key`` to a row's ``extra_metadata``, keeping the keys it already has.
+
+    A row that vanished since the caller's read is recreated; if another writer
+    created it first, its row is re-read and only ``key`` is merged into it.
+    """
+    for _ in range(2):
+        extra = dict(collection_info.extra_metadata or {})
+        if extra.get(key) is not None:
+            return collection_info
+        extra[key] = value
+        updated = collection_info.model_copy(update={"extra_metadata": extra})
+        if row_existed:
+            try:
+                await collection_manager.update_collection_fields(
+                    updated, ("extra_metadata",), store=store
+                )
+                return updated
+            except ValueError as exc:
+                if "not found" not in str(exc):
+                    raise
+        create = updated.model_copy(
+            update={"embedding_model_id": None, "embedding_dimension": None}
+        )
+        if await _with_retry(
+            lambda: store.save_collection_if_absent(create),
+            description=f"creation of collection {updated.name}",
+        ):
+            return updated
+        # Another writer created the row first: merge into what it wrote.
+        collection_info = await store.get_collection(updated.name)
+        row_existed = True
+    raise ValueError(f"Could not update extra_metadata of collection {updated.name}")
+
+
+def write_collection_binding_sync(
+    collection_name: str,
+    embedding_model_id: str,
+    embedding_dimension: int,
+    *,
+    expected_model_id: Optional[str] = None,
+    require_uninitialized: bool = False,
+) -> bool:
+    """Write a collection's bound model pair, only while it is frozen.
+
+    Returns ``False`` when the store's compare-and-set guard no longer holds, so
+    a caller can tell its own write from a concurrent one.
+    """
+    state = read_migration_state(collection_name)
+    if state.state != FROZEN:
+        raise CollectionNotFrozenError(
+            f"Collection '{collection_name}' is not frozen for an embedding "
+            "binding change.",
+            details={"collection": collection_name, "migration_state": state.state},
+        )
+    target = CollectionInfo(
+        name=collection_name,
+        embedding_model_id=embedding_model_id,
+        embedding_dimension=embedding_dimension,
+    )
+    applied = _sync_wrapper(collection_manager.update_collection_fields)(
+        target,
+        _BINDING_FIELDS,
+        expected_model_id=expected_model_id,
+        require_uninitialized=require_uninitialized,
+    )
+    if applied or not require_uninitialized:
+        return applied
+    stored = _sync_wrapper(collection_manager.get_collection)(
+        collection_name
+    ).embedding_model_id
+    if stored is None or _normalize_model_id(stored) is not None:
+        return False
+    # A whitespace-only id reads as unbound but the unbound clause misses it.
+    return _sync_wrapper(collection_manager.update_collection_fields)(
+        target, _BINDING_FIELDS, expected_model_id=stored
     )
 
 
@@ -1248,7 +1513,16 @@ async def _rebuild_collection_stats_impl(
         )
 
     rebuilt = base_info.model_copy(update=update_data)
-    await collection_manager.save_collection(rebuilt)
+    fields = _STATS_FIELDS + (
+        (("document_names",) if document_count == 0 else ()) + ("schema_version",)
+    )
+    if existing_info is None:
+        inserted = await collection_manager.save_collection_if_absent(rebuilt)
+        if inserted:
+            return rebuilt
+    await collection_manager.update_collection_fields(
+        rebuilt, fields, recreate_missing=True
+    )
     return rebuilt
 
 
@@ -1373,7 +1647,7 @@ def _resolve_effective_embedding_model_sync_impl(
                 inferred_model_id,
             )
             try:
-                updated_collection = collection_info.model_copy(
+                candidate = collection_info.model_copy(
                     update={
                         "embedding_model_id": inferred_model_id,
                         "embedding_dimension": inferred_dimension
@@ -1381,7 +1655,34 @@ def _resolve_effective_embedding_model_sync_impl(
                         else collection_info.embedding_dimension,
                     }
                 )
-                _sync_wrapper(collection_manager.save_collection)(updated_collection)
+                applied = _sync_wrapper(collection_manager.update_collection_fields)(
+                    candidate, _BINDING_FIELDS, require_uninitialized=True
+                )
+                if not applied:
+                    fresh = get_collection_sync(collection_name)
+                    # Inferring is slow enough for a switch to land meanwhile; it wins.
+                    bound = _normalize_model_id(fresh.embedding_model_id)
+                    if bound:
+                        logger.info(
+                            "Collection '%s' was bound to '%s' while inferring",
+                            collection_name,
+                            bound,
+                        )
+                        return bound
+                    if fresh.embedding_model_id is not None:
+                        # A whitespace-only id reads as unbound but the unbound
+                        # clause does not match it: repair it by exact value.
+                        _sync_wrapper(collection_manager.update_collection_fields)(
+                            candidate,
+                            _BINDING_FIELDS,
+                            expected_model_id=fresh.embedding_model_id,
+                        )
+                        # Losing that compare-and-set means a switch won: use it.
+                        stored = _normalize_model_id(
+                            get_collection_sync(collection_name).embedding_model_id
+                        )
+                        if stored:
+                            return stored
             except Exception as save_error:
                 logger.warning(
                     "Failed to persist inferred embedding metadata for collection '%s': %s",
@@ -1422,6 +1723,18 @@ async def rebuild_collection_metadata() -> None:
     Use this to migrate existing data when collection_metadata table is missing or outdated.
     """
     await _get_maintenance_compatibility_facade().rebuild_collection_metadata()
+
+
+async def _read_stored_collection(
+    collection_name: str,
+) -> Optional["CollectionInfo"]:
+    """Read the current row; ``None`` means it does not exist."""
+    try:
+        return await get_metadata_store().get_collection(collection_name)
+    except ValueError as exc:
+        if "not found" in str(exc):
+            return None
+        raise
 
 
 _ENGINE_COUNTS = ("documents", "parses", "chunks", "embeddings")
@@ -1557,19 +1870,50 @@ async def _rebuild_collection_metadata_impl() -> None:
                         break
 
             # Vectors the engine counts but no embeddings_* table holds: keep the
-            # stored model. Zero vectors still clear it so the KB can be rebound.
-            updated_collection = (
-                collection
-                if collection.embeddings > 0 and embedding_model_id is None
-                else collection.model_copy(
-                    update={
-                        "embedding_model_id": embedding_model_id,
-                        "embedding_dimension": embedding_dimension,
-                    }
-                )
+            # stored model, since the vectors are still there under another tag.
+            # Zero vectors clear it so the KB can be rebound to another model,
+            # except while it is frozen (a migration owns the binding then).
+            keep_binding = collection.embeddings > 0 and embedding_model_id is None
+            binding: dict[str, Any] = (
+                {}
+                if keep_binding
+                else {
+                    "embedding_model_id": embedding_model_id,
+                    "embedding_dimension": embedding_dimension,
+                }
             )
 
-            # Use the async save_collection method through sync wrapper
-            _sync_wrapper(collection_manager.save_collection)(updated_collection)
+            current = await _read_stored_collection(collection.name)
+            updated_collection = collection.model_copy(update=binding)
+            inserted = False
+            if current is None:
+                inserted = _sync_wrapper(collection_manager.save_collection_if_absent)(
+                    updated_collection
+                )
+            if current is not None or not inserted:
+                _sync_wrapper(collection_manager.update_collection_fields)(
+                    updated_collection,
+                    _COUNT_FIELDS + ("schema_version",),
+                    recreate_missing=True,
+                )
+                if binding and current is not None and current.is_initialized:
+                    # Unbinding is only safe while the row still holds the model
+                    # that was read, and skips a collection frozen at this check
+                    # (an unfreeze landing between check and write is not seen).
+                    if (
+                        binding["embedding_model_id"] is None
+                        and read_migration_state(collection.name).state != FROZEN
+                    ):
+                        _sync_wrapper(collection_manager.update_collection_fields)(
+                            updated_collection,
+                            tuple(binding),
+                            expected_model_id=current.embedding_model_id,
+                        )
+                elif binding:
+                    _sync_wrapper(collection_manager.update_collection_fields)(
+                        updated_collection,
+                        tuple(binding),
+                        require_uninitialized=True,
+                    )
         except Exception as e:
             logger.error("Failed to rebuild collection '%s': %s", collection.name, e)

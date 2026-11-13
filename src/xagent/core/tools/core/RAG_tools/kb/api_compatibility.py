@@ -620,39 +620,41 @@ class KBApiCompatibilityFacade:
         collection: str,
         store: Any,
     ) -> CollectionInfo | None:
-        if not _has_store_method(store, "save_collection"):
+        if not _has_store_method(store, "save_collection_if_absent"):
             return None
 
         collection_info: CollectionInfo | None = None
+        row_existed = False
         if _has_store_method(store, "get_collection"):
             try:
                 loaded = store.get_collection(collection)
                 loaded = await maybe_await(loaded)
             except ValueError:
                 collection_info = CollectionInfo(name=collection)
+                row_existed = False
             else:
                 if isinstance(loaded, CollectionInfo):
                     collection_info = loaded
+                    row_existed = True
                 elif loaded is None:
                     collection_info = CollectionInfo(name=collection)
+                    row_existed = False
         else:
             collection_info = CollectionInfo(name=collection)
+            row_existed = False
 
         if collection_info is None:
             return None
 
-        extra_metadata = dict(collection_info.extra_metadata or {})
-        if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
-            return collection_info
+        from ..management.collection_manager import merge_collection_extra_metadata
 
-        extra_metadata[KB_STORAGE_METADATA_KEY] = {
-            "backend": deployment_kb_backend().value
-        }
-        updated_collection = collection_info.model_copy(
-            update={"extra_metadata": extra_metadata}
+        return await merge_collection_extra_metadata(
+            store,
+            collection_info,
+            KB_STORAGE_METADATA_KEY,
+            {"backend": deployment_kb_backend().value},
+            row_existed=row_existed,
         )
-        await maybe_await(store.save_collection(updated_collection))
-        return updated_collection
 
     async def get_collection_config(
         self,

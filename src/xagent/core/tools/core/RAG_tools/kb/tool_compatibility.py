@@ -317,20 +317,21 @@ class KBToolCompatibilityFacade:
 
         with self._storage_context():
             metadata_store = get_metadata_store()
+            row_existed = True
             try:
                 collection_info = await metadata_store.get_collection(collection)
             except ValueError:
                 collection_info = CollectionInfo(name=collection)
+                row_existed = False
 
-            extra_metadata = dict(collection_info.extra_metadata or {})
-            if extra_metadata.get(KB_STORAGE_METADATA_KEY) is not None:
-                return collection_info
-
-            extra_metadata[KB_STORAGE_METADATA_KEY] = {
-                "backend": deployment_kb_backend().value
-            }
-            updated_collection = collection_info.model_copy(
-                update={"extra_metadata": extra_metadata}
+            from ..management.collection_manager import (
+                merge_collection_extra_metadata,
             )
-            await metadata_store.save_collection(updated_collection)
-            return updated_collection
+
+            return await merge_collection_extra_metadata(
+                metadata_store,
+                collection_info,
+                KB_STORAGE_METADATA_KEY,
+                {"backend": deployment_kb_backend().value},
+                row_existed=row_existed,
+            )

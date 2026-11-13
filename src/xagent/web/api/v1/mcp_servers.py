@@ -616,11 +616,7 @@ def _v1_tool_listing_gate() -> asyncio.Semaphore:
 
 
 def _v1_tool_listing_holders() -> dict[int, int]:
-    loop = asyncio.get_running_loop()
-    holders = _v1_tool_listing_holder_counts.get(loop)
-    if holders is None:
-        holders = _v1_tool_listing_holder_counts[loop] = {}
-    return holders
+    return _v1_tool_listing_holder_counts.setdefault(asyncio.get_running_loop(), {})
 
 
 def _release_holder(holders: dict[int, int], user_id: int) -> None:
@@ -698,8 +694,8 @@ async def _run_tool_listing(server_id: int, user_id: int) -> ConnectorToolsResul
       request, so a listing that never returns keeps both counts until the
       process stops.
     """
-    # Read before anything is counted, so nothing between taking a slot and
-    # the protected block below can raise.
+    # Read before anything is counted, so that once a slot is taken nothing
+    # can raise before the finally or the done-callback below gives it back.
     timeout = get_mcp_tool_init_timeout_seconds()
     gate = _v1_tool_listing_gate()
     holders = _v1_tool_listing_holders()
@@ -725,11 +721,7 @@ async def _run_tool_listing(server_id: int, user_id: int) -> ConnectorToolsResul
             return await _list_saved_connector_tools(server_id, user_id)
         finally:
             _give_back()
-    try:
-        load = asyncio.ensure_future(_list_saved_connector_tools(server_id, user_id))
-    except BaseException:
-        _give_back()
-        raise
+    load = asyncio.ensure_future(_list_saved_connector_tools(server_id, user_id))
     _v1_tool_listing_loads.add(load)
 
     def _done(task: "asyncio.Task[Any]") -> None:

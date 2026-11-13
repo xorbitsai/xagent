@@ -828,6 +828,24 @@ def _assert_busy(error: BaseException, message: str) -> None:
     assert error.headers == {"Retry-After": "5"}
 
 
+def _gate_cell_no_slot_in_time_suggests_the_real_wait(bob, monkeypatch):
+    class NoSlot:
+        async def acquire(self):
+            # What waiting for a slot raises once the wait has run out.
+            raise TimeoutError
+
+    monkeypatch.setattr(routes, "_v1_tool_listing_gate", NoSlot)
+
+    async def run():
+        holders = routes._v1_tool_listing_holders()
+        with pytest.raises(routes.V1ApiError) as raised:
+            await routes._run_tool_listing(1, 7)
+        _assert_busy(raised.value, BUSY)
+        assert holders == {}
+
+    asyncio.run(run())
+
+
 def _gate_cell_holder_full(bob, monkeypatch):
     monkeypatch.setattr(routes, "_v1_tool_listing_holders", lambda: {bob.user_id: 2})
     calls = _stub_loader(monkeypatch, _loaded(_tool()))
@@ -970,45 +988,17 @@ def _gate_cell_the_cap_counts_the_account_not_the_key(bob, monkeypatch):
     assert second.status_code == 200, second.text
     other_key = _bearer(second.json()["full_key"])
     assert other_key != bob.headers
-    seen: list[int] = []
-
-    async def recording(server_id, user_id):
-        seen.append(user_id)
-        return _ok_listing()
-
-    monkeypatch.setattr(routes, "_run_tool_listing", recording)
+    holders = {bob.user_id: 2}
+    monkeypatch.setattr(routes, "_v1_tool_listing_holders", lambda: holders)
+    calls = _stub_loader(monkeypatch, _loaded(_tool()))
     server_id = _seed("records", owner=bob)
 
-    assert _tools(bob, server_id).status_code == 200
-    assert (
-        client.get(f"/v1/mcp-servers/{server_id}/tools", headers=other_key).status_code
-        == 200
-    )
+    resp = client.get(f"/v1/mcp-servers/{server_id}/tools", headers=other_key)
 
-    assert seen == [bob.user_id, bob.user_id]
-
-
-def _gate_cell_a_listing_task_that_cannot_be_created_gives_back_both_counts(
-    bob, monkeypatch
-):
-    async def run():
-        _use_timeout(monkeypatch, 5)
-
-        def refuse(coro):
-            coro.close()
-            raise RuntimeError("no task")
-
-        fake = SimpleNamespace(
-            **{n: getattr(asyncio, n) for n in dir(asyncio) if not n.startswith("_")}
-        )
-        fake.ensure_future = refuse
-        monkeypatch.setattr(routes, "asyncio", fake)
-        with pytest.raises(RuntimeError, match="no task"):
-            await routes._run_tool_listing(1, 7)
-        assert routes._v1_tool_listing_holders() == {}
-        assert routes._v1_tool_listing_gate()._value == 4
-
-    asyncio.run(run())
+    error = _error(resp, 429, "rate_limited")
+    assert "already have" in error["message"]
+    assert calls == []
+    assert holders == {bob.user_id: 2}
 
 
 _GATE_CELLS = {

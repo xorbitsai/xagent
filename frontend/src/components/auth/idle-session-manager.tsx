@@ -18,6 +18,13 @@ const DEADLINE_TICK_MS = 1_000
 const CLOCK_JUMP_TOLERANCE_MS = 30_000
 /** Minimum gap between two server checks, so a server outage does not turn into a request loop. */
 const REVALIDATE_MIN_GAP_MS = 15_000
+/**
+ * The server rounds idle_expires_in down, so the local deadline can be up to a
+ * second before the server's. Waiting this long past it means the first check
+ * lands after the server deadline instead of being answered "still valid" and
+ * then held back by the gap above.
+ */
+const DEADLINE_GRACE_MS = 1_500
 /** Warning lead time: a UI constant, not policy. Halved thresholds keep very short test policies usable. */
 const WARNING_LEAD_MS = 2 * 60 * 1000
 
@@ -78,7 +85,7 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
     const checkDeadline = () => {
       const record = getRecord()
       setSecondsLeft(warningSecondsLeft(record))
-      if (record?.enforced && idleRemainingMs(record) <= 0) revalidate(true)
+      if (record?.enforced && idleRemainingMs(record) <= -DEADLINE_GRACE_MS) revalidate(true)
     }
     let lastTick = Date.now()
     const tick = () => {

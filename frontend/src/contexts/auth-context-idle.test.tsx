@@ -184,7 +184,7 @@ describe("AuthProvider never refreshes past the idle deadline", () => {
 describe("IdleSessionManager revalidation", () => {
   it("asks the server at the deadline and keeps a login another tab kept active", async () => {
     writeAuthCache()
-    writeIdleRecord({ idleExpiresIn: 0 })
+    writeIdleRecord({ idleExpiresIn: 0, observedAt: Date.now() - 5_000 })
     vi.mocked(apiRequest).mockImplementation(async url =>
       String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy({ idle_expires_in: 1500 }) }) : new Response(null, { status: 404 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
@@ -193,9 +193,22 @@ describe("IdleSessionManager revalidation", () => {
     expect(activityCalls()).toHaveLength(0)
   })
 
-  it("does not sign out when the server cannot confirm the session", async () => {
+  it("waits until the server's own deadline has passed before asking", async () => {
+    // idle_expires_in is rounded down, so the local deadline can be up to a second early.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()
     writeIdleRecord({ idleExpiresIn: 0 })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(verifyCalls()).toHaveLength(0)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(verifyCalls()).toHaveLength(1)
+  })
+
+  it("does not sign out when the server cannot confirm the session", async () => {
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: 0, observedAt: Date.now() - 5_000 })
     vi.mocked(apiRequest).mockImplementation(async () => new Response(null, { status: 503 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await waitFor(() => expect(verifyCalls().length).toBeGreaterThan(0))
@@ -206,7 +219,7 @@ describe("IdleSessionManager revalidation", () => {
   it("does not turn a server outage at the deadline into a request loop", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()
-    writeIdleRecord({ idleExpiresIn: 0 })
+    writeIdleRecord({ idleExpiresIn: 0, observedAt: Date.now() - 5_000 })
     vi.mocked(apiRequest).mockImplementation(async () => new Response(null, { status: 503 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await waitFor(() => expect(verifyCalls()).toHaveLength(1))

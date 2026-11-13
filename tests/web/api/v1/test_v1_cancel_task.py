@@ -567,16 +567,21 @@ def test_a_cancel_that_settled_as_paused_is_still_reported_busy(
     assert _row(task_id) == after_pause[0]
 
 
+@pytest.mark.parametrize("replacement_ended", [False, True], ids=["running", "ended"])
 def test_a_cancel_aimed_at_a_run_that_was_replaced_is_not_cancellable(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, replacement_ended: bool
 ):
-    """The aimed run is over and the row shows another one: retrying would
-    cancel that one, so the caller is told no retry can cancel this run."""
+    """The aimed run is over and the row shows another one, whatever state
+    that one is in: retrying would cancel it, so the caller is told no retry
+    can cancel this run."""
     task_id, _agent_id, key = _running_task()
     after_replacement: list[dict[str, Any]] = []
+    replacement: dict[str, Any] = {"run_id": "run-next", "state_version": 50}
+    if replacement_ended:
+        replacement.update(_ENDED_ROWS["completed"], runner_id=None)
 
     async def replaced_before_it_was_applied(**_kwargs: Any) -> None:
-        _update(task_id, run_id="run-next", state_version=50)
+        _update(task_id, **replacement)
         after_replacement.append(_row(task_id))
         raise TaskCommandRejected("moved", reason="stale_run")
 

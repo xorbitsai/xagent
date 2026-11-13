@@ -2530,9 +2530,6 @@ def test_deferred_job_survives_a_failed_reschedule(tmp_path, monkeypatch):
 def test_admission_clears_the_migration_anchor_so_a_later_freeze_waits(
     tmp_path, monkeypatch
 ):
-    from xagent.core.tools.core.RAG_tools.core.exceptions import (
-        CollectionMigratingError,
-    )
     from xagent.web.jobs.exceptions import BackgroundJobDeferred
     from xagent.web.jobs.kb_tasks import (
         _MIGRATION_DEFERRED_AT_KEY,
@@ -2541,13 +2538,16 @@ def test_admission_clears_the_migration_anchor_so_a_later_freeze_waits(
 
     monkeypatch.setenv(CELERY_ENABLED, "false")
     monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
     frozen = {"on": True}
 
-    def guard(_collection: str) -> None:
-        if frozen["on"]:
-            raise CollectionMigratingError("Knowledge base is being upgraded")
+    def read_state(*_args: object) -> migration_state.CollectionMigrationState:
+        state = migration_state.FROZEN if frozen["on"] else migration_state.IDLE
+        return migration_state.CollectionMigrationState(state=state)
 
-    monkeypatch.setattr("xagent.web.jobs.kb_tasks.ensure_collection_writable", guard)
+    # The real guard runs, so the admitted job holds its write lease.
+    monkeypatch.setattr(migration_state, "read_migration_state", read_state)
     monkeypatch.setattr(
         "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
         lambda *args, **kwargs: None,

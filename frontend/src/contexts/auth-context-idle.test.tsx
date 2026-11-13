@@ -1,11 +1,12 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import React from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { AuthProvider, useAuth } from "@/contexts/auth-context"
+import { AUTH_REVALIDATE_EVENT } from "@/lib/idle-session"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import { AUTH_CACHE_KEY, readAuthSessionSnapshot, readCurrentIdleSession } from "@/lib/auth-cache"
-import { IDLE_SESSION_STORAGE_KEY } from "@/lib/idle-session"
+import { IDLE_SESSION_STORAGE_KEY, readSessionEndNotice } from "@/lib/idle-session"
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: vi.fn(async () => new Response(null, { status: 404 })),
@@ -43,7 +44,16 @@ function writeIdleRecord(overrides: Record<string, unknown> = {}) {
   }))
 }
 
+const verifyCalls = () => vi.mocked(apiRequest).mock.calls.filter(([url]) => String(url).endsWith("/api/auth/verify"))
 const activityCalls = () => vi.mocked(apiRequest).mock.calls.filter(([url]) => String(url).endsWith("/api/auth/activity"))
+
+function RefreshProbe() {
+  const { refreshAccessToken, token } = useAuth()
+  return <>
+    <span data-testid="refresh-token">{token || "none"}</span>
+    <button onClick={() => { void refreshAccessToken() }}>Refresh</button>
+  </>
+}
 
 function CheckProbe() {
   const { checkAuth, token } = useAuth()
@@ -136,5 +146,144 @@ describe("AuthProvider activity reporting", () => {
     unmount()
     fireEvent.keyDown(window, { key: "a" })
     expect(activityCalls()).toHaveLength(0)
+  })
+})
+
+describe("AuthProvider never refreshes past the idle deadline", () => {
+  it("asks the server instead of refreshing when the deadline has passed while the switch is on", async () => {
+    writeAuthCache("expiring-token", 60, 3600)
+    writeIdleRecord({ idleExpiresIn: 0 })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("expiring-token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await waitFor(() => expect(verifyCalls().length).toBeGreaterThan(0))
+    expect(refreshStoredAccessToken).not.toHaveBeenCalled()
+  })
+
+  it("keeps refreshing a token near expiry while the switch is off", async () => {
+    writeAuthCache("expiring-token", 60, 3600)
+    writeIdleRecord({ enforced: false, idleExpiresIn: 0 })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("expiring-token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await waitFor(() => expect(refreshStoredAccessToken).toHaveBeenCalled())
+    expect(verifyCalls()).toHaveLength(0)
+  })
+
+  it("ends the login with a sign-in-again notice when the refresh is refused for inactivity", async () => {
+    writeAuthCache()
+    vi.mocked(refreshStoredAccessToken).mockResolvedValue({ status: "rejected", accessToken: null, reason: "session_expired" })
+    render(<AuthProvider><RefreshProbe /></AuthProvider>)
+    await screen.findByText("token")
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }))
+    await waitFor(() => expect(screen.getByTestId("refresh-token")).toHaveTextContent("none"))
+    expect(readSessionEndNotice(localStorage)).toBe("session_expired")
+  })
+})
+
+describe("IdleSessionManager revalidation", () => {
+  it("asks the server at the deadline and keeps a login another tab kept active", async () => {
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: 0 })
+    vi.mocked(apiRequest).mockImplementation(async url =>
+      String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy({ idle_expires_in: 1500 }) }) : new Response(null, { status: 404 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await waitFor(() => expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1500))
+    expect(screen.getByTestId("token")).toHaveTextContent("token")
+    expect(activityCalls()).toHaveLength(0)
+  })
+
+  it("does not sign out when the server cannot confirm the session", async () => {
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: 0 })
+    vi.mocked(apiRequest).mockImplementation(async () => new Response(null, { status: 503 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await waitFor(() => expect(verifyCalls().length).toBeGreaterThan(0))
+    expect(screen.getByTestId("token")).toHaveTextContent("token")
+    expect(readCurrentIdleSession()).not.toBeNull()
+  })
+
+  it("does not turn a server outage at the deadline into a request loop", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: 0 })
+    vi.mocked(apiRequest).mockImplementation(async () => new Response(null, { status: 503 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+    await act(async () => { await vi.advanceTimersByTimeAsync(12_000) })
+    expect(verifyCalls()).toHaveLength(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(verifyCalls()).toHaveLength(2)
+  })
+
+  it("does not act on the deadline while the switch is off", async () => {
+    writeAuthCache()
+    writeIdleRecord({ enforced: false, idleExpiresIn: 0 })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(verifyCalls()).toHaveLength(0)
+  })
+
+  it.each([
+    ["the page becomes visible", () => document.dispatchEvent(new Event("visibilitychange"))],
+    ["the window regains focus", () => window.dispatchEvent(new Event("focus"))],
+    ["the browser comes back online", () => window.dispatchEvent(new Event("online"))],
+  ])("revalidates before continuing when %s", async (_, wake) => {
+    writeAuthCache()
+    writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    expect(verifyCalls()).toHaveLength(0)
+    act(() => wake())
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+  })
+
+  it("sends one check for a burst of wake events", async () => {
+    writeAuthCache()
+    writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"))
+      window.dispatchEvent(new Event("focus"))
+      window.dispatchEvent(new Event("online"))
+    })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+  })
+
+  it("revalidates when a socket reports that the session ended", async () => {
+    writeAuthCache()
+    writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => { window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT)) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+  })
+
+  it("leaves servers without idle support alone", async () => {
+    writeAuthCache()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => {
+      window.dispatchEvent(new Event("focus"))
+      window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT))
+    })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(verifyCalls()).toHaveLength(0)
+  })
+
+  it("revalidates after the device clock jumps, as after sleep", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    expect(verifyCalls()).toHaveLength(0)
+    // Wall clock moves 10 minutes between two ticks.
+    vi.setSystemTime(Date.now() + 10 * 60_000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
   })
 })

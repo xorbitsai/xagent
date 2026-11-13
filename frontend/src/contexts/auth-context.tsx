@@ -12,8 +12,9 @@ import {
   type AuthCacheUser, type AuthSessionProjection, type AuthSessionSnapshot,
   clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
   claimAuthLoginIntent, createAuthSession, inspectAuthSession, migrateLegacyAuthSession,
-  recordIdleSessionIfCurrent,
+  endExpiredAuthSession, readCurrentIdleSession, recordIdleSessionIfCurrent,
 } from "@/lib/auth-cache"
+import { idleRemainingMs } from "@/lib/idle-session"
 
 type TeamRole = "admin" | "member" | null
 interface AuthContextType {
@@ -97,6 +98,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const refreshIfExpiring = () => {
       const current = currentProjection()
       if (!current || current.snapshot.sessionId !== session.sessionId) return
+      // Past the server's idle deadline a refresh would only be refused; the
+      // idle-session manager asks the server instead.
+      const idle = readCurrentIdleSession()
+      if (idle?.enforced && idleRemainingMs(idle) <= 0) return
       const cache = current.cache
       const deadline = Math.min(cache.expiresAt ?? cache.timestamp + AUTH_CACHE_DURATION_MS, cache.refreshExpiresAt ?? Number.POSITIVE_INFINITY)
       if (deadline - Date.now() < 5 * 60 * 1000) void refreshRef.current(current.snapshot)
@@ -198,7 +203,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       case "advanced":
         return Boolean(current && current.snapshot.sessionId === expected.sessionId && current.snapshot.accessToken === result.accessToken)
       case "rejected":
-        await clearAuthSessionIfCurrent(expected)
+        if (result.reason === "session_expired") await endExpiredAuthSession(expected)
+        else await clearAuthSessionIfCurrent(expected)
         break
       case "unavailable":
         if (mountedRef.current && operation === operationRef.current && isCurrentCredentialLineage(current, expected)) {

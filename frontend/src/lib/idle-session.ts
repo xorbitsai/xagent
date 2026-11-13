@@ -12,6 +12,8 @@ export const IDLE_SESSION_EXPIRED_ERROR = "SessionIdleExpired"
 export const IDLE_SESSION_STORAGE_KEY = "auth_idle_session"
 export const SESSION_END_NOTICE_KEY = "auth_session_end_notice"
 export const IDLE_SESSION_CLOSE_CODE = 4010
+/** Same-tab signal that the server may have ended the session (for example a socket closed with 4010). */
+export const AUTH_REVALIDATE_EVENT = "xagent:auth-revalidate"
 /** How long a sign-in-again notice stays relevant for a tab that reaches the login page. */
 export const SESSION_END_NOTICE_TTL_MS = 10 * 60 * 1000
 

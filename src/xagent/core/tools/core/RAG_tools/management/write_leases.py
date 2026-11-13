@@ -401,6 +401,10 @@ class LeaseSet:
             if self._closed:
                 # Its row was deleted (or is about to be): nothing renews it.
                 raise LeaseLostError("This lease scope is already closed")
+            if not self._ids:
+                # A scope that reused an enclosing lease had nothing to renew;
+                # its lifetime starts with the first row it owns.
+                self._alive_until = time.monotonic() + self._lifetime()
             self._ids.append(lease_id)
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -455,7 +459,8 @@ class LeaseSet:
 
         Writers call this at their commit points: a lease lost to a stalled
         process would otherwise let it write while the migration believes the
-        collection is quiet.
+        collection is quiet. A set that owns no row (a nested scope reusing the
+        enclosing lease) has no lifetime of its own to exceed.
         """
         if self._closed:
             raise LeaseLostError("This lease scope was released")
@@ -464,15 +469,19 @@ class LeaseSet:
             raise LeaseLostError(
                 f"Lost {len(lost)} write lease(s): {', '.join(sorted(lost))}"
             )
-        if time.monotonic() > self._alive_until:
+        if self.lease_ids and time.monotonic() > self._alive_until:
             # No renewal landed within the TTL: the rows may already be gone.
             raise LeaseLostError("Write leases were not renewed within their TTL")
 
-    def stop(self) -> List[str]:
-        """Stop renewing and return the ids; safe to call more than once."""
+    def begin_stop(self) -> None:
+        """Close the set and stop the heartbeat; no join, so callable on a loop."""
         with self._lock:
             self._closed = True
         self._stop.set()
+
+    def stop(self) -> List[str]:
+        """Stop renewing and return the ids; safe to call more than once."""
+        self.begin_stop()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=5.0)

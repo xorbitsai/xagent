@@ -745,6 +745,158 @@ def test_a_stalled_heartbeat_fails_the_check_at_the_local_deadline() -> None:
         held.release()
 
 
+def test_a_set_that_owns_no_lease_passes_however_long_it_opens() -> None:
+    held = LeaseSet(ttl_seconds=0.2)
+    try:
+        held._alive_until = time.monotonic() - 1
+        held.verify()
+        # Its own lifetime starts with the first row it owns.
+        held.add(acquire_lease("kb", "test"))
+        assert held._alive_until > time.monotonic()
+        held.verify()
+    finally:
+        held.release()
+
+
+def test_a_nested_scope_that_reuses_the_lease_keeps_passing_after_its_ttl() -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    with migration_state.leased_collections("kb", operation="outer"):
+        with migration_state.leased_collections("kb", operation="inner") as inner:
+            inner._alive_until = time.monotonic() - 1
+            migration_state.verify_active_leases("kb")
+
+
+def test_a_second_cancel_still_stops_the_heartbeat_and_releases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    real = migration_state.acquire_lease_async
+
+    async def _slow(name: str, operation: str, **kwargs: Any) -> str:
+        await asyncio.sleep(0.2)
+        return await real(name, operation, **kwargs)
+
+    monkeypatch.setattr(migration_state, "acquire_lease_async", _slow)
+
+    async def _run() -> None:
+        async def _hold() -> None:
+            async with migration_state.holding_leases("kb", operation="test"):
+                pytest.fail("cancelled before admission")  # pragma: no cover
+
+        task = asyncio.create_task(_hold())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+    deadline = time.monotonic() + 5.0
+    while live_leases("kb") and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert live_leases("kb") == []
+
+
+def test_a_cancelled_scope_stops_its_heartbeat_before_any_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    async def _slow_blocking(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        await asyncio.sleep(0.5)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(migration_state, "run_blocking", _slow_blocking)
+    opened: list = []
+
+    async def _run() -> None:
+        async def _hold() -> None:
+            async with migration_state._lease_scope_async() as lease_set:
+                opened.append(lease_set)
+                await asyncio.sleep(10)
+
+        task = asyncio.create_task(_hold())
+        await asyncio.sleep(0)
+        task.cancel()
+        # A second cancel lands while the cleanup is still joining.
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert opened[-1]._stop.is_set()
+
+    asyncio.run(_run())
+
+
+def test_a_cancelled_acquire_releases_in_its_own_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    seen: list = []
+    marker = object()
+
+    async def _release(ids: Any, store: Any = None) -> None:
+        seen.append((list(ids), store))
+
+    monkeypatch.setattr(migration_state, "release_leases_async", _release)
+
+    async def _run() -> None:
+        task: asyncio.Future = asyncio.get_running_loop().create_future()
+        task.set_result("lease-id")
+        migration_state._release_after_cancel(task, store=marker)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_run())
+
+    assert seen == [(["lease-id"], marker)]
+
+
+def test_the_release_tasks_are_kept_alive_until_they_run() -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    async def _run() -> None:
+        task = migration_state._release_tracked(["not-a-lease"], None)
+        assert task in migration_state._RELEASE_TASKS
+        await task
+
+    asyncio.run(_run())
+    assert migration_state._RELEASE_TASKS == set()
+
+
+def test_releases_use_the_store_the_lease_was_taken_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    seen: list = []
+
+    async def _spy(name: str, operation: str, **kwargs: Any) -> str:
+        seen.append(kwargs.get("store"))
+        return "lease-id"
+
+    released: list = []
+
+    async def _release(ids: Any, **kwargs: Any) -> None:
+        released.append(kwargs.get("store"))
+
+    monkeypatch.setattr(migration_state, "acquire_lease_async", _spy)
+    monkeypatch.setattr(migration_state, "release_leases_async", _release)
+    marker = object()
+
+    async def _run() -> None:
+        async with migration_state.holding_leases("kb", operation="test", store=marker):
+            pass
+
+    asyncio.run(_run())
+
+    assert seen == [marker]
+    assert released == [marker]
+
+
 def test_a_released_set_fails_its_check_and_takes_no_more_leases() -> None:
     held = LeaseSet(ttl_seconds=120)
     held.add(acquire_lease("kb", "test"))

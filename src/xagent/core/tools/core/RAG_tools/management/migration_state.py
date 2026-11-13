@@ -19,6 +19,7 @@ from typing import (
     Iterable,
     Iterator,
     Optional,
+    Set,
     TypeVar,
     Union,
     cast,
@@ -308,8 +309,14 @@ async def _lease_scope_async(*, store: Optional[Any] = None) -> AsyncIterator[Le
     finally:
         _LEASE_SETS.reset(sets_token)
         _LEASES.reset(leases_token)
-        ids = await run_blocking(lease_set.stop)
-        await release_leases_async(ids)
+        # Stopping the heartbeat must not wait on an await: a second cancel
+        # would leave it renewing a row nobody releases.
+        lease_set.begin_stop()
+        ids = lease_set.lease_ids
+        try:
+            await asyncio.shield(run_blocking(lease_set.stop))
+        finally:
+            await asyncio.shield(_release_tracked(ids, store))
 
 
 def _take_lease(name: str, operation: str, store: Optional[Any]) -> None:
@@ -330,16 +337,29 @@ async def _take_lease_async(name: str, operation: str, store: Optional[Any]) -> 
     except asyncio.CancelledError:
         # The insert may land after the cancel; release whatever it produced so
         # the row cannot delay a migration for a full TTL.
-        task.add_done_callback(_release_after_cancel)
+        task.add_done_callback(functools.partial(_release_after_cancel, store=store))
         raise
     _record_lease(name, lease_id)
 
 
-def _release_after_cancel(task: "asyncio.Future[str]") -> None:
+# Releases still in flight: the loop keeps only a weak reference to a task.
+_RELEASE_TASKS: Set["asyncio.Future[Any]"] = set()
+
+
+def _release_tracked(ids: Iterable[str], store: Optional[Any]) -> "asyncio.Future[Any]":
+    task = asyncio.ensure_future(release_leases_async(list(ids), store=store))
+    _RELEASE_TASKS.add(task)
+    task.add_done_callback(_RELEASE_TASKS.discard)
+    return task
+
+
+def _release_after_cancel(
+    task: "asyncio.Future[str]", store: Optional[Any] = None
+) -> None:
     if task.cancelled() or task.exception() is not None:
         return
     try:
-        asyncio.get_running_loop().create_task(release_leases_async([task.result()]))
+        _release_tracked([task.result()], store)
     except RuntimeError:  # pragma: no cover - loop gone with the request
         logger.warning("No loop to release lease %s after cancellation", task.result())
 

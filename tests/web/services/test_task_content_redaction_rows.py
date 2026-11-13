@@ -9,7 +9,8 @@ name its trace row -- the shape that order exists for.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 import sqlalchemy as sa
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_database_shared import engine as engine_fixture
 from tests.web.services.task_interaction_schema_shared import make_row
+from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import (
@@ -27,17 +29,32 @@ from xagent.web.models.task import (
     TraceEvent,
     TraceMessageBlob,
 )
+from xagent.web.models.task_channel_delivery import TaskChannelDelivery
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.models.user_channel import UserChannel
+from xagent.web.services import channel_delivery
 from xagent.web.services.task_deletion import purge_task_rows, redact_task_rows
+from xagent.web.services.task_file_lifecycle import lock_attachment_task
+from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 
 engine = engine_fixture
 
 NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
 UPDATED_AT = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+#: Routing and authorization keys survive; prompt context and the creator IP
+#: are content.
+AGENT_CONFIG = {
+    "auth_mode": "widget",
+    "guest_id": "guest-1",
+    PROMPT_CONTEXT_AGENT_CONFIG_KEY: {"text": "secret"},
+    "widget_client_ip": "203.0.113.7",
+}
 
 CONTENT_TABLES = (
     TraceEvent,
@@ -57,25 +74,46 @@ def sessions(engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, autoflush=False)
 
 
-def _seed(db: Session) -> tuple[int, int]:
-    """A completed task with content, an anchored active interaction and a file.
+def _seed(db: Session) -> tuple[int, int, int]:
+    """A completed task with content, an anchored active interaction, a file,
+    a trigger run and a channel delivery still owed.
 
-    Returns ``(task_id, owner_id)``.
+    Returns ``(task_id, owner_id, channel_id)``.
     """
     user = User(username="owner", password_hash="unused")
     db.add(user)
     db.flush()
+    agent = Agent(user_id=user.id, name="agent")
+    channel = UserChannel(
+        user_id=user.id, channel_type="slack", channel_name="ws", config={}
+    )
+    db.add_all([agent, channel])
+    db.flush()
     task = Task(
         user_id=user.id,
+        agent_id=agent.id,
         title="secret",
         input="secret",
         output="secret",
         status=TaskStatus.COMPLETED,
         input_tokens=7,
         output_tokens=3,
+        agent_config=AGENT_CONFIG,
     )
     db.add(task)
     db.flush()
+    trigger = AgentTrigger(
+        user_id=user.id, agent_id=agent.id, type="scheduled", name="t", config={}
+    )
+    db.add(trigger)
+    db.flush()
+    command = TaskExecutionCommand(
+        task_id=task.id,
+        command_id="turn-1",
+        kind="message",
+        payload={"content": "secret", "channel": {"id": channel.id}},
+        status="completed",
+    )
     trace = TraceEvent(
         task_id=task.id,
         event_id="evt-1",
@@ -83,7 +121,7 @@ def _seed(db: Session) -> tuple[int, int]:
         timestamp=NOW,
         data={"content": "secret"},
     )
-    db.add(trace)
+    db.add_all([command, trace])
     db.flush()
     db.add_all(
         [
@@ -121,13 +159,6 @@ def _seed(db: Session) -> tuple[int, int]:
                 payload={"content": "secret"},
                 occurred_at=NOW,
             ),
-            TaskExecutionCommand(
-                task_id=task.id,
-                command_id="turn-1",
-                kind="message",
-                payload={"content": "secret"},
-                status="completed",
-            ),
             TaskInteractionRequest(
                 **make_row(task_id=task.id, resume_trace_event_id=trace.id, db=db)
             ),
@@ -139,6 +170,19 @@ def _seed(db: Session) -> tuple[int, int]:
                 filename="a.txt",
                 storage_path="/nonexistent/a.txt",
                 file_size=1,
+            ),
+            TriggerRun(
+                trigger_id=trigger.id,
+                task_id=task.id,
+                status=TriggerRunStatus.COMPLETED.value,
+                idempotency_key=f"run-{task.id}",
+                payload_snapshot={"text": "secret"},
+            ),
+            # A reply still owed to the channel. The delivery worker reads
+            # its destination out of the command payload the redaction
+            # blanks.
+            TaskChannelDelivery(
+                command_id=command.id, channel_id=channel.id, destination={}
             ),
         ]
     )
@@ -153,7 +197,28 @@ def _seed(db: Session) -> tuple[int, int]:
         )
     )
     db.commit()
-    return int(task.id), int(user.id)
+    return int(task.id), int(user.id), int(channel.id)
+
+
+def _redact(sessions: sessionmaker[Session], task_id: int, now: datetime) -> None:
+    with sessions() as db:
+        task = lock_attachment_task(db, task_id, deleting=True)
+        assert task is not None
+        redact_task_rows(db, task, now=now)
+        db.commit()
+
+
+def _utc(value: datetime) -> datetime:
+    """A stored timestamp as an aware UTC value on either dialect.
+
+    SQLite hands back naive UTC; PostgreSQL an aware value in the session's
+    zone, which ``replace`` would mislabel rather than convert.
+    """
+    return (
+        value.replace(tzinfo=timezone.utc)
+        if value.tzinfo is None
+        else value.astimezone(timezone.utc)
+    )
 
 
 def _count(db: Session, model: type, task_id: int) -> int:
@@ -168,12 +233,11 @@ def _count(db: Session, model: type, task_id: int) -> int:
 
 def test_redact_task_rows_keeps_the_task_and_removes_its_content(sessions) -> None:
     with sessions() as db:
-        task_id, owner_id = _seed(db)
+        task_id, owner_id, _ = _seed(db)
 
-    for _ in range(2):  # the second run is the idempotency check
-        with sessions() as db:
-            assert redact_task_rows(db, task_id=task_id, now=NOW) is True
-            db.commit()
+    _redact(sessions, task_id, NOW)
+    # Idempotency: a re-run removes nothing and keeps the first trace stamp.
+    _redact(sessions, task_id, NOW + timedelta(days=1))
 
     with sessions() as db:
         assert {
@@ -186,20 +250,40 @@ def test_redact_task_rows_keeps_the_task_and_removes_its_content(sessions) -> No
         assert task is not None
         assert (task.title, task.input, task.output) == ("", None, None)
         assert (task.input_tokens, task.output_tokens) == (7, 3)
-        assert task.updated_at.replace(tzinfo=timezone.utc) == UPDATED_AT
-        assert task.traces_expired_at.replace(tzinfo=timezone.utc) == NOW
+        assert task.agent_config == {"auth_mode": "widget", "guest_id": "guest-1"}
+        assert _utc(task.updated_at) == UPDATED_AT
+        assert _utc(task.traces_expired_at) == NOW
         [command] = db.query(TaskExecutionCommand).filter_by(task_id=task_id).all()
         assert command.payload == {}
+        [run] = db.query(TriggerRun).filter_by(task_id=task_id).all()
+        assert run.payload_snapshot is None
 
 
-def test_redact_task_rows_returns_false_for_a_missing_task(sessions) -> None:
+def test_redaction_discards_the_pending_channel_delivery(sessions) -> None:
+    """A blanked command's delivery must leave the delivery worker's queue.
+
+    ``channel_delivery._pending`` picks pending deliveries of settled
+    commands, and the claim then reads the channel out of the command
+    payload; with that payload blanked, a still-pending row would fail its
+    claim on every pass and starve the rest of the channel's queue.
+    """
     with sessions() as db:
-        assert redact_task_rows(db, task_id=987654321, now=NOW) is False
+        task_id, _, channel_id = _seed(db)
+        command_id = int(db.query(TaskChannelDelivery.command_id).one()[0])
+
+    with patch.object(channel_delivery, "get_session_local", return_value=sessions):
+        assert channel_delivery._pending(channel_id) == [command_id]
+        _redact(sessions, task_id, NOW)
+        assert channel_delivery._pending(channel_id) == []
+
+    with sessions() as db:
+        [delivery] = db.query(TaskChannelDelivery).all()
+        assert (delivery.status, delivery.claim_token) == ("discarded", None)
 
 
 def test_purge_task_rows_still_deletes_the_task_and_detaches_files(sessions) -> None:
     with sessions() as db:
-        task_id, owner_id = _seed(db)
+        task_id, owner_id, _ = _seed(db)
 
     with sessions() as db:
         assert purge_task_rows(db, task_id=task_id, detached_reason="task_deleted")

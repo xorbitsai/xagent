@@ -45,6 +45,7 @@ from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.task_runtime_secret import TaskRuntimeSecret
 from xagent.web.models.uploaded_file import UploadedFile
+from xagent.web.services import task_content_redaction
 from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
@@ -375,6 +376,76 @@ def test_redaction_is_idempotent(_roots: Path) -> None:
         assert task.updated_at.replace(tzinfo=UTC) == UPDATED_AT
     finally:
         db.close()
+
+
+def test_a_cleanup_failure_is_reported_and_the_batch_continues(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    failing_id = _settled_task(full_key, agent_id)
+    next_id = _settled_task(full_key, agent_id)
+    _seed_content(failing_id, _roots)
+    _seed_content(next_id, _roots)
+    manager = get_agent_manager()
+    remove_agent = manager.remove_agent
+
+    def flaky_remove_agent(task_id: int, *args: Any, **kwargs: Any) -> None:
+        if task_id == failing_id:
+            raise OSError("workspace is busy")
+        remove_agent(task_id, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "remove_agent", flaky_remove_agent)
+
+    report = _redact([failing_id, next_id])
+
+    assert report == TaskContentRedactionReport(
+        redacted=(next_id,), cleanup_failed=(failing_id,)
+    )
+    # The rows were committed before the cleanup ran.
+    assert set(_content_counts(failing_id).values()) == {0}
+    assert (_roots / f"web_task_{failing_id}").exists()
+    assert not (_roots / f"web_task_{next_id}").exists()
+
+
+@pytest.mark.parametrize("new_turn_after_commit", [False, True])
+def test_cleanup_spares_a_runtime_a_later_turn_acquired(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch, new_turn_after_commit: bool
+) -> None:
+    """The eviction is fenced on the runtime identity read under the lock.
+
+    A turn that acquires the runtime between the commit and the cleanup owns
+    the cached agent and its workspace; the cleanup must leave both alone.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _, _, workspace = _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    cached_agent = MagicMock()
+    manager._agents[task_id] = cached_agent
+    manager._agent_run_generations[task_id] = 1
+
+    if new_turn_after_commit:
+
+        def acquire_after_commit(_task_id: int) -> None:
+            # Runs after the commit, before the eviction: a new acquisition.
+            manager._agent_run_generations[task_id] = 2
+
+        monkeypatch.setattr(
+            task_content_redaction, "invalidate_task_cache", acquire_after_commit
+        )
+
+    report = _redact([task_id])
+
+    assert report == TaskContentRedactionReport(redacted=(task_id,))
+    if new_turn_after_commit:
+        assert manager._agents[task_id] is cached_agent
+        cached_agent.cleanup_workspace.assert_not_called()
+        assert workspace.exists()
+    else:
+        assert task_id not in manager._agents
+        cached_agent.cleanup_workspace.assert_called_once()
+    manager._agents.pop(task_id, None)
+    manager._agent_run_generations.pop(task_id, None)
 
 
 @pytest.mark.parametrize("state", ["running", "pending_command"])

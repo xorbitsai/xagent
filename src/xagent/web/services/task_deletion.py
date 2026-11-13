@@ -1,7 +1,9 @@
 """Shared, foreign-key-safe deletion and redaction of task-owned database rows."""
 
 from datetime import datetime, timezone
+from typing import Any
 
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
@@ -15,6 +17,7 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
+from ..models.task_channel_delivery import TaskChannelDelivery
 from ..models.task_command import TaskExecutionCommand
 from ..models.task_execution_event import TaskExecutionEvent
 from ..models.task_interaction import TaskInteractionRequest
@@ -27,6 +30,7 @@ from .task_file_lifecycle import (
     lock_attachment_task,
 )
 from .task_interaction_schema import interaction_requests_table_exists
+from .task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 from .uploaded_file_store import UploadedFileStore
 
 # TriggerRun error for a run whose task was deleted before it settled.
@@ -204,39 +208,73 @@ def _delete_task_files(db: Session, task_id: int) -> None:
         store.delete(record, local_root=uploads_root)
 
 
-def redact_task_rows(db: Session, *, task_id: int, now: datetime) -> bool:
+#: ``tasks.agent_config`` keys that carry content or personal data rather
+#: than routing or authorization: the prompt reference data a run is given,
+#: and the widget creator's IP. Every other key is identity the task's later
+#: reads and turns still need (auth mode, guest id, runtime bindings, ...).
+REDACTED_AGENT_CONFIG_KEYS = frozenset(
+    {PROMPT_CONTEXT_AGENT_CONFIG_KEY, "widget_client_ip"}
+)
+
+
+def _trace_rows_exist(db: Session, task_id: int) -> bool:
+    return bool(
+        db.execute(
+            select(
+                or_(
+                    *(
+                        exists().where(model.task_id == task_id)
+                        for model in (TraceCheckpointBlob, TraceMessageBlob, TraceEvent)
+                    )
+                )
+            )
+        ).scalar_one()
+    )
+
+
+def redact_task_rows(db: Session, task: Task, *, now: datetime) -> None:
     """Delete one task's content but keep its row, in a caller-owned transaction.
+
+    ``task`` must already be locked in this transaction through
+    :func:`lock_attachment_task` with ``deleting=True``, which also fences new
+    attachments, and the caller must have established that it is not
+    executing (see ``task_content_redaction``).
 
     What goes: every row :func:`_delete_task_content_rows` removes, the chat
     transcript and execution events, the task's uploaded files (rows *and*
     stored bytes, see :func:`_delete_task_files`), the payload, result and
-    error of its execution commands, and every content-bearing ``Task``
+    error of its execution commands, the payload snapshots of the trigger
+    runs that started it, the content keys of ``agent_config``
+    (:data:`REDACTED_AGENT_CONFIG_KEYS`), and every content-bearing ``Task``
     column (title, description, latest input/output, error, structured
     result, process-mode description and examples).
 
     What stays: the row and everything metering, identity, routing or
     authorization reads -- ids, owner, status, timestamps, token counters and
-    usage details, model and agent identifiers, ``agent_config``, channel and
-    source fields, and the event sequence counter, so a later turn keeps
-    numbering monotonically. ``updated_at`` is pinned (see
-    :func:`_delete_task_content_rows`). ``traces_expired_at`` is stamped with
-    ``now``: it is the marker trace readers already honour for "steps before
-    this moment were removed".
+    usage details, model and agent identifiers, the remaining ``agent_config``
+    keys, channel and source fields, the trigger run rows themselves, and the
+    event sequence counter, so a later turn keeps numbering monotonically.
+    ``updated_at`` is pinned (see :func:`_delete_task_content_rows`).
+    ``traces_expired_at`` is stamped with ``now`` when there was a trace to
+    remove: it is the marker trace readers already honour for "steps before
+    this moment were removed", and a re-run that removes nothing keeps it.
 
     Command rows are blanked rather than deleted: their identity is the
     resend dedupe key, and a deleted row would let a client's retry of an
     old command execute it again. A retry now conflicts on the blank payload
-    instead of replaying.
+    instead of replaying. Their pending channel deliveries are discarded in
+    the same step: the delivery worker reads the destination channel out of
+    the command payload, so a pending delivery of a blanked command could
+    never be claimed and would sit at the head of its channel's queue
+    forever -- and the reply it would carry belongs to the deleted
+    conversation anyway.
 
     Idempotent: a second run finds nothing to delete and rewrites the same
-    blank values. The caller must have established that the task is not
-    executing (see ``task_content_redaction``); this function only locks.
-    Returns ``False`` when the task does not exist.
+    blank values.
     """
 
-    task = lock_attachment_task(db, task_id, deleting=True)
-    if task is None:
-        return False
+    task_id = int(task.id)
+    had_trace = _trace_rows_exist(db, task_id)
     _delete_task_files(db, task_id)
     _delete_task_content_rows(db, task_id)
     db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).delete(
@@ -244,6 +282,19 @@ def redact_task_rows(db: Session, *, task_id: int, now: datetime) -> bool:
     )
     db.query(TaskExecutionEvent).filter(TaskExecutionEvent.task_id == task_id).delete(
         synchronize_session=False
+    )
+    task_commands = select(TaskExecutionCommand.id).where(
+        TaskExecutionCommand.task_id == task_id
+    )
+    db.query(TaskChannelDelivery).filter(
+        TaskChannelDelivery.command_id.in_(task_commands),
+        TaskChannelDelivery.status == "pending",
+    ).update(
+        {
+            TaskChannelDelivery.status: "discarded",
+            TaskChannelDelivery.claim_token: None,
+        },
+        synchronize_session=False,
     )
     db.query(TaskExecutionCommand).filter(
         TaskExecutionCommand.task_id == task_id
@@ -255,22 +306,29 @@ def redact_task_rows(db: Session, *, task_id: int, now: datetime) -> bool:
         },
         synchronize_session=False,
     )
-    db.query(Task).filter(Task.id == task_id).update(
-        {
-            # NOT NULL; every other content column is nullable.
-            Task.title: "",
-            Task.description: None,
-            Task.input: None,
-            Task.output: None,
-            Task.error_message: None,
-            Task.structured_output_record: None,
-            Task.process_description: None,
-            Task.examples: None,
-            # Names the interaction row deleted above.
-            Task.interaction_protocol_version: None,
-            Task.traces_expired_at: now,
-            Task.updated_at: Task.updated_at,
-        },
-        synchronize_session=False,
+    db.query(TriggerRun).filter(TriggerRun.task_id == task_id).update(
+        {TriggerRun.payload_snapshot: None}, synchronize_session=False
     )
-    return True
+    values: dict[Any, Any] = {
+        # NOT NULL; every other content column is nullable.
+        Task.title: "",
+        Task.description: None,
+        Task.input: None,
+        Task.output: None,
+        Task.error_message: None,
+        Task.structured_output_record: None,
+        Task.process_description: None,
+        Task.examples: None,
+        # Names the interaction row deleted above.
+        Task.interaction_protocol_version: None,
+        Task.updated_at: Task.updated_at,
+    }
+    if isinstance(task.agent_config, dict):
+        values[Task.agent_config] = {
+            key: value
+            for key, value in task.agent_config.items()
+            if key not in REDACTED_AGENT_CONFIG_KEYS
+        }
+    if had_trace:
+        values[Task.traces_expired_at] = now
+    db.query(Task).filter(Task.id == task_id).update(values, synchronize_session=False)

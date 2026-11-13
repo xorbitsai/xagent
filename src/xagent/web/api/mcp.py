@@ -5912,50 +5912,41 @@ def _snapshot_builtin_oauth_revocations(
     ``auth.has_other_builtin_oauth_reference`` (checked at that later point,
     not here) confirms no other local connection still needs the grant.
     """
-    from .auth import resolve_builtin_oauth_revocation
+    from .auth import snapshot_builtin_oauth_revocations
 
     if not providers:
         return []
-    accounts = (
+    return snapshot_builtin_oauth_revocations(
+        db,
         scoped_user_oauth_query(db, user_id=user_id, resource_owner_key=None)
         .filter(UserOAuth.provider.in_(providers))
-        .all()
+        .all(),
     )
-    resolved = []
-    for account in accounts:
-        if not account.access_token:
-            continue
-        snapshot = resolve_builtin_oauth_revocation(
-            db,
-            provider=str(account.provider),
-            access_token=str(account.access_token),
-            # is not None, not a truthy check: an empty-string
-            # provider_user_id is still a real (if unlikely) identity value,
-            # and coercing it to None here would silently disable
-            # has_other_builtin_oauth_reference's cross-user protection --
-            # only an actual NULL column means "no known identity".
-            provider_user_id=(
-                str(account.provider_user_id)
-                if account.provider_user_id is not None
-                else None
-            ),
-            refresh_token=cast(str | None, account.refresh_token),
-            token_type=cast(str | None, account.token_type),
-        )
-        if snapshot is not None:
-            resolved.append(snapshot)
-    return resolved
 
 
 def _detach_shared_google_grant_for_disconnect(
     db: Session, *, user_id: int, provider: object, app_id: object
-) -> None:
-    """Detach one ordinary Google app from any explicit shared grant."""
-    if normalize_catalog_key(provider) != "google" or not isinstance(app_id, str):
-        return
-    from ..services.google_oauth_grants import detach_google_shared_oauth_app
+) -> "list[BuiltinOAuthRevocation]":
+    """Detach one ordinary Google app from any explicit shared grant.
 
+    Detaching the last app linked to a shared grant deletes the shared
+    ``google`` credential with it, so the user's shared credentials are
+    snapshotted for revocation first. One that survives the detach (another
+    app still links it) is still there for the post-commit reference check,
+    which then skips its revoke.
+    """
+    if normalize_catalog_key(provider) != "google" or not isinstance(app_id, str):
+        return []
+    from ..services.google_oauth_grants import (
+        GOOGLE_SHARED_OAUTH_PROVIDER,
+        detach_google_shared_oauth_app,
+    )
+
+    revocations = _snapshot_builtin_oauth_revocations(
+        db, user_id=user_id, providers=[GOOGLE_SHARED_OAUTH_PROVIDER]
+    )
     detach_google_shared_oauth_app(db, user_id=user_id, app_id=app_id)
+    return revocations
 
 
 def _legacy_disconnect_provider_keys(
@@ -6113,8 +6104,10 @@ def _teardown_mcp_app_server_locally(
 
         if str(server.transport or "").lower() == "oauth":
             provider = expected_app.provider_name
-            _detach_shared_google_grant_for_disconnect(
-                db, user_id=user_id, provider=provider, app_id=app_id
+            builtin_oauth_revocations.extend(
+                _detach_shared_google_grant_for_disconnect(
+                    db, user_id=user_id, provider=provider, app_id=app_id
+                )
             )
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
                 expected_app, [provider, app_id]
@@ -6431,11 +6424,13 @@ async def delete_mcp_server(
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
-                _detach_shared_google_grant_for_disconnect(
-                    db,
-                    user_id=int(user_id),
-                    provider=provider,
-                    app_id=app_id,
+                builtin_oauth_revocations.extend(
+                    _detach_shared_google_grant_for_disconnect(
+                        db,
+                        user_id=int(user_id),
+                        provider=provider,
+                        app_id=app_id,
+                    )
                 )
 
                 # Delete tokens for this specific app. For apps in

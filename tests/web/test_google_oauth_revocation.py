@@ -24,6 +24,9 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
+from xagent.web.services.google_oauth_grants import (
+    create_google_oauth_grant_association,
+)
 
 GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 
@@ -421,3 +424,114 @@ async def test_delete_mcp_server_revokes_the_google_grant(db, post):
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     _assert_revoked_with(post, "refresh")
+
+
+def _shared_grant_with_tombstoned_last_link(db: Session, user: User) -> UserOAuth:
+    """A shared ``google`` credential whose only app link points at a legacy
+    Drive row that holds no token any more (a disconnected tombstone).
+    Detaching that link deletes the shared credential as an orphan, and the
+    tombstone itself has nothing to revoke with."""
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="sub-1",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="openid scope.drive",
+    )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="google-drive",
+        provider_user_id="sub-1",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="openid scope.drive",
+    )
+    db.add_all([shared, legacy])
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="google-drive",
+        legacy_oauth_account=legacy,
+    )
+    legacy.access_token = ""
+    legacy.refresh_token = None
+    db.commit()
+    return legacy
+
+
+@pytest.mark.asyncio
+async def test_mcp_disconnect_revokes_the_shared_grant_its_last_link_deletes(db, post):
+    from xagent.web.api.mcp import delete_mcp_server
+
+    user = _user(db)
+    _shared_grant_with_tombstoned_last_link(db, user)
+    server = MCPServer(
+        name="google-drive",
+        transport="oauth",
+        managed=False,
+        auth={"app_id": "google-drive"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id), mcpserver_id=server.id, is_active=True, is_owner=True
+        )
+    )
+    db.commit()
+
+    await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
+
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    _assert_revoked_with(post, "shared-refresh")
+
+
+@pytest.mark.asyncio
+async def test_cloud_account_delete_revokes_the_shared_grant_its_last_link_deletes(
+    db, post
+):
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user = _user(db)
+    legacy = _shared_grant_with_tombstoned_last_link(db, user)
+
+    await delete_connected_account(account_id=int(legacy.id), db=db, user=user)
+
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    _assert_revoked_with(post, "shared-refresh")
+
+
+@pytest.mark.asyncio
+async def test_a_shared_grant_a_sibling_app_still_links_is_not_revoked(db, post):
+    """The shared credential is snapshotted before every detach, but one that
+    survives it is still there for the reference check."""
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user = _user(db)
+    legacy = _shared_grant_with_tombstoned_last_link(db, user)
+    shared = db.query(UserOAuth).filter(UserOAuth.provider == "google").one()
+    calendar = UserOAuth(
+        user_id=int(user.id),
+        provider="google-calendar",
+        provider_user_id="sub-1",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+    )
+    db.add(calendar)
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="google-calendar",
+        legacy_oauth_account=calendar,
+    )
+    db.commit()
+
+    await delete_connected_account(account_id=int(legacy.id), db=db, user=user)
+
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "google").count() == 1
+    post.assert_not_called()

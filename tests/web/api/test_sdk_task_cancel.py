@@ -9,6 +9,7 @@ it did not cause, the ownership fence, and the routing that sends only an
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.services import a2a_task_cancel as a2a_cancel_service
 from xagent.web.services import sdk_task_cancel
@@ -43,8 +45,10 @@ from xagent.web.services.sdk_task_cancel import (
 )
 from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
+    TaskCommandDeferred,
     TaskCommandKind,
     TaskCommandRejected,
+    stage_task_command,
 )
 from xagent.web.services.task_execution_controller import (
     StaleTaskRunError,
@@ -589,6 +593,7 @@ def test_replaced_attempt_rejects_cancel_and_preserves_task(
             agent_id=agent_id,
             expected_run_id=before["run_id"],
             expected_state_version=before["state_version"],
+            expected_status=TaskStatus.RUNNING,
             terminal_event_state={},
         )
 
@@ -838,6 +843,7 @@ async def test_sdk_scope_routes_to_the_sdk_core_only(
         agent_id=agent_id,
         expected_run_id="run-sdk",
         expected_state_version=4,
+        queued_run_id=None,
     )
     assert external_core.await_count == 0
     assert a2a_core.await_count == 0
@@ -892,6 +898,7 @@ def test_lease_fields_are_cleared_only_without_a_coordinator(
         agent_id=agent_id,
         expected_run_id=before.run_id,
         expected_state_version=before.state_version,
+        expected_status=TaskStatus.RUNNING,
         terminal_event_state={},
     )
 
@@ -902,4 +909,338 @@ def test_lease_fields_are_cleared_only_without_a_coordinator(
     assert after.lease_expires_at is not None
     assert after.lease_expires_at.replace(tzinfo=UTC) > datetime.now(UTC) - timedelta(
         minutes=5
+    )
+
+
+# ----- a turn that was queued when its cancel was requested -----
+
+QUEUED_RUN = "run-queued"
+STOPPED_BEFORE_START = {"rejection_reason": "cancelled_before_admission"}
+
+
+def _stage_start(
+    task_id: int,
+    owner_user_id: int,
+    *,
+    run_id: str = QUEUED_RUN,
+    turn_id: str = "turn-queued",
+    **columns: Any,
+) -> int:
+    """An accepted START for ``run_id`` with its pending user message."""
+    db = _direct_db_session()
+    try:
+        staged = stage_task_command(
+            db,
+            task_id=task_id,
+            actor_user_id=owner_user_id,
+            command_id=turn_id,
+            kind=TaskCommandKind.START,
+            payload={},
+            target_run_id=run_id,
+        )
+        db.commit()
+        start_id = int(staged.staged_db_id)
+        if columns:
+            db.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.id == start_id
+            ).update(columns)
+            db.commit()
+    finally:
+        db.close()
+    _seed_pending_user_message(task_id, owner_user_id, turn_id)
+    return start_id
+
+
+def _start(start_id: int) -> tuple[str, Any]:
+    db = _direct_db_session()
+    try:
+        row = db.get(TaskExecutionCommand, start_id)
+        return str(row.status), row.result
+    finally:
+        db.close()
+
+
+async def _cancel_queued(task_id: int, agent_id: int) -> None:
+    # The command was recorded against the row as it stood while the turn
+    # was queued; the core reads the target to cancel from the queued run.
+    await cancel_sdk_task_unserialized(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-before",
+        expected_state_version=4,
+        queued_run_id=QUEUED_RUN,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "previous",
+    [
+        {"status": TaskStatus.COMPLETED, "control_state": "completed", "output": "x"},
+        {"status": TaskStatus.FAILED, "control_state": "failed", "error_message": "e"},
+        {
+            "status": TaskStatus.FAILED,
+            "control_state": "failed",
+            "error_message": SDK_CANCEL_ERROR_MESSAGE,
+        },
+        {"status": TaskStatus.PAUSED, "control_state": "paused"},
+    ],
+    ids=["completed", "failed", "cancelled", "paused"],
+)
+async def test_an_appended_turn_stopped_before_it_starts_leaves_the_previous_result(
+    monkeypatch: pytest.MonkeyPatch, previous: dict[str, Any]
+) -> None:
+    """An append's failure belongs to its command, never to the row."""
+    task_id, agent_id, owner_user_id = _create_task(run_id="run-before", **previous)
+    start_id = _stage_start(task_id, owner_user_id)
+    manager = _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    for _attempt in range(2):  # the second call is the command replayed
+        await _cancel_queued(task_id, agent_id)
+
+        assert _row(task_id) == before
+        assert _start(start_id) == ("failed", STOPPED_BEFORE_START)
+        assert _delivery_status(task_id, "turn-queued") == "failed"
+    assert _assistant_rows(task_id) == []
+    assert manager.broadcast_to_task.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_version", [1, 2])
+async def test_a_new_task_cancelled_before_it_starts_is_cancelled_as_a_row(
+    monkeypatch: pytest.MonkeyPatch, storage_version: int
+) -> None:
+    """A task that never ran gets the terminal row alone: no transcript line
+    and no delivery change, which its START's own settlement owns. It has no
+    result fact either, so its terminal frame carries no display events,
+    whatever its storage version: asking for them would fail the broadcast."""
+    task_id, agent_id, owner_user_id = _create_task(
+        status=TaskStatus.PENDING,
+        control_state="idle",
+        run_id=None,
+        state_version=0,
+        storage_version=storage_version,
+    )
+    _stage_start(task_id, owner_user_id)
+    manager = _broadcast_manager(monkeypatch)
+
+    await _cancel_queued(task_id, agent_id)
+
+    task = _load_task(task_id)
+    assert is_sdk_cancelled(task.status, task.error_message)
+    assert (task.run_id, task.state_version) == (None, 1)
+    assert _assistant_rows(task_id) == []
+    assert _delivery_status(task_id, "turn-queued") == DELIVERY_PENDING
+    assert "state_version" not in _terminal_frame(manager)
+
+
+@pytest.mark.asyncio
+async def test_a_queued_turn_that_started_first_is_cancelled_as_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handoff moved the run and the version since the request; the
+    queued run names the target and the version is the one read now."""
+    task_id, agent_id, owner_user_id = _create_task(run_id=QUEUED_RUN, state_version=7)
+    _stage_start(task_id, owner_user_id, status="completed", attempt_count=1)
+    _broadcast_manager(monkeypatch)
+
+    await _cancel_queued(task_id, agent_id)
+
+    task = _load_task(task_id)
+    assert is_sdk_cancelled(task.status, task.error_message)
+    assert (task.run_id, task.state_version) == (QUEUED_RUN, 8)
+
+
+@pytest.mark.asyncio
+async def test_a_queued_turn_already_cancelled_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id=QUEUED_RUN,
+        status=TaskStatus.FAILED,
+        control_state="failed",
+        error_message=SDK_CANCEL_ERROR_MESSAGE,
+        state_version=9,
+    )
+    _stage_start(task_id, owner_user_id, status="completed", attempt_count=1)
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    await _cancel_queued(task_id, agent_id)
+
+    assert _row(task_id) == before
+
+
+@pytest.mark.asyncio
+async def test_a_later_queued_turn_is_never_stopped_for_an_earlier_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aimed turn ran to completion and another one was appended since:
+    the cancel is stale, and the newer START is not its target."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id=QUEUED_RUN,
+        status=TaskStatus.COMPLETED,
+        control_state="completed",
+        output="done",
+    )
+    _stage_start(task_id, owner_user_id, status="completed", attempt_count=1)
+    later_id = _stage_start(
+        task_id, owner_user_id, run_id="run-later", turn_id="turn-later"
+    )
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await _cancel_queued(task_id, agent_id)
+
+    assert raised.value.reason == "stale_run"
+    assert _row(task_id) == before
+    assert _start(later_id) == ("pending", None)
+    assert _delivery_status(task_id, "turn-later") == DELIVERY_PENDING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "error", "reason"),
+    [
+        ({"status": "processing", "attempt_count": 1}, TaskCommandDeferred, None),
+        ({"status": "pending", "attempt_count": 1}, TaskCommandRejected, "stale_run"),
+        (
+            {"status": "failed", "result": {"rejection_reason": "invalid_start"}},
+            TaskCommandRejected,
+            "stale_run",
+        ),
+        (None, TaskCommandRejected, "stale_run"),
+    ],
+    ids=["being_handed_off", "claimed_before", "failed_itself", "missing"],
+)
+async def test_a_queued_start_this_cancel_cannot_stop_is_left_as_it_is(
+    monkeypatch: pytest.MonkeyPatch, start, error, reason
+) -> None:
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id="run-before", status=TaskStatus.COMPLETED, control_state="completed"
+    )
+    start_id = None if start is None else _stage_start(task_id, owner_user_id, **start)
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+    start_before = None if start_id is None else _start(start_id)
+
+    with pytest.raises(error) as raised:
+        await _cancel_queued(task_id, agent_id)
+
+    if reason is not None:
+        assert raised.value.reason == reason
+    assert _row(task_id) == before
+    if start_id is not None:
+        assert _start(start_id) == start_before
+
+
+@pytest.mark.asyncio
+async def test_a_start_is_matched_by_its_run_not_by_being_the_one_queued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aimed turn failed to start and another turn is queued now: the
+    queued START belongs to that other turn and stays as it is."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id="run-before", status=TaskStatus.COMPLETED, control_state="completed"
+    )
+    _stage_start(
+        task_id,
+        owner_user_id,
+        status="failed",
+        result={"rejection_reason": "invalid_start"},
+    )
+    later_id = _stage_start(
+        task_id, owner_user_id, run_id="run-later", turn_id="turn-later"
+    )
+    _broadcast_manager(monkeypatch)
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await _cancel_queued(task_id, agent_id)
+
+    assert raised.value.reason == "stale_run"
+    assert _start(later_id) == ("pending", None)
+
+
+@pytest.mark.asyncio
+async def test_an_sdk_cancel_of_a_running_task_keeps_the_dispatcher_run_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a cancel aimed at a queued turn bypasses the dispatcher's run
+    comparison; one aimed at the running row is rejected there, as before."""
+    task_id, agent_id, _owner = _create_task(run_id="run-after")
+    _broadcast_manager(monkeypatch)
+    sdk_core = AsyncMock()
+    monkeypatch.setattr(
+        command_execution_service, "cancel_sdk_task_unserialized", sdk_core
+    )
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await command_execution_service._execute_durable_task_command(
+            _cancel_command(task_id, agent_id, scope="sdk")
+        )
+
+    assert raised.value.reason == "stale_run"
+    sdk_core.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_queued_cancel_read_without_its_queued_run_is_rejected_unwritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process that does not read ``queued_run_id`` sees a cancel aimed at
+    the queued turn's run while the row still holds an earlier, cancelled
+    run. The run comparison rejects it before any core, so that earlier
+    run is never reported as this cancel's outcome and the queued START is
+    left alone."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id="run-before",
+        status=TaskStatus.FAILED,
+        control_state="failed",
+        error_message=SDK_CANCEL_ERROR_MESSAGE,
+    )
+    start_id = _stage_start(task_id, owner_user_id)
+    _broadcast_manager(monkeypatch)
+    sdk_core = AsyncMock()
+    monkeypatch.setattr(
+        command_execution_service, "cancel_sdk_task_unserialized", sdk_core
+    )
+    before = _row(task_id)
+    command = replace(
+        _cancel_command(task_id, agent_id, scope="sdk"), target_run_id=QUEUED_RUN
+    )
+
+    with pytest.raises(TaskCommandRejected) as raised:
+        await command_execution_service._execute_durable_task_command(command)
+
+    assert raised.value.reason == "stale_run"
+    sdk_core.assert_not_awaited()
+    assert _row(task_id) == before
+    assert _start(start_id) == ("pending", None)
+
+
+@pytest.mark.asyncio
+async def test_an_sdk_cancel_reaches_its_core_whatever_run_the_row_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The command was recorded against the run before the queued one, so
+    the dispatcher's own run comparison must not reject it."""
+    task_id, agent_id, _owner = _create_task(run_id=QUEUED_RUN)
+    _broadcast_manager(monkeypatch)
+    sdk_core = AsyncMock()
+    monkeypatch.setattr(
+        command_execution_service, "cancel_sdk_task_unserialized", sdk_core
+    )
+
+    await command_execution_service._execute_durable_task_command(
+        _cancel_command(task_id, agent_id, scope="sdk", queued_run_id=QUEUED_RUN)
+    )
+
+    sdk_core.assert_awaited_once_with(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-sdk",
+        expected_state_version=4,
+        queued_run_id=QUEUED_RUN,
     )

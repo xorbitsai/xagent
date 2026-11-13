@@ -172,6 +172,16 @@ def stage_task_start_command(
     )
 
 
+# Terminal statuses an append is accepted from. With shared execution the row
+# keeps one of them, and the previous turn's output and error, until the
+# queued START is handed off, so a caller waiting for a terminal status would
+# take the previous turn as the new one; such a row reads as ``pending``. A
+# PAUSED row keeps reading as paused, which callers already wait on. A RUNNING
+# or WAITING_FOR_USER row has moved since the START was queued, and a PENDING
+# row already reads as pending.
+QUEUED_START_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+
+
 def has_queued_start(db: Session, task_id: int) -> bool:
     """Whether an accepted START of ``task_id`` has not been handed off yet.
 

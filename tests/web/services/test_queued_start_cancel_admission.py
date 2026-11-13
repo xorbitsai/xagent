@@ -19,6 +19,7 @@ from xagent.web.models.task_runtime_secret import TaskRuntimeSecret
 from xagent.web.services import (
     a2a_task_cancel,
     external_task_cancel,
+    sdk_task_cancel,
     task_command_execution,
 )
 from xagent.web.services import task_command_transport as transport
@@ -38,7 +39,7 @@ from .test_task_execution_admission import (
 )
 
 
-@pytest.mark.parametrize("scope", ["a2a", "external"])
+@pytest.mark.parametrize("scope", ["a2a", "external", "sdk"])
 async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
     """External runtime input is the supported host contract for its START."""
     monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -49,6 +50,7 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
     monkeypatch.setattr(
         external_task_cancel, "get_session_local", lambda: host.sessions
     )
+    monkeypatch.setattr(sdk_task_cancel, "get_session_local", lambda: host.sessions)
     monkeypatch.setattr(
         "xagent.web.services.task_event_bridge.get_task_event_bridge", lambda: Mock()
     )
@@ -119,6 +121,10 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
         payload = {"agent_id": agent_id, "target_state_version": 0}
         if scope == "external":
             payload.update({"scope": "external", "turn_id": turn_id})
+        if scope == "sdk":
+            with host.sessions() as db:
+                queued_run_id = db.get(TaskExecutionCommand, start_id).target_run_id
+            payload.update({"scope": "sdk", "queued_run_id": queued_run_id})
         with host.sessions() as db:
             cancel = transport.enqueue_task_command(
                 db,
@@ -152,11 +158,11 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
             }
             assert (task.status, task.error_message) == (
                 TaskStatus.FAILED,
-                (
-                    "Stopped by the visitor."
-                    if scope == "external"
-                    else "Task canceled by A2A client."
-                ),
+                {
+                    "external": "Stopped by the visitor.",
+                    "a2a": "Task canceled by A2A client.",
+                    "sdk": sdk_task_cancel.SDK_CANCEL_ERROR_MESSAGE,
+                }[scope],
             )
             assert queued_start.status == "failed"
             assert queued_start.error == "Task command stopped by a control request."

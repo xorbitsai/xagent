@@ -616,8 +616,8 @@ class V1McpServerTools(BaseModel):
     """Response of ``GET /v1/mcp-servers/{server_id}/tools``.
 
     The connector is started the way a task would start it. Waiting for a
-    free slot takes at most one MCP initialization timeout; starting the
-    connector takes at most one more, plus the time to read its settings.
+    free slot takes at most five seconds; starting the connector takes at most
+    one MCP initialization timeout, plus the time to read its settings.
     ``failures`` is non-empty when some loads failed but at least one tool
     came back.
     """

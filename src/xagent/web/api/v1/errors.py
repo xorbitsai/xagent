@@ -134,7 +134,8 @@ class V1ErrorCode(str, Enum):
     INVALID_INPUT = "invalid_input"
 
     # Emitted when a caller exceeds the v1 SSE stream concurrency caps
-    # (per-task or per-principal), or when no MCP tool-listing slot frees up.
+    # (per-task or per-principal), or the MCP tool-listing caps (per key holder,
+    # or no shared slot frees up in time).
     RATE_LIMITED = "rate_limited"
 
     # Monthly execution quota exhausted. 402 Payment Required. Two distinct

@@ -1,6 +1,7 @@
 """Tests for the model-invocable ``store_memory`` tool."""
 
 import asyncio
+import json
 from typing import Any, cast
 
 import pytest
@@ -18,6 +19,7 @@ from xagent.core.execution_scope import ExecutionScope, ExecutionScopeContext
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
+from xagent.core.memory.provenance import validate_memory_provenance
 from xagent.core.model.embedding import BaseEmbedding
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
@@ -92,6 +94,79 @@ async def test_store_memory_adds_note_with_metadata() -> None:
     # purged conversation inside the memory store (#2753).
     assert note.metadata == {"kind": "user_preference", "source": "store_memory"}
     assert tool.stored_count == 1
+
+
+@pytest.mark.asyncio
+async def test_store_memory_stamps_host_provenance() -> None:
+    store = RecordingMemoryStore()
+    provenance = validate_memory_provenance(
+        {"channel_kind": "channel", "channel_id": "C123ABC", "task_id": "42"}
+    )
+    [tool, *_] = build_memory_tools(
+        memory_store=store,
+        task="Summarize what Alice said about the Q3 launch",
+        provenance=provenance,
+    )
+
+    await tool.execute(content="Team ships on Thursdays.", kind="domain_insight")
+    await tool.execute(content="User prefers bullet lists.", kind="user_preference")
+
+    first, second = store.added
+    assert first.metadata == {
+        "kind": "domain_insight",
+        "source": "store_memory",
+        "provenance": {
+            "channel_kind": "channel",
+            "channel_id": "C123ABC",
+            "task_id": "42",
+        },
+    }
+    # Each note gets its own plain JSON-serializable copy.
+    assert type(first.metadata["provenance"]) is dict
+    assert first.metadata["provenance"] is not second.metadata["provenance"]
+    # Neither the task request nor any other conversation text is stamped.
+    serialized = json.dumps(first.metadata)
+    assert "Alice" not in serialized
+    assert "Q3 launch" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_store_memory_without_provenance_keeps_legacy_metadata() -> None:
+    store = RecordingMemoryStore()
+    [tool, *_] = build_memory_tools(memory_store=store, task="task")
+
+    await tool.execute(content="Team ships on Thursdays.", kind="domain_insight")
+
+    assert store.added[0].metadata == {
+        "kind": "domain_insight",
+        "source": "store_memory",
+    }
+
+
+@pytest.mark.asyncio
+async def test_store_memory_provenance_survives_lancedb_round_trip(
+    tmp_path: Any,
+) -> None:
+    store = LanceDBMemoryStore(
+        db_dir=str(tmp_path),
+        collection_name="provenance_round_trip",
+        embedding_model=_DeterministicEmbedding(),
+    )
+    tool = StoreMemoryTool(
+        memory_store=store,
+        task="task",
+        provenance=validate_memory_provenance(
+            {"channel_kind": "dm", "channel_id": "D42"}
+        ),
+    )
+
+    result = await tool.execute(content="User prefers concise replies.")
+
+    stored = store.get(result["memory_id"]).content
+    assert stored.metadata["provenance"] == {"channel_kind": "dm", "channel_id": "D42"}
+    assert stored.timestamp.utcoffset() is not None
+    [listed] = store.list_all()
+    assert listed.metadata["provenance"] == {"channel_kind": "dm", "channel_id": "D42"}
 
 
 @pytest.mark.asyncio

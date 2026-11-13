@@ -17,7 +17,7 @@ from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from ..utils.lancedb_sql import sql_string_literal
-from .base import MemoryStore
+from .base import MemoryStore, comparable_timestamp
 from .core import MemoryNote, MemoryResponse
 from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
 from .schema_migration import (
@@ -1130,8 +1130,8 @@ class LanceDBMemoryStore(MemoryStore):
         newest-first to match InMemoryStore.list_all.
         """
         notes = self.search(query="", k=10000, filters=filters or None)
-        # Mirror InMemoryStore: newest first.
-        notes.sort(key=lambda n: n.timestamp, reverse=True)
+        # Mirror InMemoryStore: newest first, over naive legacy and aware rows.
+        notes.sort(key=lambda n: comparable_timestamp(n.timestamp), reverse=True)
         return notes
 
     def get_stats(self) -> dict[str, Any]:

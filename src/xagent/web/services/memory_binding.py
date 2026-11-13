@@ -20,6 +20,7 @@ from typing import Any, TypeAlias
 
 from ...core.memory.access_scope import MemoryAccessScope, bind_memory_access_scope
 from ...core.memory.base import MemoryStore
+from ...core.memory.provenance import MemoryProvenance
 from ...core.memory.scope_columns import strict_user_id
 from .db_runtime import run_db_io_cancellation_safe
 
@@ -108,12 +109,19 @@ class MemoryToolAssemblyRequest:
     The factory is called synchronously during pattern setup and must not
     perform blocking I/O. Core copies the returned sequence before adding
     run-local tools and marks the context for memory-usage guidance.
+
+    ``provenance`` is a plain-dict copy of the task's validated
+    ``MemoryPolicyDecision`` provenance (``None`` when the policy resolver
+    supplied none). A factory
+    that builds its own ``store_memory`` tool should forward it so notes carry
+    the same provenance as the default tool set.
     """
 
     memory_store: MemoryStore = field(repr=False)
     task: str
     runtime: Any | None = field(default=None, repr=False)
     context: Any | None = field(default=None, repr=False)
+    provenance: MemoryProvenance | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.memory_store, MemoryStore):

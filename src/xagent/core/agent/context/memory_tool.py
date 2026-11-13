@@ -15,6 +15,7 @@ from typing import Any, Literal, get_args
 from pydantic import BaseModel, Field
 
 from ...memory.core import MemoryNote
+from ...memory.provenance import MEMORY_PROVENANCE_METADATA_KEY, MemoryProvenance
 from ..trace import (
     trace_memory_retrieve_end,
     trace_memory_retrieve_start,
@@ -80,7 +81,16 @@ class StoreMemoryArgs(BaseModel):
 
 
 class StoreMemoryTool:
-    """Execution-scoped ``store_memory`` tool bound to a memory store."""
+    """Execution-scoped ``store_memory`` tool bound to a memory store.
+
+    ``provenance`` is an optional host mapping, already validated by
+    ``core.memory.provenance.validate_memory_provenance``, that is copied
+    into every stored note's metadata under
+    ``MEMORY_PROVENANCE_METADATA_KEY``. It is fixed for the tool's lifetime
+    because a tool instance never outlives the run (and so the task/channel)
+    it was built for. Without it the stored metadata is
+    exactly ``{kind, source}``, as before provenance existed.
+    """
 
     name = STORE_MEMORY_TOOL_NAME
     description = _STORE_MEMORY_DESCRIPTION
@@ -95,6 +105,7 @@ class StoreMemoryTool:
         category: str = "react_memory",
         max_stores: int = DEFAULT_MAX_STORES_PER_RUN,
         dedup_distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD,
+        provenance: MemoryProvenance | None = None,
     ) -> None:
         self.memory_store = memory_store
         self.task = task
@@ -102,6 +113,7 @@ class StoreMemoryTool:
         self.category = category
         self.max_stores = max_stores
         self.dedup_distance_threshold = dedup_distance_threshold
+        self.provenance = provenance
         self.stored_count = 0
         self._store_lock = asyncio.Lock()
 
@@ -205,16 +217,18 @@ class StoreMemoryTool:
         return results[0] if results else None
 
     def _add(self, content: str, kind: str) -> str | None:
-        note = MemoryNote(
-            content=content,
-            category=self.category,
-            # No request text here: it is conversation content, and a note
-            # outlives the conversation it came from (#2753).
-            metadata={
-                "kind": kind,
-                "source": STORE_MEMORY_TOOL_NAME,
-            },
-        )
+        # No request text here: it is conversation content, and a note
+        # outlives the conversation it came from (#2753). Provenance carries
+        # identifiers only (grammar-checked by ``validate_memory_provenance``).
+        metadata: dict[str, Any] = {
+            "kind": kind,
+            "source": STORE_MEMORY_TOOL_NAME,
+        }
+        if self.provenance is not None:
+            # A fresh plain dict per note: stores serialize metadata as JSON
+            # and must not share one mutable mapping across notes.
+            metadata[MEMORY_PROVENANCE_METADATA_KEY] = dict(self.provenance)
+        note = MemoryNote(content=content, category=self.category, metadata=metadata)
         try:
             response = self.memory_store.add(note)
         except Exception:
@@ -326,7 +340,13 @@ class UpdateMemoryArgs(BaseModel):
 
 
 class UpdateMemoryTool:
-    """Execution-scoped ``update_memory`` tool bound to a memory store."""
+    """Execution-scoped ``update_memory`` tool bound to a memory store.
+
+    Only the content changes: the note keeps its metadata, including any
+    ``provenance``. Provenance records where a memory was *originally learned*
+    and is deliberately not re-stamped with the updating run's channel, so a
+    correction made elsewhere never relabels the memory's origin.
+    """
 
     name = UPDATE_MEMORY_TOOL_NAME
     description = (
@@ -514,18 +534,27 @@ def build_memory_tools(
     task: str,
     runtime: Any | None = None,
     context: Any | None = None,
+    provenance: MemoryProvenance | None = None,
 ) -> list[Any]:
     """Create the memory tool set, or [] when no memory store is active.
 
     When ``context`` is given, mark it so the system context renders the
     memory-usage guidance alongside the tools (see
-    ``MEMORY_TOOLS_METADATA_KEY``).
+    ``MEMORY_TOOLS_METADATA_KEY``). ``provenance`` is forwarded to
+    ``store_memory`` (see :class:`StoreMemoryTool`); hosts supply it through
+    ``MemoryPolicyDecision.memory_provenance``, which binds it here as the
+    run's memory-tools factory.
     """
 
     if memory_store is None:
         return []
     tools: list[Any] = [
-        StoreMemoryTool(memory_store=memory_store, task=task, runtime=runtime),
+        StoreMemoryTool(
+            memory_store=memory_store,
+            task=task,
+            runtime=runtime,
+            provenance=provenance,
+        ),
         SearchMemoryTool(memory_store=memory_store, runtime=runtime),
         UpdateMemoryTool(memory_store=memory_store),
         DeleteMemoryTool(memory_store=memory_store),

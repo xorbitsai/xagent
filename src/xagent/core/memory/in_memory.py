@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, List, Optional
 
-from .base import MemoryStore
+from .base import MemoryStore, comparable_timestamp
 from .core import MemoryNote, MemoryResponse
 
 
@@ -77,8 +77,9 @@ class InMemoryMemoryStore(MemoryStore):
         else:
             results = list(self._store.values())
 
-        # Sort by timestamp (newest first)
-        results.sort(key=lambda x: x.timestamp, reverse=True)
+        # Sort by timestamp (newest first); normalized because legacy naive
+        # and current aware timestamps cannot be compared directly.
+        results.sort(key=lambda x: comparable_timestamp(x.timestamp), reverse=True)
 
         return results
 

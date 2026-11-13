@@ -35,8 +35,6 @@ _PINNED_LEGACY = frozenset(
         "aws",
         "chartmogul",
         "chrome-devtools",
-        "deputy",
-        "employment-hero",
         "facebook",
         "fireflies",
         "freshdesk",
@@ -44,8 +42,6 @@ _PINNED_LEGACY = frozenset(
         "google-search-console",
         "granola",
         "instagram",
-        "intercom",
-        "linear",
         "linkedin",
         "magento",
         "meta-ads",
@@ -57,7 +53,6 @@ _PINNED_LEGACY = frozenset(
         "shopify",
         "stripe",
         "whatsapp",
-        "xero",
     }
 )
 

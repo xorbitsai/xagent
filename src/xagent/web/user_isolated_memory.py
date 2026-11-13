@@ -13,8 +13,18 @@ from xagent.core.execution_scope import (
 from xagent.core.memory.access_scope import MemoryAccessScope
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.provenance import MEMORY_PROVENANCE_METADATA_KEY
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
+
+
+def _is_server_owned_metadata_key(key: str) -> bool:
+    """Metadata a by-id update restores from the stored note: scope-dimension
+    stamps and ``provenance`` (``user_id`` is re-stamped separately)."""
+    return (
+        key.startswith(MEMORY_DIMENSION_METADATA_PREFIX)
+        or key == MEMORY_PROVENANCE_METADATA_KEY
+    )
 
 
 class UserIsolatedMemoryStore(MemoryStore):
@@ -274,17 +284,18 @@ class UserIsolatedMemoryStore(MemoryStore):
                 existing_isolation_metadata = {
                     key: value
                     for key, value in existing_response.content.metadata.items()
-                    if key.startswith(MEMORY_DIMENSION_METADATA_PREFIX)
+                    if _is_server_owned_metadata_key(key)
                 }
 
-        # Isolation metadata is server-owned. A caller may replace ordinary
-        # metadata, but cannot move an authenticated note to another owner (or
-        # to an invalid/ownerless value), nor add/remove its scope dimensions.
-        # An unscoped note stays unscoped: the stored set is restored even when
-        # it is empty.
+        # Isolation metadata and provenance are server-owned. A caller may
+        # replace ordinary metadata, but cannot move an authenticated note to
+        # another owner (or to an invalid/ownerless value), add/remove its
+        # scope dimensions, or forge/wipe where it was originally learned. An
+        # unscoped (or provenance-less) note stays so: the stored set is
+        # restored even when it is empty.
         if existing_isolation_metadata is not None:
             for key in tuple(note.metadata):
-                if key.startswith(MEMORY_DIMENSION_METADATA_PREFIX):
+                if _is_server_owned_metadata_key(key):
                     note.metadata.pop(key)
             note.metadata.update(existing_isolation_metadata)
         if user_id is not None:

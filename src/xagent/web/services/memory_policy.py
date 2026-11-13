@@ -98,8 +98,15 @@ def resolve_trusted_memory_policy(
         decision = resolver(request)
         _validate_decision(decision)
         return decision
-    except Exception:
-        logger.warning("Trusted memory policy resolver failed")
+    except Exception as exc:
+        # Name the failure so a rejected decision (e.g. an invalid provenance
+        # value) is diagnosable. Validation messages name the offending key
+        # and grammar, never the rejected value, which may be content.
+        logger.warning(
+            "Trusted memory policy resolver failed (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
         return MemoryPolicyDecision(
             enabled=False,
             available=False,

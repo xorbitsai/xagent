@@ -357,7 +357,9 @@ def _adapt_memory_tools_factory(
                 task=task,
                 runtime=runtime,
                 context=context,
-                provenance=provenance,
+                # A plain dict: host factories may serialize or store it,
+                # which a read-only mapping proxy would not survive.
+                provenance=None if provenance is None else dict(provenance),
             )
         )
         if isinstance(tools, (str, bytes)) or not isinstance(tools, Sequence):

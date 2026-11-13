@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import MINYEAR, datetime, timezone
 from typing import Any, Collection, List, Optional
 
 from .core import MemoryNote, MemoryResponse
@@ -21,17 +21,33 @@ def comparable_timestamp(value: Any) -> Any:
     date query params with an offset into aware datetimes). Comparing naive
     with aware raises ``TypeError``, which the stores' outer exception
     handlers would swallow into a silently empty result, and sorting a mixed
-    list raises outright. Naive datetimes are therefore interpreted as
-    server-local time -- what the legacy ``datetime.now`` default wrote -- and
-    every datetime is converted to aware UTC; non-datetime values pass through
-    unchanged.
+    list raises outright. Every datetime is therefore converted to aware UTC;
+    non-datetime values pass through unchanged.
+
+    Legacy assumption: a naive datetime is interpreted in the *current*
+    process timezone, because that is what the old ``datetime.now`` default
+    wrote. This is only exact while the server's timezone has not changed
+    since the legacy rows were written; if it has, those rows are shifted by
+    the difference. Nothing stored records the original zone, so this cannot
+    be corrected after the fact.
+
+    A value within a day of ``datetime.min``/``datetime.max`` (e.g. an
+    open-ended ``date_from=0001-01-01`` filter) cannot be shifted to UTC
+    without leaving the representable range; it is clamped to the matching
+    UTC bound instead of raising, so the filter still means "unbounded"
+    rather than failing the whole request.
 
     Shared by every ``MemoryStore`` implementation's filter dispatch and
     newest-first ordering so the stores cannot drift apart on this policy.
     """
-    if isinstance(value, datetime):
+    if not isinstance(value, datetime):
+        return value
+    try:
         return value.astimezone(timezone.utc)
-    return value
+    except (OverflowError, ValueError):
+        # Only years 1 and 9999 can overflow, so the year picks the bound.
+        bound = datetime.min if value.year == MINYEAR else datetime.max
+        return bound.replace(tzinfo=timezone.utc)
 
 
 class MemoryStore(ABC):

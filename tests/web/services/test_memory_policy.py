@@ -887,6 +887,7 @@ def test_resolver_without_provenance_keeps_builtin_memory_tool_path(
 
 def test_resolver_provenance_carrying_text_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     get_memory_store = Mock(name="get-memory-store")
     monkeypatch.setattr(agent_runtime_service, "get_memory_store", get_memory_store)
@@ -898,8 +899,14 @@ def test_resolver_provenance_carrying_text_fails_closed(
         )
     )
 
-    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+    with caplog.at_level("WARNING"):
+        policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
 
+    # The failure is diagnosable (names the key and grammar) without echoing
+    # the rejected value, which may be conversation content.
+    assert "ValueError" in caplog.text
+    assert "memory provenance value for 'channel_id'" in caplog.text
+    assert "please remember my password" not in caplog.text
     assert isinstance(policy.memory, InMemoryMemoryStore)
     assert policy.memory_enabled is False
     assert policy.memory_available is False
@@ -937,8 +944,107 @@ def test_binding_tool_factory_receives_policy_provenance() -> None:
     )
 
     [request] = seen
-    assert request.provenance is not None
-    assert dict(request.provenance) == {"channel_kind": "dm", "channel_id": "D7"}
+    # A plain dict copy, so host factories can serialize or keep it.
+    assert type(request.provenance) is dict
+    assert request.provenance == {"channel_kind": "dm", "channel_id": "D7"}
+
+
+@pytest.mark.asyncio
+async def test_binding_without_tool_factory_binds_provenance_to_default_tools() -> None:
+    store = InMemoryMemoryStore()
+    set_trusted_memory_binding_resolver(
+        lambda _request: MemoryStoreBinding(
+            store=store,
+            backend_identity="backend-a",
+            route_generation="route-1",
+        )
+    )
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance={"channel_kind": "dm", "channel_id": "D7"},
+        )
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory is store
+    assert policy.memory_tools_factory is not None
+    tools = policy.memory_tools_factory(
+        memory_store=policy.memory, task="t", runtime=None, context=None
+    )
+    assert [tool.name for tool in tools] == [
+        "store_memory",
+        "search_memory",
+        "update_memory",
+        "delete_memory",
+    ]
+    result = await tools[0].execute(content="User prefers short answers.")
+    assert store.get(result["memory_id"]).content.metadata["provenance"] == {
+        "channel_kind": "dm",
+        "channel_id": "D7",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cached_service_picks_up_and_drops_provenance_across_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryMemoryStore()
+    monkeypatch.setattr(
+        agent_runtime_service, "get_memory_store", Mock(return_value=store)
+    )
+    turn_provenance: dict[str, Any] = {"value": {"channel_id": "C1"}}
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance=turn_provenance["value"],
+        )
+    )
+    service = AgentService(
+        name="cached",
+        id="web_task_17",
+        tools=[],
+        enable_workspace=False,
+        memory=InMemoryMemoryStore(),
+    )
+    service._execution_adapter = service._build_execution_adapter()
+    manager = agent_runtime_service.AgentServiceManager()
+    manager._agents[17] = service
+
+    async def reconcile() -> None:
+        await manager._reconcile_cached_agent_memory_policy(
+            17,
+            task=_task(),
+            agent_config={},
+            ambient_owner_user_id=23,
+            ambient_execution_scope=None,
+        )
+
+    def store_tool_provenance() -> dict[str, str] | None:
+        factory = service.memory_tools_factory
+        assert service._execution_adapter.config.memory_tools_factory is factory
+        if factory is None:
+            return None
+        [store_tool, *_] = factory(
+            memory_store=store, task="t", runtime=None, context=None
+        )
+        return dict(store_tool.provenance)
+
+    await reconcile()
+    assert store_tool_provenance() == {"channel_id": "C1"}
+
+    # A later turn without provenance falls back to the built-in tool path.
+    turn_provenance["value"] = None
+    await reconcile()
+    assert store_tool_provenance() is None
+
+    # And a turn from another channel picks up that channel's provenance.
+    turn_provenance["value"] = {"channel_id": "D2"}
+    await reconcile()
+    assert store_tool_provenance() == {"channel_id": "D2"}
 
 
 def test_resolver_receives_none_for_missing_or_nonprimitive_task_fields() -> None:

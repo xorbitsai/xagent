@@ -27,6 +27,7 @@ def test_validate_memory_provenance_returns_frozen_copy() -> None:
         "D0123ABCD",  # Slack DM
         "G0123ABCD",  # Slack group DM / private channel
         "19:abcDEF0123@thread.tacv2",  # Teams channel conversation
+        "19:abcDEF0123@thread.tacv2;messageid=1700000000000",  # Teams thread
         "a:1Xyz-AbC_dEf+gh/ij=",  # Teams personal conversation
         "oc_5ad11d72b830411d72b836c20",  # Feishu chat
         "42",  # task id

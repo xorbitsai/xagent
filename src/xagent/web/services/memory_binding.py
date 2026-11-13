@@ -110,8 +110,9 @@ class MemoryToolAssemblyRequest:
     perform blocking I/O. Core copies the returned sequence before adding
     run-local tools and marks the context for memory-usage guidance.
 
-    ``provenance`` is the task's validated ``MemoryPolicyDecision``
-    provenance (``None`` when the policy resolver supplied none). A factory
+    ``provenance`` is a plain-dict copy of the task's validated
+    ``MemoryPolicyDecision`` provenance (``None`` when the policy resolver
+    supplied none). A factory
     that builds its own ``store_memory`` tool should forward it so notes carry
     the same provenance as the default tool set.
     """

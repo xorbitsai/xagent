@@ -340,7 +340,13 @@ class UpdateMemoryArgs(BaseModel):
 
 
 class UpdateMemoryTool:
-    """Execution-scoped ``update_memory`` tool bound to a memory store."""
+    """Execution-scoped ``update_memory`` tool bound to a memory store.
+
+    Only the content changes: the note keeps its metadata, including any
+    ``provenance``. Provenance records where a memory was *originally learned*
+    and is deliberately not re-stamped with the updating run's channel, so a
+    correction made elsewhere never relabels the memory's origin.
+    """
 
     name = UPDATE_MEMORY_TOOL_NAME
     description = (

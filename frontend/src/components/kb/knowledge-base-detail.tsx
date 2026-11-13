@@ -13,7 +13,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES, uploadWithCollectionMigrationRetry } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import {
   getBackgroundJobFailureMessage,
@@ -162,6 +162,15 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [ingestionResults, setIngestionResults] = useState<IngestionResult[]>([])
   const [currentUploadFileName, setCurrentUploadFileName] = useState<string | null>(null)
   const [completedUploadCount, setCompletedUploadCount] = useState(0)
+  const uploadAbortRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      uploadAbortRef.current?.abort()
+    }
+  }, [])
   const [isAddSourceOpen, setIsAddSourceOpen] = useState(false)
   const [activeAddSourceMode, setActiveAddSourceMode] = useState<"web" | "file" | null>(null)
   const [isDragging, setIsDragging] = useState(false)
@@ -214,6 +223,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
   const [isWebIngesting, setIsWebIngesting] = useState(false)
   const [webIngestionProgress, setWebIngestionProgress] = useState(0)
   const [webIngestionResult, setWebIngestionResult] = useState<WebIngestionResult | null>(null)
+  const [webIngestionNotice, setWebIngestionNotice] = useState<string | null>(null)
   const [webIngestionConfig, setWebIngestionConfig] = useState({
     start_url: "",
     max_pages: 100,
@@ -405,8 +415,16 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setSelectedFiles(prev => prev.filter((_, i) => i !== index))
   }
 
+  const beginAbortableUpload = () => {
+    uploadAbortRef.current?.abort()
+    const controller = new AbortController()
+    uploadAbortRef.current = controller
+    return controller
+  }
+
   const doUpload = async () => {
     if (selectedFiles.length === 0) return
+    const controller = beginAbortableUpload()
 
     setIsUploading(true)
     setUploadProgress(0)
@@ -430,13 +448,17 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
           normalizeIngestionConfigForFilename(ingestionConfig, file.name)
         )
 
-        const response = await apiRequest(
+        const response = await uploadWithCollectionMigrationRetry(
           `${apiUrl}/api/kb/ingest${useBackgroundJobs ? "/jobs" : ""}`,
           {
             method: "POST",
             body: formData
-          }
+          },
+          () => setUploadProgressDetail(t("kb.migration.upgrading")),
+          controller.signal
         )
+        setUploadProgressDetail(null)
+        if (controller.signal.aborted) return
 
         const parsed = await parseApiResponse(response)
 
@@ -533,9 +555,11 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         description: toastContent.description,
       })
     } finally {
-      setIsUploading(false)
-      setCurrentUploadFileName(null)
-      setUploadProgressDetail(null)
+      if (mountedRef.current) {
+        setIsUploading(false)
+        setCurrentUploadFileName(null)
+        setUploadProgressDetail(null)
+      }
     }
   }
 
@@ -599,6 +623,8 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
     setIsWebIngesting(true)
     setWebIngestionProgress(0)
     setWebIngestionResult(null)
+    setWebIngestionNotice(null)
+    const controller = beginAbortableUpload()
 
     try {
       const apiUrl = getApiUrl()
@@ -632,13 +658,17 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
 
       setWebIngestionProgress(10)
 
-      const response = await apiRequest(
+      const response = await uploadWithCollectionMigrationRetry(
         `${apiUrl}/api/kb/ingest-web${useBackgroundJobs ? "/jobs" : ""}`,
         {
           method: "POST",
           body: formData
-        }
+        },
+        () => setWebIngestionNotice(t("kb.migration.upgrading")),
+        controller.signal
       )
+      setWebIngestionNotice(null)
+      if (controller.signal.aborted) return
 
       const parsed = await parseApiResponse(response)
 
@@ -730,8 +760,10 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
         description: toastContent.description,
       })
     } finally {
-      setIsWebIngesting(false)
-      setWebIngestionProgress(0)
+      if (mountedRef.current) {
+        setIsWebIngesting(false)
+        setWebIngestionProgress(0)
+      }
     }
   }
 
@@ -1568,7 +1600,7 @@ export function KnowledgeBaseDetailContent({ collectionName }: { collectionName:
                       {isWebIngesting ? (
                          <div className="flex items-center gap-2">
                             <Loader2 className="h-4 w-4 animate-spin" />
-                            {t("kb.dialog.webImport.status.crawling")} ({Math.round(webIngestionProgress)}%)
+                            {webIngestionNotice || t("kb.dialog.webImport.status.crawling")} ({Math.round(webIngestionProgress)}%)
                          </div>
                       ) : (
                          t("kb.index.startImport")

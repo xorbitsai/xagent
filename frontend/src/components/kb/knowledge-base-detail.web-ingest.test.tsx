@@ -7,6 +7,7 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
+  uploadWithCollectionMigrationRetry: apiRequestMock,
   parseApiResponse: async (response: { json: () => Promise<unknown> }) => ({
     data: await response.json(),
     text: null,
@@ -289,6 +290,94 @@ describe("KnowledgeBaseDetailContent web ingest", () => {
       "kb.errors.nameUnavailable",
       expect.anything()
     )
+  })
+
+  it("clears the upgrading notice once a retried web import is accepted", async () => {
+    const previous = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation(
+      (url: string, options?: RequestInit, onUpgrading?: () => void) => {
+        if (url === "http://api.local/api/kb/ingest-web/jobs") {
+          onUpgrading?.()
+          return Promise.resolve(
+            createJsonResponse({
+              id: "job-2",
+              user_id: 1,
+              job_type: "kb.ingest.web",
+              queue: "kb",
+              status: "running",
+              progress: { message: "Crawling", completed: 0, total: 1 },
+              result: null,
+              error_message: null,
+              celery_task_id: "task-2",
+              attempts: 1,
+              max_attempts: 3,
+            })
+          )
+        }
+        if (url === "http://api.local/api/jobs/job-2") {
+          return new Promise(() => {})
+        }
+        return previous(url, options)
+      }
+    )
+
+    render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.detail.files.addSource")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.detail.files.addSource"))
+    fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+    fireEvent.change(screen.getByLabelText("kb.dialog.webImport.basic.startUrl *"), {
+      target: { value: "https://example.com/docs" },
+    })
+    fireEvent.click(screen.getByText("kb.index.startImport"))
+
+    await waitFor(() => {
+      expect(
+        apiRequestMock.mock.calls.some(
+          ([url]) => url === "http://api.local/api/jobs/job-2"
+        )
+      ).toBe(true)
+    }, { timeout: 5000 })
+    expect(screen.queryByText(/kb\.migration\.upgrading/)).toBeNull()
+  })
+
+  it("aborts the pending upload retry when the page unmounts", async () => {
+    const previous = apiRequestMock.getMockImplementation()!
+    let signal: AbortSignal | undefined
+    apiRequestMock.mockImplementation(
+      (
+        url: string,
+        options?: RequestInit,
+        _onUpgrading?: () => void,
+        captured?: AbortSignal
+      ) => {
+        if (url === "http://api.local/api/kb/ingest-web/jobs") {
+          signal = captured
+          return new Promise(() => {})
+        }
+        return previous(url, options)
+      }
+    )
+
+    const { unmount } = render(<KnowledgeBaseDetailContent collectionName="demo" />)
+
+    await waitFor(() => {
+      expect(screen.getByText("kb.detail.files.addSource")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText("kb.detail.files.addSource"))
+    fireEvent.click(screen.getByText("kb.dialog.tabs.web"))
+    fireEvent.change(screen.getByLabelText("kb.dialog.webImport.basic.startUrl *"), {
+      target: { value: "https://example.com/docs" },
+    })
+    fireEvent.click(screen.getByText("kb.index.startImport"))
+
+    await waitFor(() => expect(signal).toBeDefined())
+    unmount()
+    expect(signal?.aborted).toBe(true)
   })
 })
 

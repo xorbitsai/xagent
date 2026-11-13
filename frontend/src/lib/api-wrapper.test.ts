@@ -5,8 +5,12 @@ import {
   classifyUploadError,
   getApiErrorMessage,
   getUploadErrorMessage,
+  KB_COLLECTION_MIGRATING_CODE,
+  KB_MIGRATION_RETRY_DELAY_MS,
+  KB_MIGRATION_RETRY_LIMIT,
   parseApiResponse,
   refreshStoredAccessToken,
+  uploadWithCollectionMigrationRetry,
 } from "@/lib/api-wrapper"
 import {
   AUTH_CACHE_KEY,
@@ -257,6 +261,283 @@ describe("api-wrapper API error helpers", () => {
     }, "Request failed")
 
     expect(message).toBe("Startup file storage sync failed")
+  })
+})
+
+describe("api-wrapper collection migration retry", () => {
+  function migratingResponse(retryAfterSeconds?: number): Response {
+    const headers: Record<string, string> = { "Content-Type": "application/json" }
+    if (retryAfterSeconds !== undefined) headers["Retry-After"] = String(retryAfterSeconds)
+    return new Response(JSON.stringify({
+      detail: {
+        code: KB_COLLECTION_MIGRATING_CODE,
+        message: "Knowledge base is being upgraded",
+      },
+    }), { status: 409, headers })
+  }
+
+  function successResponse(): Response {
+    return new Response(JSON.stringify({ status: "success" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  }
+
+  it("reads the structured detail message for uploads", async () => {
+    const response = migratingResponse()
+    const parsed = await parseApiResponse(response)
+
+    expect(getUploadErrorMessage(response, parsed, MESSAGES)).toBe(
+      "Knowledge base is being upgraded",
+    )
+  })
+
+  it("retries an upload refused while the collection is frozen", async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(5))
+        .mockResolvedValueOnce(successResponse())
+      const onUpgrading = vi.fn()
+
+      const options = { method: "POST", body: new FormData() }
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        options,
+        onUpgrading,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      // The server's Retry-After paces the retry; the default gap is not used.
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+
+      const response = await pending
+      expect(response.status).toBe(200)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(onUpgrading).toHaveBeenCalledTimes(1)
+      const [retriedUrl, retriedOptions] = fetchMock.mock.calls[1]
+      expect(retriedUrl).toBe("/api/kb/ingest/jobs")
+      expect(retriedOptions?.method).toBe("POST")
+      expect(retriedOptions?.body).toBe(options.body)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("gives up after the retry limit and returns the refusal", async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.spyOn(globalThis, "fetch")
+      for (let i = 0; i < KB_MIGRATION_RETRY_LIMIT + 1; i++) {
+        fetchMock.mockResolvedValueOnce(migratingResponse())
+      }
+      const onUpgrading = vi.fn()
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+        onUpgrading,
+      )
+      for (let i = 0; i < KB_MIGRATION_RETRY_LIMIT; i++) {
+        await vi.advanceTimersByTimeAsync(KB_MIGRATION_RETRY_DELAY_MS)
+      }
+
+      const response = await pending
+      expect(response.status).toBe(409)
+      expect(fetchMock).toHaveBeenCalledTimes(KB_MIGRATION_RETRY_LIMIT + 1)
+      expect(onUpgrading).toHaveBeenCalledTimes(KB_MIGRATION_RETRY_LIMIT)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("stops retrying when another sign-in replaces the initiating session", async () => {
+    vi.useFakeTimers()
+    try {
+      writeAuthCache({ id: "1", username: "alice" }, "token-a")
+      const fetchMock = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(5))
+      const onUpgrading = vi.fn()
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+        onUpgrading,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      writeAuthCache({ id: "2", username: "bob" }, "token-b")
+      await vi.advanceTimersByTimeAsync(5_000)
+
+      const response = await pending
+      expect(response.status).toBe(409)
+      // A's body must never be resent with B's session.
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(onUpgrading).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("stops retrying when the signal aborts during the wait", async () => {
+    vi.useFakeTimers()
+    try {
+      writeAuthCache({ id: "1", username: "alice" }, "token-a")
+      const controller = new AbortController()
+      const fetchMock = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(15))
+      const onUpgrading = vi.fn()
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+        onUpgrading,
+        controller.signal,
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(0)
+
+      const response = await pending
+      expect(response.status).toBe(409)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(onUpgrading).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("sends no request at all when the signal is already aborted", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+
+    const response = await uploadWithCollectionMigrationRetry(
+      "/api/kb/ingest/jobs",
+      { method: "POST", body: new FormData() },
+      undefined,
+      controller.signal,
+    )
+
+    expect(response.status).toBe(409)
+    expect(fetchMock).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
+  })
+
+  it("sends the credential from the snapshot it checked, not a later storage read", async () => {
+    writeAuthCache({ id: "1", username: "alice" }, "token-a")
+    const cacheA = localStorage.getItem(AUTH_CACHE_KEY)
+    writeAuthCache({ id: "2", username: "bob" }, "token-b")
+    const cacheB = localStorage.getItem(AUTH_CACHE_KEY)
+    if (!cacheA || !cacheB) throw new Error("auth cache missing")
+    localStorage.setItem(AUTH_CACHE_KEY, cacheA)
+
+    const originalGetItem = window.localStorage.getItem.bind(window.localStorage)
+    let authReads = 0
+    vi.spyOn(window.localStorage, "getItem").mockImplementation((key: string) => {
+      if (key === AUTH_CACHE_KEY) {
+        authReads += 1
+        // The storage probe plus the snapshot read are one logical read; any
+        // further read would pick up the other tab's session.
+        return authReads <= 2 ? cacheA : cacheB
+      }
+      return originalGetItem(key)
+    })
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(successResponse())
+
+    const response = await uploadWithCollectionMigrationRetry(
+      "/api/kb/ingest/jobs",
+      { method: "POST", body: new FormData() },
+    )
+
+    expect(response.status).toBe(200)
+    expect(authReads).toBe(2)
+    const headers = fetchMock.mock.calls[0][1]?.headers as Record<string, string>
+    expect(headers.Authorization).toBe("Bearer token-a")
+    vi.restoreAllMocks()
+  })
+
+  it("keeps retrying after a credential refresh within the initiating session", async () => {
+    vi.useFakeTimers()
+    try {
+      writeAuthCache({ id: "1", username: "alice" }, "token-a")
+      const cached = readAuthCache()
+      if (!cached) throw new Error("auth cache missing")
+      const fetchMock = vi.spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(migratingResponse(5))
+        .mockResolvedValueOnce(successResponse())
+
+      const pending = uploadWithCollectionMigrationRetry(
+        "/api/kb/ingest/jobs",
+        { method: "POST", body: new FormData() },
+      )
+      await vi.advanceTimersByTimeAsync(0)
+      localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+        ...cached,
+        credentialRevision: cached.credentialRevision + 1,
+        token: "token-a-refreshed",
+      }))
+      await vi.advanceTimersByTimeAsync(5_000)
+
+      const response = await pending
+      expect(response.status).toBe(200)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+      vi.restoreAllMocks()
+    }
+  })
+
+  it("does not retry a 409 that is not a migration refusal", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        detail: { code: "kb_admission_conflict", message: "Another upload is in progress" },
+      }), { status: 409, headers: { "Content-Type": "application/json" } }))
+    const onUpgrading = vi.fn()
+
+    const response = await uploadWithCollectionMigrationRetry(
+      "/api/kb/ingest/jobs",
+      { method: "POST", body: new FormData() },
+      onUpgrading,
+    )
+
+    expect(response.status).toBe(409)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(onUpgrading).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
+  })
+
+  it("does not retry a 409 whose body is not parseable JSON", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response("<html>upstream</html>", {
+        status: 409,
+        headers: { "Content-Type": "text/html" },
+      }),
+    )
+    const onUpgrading = vi.fn()
+
+    const response = await uploadWithCollectionMigrationRetry(
+      "/api/kb/ingest/jobs",
+      { method: "POST", body: new FormData() },
+      onUpgrading,
+    )
+
+    expect(response.status).toBe(409)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(onUpgrading).not.toHaveBeenCalled()
+    vi.restoreAllMocks()
   })
 })
 

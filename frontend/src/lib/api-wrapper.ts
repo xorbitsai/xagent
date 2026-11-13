@@ -11,6 +11,7 @@ import {
   type AuthMutationUnavailableReason,
   clearAuthSessionIfCurrent,
   compareAuthSession, compareCredentialSession,
+  compareAuthSessionLineage,
   commitAuthSessionRefresh,
   getAuthStorageAvailability,
   isSafeAuthExpirySeconds,
@@ -148,8 +149,12 @@ function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
 /** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
-export async function apiRequest(url: string, options: RequestInit = {}): Promise<Response> {
-  const session = readAuthSessionSnapshot()
+export async function apiRequest(
+  url: string,
+  options: RequestInit = {},
+  capturedSession?: AuthSessionSnapshot,
+): Promise<Response> {
+  const session = capturedSession ?? readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
   const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
   if (response.status !== 401 || shouldSkipRefresh(url)) return response
@@ -208,10 +213,68 @@ export function getUploadErrorMessage(response: Response, parsed: ParsedApiRespo
       .filter(Boolean)
     if (validationMessages.length) return validationMessages.join("; ")
   }
+  if (isJsonRecord(parsed.data) && isJsonRecord(parsed.data.detail) && typeof parsed.data.detail.message === "string" && parsed.data.detail.message.trim()) return parsed.data.detail.message
   if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) return parsed.data.message
   if (response.status === 413) return messages.tooLarge
   if (parsed.isHtml) return messages.proxy
   return parsed.text?.trim() ? truncateUploadMessage(parsed.text) : messages.generic
+}
+export const KB_COLLECTION_MIGRATING_CODE = "kb_collection_migrating"
+export const KB_MIGRATION_RETRY_LIMIT = 8
+export const KB_MIGRATION_RETRY_DELAY_MS = 10_000
+function isCollectionMigratingResponse(parsed: ParsedApiResponse): boolean {
+  return isJsonRecord(parsed.data) && isJsonRecord(parsed.data.detail)
+    && parsed.data.detail.code === KB_COLLECTION_MIGRATING_CODE
+}
+function isSameSessionLineage(captured: AuthSessionSnapshot, current: AuthSessionSnapshot): boolean {
+  return compareAuthSessionLineage(captured, current) === "same"
+}
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    if (signal?.aborted) { resolve(); return }
+    let timer: ReturnType<typeof setTimeout>
+    const done = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener("abort", done)
+      resolve()
+    }
+    timer = setTimeout(done, ms)
+    signal?.addEventListener("abort", done, { once: true })
+  })
+}
+/** Retries an upload refused while its collection is frozen, staying with the initiating user. */
+export async function uploadWithCollectionMigrationRetry(
+  url: string,
+  options: RequestInit,
+  onUpgrading?: () => void,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let initiatingSession: AuthSessionSnapshot | null = null
+  let boundToSession = false
+  let refusal = new Response(null, { status: 409 })
+  for (let attempt = 0; ; attempt += 1) {
+    if (signal?.aborted) return refusal
+    // One read per attempt: the checked snapshot is the one whose credential is sent.
+    const attemptSession = readAuthSessionSnapshot()
+    if (initiatingSession === null) {
+      initiatingSession = attemptSession
+      boundToSession = Boolean(attemptSession.sessionId)
+    } else if (boundToSession && !isSameSessionLineage(initiatingSession, attemptSession)) {
+      // Another tab may have signed in as someone else while this one waited.
+      return refusal
+    }
+    const response = await apiRequest(url, options, attemptSession)
+    if (response.status !== 409 || attempt >= KB_MIGRATION_RETRY_LIMIT) return response
+    if (!isCollectionMigratingResponse(await parseApiResponse(response.clone()))) return response
+    refusal = response
+    const retryAfterSeconds = Number.parseInt(response.headers.get("Retry-After") ?? "", 10)
+    const delayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? Math.min(retryAfterSeconds, 60) * 1000
+      : KB_MIGRATION_RETRY_DELAY_MS
+    if (signal?.aborted) return refusal
+    onUpgrading?.()
+    await waitForRetry(delayMs, signal)
+  }
 }
 export interface ClassifiedUploadError {
   errorCode: ClientErrorCode

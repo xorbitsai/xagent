@@ -4,11 +4,16 @@ import asyncio
 import hashlib
 import logging
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
+from ...config import (
+    get_kb_migration_defer_budget_seconds,
+    get_kb_migration_defer_delay_seconds,
+)
 from ...core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from ...core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
@@ -46,12 +51,19 @@ from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
 from ..services.kb_reference_protection import coordinate_ingest_job
 from ..services.quota_hooks import get_standalone_gate
 from ..tracking.standalone_usage import StandaloneUsageRefused, usage_scope
-from .exceptions import BackgroundJobHandlerError
+from .exceptions import BackgroundJobDeferred, BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
 logger = logging.getLogger(__name__)
 
 _SUPERSEDED_STAGED_INGEST_MESSAGE = "KB ingest job superseded by a newer upload"
+
+# created_at also covers queue wait and stale requeues, so it cannot anchor
+# the wait budget; a deferred job carries its first refusal here instead.
+_MIGRATION_DEFERRED_AT_KEY = "_migration_deferred_at"
+_MIGRATION_GIVE_UP_MESSAGE = (
+    "Gave up waiting for the knowledge base upgrade; please re-submit."
+)
 
 
 class StagedDocumentIngestSuperseded(RuntimeError):
@@ -65,6 +77,43 @@ def _get_api_compatibility_facade() -> KBApiCompatibilityFacade:
 def _payload_collection(db: Session, job: BackgroundJob) -> str | None:
     collection = dict(job.payload or {}).get("collection")
     return str(collection) if collection is not None else None
+
+
+def _defer_collection_migration(
+    db: Session, job: BackgroundJob, exc: CollectionMigratingError
+) -> BackgroundJobDeferred | None:
+    now = datetime.now(timezone.utc)
+    payload = dict(job.payload or {})
+    first_deferral = payload.get(_MIGRATION_DEFERRED_AT_KEY)
+    if first_deferral is None:
+        first_at = now
+        payload[_MIGRATION_DEFERRED_AT_KEY] = first_at.isoformat()
+        setattr(job, "payload", payload)
+        db.add(job)
+        db.commit()
+    else:
+        first_at = datetime.fromisoformat(str(first_deferral))
+        if first_at.tzinfo is None:
+            first_at = first_at.replace(tzinfo=timezone.utc)
+    remaining = get_kb_migration_defer_budget_seconds() - int(
+        (now - first_at).total_seconds()
+    )
+    if remaining <= 0:
+        return None
+    return BackgroundJobDeferred(
+        str(exc),
+        delay_seconds=min(get_kb_migration_defer_delay_seconds(), remaining),
+    )
+
+
+def _clear_migration_deferral(db: Session, job: BackgroundJob) -> None:
+    payload = dict(job.payload or {})
+    if _MIGRATION_DEFERRED_AT_KEY not in payload:
+        return
+    payload.pop(_MIGRATION_DEFERRED_AT_KEY)
+    setattr(job, "payload", payload)
+    db.add(job)
+    db.commit()
 
 
 def _collection_existed_before(payload: dict[str, Any]) -> bool:
@@ -252,13 +301,18 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
     # Before model resolution, which rewrites the collection's metadata row, and
-    # outside the try: a job refused here was never admitted and must not compensate.
+    # outside the try: a refused job never compensates, only a give-up cleans up.
     try:
         ensure_collection_writable(str(payload["collection"]))
-    except CollectionMigratingError:
-        if int(job.attempts or 0) >= int(job.max_attempts or 1):
-            _cleanup_staged_document_input(payload)
-        raise
+    except CollectionMigratingError as exc:
+        deferred = _defer_collection_migration(db, job, exc)
+        if deferred is not None:
+            raise deferred from exc
+        _cleanup_staged_document_input(payload)
+        raise BackgroundJobHandlerError(
+            _MIGRATION_GIVE_UP_MESSAGE, retryable=False
+        ) from exc
+    _clear_migration_deferral(db, job)
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         # Billed to the member who submitted the job (the job's owner), not
@@ -447,7 +501,16 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
             db_session.close()
 
     update_job_progress(db, job, message="Crawling website")
-    ensure_collection_writable(collection)
+    try:
+        ensure_collection_writable(collection)
+    except CollectionMigratingError as exc:
+        deferred = _defer_collection_migration(db, job, exc)
+        if deferred is not None:
+            raise deferred from exc
+        raise BackgroundJobHandlerError(
+            _MIGRATION_GIVE_UP_MESSAGE, retryable=False
+        ) from exc
+    _clear_migration_deferral(db, job)
     try:
         model_pin, model_ids = _resolve_job_ingestion_models(payload, ingestion_config)
         with (

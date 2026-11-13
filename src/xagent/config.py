@@ -250,6 +250,8 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+KB_MIGRATION_DEFER_DELAY_SECONDS = "XAGENT_KB_MIGRATION_DEFER_DELAY_SECONDS"
+KB_MIGRATION_DEFER_BUDGET_SECONDS = "XAGENT_KB_MIGRATION_DEFER_BUDGET_SECONDS"
 KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
 KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
@@ -1866,6 +1868,16 @@ def get_background_job_sweep_interval_seconds() -> int:
         300,
         minimum=30,
     )
+
+
+def get_kb_migration_defer_delay_seconds() -> int:
+    """Return how long an ingest job waits before retrying a frozen collection."""
+    return _get_positive_int_env(KB_MIGRATION_DEFER_DELAY_SECONDS, 15)
+
+
+def get_kb_migration_defer_budget_seconds() -> int:
+    """Return the longest an ingest job defers for a collection migration."""
+    return _get_positive_int_env(KB_MIGRATION_DEFER_BUDGET_SECONDS, 10 * 60)
 
 
 def get_kb_milvus_cleanup_interval_seconds() -> int:

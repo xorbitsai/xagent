@@ -1630,6 +1630,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The upload retry loop paces itself by this hint across origins.
+    expose_headers=["Retry-After"],
 )
 app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")

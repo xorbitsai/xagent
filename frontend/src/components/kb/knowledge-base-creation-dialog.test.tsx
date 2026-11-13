@@ -14,6 +14,7 @@ vi.mock("@/contexts/auth-context", () => ({
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
+  uploadWithCollectionMigrationRetry: apiRequestMock,
   parseApiResponse: async (response: { json: () => Promise<unknown> }) => ({
     data: await response.json(),
     text: null,
@@ -621,6 +622,8 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
       expect(apiRequestMock).toHaveBeenCalledWith(
         "http://api.local/api/kb/ingest-cloud",
         expect.any(Object),
+        expect.any(Function),
+        expect.any(Object),
       )
     })
     const cloudCall = apiRequestMock.mock.calls.find(
@@ -706,6 +709,56 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
     } finally {
       consoleErrorSpy.mockRestore()
     }
+  })
+
+  it("clears the upgrading notice once a retried web import is accepted", async () => {
+    const base = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation(
+      (url: string, options?: RequestInit, onUpgrading?: () => void) => {
+        if (url === "http://api.local/api/kb/ingest-web/jobs") {
+          onUpgrading?.()
+          return Promise.resolve(
+            createJsonResponse({
+              id: "job-2",
+              user_id: 1,
+              job_type: "kb.ingest.web",
+              queue: "kb",
+              status: "running",
+              progress: { message: "Crawling", completed: 0, total: 1 },
+              result: null,
+              error_message: null,
+              celery_task_id: "task-2",
+              attempts: 1,
+              max_attempts: 3,
+            })
+          )
+        }
+        if (url === "http://api.local/api/jobs/job-2") {
+          return new Promise(() => {})
+        }
+        return base(url, options)
+      }
+    )
+
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "web_collection" },
+    })
+
+    await goToStep3(container, "web")
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(
+        apiRequestMock.mock.calls.some(
+          ([url]) => url === "http://api.local/api/jobs/job-2"
+        )
+      ).toBe(true)
+    }, { timeout: 5000 })
+    expect(screen.queryByText(/kb\.migration\.upgrading/)).toBeNull()
   })
 })
 

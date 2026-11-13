@@ -2120,3 +2120,590 @@ def test_kb_document_job_publishes_the_config_end_to_end(tmp_path, monkeypatch):
         assert '"chunk_size":1234' in saved_config
     finally:
         db.close()
+
+
+def _freeze_collection(monkeypatch) -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+
+    def refuse(_collection: str) -> None:
+        raise CollectionMigratingError("Knowledge base 'kb' is being upgraded")
+
+    monkeypatch.setattr("xagent.web.jobs.kb_tasks.ensure_collection_writable", refuse)
+
+
+def _backdate_created_at(db, job, *, seconds: int) -> None:
+    db.query(BackgroundJob).filter(BackgroundJob.id == job.id).update(
+        {"created_at": datetime.now(timezone.utc) - timedelta(seconds=seconds)},
+        synchronize_session=False,
+    )
+    db.commit()
+    db.expire_all()
+
+
+def test_kb_document_job_defers_while_collection_is_migrating(tmp_path, monkeypatch):
+    from xagent.web.jobs.exceptions import BackgroundJobDeferred
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        handle_kb_ingest_document,
+    )
+    from xagent.web.services.kb_ingest_targets import admit_kb_ingest_target
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    _freeze_collection(monkeypatch)
+
+    SessionLocal = _init_test_db(tmp_path / "kb-migration-defer.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-migration-defer")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged content", encoding="utf-8")
+        file_id = "22222222-2222-4222-8222-222222222222"
+        generation_id = "33333333-3333-4333-8333-333333333333"
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": file_id,
+                "generation_id": generation_id,
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+        admit_kb_ingest_target(
+            db,
+            user_id=int(user.id),
+            collection="kb",
+            target_path=str(target_file),
+            file_id=file_id,
+            generation_id=generation_id,
+            job_id=str(job.id),
+            file_sha256="0" * 64,
+        )
+        # Even on the last allowed attempt a deferral keeps the reservation:
+        # the job will run again, and the freeze is not the job's failure.
+        setattr(job, "attempts", int(job.max_attempts or 3))
+        db.commit()
+        db.refresh(job)
+        # A stale requeue can run a job hours after it was created; the wait
+        # budget must still start when the freeze is first hit, not at creation.
+        _backdate_created_at(db, job, seconds=2 * 3600)
+
+        releases: list[dict] = []
+        monkeypatch.setattr(
+            "xagent.web.services.kb_ingest_targets.release_kb_ingest_target_generation",
+            lambda *args, **kwargs: releases.append(kwargs) or True,
+        )
+        ingest_calls: list[dict] = []
+        monkeypatch.setattr(
+            "xagent.web.jobs.kb_tasks.run_document_ingestion",
+            lambda **kwargs: ingest_calls.append(kwargs),
+        )
+        cleaned_staging: list[object] = []
+        monkeypatch.setattr(
+            "xagent.web.api.kb._cleanup_background_ingest_staging_file",
+            lambda path: cleaned_staging.append(path),
+        )
+
+        with pytest.raises(BackgroundJobDeferred) as raised:
+            handle_kb_ingest_document(db, job)
+
+        assert raised.value.delay_seconds == 15
+        # A refused job reruns later: its staged input and reservation stay.
+        assert not cleaned_staging
+        assert not releases
+        assert not ingest_calls
+        assert staged_file.read_text(encoding="utf-8") == "staged content"
+        assert not target_file.exists()
+        db.refresh(job)
+        assert job.payload[_MIGRATION_DEFERRED_AT_KEY]
+    finally:
+        db.close()
+
+
+def test_kb_document_job_gives_up_when_migration_budget_is_spent(tmp_path, monkeypatch):
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        _MIGRATION_GIVE_UP_MESSAGE,
+        handle_kb_ingest_document,
+    )
+    from xagent.web.services.kb_ingest_targets import admit_kb_ingest_target
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    _freeze_collection(monkeypatch)
+
+    SessionLocal = _init_test_db(tmp_path / "kb-migration-give-up.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-migration-give-up")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged content", encoding="utf-8")
+        file_id = "44444444-4444-4444-8444-444444444444"
+        generation_id = "55555555-5555-4555-8555-555555555555"
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": file_id,
+                "generation_id": generation_id,
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+                _MIGRATION_DEFERRED_AT_KEY: (
+                    datetime.now(timezone.utc) - timedelta(minutes=11)
+                ).isoformat(),
+            },
+        )
+        admit_kb_ingest_target(
+            db,
+            user_id=int(user.id),
+            collection="kb",
+            target_path=str(target_file),
+            file_id=file_id,
+            generation_id=generation_id,
+            job_id=str(job.id),
+            file_sha256="0" * 64,
+        )
+        db.commit()
+
+        releases: list[dict] = []
+        monkeypatch.setattr(
+            "xagent.web.services.kb_ingest_targets.release_kb_ingest_target_generation",
+            lambda *args, **kwargs: releases.append(kwargs) or True,
+        )
+
+        with pytest.raises(BackgroundJobHandlerError) as raised:
+            handle_kb_ingest_document(db, job)
+
+        assert raised.value.retryable is False
+        assert str(raised.value) == _MIGRATION_GIVE_UP_MESSAGE
+        # Giving up follows the terminal path: staged input removed, reservation
+        # released so a later upload can take the target.
+        assert not staged_file.exists()
+        assert [call["generation_id"] for call in releases] == [generation_id]
+    finally:
+        db.close()
+
+
+def test_kb_web_job_defers_while_collection_is_migrating(tmp_path, monkeypatch):
+    from xagent.web.jobs.exceptions import BackgroundJobDeferred
+    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    _freeze_collection(monkeypatch)
+
+    SessionLocal = _init_test_db(tmp_path / "kb-web-migration-defer.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-web-migration-defer")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "web-kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": False,
+            },
+        )
+
+        with pytest.raises(BackgroundJobDeferred) as raised:
+            handle_kb_ingest_web(db, job)
+
+        assert raised.value.delay_seconds == 15
+    finally:
+        db.close()
+
+
+def test_execute_background_job_reschedules_a_deferred_job(tmp_path, monkeypatch):
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import BackgroundJobDeferred
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    job_type = "test.deferred_registered"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-deferred.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "registered-deferred")
+        job = create_background_job(
+            db, user_id=int(user.id), job_type=job_type, payload={}, max_attempts=3
+        )
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    def deferring_handler(_session, _job):
+        raise BackgroundJobDeferred(
+            "Knowledge base is being upgraded", delay_seconds=15
+        )
+
+    tasks_module.register_background_job_handler(job_type, deferring_handler)
+    rescheduled: list[dict] = []
+
+    def fake_apply_async(*, args, queue, countdown):
+        rescheduled.append({"args": args, "queue": queue, "countdown": countdown})
+        return MagicMock(id="deferred-task-id")
+
+    monkeypatch.setattr(
+        tasks_module.execute_background_job, "apply_async", fake_apply_async
+    )
+
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert outcome.result == {"status": "deferred"}
+    assert rescheduled == [{"args": [job_id], "queue": "default", "countdown": 15}]
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        assert refreshed.status == BackgroundJobStatus.ENQUEUED.value
+        # The deferral must not spend the job's retry budget.
+        assert refreshed.attempts == 0
+        assert refreshed.error_message is None
+        assert "upgraded" in refreshed.progress["message"]
+        assert refreshed.celery_task_id == "deferred-task-id"
+    finally:
+        verify_db.close()
+
+
+def test_deferred_job_keeps_its_retry_budget_for_real_failures(tmp_path, monkeypatch):
+    """A deferral returns the attempt, so a later real failure still retries."""
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import (
+        BackgroundJobDeferred,
+        BackgroundJobHandlerError,
+    )
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    job_type = "test.deferred_then_failing"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-deferred-budget.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "deferred-budget")
+        job = create_background_job(
+            db, user_id=int(user.id), job_type=job_type, payload={}, max_attempts=2
+        )
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    runs: list[int] = []
+
+    def handler(_session, _job):
+        runs.append(len(runs) + 1)
+        if len(runs) == 1:
+            raise BackgroundJobDeferred(
+                "Knowledge base is being upgraded", delay_seconds=15
+            )
+        raise BackgroundJobHandlerError("ingest failed", retryable=True)
+
+    tasks_module.register_background_job_handler(job_type, handler)
+    monkeypatch.setattr(
+        tasks_module.execute_background_job,
+        "apply_async",
+        lambda **_kwargs: MagicMock(id="deferred-task-id"),
+    )
+    retry_calls: list[dict] = []
+
+    def fake_retry(*_args, **kwargs):
+        retry_calls.append(kwargs)
+        return RuntimeError("retry requested")
+
+    monkeypatch.setattr(tasks_module.execute_background_job, "retry", fake_retry)
+
+    try:
+        tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+        tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert len(runs) == 2
+    assert len(retry_calls) == 1
+    assert retry_calls[0]["exc"].retryable is True
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        # The deferral spent nothing: the failed rerun is attempt 1 of 2.
+        assert refreshed.attempts == 1
+        assert refreshed.status == BackgroundJobStatus.ENQUEUED.value
+    finally:
+        verify_db.close()
+
+
+def test_deferred_job_survives_a_failed_reschedule(tmp_path, monkeypatch):
+    from xagent.web.jobs import tasks as tasks_module
+    from xagent.web.jobs.exceptions import BackgroundJobDeferred
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    job_type = "test.deferred_reschedule_failure"
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-deferred-broker-down.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, "deferred-broker-down")
+        job = create_background_job(
+            db, user_id=int(user.id), job_type=job_type, payload={}, max_attempts=3
+        )
+        job_id = str(job.id)
+    finally:
+        db.close()
+
+    def handler(_session, _job):
+        raise BackgroundJobDeferred(
+            "Knowledge base is being upgraded", delay_seconds=15
+        )
+
+    def failing_apply_async(**_kwargs):
+        raise RuntimeError("broker down")
+
+    tasks_module.register_background_job_handler(job_type, handler)
+    monkeypatch.setattr(
+        tasks_module.execute_background_job, "apply_async", failing_apply_async
+    )
+
+    try:
+        outcome = tasks_module.execute_background_job.apply(args=[job_id], throw=False)
+    finally:
+        tasks_module._EXTRA_HANDLERS.pop(job_type, None)
+
+    assert outcome.result == {"status": "deferred"}
+
+    verify_db = SessionLocal()
+    try:
+        refreshed = (
+            verify_db.query(BackgroundJob).filter(BackgroundJob.id == job_id).first()
+        )
+        assert refreshed is not None
+        # The row stays recoverable for the stale sweep instead of being failed.
+        assert refreshed.status == BackgroundJobStatus.ENQUEUED.value
+        assert refreshed.attempts == 0
+    finally:
+        verify_db.close()
+
+
+def test_admission_clears_the_migration_anchor_so_a_later_freeze_waits(
+    tmp_path, monkeypatch
+):
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+    from xagent.web.jobs.exceptions import BackgroundJobDeferred
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        handle_kb_ingest_document,
+    )
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    frozen = {"on": True}
+
+    def guard(_collection: str) -> None:
+        if frozen["on"]:
+            raise CollectionMigratingError("Knowledge base is being upgraded")
+
+    monkeypatch.setattr("xagent.web.jobs.kb_tasks.ensure_collection_writable", guard)
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks._save_job_collection_config_after_ingest",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks.run_document_ingestion",
+        lambda **kwargs: IngestionResult(
+            status="success",
+            doc_id="doc-1",
+            chunk_count=1,
+            message="ok",
+            completed_steps=[
+                {"name": "register_document", "metadata": {"created": True}}
+            ],
+        ),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "kb-anchor-cleared.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="kb-anchor-cleared")
+        staged_file = tmp_path / "stage" / "doc.txt"
+        target_file = tmp_path / "canonical" / "doc.txt"
+        staged_file.parent.mkdir(parents=True)
+        staged_file.write_text("staged content", encoding="utf-8")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload={
+                "collection": "kb",
+                "source_path": str(staged_file),
+                "target_path": str(target_file),
+                "file_id": "66666666-6666-4666-8666-666666666666",
+                "filename": "doc.txt",
+                "mime_type": "text/plain",
+                "file_size": staged_file.stat().st_size,
+                "user_id": int(user.id),
+                "is_admin": False,
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "collection_existed_before": True,
+            },
+        )
+
+        with pytest.raises(BackgroundJobDeferred):
+            handle_kb_ingest_document(db, job)
+        db.refresh(job)
+        assert job.payload[_MIGRATION_DEFERRED_AT_KEY]
+
+        # The first refusal happened long ago; if the anchor survived admission,
+        # the next freeze would give up instead of waiting.
+        payload = dict(job.payload)
+        payload[_MIGRATION_DEFERRED_AT_KEY] = (
+            datetime.now(timezone.utc) - timedelta(minutes=11)
+        ).isoformat()
+        setattr(job, "payload", payload)
+        db.commit()
+
+        frozen["on"] = False
+        handle_kb_ingest_document(db, job)
+        db.refresh(job)
+        assert _MIGRATION_DEFERRED_AT_KEY not in job.payload
+
+        frozen["on"] = True
+        with pytest.raises(BackgroundJobDeferred) as raised:
+            handle_kb_ingest_document(db, job)
+        assert raised.value.delay_seconds == 15
+    finally:
+        db.close()
+
+
+def test_kb_web_job_clears_the_anchor_once_admitted(tmp_path, monkeypatch):
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        handle_kb_ingest_web,
+    )
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    monkeypatch.setattr(
+        "xagent.web.jobs.kb_tasks._resolve_job_ingestion_models",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("stop after admission")
+        ),
+    )
+
+    SessionLocal = _init_test_db(tmp_path / "web-anchor-cleared.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-anchor-cleared")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "web-kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": False,
+                _MIGRATION_DEFERRED_AT_KEY: (
+                    datetime.now(timezone.utc) - timedelta(minutes=11)
+                ).isoformat(),
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="stop after admission"):
+            handle_kb_ingest_web(db, job)
+        db.refresh(job)
+        assert _MIGRATION_DEFERRED_AT_KEY not in job.payload
+    finally:
+        db.close()
+
+
+def test_kb_web_job_gives_up_with_a_terminal_message(tmp_path, monkeypatch):
+    from xagent.web.jobs.exceptions import BackgroundJobHandlerError
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        _MIGRATION_GIVE_UP_MESSAGE,
+        handle_kb_ingest_web,
+    )
+
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+    _freeze_collection(monkeypatch)
+
+    SessionLocal = _init_test_db(tmp_path / "web-give-up-message.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="web-give-up-message")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": "kb",
+                "crawl_config": WebCrawlConfig(
+                    start_url="https://example.com"
+                ).model_dump(mode="json"),
+                "ingestion_config": IngestionConfig().model_dump(mode="json"),
+                "user_id": int(user.id),
+                "is_admin": False,
+                "collection_existed_before": True,
+                _MIGRATION_DEFERRED_AT_KEY: (
+                    datetime.now(timezone.utc) - timedelta(minutes=11)
+                ).isoformat(),
+            },
+        )
+
+        with pytest.raises(BackgroundJobHandlerError) as raised:
+            handle_kb_ingest_web(db, job)
+
+        assert raised.value.retryable is False
+        assert str(raised.value) == _MIGRATION_GIVE_UP_MESSAGE
+    finally:
+        db.close()

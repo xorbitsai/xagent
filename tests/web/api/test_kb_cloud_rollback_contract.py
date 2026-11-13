@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -577,20 +578,27 @@ def test_staged_job_rollback_runs_inside_admission_after_mid_job_freeze(
     assert str(err) == "ingestion failed"
 
 
-@pytest.mark.parametrize("job_type", ["document", "web"])
+@pytest.mark.parametrize(
+    ("job_type", "give_up"),
+    [("document", False), ("document", True), ("web", False), ("web", True)],
+)
 def test_frozen_job_refuses_before_model_resolution(
-    test_env, tmp_path, monkeypatch, job_type
+    test_env, tmp_path, monkeypatch, job_type, give_up
 ) -> None:
-    from xagent.core.tools.core.RAG_tools.core.exceptions import (
-        CollectionMigratingError,
-    )
     from xagent.core.tools.core.RAG_tools.management.migration_state import (
         FROZEN,
         CollectionMigrationState,
         clear_migration_state,
         write_migration_state,
     )
-    from xagent.web.jobs.kb_tasks import handle_kb_ingest_web
+    from xagent.web.jobs.exceptions import (
+        BackgroundJobDeferred,
+        BackgroundJobHandlerError,
+    )
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        handle_kb_ingest_web,
+    )
 
     resolved: list[str] = []
     monkeypatch.setattr(
@@ -598,6 +606,9 @@ def test_frozen_job_refuses_before_model_resolution(
         lambda *a, **k: resolved.append("called"),
     )
     _, _, user, session_local = test_env
+    staged = tmp_path / "stage" / "doc.txt"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("staged", encoding="utf-8")
     payload: dict[str, Any] = {
         "collection": "existing-kb",
         "user_id": int(user.id),
@@ -605,8 +616,13 @@ def test_frozen_job_refuses_before_model_resolution(
         "ingestion_config": IngestionConfig().model_dump(mode="json"),
         "collection_existed_before": True,
     }
+    if give_up:
+        payload[_MIGRATION_DEFERRED_AT_KEY] = (
+            datetime.now(timezone.utc) - timedelta(minutes=11)
+        ).isoformat()
     if job_type == "document":
         handler, kind = handle_kb_ingest_document, BackgroundJobType.KB_INGEST_DOCUMENT
+        payload["source_path"] = str(staged)
         payload["target_path"] = str(tmp_path / "doc.txt")
     else:
         handler, kind = handle_kb_ingest_web, BackgroundJobType.KB_INGEST_WEB
@@ -617,24 +633,27 @@ def test_frozen_job_refuses_before_model_resolution(
         job = create_background_job(
             db, user_id=int(user.id), job_type=kind, payload=payload
         )
-        with pytest.raises(CollectionMigratingError):
+        expected_error = BackgroundJobHandlerError if give_up else BackgroundJobDeferred
+        with pytest.raises(expected_error) as raised:
             handler(db, job)
     finally:
         clear_migration_state("existing-kb")
         db.close()
 
     assert resolved == []
+    if give_up:
+        assert raised.value.retryable is False
+    if job_type == "document":
+        # Deferred keeps the staged copy; only giving up removes it.
+        assert staged.exists() is not give_up
 
 
 @pytest.mark.parametrize(
-    ("frozen", "final"), [(True, True), (True, False), (False, True)]
+    ("frozen", "give_up"), [(True, False), (True, True), (False, False)]
 )
 def test_final_attempt_refusal_does_not_compensate_an_existing_document(
-    test_env, tmp_path, monkeypatch, frozen, final
+    test_env, tmp_path, monkeypatch, frozen, give_up
 ) -> None:
-    from xagent.core.tools.core.RAG_tools.core.exceptions import (
-        CollectionMigratingError,
-    )
     from xagent.core.tools.core.RAG_tools.management.migration_state import (
         FROZEN,
         CollectionMigrationState,
@@ -647,6 +666,14 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
     )
     from xagent.core.tools.core.RAG_tools.utils.string_utils import (
         generate_deterministic_doc_id,
+    )
+    from xagent.web.jobs.exceptions import (
+        BackgroundJobDeferred,
+        BackgroundJobHandlerError,
+    )
+    from xagent.web.jobs.kb_tasks import (
+        _MIGRATION_DEFERRED_AT_KEY,
+        _MIGRATION_GIVE_UP_MESSAGE,
     )
 
     _, _, user, session_local = test_env
@@ -668,42 +695,58 @@ def test_final_attempt_refusal_does_not_compensate_an_existing_document(
     db = session_local()
     if frozen:
         write_migration_state("existing-kb", CollectionMigrationState(state=FROZEN))
+    payload: dict[str, Any] = {
+        "collection": "existing-kb",
+        "source_path": str(staged),
+        "target_path": str(tmp_path / "canonical" / "doc.txt"),
+        "file_id": file_id,
+        "filename": "doc.txt",
+        "user_id": int(user.id),
+        "is_admin": False,
+        "ingestion_config": IngestionConfig().model_dump(mode="json"),
+        "collection_existed_before": True,
+        "document_existed_before": True,
+    }
+    if give_up:
+        payload[_MIGRATION_DEFERRED_AT_KEY] = (
+            datetime.now(timezone.utc) - timedelta(minutes=11)
+        ).isoformat()
     try:
         job = create_background_job(
             db,
             user_id=int(user.id),
             job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
-            payload={
-                "collection": "existing-kb",
-                "source_path": str(staged),
-                "target_path": str(tmp_path / "canonical" / "doc.txt"),
-                "file_id": file_id,
-                "filename": "doc.txt",
-                "user_id": int(user.id),
-                "is_admin": False,
-                "ingestion_config": IngestionConfig().model_dump(mode="json"),
-                "collection_existed_before": True,
-                "document_existed_before": True,
-            },
+            payload=payload,
             max_attempts=2,
         )
-        job.attempts = 2 if final else 1
+        # Even the last allowed attempt is deferred while the budget holds: a
+        # freeze is not a failed attempt.
+        job.attempts = 2
+        if frozen and not give_up:
+            expected_error: type[Exception] = BackgroundJobDeferred
+        elif frozen:
+            expected_error = BackgroundJobHandlerError
+        else:
+            expected_error = RuntimeError
         with (
             patch(
                 "xagent.web.api.kb._rollback_failed_cloud_ingestion",
                 side_effect=_rollback,
             ),
-            pytest.raises(CollectionMigratingError if frozen else RuntimeError),
+            pytest.raises(expected_error) as raised,
         ):
             handle_kb_ingest_document(db, job)
     finally:
         clear_migration_state("existing-kb")
         db.close()
 
+    if frozen and give_up:
+        assert raised.value.retryable is False
+        assert str(raised.value) == _MIGRATION_GIVE_UP_MESSAGE
     # The unfrozen run is the positive control: this payload does reach compensation.
     assert compensated == ([] if frozen else ["existing-kb"])
-    # A retry still needs the staged copy; the last attempt must not leak it.
-    assert staged.exists() is not final
+    # A deferred job still needs the staged copy; giving up or failing does not.
+    assert staged.exists() is (frozen and not give_up)
     if frozen:
         rows = load_ingestion_status("existing-kb", doc_id, user_id=user.id)
         assert [r["status"] for r in rows] == ["success"]

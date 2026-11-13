@@ -16,7 +16,7 @@ import argparse
 import logging
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_candidates,
@@ -36,6 +36,7 @@ SKIP_NO_SOURCE_MODEL = "no-source-model"
 SKIP_NO_OWNER = "no-owner"
 SKIP_NO_DOC_ID = "no-doc-id"
 SKIP_NO_TEXT = "no-text"
+SKIP_LEGACY_SHADOWED = "legacy-table-shadowed"
 SKIP_NO_METADATA = "no-metadata"
 
 # A table without one of these turns rows into skips that acceptance then
@@ -131,6 +132,42 @@ def _legacy_table_name(model_id: str) -> Optional[str]:
     return legacy_embeddings_table_name(model_id)
 
 
+def writable_embeddings_table(model_id: str, conn: Optional[Any] = None) -> str:
+    """The table the writer will use, refusing to shadow a populated legacy one.
+
+    Search prefers the canonical name, so writing there while a legacy table
+    holds rows would hide those rows from every collection on this model. An
+    empty legacy table shadows nothing; a populated one must be migrated first.
+    """
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        embeddings_table_candidates,
+    )
+
+    conn = conn if conn is not None else connection()
+    canonical = embeddings_table_candidates(model_id)[0]
+    names = table_names(conn)
+    if canonical in names:
+        return canonical
+    legacy = _legacy_table_name(model_id)
+    if legacy and legacy != canonical and legacy in names:
+        if _row_count(conn, legacy) > 0:
+            raise MigrationCliError(
+                f"embeddings table '{legacy}' holds rows and the canonical "
+                f"'{canonical}' does not exist; writing the canonical table "
+                f"would hide those rows from search. Migrate {legacy} to "
+                f"{canonical} first."
+            )
+    return canonical
+
+
+def _row_count(conn: Any, table: str) -> int:
+    opened = conn.open_table(table)
+    try:
+        return int(opened.count_rows())
+    finally:
+        _safe_close_table(opened)
+
+
 def iter_rows(
     conn: Any,
     table: str,
@@ -217,11 +254,41 @@ def collection_engine(info: Any) -> str:
         return ""
 
 
+def iter_source_doc_ids(
+    collection: str, model_id: str, *, conn: Optional[Any] = None
+) -> Tuple[List[str], int]:
+    """The collection's document ids and the count of rows without one.
+
+    Chunk rows are not ordered by document, so a document is only complete
+    when read on its own; this lists what to read.
+    """
+    conn = conn if conn is not None else connection()
+    table = source_embeddings_table(model_id, conn)
+    if table is None:
+        return [], 0
+    require_columns(conn, table, collection)
+    ids: Set[str] = set()
+    unaddressable = 0
+    for row in iter_rows(
+        conn,
+        table,
+        collection_filter(collection),
+        ["doc_id", "chunk_id"],
+    ):
+        doc_id = str(row.get("doc_id") or "").strip()
+        if not doc_id or not str(row.get("chunk_id") or "").strip():
+            unaddressable += 1
+            continue
+        ids.add(doc_id)
+    return sorted(ids), unaddressable
+
+
 def iter_source_chunks(
     collection: str,
     model_id: str,
     *,
     conn: Optional[Any] = None,
+    doc_id: Optional[str] = None,
 ) -> Iterator[SearchableChunk]:
     """Every searchable chunk of ``collection`` under ``model_id``.
 
@@ -233,7 +300,10 @@ def iter_source_chunks(
     if table is None:
         return
     require_columns(conn, table, collection)
-    for row in iter_rows(conn, table, collection_filter(collection), CHUNK_COLUMNS):
+    where = collection_filter(collection)
+    if doc_id is not None:
+        where += f" AND doc_id = '{escape_lancedb_string(doc_id)}'"
+    for row in iter_rows(conn, table, where, CHUNK_COLUMNS):
         doc_id = str(row.get("doc_id") or "").strip()
         chunk_id = str(row.get("chunk_id") or "").strip()
         if not doc_id or not chunk_id:
@@ -309,8 +379,10 @@ def target_chunk_ids(
     """
     from xagent.migrations.embedding.embed import _validate_vector
 
+    # The table search selects: a legacy-named one is what the run must compare
+    # against, or a held row would be copied into a table nobody reads.
     conn = conn if conn is not None else connection()
-    table = embeddings_table(model_id, conn)
+    table = source_embeddings_table(model_id, conn)
     if table is None:
         return set()
     held: Set[str] = set()
@@ -390,10 +462,27 @@ def _team_collection_names(team_id: int) -> List[str]:
     return sorted({item.name for item in access if item.name})
 
 
+def resolve_target(model_id: str) -> Tuple[str, Optional[int]]:
+    """The target as embed will use it: canonical id and configured dimension.
+
+    An alias must not reach the held-row scan as a table-name candidate, and a
+    row can only be counted as held if it has the configured dimension.
+    """
+    from xagent.core.tools.core.RAG_tools.management.embedding_switch import (
+        resolve_configured_model,
+    )
+
+    canonical, dimension = resolve_configured_model(model_id)
+    return canonical, dimension
+
+
 def scope_collection(
     name: str, target_model_id: Optional[str] = None, *, conn: Optional[Any] = None
 ) -> CollectionScope:
     """Count what a migration would copy for one collection."""
+    target_dimension: Optional[int] = None
+    if target_model_id:
+        target_model_id, target_dimension = resolve_target(target_model_id)
     info = collection_info(name)
     item = CollectionScope(name=name, engine=collection_engine(info))
     if not item.engine:
@@ -409,7 +498,9 @@ def scope_collection(
 
     conn = conn if conn is not None else connection()
     have = (
-        target_chunk_ids(name, target_model_id, conn=conn) if target_model_id else set()
+        target_chunk_ids(name, target_model_id, conn=conn, dimension=target_dimension)
+        if target_model_id
+        else set()
     )
     documents: Set[str] = set()
     for chunk in iter_source_chunks(name, item.source_model_id, conn=conn):

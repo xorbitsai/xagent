@@ -19,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
@@ -32,6 +32,8 @@ from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
     write_vectors_to_db,
 )
 from xagent.migrations.embedding.scope import (
+    SKIP_LEGACY_SHADOWED,
+    SKIP_NO_DOC_ID,
     SKIP_NO_SOURCE_MODEL,
     SKIP_OTHER_ENGINE,
     SKIP_UNREADABLE_BINDING,
@@ -41,11 +43,14 @@ from xagent.migrations.embedding.scope import (
     collection_engine,
     collection_info,
     connection,
+    embeddings_table,
     iter_source_chunks,
+    iter_source_doc_ids,
     resolve_collection_names,
     skip_reason,
     source_model_id,
     target_chunk_ids,
+    writable_embeddings_table,
 )
 
 logger = logging.getLogger(__name__)
@@ -257,60 +262,77 @@ def embed_collection(
     have = target_chunk_ids(
         name, model_id, conn=conn, dimension=embedding_config.dimension
     )
-    source_rows = iter_source_chunks(name, report.source_model_id, conn=conn)
+    if not dry_run:
+        try:
+            writable_embeddings_table(model_id, conn=conn)
+        except MigrationCliError as exc:
+            logger.error("%s: %s", name, exc)
+            report.collection_skip = SKIP_LEGACY_SHADOWED
+            return report
+    doc_ids, unaddressable = iter_source_doc_ids(
+        name, report.source_model_id, conn=conn
+    )
+    if unaddressable:
+        report.skipped[SKIP_NO_DOC_ID] = (
+            report.skipped.get(SKIP_NO_DOC_ID, 0) + unaddressable
+        )
     consecutive_failures = 0
     # (doc_id, chunk_id) only: the text is not kept after its write.
     written: List[Tuple[str, str]] = []
-    for by_doc in _document_windows(source_rows, report.skipped, window=50):
-        report.documents_total += len(by_doc)
-        report.chunks_pending += sum(
-            1
-            for items in by_doc.values()
-            for chunk in items
-            if chunk.chunk_id not in have
-        )
-        if dry_run:
-            for items in by_doc.values():
-                if any(chunk.chunk_id not in have for chunk in items):
-                    report.documents_embedded += 1
-                else:
-                    report.documents_unchanged += 1
+    # One document at a time: its rows are not contiguous in the table, so a
+    # window of documents would split its counts and failures across windows.
+    for doc_id in doc_ids:
+        items = [
+            chunk
+            for chunk in iter_source_chunks(
+                name, report.source_model_id, conn=conn, doc_id=doc_id
+            )
+            if _count_skip(chunk, report.skipped)
+        ]
+        report.documents_total += 1
+        if not items:
             continue
-        for doc_id, items in by_doc.items():
-            missing = [chunk for chunk in items if chunk.chunk_id not in have]
-            if not missing:
+        missing = [chunk for chunk in items if chunk.chunk_id not in have]
+        report.chunks_pending += len(missing)
+        if dry_run:
+            if missing:
+                report.documents_embedded += 1
+            else:
                 report.documents_unchanged += 1
-                continue
-            try:
-                _write_chunks(
-                    name,
-                    missing,
-                    model_id=model_id,
-                    embedding_config=embedding_config,
-                    embedding_adapter=embedding_adapter,
-                    cfg=cfg,
-                )
-            except Exception as exc:  # noqa: BLE001 - continue with the next document
-                consecutive_failures += 1
-                report.failures.append(
-                    DocumentFailure(doc_id, f"{type(exc).__name__}: {exc}")
-                )
+            continue
+        if not missing:
+            report.documents_unchanged += 1
+            continue
+        try:
+            _write_chunks(
+                name,
+                missing,
+                model_id=model_id,
+                embedding_config=embedding_config,
+                embedding_adapter=embedding_adapter,
+                cfg=cfg,
+            )
+        except Exception as exc:  # noqa: BLE001 - continue with the next document
+            consecutive_failures += 1
+            report.failures.append(
+                DocumentFailure(doc_id, f"{type(exc).__name__}: {exc}")
+            )
+            logger.error(
+                "%s/%s: embedding failed: %s", name, doc_id, exc, exc_info=True
+            )
+            if consecutive_failures >= MAX_CONSECUTIVE_DOCUMENT_FAILURES:
+                report.aborted = True
                 logger.error(
-                    "%s/%s: embedding failed: %s", name, doc_id, exc, exc_info=True
+                    "%s: aborting after %d consecutive document failures",
+                    name,
+                    consecutive_failures,
                 )
-                if consecutive_failures >= MAX_CONSECUTIVE_DOCUMENT_FAILURES:
-                    report.aborted = True
-                    logger.error(
-                        "%s: aborting after %d consecutive document failures",
-                        name,
-                        consecutive_failures,
-                    )
-                    return report
-                continue
-            consecutive_failures = 0
-            written.extend((chunk.doc_id, chunk.chunk_id) for chunk in missing)
-            report.documents_embedded += 1
-            report.chunks_embedded += len(missing)
+                return report
+            continue
+        consecutive_failures = 0
+        written.extend((chunk.doc_id, chunk.chunk_id) for chunk in missing)
+        report.documents_embedded += 1
+        report.chunks_embedded += len(missing)
 
     if dry_run:
         return report
@@ -322,38 +344,31 @@ def embed_collection(
         conn=conn,
         dimension=embedding_config.dimension,
     )
-    _ensure_indexes(name, model_id, report)
+    _ensure_indexes(name, model_id, report, conn=conn)
     return report
 
 
-def _document_windows(
-    rows: Iterator[SearchableChunk], skipped: Dict[str, int], *, window: int
-) -> Iterator[Dict[str, List[SearchableChunk]]]:
-    """Group source rows per document, at most ``window`` documents at a time.
-
-    One collection can hold millions of chunks; only a window of documents is
-    held in memory, never the whole collection with its text.
-    """
-    by_doc: Dict[str, List[SearchableChunk]] = {}
-    for chunk in rows:
-        reason = skip_reason(chunk)
-        if reason:
-            skipped[reason] = skipped.get(reason, 0) + 1
-            continue
-        by_doc.setdefault(chunk.doc_id, []).append(chunk)
-        if len(by_doc) >= window:
-            yield by_doc
-            by_doc = {}
-    if by_doc:
-        yield by_doc
+def _count_skip(chunk: SearchableChunk, skipped: Dict[str, int]) -> bool:
+    """Count this row as skipped when it must be, and say whether it is usable."""
+    reason = skip_reason(chunk)
+    if reason:
+        skipped[reason] = skipped.get(reason, 0) + 1
+        return False
+    return True
 
 
-def _ensure_indexes(name: str, model_id: str, report: CollectionReport) -> None:
+def _ensure_indexes(
+    name: str, model_id: str, report: CollectionReport, *, conn: Optional[Any] = None
+) -> None:
     """Build the target table's indexes so search works right after the flip."""
     from xagent.core.tools.core.RAG_tools.storage.factory import (
         get_vector_index_store,
     )
 
+    conn = conn if conn is not None else connection()
+    if embeddings_table(model_id, conn) is None:
+        # Nothing was ever written for this model: no table, no index needed.
+        return
     result = get_vector_index_store().create_index(model_id)
     logger.info(
         "%s: target index status %s (fts=%s)", name, result.status, result.fts_enabled
@@ -366,10 +381,9 @@ def _ensure_indexes(name: str, model_id: str, report: CollectionReport) -> None:
             )
         )
         return
-    if report.chunks_embedded == 0 and report.documents_unchanged:
-        # Nothing was written, so no table had to be created either.
-        return
     if not result.fts_enabled:
+        # A populated target needs FTS even when this invocation wrote nothing:
+        # an earlier run may have written the rows and failed the index.
         report.failures.append(
             DocumentFailure("*", "target table has no full-text index after the copy")
         )

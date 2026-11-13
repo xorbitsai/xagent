@@ -136,6 +136,34 @@ def _wire(
         ),
     )
     monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+    monkeypatch.setattr(mod, "embeddings_table", lambda model_id, conn: "target")
+
+    def _doc_ids(name: str, model_id: str, *, conn: Any = None) -> Any:
+        rows = conn.tables["embeddings_old"].rows
+        ids = sorted({row["doc_id"] for row in rows if row.get("doc_id")})
+        unaddressable = sum(
+            1 for row in rows if not row.get("doc_id") or not row.get("chunk_id")
+        )
+        return ids, unaddressable
+
+    def _chunks(
+        name: str, model_id: str, *, conn: Any = None, doc_id: Any = None
+    ) -> Any:
+        for row in conn.tables["embeddings_old"].rows:
+            if doc_id is not None and row.get("doc_id") != doc_id:
+                continue
+            yield __import__("types").SimpleNamespace(
+                doc_id=str(row.get("doc_id") or ""),
+                chunk_id=str(row.get("chunk_id") or ""),
+                parse_hash=row.get("parse_hash") or "",
+                text=str(row.get("text") or ""),
+                chunk_hash=row.get("chunk_hash") or "",
+                metadata=row.get("metadata"),
+                user_id=row.get("user_id"),
+            )
+
+    monkeypatch.setattr(mod, "iter_source_doc_ids", _doc_ids)
+    monkeypatch.setattr(mod, "iter_source_chunks", _chunks)
 
     def _write(**kwargs: Any) -> None:
         writes.append(kwargs)
@@ -634,7 +662,7 @@ def test_the_target_indexes_are_built_before_the_command_returns(
     monkeypatch.setattr(
         mod,
         "_ensure_indexes",
-        lambda name, model_id, report: calls.append((name, model_id)),
+        lambda name, model_id, report, **kwargs: calls.append((name, model_id)),
     )
 
     mod.embed_collections("new")
@@ -655,6 +683,7 @@ def test_a_broken_target_index_is_a_failure(
             )
 
     monkeypatch.setattr(factory, "get_vector_index_store", lambda: _Store())
+    monkeypatch.setattr(mod, "embeddings_table", lambda model_id, conn: "t")
     report = mod.CollectionReport(name="kb", documents_unchanged=1)
 
     mod._ensure_indexes("kb", "new", report)
@@ -693,6 +722,7 @@ def test_a_target_without_a_full_text_index_is_a_failure(
             )
 
     monkeypatch.setattr(factory, "get_vector_index_store", lambda: _Store())
+    monkeypatch.setattr(mod, "embeddings_table", lambda model_id, conn: "t")
     report = mod.CollectionReport(name="kb", documents_unchanged=0)
 
     mod._ensure_indexes("kb", "new", report)
@@ -771,6 +801,24 @@ class _FixedAdapter:
         return [[0.5, 0.5][: self.dimension] for _ in items]
 
 
+def _install_source_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Four rows over two documents, readable one document at a time."""
+    monkeypatch.setattr(
+        mod, "iter_source_doc_ids", lambda *a, **k: (["doc-0", "doc-1"], 0)
+    )
+    monkeypatch.setattr(
+        mod,
+        "iter_source_chunks",
+        lambda *a, doc_id=None, **k: iter(
+            [
+                chunk
+                for chunk in _source_chunks(4)
+                if doc_id is None or chunk.doc_id == doc_id
+            ]
+        ),
+    )
+
+
 def _source_chunks(count: int) -> List[Any]:
     from xagent.migrations.embedding.scope import SearchableChunk
 
@@ -813,9 +861,7 @@ def test_embed_writes_a_real_table_and_builds_both_indexes(
     )
 
     _make_collection()
-    monkeypatch.setattr(
-        mod, "iter_source_chunks", lambda *a, **k: iter(_source_chunks(4))
-    )
+    _install_source_stub(monkeypatch)
     # A real vector index instead of the 50k rows its default threshold needs.
     real_policy = core_config.IndexPolicy
 
@@ -859,9 +905,7 @@ def test_embed_writes_a_real_table_and_builds_both_indexes(
 def test_a_real_rerun_over_held_chunks_writes_nothing() -> None:
     _make_collection()
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(
-        mod, "iter_source_chunks", lambda *a, **k: iter(_source_chunks(4))
-    )
+    _install_source_stub(monkeypatch)
     monkeypatch.setattr(mod, "_ensure_indexes", lambda *a, **k: None)
     target = EmbeddingModelConfig(id="new-model", model_name="stub", dimension=2)
     adapter = _FixedAdapter()
@@ -887,3 +931,205 @@ def test_a_real_rerun_over_held_chunks_writes_nothing() -> None:
     assert (first.chunks_embedded, second.chunks_embedded) == (4, 0)
     assert second.documents_unchanged == first.documents_embedded
     assert len(adapter.calls) == calls
+
+
+# --- round 1: one physical table for the held scan and the writer ---
+
+
+def _legacy_name(model_id: str) -> Any:
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        legacy_embeddings_table_name,
+    )
+
+    return legacy_embeddings_table_name(model_id)
+
+
+def _create_embeddings_table(conn: Any, name: str, rows: Any) -> None:
+    schema = pa.schema(
+        [
+            ("collection", pa.string()),
+            ("doc_id", pa.string()),
+            ("chunk_id", pa.string()),
+            ("parse_hash", pa.string()),
+            ("user_id", pa.int64()),
+            ("text", pa.string()),
+            ("chunk_hash", pa.string()),
+            ("metadata", pa.string()),
+            ("vector", pa.list_(pa.float32(), 2)),
+        ]
+    )
+    conn.create_table(name, data=pa.Table.from_pylist(rows, schema=schema))
+
+
+def _embedding_row(chunk_id: str, model_id: str) -> Any:
+    return {
+        "collection": "kb",
+        "doc_id": "doc-0",
+        "chunk_id": chunk_id,
+        "parse_hash": "h",
+        "user_id": 7,
+        "text": "t",
+        "chunk_hash": "c",
+        "metadata": None,
+        "vector": [0.5, 0.5],
+    }
+
+
+def _stub_legacy_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+    monkeypatch.setattr(
+        model_resolver,
+        "resolve_embedding_adapter",
+        lambda model_id: (SimpleNamespace(model_name="stub"), object()),
+    )
+
+
+def test_a_populated_legacy_table_is_refused_instead_of_shadowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    _make_collection()
+    _install_source_stub(monkeypatch)
+    _stub_legacy_model(monkeypatch)
+    monkeypatch.setattr(
+        mod,
+        "resolve_target_model",
+        lambda model_id: (
+            EmbeddingModelConfig(id=model_id, model_name="stub", dimension=2),
+            _FixedAdapter(),
+        ),
+    )
+    monkeypatch.setattr(mod, "_ensure_indexes", lambda *a, **k: None)
+    conn = get_vector_index_store().get_raw_connection()
+    legacy = _legacy_name("new-model")
+    _create_embeddings_table(conn, legacy, [_embedding_row("legacy-1", "new-model")])
+
+    report = mod.embed_collection(
+        "kb",
+        model_id="new-model",
+        embedding_config=EmbeddingModelConfig(
+            id="new-model", model_name="stub", dimension=2
+        ),
+        embedding_adapter=_FixedAdapter(),
+        cfg=_config(),
+        dry_run=False,
+        source="old-model",
+    )
+
+    assert report.collection_skip == mod.SKIP_LEGACY_SHADOWED
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        embeddings_table_candidates,
+    )
+
+    assert embeddings_table_candidates("new-model")[0] not in set(
+        conn.list_tables() if isinstance(conn.list_tables(), list) else []
+    )
+
+
+def test_held_rows_are_read_from_the_table_search_would_pick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    _stub_legacy_model(monkeypatch)
+
+    conn = get_vector_index_store().get_raw_connection()
+    legacy = _legacy_name("new-model")
+    _create_embeddings_table(conn, legacy, [_embedding_row("legacy-1", "new-model")])
+
+    held = mod.target_chunk_ids("kb", "new-model", dimension=2)
+    mod.target_chunk_ids("kb", "new-model", dimension=2)
+
+    from xagent.migrations.embedding import scope as scope_mod
+
+    assert held == {"legacy-1"}
+    assert scope_mod.source_embeddings_table("new-model", conn) == legacy
+
+
+def test_a_populated_target_without_fts_fails_even_when_nothing_was_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage import factory
+
+    class _Store:
+        def create_index(self, model_id: str) -> Any:
+            return __import__("types").SimpleNamespace(
+                status="below_threshold", advice=None, fts_enabled=False
+            )
+
+    monkeypatch.setattr(factory, "get_vector_index_store", lambda: _Store())
+    monkeypatch.setattr(mod, "embeddings_table", lambda model_id, conn: "t")
+    report = mod.CollectionReport(name="kb", documents_unchanged=3)
+
+    mod._ensure_indexes("kb", "new", report)
+
+    assert report.failures[0].doc_id == "*"
+
+
+def test_a_collection_with_no_target_table_needs_no_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage import factory
+
+    class _Store:
+        def create_index(self, model_id: str) -> Any:  # pragma: no cover
+            raise AssertionError("no table, no index call")
+
+    monkeypatch.setattr(factory, "get_vector_index_store", lambda: _Store())
+    monkeypatch.setattr(mod, "embeddings_table", lambda model_id, conn: None)
+    report = mod.CollectionReport(name="kb")
+
+    mod._ensure_indexes("kb", "new", report)
+
+    assert report.failures == []
+
+
+def test_a_document_is_settled_once_across_many_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.migrations.embedding.scope import SearchableChunk
+
+    many = [
+        SearchableChunk(
+            doc_id="doc-0",
+            chunk_id=f"c{index}",
+            parse_hash="h",
+            text="t",
+            chunk_hash="c",
+            metadata=None,
+            user_id=7,
+        )
+        for index in range(120)
+    ]
+    _wire(monkeypatch, _Conn({"embeddings_old": []}))
+    monkeypatch.setattr(mod, "iter_source_doc_ids", lambda *a, **k: (["doc-0"], 0))
+    monkeypatch.setattr(mod, "iter_source_chunks", lambda *a, **k: iter(many))
+    written: List[int] = []
+    real_write = mod.embed_collection.__globals__["_write_chunks"]
+
+    def _record(*args: Any, **kwargs: Any) -> None:
+        written.append(len(args[1]))
+        real_write(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_write_chunks", _record)
+
+    report = mod.embed_collection(
+        "kb",
+        model_id="new",
+        embedding_config=EmbeddingModelConfig(id="new", model_name="stub", dimension=2),
+        embedding_adapter=_FixedAdapter(),
+        cfg=_config(),
+        dry_run=False,
+        source="old",
+    )
+
+    assert written == [120]
+    assert (report.documents_embedded, report.documents_total) == (1, 1)

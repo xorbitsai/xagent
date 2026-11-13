@@ -12,6 +12,12 @@ from xagent.migrations.embedding import scope as mod
 from xagent.migrations.embedding.scope import MigrationCliError, SearchableChunk
 
 
+@pytest.fixture(autouse=True)
+def _stub_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--model resolution needs the model hub; tests pin it to a 2-d stub."""
+    monkeypatch.setattr(mod, "resolve_target", lambda model_id: (model_id, 2))
+
+
 class _Table:
     def __init__(self, rows: List[Dict[str, Any]], *, fail: bool = False) -> None:
         self._rows = rows
@@ -227,7 +233,7 @@ def test_the_missing_count_uses_the_target_table(
             "embeddings_old": _Table(
                 [_row(chunk_id="a1"), _row(chunk_id="a2"), _row(chunk_id="a3")]
             ),
-            "embeddings_new": _Table([{"chunk_id": "a1", "vector": [0.5]}]),
+            "embeddings_new": _Table([{"chunk_id": "a1", "vector": [0.5, 0.5]}]),
         }
     )
 
@@ -788,3 +794,27 @@ def test_scope_and_dry_run_write_nothing_to_collection_metadata(
     mod.target_chunk_ids("kb", "new-model", conn=conn)
 
     assert _metadata_snapshot() == before
+
+
+def test_an_explicit_model_is_resolved_like_embed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: Dict[str, Any] = {}
+    monkeypatch.setattr(mod, "resolve_target", lambda model_id: ("canonical-id", 3))
+    monkeypatch.setattr(
+        mod,
+        "target_chunk_ids",
+        lambda name, model_id, **kwargs: seen.update(
+            {"name": name, "model": model_id, **kwargs}
+        )
+        or set(),
+    )
+    monkeypatch.setattr(mod, "collection_info", lambda name: SimpleNamespace())
+    monkeypatch.setattr(mod, "collection_engine", lambda info: "lancedb")
+    monkeypatch.setattr(mod, "source_model_id", lambda name, info: "source-model")
+    monkeypatch.setattr(mod, "iter_source_chunks", lambda *a, **k: iter([]))
+
+    mod.scope_collection("kb", "an-alias")
+
+    assert seen["model"] == "canonical-id"
+    assert seen["dimension"] == 3

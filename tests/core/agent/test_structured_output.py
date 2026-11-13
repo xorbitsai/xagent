@@ -1541,3 +1541,46 @@ async def test_a_run_without_a_tracer_still_gets_its_result():
     result = _result()
     await _attach(result, _fmt(SHAPE), ScriptedModel([_args_reply(GOOD)]), None)
     assert result[so.STRUCTURED_OUTPUT_RESULT_KEY]["status"] == "ready"
+
+
+# --- the partial output of a settled outcome -------------------------------------
+
+
+def test_settled_partial_output_only_incomplete() -> None:
+    from xagent.web.services.structured_output_projection import _FAILED_CODES
+
+    partial = {"a": None}
+    for code in sorted(_FAILED_CODES):
+        with pytest.raises(ValueError):
+            so._settled("failed", code, partial_output=partial)
+    with pytest.raises(ValueError):
+        so._settled("ready", output={"a": "x"}, partial_output=partial)
+
+    kept = so._settled("incomplete", "information_missing", partial_output=partial)
+    assert kept == {
+        "status": "incomplete",
+        "output": None,
+        "reason": {"code": "information_missing"},
+        "partial_output": partial,
+    }
+    assert "partial_output" not in so._settled("incomplete", "information_missing")
+    assert "partial_output" not in so._settled("failed", "model_error")
+    assert "partial_output" not in so._settled("ready", output={"a": "x"})
+
+
+def test_a_verdict_with_a_value_settles_with_that_value_under_its_own_key() -> None:
+    compiled = ss.compile_schema(_obj({"a": STRING, "g": STRING}))
+    verdict = ss.judge_instance(compiled, {"a": "x", "g": None}, keep_output=True)
+
+    settled = so._settled_from_verdict(verdict)
+
+    assert settled["status"] == "incomplete" and settled["output"] is None
+    assert settled["reason"] == {
+        "code": "information_missing",
+        "missing_fields": ["/g"],
+    }
+    assert settled["partial_output"] == {"a": "x", "g": None}
+    without = so._settled_from_verdict(
+        ss.judge_instance(compiled, {"a": "x", "g": None})
+    )
+    assert "partial_output" not in without

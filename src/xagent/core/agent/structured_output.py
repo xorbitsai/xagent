@@ -156,10 +156,16 @@ def _settled(
     output: Any = None,
     missing: Any = (),
     unexpressible: Any = (),
+    partial_output: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """An outcome in the shape every read path accepts: a ready result holds
     its output and no reason; the others hold a reason code, with the field
-    lists only when they are not empty."""
+    lists only when they are not empty. ``output`` of a status other than ready
+    is always None. An incomplete outcome may also carry ``partial_output``, the
+    values extracted despite the gaps, under its own key; any other status
+    given one raises ``ValueError``."""
+    if partial_output is not None and status != "incomplete":
+        raise ValueError("only an incomplete outcome can hold a partial output")
     if status == "ready":
         return {"status": "ready", "output": output, "reason": None}
     reason: dict[str, Any] = {"code": code}
@@ -167,7 +173,10 @@ def _settled(
         reason["missing_fields"] = list(missing)
     if unexpressible:
         reason["unexpressible_fields"] = list(unexpressible)
-    return {"status": status, "output": None, "reason": reason}
+    outcome: dict[str, Any] = {"status": status, "output": None, "reason": reason}
+    if partial_output is not None:
+        outcome["partial_output"] = partial_output
+    return outcome
 
 
 def _settled_from_verdict(
@@ -187,6 +196,7 @@ def _settled_from_verdict(
         code,
         missing=verdict.missing_fields,
         unexpressible=verdict.unexpressible_fields,
+        partial_output=verdict.output,
     )
 
 

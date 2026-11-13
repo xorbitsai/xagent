@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -362,6 +362,43 @@ class TestMemoryListEndpoint:
         assert "metadata" in memory
         # Ensure context field is not present
         assert "context" not in memory
+
+    def test_list_and_get_surface_provenance_and_utc_timestamp(
+        self, client, mock_memory_store, auth_headers
+    ):
+        """Provenance lives in metadata and is returned verbatim; aware UTC
+        timestamps serialize with their offset next to naive legacy ones."""
+        provenance = {"channel_kind": "dm", "channel_id": "D123", "task_id": "9"}
+        aware = MemoryNote(
+            id=MEMORY_ID_1,
+            content="User prefers concise replies.",
+            category="react_memory",
+            metadata={
+                "kind": "user_preference",
+                "source": "store_memory",
+                "provenance": provenance,
+            },
+            timestamp=datetime(2026, 11, 13, 8, 30, tzinfo=timezone.utc),
+        )
+        legacy = MemoryNote(
+            id=MEMORY_ID_2,
+            content="Legacy note.",
+            timestamp=datetime(2026, 1, 1, 8, 30),
+        )
+        mock_memory_store.list_all.return_value = [aware, legacy]
+        mock_memory_store.get.return_value = Mock(
+            success=True, memory_id=MEMORY_ID_1, content=aware
+        )
+
+        listed = client.get("/api/memory/list", headers=auth_headers).json()
+        fetched = client.get(f"/api/memory/{MEMORY_ID_1}", headers=auth_headers)
+
+        first, second = listed["memories"]
+        assert first["metadata"]["provenance"] == provenance
+        assert datetime.fromisoformat(first["timestamp"]).utcoffset() is not None
+        assert datetime.fromisoformat(second["timestamp"]).tzinfo is None
+        assert fetched.status_code == 200
+        assert fetched.json()["metadata"]["provenance"] == provenance
 
     def test_list_memories_with_category_filter(
         self, client, mock_memory_store, auth_headers

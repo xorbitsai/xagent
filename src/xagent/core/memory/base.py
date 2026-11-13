@@ -2,14 +2,53 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import MINYEAR, datetime, timezone
-from typing import Any, Collection, List, Optional
+from typing import Any, Collection, List, Mapping, Optional
 
+from ..execution_scope import ExecutionScope
 from .core import MemoryNote, MemoryResponse
 from .scope_columns import (
     SCOPE_EXCLUSIVE_FILTER_KEY,
+    coerce_user_id,
     encode_scope_dims,
     scope_dim_element,
 )
+
+
+class MemoryScopeTooBroadError(ValueError):
+    """A bulk delete was requested without a scope narrow enough to bound it.
+
+    Raised instead of widening the delete: a scoped bulk delete needs both an
+    owner and at least one execution-scope dimension, otherwise it would reach
+    every principal sharing that owner (e.g. every member of one Slack
+    workspace, all stored under one machine owner).
+    """
+
+
+def validate_scope_delete(
+    owner_user_id: int, dims: Mapping[str, str]
+) -> dict[str, str]:
+    """Validate the predicate of a scoped bulk delete and return its dimensions.
+
+    ``owner_user_id`` must be a positive signed-int64 ``int`` (``bool`` and
+    lossy numeric spellings are rejected, as for ``MemoryAccessScope``).
+    ``dims`` must be non-empty and satisfy the ``ExecutionScope`` component
+    rules, i.e. exactly what a write could have stamped: string keys matching
+    ``[a-zA-Z0-9_-]{1,63}`` and non-empty string values. An integer value is
+    rejected rather than ``str()``-coerced, so a caller can never silently
+    match nothing because of a non-canonical spelling.
+
+    Raises:
+        ValueError: ``owner_user_id`` is not a positive signed-int64 ``int``.
+        MemoryScopeTooBroadError: ``dims`` is empty.
+        InvalidScopeComponentError: a key or value is not a valid component.
+    """
+    if type(owner_user_id) is not int or not 0 < owner_user_id < 2**63:
+        raise ValueError("owner_user_id must be a positive signed int64")
+    if not dims:
+        raise MemoryScopeTooBroadError(
+            "a scoped memory delete requires at least one scope dimension"
+        )
+    return dict(ExecutionScope(memory_dimensions=dims).memory_dimensions)
 
 
 def comparable_timestamp(value: Any) -> Any:
@@ -359,6 +398,79 @@ class MemoryStore(ABC):
                 metadata={"deleted_count": deleted},
             )
         return MemoryResponse(success=True, metadata={"deleted_count": deleted})
+
+    def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
+        """
+        Delete every note of ``owner_user_id`` that carries all of ``dims``.
+
+        Trusted control-plane primitive for scoped erasure, e.g. "forget
+        everything in this workspace" (owner + ``client_application_id``) or
+        "forget this member" (owner + ``end_user_id`` + ...). The owner
+        predicate and at least one dimension are mandatory (see
+        ``validate_scope_delete``), so this can never degrade into an
+        owner-wide or store-wide wipe. A note matches when its owner equals
+        ``owner_user_id`` and its scope dimensions are a superset of ``dims``
+        (exact per-dimension string equality, the same semantics as a scoped
+        search); dimension-less notes never match.
+
+        Bypasses per-user isolation wrappers: callers are responsible for
+        deriving ``owner_user_id``/``dims`` from trusted state, never from
+        agent or end-user input.
+
+        This default walks ``list_all()`` and deletes note-by-note, assuming
+        ``list_all()`` returns the complete store; backends with a native
+        predicate delete should override it.
+
+        Returns:
+            int: Number of notes deleted.
+
+        Raises:
+            ValueError: invalid predicate (see ``validate_scope_delete``).
+            RuntimeError: a matching note could not be deleted. Notes deleted
+                before the failure stay deleted; re-running is idempotent.
+        """
+        required = {
+            scope_dim_element(key, value)
+            for key, value in validate_scope_delete(owner_user_id, dims).items()
+        }
+        deleted = 0
+        for note in self.list_all():
+            if (
+                note.id
+                and coerce_user_id(note.metadata.get("user_id")) == owner_user_id
+                and required <= set(encode_scope_dims(note.metadata))
+            ):
+                response = self.delete(note.id)
+                if not response.success:
+                    raise RuntimeError(
+                        f"Failed to delete memory {note.id!r}: {response.error}"
+                    )
+                deleted += 1
+        return deleted
+
+    def can_delete_current_scope(self) -> bool:
+        """
+        Whether ``delete_current_scope`` would act rather than refuse.
+
+        Lets tool builders expose a scoped bulk delete only where it can
+        work. ``False`` for stores without an owner/execution-scope binding.
+        """
+        return False
+
+    def delete_current_scope(self) -> int:
+        """
+        Delete every note in the caller's current memory scope.
+
+        Only stores bound to an owner and an execution scope (e.g.
+        ``UserIsolatedMemoryStore``) can resolve that scope; a raw storage
+        backend has neither, so this default refuses rather than guessing.
+
+        Raises:
+            MemoryScopeTooBroadError: always, for stores without a scope.
+        """
+        raise MemoryScopeTooBroadError(
+            f"{type(self).__name__} is not bound to an execution scope"
+        )
 
     def list_scope_dimension_values(self, dim_key: str) -> set[str]:
         """

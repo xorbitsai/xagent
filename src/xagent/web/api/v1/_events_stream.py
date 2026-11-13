@@ -154,7 +154,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from time import monotonic
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping, cast
 
 from fastapi import WebSocket
 from fastapi.responses import StreamingResponse
@@ -166,6 +166,7 @@ from ...models.user import User
 from ...models.user_api_key import UserApiKey
 from ...schemas.v1 import PublicStep
 from ...services.db_runtime import run_db_io_cancellation_safe
+from ...services.execution_result_projection import completion_outcome_fields
 from ...services.public_trace_events import (
     DELEGATED_AGENT_TRACE_SOURCE,
     is_audit_only_trace_data,
@@ -320,7 +321,8 @@ def _stream_close_reason(status: TaskStatus, control_state: str | None) -> str |
 
 # A sync callable: (task_id, principal) -> ``_TaskInfoSnapshot``-shaped
 # object (duck-typed: ``.status`` / ``.control_state`` / ``.output`` /
-# ``.error`` / ``.pending_question``), raising
+# ``.error`` / ``.pending_question`` / ``.completion_outcome`` /
+# ``.accept_partial``), raising
 # ``V1ApiError(TASK_NOT_FOUND, 404)`` when the task is missing or not
 # owned, or ``V1ApiError(TASK_EXPIRED, 410)`` when retention expired a
 # task the key could have seen (see ``_task_gone_error_frame``); the two
@@ -417,6 +419,7 @@ def completed_frame(
     structured_output: dict[str, Any] | None = None,
     structured_output_status: str | None = None,
     structured_output_reason: dict[str, Any] | None = None,
+    reported_outcome: Mapping[str, str | None] | None = None,
     snapshot_total_steps: int | None = None,
 ) -> str:
     return _sse_frame(
@@ -429,6 +432,7 @@ def completed_frame(
             "structured_output": structured_output,
             "structured_output_status": structured_output_status,
             "structured_output_reason": structured_output_reason,
+            **(reported_outcome or {}),
             **_snapshot_marker_fields(snapshot_total_steps),
         },
     )
@@ -444,6 +448,17 @@ def _structured_output_fields(snapshot: "_TaskInfoSnapshot") -> dict[str, Any]:
         record=snapshot.structured_output_record,
         format_configured=snapshot.format_configured,
     ).as_dict()
+
+
+def _completion_outcome_fields(snapshot: "_TaskInfoSnapshot") -> dict[str, str | None]:
+    """The ``completion_outcome`` key of a conclusion frame, from the same
+    effective snapshot that supplies its status: empty unless the task's format
+    sets accept_partial, as on ``GET /v1/chat/tasks/{task_id}``."""
+    return completion_outcome_fields(
+        snapshot.status,
+        snapshot.completion_outcome,
+        accept_partial=snapshot.accept_partial,
+    )
 
 
 def input_required_frame(
@@ -1506,6 +1521,7 @@ async def watchdog_check_once(
                 error=snapshot.error,
                 error_code=snapshot.error_code,
                 **_structured_output_fields(snapshot),
+                reported_outcome=_completion_outcome_fields(snapshot),
             )
         )
     if close_reason == "input_required":
@@ -2149,6 +2165,7 @@ def _terminal_snapshot_stream(
             error=snapshot.error,
             error_code=snapshot.error_code,
             **_structured_output_fields(snapshot),
+            reported_outcome=_completion_outcome_fields(snapshot),
             snapshot_total_steps=snapshot_total_steps,
         )
 

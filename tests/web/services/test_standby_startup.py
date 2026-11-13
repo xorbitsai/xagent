@@ -28,6 +28,7 @@ from tests.integration.test_auto_migration_startup import (  # noqa: F401
 )
 from xagent.config import STANDBY as STANDBY_ENV
 from xagent.web.models import database as database_module
+from xagent.web.services import task_execution
 from xagent.web.services.release_hold import release_hold
 from xagent.web.services.standby import StandbyPhase, standby
 
@@ -336,6 +337,14 @@ async def test_shutdown_cleans_sandboxes_only_when_it_owned_them(
         "stop_app_process_diagnostics",
     ):
         monkeypatch.setattr(app_module, name, AsyncMock())
+    # shutdown_event() leaves the process-wide background task manager refusing
+    # work, and nothing in this process reopens it, so give it a fresh one:
+    # later tests in this process still need the shared manager to accept work.
+    monkeypatch.setattr(
+        task_execution,
+        "background_task_manager",
+        task_execution.BackgroundTaskManager(),
+    )
     if started_as_standby:
         standby.begin()
 

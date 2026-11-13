@@ -4,12 +4,10 @@ projected from it."""
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 
 import pytest
 
 from tests.web.services.test_structured_output_projection import MESSAGES
-from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.task import Task
 from xagent.web.schemas.v1 import TaskInfoResponse
 from xagent.web.services.hot_path_cache import (
@@ -30,11 +28,14 @@ from .structured_output_shared import (
     MOMENT,
     NEW_KEYS,
     RECORD,
+    SWITCH_ON_CONFIG,
+    TERMINAL_VIEW,
     bearer,
     create_agent_with_key,
     insert_task,
     recorded_statements,
     task_selects,
+    with_snapshot,
 )
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -99,6 +100,7 @@ def test_the_response_models_new_fields_all_default_to_none():
     assert response.structured_output is None
     assert response.structured_output_status is None
     assert response.structured_output_reason is None
+    assert response.completion_outcome is None
 
 
 def test_a_ready_record_of_the_current_run_is_returned_in_stored_key_order():
@@ -148,17 +150,6 @@ def test_the_existing_fields_are_byte_identical_to_the_recorded_baseline():
         assert json.dumps(body, ensure_ascii=False, separators=(",", ":")) == expected
 
 
-# A record of the run the task shows, with a format configured: what a reader
-# would report if nothing hid it.
-def _with_snapshot(monkeypatch, **changes):
-    real = v1_tasks._load_task_info_snapshot
-    monkeypatch.setattr(
-        v1_tasks,
-        "_load_task_info_snapshot",
-        lambda task_id, principal: replace(real(task_id, principal), **changes),
-    )
-
-
 def test_a_record_of_an_earlier_run_is_not_shown_for_the_current_run():
     agent_id, key = create_agent_with_key()
     stale = insert_task(
@@ -178,7 +169,7 @@ def test_a_record_of_an_earlier_run_is_not_shown_for_the_current_run():
 def test_a_queued_start_hides_the_record_of_the_previous_run(monkeypatch):
     agent_id, key = create_agent_with_key()
     task_id = insert_task(agent_id, record=RECORD, agent_config=FORMAT_CONFIG)
-    _with_snapshot(monkeypatch, start_queued=True)
+    with_snapshot(monkeypatch, start_queued=True)
 
     body = get(key, task_id).json()
 
@@ -190,7 +181,7 @@ def test_a_terminal_view_hides_the_record(monkeypatch):
     agent_id, key = create_agent_with_key()
     task_id = insert_task(agent_id, record=RECORD, agent_config=FORMAT_CONFIG)
     view = TerminalView(state="stopped", error="stopped", stopped_at=MOMENT, reason="x")
-    _with_snapshot(monkeypatch, view=view)
+    with_snapshot(monkeypatch, view=view)
 
     body = get(key, task_id).json()
 
@@ -253,3 +244,27 @@ def test_the_message_of_a_reason_is_the_fixed_text_of_its_code(code):
         assert "missing_fields" not in resp.text
     if code not in ("information_missing", "value_not_expressible"):
         assert "unexpressible_fields" not in resp.text
+
+
+# --- the completion_outcome key -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{}, {"start_queued": True}, {"view": TERMINAL_VIEW}],
+    ids=["none", "start-queued", "view"],
+)
+def test_the_cache_body_never_holds_completion_outcome(
+    changes, monkeypatch, task_cache
+):
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(
+        agent_id, agent_config=SWITCH_ON_CONFIG, completion_outcome="partial"
+    )
+    with_snapshot(monkeypatch, **changes)
+
+    first = get(key, task_id)
+    second = get(key, task_id)
+
+    assert "completion_outcome" not in cache_get(task_snapshot_key(task_id))["response"]
+    assert second.text == first.text

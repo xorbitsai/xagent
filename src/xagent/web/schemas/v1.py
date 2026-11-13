@@ -31,9 +31,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
     StringConstraints,
+    model_serializer,
 )
 
 from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
@@ -1356,7 +1358,8 @@ class TaskInfoResponse(BaseModel):
     Returns a snapshot of the task's current state from the ``tasks``
     row. ``input`` / ``output`` / ``error`` reflect the **latest** turn
     only -- full transcript history is queryable via the ``/steps``
-    endpoint's ``message`` type steps.
+    endpoint's ``message`` type steps. The ``completion_outcome`` key is
+    present only when the task's response format sets accept_partial.
     """
 
     task_id: int
@@ -1504,6 +1507,31 @@ class TaskInfoResponse(BaseModel):
             "otherwise."
         ),
     )
+    completion_outcome: Optional[str] = Field(
+        None,
+        description=(
+            "How the agent rated the run shown in this response: completed, "
+            "partial or blocked. Present only when the task's response format "
+            "sets accept_partial; the key is absent otherwise. When present, "
+            "null unless the task is completed and the run recorded a rating. "
+            "Whether a structured result is complete is told by "
+            "structured_output_status, not by this field."
+        ),
+    )
+
+    # Responses for a task without accept_partial must stay byte-identical to
+    # those of servers that predate this field, so the key is dropped unless
+    # the response was built or updated with it. No return annotation: any
+    # annotation, Any included, replaces this model's serialization schema in
+    # the OpenAPI document.
+    @model_serializer(mode="wrap")
+    def _omit_unreported_completion_outcome(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        data = handler(self)
+        if "completion_outcome" not in self.model_fields_set:
+            data.pop("completion_outcome", None)
+        return data
 
 
 # ``PublicStep.type`` is the public surface for what was internally one

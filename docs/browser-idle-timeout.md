@@ -80,19 +80,19 @@ Login, refresh, Google OIDC exchange, `GET /api/auth/verify` and
 
 ## Revocation and rejections
 
-A login is revoked (`revoked_at`) while the switch is on when a request
+While the switch is on, a login is revoked (`revoked_at`) when a request
 carrying its `sid` arrives after its deadline, when the sweep finds it past its
 deadline, or when it logs out. Every replica runs the sweep every 60 seconds;
 it also deletes rows whose last use is older than the refresh-token lifetime
 plus the access-token lifetime plus one day, when no token for them can still
-be valid. **A revoked login stays rejected after the switch is turned off.**
-Revocation is keyed by `sid`, so it never affects another login of the user.
+be valid. Revocation is keyed by `sid`, so it never affects another login of
+the user.
 
 | Case | Switch on | Switch off |
 | --- | --- | --- |
-| Idle deadline passed | 401 `SessionIdleExpired` | accepted |
+| Idle deadline passed | 401 `SessionIdleExpired` | 401 if it passed while the switch was on (below), otherwise accepted |
 | Revoked login | 401 `SessionIdleExpired` | 401 `SessionIdleExpired` |
-| Token without `sid`, or `sid` without a row | 401 `SessionIdleExpired` | accepted |
+| Token without `sid`, or `sid` without a row | 401 `SessionIdleExpired` | accepted (refresh: 401 after an enforced period) |
 | Database unavailable | 5xx, never 401 | 5xx |
 
 Once a login is rejected, access-token requests carrying its `sid` and
@@ -109,30 +109,86 @@ handshake keeps the endpoint's existing close code (4001 or 1008); on 4001 the
 browser refreshes once and then receives `SessionIdleExpired`. Do not refresh
 on `SessionIdleExpired` or 4010; `TokenExpired` and 4001 keep their meaning.
 
-Logout with the switch on also revokes the presented access token's login.
-Its refresh-token handling is unchanged: the stored refresh token is cleared
-when the presented one matches, or when none is presented.
+## Switching the policy off
 
-Remaining gap: a login whose deadline passed after the last sweep and that saw
-no request before the last switch-on replica stopped can still be used after
-the switch is turned off. With the sweep running, this window is at most about
-60 seconds.
+Turning the switch off must not revive a login that expired while it was on,
+including one that no request and no sweep saw expire. Every replica with the
+switch on renews, every 5 seconds and in a loop of its own, a lease in
+`browser_idle_enforcement`: "these thresholds are enforced until now + 15
+seconds". Each threshold set has its own row, so replicas running different
+thresholds during a rolling change do not overwrite each other; a row only
+moves forward. With the switch off, a replica rejects and revokes a login if,
+under any recorded threshold set, its deadline has passed and fell before that
+set's lease ended. A login still valid when the last enforcing replica stopped
+is free at once, and its later activity is recorded as usual. While any
+replica still enforces, its lease keeps moving, so switched-off replicas reach
+the same decisions; their activity and refresh writes repeat the test in the
+UPDATE.
+
+- **Role**: each login row records the platform-admin role at its last login,
+  activity or refresh, and enforcing replicas mark the live logins of current
+  admins with every lease renewal. With the switch off the stricter of the
+  recorded and the current role applies, so a demotion after switch-off revives
+  nothing, except for a promotion made within one renewal interval (5 seconds)
+  before switch-off. Errors go only toward signing out: a user demoted while the
+  switch was on, or promoted after it, whose login is idle between the two
+  thresholds is signed out once more.
+- **Cost with the switch off**: decisions read the lease rows directly, with no
+  cache, including in deployments that never enabled the policy (an empty
+  table). A login active within the last minute (no threshold is shorter)
+  skips the read. Otherwise each authenticated request adds one small query
+  over the few lease rows; an open WebSocket's 5-second recheck does the same;
+  a refresh reads them up to twice and an activity write once.
+- **Conditions**: leases must keep being renewed; a replica that cannot write
+  keeps enforcing and logs errors, but expirations during an outage longer than
+  about 10 seconds are not covered. Replica clocks must be synchronised (NTP)
+  to within 5 seconds; the 15-second lease absorbs that.
+- **Window**: logins due to expire within about 10–15 seconds after the last
+  enforcing replica stops still expire on time.
+- **Legacy credentials**: once any lease exists, a refresh token without a
+  known `sid` is rejected rather than migrated. Access tokens without `sid` are
+  not checked against the leases (to avoid a per-request read); the rollout
+  enables the switch only after every pre-release access token has expired.
+  Enabled earlier, or with a token issuer that does not yet add `sid`, such an
+  access token is accepted again after switch-off until its own expiry.
+- **Turning it back on**: logins idle beyond the threshold during the off
+  period expire at once.
+
+## Logout
+
+With the switch on, logout revokes the presented access token's login. Whether
+or not the switch is on, it clears the stored refresh token only if this logout
+owns it, checked in the same UPDATE: a presented refresh token must match the
+stored value, unchanged since it was checked; without one, the access token's
+`sid` must hold the refresh token (`users.browser_session_id`). An access token
+without `sid` cannot name its login and keeps the previous revoke-all
+behaviour, an explicit compatibility exception that lasts until every token
+issuer adds `sid` (for xagent-saas, when xorbitsai/xagent-saas#2928's
+integration ships).
 
 ## Streaming and derived access
 
-With the switch on and the database reachable, access stops after expiry:
+Bounded, with the switch on and the database reachable:
 
 | Path | Bound |
 | --- | --- |
 | WebSockets authenticated with access tokens (chat, build chat, build preview, progress, ASR) | Rechecked about every 5 s (±20%) and, except ASR, on each inbound message; closed with 4010 within about 6 s. Three failed rechecks close with 1011. |
 | File stream tickets | Checked on every redemption, including each Range request |
-| Whole-file transfers already started (FileResponse, X-Accel) | Run to completion |
-| Object-storage signed URLs (`XAGENT_FILE_DELIVERY_REDIRECT_ENABLED`, off by default) | Valid for `XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS` (default 300 s) after issue; a download started within it completes |
-| TTS stream | Checked at start; at most 600 s |
 | OAuth launch (30 s) and regional handoff (120 s) tickets | Checked at redemption |
+| TTS stream | Checked at start; at most 600 s |
 
-Not covered: `/api/files/public/preview` and `/api/files/public/download`
-accept the file ID alone for ordinary tasks, independent of any login.
+Exclusions:
+
+- Whole-file transfers already started (FileResponse, X-Accel) run to
+  completion. With the object-storage redirect
+  (`XAGENT_FILE_DELIVERY_REDIRECT_ENABLED`, off by default) a download can still
+  start up to `XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS` (300 s by default)
+  after expiry and then also runs to completion.
+- `/api/files/public/preview` and `/api/files/public/download` accept the file
+  ID alone for ordinary tasks, independent of any login; tracked in #1268
+  (https://github.com/xorbitsai/xagent/issues/1268#issuecomment-6852127073).
+- The `/v1` task event stream and the `/api/a2a` streams accept API keys only,
+  never browser tokens, so the policy does not apply to them.
 
 ## Scope
 
@@ -177,7 +233,9 @@ Adapters without a core user (for example Toby) use
 `rejection_http_exception()`, and keep their own session state with the same
 guarantees: shared across replicas and restarts, conditional writes that
 cannot revive an expired login, per-login revocation that survives turning the
-switch off. An adapter may expose its own activity endpoint (keeping its
+switch off. With the switch off they must not implement the lease rule
+themselves: use `expired_while_enforced(enforcement_leases(db),
+last_activity_at=..., roles=..., now=...)`. An adapter may expose its own activity endpoint (keeping its
 CSRF/Origin checks) with the same semantics: check expiry before writing, write
 at most once per login per 60 seconds, return 200 with `idle_session`, no 429.
 Only a real authentication (password, provider OAuth callback, MFA
@@ -208,8 +266,11 @@ same `sid` and is not activity.
    rollout (its refresh token has no `sid`, but an older `sid` is still
    recorded); such a login migrates on its next refresh, or must sign in again
    at activation if it is never refreshed.
-4. Turn the switch on in staging, verify, then in production. Logins without
+4. Make sure `scripts/connector_smoke` no longer depends on a long-lived
+   password-login token (#3787) wherever these checks run, staging included.
+5. Turn the switch on in staging, verify, then in production. Logins without
    `sid`, and logins already idle beyond the threshold, must sign in again.
 
-Turning the switch off stops new expiries immediately; revoked logins stay
-revoked (see the remaining gap above).
+Rollback: turning the switch off stops new expiries immediately and frees every
+login still valid at that moment; logins that expired while it was on stay
+rejected (see "Switching the policy off").

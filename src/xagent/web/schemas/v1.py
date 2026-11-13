@@ -256,6 +256,39 @@ class RuntimeKeyResponse(BaseModel):
     created_at: datetime
 
 
+class AgentRuntimeKeyItem(BaseModel):
+    """One runtime key of an agent, as listed by
+    ``GET /v1/agents/{agent_id}/api-keys``.
+
+    Never carries the secret: ``masked_key`` shows the public prefix followed
+    by a fixed number of bullets, and the full key is only ever returned once,
+    by the call that created it.
+    """
+
+    id: int
+    label: Optional[str] = None
+    key_prefix: str
+    masked_key: str
+    status: Literal["active", "paused", "revoked"]
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class AgentRuntimeKeyRevokeResponse(BaseModel):
+    """Result of ``DELETE /v1/agents/{agent_id}/api-keys/{key_id}``.
+
+    ``revoked`` is ``True`` when this call revoked the key and ``False`` when
+    it had already been revoked; ``revoked_at`` is when the key was revoked
+    either way. ``key_prefix`` identifies the secret that was revoked.
+    """
+
+    id: int
+    key_prefix: str
+    revoked: bool
+    revoked_at: datetime
+
+
 class V1AgentCreateRequest(BaseModel):
     """Body for ``POST /v1/agents``."""
 

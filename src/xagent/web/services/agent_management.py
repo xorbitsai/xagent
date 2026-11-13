@@ -43,6 +43,8 @@ from ..services.agent_store import (
 from .agent_team_scope import get_agent_team_scope
 from .api_keys import (
     AgentApiKeyService,
+    AgentKeyMetadata,
+    AgentKeyRevocation,
     ApiKeyCandidate,
     KeyRotationConflict,
     RuntimeKeyDeliveryError,
@@ -1482,6 +1484,114 @@ class AgentManagementRuntime:
                 all_connectors,
             )
             return _connector_selection(stored, names.visible)
+
+    async def list_agent_runtime_keys(
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+        include_revoked: bool = False,
+    ) -> tuple[AgentKeyMetadata, ...] | None:
+        """The runtime keys of an agent the user can manage, newest first.
+
+        Returns ``None`` when the user cannot manage the agent; that is
+        decided before any key is read. An agent without matching keys is an
+        empty tuple. Revoked keys are left out unless ``include_revoked``.
+        A failed read propagates.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._list_agent_runtime_keys_sync(
+                user_id=user_id,
+                agent_id=agent_id,
+                include_revoked=include_revoked,
+            )
+        )
+
+    @staticmethod
+    def _list_agent_runtime_keys_sync(
+        *, user_id: int, agent_id: int, include_revoked: bool
+    ) -> tuple[AgentKeyMetadata, ...] | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            if AgentStore(db).get_owned_agent(user_id, agent_id, team_scope) is None:
+                return None
+            return tuple(
+                AgentApiKeyService(db).list_keys_for_agent(
+                    agent_id, include_revoked=include_revoked
+                )
+            )
+
+    async def revoke_agent_runtime_key(
+        self,
+        *,
+        user_id: int,
+        credential_ref: str,
+        agent_id: int,
+        key_id: int,
+    ) -> AgentKeyRevocation | None:
+        """Revoke one runtime key of an agent the user can manage.
+
+        Returns ``None`` when the user cannot manage the agent. That is
+        checked before the agent row is locked and before any key is read,
+        and again under the agent's runtime-key transition fence with a
+        freshly resolved team scope, which is the check that decides. Raises
+        :class:`~.api_keys.AgentRuntimeKeyNotFoundError` when the agent has no key with
+        this id. Revoking an already revoked key changes nothing and reports
+        ``revoked=False`` with the original time. A failed commit propagates
+        and leaves the key as it was.
+
+        ``credential_ref`` names the credential the request was made with and
+        is only written to the log line of an effective revocation.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._revoke_agent_runtime_key_sync(
+                user_id=user_id,
+                credential_ref=credential_ref,
+                agent_id=agent_id,
+                key_id=key_id,
+            )
+        )
+
+    @staticmethod
+    def _revoke_agent_runtime_key_sync(
+        *, user_id: int, credential_ref: str, agent_id: int, key_id: int
+    ) -> AgentKeyRevocation | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            store = AgentStore(db)
+            if (
+                store.get_owned_agent(
+                    user_id, agent_id, get_agent_team_scope(db, user_id)
+                )
+                is None
+            ):
+                return None
+            if not acquire_runtime_key_transition_fence(db, agent_id):
+                return None
+            # The fence serializes changes to the agent row. Resolve the team
+            # scope again so a membership change committed since the first
+            # check is honored as well.
+            if (
+                store.get_owned_agent(
+                    user_id, agent_id, get_agent_team_scope(db, user_id)
+                )
+                is None
+            ):
+                return None
+            revocation = AgentApiKeyService(db).revoke_key_for_agent(agent_id, key_id)
+            db.commit()
+        if revocation.revoked:
+            logger.info(
+                "runtime key revoked: credential=%s user_id=%d agent_id=%d "
+                "key_id=%d key_prefix=%s",
+                credential_ref,
+                user_id,
+                agent_id,
+                revocation.key_id,
+                revocation.key_prefix,
+            )
+        return revocation
 
     @staticmethod
     def _run_runtime_key_session_operation(

@@ -109,6 +109,12 @@ class V1ErrorCode(str, Enum):
     # Template id is unknown or unavailable to the caller.
     TEMPLATE_NOT_FOUND = "template_not_found"
 
+    # The agent is manageable by the caller but has no runtime key with the
+    # requested id. 404 -- distinct from agent_not_found so SDK clients can
+    # tell "bad key id" from "bad agent id". A key bound to another agent or
+    # to a workforce is reported the same way as an id that does not exist.
+    API_KEY_NOT_FOUND = "api_key_not_found"
+
     # No skill the key holder can see has this name (GET), or the name does
     # not address a personal skill the holder owns (PUT / DELETE). 404.
     SKILL_NOT_FOUND = "skill_not_found"
@@ -283,6 +289,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "This task's conversation was removed under the retention policy."
     ),
     V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
+    V1ErrorCode.API_KEY_NOT_FOUND: "API key not found for this agent.",
     V1ErrorCode.SKILL_NOT_FOUND: "Skill not found.",
     V1ErrorCode.SKILL_ALREADY_EXISTS: "A skill with this name already exists.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",

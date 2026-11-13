@@ -5274,6 +5274,9 @@ def _schedule_reclaim(
             server_name, task, recorder, _HANDSHAKE_RECLAIM_GRACE_SECONDS
         )
     )
+    from .mcp_load_lifetime import track_mcp_load_task
+
+    track_mcp_load_task(reaper)
     _RECLAIM_TASKS.add(reaper)
     reaper.add_done_callback(_RECLAIM_TASKS.discard)
 
@@ -5561,7 +5564,10 @@ async def _load_server_tools_bounded(
     if timeout_seconds <= 0:
         return await load_coro
 
+    from .mcp_load_lifetime import track_mcp_load_task
+
     task = asyncio.ensure_future(load_coro)
+    track_mcp_load_task(task)
     # Keep a strong reference until the task truly finishes, including an
     # abandoned (cancellation-resistant) load.
     _active_load_tasks.add(task)

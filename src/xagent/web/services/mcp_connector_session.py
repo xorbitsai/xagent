@@ -19,6 +19,7 @@ by catalog ``app_id`` through ``list_actor_stdio_connector_tools`` instead.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import shlex
 from contextlib import asynccontextmanager
@@ -408,21 +409,40 @@ async def _start_and_list(
     # connection across it, as create_mcp_tools does not (issue #889).
     tool_config.release_db_connection()
 
-    try:
+    connector_refs = ToolFactory._mcp_connector_refs({server_name: server_config})
+    from ...core.tools.adapters.vibe.mcp_load_lifetime import current_load_lifetime
+
+    lifetime = current_load_lifetime.get()
+
+    async def start_and_list() -> Any:
         async with _task_sandbox(connection, user_id) as sandbox:
             load_kwargs: dict[str, Any] = {}
             if sandbox is not None:
                 load_kwargs["sandbox"] = sandbox
-            # Typed like ToolFactory's own connection map (factory.py).
             connections: dict[str, Any] = {server_name: connection}
-            load_result = await mcp_adapter.load_mcp_tools_as_agent_tools(
-                connections,
-                name_prefix=name_prefix,
-                connector_refs=ToolFactory._mcp_connector_refs(
-                    {server_name: server_config}
-                ),
-                **load_kwargs,
-            )
+            try:
+                return await mcp_adapter.load_mcp_tools_as_agent_tools(
+                    connections,
+                    name_prefix=name_prefix,
+                    connector_refs=connector_refs,
+                    **load_kwargs,
+                )
+            finally:
+                # Do not release a sandbox still used by a detached handshake.
+                if lifetime is not None and sandbox is not None:
+                    pending = lifetime.pending_tasks()
+                    if pending:
+                        await asyncio.wait(pending)
+
+    try:
+        if lifetime is None:
+            load_result = await start_and_list()
+        else:
+            # Only transport/sandbox work escapes the request, never its DB
+            # session or ORM user. Acquire, attach and release have one owner.
+            work = asyncio.create_task(start_and_list())
+            lifetime.track(work)
+            load_result = await asyncio.shield(work)
     except _SandboxUnavailable:
         return result(
             ConnectorToolsOutcome.FAILED_TO_START, reason="sandbox_unavailable"

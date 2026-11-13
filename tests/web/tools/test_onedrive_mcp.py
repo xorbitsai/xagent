@@ -3124,20 +3124,18 @@ def test_upload_file_returns_structured_lock_error_without_blind_retry(
 
     result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
 
+    message = result.pop("message")
     assert result == {
         "status": "error",
-        "message": (
-            "The OneDrive item is locked, so it could not be overwritten. "
-            "Close the document in Word or Teams and retry later, or use a "
-            "different destination path to save a copy."
-        ),
         "code": "resource_locked",
         "retryable": True,
         "lock_owner": None,
         "suggested_actions": ["close_document_and_retry", "save_as_copy"],
     }
+    assert "locked" in message
+    assert "overwritten" in message
     assert request.call_count == 1
-    assert "download.example" not in result["message"]
+    assert "download.example" not in message
 
 
 def test_upload_file_maps_large_upload_423_to_structured_lock_error(
@@ -3509,3 +3507,225 @@ def test_upload_session_omits_personal_onedrive_download_url(
     result = _assert_no_download_urls(onedrive.onedrive_upload_file(str(local_file)))
 
     assert result["item"] == _caller_visible_item()
+
+
+def _call_item_write_tool(operation):
+    if operation == "rename":
+        return json.loads(onedrive.onedrive_rename_item("item-1", "new.txt"))
+    if operation == "delete":
+        return json.loads(onedrive.onedrive_delete_item("item-1"))
+    return json.loads(onedrive.onedrive_upload_text_file("report.txt", "text"))
+
+
+@pytest.mark.parametrize("operation", ["rename", "delete", "text_upload"])
+def test_item_write_lock_requires_user_confirmation(monkeypatch, caplog, operation):
+    # Production reports in #3021 observed 423 with notAllowed.
+    error = {
+        "code": "notAllowed",
+        "message": "locked; secret=https://upload.example/s?token=SECRET",
+    }
+    request = Mock(return_value=MockResponse({"error": error}, status_code=423))
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = _call_item_write_tool(operation)
+
+    assert result["status"] == "error"
+    assert result.get("code") == "resource_locked"
+    assert result["retryable"] is True
+    assert result["lock_owner"] is None
+    assert "locked" in result["message"]
+    assert "Do not retry until the user confirms" in result["message"]
+    assert "possibly by someone else" in result["message"]
+    assert "(Graph error code: notAllowed)" in result["message"]
+    assert "HTTP 423" not in result["message"]
+    assert "SECRET" not in json.dumps(result) + caplog.text
+    assert request.call_count == 1
+    assert not onedrive.time.sleep.called
+    if operation in {"rename", "delete"}:
+        assert result["suggested_actions"] == ["close_document_and_retry"]
+        assert "save a copy" not in result["message"]
+        # Rename and delete accept folders, which a locked file inside blocks.
+        assert "or a file in it" in result["message"]
+    else:
+        assert "or a file in it" not in result["message"]
+        assert result["suggested_actions"] == [
+            "close_document_and_retry",
+            "save_as_copy",
+        ]
+        assert "Ask the user before" in result["message"]
+
+
+def test_item_write_classifier_recognizes_lock_without_error_code():
+    # Constructed boundary: the HTTP status is sufficient without error.code.
+    error = onedrive._GraphRequestError("Graph request failed with HTTP 423", 423)
+
+    result = json.loads(
+        onedrive._item_write_error(error, "deleted", is_file_write=False)
+    )
+
+    assert result["code"] == "resource_locked"
+    assert "Do not retry until the user confirms" in result["message"]
+    assert "HTTP 423" not in result["message"]
+    assert "Graph error code" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    ("status", "graph_code", "expected_message"),
+    [
+        (403, "accessDenied", "no permission"),
+        (404, "itemNotFound", "was not found"),
+    ],
+)
+def test_item_write_classifier_explains_access_errors(
+    status, graph_code, expected_message
+):
+    error = onedrive._GraphRequestError("Graph request failed", status, graph_code)
+
+    result = json.loads(
+        onedrive._item_write_error(error, "deleted", is_file_write=False)
+    )
+
+    assert result["status"] == "error"
+    assert expected_message in result["message"]
+    assert f"(Graph error code: {graph_code})" in result["message"]
+    assert result.get("code") != "resource_locked"
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_text_upload_access_errors_do_not_assume_an_existing_file(monkeypatch, status):
+    # A text upload usually creates a new file.
+    request = Mock(
+        return_value=MockResponse(
+            {"error": {"code": "accessDenied"}}, status_code=status
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = _call_item_write_tool("text_upload")
+
+    assert result["status"] == "error"
+    assert "overwritten" not in result["message"]
+    assert "no longer exists" not in result["message"]
+
+
+def test_rename_name_conflict_suggests_a_different_name(monkeypatch):
+    request = Mock(
+        return_value=MockResponse(
+            {"error": {"code": "nameAlreadyExists"}}, status_code=409
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = _call_item_write_tool("rename")
+
+    assert result["status"] == "error"
+    assert "already contains an item named 'new.txt'" in result["message"]
+    assert "different new_name" in result["message"]
+    assert "HTTP 409" not in result["message"]
+    assert result.get("code") != "resource_locked"
+    assert request.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "graph_code"),
+    [(409, "otherConflict"), (409, None), (500, "generalException")],
+)
+def test_item_write_classifier_preserves_unknown_errors(status, graph_code):
+    error = onedrive._GraphRequestError("original Graph error", status, graph_code)
+
+    # Supply new_name so these cases exercise the boundary of rename guidance.
+    result = json.loads(
+        onedrive._item_write_error(
+            error, "renamed", is_file_write=False, new_name="new.txt"
+        )
+    )
+
+    assert result == {"status": "error", "message": str(error)}
+
+
+@pytest.mark.parametrize("operation", ["delete", "text_upload"])
+def test_name_conflict_guidance_is_specific_to_rename(monkeypatch, operation):
+    request = Mock(
+        return_value=MockResponse(
+            {"error": {"code": "nameAlreadyExists"}}, status_code=409
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = _call_item_write_tool(operation)
+
+    assert "HTTP 409" in result["message"]
+    assert "different new_name" not in result["message"]
+    assert result.get("code") != "resource_locked"
+
+
+@pytest.mark.parametrize("operation", ["rename", "delete", "text_upload"])
+def test_item_write_success_still_sends_one_request(monkeypatch, operation):
+    request = Mock(
+        return_value=MockResponse(
+            {"id": "item-1", "name": "new.txt"},
+            status_code=204 if operation == "delete" else 200,
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = _call_item_write_tool(operation)
+
+    if operation == "delete":
+        assert result == {"status": "success", "message": "Item deleted successfully"}
+    else:
+        assert result == {
+            "status": "success",
+            "item": {"id": "item-1", "name": "new.txt"},
+        }
+    assert request.call_count == 1
+
+
+@pytest.mark.parametrize("upload_step", ["simple", "session_creation", "fragment"])
+def test_file_upload_lock_waits_for_confirmation_before_retry_or_copy(
+    monkeypatch, caplog, _upload_allowed_dirs_env, upload_step
+):
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"content")
+    request = Mock(
+        return_value=MockResponse(
+            {"error": {"code": "notAllowed", "message": "SECRET"}}, status_code=423
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+    if upload_step == "session_creation":
+        monkeypatch.setattr(
+            onedrive.os,
+            "fstat",
+            Mock(return_value=Mock(st_size=onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1)),
+        )
+    if upload_step == "fragment":
+        with local_file.open("r+b") as fh:
+            fh.truncate(onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1)
+        put = Mock(
+            return_value=MockResponse({"error": {"message": "SECRET"}}, status_code=423)
+        )
+        request.return_value = MockResponse(
+            {"uploadUrl": "https://upload.example/s?token=SECRET"}
+        )
+        _patch_session(monkeypatch, _FakeSession(put=put))
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert result.get("code") == "resource_locked"
+    assert result["retryable"] is True
+    assert result["lock_owner"] is None
+    assert result["suggested_actions"] == [
+        "close_document_and_retry",
+        "save_as_copy",
+    ]
+    assert "Do not retry until the user confirms" in result["message"]
+    assert "Ask the user before" in result["message"]
+    assert "save a copy" in result["message"]
+    assert "HTTP 423" not in result["message"]
+    assert "SECRET" not in json.dumps(result) + caplog.text
+    assert request.call_count == 1
+    assert not onedrive.time.sleep.called
+    if upload_step == "fragment":
+        assert put.call_count == 1

@@ -12,17 +12,24 @@ module's own ``_masked_auth``.
 A create calls the web ``create_mcp_server`` with a request model built from
 the SDK body, so the web code decides every stored value, name rule and
 encryption. This module never assigns ``url`` or ``auth`` on a stored row.
-A delete calls the web ``delete_mcp_server`` and a switch calls the web
-``update_mcp_server`` with an ``is_active``-only request, after this module has
-checked that the holder has a link of their own to change. The web function's
-``HTTPException`` propagates; the route translates it.
+An update calls the web ``update_mcp_server`` with a request model that holds
+exactly the fields the SDK body carried, ``url``, ``headers`` and ``auth``
+inside ``config``. A delete calls the web ``delete_mcp_server`` and a switch
+calls the web ``update_mcp_server`` with an ``is_active``-only request, after
+this module has checked that the holder has a link of their own to change. The
+web function's ``HTTPException`` propagates; the route translates it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Iterable, Optional, cast
+from types import SimpleNamespace
+from typing import Any, Callable, Iterable, Optional, cast
+
+from sqlalchemy import String
+from sqlalchemy import cast as sa_cast
+from sqlalchemy import literal, or_
 
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
@@ -36,6 +43,7 @@ from ..api.mcp import (
     _format_optional_datetime,
     _mask_env,
     _mcp_oauth_configuration_error,
+    _member_grant_binding,
     _oauth_account_summaries,
     _require_parsable_mcp_oauth_identifiers,
     create_mcp_server,
@@ -51,6 +59,7 @@ from ..schemas.v1 import (
     V1McpServer,
     V1McpServerAuthorization,
     V1McpServerCreateRequest,
+    V1McpServerUpdateRequest,
 )
 from .connector_team_scope import (
     ConnectorHookSessionBoundaryError,
@@ -285,6 +294,170 @@ def _web_create_request(request: V1McpServerCreateRequest) -> MCPServerCreate:
         signed_uploads=request.signed_uploads,
         allow_delegated_authorization=request.allow_delegated_authorization,
     )
+
+
+def _web_update_request(request: V1McpServerUpdateRequest) -> MCPServerUpdate:
+    # The web function decides what to write from which fields are present, so
+    # only the fields the body carried are passed, null ones included.
+    data = request.model_dump(exclude_unset=True)
+    config = {key: data.pop(key) for key in ("url", "headers", "auth") if key in data}
+    if config:
+        data["config"] = config
+    return MCPServerUpdate(**data)
+
+
+_REBIND_REFUSED_MESSAGE = (
+    "Other accounts have authorized this connector with their own sign-in; "
+    "change its URL, issuer or resource metadata URL in the web app."
+)
+
+
+def _grants_surviving_rebind(db: Any, *, server_id: int, user_id: int) -> Any:
+    """Ids of the active grants on ``server_id`` that update_mcp_server keeps
+    on a binding change, other than the holder's own default-identity grant.
+
+    The filter is the complement of the deletion in
+    _delete_team_path_mcp_oauth_state within active grants; a test runs both
+    on one connector and checks that every such grant is deleted or counted.
+    """
+    holds_association = (
+        db.query(UserMCPServer.id)
+        .filter(
+            UserMCPServer.user_id == MCPOAuthGrant.user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .exists()
+    )
+    own_default = _default_resource_owner_key(user_id)
+    return db.query(MCPOAuthGrant.id).filter(
+        MCPOAuthGrant.mcp_server_id == server_id,
+        MCPOAuthGrant.status == "active",
+        or_(
+            MCPOAuthGrant.user_id != user_id,
+            MCPOAuthGrant.resource_owner_key != own_default,
+        ),
+        or_(
+            holds_association,
+            MCPOAuthGrant.resource_owner_key
+            != literal("xagent:user:") + sa_cast(MCPOAuthGrant.user_id, String),
+        ),
+    )
+
+
+def _has_active_grant_surviving_rebind(
+    db: Any, *, server_id: int, user_id: int
+) -> bool:
+    """Whether an active grant that update_mcp_server keeps on a binding change
+    exists, other than the holder's own default-identity grant.
+
+    update_mcp_server deletes the grants of users without an association row
+    held under their own default owner key (_delete_team_path_mcp_oauth_state).
+    This matches the rest: grants of users who hold an association row (active
+    or not), and grants under any other owner key. It does not look at
+    expiry or at the current auth configuration: the runtime does not filter
+    grants by expiry, and a configuration switched away and back selects the
+    old grants again.
+
+    The web app makes the same change and keeps these grants. This route
+    refuses it instead, because such a change does not always leave a kept
+    grant unusable: grant selection compares a linked user's grant with
+    ``auth.resource`` and ``auth.issuer`` only when they are set.
+    """
+    return (
+        _grants_surviving_rebind(db, server_id=server_id, user_id=user_id).first()
+        is not None
+    )
+
+
+def _require_rebind_editor(db: Any, *, server_id: int, user_id: int) -> None:
+    """Refuse a binding change from a holder who may not edit the shared
+    configuration.
+
+    Runs with the definition row locked and before any grant is read. The
+    holder's link and admin flag are read again, as update_mcp_server reads
+    them after its own lock, so a holder who may not edit gets the same
+    answer whoever else has authorized the connector.
+    """
+    # Imported here for the reason given in ``_load_holder``.
+    from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+    link = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user_id,
+            UserMCPServer.mcpserver_id == server_id,
+        )
+        .populate_existing()
+        .first()
+    )
+    if link is None:
+        raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
+    holder = db.query(User).filter(User.id == user_id).populate_existing().first()
+    if holder is None:
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+    if not _check_mcp_permission(link, bool(holder.is_admin), require="edit"):
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_FORBIDDEN, 403, details={"reason": "not_permitted"}
+        )
+
+
+def _refuse_unsafe_update_under_lock(
+    db: Any, request: V1McpServerUpdateRequest, *, server_id: int, user_id: int
+) -> None:
+    """Refuse an update the web function would apply wrongly or unsafely.
+
+    Takes the definition row lock, as the web function does later in the same
+    transaction, and judges against the row read under it. Reads only; nothing
+    is written before the web function runs.
+    """
+    # Imported here for the reason given in ``_load_holder``.
+    from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+    locked = (
+        db.query(MCPServer)
+        .filter(MCPServer.id == server_id)
+        .populate_existing()
+        .with_for_update(key_share=True)
+        .first()
+    )
+    if locked is None:
+        raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
+    sent = request.model_fields_set
+    before = _member_grant_binding(locked)
+    # What the web function will store, read by the web function's own rule
+    # for what a grant is bound to. The stored row is never assigned to.
+    after = _member_grant_binding(
+        cast(
+            MCPServer,
+            SimpleNamespace(
+                url=request.url if "url" in sent else locked.url,
+                auth=request.auth if "auth" in sent else locked.auth,
+            ),
+        )
+    )
+    if before != after:
+        _require_rebind_editor(db, server_id=server_id, user_id=user_id)
+        if _has_active_grant_surviving_rebind(db, server_id=server_id, user_id=user_id):
+            raise V1ApiError(
+                V1ErrorCode.CONNECTOR_NOT_EDITABLE,
+                409,
+                _REBIND_REFUSED_MESSAGE,
+                details={"reason": "authorized_by_others"},
+            )
+    # The web function stores a masked secret that has nothing to keep as
+    # empty, without an error.
+    stored_auth = locked.auth if isinstance(locked.auth, dict) else {}
+    for key, value in (request.auth or {}).items():
+        if (
+            key in SENSITIVE_AUTH_FIELDS
+            and value == MASKED_SECRET_VALUE
+            and not stored_auth.get(key)
+        ):
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                400,
+                f"Masked secret '{key}' has no stored value; provide a new value",
+            )
 
 
 def _masked_dict(value: Any) -> Optional[dict[str, Any]]:
@@ -643,6 +816,86 @@ class McpServerManagementRuntime:
             _log_write(
                 "enable" if enabled else "disable", key_prefix, user_id, server_id
             )
+            return projected
+
+        return await run_db_io_cancellation_safe(run)
+
+    async def update_server(
+        self,
+        *,
+        user_id: int,
+        key_prefix: str,
+        server_id: int,
+        request: V1McpServerUpdateRequest,
+        validate: Callable[[V1McpServerUpdateRequest], None],
+    ) -> V1McpServer:
+        """Change the fields the body carries and return the connector.
+
+        ``validate`` holds the body rules that need no database; it runs after
+        the connector is found and known to be one the holder may try to
+        change, so a connector the holder may not change answers before a bad
+        body does. A holder who may not edit the shared configuration answers
+        403 for any non-empty body, before the web function runs and without a
+        write line. A body with no field changes nothing. The web function
+        commits before the projection runs, so a projection failure answers 500
+        with the change stored.
+        """
+        # Imported here for the reason given in ``_load_holder``.
+        from ..api.v1.errors import V1ApiError, V1ErrorCode
+
+        def run() -> V1McpServer:
+            with get_session_local()() as db:
+                user = _load_holder(db, user_id)
+                server, link = _resolve_changeable(db, user_id, server_id)
+                if connector_kind(db, server) == "catalog":
+                    raise V1ApiError(
+                        V1ErrorCode.CONNECTOR_NOT_EDITABLE,
+                        409,
+                        _CATALOG_NOT_EDITABLE_MESSAGE,
+                        details={"reason": "catalog"},
+                    )
+                if server.transport not in _REMOTE_TRANSPORTS:
+                    raise V1ApiError(
+                        V1ErrorCode.TRANSPORT_NOT_SUPPORTED,
+                        400,
+                        f"This connector uses the '{server.transport}' transport; "
+                        "change it in the web app.",
+                    )
+                sent = request.model_fields_set
+                # Every field this body can carry is shared configuration; the
+                # web function refuses or silently drops it for a holder who may
+                # not edit, so such a holder can change nothing here.
+                if sent and not _check_mcp_permission(
+                    link, bool(user.is_admin), require="edit"
+                ):
+                    raise V1ApiError(
+                        V1ErrorCode.CONNECTOR_FORBIDDEN,
+                        403,
+                        details={"reason": "not_permitted"},
+                    )
+                validate(request)
+                shown: tuple[MCPServer, UserMCPServer | None] = (server, link)
+                if sent:
+                    if sent & {"url", "auth"}:
+                        _refuse_unsafe_update_under_lock(
+                            db, request, server_id=server_id, user_id=user_id
+                        )
+                    update_mcp_server(
+                        server_id,
+                        _web_update_request(request),
+                        current_user=user,
+                        db=db,
+                    )
+                    resolved = resolve_holder_connector(db, user_id, server_id)
+                    if resolved is None or resolved[1] is None:
+                        # The web function has committed the update, so the
+                        # holder's link is gone only if it was deleted in between,
+                        # even when the team still shares the connector.
+                        raise V1ApiError(V1ErrorCode.CONNECTOR_NOT_FOUND, 404)
+                    shown = resolved
+                projected = _project_rows(db, user, [shown])[0]
+            if sent:
+                _log_write("update", key_prefix, user_id, server_id)
             return projected
 
         return await run_db_io_cancellation_safe(run)

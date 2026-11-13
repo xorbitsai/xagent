@@ -686,6 +686,57 @@ class V1McpServerCreateRequest(BaseModel):
     )
 
 
+class V1McpServerUpdateRequest(BaseModel):
+    """Body for ``PATCH /v1/mcp-servers/{server_id}``.
+
+    Only the fields present in the body change. ``name``, ``transport``,
+    ``url``, ``description``, ``headers``, ``auth`` and
+    ``allow_delegated_authorization`` cannot be null; omit them to keep the
+    stored value. ``runtime_input_schema``, ``runtime_bindings`` and
+    ``signed_uploads`` are cleared by sending null. ``headers`` and ``auth``
+    replace the stored dictionary as a whole; send ``{}`` to clear one. A
+    header value or a secret auth field (``bearer_token``, ``api_key_value``,
+    ``client_secret``, ``access_token``) sent as ``********`` keeps its stored
+    value. An empty body changes nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[Annotated[str, StringConstraints(min_length=1, max_length=100)]] = (
+        None
+    )
+    transport: Optional[
+        Annotated[str, StringConstraints(min_length=1, max_length=32)]
+    ] = Field(None, description="'streamable_http' or 'sse'.")
+    url: Optional[Annotated[str, StringConstraints(min_length=1, max_length=500)]] = (
+        Field(None, description="Absolute http(s) URL without user info.")
+    )
+    description: Optional[Annotated[str, StringConstraints(max_length=10000)]] = None
+    headers: Optional[dict[_HeaderName, _HeaderValue]] = Field(
+        None,
+        max_length=20,
+        description=(
+            "Replaces the stored headers as a whole; send {} to clear them. "
+            "A value sent as '********' keeps the stored value of that header."
+        ),
+    )
+    auth: Optional[dict[str, Any]] = Field(
+        None,
+        max_length=30,
+        description=(
+            "Replaces the stored authentication settings as a whole; send {} "
+            "to clear them. Leaving out 'issuer' or 'resource_metadata_url' "
+            "removes it. A secret field sent as '********' keeps its stored "
+            "value. The keys 'app_id', 'provider' and "
+            "'builtin_provenance' mark catalog connectors and are rejected."
+        ),
+    )
+    runtime_input_schema: Optional[dict[str, Any]] = None
+    runtime_bindings: Optional[list[dict[str, Any]]] = None
+    signed_uploads: Optional[list[dict[str, Any]]] = None
+    allow_delegated_authorization: Optional[bool] = None
+
+
 class V1McpServerEnabledRequest(BaseModel):
     """Body for ``PUT /v1/mcp-servers/{server_id}/enabled``."""
 

@@ -157,12 +157,13 @@ class V1ErrorCode(str, Enum):
     CONNECTOR_NAME_CONFLICT = "connector_name_conflict"
 
     # The connector cannot be changed or deleted through the API: it is a
-    # catalog app connection, or a connector with OAuth connections that
-    # another account (such as an automation account) manages through the
-    # holder's link. 409.
-    # ``details.reason`` says which: ``catalog`` or ``managed_elsewhere``
-    # (``unknown`` for a 409 from a create or a switch, which the web code
-    # does not raise today).
+    # catalog app connection, a connector with OAuth connections that another
+    # account (such as an automation account) manages through the holder's
+    # link, or a connector whose URL, issuer or resource metadata URL cannot
+    # move while authorizations of other accounts would be kept. 409.
+    # ``details.reason`` says which: ``catalog``, ``managed_elsewhere`` or
+    # ``authorized_by_others`` (``unknown`` for a web 409 from a create, a
+    # switch or an update, which the web code does not raise today).
     CONNECTOR_NOT_EDITABLE = "connector_not_editable"
 
     # The key holder may see the connector but may not change it: the team

@@ -237,6 +237,7 @@ def _own_routes() -> list[tuple[str, str]]:
         ("GET", "/v1/mcp-servers/{server_id}/tools"),
         ("DELETE", "/v1/mcp-servers/{server_id}"),
         ("PUT", "/v1/mcp-servers/{server_id}/enabled"),
+        ("PATCH", "/v1/mcp-servers/{server_id}"),
     ],
 )
 def test_mcp_routes_accept_only_personal_keys(method, path, kind):
@@ -245,10 +246,11 @@ def test_mcp_routes_accept_only_personal_keys(method, path, kind):
         ("GET", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}"),
         ("GET", "/v1/mcp-servers/{server_id}/tools"),
+        ("PATCH", "/v1/mcp-servers/{server_id}"),
         ("POST", "/v1/mcp-servers"),
         ("PUT", "/v1/mcp-servers/{server_id}/enabled"),
     ]
-    bodies = {"POST": _create_body(), "PUT": {"enabled": True}}
+    bodies = {"POST": _create_body(), "PUT": {"enabled": True}, "PATCH": {}}
     resp = client.request(
         method,
         path.replace("{server_id}", "1"),
@@ -1658,6 +1660,13 @@ _ROW_CASES: list[tuple[str, HTTPException, int, str, str]] = [
         _DEFAULT_MESSAGES[V1ErrorCode.CONNECTOR_FORBIDDEN],
     ),
     (
+        "account_gone",
+        HTTPException(404, "Requesting user account no longer exists"),
+        401,
+        "invalid_api_key",
+        _DEFAULT_MESSAGES[V1ErrorCode.INVALID_API_KEY],
+    ),
+    (
         "not_found",
         HTTPException(404, f"MCP server not found {_REQUEST_SECRET_VALUES[1]}"),
         404,
@@ -1698,7 +1707,7 @@ _ROW_DETAILS = {
 
 def test_create_success_carries_no_secret(bob):
     rows = mcp_servers_routes._MCP_WRITE_ERROR_ROWS
-    assert len(rows) == 9
+    assert len(rows) == 10
     assert {row.id for row in rows} == {case[0] for case in _ROW_CASES}
 
     ok = _create(bob, name="made-connector", **_REQUEST_SECRETS)
@@ -1719,7 +1728,7 @@ def test_create_success_carries_no_secret(bob):
     ids=[f"{case[0]}-{i}" for i, case in enumerate(_ROW_CASES)],
 )
 def test_write_error_translation(bob, monkeypatch, row_id, exc, status, code, message):
-    assert len(_ROW_CASES) == 13
+    assert len(_ROW_CASES) == 14
     before = _store()
     _fail_web_create(monkeypatch, exc)
 

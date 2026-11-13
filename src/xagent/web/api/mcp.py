@@ -104,6 +104,7 @@ from ..services.mcp_oauth import (
     MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
+    OAUTH_TOKEN_PAYLOAD_EXCLUDED_METADATA_KEYS,
     MCPOAuthDiscoveryError,
     SafeOAuthAsyncHTTPTransport,
     _canonical_issuer,
@@ -2469,7 +2470,7 @@ def _upsert_mcp_oauth_grant(
         {
             key: value
             for key, value in token_data.items()
-            if key not in {"access_token", "refresh_token"}
+            if key not in OAUTH_TOKEN_PAYLOAD_EXCLUDED_METADATA_KEYS
         },
     )
     setattr(grant, "expires_at", oauth_token_expires_at(token_data))

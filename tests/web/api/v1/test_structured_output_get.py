@@ -143,6 +143,8 @@ def test_the_existing_fields_are_byte_identical_to_the_recorded_baseline():
         assert all(name in body for name in NEW_KEYS)
         for name in NEW_KEYS:
             del body[name]
+        # Added after the baseline was recorded; null for these tasks.
+        assert body.pop("error_code") is None
         assert json.dumps(body, ensure_ascii=False, separators=(",", ":")) == expected
 
 

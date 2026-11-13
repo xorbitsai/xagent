@@ -182,7 +182,68 @@ def test_the_stream_reads_the_record_with_the_row_in_one_select():
 
 
 def test_a_frame_built_without_fields_carries_null_for_each():
-    frame = es.completed_frame(status=TaskStatus.FAILED.value, output=None, error="x")
+    frame = es.completed_frame(
+        status=TaskStatus.FAILED.value, output=None, error="x", error_code=None
+    )
 
     data = json.loads(frame.split("data: ", 1)[1])
     assert [data[name] for name in NEW_KEYS] == [None, None, None]
+
+
+def _incomplete_record(code: str, **extra: Any) -> dict[str, Any]:
+    reason: dict[str, Any] = {"code": code}
+    if code == "information_missing":
+        reason["missing_fields"] = ["/g"]
+    if code == "value_not_expressible":
+        reason["unexpressible_fields"] = ["/g"]
+    return {
+        "run_id": "run-1",
+        "status": "incomplete",
+        "output": None,
+        "reason": reason,
+        **extra,
+    }
+
+
+PARTIAL = {"name": "x", "g": None}
+RETURNED_RECORDS = {
+    "gap-code-with-values": _incomplete_record(
+        "information_missing", partial_output=PARTIAL
+    ),
+    "agent-partial-with-values": _incomplete_record(
+        "agent_partial", partial_output=PARTIAL
+    ),
+    "agent-partial-with-values-and-lists": _incomplete_record(
+        "agent_partial",
+        partial_output=PARTIAL,
+        partial_gaps={"missing_fields": ["/g"], "unexpressible_fields": ["/n"]},
+    ),
+    "agent-blocked-with-values": _incomplete_record(
+        "agent_blocked", partial_output=PARTIAL
+    ),
+    "agent-blocked-with-values-and-lists": _incomplete_record(
+        "agent_blocked",
+        partial_output=PARTIAL,
+        partial_gaps={"missing_fields": ["/g"]},
+    ),
+    "incomplete-without-values": _incomplete_record("agent_partial"),
+    "ready": RECORD,
+}
+
+
+@pytest.mark.parametrize("name", list(RETURNED_RECORDS))
+def test_the_response_and_the_frame_return_the_same_result_and_reason(name):
+    record = RETURNED_RECORDS[name]
+    assert len(RETURNED_RECORDS) == 7
+    agent_id, key = create_agent_with_key()
+    task_id = insert_task(agent_id, record=record, agent_config=FORMAT_CONFIG)
+
+    data, _raw = completed_data(key, task_id)
+    response = client.get(f"/v1/chat/tasks/{task_id}", headers=bearer(key)).json()
+
+    assert {k: data[k] for k in NEW_KEYS} == {k: response[k] for k in NEW_KEYS}
+    expected = record.get("partial_output", record["output"])
+    assert response["structured_output"] == expected
+    assert response["structured_output_status"] == record["status"]
+    if record["reason"] is not None:
+        assert response["structured_output_reason"]["code"] == record["reason"]["code"]

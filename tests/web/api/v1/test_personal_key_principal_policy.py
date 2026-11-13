@@ -130,8 +130,8 @@ def test_personal_key_policy_runs_only_after_the_key_verifies() -> None:
 def test_personal_key_policy_applies_to_every_personal_key_route() -> None:
     routes = _personal_key_routes()
     # The 24 management routes (me, agents, templates, skills, MCP connectors, agent
-    # connectors), the 11 /v1/chat task routes and the features route.
-    assert len(routes) == 36, routes
+    # connectors), the 12 /v1/chat task routes and the features route.
+    assert len(routes) == 37, routes
     headers = _bearer(_create_personal_key()[0])
 
     for method, template in routes:

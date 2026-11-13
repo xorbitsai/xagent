@@ -991,3 +991,23 @@ With automatic resume on, and `XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED` not set 
 ### Rollback
 
 - Nothing stored needs to be undone. Reads show `paused` again. SDK tasks paused by a settlement interruption keep being resumed automatically and rest `paused` when automatic resume stops; deploying again makes them read `failed`.
+
+## 2026-11-13 — SDK tasks: `POST /v1/chat/tasks/{task_id}/cancel`, and `error_code` on task reads
+
+A running task created through `/v1` can now be cancelled. The cancelled task reads `failed` with a new `error_code` of `task_cancelled`, and accepts a new message like any failed task.
+
+### Client-visible changes
+
+- `POST /v1/chat/tasks/{task_id}/cancel` answers 200 once the task is cancelled, including when an earlier call already cancelled it, and 202 when the cancel is recorded but not applied yet. If a new turn has started by the time 200 is returned, `status` and `run_id` describe the new turn and `cancelled_run_id` names the cancelled one.
+- 409 `task_not_cancellable` means the run ended without being cancelled, including one that ended on its own, or was replaced by another turn, while the cancel was being applied. 409 `task_busy` means retry: the task is waiting for an answer, paused, has a turn queued to start, or changed state while the cancel was applied. 503 means the cancel could not be applied; retry.
+- `GET /v1/chat/tasks/{task_id}` and the `task.completed` frame of `GET /v1/chat/tasks/{task_id}/events` carry `error_code`, `task_cancelled` for a cancelled task and `null` otherwise.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Mixed versions: a run owned by a process that predates this change rejects the cancel command as an unsupported scope, so the endpoint answers 503 until every process that executes tasks has been upgraded; calling again then succeeds.
+- The Python SDK `tasks.cancel()` ships once waiting and paused tasks can be cancelled as well; until then only direct HTTP callers reach this endpoint.
+
+### Rollback
+
+- A task cancelled before the rollback stays `failed`; an older process does not report `error_code`, so that field is absent from its reads. The cancel endpoint answers 404 again.

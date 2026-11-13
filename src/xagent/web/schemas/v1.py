@@ -144,9 +144,13 @@ class CreateTaskRequest(BaseModel):
             "Output format of the task. Omitted, null or "
             '``{"type": "text"}`` means no format; a ``json_schema`` object '
             "(``name``, ``schema`` and optionally ``strict`` set to true and "
-            "``description``) sets it for this and later turns. An invalid "
-            "value is rejected with 422 ``invalid_input``; the message starts "
-            "with the rule id and the JSON path of the offending value."
+            "``description``) sets it for this and later turns. A "
+            "``json_schema`` object may also carry ``accept_partial`` (true or "
+            "false, default false), a switch that keeps the values extracted "
+            "from a run the agent rated partial or blocked, and from an "
+            "incomplete result; it is not accepted with ``type`` ``text``. An "
+            "invalid value is rejected with 422 ``invalid_input``; the message "
+            "starts with the rule id and the JSON path of the offending value."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
@@ -960,10 +964,15 @@ class AppendMessageRequest(BaseModel):
             'format as it is; ``{"type": "text"}`` clears it; a '
             "``json_schema`` object (``name``, ``schema`` and optionally "
             "``strict`` set to true and ``description``) sets it for this and "
-            "later turns. An invalid value is rejected with 422 "
-            "``invalid_input``; the message starts with the rule id and the "
-            "JSON path of the offending value. Not accepted with a workforce "
-            "key (422)."
+            "later turns. A new ``json_schema`` object replaces the stored one "
+            "as a whole, including ``accept_partial``: send ``accept_partial`` "
+            "again to keep it. ``accept_partial`` (true or false, default "
+            "false) keeps the values extracted from a run the agent rated "
+            "partial or blocked, and from an incomplete result; it is not "
+            "accepted with ``type`` ``text``. An invalid value is rejected "
+            "with 422 ``invalid_input``; the message starts with the rule id "
+            "and the JSON path of the offending value. Not accepted with a "
+            "workforce key (422)."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
@@ -1195,6 +1204,48 @@ class CancelQuestionResponse(BaseModel):
     )
 
 
+class CancelTaskResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/cancel`` -> 200 / 202 response.
+
+    200: the run named by ``cancelled_run_id`` is cancelled, whether this
+    call did it or an earlier one already had. The other fields describe
+    the task now: it reads ``failed`` with ``error_code='task_cancelled'``
+    unless a new turn has started since, in which case ``status``,
+    ``run_id``, ``state_version`` and ``error_code`` describe that turn.
+    202: the cancel was recorded but not applied yet; ``status`` is still
+    the task's current one and ``cancelled_run_id`` is null. Calling again
+    reaches the same request.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    status: str = Field(
+        ...,
+        description=(
+            "Task status as stored: 'failed' once cancelled, the status of a "
+            "turn that started after the cancel, or, on 202, the status the "
+            "cancel is still being applied to."
+        ),
+    )
+    run_id: Optional[str] = Field(..., description="Current execution run identity.")
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    cancelled_run_id: Optional[str] = Field(
+        ...,
+        description=(
+            "The run that was cancelled. Null while the cancel has not been applied."
+        ),
+    )
+    error_code: Optional[str] = Field(
+        ...,
+        description=(
+            "'task_cancelled' while the task reads as cancelled, otherwise "
+            "null (before the cancel is applied, or once a later turn has "
+            "started); the same value GET /v1/chat/tasks/{task_id} reports."
+        ),
+    )
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 
@@ -1367,6 +1418,16 @@ class TaskInfoResponse(BaseModel):
             "a fixed text saying why automatic resume stopped."
         ),
     )
+    error_code: Optional[str] = Field(
+        None,
+        description=(
+            "Machine-readable reason for status='failed', when one is "
+            "defined: 'task_cancelled' for a task stopped through "
+            "POST /v1/chat/tasks/{task_id}/cancel. Null for every other "
+            "failure, for a derived failed, and whenever status is not "
+            "'failed'."
+        ),
+    )
     created_at: datetime
     completed_at: Optional[datetime] = Field(
         None,
@@ -1408,8 +1469,13 @@ class TaskInfoResponse(BaseModel):
     structured_output: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "The structured result of the run shown in this response, when "
-            "structured_output_status is 'ready'; null otherwise."
+            "The structured result of the run shown in this response. When "
+            "structured_output_status is 'ready', the complete result. When "
+            "it is 'incomplete' and the format sets accept_partial, the "
+            "values that were extracted, with null where a value is missing "
+            "or cannot be written (structured_output_reason lists up to 20 "
+            "such positions of each kind); null when nothing could be kept. "
+            "Null otherwise."
         ),
     )
     structured_output_status: Optional[str] = Field(
@@ -1423,11 +1489,14 @@ class TaskInfoResponse(BaseModel):
     structured_output_reason: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "Why there is no structured result when structured_output_status "
-            "is 'incomplete' or 'failed': an object with code and message, "
-            "and missing_fields or unexpressible_fields (at most 20 paths "
-            "each) when the result lacks or cannot express values. A key with "
-            "no value is absent. code is one of: agent_partial / "
+            "Why the structured result is missing or partial when "
+            "structured_output_status is 'incomplete' or 'failed': an object "
+            "with code and message, and missing_fields or "
+            "unexpressible_fields (at most 20 paths each) when the result "
+            "lacks or cannot express values. With accept_partial, "
+            "agent_partial and agent_blocked may also carry missing_fields "
+            "and unexpressible_fields. A key with no value is absent. code "
+            "is one of: agent_partial / "
             "agent_blocked / information_missing / value_not_expressible / "
             "not_produced (status incomplete); schema_mismatch / "
             "result_too_large / model_error / invalid_stored_format / "

@@ -413,6 +413,7 @@ def completed_frame(
     status: str,
     output: str | None,
     error: str | None,
+    error_code: str | None,
     structured_output: dict[str, Any] | None = None,
     structured_output_status: str | None = None,
     structured_output_reason: dict[str, Any] | None = None,
@@ -424,6 +425,7 @@ def completed_frame(
             "status": status,
             "output": output,
             "error": error,
+            "error_code": error_code,
             "structured_output": structured_output,
             "structured_output_status": structured_output_status,
             "structured_output_reason": structured_output_reason,
@@ -1502,6 +1504,7 @@ async def watchdog_check_once(
                 status=status.value,
                 output=snapshot.output,
                 error=snapshot.error,
+                error_code=snapshot.error_code,
                 **_structured_output_fields(snapshot),
             )
         )
@@ -2144,6 +2147,7 @@ def _terminal_snapshot_stream(
             status=snapshot.status.value,
             output=snapshot.output,
             error=snapshot.error,
+            error_code=snapshot.error_code,
             **_structured_output_fields(snapshot),
             snapshot_total_steps=snapshot_total_steps,
         )

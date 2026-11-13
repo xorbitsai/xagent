@@ -2180,6 +2180,86 @@ async def test_user_oauth_refresh_google_revoked_token_keeps_reconnect_tombstone
         assert tombstone.expires_at is None
 
 
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_zoom_invalid_grant_keeps_reconnect_tombstone(
+    db_session, monkeypatch
+):
+    """Zoom answers invalid_grant once the same user re-authorizes the app
+    (only the latest grant works) or revokes it; the connection must be
+    marked for reconnect instead of retried on every load, with the account
+    identity kept for the reconnect flow.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="zoom",
+            name="Zoom",
+            client_id=encrypt_value("zoom-client-id"),
+            client_secret=encrypt_value("zoom-client-secret"),
+            auth_url="https://zoom.us/oauth/authorize",
+            token_url="https://zoom.us/oauth/token",
+        )
+    )
+    oauth_server = _add_oauth_server(
+        db,
+        user,
+        name="Zoom",
+        app_id="resolver-zoom",
+        provider="zoom",
+        launch_config=_launch_config("ZOOM_ACCESS_TOKEN"),
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="zoom", access_token="expired-token"
+    )
+    oauth_account.refresh_token = "superseded-refresh-token"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    account_id = oauth_account.id
+    db.commit()
+
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class DeadRefreshTokenAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Invalid refresh token",
+                },
+            )
+
+    monkeypatch.setattr(
+        web_tools_config, "create_public_async_client", DeadRefreshTokenAsyncClient
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Zoom"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        tombstone = verification_db.get(UserOAuth, account_id)
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert tombstone.refresh_token is None
+        assert tombstone.expires_at is None
+        assert tombstone.provider == "zoom"
+
+
 def test_google_refresh_classifies_explicit_revocation():
     with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
         web_tools_config._log_and_classify_failed_refresh(
@@ -2240,7 +2320,7 @@ def test_google_refresh_classifies_explicit_revocation():
             },
         ),
         (
-            "zoom",
+            "linear",
             400,
             {
                 "error": "invalid_grant",

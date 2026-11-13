@@ -357,6 +357,92 @@ async def test_zoom_expired_token_refresh_uses_http_basic_auth_with_capitalized_
     assert "client_secret" not in kwargs["data"]
 
 
+def _expired_zoom_grant(db, user):
+    db.add(
+        OAuthProvider(
+            provider_name="zoom",
+            name="Zoom",
+            client_id=encrypt_value("zoom-client-id"),
+            client_secret=encrypt_value("zoom-client-secret"),
+            auth_url="https://zoom.us/oauth/authorize",
+            token_url="https://zoom.us/oauth/token",
+            redirect_uri="https://app.example.com/api/auth/zoom/callback",
+            userinfo_url="https://api.zoom.us/v2/users/me",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["meeting:read:meeting"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="zoom",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="zoom-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+    return oauth_account
+
+
+def _zoom_token_endpoint(monkeypatch, data, status_code):
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            return MockResponse(data, status_code=status_code)
+
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
+
+
+@pytest.mark.asyncio
+async def test_zoom_refresh_invalid_grant_is_permanent(db_session, monkeypatch):
+    """A grant superseded by a newer authorization of the same Zoom user
+    answers invalid_grant; retrying cannot fix it, so it must be classified
+    like Zendesk's dead token."""
+    db, user = db_session
+    grant = _expired_zoom_grant(db, user)
+    _zoom_token_endpoint(
+        monkeypatch, {"error": "invalid_grant", "error_description": "expired"}, 400
+    )
+
+    with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
+        await tool_config.refresh_oauth_token_if_needed(db, grant, "zoom")
+
+
+@pytest.mark.asyncio
+async def test_zoom_refresh_invalid_client_is_not_a_dead_grant(db_session, monkeypatch):
+    """Zoom answers a rejected platform client with invalid_client, which
+    says nothing about this user's grant -- keeping it avoids tombstoning
+    every connection on one admin credential change."""
+    db, user = db_session
+    grant = _expired_zoom_grant(db, user)
+    _zoom_token_endpoint(monkeypatch, {"error": "invalid_client"}, 400)
+
+    with pytest.raises(tool_config._OAuthRefreshClientRejected):
+        await tool_config.refresh_oauth_token_if_needed(db, grant, "zoom")
+
+    assert grant.refresh_token == "old-refresh"
+
+
+@pytest.mark.asyncio
+async def test_zoom_refresh_5xx_with_invalid_grant_stays_transient(
+    db_session, monkeypatch
+):
+    """A 5xx is Zoom's own outage, never proof this grant is dead, even when
+    the body carries a code that is trusted for Zoom on a 4xx."""
+    db, user = db_session
+    grant = _expired_zoom_grant(db, user)
+    _zoom_token_endpoint(monkeypatch, {"error": "invalid_grant"}, 502)
+
+    assert await tool_config.refresh_oauth_token_if_needed(db, grant, "zoom") is False
+
+
 @pytest.mark.asyncio
 async def test_generic_provider_refresh_sends_client_id_and_secret_in_body(
     db_session, monkeypatch

@@ -914,6 +914,9 @@ _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES: dict[str, frozenset[str]] = {
     # in _finish_legacy_oauth_access_token_resolution; the actor flow holds
     # its row lock across the refresh instead.
     "zendesk": frozenset({"invalid_grant"}),
+    # Assumes, as for Zendesk, that a client change answers invalid_client (the
+    # refresh path's default client-rejected code), not invalid_grant.
+    "zoom": frozenset({"invalid_grant"}),
 }
 
 

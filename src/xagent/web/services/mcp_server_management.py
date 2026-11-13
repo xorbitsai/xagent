@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Optional, cast
 
@@ -32,6 +33,7 @@ from sqlalchemy import cast as sa_cast
 from sqlalchemy import literal, or_
 
 from ...core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
 from ...core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ..api.mcp import (
@@ -50,6 +52,7 @@ from ..api.mcp import (
     delete_mcp_server,
     update_mcp_server,
 )
+from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_session_local
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.mcp_oauth import MCPOAuthGrant
@@ -118,6 +121,32 @@ def _load_holder(db: Any, user_id: int) -> User:
     return user
 
 
+def _visible_mcp_listing(
+    db: Any, user_id: int
+) -> tuple[list[tuple[MCPServer, UserMCPServer | None]], dict[str, set[int]]]:
+    """The rows of ``visible_mcp_server_rows`` and the team hook's answer.
+
+    The team list hook is called exactly once. Its answer is returned whole so
+    that a caller needing the Custom API half does not call it again.
+    """
+    own = (
+        db.query(MCPServer, UserMCPServer)
+        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(UserMCPServer.user_id == user_id)
+        .all()
+    )
+    own_ids = {int(server.id) for server, _link in own}
+    team_shared = visible_team_connector_ids(db, user_id)
+    team_ids = team_shared["mcp"] - own_ids
+    team = (
+        db.query(MCPServer).filter(MCPServer.id.in_(team_ids)).all() if team_ids else []
+    )
+    rows = [(server, link) for server, link in own] + [
+        (server, None) for server in team
+    ]
+    return rows, team_shared
+
+
 def visible_mcp_server_rows(
     db: Any, user_id: int
 ) -> list[tuple[MCPServer, UserMCPServer | None]]:
@@ -132,20 +161,66 @@ def visible_mcp_server_rows(
     A failing team hook propagates. Folding it into "the team shares nothing"
     would return a list that silently lacks connectors.
     """
-    own = (
-        db.query(MCPServer, UserMCPServer)
-        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-        .filter(UserMCPServer.user_id == user_id)
+    return _visible_mcp_listing(db, user_id)[0]
+
+
+@dataclass(frozen=True)
+class HolderConnectorNames:
+    """The folded names an agent's ``mcp:<name>`` entry can select for a holder.
+
+    A name is folded with ``normalize_mcp_server_name``. An entry selects an
+    MCP connector or a Custom API, so both are counted.
+
+    ``visible`` is every name the holder can see. ``own_active`` and
+    ``own_inactive`` are the names of the holder's own links, enabled and
+    disabled. ``team_keys`` are the names of every connector the team shares,
+    including one the holder also links.
+    """
+
+    visible: frozenset[str]
+    own_active: frozenset[str]
+    own_inactive: frozenset[str]
+    team_keys: frozenset[str]
+
+
+def holder_connector_names(db: Any, user_id: int) -> HolderConnectorNames:
+    """The folded connector names the holder can see, split by where they come from.
+
+    The team list hook is called once. A failing hook propagates: an empty set
+    would make every name look invisible.
+    """
+    rows, team_shared = _visible_mcp_listing(db, user_id)
+    own_active: set[str] = set()
+    own_inactive: set[str] = set()
+    team_keys: set[str] = set()
+    for server, link in rows:
+        key = normalize_mcp_server_name(str(server.name))
+        if link is None or int(server.id) in team_shared["mcp"]:
+            team_keys.add(key)
+        if link is not None:
+            (own_active if link.is_active else own_inactive).add(key)
+
+    own_apis = (
+        db.query(CustomApi.id, CustomApi.name, UserCustomApi.is_active)
+        .join(UserCustomApi, UserCustomApi.custom_api_id == CustomApi.id)
+        .filter(UserCustomApi.user_id == user_id)
         .all()
     )
-    own_ids = {int(server.id) for server, _link in own}
-    team_ids = visible_team_connector_ids(db, user_id)["mcp"] - own_ids
-    team = (
-        db.query(MCPServer).filter(MCPServer.id.in_(team_ids)).all() if team_ids else []
+    for _api_id, name, is_active in own_apis:
+        (own_active if is_active else own_inactive).add(
+            normalize_mcp_server_name(str(name))
+        )
+    team_api_ids = team_shared["custom_api"]
+    if team_api_ids:
+        for (name,) in db.query(CustomApi.name).filter(CustomApi.id.in_(team_api_ids)):
+            team_keys.add(normalize_mcp_server_name(str(name)))
+
+    return HolderConnectorNames(
+        visible=frozenset(own_active | own_inactive | team_keys),
+        own_active=frozenset(own_active),
+        own_inactive=frozenset(own_inactive),
+        team_keys=frozenset(team_keys),
     )
-    return [(server, link) for server, link in own] + [
-        (server, None) for server in team
-    ]
 
 
 def resolve_holder_connector(

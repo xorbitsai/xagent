@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import MINYEAR, datetime, timezone
 from typing import Any, Collection, List, Mapping, Optional
 
 from ..execution_scope import ExecutionScope
@@ -52,23 +52,41 @@ def validate_scope_delete(
 
 
 def comparable_timestamp(value: Any) -> Any:
-    """Normalize a datetime for cross-comparison in date-range filters.
+    """Normalize a datetime so naive and aware values order correctly.
 
-    Stored note timestamps default to naive local time
-    (``MemoryNote.timestamp``'s ``datetime.now`` factory), while caller-supplied
-    ``date_from``/``date_to`` filter values may be timezone-aware (FastAPI
-    parses ISO date query params with an offset into aware datetimes).
-    Comparing the two directly raises ``TypeError``, which the stores' outer
-    exception handlers would swallow into a silently empty result. Aware
-    datetimes are therefore converted to naive local time before comparison;
-    naive datetimes and non-datetime values pass through unchanged.
+    ``MemoryNote.timestamp`` defaults to aware UTC, but notes written before
+    that default carry naive server-local time, and caller-supplied
+    ``date_from``/``date_to`` filter values may be either (FastAPI parses ISO
+    date query params with an offset into aware datetimes). Comparing naive
+    with aware raises ``TypeError``, which the stores' outer exception
+    handlers would swallow into a silently empty result, and sorting a mixed
+    list raises outright. Every datetime is therefore converted to aware UTC;
+    non-datetime values pass through unchanged.
 
-    Shared by every ``MemoryStore`` implementation's filter dispatch so the
-    stores cannot drift apart on this policy.
+    Legacy assumption: a naive datetime is interpreted in the *current*
+    process timezone, because that is what the old ``datetime.now`` default
+    wrote. This is only exact while the server's timezone has not changed
+    since the legacy rows were written; if it has, those rows are shifted by
+    the difference. Nothing stored records the original zone, so this cannot
+    be corrected after the fact.
+
+    A value within a day of ``datetime.min``/``datetime.max`` (e.g. an
+    open-ended ``date_from=0001-01-01`` filter) cannot be shifted to UTC
+    without leaving the representable range; it is clamped to the matching
+    UTC bound instead of raising, so the filter still means "unbounded"
+    rather than failing the whole request.
+
+    Shared by every ``MemoryStore`` implementation's filter dispatch and
+    newest-first ordering so the stores cannot drift apart on this policy.
     """
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
-    return value
+    if not isinstance(value, datetime):
+        return value
+    try:
+        return value.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        # Only years 1 and 9999 can overflow, so the year picks the bound.
+        bound = datetime.min if value.year == MINYEAR else datetime.max
+        return bound.replace(tzinfo=timezone.utc)
 
 
 class MemoryStore(ABC):
@@ -297,8 +315,8 @@ class MemoryStore(ABC):
         ):
             return False
 
-        # Date range filters (both sides tz-normalized so an aware filter
-        # against the naive default timestamps cannot raise TypeError;
+        # Date range filters (both sides tz-normalized so naive legacy rows,
+        # aware rows and aware/naive filters never raise TypeError;
         # explicit None = no bound)
         date_from = filters.get("date_from")
         date_to = filters.get("date_to")

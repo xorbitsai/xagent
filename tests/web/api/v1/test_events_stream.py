@@ -100,10 +100,17 @@ def mock_start_task():
         yield mocked
 
 
-# The raw structured output values of a snapshot that has none, and the fields
-# a conclusion frame then carries.
-NO_STRUCTURED_OUTPUT = {"structured_output_record": None, "format_configured": False}
+# The raw structured output values of a snapshot that has none and was not
+# cancelled, and the fields a conclusion frame then carries.
+NO_STRUCTURED_OUTPUT = {
+    "structured_output_record": None,
+    "format_configured": False,
+    "error_code": None,
+    "completion_outcome": None,
+    "accept_partial": False,
+}
 NULL_STRUCTURED_OUTPUT_FIELDS = {
+    "error_code": None,
     "structured_output": None,
     "structured_output_status": None,
     "structured_output_reason": None,
@@ -947,7 +954,7 @@ async def test_watchdog_terminal_task_row_closes_with_completed():
     )
     assert closed is True
     assert sink.queue.get_nowait() == (
-        es.completed_frame(status="failed", output=None, error="boom"),
+        es.completed_frame(status="failed", output=None, error="boom", error_code=None),
         True,
     )
 
@@ -1437,7 +1444,9 @@ async def test_close_frame_delivered_when_enqueued_between_two_yields():
         # awaiting the socket write while other tasks run.
 
         won = sink.enqueue_close(
-            es.completed_frame(status="completed", output="done", error=None)
+            es.completed_frame(
+                status="completed", output="done", error=None, error_code=None
+            )
         )
         assert won is True
 

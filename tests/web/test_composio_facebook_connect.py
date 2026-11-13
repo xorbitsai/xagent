@@ -86,6 +86,10 @@ class FakeComposio:
         self.complete_without_id = False
         self.complete_account: str | None = None
         self.account_overrides: dict[str, Any] = {}
+        # A single-account lookup's own answer, by connected account id.
+        self.account_lookup: dict[str, tuple[int, Any]] = {}
+        # Runs before a single-account lookup answers, to change the row first.
+        self.on_lookup: Any = None
         self.me_response: tuple[int, Any] | None = None
         self.raise_on: str | None = None
         # Pages GET /connected_accounts returns, by cursor ("" is the first).
@@ -152,6 +156,11 @@ class FakeComposio:
             return _Response(200, page)
         if method == "GET" and path.startswith("/connected_accounts/"):
             account_id = path.rsplit("/", 1)[1]
+            if self.on_lookup is not None:
+                self.on_lookup(account_id)
+            if account_id in self.account_lookup:
+                status, payload = self.account_lookup[account_id]
+                return _Response(status, payload)
             auth_config_id = self.auth_configs.get(account_id, AUTH_CONFIG_ID)
             toolkit = (
                 "instagram"
@@ -1187,6 +1196,8 @@ def _store_composio_grant(
     owner: str = OWNER,
     provider: str = "facebook",
     facebook_id: str = FACEBOOK_USER_ID,
+    refresh_token: str | None = None,
+    expires_at: datetime | None = None,
 ) -> None:
     db.add(
         UserOAuth(
@@ -1197,6 +1208,8 @@ def _store_composio_grant(
             access_token=account_id,
             token_type="composio",
             instance_url="xagent-user",
+            refresh_token=refresh_token,
+            expires_at=expires_at,
         )
     )
     db.commit()
@@ -1786,6 +1799,491 @@ def test_a_stop_signal_before_the_pass_lists_nothing(
     assert composio_auth.reconcile_orphan_accounts(db, now=NOW, stop_event=stop) == 0
 
     assert composio.calls == []
+
+
+# --- Reconciler: grants whose connected account Composio no longer has ---------------
+
+MISSING_ACCOUNT = {
+    "error": {
+        "slug": "ConnectedAccount_ResourceNotFound",
+        "message": "Connected account not found",
+    }
+}
+
+
+def _lookups(composio: FakeComposio) -> list[str]:
+    """The single-account lookups, not the auth-config listings."""
+    return [
+        path
+        for path in composio.paths("GET")
+        if path.startswith("/connected_accounts/")
+    ]
+
+
+def test_a_grant_whose_account_is_gone_is_tombstoned(
+    db_session, composio_env, composio, monkeypatch
+):
+    from xagent.web.api import mcp as mcp_api
+
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(
+        db,
+        user,
+        account_id="ca_gone",
+        refresh_token="refresh",
+        expires_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    row = _grants(db)[0]
+    assert mcp_api._oauth_account_can_connect(row) is True
+    assert mcp_api._build_oauth_account_lookup([row]) == {"facebook": row}
+    composio.account_lookup["ca_gone"] = (404, MISSING_ACCOUNT)
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 1
+
+    row = _grants(db)[0]
+    assert row.id is not None
+    assert row.resource_owner_key == OWNER
+    assert row.access_token == ""
+    assert row.refresh_token is None
+    assert row.expires_at is None
+    assert mcp_api._oauth_account_can_connect(row) is False
+    assert mcp_api._build_oauth_account_lookup([row]) == {}
+
+
+def test_a_reconnect_between_lookup_and_write_is_kept(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_old")
+    row_id = _grants(db)[0].id
+    composio.account_lookup["ca_old"] = (404, MISSING_ACCOUNT)
+
+    def reconnect(account_id: str) -> None:
+        db.execute(
+            text("UPDATE user_oauth SET access_token = :t WHERE id = :i"),
+            {"t": encrypt_value("ca_new"), "i": row_id},
+        )
+        db.commit()
+
+    composio.on_lookup = reconnect
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _grants(db)[0].access_token == "ca_new"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (404, {"error": {"slug": "ConnectedAccount_NotFound"}}),
+        (404, None),
+        (401, {"error": {"slug": "ConnectedAccount_ResourceNotFound"}}),
+        (500, {"error": {"slug": "ConnectedAccount_ResourceNotFound"}}),
+        (200, {"id": "ca_bound", "status": "EXPIRED"}),
+    ],
+)
+def test_any_other_lookup_answer_leaves_the_grant_alone(
+    db_session, composio_env, composio, monkeypatch, answer
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_bound")
+    composio.account_lookup["ca_bound"] = answer
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _lookups(composio) == ["/connected_accounts/ca_bound"]
+    assert _grants(db)[0].access_token == "ca_bound"
+
+
+def test_an_unreachable_composio_ends_the_pass(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_first")
+    _store_composio_grant(db, user, account_id="ca_second", facebook_id="102030405061")
+    composio.raise_on = "/connected_accounts/ca_first"
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _lookups(composio) == ["/connected_accounts/ca_first"]
+    assert [grant.access_token for grant in _grants(db)] == [
+        "ca_first",
+        "ca_second",
+    ]
+
+
+def test_an_undecryptable_grant_is_skipped_and_the_pass_continues(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_foreign")
+    _store_composio_grant(db, user, account_id="ca_gone", facebook_id="102030405061")
+    foreign_id = _grants(db)[0].id
+    foreign = Fernet(Fernet.generate_key()).encrypt(b"ca_foreign").decode()
+    db.execute(
+        text("UPDATE user_oauth SET access_token = :t WHERE id = :i"),
+        {"t": foreign, "i": foreign_id},
+    )
+    db.commit()
+    composio.account_lookup["ca_gone"] = (404, MISSING_ACCOUNT)
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 1
+
+    assert _lookups(composio) == ["/connected_accounts/ca_gone"]
+    assert (
+        db.execute(
+            text("SELECT access_token FROM user_oauth WHERE id = :i"),
+            {"i": foreign_id},
+        ).scalar()
+        == foreign
+    )
+
+
+def test_a_stop_signal_ends_the_missing_account_pass_between_lookups(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_first")
+    _store_composio_grant(db, user, account_id="ca_second", facebook_id="102030405061")
+    stop = threading.Event()
+    composio.on_lookup = lambda account_id: stop.set()
+
+    assert composio_auth.tombstone_missing_composio_accounts(db, stop_event=stop) == 0
+
+    assert _lookups(composio) == ["/connected_accounts/ca_first"]
+
+
+def test_a_stop_signal_before_the_missing_account_pass_looks_nothing_up(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_gone")
+    stop = threading.Event()
+    stop.set()
+
+    assert composio_auth.tombstone_missing_composio_accounts(db, stop_event=stop) == 0
+
+    assert _lookups(composio) == []
+
+
+def test_one_pass_is_capped_and_the_next_pass_continues(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    monkeypatch.setattr(composio_auth, "_MISSING_ACCOUNT_LOOKUP_LIMIT", 1)
+    _store_composio_grant(db, user, account_id="ca_first")
+    _store_composio_grant(db, user, account_id="ca_second", facebook_id="102030405061")
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _lookups(composio) == ["/connected_accounts/ca_first"]
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _lookups(composio) == [
+        "/connected_accounts/ca_first",
+        "/connected_accounts/ca_second",
+    ]
+
+
+def test_the_cursor_wraps_after_the_last_row(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    monkeypatch.setattr(composio_auth, "_MISSING_ACCOUNT_LOOKUP_LIMIT", 1)
+    _store_composio_grant(db, user, account_id="ca_first")
+    _store_composio_grant(db, user, account_id="ca_second", facebook_id="102030405061")
+
+    for _ in range(3):
+        assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _lookups(composio) == [
+        "/connected_accounts/ca_first",
+        "/connected_accounts/ca_second",
+        "/connected_accounts/ca_first",
+    ]
+
+
+def test_rows_without_a_usable_lookup_do_not_count_toward_the_cap(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    monkeypatch.setattr(composio_auth, "_MISSING_ACCOUNT_LOOKUP_LIMIT", 1)
+    _store_composio_grant(db, user, account_id="ca bad/id")
+    _store_composio_grant(
+        db,
+        user,
+        account_id="ca_other_app",
+        provider="instagram",
+        facebook_id="102030405061",
+    )
+    _store_composio_grant(db, user, account_id="ca_gone", facebook_id="102030405062")
+    composio.account_lookup["ca_gone"] = (404, MISSING_ACCOUNT)
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 1
+
+    assert _lookups(composio) == ["/connected_accounts/ca_gone"]
+    assert [grant.access_token for grant in _grants(db)] == [
+        "ca bad/id",
+        "ca_other_app",
+        "",
+    ]
+
+
+# --- Missing-account circuit breaker --------------------------------------------------
+
+
+def _warning_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == composio_auth.__name__ and record.levelno == logging.WARNING
+    ]
+
+
+def test_most_lookups_answering_missing_write_nothing(
+    db_session, composio_env, composio, monkeypatch, caplog
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    for index, account_id in enumerate(("ca_1", "ca_2", "ca_3")):
+        _store_composio_grant(
+            db, user, account_id=account_id, facebook_id=f"10203040506{index}"
+        )
+        composio.account_lookup[account_id] = (404, MISSING_ACCOUNT)
+    _store_composio_grant(db, user, account_id="ca_4", facebook_id="102030405063")
+    composio.account_lookup["ca_4"] = (200, {"id": "ca_4"})
+
+    with caplog.at_level(logging.WARNING, logger=composio_auth.__name__):
+        assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert [grant.access_token for grant in _grants(db)] == [
+        "ca_1",
+        "ca_2",
+        "ca_3",
+        "ca_4",
+    ]
+    warnings = _warning_messages(caplog)
+    assert len(warnings) == 1
+    assert "3 of 4" in warnings[0]
+
+
+def test_below_the_breaker_minimum_missing_rows_are_tombstoned(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    for index, account_id in enumerate(("ca_1", "ca_2")):
+        _store_composio_grant(
+            db, user, account_id=account_id, facebook_id=f"10203040506{index}"
+        )
+        composio.account_lookup[account_id] = (404, MISSING_ACCOUNT)
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 2
+
+    assert [grant.access_token for grant in _grants(db)] == ["", ""]
+
+
+def test_a_single_missing_answer_among_three_is_tombstoned(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    for index, account_id in enumerate(("ca_1", "ca_2", "ca_3")):
+        _store_composio_grant(
+            db, user, account_id=account_id, facebook_id=f"10203040506{index}"
+        )
+    composio.account_lookup["ca_1"] = (404, MISSING_ACCOUNT)
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 1
+
+    assert [grant.access_token for grant in _grants(db)] == ["", "ca_2", "ca_3"]
+
+
+def test_another_404_slug_leaves_the_grant_and_logs_the_slug(
+    db_session, composio_env, composio, monkeypatch, caplog
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_keep")
+    composio.account_lookup["ca_keep"] = (
+        404,
+        {"error": {"slug": "ConnectedAccount_NotFound", "message": "gone"}},
+    )
+
+    with caplog.at_level(logging.WARNING, logger=composio_auth.__name__):
+        assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _grants(db)[0].access_token == "ca_keep"
+    messages = _warning_messages(caplog)
+    assert any("ConnectedAccount_NotFound" in message for message in messages)
+    assert all("ca_keep" not in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("status", "second_pass_first"),
+    [(401, "ca_first"), (403, "ca_first"), (429, "ca_first"), (503, "ca_second")],
+)
+def test_a_refused_or_unavailable_lookup_ends_the_pass_before_writing(
+    db_session, composio_env, composio, monkeypatch, status, second_pass_first
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_first")
+    _store_composio_grant(db, user, account_id="ca_second", facebook_id="102030405061")
+    composio.account_lookup["ca_first"] = (status, {"error": {"message": "x"}})
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _lookups(composio) == ["/connected_accounts/ca_first"]
+    assert [grant.access_token for grant in _grants(db)] == [
+        "ca_first",
+        "ca_second",
+    ]
+
+    # 5xx is skipped next pass; a refused key retries the same row.
+    composio.account_lookup["ca_first"] = (200, {"id": "ca_first"})
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+    assert _lookups(composio)[1] == f"/connected_accounts/{second_pass_first}"
+
+
+def test_a_row_deleted_between_lookup_and_write_is_not_an_error(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_old")
+    row_id = _grants(db)[0].id
+    composio.account_lookup["ca_old"] = (404, MISSING_ACCOUNT)
+
+    def disconnect(account_id: str) -> None:
+        db.execute(text("DELETE FROM user_oauth WHERE id = :i"), {"i": row_id})
+        db.commit()
+
+    composio.on_lookup = disconnect
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    assert _grants(db) == []
+
+
+def test_a_reconnect_replacing_the_row_between_lookup_and_write_is_kept(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_old")
+    row_id = _grants(db)[0].id
+    composio.account_lookup["ca_old"] = (404, MISSING_ACCOUNT)
+
+    def reconnect(account_id: str) -> None:
+        db.execute(text("DELETE FROM user_oauth WHERE id = :i"), {"i": row_id})
+        db.commit()
+        _store_composio_grant(db, user, account_id="ca_new")
+
+    composio.on_lookup = reconnect
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 0
+
+    grants = _grants(db)
+    assert [grant.access_token for grant in grants] == ["ca_new"]
+
+
+def test_the_orphan_pass_leaves_missing_accounts_to_their_own_loop(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_gone")
+    composio.account_lookup["ca_gone"] = (404, MISSING_ACCOUNT)
+    composio.listing[""] = {"items": []}
+
+    composio_auth.reconcile_orphan_accounts_isolated(session_factory=lambda: db)
+
+    assert _lookups(composio) == []
+    assert _grants(db)[0].access_token == "ca_gone"
+
+
+def test_the_isolated_missing_account_pass_tombstones_missing_accounts(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_gone")
+    composio.account_lookup["ca_gone"] = (404, MISSING_ACCOUNT)
+
+    tombstoned = composio_auth.tombstone_missing_composio_accounts_isolated(
+        session_factory=lambda: db
+    )
+
+    assert tombstoned == 1
+    assert _grants(db)[0].access_token == ""
+
+
+def test_the_missing_account_loop_needs_a_configured_app(monkeypatch):
+    from xagent.web.app import start_composio_missing_account_task
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv(composio_auth.COMPOSIO_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(
+        "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", raising=False
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert start_composio_missing_account_task(app) is None
+
+
+def test_the_missing_account_loop_is_off_at_zero(composio_env, monkeypatch):
+    from xagent.web.app import start_composio_missing_account_task
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", "0")
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert start_composio_missing_account_task(app) is None
+
+
+async def test_the_missing_account_loop_starts_with_its_variable_unset(
+    composio_env, monkeypatch
+):
+    import asyncio
+
+    from xagent.web.app import (
+        start_composio_missing_account_task,
+        stop_composio_missing_account_task,
+    )
+
+    started = threading.Event()
+
+    def pass_once(*, stop_event: threading.Event) -> int:
+        started.set()
+        return 0
+
+    monkeypatch.setattr(
+        composio_auth, "tombstone_missing_composio_accounts_isolated", pass_once
+    )
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv(
+        "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", raising=False
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    task = start_composio_missing_account_task(app)
+    assert task is not None
+    assert await asyncio.to_thread(started.wait, 5)
+    await stop_composio_missing_account_task(app)
+
+    assert task.done()
 
 
 def test_the_reconcile_loop_is_off_unless_its_interval_is_set(

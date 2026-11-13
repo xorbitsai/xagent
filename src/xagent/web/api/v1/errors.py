@@ -147,6 +147,15 @@ class V1ErrorCode(str, Enum):
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
 
+    # A team agent would select connectors its team cannot use. 400.
+    # ``details.connectors`` lists each one as ``{"name", "reason"}`` with
+    # ``reason`` one of ``not_shared``, ``disabled`` or ``unresolved``.
+    CONNECTOR_NOT_SHARED = "connector_not_shared"
+
+    # The agent has never had its tools chosen and uses the default tool
+    # set, so there is no selection to read connectors from or replace. 409.
+    AGENT_TOOLS_UNCONFIGURED = "agent_tools_unconfigured"
+
     # The connector's transport is not one the API can create, change or list
     # tools for (only ``streamable_http`` and ``sse``). 400.
     TRANSPORT_NOT_SUPPORTED = "transport_not_supported"
@@ -216,6 +225,14 @@ class V1ErrorCode(str, Enum):
     # current run (pending / paused / completed normally / failed). 409.
     TASK_NOT_WAITING = "task_not_waiting"
 
+    # ``POST /v1/chat/tasks/{id}/cancel`` was called on a task that already
+    # ended without being cancelled (completed, or failed on its own), or
+    # whose run the cancel was aimed at ended while the cancel was being
+    # applied and another turn took its place. 409,
+    # not retryable -- a task that can be cancelled later answers
+    # ``task_busy`` instead.
+    TASK_NOT_CANCELLABLE = "task_not_cancellable"
+
     # A reply's saved progress could not be read due to a transient
     # infrastructure failure. 503, retryable -- distinct from
     # ``interaction_not_resumable`` (which means resuming can never
@@ -278,6 +295,12 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
     V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.CONNECTOR_NOT_SHARED: (
+        "The agent would select connectors its team cannot use."
+    ),
+    V1ErrorCode.AGENT_TOOLS_UNCONFIGURED: (
+        "This agent uses the default tool set; choose its tools in the web app first."
+    ),
     V1ErrorCode.TRANSPORT_NOT_SUPPORTED: (
         "Only the streamable_http and sse transports are supported through the API."
     ),
@@ -320,6 +343,9 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     ),
     V1ErrorCode.TASK_NOT_WAITING: (
         "This task is not waiting for an answer to a question."
+    ),
+    V1ErrorCode.TASK_NOT_CANCELLABLE: (
+        "This task has already ended and cannot be cancelled."
     ),
     V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
         "Reply was accepted but its outcome is not yet known. "

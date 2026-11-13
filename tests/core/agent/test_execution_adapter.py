@@ -17,12 +17,13 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
+from xagent.core.agent import execution_adapter as execution_adapter_module
 from xagent.core.agent.context.execution import TURN_CONTEXT_HEADER
 from xagent.core.agent.context.memory_retrieval import (
     MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
 )
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
-from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
+from xagent.core.agent.result import COMPLETION_OUTCOMES, NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.memory.in_memory import InMemoryMemoryStore
@@ -2012,6 +2013,33 @@ def test_execution_adapter_preserves_completion_outcome(reason: str) -> None:
     assert result["metadata"]["completion_outcome"] == "partial"
     assert result["termination_reason"] == reason
     assert result["metadata"]["termination_reason"] == reason
+
+
+def _normalized_outcome(rating: Any) -> Any:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(name="test", pattern="react", llm=FakeLLM([]))
+    )
+    result = adapter._normalize_result(
+        result={"success": True, "output": "An answer.", "completion_outcome": rating},
+        execution_type="agent_react",
+        execution_id="rating-exec",
+    )
+    return result.get("completion_outcome")
+
+
+def test_completion_outcomes_single_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    samples = [*sorted(COMPLETION_OUTCOMES), "other", None]
+    passed = {rating for rating in samples if _normalized_outcome(rating) is not None}
+
+    assert passed == COMPLETION_OUTCOMES
+
+    # The gate reads the shared constant: a rating added to it is let through.
+    monkeypatch.setattr(
+        execution_adapter_module,
+        "COMPLETION_OUTCOMES",
+        COMPLETION_OUTCOMES | {"extra"},
+    )
+    assert _normalized_outcome("extra") == "extra"
 
 
 @pytest.mark.parametrize("reason", [None, "provider token=secret", [], {}])

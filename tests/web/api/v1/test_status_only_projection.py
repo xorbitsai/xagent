@@ -300,7 +300,7 @@ def test_view_call_sites():
     assert sorted(computed) == sorted(
         [
             (tasks_py, "_load_task_info_snapshot"),
-            (cancel_py, "_prepare_cancel_sync"),
+            (cancel_py, "_ended_without_cancel"),
         ]
     )
 

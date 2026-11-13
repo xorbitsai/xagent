@@ -537,7 +537,7 @@ class _DeferredInjectionRejectedRetryableError(RuntimeError):
 
 
 def _resume_cancel_settlement_error(
-    task_source: str | None, *, explicit_cancel: bool = False
+    task_source: str | None, *, explicit_cancel: bool
 ) -> str:
     """Settlement text for a cancelled resume, matching a cancelled run.
 

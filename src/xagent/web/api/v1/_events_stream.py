@@ -413,7 +413,7 @@ def completed_frame(
     status: str,
     output: str | None,
     error: str | None,
-    error_code: str | None = None,
+    error_code: str | None,
     structured_output: dict[str, Any] | None = None,
     structured_output_status: str | None = None,
     structured_output_reason: dict[str, Any] | None = None,

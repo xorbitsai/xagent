@@ -7,7 +7,9 @@ asks the caller to retry; that a refusal writes nothing; and that the
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +22,7 @@ from xagent.web.services import sdk_task_cancel, task_auto_resume
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services.sdk_task_cancel import SDK_CANCEL_ERROR_MESSAGE
 from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
     TaskCommandKind,
     TaskCommandRejected,
     TaskCommandTaskMissing,
@@ -421,7 +424,11 @@ def test_an_unapplied_cancel_is_accepted_and_repeats_reach_the_same_command(
 
 @pytest.mark.parametrize(
     ("reason", "status_code", "code"),
-    [("stale_run", 409, "task_busy"), ("unsupported_scope", 503, "internal_error")],
+    [
+        ("stale_run", 409, "task_busy"),
+        ("unsupported_scope", 503, "internal_error"),
+        (None, 503, "internal_error"),
+    ],
 )
 def test_a_rejected_command_tells_the_caller_whether_to_retry(
     monkeypatch: pytest.MonkeyPatch, reason, status_code, code
@@ -465,32 +472,297 @@ def test_a_task_deleted_before_the_command_is_stored_is_404(
     assert _error(response) == "task_not_found"
 
 
-def test_a_turn_queued_while_the_cancel_was_applied_is_not_reported_cancelled(
+_ENDED_ROWS = {
+    "completed": {
+        "status": TaskStatus.COMPLETED,
+        "control_state": TaskControlState.COMPLETED.value,
+        "output": "done",
+    },
+    "failed_itself": {
+        "status": TaskStatus.FAILED,
+        "control_state": TaskControlState.FAILED.value,
+        "error_message": "boom",
+    },
+}
+
+
+def _cancelled_row_values() -> dict[str, Any]:
+    return {
+        "status": TaskStatus.FAILED,
+        "control_state": TaskControlState.FAILED.value,
+        "error_message": SDK_CANCEL_ERROR_MESSAGE,
+    }
+
+
+def _replace_cancel_core(monkeypatch: pytest.MonkeyPatch, core: Any) -> None:
+    monkeypatch.setattr(command_execution_service, "cancel_sdk_task_unserialized", core)
+
+
+@pytest.mark.parametrize("ended", list(_ENDED_ROWS))
+@pytest.mark.parametrize("exit_path", ["stale_run", "deadline"])
+def test_a_run_that_ended_on_its_own_is_never_reported_as_busy_or_accepted(
+    monkeypatch: pytest.MonkeyPatch, ended: str, exit_path: str
+):
+    """Whichever way the wait ends, a run that ended without a cancel
+    answers what the request would have answered on arrival."""
+    task_id, _agent_id, key = _running_task()
+    values = {**_ENDED_ROWS[ended], "runner_id": None, "lease_expires_at": None}
+    after_the_run_ended: list[dict[str, Any]] = []
+
+    def end_the_run() -> None:
+        _update(task_id, **values)
+        after_the_run_ended.append(_row(task_id))
+
+    if exit_path == "stale_run":
+
+        async def ended_before_it_was_applied(**_kwargs: Any) -> None:
+            end_the_run()
+            raise TaskCommandRejected("moved", reason="stale_run")
+
+        _replace_cancel_core(monkeypatch, ended_before_it_was_applied)
+    else:
+
+        async def ended_while_the_command_waits(*_args: Any, **_kwargs: Any) -> bool:
+            end_the_run()
+            return False
+
+        monkeypatch.setattr(
+            sdk_task_cancel,
+            "dispatch_one_task_command",
+            AsyncMock(side_effect=ended_while_the_command_waits),
+        )
+        monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    assert _row(task_id) == after_the_run_ended[0]
+    assert len(_cancel_commands(task_id)) == 1
+
+
+def test_a_cancel_that_settled_as_paused_is_still_reported_busy(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """The command ended, the task was cancelled by another request and a
-    new turn was queued before this request read the outcome."""
     task_id, _agent_id, key = _running_task()
+    after_pause: list[dict[str, Any]] = []
 
-    async def cancelled_elsewhere_then_appended(**_kwargs: Any) -> None:
+    async def paused_before_it_was_applied(**_kwargs: Any) -> None:
         _update(
             task_id,
-            status=TaskStatus.FAILED,
-            control_state=TaskControlState.FAILED.value,
-            error_message=SDK_CANCEL_ERROR_MESSAGE,
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
             runner_id=None,
             lease_expires_at=None,
         )
-        _queue_start(task_id)
+        after_pause.append(_row(task_id))
         raise TaskCommandRejected("moved", reason="stale_run")
 
-    monkeypatch.setattr(
-        command_execution_service,
-        "cancel_sdk_task_unserialized",
-        cancelled_elsewhere_then_appended,
-    )
+    _replace_cancel_core(monkeypatch, paused_before_it_was_applied)
 
     response = _cancel(task_id, key)
 
     assert response.status_code == 409, response.text
     assert _error(response) == "task_busy"
+    assert _row(task_id) == after_pause[0]
+
+
+def test_a_cancel_aimed_at_a_run_that_was_replaced_is_not_cancellable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The aimed run is over and the row shows another one: retrying would
+    cancel that one, so the caller is told no retry can cancel this run."""
+    task_id, _agent_id, key = _running_task()
+    after_replacement: list[dict[str, Any]] = []
+
+    async def replaced_before_it_was_applied(**_kwargs: Any) -> None:
+        _update(task_id, run_id="run-next", state_version=50)
+        after_replacement.append(_row(task_id))
+        raise TaskCommandRejected("moved", reason="stale_run")
+
+    _replace_cancel_core(monkeypatch, replaced_before_it_was_applied)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    assert (
+        response.json()["error"]["message"]
+        == "The run this cancel was aimed at has already ended."
+    )
+    assert _row(task_id) == after_replacement[0]
+    assert len(_cancel_commands(task_id)) == 1
+
+
+def test_a_turn_queued_while_the_cancel_was_applied_still_reports_the_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The command ended, the task was cancelled by another request and a
+    new turn was queued before this request read the outcome: the run this
+    call aimed at is cancelled, so the answer says so."""
+    task_id, _agent_id, key = _running_task()
+    before = _row(task_id)
+
+    async def cancelled_elsewhere_then_appended(**_kwargs: Any) -> None:
+        _update(
+            task_id,
+            runner_id=None,
+            lease_expires_at=None,
+            **_cancelled_row_values(),
+        )
+        _queue_start(task_id)
+        raise TaskCommandRejected("moved", reason="stale_run")
+
+    _replace_cancel_core(monkeypatch, cancelled_elsewhere_then_appended)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "task_id": task_id,
+        "status": "failed",
+        "run_id": before["run_id"],
+        "state_version": before["state_version"],
+        "cancelled_run_id": before["run_id"],
+        "error_code": "task_cancelled",
+    }
+
+
+def test_a_completed_command_is_a_cancel_of_its_aimed_run_even_if_a_turn_is_queued(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task_id, _agent_id, key = _running_task()
+    before = _row(task_id)
+
+    async def cancelled_then_appended(**_kwargs: Any) -> None:
+        _update(
+            task_id,
+            state_version=before["state_version"] + 1,
+            runner_id=None,
+            lease_expires_at=None,
+            **_cancelled_row_values(),
+        )
+        _queue_start(task_id)
+
+    _replace_cancel_core(monkeypatch, cancelled_then_appended)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "task_id": task_id,
+        "status": "failed",
+        "run_id": before["run_id"],
+        "state_version": before["state_version"] + 1,
+        "cancelled_run_id": before["run_id"],
+        "error_code": "task_cancelled",
+    }
+
+
+def test_a_completed_command_names_its_own_run_when_a_new_run_already_runs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The answer describes the row as it is now; ``cancelled_run_id`` is the
+    run the command cancelled, and nothing of the new run is touched."""
+    task_id, _agent_id, key = _running_task()
+    before = _row(task_id)
+    after_the_new_run_started: list[dict[str, Any]] = []
+
+    async def cancelled_then_next_run_started(**_kwargs: Any) -> None:
+        _update(
+            task_id,
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            run_id="run-next",
+            state_version=before["state_version"] + 2,
+            error_message=None,
+        )
+        after_the_new_run_started.append(_row(task_id))
+
+    _replace_cancel_core(monkeypatch, cancelled_then_next_run_started)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "task_id": task_id,
+        "status": "running",
+        "run_id": "run-next",
+        "state_version": before["state_version"] + 2,
+        "cancelled_run_id": before["run_id"],
+        "error_code": None,
+    }
+    assert _row(task_id) == after_the_new_run_started[0]
+    assert len(_cancel_commands(task_id)) == 1
+
+
+def test_a_command_applied_by_another_process_while_polling_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task_id, _agent_id, key = _running_task()
+    before = _row(task_id)
+
+    def apply_elsewhere() -> None:
+        _update(
+            task_id,
+            state_version=before["state_version"] + 1,
+            runner_id=None,
+            lease_expires_at=None,
+            **_cancelled_row_values(),
+        )
+        db = _direct_db_session()
+        try:
+            db.query(TaskExecutionCommand).filter(
+                TaskExecutionCommand.task_id == task_id,
+                TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
+            ).update({"status": COMMAND_COMPLETED})
+            db.commit()
+        finally:
+            db.close()
+
+    async def left_to_the_owning_process(*_args: Any, **_kwargs: Any) -> bool:
+        threading.Timer(0.2, apply_elsewhere).start()
+        return False
+
+    monkeypatch.setattr(
+        sdk_task_cancel,
+        "dispatch_one_task_command",
+        AsyncMock(side_effect=left_to_the_owning_process),
+    )
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled_run_id"] == before["run_id"]
+    assert response.json()["error_code"] == "task_cancelled"
+
+
+def test_the_wait_is_timed_from_before_the_command_is_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A dispatch that outlasts the wait leaves nothing to wait for: the
+    first poll after it already finds the deadline passed."""
+    task_id, _agent_id, key = _running_task()
+    polls: list[int] = []
+    real_load = sdk_task_cancel.load_task_command
+
+    def counting_load(command_db_id: int):
+        polls.append(command_db_id)
+        return real_load(command_db_id)
+
+    async def slow_dispatch_that_applies_nothing(*_args: Any, **_kwargs: Any) -> bool:
+        await asyncio.sleep(0.4)
+        return False
+
+    monkeypatch.setattr(
+        sdk_task_cancel,
+        "dispatch_one_task_command",
+        AsyncMock(side_effect=slow_dispatch_that_applies_nothing),
+    )
+    monkeypatch.setattr(sdk_task_cancel, "load_task_command", counting_load)
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 202, response.text
+    assert len(polls) == 1

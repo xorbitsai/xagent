@@ -8,6 +8,7 @@ it did not cause, the ownership fence, and the routing that sends only an
 """
 
 import asyncio
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -371,7 +372,14 @@ async def test_running_cancel_is_settled_by_the_cancelled_run(
             _assert_cancelled(task_id, before=before, storage_version=storage_version)
     finally:
         task_execution_service.background_task_manager.running_tasks.pop(task_id, None)
-    assert manager.broadcast_to_task.await_count == 2
+    # One terminal announcement per call; a version-2 task also replays the
+    # turn's display events ahead of each.
+    announcements = [
+        call.args[0]
+        for call in manager.broadcast_to_task.await_args_list
+        if call.args[0].get("type") == "task_error"
+    ]
+    assert len(announcements) == 2
 
 
 @pytest.mark.asyncio
@@ -581,6 +589,7 @@ def test_replaced_attempt_rejects_cancel_and_preserves_task(
             agent_id=agent_id,
             expected_run_id=before["run_id"],
             expected_state_version=before["state_version"],
+            terminal_event_state={},
         )
 
     assert _row(task_id) == before
@@ -612,6 +621,182 @@ async def test_cancel_announces_after_commit_and_survives_a_failed_broadcast(
 
     assert seen == [TaskStatus.FAILED]
     assert _load_task(task_id).error_message == SDK_CANCEL_ERROR_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_the_cache_is_invalidated_once_after_the_commit_and_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The invalidation is a blocking round trip with some cache backends, so
+    it belongs to the finalize that runs in a worker thread."""
+    task_id, agent_id, _owner = _create_task()
+    _broadcast_manager(monkeypatch)
+    calls: list[tuple[int, bool, TaskStatus]] = []
+
+    def record(invalidated_task_id: int) -> None:
+        try:
+            asyncio.get_running_loop()
+            on_event_loop = True
+        except RuntimeError:
+            on_event_loop = False
+        calls.append((invalidated_task_id, on_event_loop, _load_task(task_id).status))
+
+    monkeypatch.setattr(task_orchestrator, "invalidate_task_cache_best_effort", record)
+
+    await cancel_sdk_task_unserialized(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-sdk",
+        expected_state_version=4,
+    )
+
+    assert calls == [(task_id, False, TaskStatus.FAILED)]
+
+
+def _terminal_frame(manager: MagicMock) -> dict[str, Any]:
+    frames = [call.args[0] for call in manager.broadcast_to_task.await_args_list]
+    return next(frame for frame in frames if frame.get("type") == "task_error")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_version", [1, 2])
+@pytest.mark.parametrize("writer", ["core", "run_settlement"])
+async def test_the_terminal_frame_carries_the_control_snapshot_of_a_v2_task(
+    monkeypatch: pytest.MonkeyPatch, writer: str, storage_version: int
+) -> None:
+    """Without the snapshot, readers of a version-2 task's live frames never
+    get the turn's last display events. Whichever writer lands the terminal
+    row, the frame carries the state it left, and a version-1 task has none."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id=None, state_version=0, storage_version=storage_version
+    )
+    _seed_pending_user_message(task_id, owner_user_id, "turn-running")
+    manager = _broadcast_manager(monkeypatch)
+    if writer == "run_settlement":
+        await _start_blocked_run(
+            monkeypatch, task_id=task_id, owner_user_id=owner_user_id, source="sdk"
+        )
+    before = _load_task(task_id)
+
+    try:
+        await cancel_sdk_task_unserialized(
+            task_id=task_id,
+            agent_id=agent_id,
+            expected_run_id=before.run_id,
+            expected_state_version=before.state_version,
+        )
+    finally:
+        task_execution_service.background_task_manager.running_tasks.pop(task_id, None)
+
+    frame = _terminal_frame(manager)
+    if storage_version == 2:
+        assert frame["state_version"] == before.state_version + 1
+        assert frame["task"]["status"] == "failed"
+        frames = [call.args[0] for call in manager.broadcast_to_task.await_args_list]
+        assert frames.index(frame) > 0, "display events precede the terminal frame"
+    else:
+        assert "state_version" not in frame
+
+
+async def _start_resume(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    task_id: int,
+    owner_user_id: int,
+    run_id: str,
+    phase: str,
+    source: str = "sdk",
+) -> asyncio.Task:
+    """A real resume coordinator parked in ``phase``.
+
+    It is registered the way the resume handoff registers it, in
+    ``resume_tasks``, so ``cancel_task`` reaches it. ``execution`` parks it
+    inside the agent's resumed execution; ``lease_acquisition`` parks it in
+    the worker thread that claims the run's lease, which then claims it.
+    """
+    started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    real_acquire = task_execution_service._acquire_resume_task_lease
+
+    def acquire_slowly(*args: Any, **kwargs: Any) -> Any:
+        loop.call_soon_threadsafe(started.set)
+        time.sleep(0.3)
+        return real_acquire(*args, **kwargs)
+
+    if phase == "lease_acquisition":
+        monkeypatch.setattr(
+            task_execution_service, "_acquire_resume_task_lease", acquire_slowly
+        )
+
+    async def block_until_cancelled(*_args: object, **_kwargs: object) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(side_effect=block_until_cancelled)
+    resume = asyncio.create_task(
+        task_execution_service.execute_resume_background(
+            task_id,
+            agent_service,
+            owner_user_id,
+            expected_run_id=run_id,
+            trusted_task_source=source,
+        )
+    )
+    task_execution_service.background_task_manager.resume_tasks[task_id] = resume
+    await asyncio.wait_for(started.wait(), timeout=DB_PROGRESS_TIMEOUT)
+    return resume
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "explicit", "expected"),
+    [
+        ("execution", True, SDK_CANCEL_ERROR_MESSAGE),
+        ("execution", False, "resume execution cancelled"),
+        ("lease_acquisition", True, SDK_CANCEL_ERROR_MESSAGE),
+        ("lease_acquisition", False, "resume cancelled during lease acquisition"),
+    ],
+    ids=[
+        "execution-explicit_cancel",
+        "execution-direct_cancel",
+        "lease_acquisition-explicit_cancel",
+        "lease_acquisition-direct_cancel",
+    ],
+)
+async def test_a_cancelled_resume_settles_as_cancelled_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch, phase: str, explicit: bool, expected: str
+) -> None:
+    """A resumed SDK run takes the same two ways out as a first run: an
+    explicit ``cancel_task`` settles it as cancelled, any other cancellation
+    keeps the wording it has always had."""
+    task_id, _agent_id, owner_user_id = _create_task(
+        status=TaskStatus.WAITING_FOR_USER,
+        control_state=TaskControlState.WAITING_FOR_USER.value,
+    )
+    _broadcast_manager(monkeypatch)
+    resume = await _start_resume(
+        monkeypatch,
+        task_id=task_id,
+        owner_user_id=owner_user_id,
+        run_id="run-sdk",
+        phase=phase,
+    )
+    manager = task_execution_service.background_task_manager
+    try:
+        if explicit:
+            await manager.cancel_task(task_id, timeout_seconds=DB_PROGRESS_TIMEOUT)
+        else:
+            resume.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await resume
+    finally:
+        manager.running_tasks.pop(task_id, None)
+        manager.resume_tasks.pop(task_id, None)
+
+    row = _load_task(task_id)
+    assert row.status == TaskStatus.FAILED
+    assert row.error_message == expected
 
 
 def _cancel_command(task_id: int, agent_id: int, **payload: Any) -> ClaimedTaskCommand:
@@ -707,6 +892,7 @@ def test_lease_fields_are_cleared_only_without_a_coordinator(
         agent_id=agent_id,
         expected_run_id=before.run_id,
         expected_state_version=before.state_version,
+        terminal_event_state={},
     )
 
     after = _load_task(task_id)

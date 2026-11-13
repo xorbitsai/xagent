@@ -1514,12 +1514,15 @@ async def cancel_chat_task(
     about the task's state is read. The cancelled task reads ``failed``
     with ``error_code='task_cancelled'``, and accepts
     ``POST /v1/chat/tasks/{id}/messages`` like any failed task. A workforce
-    run is one task: cancelling it stops its members too.
+    run is cancelled as one task.
 
-    The call waits a bounded time for the cancel to be applied. 200 means
-    the task is cancelled, including when an earlier call already cancelled
-    it; 202 means the cancel is recorded but not applied yet, and calling
-    again reaches the same request.
+    The call polls up to about 10 seconds for the cancel to be applied;
+    when this process applies the cancel itself it also waits for the run
+    to stop. 200 means the task is cancelled, including when an earlier
+    call already cancelled it; if a new turn has started since, ``status``
+    and ``run_id`` describe that turn and ``cancelled_run_id`` names the
+    cancelled one. 202 means the cancel is recorded but not applied yet,
+    and calling again reaches the same request.
 
     Only a running task is cancelled. One that is waiting for an answer,
     paused, or whose turn is still queued to start answers 409
@@ -1529,7 +1532,9 @@ async def cancel_chat_task(
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task missing, not owned by the key, or not SDK-created.
         V1ApiError 409: ``task_not_cancellable`` for a task that already
-            ended without being cancelled; ``task_busy`` when the task
+            ended without being cancelled, including one whose run ended
+            on its own while the cancel was being applied; ``task_busy``
+            when the task
             cannot be cancelled in its current state or changed state while
             the cancel was applied -- retry.
         V1ApiError 410: ``task_expired`` for a retention-expired task.
@@ -1550,7 +1555,9 @@ async def cancel_chat_task(
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
     except SdkTaskNotCancellable as exc:
-        raise V1ApiError(V1ErrorCode.TASK_NOT_CANCELLABLE, 409) from exc
+        raise V1ApiError(
+            V1ErrorCode.TASK_NOT_CANCELLABLE, 409, message=str(exc) or None
+        ) from exc
     except SdkTaskCancelBusy as exc:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409, message=str(exc)) from exc
     except SdkTaskCancelFailed as exc:

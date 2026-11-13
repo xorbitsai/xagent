@@ -366,3 +366,95 @@ def test_compact_skips_rewrite_without_deletions(tmp_path: Path) -> None:
     deleted = _table_version(store)
     store._compact(timedelta(0))
     assert _table_version(store) > deleted
+
+
+class _CompactBeforeDelete:
+    """A table handle that lets a concurrent ``compact()`` win the race.
+
+    Forwards everything to the real handle, but runs a zero-retention
+    compaction right before the first delete: the table is rewritten and the
+    version this handle opened is pruned, exactly the interleaving of a
+    delete on an idle table (latest version already past the retention)
+    racing the host's periodic ``compact()``.
+    """
+
+    def __init__(self, table: Any, store: LanceDBMemoryStore) -> None:
+        self._table = table
+        self._store = store
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._table, name)
+
+    def delete(self, where: str) -> Any:
+        self._store._compact(timedelta(0))
+        return self._table.delete(where)
+
+
+def _race_next_open(store: LanceDBMemoryStore, monkeypatch: Any) -> None:
+    """Hand the next ``open_table`` caller a handle that loses the race."""
+    connection = store._vector_store.get_raw_connection()
+    real_open = connection.open_table
+
+    def open_once(name: str) -> Any:
+        monkeypatch.setattr(connection, "open_table", real_open)
+        return _CompactBeforeDelete(real_open(name), store)
+
+    monkeypatch.setattr(connection, "open_table", open_once)
+
+
+def _seed_pending_deletion(store: LanceDBMemoryStore) -> dict[str, str]:
+    """Seed notes in one fragment plus a soft-deleted row, so the next
+    compaction rewrites the table and prunes every older version."""
+    ids = _seed(store)
+    store._compact(timedelta(0))
+    assert store.delete_for_scope(2, MEMBER_7) == 1
+    return ids
+
+
+def test_scoped_delete_survives_racing_compaction(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = _lancedb_store(tmp_path)
+    ids = _seed_pending_deletion(store)
+    _race_next_open(store, monkeypatch)
+
+    assert store.delete_for_scope(1, MEMBER_7) == 1
+
+    assert _remaining(store, ids) == set(ids) - {"member7", "other_owner"}
+
+
+def test_by_id_delete_survives_racing_compaction(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = _lancedb_store(tmp_path)
+    ids = _seed_pending_deletion(store)
+    _race_next_open(store, monkeypatch)
+
+    assert store.delete(ids["member8"]).success
+
+    assert _remaining(store, ids) == set(ids) - {"member8", "other_owner"}
+
+
+def test_delete_does_not_retry_unrelated_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    store = _lancedb_store(tmp_path)
+    opened: list[str] = []
+    connection = store._vector_store.get_raw_connection()
+
+    class FailingTable:
+        def count_rows(self, *_args: Any) -> int:
+            return 1
+
+        def delete(self, *_args: Any) -> None:
+            raise RuntimeError("lance error: commit conflict")
+
+    def open_table(name: str) -> FailingTable:
+        opened.append(name)
+        return FailingTable()
+
+    monkeypatch.setattr(connection, "open_table", open_table)
+
+    with pytest.raises(RuntimeError, match="commit conflict"):
+        store.delete_for_scope(1, MEMBER_7)
+    assert opened == ["memories"]

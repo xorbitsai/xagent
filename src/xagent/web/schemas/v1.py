@@ -31,9 +31,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
     StringConstraints,
+    model_serializer,
 )
 
 from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
@@ -144,9 +146,13 @@ class CreateTaskRequest(BaseModel):
             "Output format of the task. Omitted, null or "
             '``{"type": "text"}`` means no format; a ``json_schema`` object '
             "(``name``, ``schema`` and optionally ``strict`` set to true and "
-            "``description``) sets it for this and later turns. An invalid "
-            "value is rejected with 422 ``invalid_input``; the message starts "
-            "with the rule id and the JSON path of the offending value."
+            "``description``) sets it for this and later turns. A "
+            "``json_schema`` object may also carry ``accept_partial`` (true or "
+            "false, default false), a switch that keeps the values extracted "
+            "from a run the agent rated partial or blocked, and from an "
+            "incomplete result; it is not accepted with ``type`` ``text``. An "
+            "invalid value is rejected with 422 ``invalid_input``; the message "
+            "starts with the rule id and the JSON path of the offending value."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
@@ -248,6 +254,39 @@ class RuntimeKeyResponse(BaseModel):
     full_key: str
     key_prefix: str
     created_at: datetime
+
+
+class AgentRuntimeKeyItem(BaseModel):
+    """One runtime key of an agent, as listed by
+    ``GET /v1/agents/{agent_id}/api-keys``.
+
+    Never carries the secret: ``masked_key`` shows the public prefix followed
+    by a fixed number of bullets, and the full key is only ever returned once,
+    by the call that created it.
+    """
+
+    id: int
+    label: Optional[str] = None
+    key_prefix: str
+    masked_key: str
+    status: Literal["active", "paused", "revoked"]
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class AgentRuntimeKeyRevokeResponse(BaseModel):
+    """Result of ``DELETE /v1/agents/{agent_id}/api-keys/{key_id}``.
+
+    ``revoked`` is ``True`` when this call revoked the key and ``False`` when
+    it had already been revoked; ``revoked_at`` is when the key was revoked
+    either way. ``key_prefix`` identifies the secret that was revoked.
+    """
+
+    id: int
+    key_prefix: str
+    revoked: bool
+    revoked_at: datetime
 
 
 class V1AgentCreateRequest(BaseModel):
@@ -449,6 +488,101 @@ class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
     )
 
 
+class V1AgentConnectorsResponse(BaseModel):
+    """Response of ``GET`` and ``PUT /v1/agents/{agent_id}/connectors``."""
+
+    agent_id: int
+    connectors: list[str] = Field(
+        ...,
+        description=(
+            "The connector names the agent selects, as stored: in stored "
+            "order, a repeated name repeated. An agent that uses the default "
+            "tool set selects none."
+        ),
+    )
+    all_connectors: bool = Field(
+        ...,
+        description=(
+            "True when the agent uses the default tool set, or its tool list "
+            "has the category that selects every MCP connector."
+        ),
+    )
+    unresolved: list[str] = Field(
+        ...,
+        description=(
+            "Names in ``connectors`` that are not among the connectors the key "
+            "holder can see through this API. This is computed for the key "
+            "holder and can differ from the set a task loads when it runs."
+        ),
+    )
+
+
+class V1AgentConnectorsUpdateRequest(BaseModel):
+    """Body for ``PUT /v1/agents/{agent_id}/connectors``.
+
+    The agent's connector selection is replaced as a whole, so read it with
+    ``GET`` first and send it back with your change. Entries of the agent's
+    tool list that do not select a connector keep their relative order, and
+    the connector entries follow them in the order given here. Sending back
+    exactly what ``GET`` returned changes nothing and writes nothing.
+
+    Only names this request adds are checked: each must be a connector the key
+    holder can see. A name already on the agent is kept even when the key
+    holder cannot see it, and ``unresolved`` in the response lists it. A
+    connector the key holder has disabled for themselves can be added to a
+    personal agent; it is stored and listed as resolved, and tasks load it
+    only once it is enabled again. A connector the key holder sees only
+    because their team shares it is also accepted and listed as resolved,
+    but a task takes team connectors from the team that owns the agent, so a
+    task of a personal agent runs without it.
+
+    For an agent that belongs to a team, the new list, with the category that
+    selects every connector when ``all_connectors`` is true, is checked by the
+    team connector validator the deployment installs. A list it refuses fails
+    with ``connector_not_shared``; whether ``all_connectors=true`` is accepted
+    is also its decision. With no validator installed, this check refuses
+    nothing. An agent that uses the default tool set is refused with
+    ``agent_tools_unconfigured``.
+
+    New tasks use the new selection at once. An existing task keeps using the
+    previous one while its cached agent runtime is alive; each server process
+    has its own cache, and how long a runtime stays cached depends on the
+    task's state. If the agent is the manager or an enabled worker of a
+    workforce and its tool list now differs, other than in order, from the
+    list it had when an ongoing workforce conversation started, that
+    conversation is rejected with ``workforce_config_changed`` on its next
+    turn; a preview conversation in the workforce builder is not checked.
+
+    A selection with more than 100 names, or a name that is empty, blank or
+    longer than 100 characters, cannot be sent back unchanged. There is no
+    conflict detection: of two concurrent replacements the later one wins.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connectors: list[
+        Annotated[str, StringConstraints(min_length=1, max_length=100, pattern=r"\S")]
+    ] = Field(
+        ...,
+        max_length=100,
+        description=(
+            "The complete new list of connector names; a name repeated "
+            "exactly is kept once, at its first position. Names that fold "
+            "to the same identity, such as 'Foo' and 'foo', are both kept."
+        ),
+    )
+    all_connectors: bool = Field(
+        ...,
+        description=(
+            "False selects only the connectors listed: the category that "
+            "selects every connector is removed. True keeps that category, "
+            "adding it when the agent lacks it, so the list does not narrow "
+            "which connectors the agent can use; it still decides which "
+            "Custom APIs are selected."
+        ),
+    )
+
+
 class V1McpTool(BaseModel):
     """One tool a connector offers."""
 
@@ -482,8 +616,8 @@ class V1McpServerTools(BaseModel):
     """Response of ``GET /v1/mcp-servers/{server_id}/tools``.
 
     The connector is started the way a task would start it. Waiting for a
-    free slot takes at most one MCP initialization timeout; starting the
-    connector takes at most one more, plus the time to read its settings.
+    free slot takes at most five seconds; starting the connector takes at most
+    one MCP initialization timeout, plus the time to read its settings.
     ``failures`` is non-empty when some loads failed but at least one tool
     came back.
     """
@@ -865,10 +999,15 @@ class AppendMessageRequest(BaseModel):
             'format as it is; ``{"type": "text"}`` clears it; a '
             "``json_schema`` object (``name``, ``schema`` and optionally "
             "``strict`` set to true and ``description``) sets it for this and "
-            "later turns. An invalid value is rejected with 422 "
-            "``invalid_input``; the message starts with the rule id and the "
-            "JSON path of the offending value. Not accepted with a workforce "
-            "key (422)."
+            "later turns. A new ``json_schema`` object replaces the stored one "
+            "as a whole, including ``accept_partial``: send ``accept_partial`` "
+            "again to keep it. ``accept_partial`` (true or false, default "
+            "false) keeps the values extracted from a run the agent rated "
+            "partial or blocked, and from an incomplete result; it is not "
+            "accepted with ``type`` ``text``. An invalid value is rejected "
+            "with 422 ``invalid_input``; the message starts with the rule id "
+            "and the JSON path of the offending value. Not accepted with a "
+            "workforce key (422)."
         ),
     )
     connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
@@ -1100,6 +1239,48 @@ class CancelQuestionResponse(BaseModel):
     )
 
 
+class CancelTaskResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/cancel`` -> 200 / 202 response.
+
+    200: the run named by ``cancelled_run_id`` is cancelled, whether this
+    call did it or an earlier one already had. The other fields describe
+    the task now: it reads ``failed`` with ``error_code='task_cancelled'``
+    unless a new turn has started since, in which case ``status``,
+    ``run_id``, ``state_version`` and ``error_code`` describe that turn.
+    202: the cancel was recorded but not applied yet; ``status`` is still
+    the task's current one and ``cancelled_run_id`` is null. Calling again
+    reaches the same request.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    status: str = Field(
+        ...,
+        description=(
+            "Task status as stored: 'failed' once cancelled, the status of a "
+            "turn that started after the cancel, or, on 202, the status the "
+            "cancel is still being applied to."
+        ),
+    )
+    run_id: Optional[str] = Field(..., description="Current execution run identity.")
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    cancelled_run_id: Optional[str] = Field(
+        ...,
+        description=(
+            "The run that was cancelled. Null while the cancel has not been applied."
+        ),
+    )
+    error_code: Optional[str] = Field(
+        ...,
+        description=(
+            "'task_cancelled' while the task reads as cancelled, otherwise "
+            "null (before the cancel is applied, or once a later turn has "
+            "started); the same value GET /v1/chat/tasks/{task_id} reports."
+        ),
+    )
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 
@@ -1210,7 +1391,8 @@ class TaskInfoResponse(BaseModel):
     Returns a snapshot of the task's current state from the ``tasks``
     row. ``input`` / ``output`` / ``error`` reflect the **latest** turn
     only -- full transcript history is queryable via the ``/steps``
-    endpoint's ``message`` type steps.
+    endpoint's ``message`` type steps. The ``completion_outcome`` key is
+    present only when the task's response format sets accept_partial.
     """
 
     task_id: int
@@ -1272,6 +1454,16 @@ class TaskInfoResponse(BaseModel):
             "a fixed text saying why automatic resume stopped."
         ),
     )
+    error_code: Optional[str] = Field(
+        None,
+        description=(
+            "Machine-readable reason for status='failed', when one is "
+            "defined: 'task_cancelled' for a task stopped through "
+            "POST /v1/chat/tasks/{task_id}/cancel. Null for every other "
+            "failure, for a derived failed, and whenever status is not "
+            "'failed'."
+        ),
+    )
     created_at: datetime
     completed_at: Optional[datetime] = Field(
         None,
@@ -1313,8 +1505,13 @@ class TaskInfoResponse(BaseModel):
     structured_output: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "The structured result of the run shown in this response, when "
-            "structured_output_status is 'ready'; null otherwise."
+            "The structured result of the run shown in this response. When "
+            "structured_output_status is 'ready', the complete result. When "
+            "it is 'incomplete' and the format sets accept_partial, the "
+            "values that were extracted, with null where a value is missing "
+            "or cannot be written (structured_output_reason lists up to 20 "
+            "such positions of each kind); null when nothing could be kept. "
+            "Null otherwise."
         ),
     )
     structured_output_status: Optional[str] = Field(
@@ -1328,11 +1525,14 @@ class TaskInfoResponse(BaseModel):
     structured_output_reason: Optional[Dict[str, Any]] = Field(
         None,
         description=(
-            "Why there is no structured result when structured_output_status "
-            "is 'incomplete' or 'failed': an object with code and message, "
-            "and missing_fields or unexpressible_fields (at most 20 paths "
-            "each) when the result lacks or cannot express values. A key with "
-            "no value is absent. code is one of: agent_partial / "
+            "Why the structured result is missing or partial when "
+            "structured_output_status is 'incomplete' or 'failed': an object "
+            "with code and message, and missing_fields or "
+            "unexpressible_fields (at most 20 paths each) when the result "
+            "lacks or cannot express values. With accept_partial, "
+            "agent_partial and agent_blocked may also carry missing_fields "
+            "and unexpressible_fields. A key with no value is absent. code "
+            "is one of: agent_partial / "
             "agent_blocked / information_missing / value_not_expressible / "
             "not_produced (status incomplete); schema_mismatch / "
             "result_too_large / model_error / invalid_stored_format / "
@@ -1340,6 +1540,31 @@ class TaskInfoResponse(BaseModel):
             "otherwise."
         ),
     )
+    completion_outcome: Optional[str] = Field(
+        None,
+        description=(
+            "How the agent rated the run shown in this response: completed, "
+            "partial or blocked. Present only when the task's response format "
+            "sets accept_partial; the key is absent otherwise. When present, "
+            "null unless the task is completed and the run recorded a rating. "
+            "Whether a structured result is complete is told by "
+            "structured_output_status, not by this field."
+        ),
+    )
+
+    # Responses for a task without accept_partial must stay byte-identical to
+    # those of servers that predate this field, so the key is dropped unless
+    # the response was built or updated with it. No return annotation: any
+    # annotation, Any included, replaces this model's serialization schema in
+    # the OpenAPI document.
+    @model_serializer(mode="wrap")
+    def _omit_unreported_completion_outcome(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        data = handler(self)
+        if "completion_outcome" not in self.model_fields_set:
+            data.pop("completion_outcome", None)
+        return data
 
 
 # ``PublicStep.type`` is the public surface for what was internally one

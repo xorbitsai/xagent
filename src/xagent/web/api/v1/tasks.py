@@ -45,6 +45,7 @@ from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
     CancelQuestionResponse,
+    CancelTaskResponse,
     CreateTaskRequest,
     CreateTaskResponse,
     DeleteTaskResponse,
@@ -64,6 +65,7 @@ from ...services.api_idempotency import IdempotencyClaim
 from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
+from ...services.execution_result_projection import completion_outcome_fields
 from ...services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -82,8 +84,10 @@ from ...services.response_format import (
     normalize_response_format,
     violation_message,
 )
+from ...services.sdk_task_cancel import sdk_cancel_error_code
 from ...services.structured_output_projection import (
     project_structured_output,
+    response_format_accepts_partial,
     response_format_configured,
 )
 from ...services.task_auto_resume import TerminalView, status_only_terminal_view
@@ -590,6 +594,15 @@ class _TaskInfoSnapshot:
     # ``project_structured_output`` applied to the effective status.
     structured_output_record: Any = None
     format_configured: bool = False
+    # ``task_cancelled`` when the stored row is the outcome of a cancel
+    # request, ``None`` for every other row. Cleared like ``error`` wherever
+    # the status shown is not the stored one.
+    error_code: str | None = None
+    # Read from the same row: the stored completion rating and whether the
+    # task's stored format sets accept_partial, which decides if the response
+    # carries a completion_outcome key at all.
+    completion_outcome: Any = None
+    accept_partial: bool = False
 
 
 # Terminal statuses an append is accepted from. With shared execution the row
@@ -618,6 +631,7 @@ def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
             status=TaskStatus.PENDING,
             output=None,
             error=None,
+            error_code=None,
         )
     view = snapshot.view
     if view is None:
@@ -628,6 +642,7 @@ def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
         control_state=TaskStatus.FAILED.value,
         output=None,
         error=view.error,
+        error_code=None,
     )
 
 
@@ -864,6 +879,11 @@ def _load_task_info_snapshot(
             start_queued=start_queued,
             structured_output_record=task.structured_output_record,
             format_configured=response_format_configured(task.agent_config),
+            error_code=sdk_cancel_error_code(
+                task.status, cast(str | None, task.error_message)
+            ),
+            completion_outcome=task.completion_outcome,
+            accept_partial=response_format_accepts_partial(task.agent_config),
         )
 
 
@@ -1010,7 +1030,8 @@ def _get_chat_task_sync(
     current. The cached body holds the stored values; the view is applied
     to the response after every cache read or write. A queued START is
     applied the same way, for the same reason. So are the structured output
-    fields: the cached body holds them as null.
+    fields and the completion_outcome key: the cached body holds the fields
+    as null and has no such key.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -1030,6 +1051,7 @@ def _get_chat_task_sync(
             status=effective.status.value,
             output=effective.output,
             error=effective.error,
+            error_code=effective.error_code,
             completed_at=None,
         )
     if task.view is not None:
@@ -1039,6 +1061,7 @@ def _get_chat_task_sync(
             control_state=effective.control_state,
             output=effective.output,
             error=effective.error,
+            error_code=effective.error_code,
             completed_at=task.view.stopped_at,
         )
     # Applied on every read, never cached: the record can change without the
@@ -1051,6 +1074,15 @@ def _get_chat_task_sync(
             record=task.structured_output_record,
             format_configured=task.format_configured,
         ).as_dict()
+    )
+    # The key is absent unless the stored format sets accept_partial, so it is
+    # only ever added here, never passed to the cached response.
+    overlay.update(
+        completion_outcome_fields(
+            effective_task_snapshot(task).status,
+            task.completion_outcome,
+            accept_partial=task.accept_partial,
+        )
     )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
@@ -1072,6 +1104,7 @@ def _get_chat_task_sync(
         input=task.input,
         output=task.output,
         error=task.error,
+        error_code=task.error_code,
         created_at=task.created_at,
         completed_at=completed_at,
     )
@@ -1478,6 +1511,96 @@ async def cancel_waiting_task_question(
     )
 
 
+@router.post(
+    "/chat/tasks/{task_id}/cancel",
+    response_model=CancelTaskResponse,
+    responses={
+        202: {
+            "model": CancelTaskResponse,
+            "description": "The cancel is recorded but not applied yet.",
+        }
+    },
+)
+async def cancel_chat_task(
+    task_id: int,
+    response: Response,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> CancelTaskResponse:
+    """Stop a task that is still running.
+
+    Reuses ``GET``'s ownership rule (another agent's task, another user's
+    agent, a missing id, or a non-SDK task all answer 404) before anything
+    about the task's state is read. The cancelled task reads ``failed``
+    with ``error_code='task_cancelled'``, and accepts
+    ``POST /v1/chat/tasks/{id}/messages`` like any failed task. A workforce
+    run is cancelled as one task.
+
+    The call polls up to about 10 seconds for the cancel to be applied;
+    when this process applies the cancel itself it also waits for the run
+    to stop. 200 means the task is cancelled, including when an earlier
+    call already cancelled it; if a new turn has started since, ``status``
+    and ``run_id`` describe that turn and ``cancelled_run_id`` names the
+    cancelled one. 202 means the cancel is recorded but not applied yet,
+    and calling again reaches the same request.
+
+    Only a running task is cancelled. One that is waiting for an answer,
+    paused, or whose turn is still queued to start answers 409
+    ``task_busy`` and is left untouched.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing, not owned by the key, or not SDK-created.
+        V1ApiError 409: ``task_not_cancellable`` for a task that already
+            ended without being cancelled, including one whose run ended
+            on its own, or was replaced by another turn, while the cancel
+            was being applied; ``task_busy`` when the task cannot be
+            cancelled in its current state or changed state while the
+            cancel was applied -- retry.
+        V1ApiError 410: ``task_expired`` for a retention-expired task.
+        V1ApiError 503: the cancel could not be applied; retry.
+    """
+    from ...services.sdk_task_cancel import (
+        SdkTaskCancelBusy,
+        SdkTaskCancelFailed,
+        SdkTaskNotCancellable,
+        request_sdk_task_cancel,
+    )
+
+    try:
+        result = await request_sdk_task_cancel(
+            task_id=task_id,
+            scope=_sdk_task_scope(principal),
+        )
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
+    except SdkTaskNotCancellable as exc:
+        raise V1ApiError(
+            V1ErrorCode.TASK_NOT_CANCELLABLE, 409, message=str(exc) or None
+        ) from exc
+    except SdkTaskCancelBusy as exc:
+        raise V1ApiError(V1ErrorCode.TASK_BUSY, 409, message=str(exc)) from exc
+    except SdkTaskCancelFailed as exc:
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            503,
+            message="The cancel could not be applied; retry.",
+        ) from exc
+
+    await record_principal_usage(
+        principal, route="cancel_task", task_id=result.task_id, agent_id=None
+    )
+    if not result.cancelled:
+        response.status_code = 202
+    return CancelTaskResponse(
+        task_id=result.task_id,
+        status=result.status,
+        run_id=result.run_id,
+        state_version=result.state_version,
+        cancelled_run_id=result.cancelled_run_id,
+        error_code=result.error_code,
+    )
+
+
 @router.get("/chat/tasks/{task_id}", response_model=TaskInfoResponse)
 async def get_chat_task(
     task_id: int,
@@ -1626,7 +1749,11 @@ async def stream_chat_task_events(
       - ``task.completed``: ``{status, output, error, structured_output,
         structured_output_status, structured_output_reason}``. The three
         structured fields carry the same values as the fields of the
-        same name on ``GET /v1/chat/tasks/{task_id}``. A failed task
+        same name on ``GET /v1/chat/tasks/{task_id}``. A
+        ``completion_outcome`` key follows them only when the task's
+        response format sets accept_partial; its value is completed,
+        partial or blocked, or null (null unless the task is completed
+        and the run recorded a rating). A failed task
         also ends the stream with this event rather than a separate
         one -- ``status`` is ``"failed"`` and ``error`` is set.
       - ``task.input_required``: ``{task_id, prompt}``. ``prompt`` is the

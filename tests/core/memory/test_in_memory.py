@@ -562,6 +562,25 @@ class TestSearchListOnlyFilterParity:
             n.id for n in memory_store.list_all(filters={"date_from": cutoff_utc})
         ] == ["new-home"]
 
+    def test_list_all_orders_naive_legacy_and_aware_utc_rows(self, memory_store):
+        # Rows written before UTC timestamps are naive server-local time;
+        # new rows are aware UTC. list_all must order the mix newest-first
+        # instead of raising TypeError on a naive/aware comparison.
+        between = (self.now - timedelta(days=1)).astimezone(timezone.utc)
+        memory_store.add(
+            MemoryNote(id="aware-middle", content="aware report", timestamp=between)
+        )
+        memory_store.add(
+            MemoryNote(id="aware-default", content="default timestamp report")
+        )
+
+        assert [n.id for n in memory_store.list_all()] == [
+            "aware-default",
+            "new-home",
+            "aware-middle",
+            "old-work",
+        ]
+
     def test_timezone_aware_stored_timestamp_with_naive_filter(self, memory_store):
         # The other direction: an aware stored timestamp must compare against
         # a naive filter value.

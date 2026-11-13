@@ -257,6 +257,9 @@ KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
 COMPOSIO_RECONCILE_INTERVAL_SECONDS = "XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS"
+COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS = (
+    "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS"
+)
 TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
 TASK_CLEANUP_MAX_ATTEMPTS = "XAGENT_TASK_CLEANUP_MAX_ATTEMPTS"
 WORKFORCE_PREVIEW_RUN_STALE_SECONDS = "XAGENT_WORKFORCE_PREVIEW_RUN_STALE_SECONDS"
@@ -1950,6 +1953,33 @@ def get_composio_reconcile_interval_seconds() -> int | None:
             value,
         )
         return None
+    return parsed
+
+
+def get_composio_missing_account_interval_seconds() -> int:
+    """How often grants whose Composio account is gone are cleared.
+
+    On by default: the pass only reads the grants this database stores and
+    clears their local tokens, deleting nothing in Composio, so unlike
+    the orphan cleanup it needs no operator opt-in. "0" turns it off; any
+    other value that is not an integer of at least 300 falls back to 3600.
+    """
+    value = (os.getenv(COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS) or "").strip()
+    if not value:
+        return 3600
+    if value == "0":
+        return 0
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = 0
+    if parsed < 300:
+        logger.warning(
+            "Invalid %s=%r; using 3600",
+            COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS,
+            value,
+        )
+        return 3600
     return parsed
 
 

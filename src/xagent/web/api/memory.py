@@ -11,8 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field, field_validator
 from starlette import convertors as starlette_url  # codespell:ignore
 
-from xagent.core.memory.base import MemoryStore
+from xagent.core.memory.base import MemoryStore, comparable_timestamp
 from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.provenance import MEMORY_PROVENANCE_METADATA_KEY
 
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store, get_memory_store_manager
@@ -344,7 +345,10 @@ class MemoryManagementRouter:
                             "keywords": memory.keywords,
                             "tags": memory.tags,
                             "category": memory.category,
-                            "timestamp": memory.timestamp,
+                            # Legacy rows are naive server-local time; emit
+                            # every timestamp as aware UTC so clients never
+                            # reinterpret it in the viewer's timezone.
+                            "timestamp": comparable_timestamp(memory.timestamp),
                             "mime_type": memory.mime_type,
                             "metadata": memory.metadata,
                         }
@@ -513,6 +517,10 @@ class MemoryManagementRouter:
                         category=memory_request.get("category", "general"),
                         metadata=memory_request.get("metadata", {}),
                     )
+                    # Provenance is server-owned (stamped only by the
+                    # store_memory tool from host policy); a client cannot
+                    # claim where a hand-written memory was learned.
+                    memory_note.metadata.pop(MEMORY_PROVENANCE_METADATA_KEY, None)
 
                     # Embeds the note.
                     async with usage_scope(
@@ -598,7 +606,8 @@ class MemoryManagementRouter:
                                 "keywords": memory.keywords,
                                 "tags": memory.tags,
                                 "category": memory.category,
-                                "timestamp": memory.timestamp,
+                                # Aware UTC, as in the list response.
+                                "timestamp": comparable_timestamp(memory.timestamp),
                                 "mime_type": memory.mime_type,
                                 "metadata": memory.metadata,
                             }

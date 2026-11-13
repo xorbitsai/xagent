@@ -208,6 +208,7 @@ def test_compose_memory_binding_preserves_matching_scope_authority() -> None:
         policy_scope=scope,
         enabled=True,
         availability_reason=None,
+        provenance=None,
     )
 
     assert policy.memory is binding.store
@@ -231,6 +232,7 @@ def test_compose_memory_binding_binds_policy_scope_when_binding_has_none() -> No
         policy_scope=scope,
         enabled=True,
         availability_reason=None,
+        provenance=None,
     )
 
     assert policy.memory is not binding.store
@@ -257,6 +259,7 @@ def test_compose_memory_binding_rejects_conflicting_scope_authorities() -> None:
         ),
         enabled=True,
         availability_reason=None,
+        provenance=None,
     )
 
     assert policy.memory_enabled is False
@@ -784,6 +787,11 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
                 memory_dimensions={"principal": "person-1"},
             ),
         ),
+        MemoryPolicyDecision(
+            enabled=False,
+            available=True,
+            memory_provenance={"channel_id": "C1"},
+        ),
     ],
     ids=(
         "wrong-type",
@@ -793,6 +801,7 @@ def test_resolver_exception_fails_closed_for_preview() -> None:
         "non-bool-flag",
         "malformed-access-scope",
         "scope-while-disabled",
+        "provenance-while-disabled",
     ),
 )
 def test_invalid_resolver_decision_fails_closed(
@@ -810,6 +819,232 @@ def test_invalid_resolver_decision_fails_closed(
     assert policy.memory_available is False
     assert policy.memory_availability_reason == MEMORY_POLICY_RESOLVER_FAILURE_REASON
     get_memory_store.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolver_provenance_is_stamped_by_default_store_memory_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryMemoryStore()
+    monkeypatch.setattr(
+        agent_runtime_service, "get_memory_store", Mock(return_value=store)
+    )
+    host_provenance = {"channel_kind": "channel", "channel_id": "C42", "task_id": "17"}
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance=host_provenance,
+        )
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+    # The decision froze its own copy; a later host mutation cannot leak in.
+    host_provenance["channel_id"] = "C-mutated"
+
+    assert policy.memory is store
+    assert policy.memory_tools_factory is not None
+    tools = policy.memory_tools_factory(
+        memory_store=policy.memory,
+        task="what did Bob say in the standup?",
+        runtime=None,
+        context=None,
+    )
+    assert [tool.name for tool in tools] == [
+        "store_memory",
+        "search_memory",
+        "update_memory",
+        "delete_memory",
+    ]
+    result = await tools[0].execute(content="Standups are at 10:00 UTC.")
+
+    note = store.get(result["memory_id"]).content
+    assert note.metadata["provenance"] == {
+        "channel_kind": "channel",
+        "channel_id": "C42",
+        "task_id": "17",
+    }
+    assert "Bob" not in str(note.metadata)
+
+
+def test_resolver_without_provenance_keeps_builtin_memory_tool_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_runtime_service,
+        "get_memory_store",
+        Mock(return_value=InMemoryMemoryStore()),
+    )
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(enabled=True, available=True)
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    # No factory: ReAct builds its default tool set exactly as before.
+    assert policy.memory_tools_factory is None
+
+
+def test_resolver_provenance_carrying_text_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    get_memory_store = Mock(name="get-memory-store")
+    monkeypatch.setattr(agent_runtime_service, "get_memory_store", get_memory_store)
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance={"channel_id": "please remember my password"},
+        )
+    )
+
+    with caplog.at_level("WARNING"):
+        policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    # The failure is diagnosable (names the key and grammar) without echoing
+    # the rejected value, which may be conversation content.
+    assert "ValueError" in caplog.text
+    assert "memory provenance value for 'channel_id'" in caplog.text
+    assert "please remember my password" not in caplog.text
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert policy.memory_availability_reason == MEMORY_POLICY_RESOLVER_FAILURE_REASON
+    get_memory_store.assert_not_called()
+
+
+def test_binding_tool_factory_receives_policy_provenance() -> None:
+    seen: list[MemoryToolAssemblyRequest] = []
+
+    def factory(request: MemoryToolAssemblyRequest) -> list[object]:
+        seen.append(request)
+        return []
+
+    set_trusted_memory_binding_resolver(
+        lambda _request: MemoryStoreBinding(
+            store=InMemoryMemoryStore(),
+            backend_identity="backend-a",
+            route_generation="route-1",
+            memory_tools_factory=factory,
+        )
+    )
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance={"channel_kind": "dm", "channel_id": "D7"},
+        )
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+    assert policy.memory_tools_factory is not None
+    policy.memory_tools_factory(
+        memory_store=policy.memory, task="t", runtime=None, context=None
+    )
+
+    [request] = seen
+    # A plain dict copy, so host factories can serialize or keep it.
+    assert type(request.provenance) is dict
+    assert request.provenance == {"channel_kind": "dm", "channel_id": "D7"}
+
+
+@pytest.mark.asyncio
+async def test_binding_without_tool_factory_binds_provenance_to_default_tools() -> None:
+    store = InMemoryMemoryStore()
+    set_trusted_memory_binding_resolver(
+        lambda _request: MemoryStoreBinding(
+            store=store,
+            backend_identity="backend-a",
+            route_generation="route-1",
+        )
+    )
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance={"channel_kind": "dm", "channel_id": "D7"},
+        )
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory is store
+    assert policy.memory_tools_factory is not None
+    tools = policy.memory_tools_factory(
+        memory_store=policy.memory, task="t", runtime=None, context=None
+    )
+    assert [tool.name for tool in tools] == [
+        "store_memory",
+        "search_memory",
+        "update_memory",
+        "delete_memory",
+    ]
+    result = await tools[0].execute(content="User prefers short answers.")
+    assert store.get(result["memory_id"]).content.metadata["provenance"] == {
+        "channel_kind": "dm",
+        "channel_id": "D7",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cached_service_picks_up_and_drops_provenance_across_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryMemoryStore()
+    monkeypatch.setattr(
+        agent_runtime_service, "get_memory_store", Mock(return_value=store)
+    )
+    turn_provenance: dict[str, Any] = {"value": {"channel_id": "C1"}}
+    set_trusted_memory_policy_resolver(
+        lambda _request: MemoryPolicyDecision(
+            enabled=True,
+            available=True,
+            memory_provenance=turn_provenance["value"],
+        )
+    )
+    service = AgentService(
+        name="cached",
+        id="web_task_17",
+        tools=[],
+        enable_workspace=False,
+        memory=InMemoryMemoryStore(),
+    )
+    service._execution_adapter = service._build_execution_adapter()
+    manager = agent_runtime_service.AgentServiceManager()
+    manager._agents[17] = service
+
+    async def reconcile() -> None:
+        await manager._reconcile_cached_agent_memory_policy(
+            17,
+            task=_task(),
+            agent_config={},
+            ambient_owner_user_id=23,
+            ambient_execution_scope=None,
+        )
+
+    def store_tool_provenance() -> dict[str, str] | None:
+        factory = service.memory_tools_factory
+        assert service._execution_adapter.config.memory_tools_factory is factory
+        if factory is None:
+            return None
+        [store_tool, *_] = factory(
+            memory_store=store, task="t", runtime=None, context=None
+        )
+        return dict(store_tool.provenance)
+
+    await reconcile()
+    assert store_tool_provenance() == {"channel_id": "C1"}
+
+    # A later turn without provenance falls back to the built-in tool path.
+    turn_provenance["value"] = None
+    await reconcile()
+    assert store_tool_provenance() is None
+
+    # And a turn from another channel picks up that channel's provenance.
+    turn_provenance["value"] = {"channel_id": "D2"}
+    await reconcile()
+    assert store_tool_provenance() == {"channel_id": "D2"}
 
 
 def test_resolver_receives_none_for_missing_or_nonprimitive_task_fields() -> None:

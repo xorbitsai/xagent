@@ -311,6 +311,26 @@ async def _run_resume(
     return task_id, seen, sink
 
 
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [({}, False), ({"accept_partial": True}, True)],
+    ids=["no-key", "true"],
+)
+@pytest.mark.parametrize("entry", ["new-turn", "resume"])
+async def test_both_entries_carry_accept_partial(
+    db_session, monkeypatch, entry: str, extra: dict[str, Any], expected: bool
+) -> None:
+    config = _config(_stored(**extra))
+    if entry == "new-turn":
+        _, seen = await _run_new_turn(db_session, monkeypatch, config, _good_model())
+    else:
+        _, seen, _ = await _run_resume(db_session, monkeypatch, config, _good_model())
+
+    fmt = seen[KWARG]
+    assert fmt is not INVALID
+    assert fmt.accept_partial is expected
+
+
 # --- a new turn --------------------------------------------------------------
 
 

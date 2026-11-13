@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import TracebackType
-from typing import Any, Callable, NamedTuple, TypeVar
+from typing import Any, Callable, NamedTuple, TypeVar, cast
 
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError, NoResultFound
@@ -59,6 +59,34 @@ class RuntimeKeyReceipt:
             raise ValueError("Replaced runtime keys require a rotation timestamp.")
 
 
+@dataclass(frozen=True)
+class AgentKeyMetadata:
+    """Detached, secret-free description of one key of an agent."""
+
+    id: int
+    label: str | None
+    key_prefix: str
+    masked_key: str
+    status: str
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None
+
+
+@dataclass(frozen=True)
+class AgentKeyRevocation:
+    """Outcome of revoking one key of one agent.
+
+    ``revoked`` is True when this call revoked the key and False when it was
+    already revoked; ``revoked_at`` is the stored timestamp either way.
+    """
+
+    key_id: int
+    key_prefix: str
+    revoked: bool
+    revoked_at: datetime
+
+
 class RuntimeKeyDeliveryError(Exception):
     """Carry a possibly committed key transition through worker teardown.
 
@@ -83,6 +111,10 @@ class RuntimeKeyDeliveryError(Exception):
 
 class KeyRotationConflict(RuntimeError):
     """A key-prefix conflict that was rolled back before delivery."""
+
+
+class AgentRuntimeKeyNotFoundError(LookupError):
+    """The agent has no runtime key with the requested id."""
 
 
 def acquire_runtime_key_transition_fence(db: Session, agent_id: int) -> bool:
@@ -114,6 +146,10 @@ def _key_status(row: AgentApiKey) -> str:
     if row.paused_at is not None:
         return "paused"
     return "active"
+
+
+def _normalized_or_none(value: Any) -> datetime | None:
+    return None if value is None else normalize_datetime_from_db(value)
 
 
 def _masked_key(row: AgentApiKey) -> str:
@@ -359,6 +395,97 @@ class AgentApiKeyService:
             raise
         logger.info("Revoked runtime API key for agent %s", agent_id)
         return APIKeyRevokeResponse(revoked=True, revoked_at=now)
+
+    def list_keys_for_agent(
+        self, agent_id: int, *, include_revoked: bool = False
+    ) -> list[AgentKeyMetadata]:
+        """The keys bound to one agent, newest first, without any secret.
+
+        Performs no authorization: the caller must already have established
+        that the requester may manage ``agent_id``. Only rows whose
+        ``agent_id`` matches are returned, so a workforce-bound key or
+        another agent's key is never part of the result. Paused keys are
+        always returned; revoked keys only when ``include_revoked`` is set.
+        """
+        query = self.db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id)
+        if not include_revoked:
+            query = query.filter(AgentApiKey.revoked_at.is_(None))
+        rows = query.order_by(
+            AgentApiKey.created_at.desc(), AgentApiKey.id.desc()
+        ).all()
+        return [
+            AgentKeyMetadata(
+                id=int(row.id),
+                label=cast("str | None", row.label),
+                key_prefix=str(row.key_prefix),
+                masked_key=_masked_key(row),
+                status=_key_status(row),
+                created_at=normalize_datetime_from_db(cast(datetime, row.created_at)),
+                last_used_at=_normalized_or_none(row.last_used_at),
+                revoked_at=_normalized_or_none(row.revoked_at),
+            )
+            for row in rows
+        ]
+
+    def revoke_key_for_agent(self, agent_id: int, key_id: int) -> AgentKeyRevocation:
+        """Stage the revocation of one key of one agent.
+
+        Performs no authorization and does NOT commit: the caller must have
+        established, under the agent's runtime-key transition fence, that the
+        requester may manage ``agent_id``, and owns the transaction boundary.
+
+        The write is one conditional UPDATE matching the key id, the agent id
+        and ``revoked_at IS NULL`` together, so it can neither revoke a key
+        bound elsewhere nor overwrite an earlier revocation timestamp. A key
+        that was already revoked is reported with ``revoked=False`` and its
+        original timestamp.
+
+        Known window: because an already revoked key is left untouched, this
+        does not turn a rotation's revocation into an explicit one. If a
+        rotation revoked the key and is later compensated (its new key could
+        not be delivered), the compensation restores every replaced key whose
+        ``revoked_at`` still equals the rotation timestamp, including a key
+        for which this method reported ``revoked=False`` in between. A caller
+        that must be certain should list the agent's keys again once the
+        rotation has settled.
+
+        Raises :class:`AgentRuntimeKeyNotFoundError` when ``agent_id`` has no
+        key with this id.
+        """
+        now = datetime.now(timezone.utc)
+        updated_count = (
+            self.db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.id == key_id,
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .update(
+                {AgentApiKey.revoked_at: now, AgentApiKey.updated_at: now},
+                synchronize_session=False,
+            )
+        )
+        row = (
+            self.db.query(AgentApiKey.key_prefix, AgentApiKey.revoked_at)
+            .filter(AgentApiKey.id == key_id, AgentApiKey.agent_id == agent_id)
+            .first()
+        )
+        if row is None:
+            raise AgentRuntimeKeyNotFoundError(
+                f"Agent {int(agent_id)} has no key {int(key_id)}."
+            )
+        key_prefix, revoked_at = row
+        if revoked_at is None:
+            raise RuntimeError(
+                f"Key {int(key_id)} of agent {int(agent_id)} is still active "
+                "after its revocation was staged."
+            )
+        return AgentKeyRevocation(
+            key_id=int(key_id),
+            key_prefix=str(key_prefix),
+            revoked=updated_count == 1,
+            revoked_at=normalize_datetime_from_db(revoked_at),
+        )
 
     # ===== Multi-key admin operations (centralized "API Keys" page) =====
     #

@@ -182,7 +182,9 @@ def test_the_stream_reads_the_record_with_the_row_in_one_select():
 
 
 def test_a_frame_built_without_fields_carries_null_for_each():
-    frame = es.completed_frame(status=TaskStatus.FAILED.value, output=None, error="x")
+    frame = es.completed_frame(
+        status=TaskStatus.FAILED.value, output=None, error="x", error_code=None
+    )
 
     data = json.loads(frame.split("data: ", 1)[1])
     assert [data[name] for name in NEW_KEYS] == [None, None, None]

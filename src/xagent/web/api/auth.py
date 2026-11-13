@@ -65,6 +65,7 @@ from ...core.runtime_performance import (
 )
 from ...core.utils.api_key import verify_dummy
 from ...core.utils.security import host_matches_suffix
+from .. import browser_idle
 from .. import jwt_codec as jwt
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -73,7 +74,6 @@ from ..auth_config import (
     PASSWORD_MIN_LENGTH,
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
-from .. import browser_idle
 from ..auth_dependencies import get_current_user, get_user_from_token
 from ..auth_sessions import (
     commit_refresh_credentials,
@@ -3075,22 +3075,39 @@ async def logout(
         browser_idle.revoke_browser_session(
             db, sid, reason="logout", user_id=int(user.id)
         )
-    # A stale tab must not revoke a newer session that replaced its refresh
-    # token. Omitting the body preserves the endpoint's legacy revoke-all
-    # behavior for API clients that only send the access token.
-    if (
-        request is not None
-        and request.refresh_token is not None
-        and not refresh_token_matches(
-            getattr(user, "refresh_token", None), request.refresh_token
-        )
-    ):
-        db.commit()
-        return {"success": True, "message": "Logged out successfully"}
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
+    presented = request.refresh_token if request is not None else None
+    _clear_refresh_token_at_logout(db, user, sid=sid, presented=presented)
     db.commit()
     return {"success": True, "message": "Logged out successfully"}
+
+
+def _clear_refresh_token_at_logout(
+    db: Session, user: User, *, sid: str | None, presented: str | None
+) -> None:
+    """Clear the stored refresh token only if this logout owns it.
+
+    The ownership test is part of the UPDATE, so a newer login committed in
+    the meantime keeps its token:
+
+    - a presented refresh token must match the stored one (a stale tab never
+      revokes a newer login), and the stored value must still be the one that
+      was matched;
+    - without one, an access token's ``sid`` must hold the refresh token;
+    - an access token without ``sid`` (issued before browser sessions) keeps
+      the legacy revoke-all behaviour, which cannot tell logins apart.
+    """
+    stored = getattr(user, "refresh_token", None)
+    query = db.query(User).filter(User.id == user.id, User.refresh_token.isnot(None))
+    if presented is not None:
+        if not refresh_token_matches(stored, presented):
+            return
+        query = query.filter(User.refresh_token == stored)
+    elif sid is not None:
+        query = query.filter(User.browser_session_id == sid)
+    query.update(
+        {User.refresh_token: None, User.refresh_token_expires_at: None},
+        synchronize_session=False,
+    )
 
 
 @auth_router.get("/check")

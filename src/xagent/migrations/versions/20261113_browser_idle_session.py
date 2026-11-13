@@ -1,8 +1,10 @@
 """Track interactive browser logins for the idle-expiry policy.
 
 ``browser_sessions`` holds one row per login (its ``sid``, last activity and
-revocation). ``users.browser_session_id`` records which login holds the user's
-refresh token, so refresh tokens issued before this release can be counted.
+revocation); ``browser_idle_enforcement`` records how long the policy is
+known to be enforced, so switching it off does not revive expired logins.
+``users.browser_session_id`` records which login holds the user's refresh
+token, so refresh tokens issued before this release can be counted.
 Both start empty; the idle policy is off by default.
 
 Revision ID: 20261113_browser_idle_session
@@ -41,15 +43,30 @@ def upgrade() -> None:
             sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=False),
             sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column("revoked_reason", sa.String(16), nullable=True),
+            sa.Column(
+                "recorded_admin",
+                sa.Boolean(),
+                nullable=False,
+                server_default=sa.false(),
+            ),
         )
         op.create_index("ix_browser_sessions_user_id", "browser_sessions", ["user_id"])
         op.create_index(
             "ix_browser_sessions_last_used_at", "browser_sessions", ["last_used_at"]
         )
+    if not inspector.has_table("browser_idle_enforcement"):
+        op.create_table(
+            "browser_idle_enforcement",
+            sa.Column("ordinary_minutes", sa.Integer(), primary_key=True),
+            sa.Column("admin_minutes", sa.Integer(), primary_key=True),
+            sa.Column("enforced_until", sa.DateTime(timezone=True), nullable=False),
+        )
 
 
 def downgrade() -> None:
     inspector = sa.inspect(op.get_bind())
+    if inspector.has_table("browser_idle_enforcement"):
+        op.drop_table("browser_idle_enforcement")
     if inspector.has_table("browser_sessions"):
         op.drop_table("browser_sessions")
     if inspector.has_table("users") and "browser_session_id" in {

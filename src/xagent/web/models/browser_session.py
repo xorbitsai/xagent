@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String
 
 from .database import Base
 
@@ -29,3 +29,24 @@ class BrowserSession(Base):  # type: ignore[no-any-unimported]
     # the idle policy is currently enabled.
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     revoked_reason = Column(String(16), nullable=True)
+    # The user's platform-admin role at the last login, activity or refresh.
+    # With the policy off, expiry is judged by the stricter of this and the
+    # current role, so a demotion after switch-off cannot revive a login.
+    recorded_admin = Column(Boolean, nullable=False, default=False)
+
+
+class BrowserIdleEnforcement(Base):  # type: ignore[no-any-unimported]
+    """How long the idle policy is known to be enforced, per threshold set.
+
+    Every replica with the policy enabled pushes the row for its own
+    thresholds a lease ahead of now. With the policy disabled, a login that
+    expired under any recorded threshold set before that set's
+    ``enforced_until`` stays rejected, so switching the policy off cannot
+    revive it, even after a rolling threshold change.
+    """
+
+    __tablename__ = "browser_idle_enforcement"
+
+    ordinary_minutes = Column(Integer, primary_key=True)
+    admin_minutes = Column(Integer, primary_key=True)
+    enforced_until = Column(DateTime(timezone=True), nullable=False)

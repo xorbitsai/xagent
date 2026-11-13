@@ -2,7 +2,9 @@
 Tests for WebSearch tool
 """
 
+import logging
 import os
+import traceback
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
@@ -185,6 +187,96 @@ class TestWebSearchTool:
             ):
                 with pytest.raises(ValueError, match="Network error during search"):
                     await web_search_tool.run_json_async({"query": "test"})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status_code", [400, 429, 500])
+    async def test_http_error_keeps_key_and_query_out_of_errors_and_logs(
+        self, web_search_tool, status_code, caplog
+    ):
+        """An HTTP error must not carry the request URL into errors or logs.
+
+        The request goes through a real httpx client on a mock transport, so
+        the URL in the HTTPStatusError is the one the core really built.
+        """
+        secret_key = "AIza-secret-key-value"
+        query = "jane.doe@example.com 0412 345 678"
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(status_code, json={"error": {"message": "x"}})
+
+        real_client = httpx.AsyncClient
+
+        def client_factory(**_kwargs):
+            return real_client(transport=httpx.MockTransport(handler))
+
+        with (
+            patch.dict(
+                os.environ,
+                {"GOOGLE_API_KEY": secret_key, "GOOGLE_CSE_ID": "test_cse"},
+                clear=True,
+            ),
+            patch("httpx.AsyncClient", side_effect=client_factory),
+            caplog.at_level(logging.DEBUG),
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                await web_search_tool.run_json_async({"query": query})
+
+        assert len(seen) == 1
+        # What the model and an operator see of the failure: the message, the
+        # traceback with its chained exceptions, and the error log records.
+        failure = "".join(
+            traceback.format_exception(
+                type(excinfo.value), excinfo.value, excinfo.value.__traceback__
+            )
+        )
+        failure += "".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
+        assert str(status_code) in str(excinfo.value)
+        assert "jane.doe" not in failure
+        assert "0412" not in failure
+        # The key and the request URL appear nowhere, at any log level.
+        everything = failure + caplog.text
+        assert secret_key not in everything
+        assert "customsearch/v1?" not in everything
+
+    @pytest.mark.asyncio
+    async def test_api_key_is_sent_as_header_not_in_url(
+        self, web_search_tool, mock_google_response
+    ):
+        """The key must not be part of the URL, which httpx logs and reports."""
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json=mock_google_response)
+
+        real_client = httpx.AsyncClient
+
+        def client_factory(**_kwargs):
+            return real_client(transport=httpx.MockTransport(handler))
+
+        with (
+            patch.dict(
+                os.environ,
+                {"GOOGLE_API_KEY": "AIza-secret-key-value", "GOOGLE_CSE_ID": "cse"},
+                clear=True,
+            ),
+            patch("httpx.AsyncClient", side_effect=client_factory),
+        ):
+            result = await web_search_tool.run_json_async({"query": "test"})
+
+        assert len(result["results"]) == 2
+        (request,) = seen
+        assert request.headers["X-goog-api-key"] == "AIza-secret-key-value"
+        assert "key" not in request.url.params
+        assert "AIza-secret-key-value" not in str(request.url)
+        assert request.url.params["cx"] == "cse"
+        assert request.url.params["q"] == "test"
 
     @pytest.mark.asyncio
     async def test_empty_search_results(self, web_search_tool):

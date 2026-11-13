@@ -58,8 +58,11 @@ class WebSearchCore:
         if proxy_url:
             logger.info(f"🌐 Using proxy: {proxy_url}")
 
+        # The key travels in a header, never in the URL: httpx puts the request
+        # URL into its request log line and into the text of every
+        # HTTPStatusError, and both end up in logs and tool errors.
+        headers = {"X-goog-api-key": api_key}
         params: Dict[str, Any] = {
-            "key": api_key,
             "cx": cse_id,
             "q": query,
             "num": num_results,
@@ -77,6 +80,7 @@ class WebSearchCore:
                 response = await client.get(
                     "https://www.googleapis.com/customsearch/v1",
                     params=params,
+                    headers=headers,
                     timeout=10,
                 )
 
@@ -91,6 +95,12 @@ class WebSearchCore:
                     data, include_content, proxy_url
                 )
 
+        except httpx.HTTPStatusError as e:
+            # str(e) and the chained traceback both carry the request URL, and
+            # with it the query. Report the status alone and drop the chain.
+            status = f"{e.response.status_code} {e.response.reason_phrase}".strip()
+            logger.error("❌ Google API HTTP error: %s", status)
+            raise ValueError(f"Google API HTTP error: {status}") from None
         except httpx.RequestError as e:
             logger.error(f"❌ Network error during search: {str(e)}")
             raise ValueError(f"Network error during search: {str(e)}") from e

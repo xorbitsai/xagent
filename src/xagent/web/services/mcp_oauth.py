@@ -70,6 +70,10 @@ class _RetryRuntimeGrantSelection(RuntimeError):
         self.message = message
 
 
+class _InvalidGrantRefreshError(MCPOAuthRuntimeError):
+    """The token endpoint answered ``invalid_grant`` for the grant being refreshed."""
+
+
 @dataclass(frozen=True)
 class MCPAuthorizationChallenge:
     """Bearer challenge advertised by a protected MCP resource."""
@@ -808,15 +812,38 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
         )
         refresh_db.rollback()
 
-        token_data = await _refresh_mcp_oauth_grant(
-            oauth_client_snapshot,
-            refresh_token=refresh_token,
-            resource=refresh_resource,
-            client=client,
-            credential_provider=_platform_credential_provider(
-                oauth_client_snapshot.client_id
-            ),
-        )
+        try:
+            token_data = await _refresh_mcp_oauth_grant(
+                oauth_client_snapshot,
+                refresh_token=refresh_token,
+                resource=refresh_resource,
+                client=client,
+                credential_provider=_platform_credential_provider(
+                    oauth_client_snapshot.client_id
+                ),
+            )
+        except _InvalidGrantRefreshError:
+            with refresh_db.begin():
+                rejected_grant: Any = (
+                    refresh_db.query(MCPOAuthGrant)
+                    .filter(MCPOAuthGrant.id == grant_id)
+                    .with_for_update()
+                    .first()
+                )
+                # A different token means a concurrent refresh rotated the grant:
+                # retiring it would throw away the live one, so retry on it.
+                if (
+                    rejected_grant is None
+                    or not rejected_grant.refresh_token
+                    or str(rejected_grant.refresh_token) != encrypted_refresh_token
+                ):
+                    raise _RetryRuntimeGrantSelection(
+                        "authorization_required",
+                        "MCP OAuth grant changed while preparing runtime authorization",
+                    )
+                rejected_grant.status = "revoked"
+                rejected_grant.revoked_at = _utc_now()
+            raise
 
         with refresh_db.begin():
             locked_grant: Any = (
@@ -1357,6 +1384,12 @@ async def _refresh_mcp_oauth_grant(
     affects every user of the server. Any other client, a user's custom
     static client or a per-user registered one, keeps
     ``token_refresh_failed``.
+
+    A 400/401 answer whose error is ``invalid_grant`` is taken to mean this
+    user's grant is no longer valid: it raises ``_InvalidGrantRefreshError``
+    so the caller can retire it, while 5xx, network errors and every other
+    code stay transient. Per RFC 6749 section 5.2 a client authentication
+    failure answers ``invalid_client``, which the check above handles.
     """
     data = {
         "grant_type": "refresh_token",
@@ -1441,6 +1474,16 @@ async def _refresh_mcp_oauth_grant(
             raise MCPOAuthRuntimeError(
                 client_rejected_reason(credential_provider),
                 "The OAuth provider rejected the platform's client",
+            )
+        if (
+            response.status_code in {400, 401}
+            and isinstance(payload, dict)
+            and payload.get("error") == "invalid_grant"
+        ):
+            raise _InvalidGrantRefreshError(
+                "authorization_required",
+                "MCP OAuth grant was rejected by the authorization server "
+                "and requires reauthorization",
             )
         raise MCPOAuthRuntimeError(
             "token_refresh_failed",

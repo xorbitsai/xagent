@@ -240,7 +240,8 @@ async def _refresh_mcp(
         # Any other client, a user's own static or registered one, only
         # affects that user.
         ({"error": "invalid_client"}, None, "token_refresh_failed"),
-        ({"error": "invalid_grant"}, "hubspot", "token_refresh_failed"),
+        # A dead grant is its holder's to fix, not the platform client's.
+        ({"error": "invalid_grant"}, "hubspot", "authorization_required"),
     ],
 )
 def test_an_mcp_refresh_rejects_only_the_platform_client(

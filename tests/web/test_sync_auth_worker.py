@@ -17,7 +17,7 @@ from xagent.web import browser_idle
 from xagent.web.api import auth
 from xagent.web.auth_sessions import hash_refresh_token, token_browser_session_id
 from xagent.web.models import auth_database
-from xagent.web.models.browser_session import BrowserSession
+from xagent.web.models.browser_session import BrowserIdleEnforcement, BrowserSession
 from xagent.web.models.user import User
 
 
@@ -38,6 +38,7 @@ def worker_db(tmp_path, request):
         engine = create_engine(f"sqlite:///{tmp_path / 'auth.db'}")
     User.__table__.create(engine)
     BrowserSession.__table__.create(engine)
+    BrowserIdleEnforcement.__table__.create(engine)
     with Session(engine) as session:
         session.add(
             User(username="worker", password_hash=auth.hash_password("password123"))
@@ -105,9 +106,8 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
         "create",
         "SELECT",
         "UPDATE",
+        "INSERT",  # The login's browser_sessions row (#3771).
         "commit",
-        # The login's browser_sessions row, flushed by commit (#3771).
-        "INSERT",
         "close",
     ]
     assert len({owner for _, owner in events}) == 1

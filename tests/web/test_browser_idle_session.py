@@ -25,7 +25,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY, validate_auth_config
 from xagent.web.auth_sessions import hash_refresh_token, user_session_claims
-from xagent.web.models.browser_session import BrowserSession
+from xagent.web.models.browser_session import BrowserIdleEnforcement, BrowserSession
 from xagent.web.models.user import User
 
 pytestmark = pytest.mark.usefixtures("test_db")
@@ -258,6 +258,241 @@ def test_sweep_revokes_logins_no_request_ever_saw_expire(monkeypatch):
     assert _verify(active).status_code == 200
 
 
+def _lease_until(at: datetime, ordinary_minutes: int = 30) -> None:
+    """As left by enforcing replicas: one threshold set and its lease end."""
+    with auth_tests.TestingSessionLocal() as session:
+        session.merge(
+            BrowserIdleEnforcement(
+                ordinary_minutes=ordinary_minutes,
+                admin_minutes=15,
+                enforced_until=at,
+            )
+        )
+        session.commit()
+
+
+def test_expiry_no_request_saw_stays_dead_after_switch_off(monkeypatch):
+    """Expiry after the last sweep, no request, switch off, then access."""
+    _switch(monkeypatch, True)
+    _users()
+    tokens = _login()
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session)  # The enabled heartbeat.
+        session.commit()
+    _idle_for(tokens, 31)  # Expired while enforced; no request, no sweep.
+
+    _switch(monkeypatch, False)
+    _assert_idle_rejection(_verify(tokens))
+    _assert_idle_rejection(_refresh(tokens))
+    assert _row(_sid(tokens)).revoked_at is not None
+
+
+def test_a_login_alive_at_switch_off_is_free_at_once(monkeypatch):
+    """The policy went off 40 minutes ago; this login was alive then."""
+    _switch(monkeypatch, False)
+    _users()
+    tokens = _login()
+    now = datetime.now(timezone.utc)
+    _lease_until(now - timedelta(minutes=40))
+    _idle_for(tokens, 35)  # Deadline 5 minutes ago, after the lease ended.
+
+    assert _verify(tokens).status_code == 200
+    assert _refresh(tokens).status_code == 200
+
+
+@pytest.mark.parametrize("offset_seconds,rejected", [(-1, True), (1, False)])
+def test_switch_off_decision_at_the_lease_boundary(
+    monkeypatch, offset_seconds, rejected
+):
+    _switch(monkeypatch, False)
+    _users()
+    tokens = _login()
+    lease_end = datetime.now(timezone.utc) - timedelta(minutes=10)
+    _lease_until(lease_end)
+    deadline = lease_end + timedelta(seconds=offset_seconds)
+    _set_activity(_sid(tokens), deadline - timedelta(minutes=30))
+
+    response = _verify(tokens)
+    if rejected:
+        _assert_idle_rejection(response)
+    else:
+        assert response.status_code == 200
+
+
+def test_legacy_refresh_tokens_stay_rejected_after_an_enforced_period(monkeypatch):
+    """Rollout enables the policy only after pre-release access tokens expired;
+    a pre-release refresh token the policy refused is not migrated later."""
+    _switch(monkeypatch, False)
+    _users()
+    legacy = _legacy_tokens()
+    _lease_until(datetime.now(timezone.utc) - timedelta(minutes=5))
+    _assert_idle_rejection(_refresh(legacy))
+
+
+def test_switch_off_judges_expiry_with_the_thresholds_then_in_force(monkeypatch):
+    """Raising the threshold together with switch-off revives nothing."""
+    _switch(monkeypatch, False)
+    monkeypatch.setenv(ENV_MINUTES, "120")
+    _users()
+    tokens = _login()
+    _lease_until(datetime.now(timezone.utc) - timedelta(minutes=5))
+    _idle_for(tokens, 40)  # Expired under 30 minutes before the lease ended.
+    _assert_idle_rejection(_verify(tokens))
+
+
+def test_a_disabled_replicas_activity_write_cannot_revive(monkeypatch):
+    """Enforcing replicas still run (lease ahead); this one is switched off."""
+    _switch(monkeypatch, False)
+    _users()
+    tokens = _login()
+    _lease_until(datetime.now(timezone.utc) + timedelta(seconds=10))
+    idle_since = _idle_for(tokens, 31)
+    # The read-side check passed on this replica; the write must still refuse.
+    monkeypatch.setattr(browser_idle, "session_rejected", lambda *_a, **_k: False)
+    _assert_idle_rejection(
+        auth_tests.client.post("/api/auth/activity", headers=_bearer(tokens))
+    )
+    assert _as_utc(_row(_sid(tokens)).last_activity_at) == idle_since
+
+
+def test_a_demotion_after_switch_off_revives_nothing(monkeypatch):
+    """An admin login expired at 15 minutes; demotion would allow 30."""
+    _switch(monkeypatch, False)
+    _users()
+    admin = _login("administrator")
+    _lease_until(datetime.now(timezone.utc) - timedelta(minutes=2))
+    _idle_for(admin, 20)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="administrator").one().is_admin = False
+        session.commit()
+    _assert_idle_rejection(_verify(admin))
+
+
+def test_a_promotion_while_enforced_is_recorded_without_activity(monkeypatch):
+    """Promoted while on, idle, expired at 15 minutes, demoted after switch-off."""
+    _switch(monkeypatch, True)
+    _users()
+    member = _login("member")
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = True
+        session.commit()
+        browser_idle.renew_enforcement_lease(session)  # The enabled heartbeat.
+        browser_idle.record_current_admin_roles(session)
+        session.commit()
+    _idle_for(member, 20)
+
+    _switch(monkeypatch, False)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = False
+        session.commit()
+    _assert_idle_rejection(_verify(member))
+
+
+def test_activity_records_the_current_role(enforced):
+    _users()
+    member = _login("member")
+    _idle_for(member, 5)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = True
+        session.commit()
+    assert _row(_sid(member)).recorded_admin is False
+    auth_tests.client.post("/api/auth/activity", headers=_bearer(member))
+    assert _row(_sid(member)).recorded_admin is True
+
+
+def test_each_threshold_set_applies_after_a_rolling_change(monkeypatch):
+    """Replicas renewed 30-minute and 60-minute leases until switch-off."""
+    _switch(monkeypatch, False)
+    _users()
+    expired_under_30 = _login()
+    alive_under_both = _login("administrator")
+    ended = datetime.now(timezone.utc) - timedelta(minutes=2)
+    _lease_until(ended, ordinary_minutes=30)
+    _lease_until(ended, ordinary_minutes=60)
+    _idle_for(expired_under_30, 40)
+    _idle_for(alive_under_both, 10)  # Admin threshold 15: alive at switch-off.
+
+    _assert_idle_rejection(_verify(expired_under_30))
+    assert _verify(alive_under_both).status_code == 200
+
+
+def test_renewal_keeps_one_row_per_threshold_set(monkeypatch):
+    _users()
+    now = datetime.now(timezone.utc)
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session, now=now)
+        monkeypatch.setenv(ENV_MINUTES, "60")
+        browser_idle.renew_enforcement_lease(session, now=now + timedelta(seconds=10))
+        session.commit()
+        leases = browser_idle.enforcement_leases(session)
+    ends = {lease.ordinary_minutes: lease.until for lease in leases}
+    lease = browser_idle.ENFORCEMENT_LEASE
+    # The 60-minute replica's renewal does not extend the 30-minute set.
+    assert ends == {30: now + lease, 60: now + timedelta(seconds=10) + lease}
+
+
+def test_adapters_can_judge_switch_off_without_a_core_user():
+    now = datetime.now(timezone.utc)
+    lease = browser_idle.EnforcementLease(
+        until=now - timedelta(minutes=2), ordinary_minutes=30, admin_minutes=15
+    )
+    judge = browser_idle.expired_while_enforced
+    assert judge(
+        [lease],
+        last_activity_at=now - timedelta(minutes=40),
+        roles=(False,),
+        now=now,
+    )
+    assert not judge(
+        [lease],
+        last_activity_at=now - timedelta(minutes=20),
+        roles=(False,),
+        now=now,
+    )
+
+
+def test_the_lease_runs_ahead_of_now_and_never_moves_back():
+    """Ahead, so it covers the moment an enforcing replica dies."""
+    _users()
+    now = datetime.now(timezone.utc)
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session, now=now)
+        browser_idle.renew_enforcement_lease(session, now=now - timedelta(hours=1))
+        session.commit()
+        until = browser_idle.enforced_until(session)
+    assert until == now + browser_idle.ENFORCEMENT_LEASE
+    assert browser_idle.ENFORCEMENT_LEASE > timedelta(
+        seconds=browser_idle.ENFORCEMENT_HEARTBEAT_SECONDS
+    )
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_the_heartbeat_renews_the_lease_only_while_enabled(monkeypatch, on):
+    _switch(monkeypatch, on)
+    _users()
+    member = _login("member")
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = True
+        session.commit()
+
+    async def one_tick():
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            browser_idle.run_browser_session_sweep_loop(
+                auth_tests.TestingSessionLocal, stop_event=stop
+            )
+        )
+        await asyncio.sleep(0.2)
+        stop.set()
+        await task
+
+    asyncio.run(one_tick())
+    with auth_tests.TestingSessionLocal() as session:
+        assert (browser_idle.enforced_until(session) is not None) is on
+    # While enforced, the heartbeat also records the promotion.
+    assert _row(_sid(member)).recorded_admin is on
+
+
 def test_sweep_uses_each_users_server_side_threshold(enforced):
     _users()
     member = _login("member")
@@ -433,6 +668,59 @@ def test_logout_from_a_stale_tab_still_revokes_its_own_login(enforced):
     )
     assert response.status_code == 200
     assert _row(_sid(first)).revoked_at is not None
+    assert _refresh(second).status_code == 200
+
+
+def _logout(tokens: dict[str, Any], body: dict[str, Any] | None = None):
+    return auth_tests.client.post(
+        "/api/auth/logout", headers=_bearer(tokens), json=body
+    )
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_an_old_logins_logout_never_clears_a_newer_refresh_token(monkeypatch, on):
+    """A signs in, B signs in, A logs out without a refresh token."""
+    _switch(monkeypatch, on)
+    _users()
+    first = _login()
+    second = _login()
+    assert _logout(first).status_code == 200
+    assert _refresh(second).status_code == 200
+
+
+def test_logout_without_a_refresh_token_clears_the_logins_own():
+    _users()
+    tokens = _login()
+    assert _logout(tokens).status_code == 200
+    assert _user().refresh_token is None
+
+
+def test_a_legacy_token_logout_keeps_revoking_all():
+    """Compatibility exception: a token without sid cannot name its login."""
+    _users()
+    legacy = _legacy_tokens()
+    assert _logout(legacy).status_code == 200
+    assert _user().refresh_token is None
+
+
+@pytest.mark.parametrize("presents_refresh_token", [False, True])
+def test_a_newer_login_committed_during_logout_keeps_its_token(
+    presents_refresh_token,
+):
+    """The ownership test runs in the UPDATE, not on the loaded user."""
+    _users()
+    first = _login()
+    with auth_tests.TestingSessionLocal() as session:
+        stale = session.query(User).filter_by(username="member").one()
+        stale.refresh_token  # Loaded while the first login holds the token.
+        second = _login()  # Another worker commits a newer login meanwhile.
+        auth._clear_refresh_token_at_logout(
+            session,
+            stale,
+            sid=_sid(first),
+            presented=first["refresh_token"] if presents_refresh_token else None,
+        )
+        session.commit()
     assert _refresh(second).status_code == 200
 
 

@@ -472,7 +472,7 @@ def test_sequential_callbacks_request_and_resolve_one_shared_scope_union(db_sess
         expires_at=None,
         legacy_oauth_account=docs,
         # Google confirmed the stored token covers the docs scopes too.
-        stored_refresh_scopes_verified=True,
+        verified_refresh_token="shared-refresh",
     )
     db.commit()
 
@@ -520,7 +520,7 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
         token_type="Bearer",
         expires_at=None,
         legacy_oauth_account=legacy,
-        stored_refresh_scopes_verified=True,
+        verified_refresh_token="refresh",
     )
     db.commit()
     shared_id = int(shared.id)
@@ -547,7 +547,7 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
         token_type="Bearer",
         expires_at=None,
         legacy_oauth_account=legacy,
-        stored_refresh_scopes_verified=True,
+        verified_refresh_token="refresh",
     )
     db.commit()
 

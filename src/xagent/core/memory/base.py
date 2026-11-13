@@ -430,6 +430,15 @@ class MemoryStore(ABC):
                 deleted += 1
         return deleted
 
+    def can_delete_current_scope(self) -> bool:
+        """
+        Whether ``delete_current_scope`` would act rather than refuse.
+
+        Lets tool builders expose a scoped bulk delete only where it can
+        work. ``False`` for stores without an owner/execution-scope binding.
+        """
+        return False
+
     def delete_current_scope(self) -> int:
         """
         Delete every note in the caller's current memory scope.

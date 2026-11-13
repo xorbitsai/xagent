@@ -156,6 +156,7 @@ def test_invalid_dimension_is_rejected(store: MemoryStore, dims: Any) -> None:
 
 
 def test_raw_store_refuses_current_scope_delete(store: MemoryStore) -> None:
+    assert not store.can_delete_current_scope()
     with pytest.raises(MemoryScopeTooBroadError):
         store.delete_current_scope()
 
@@ -197,6 +198,7 @@ def test_current_scope_delete_matches_the_active_scope_exactly(
         UserContext(1),
         ExecutionScopeContext(ExecutionScope(memory_dimensions=MEMBER_7)),
     ):
+        assert isolated.can_delete_current_scope()
         assert isolated.delete_current_scope() == 1
 
     assert _remaining(store, ids) == set(ids) - {"member7"}
@@ -215,6 +217,7 @@ def test_current_scope_delete_with_fixed_access_scope(store: MemoryStore) -> Non
             ExecutionScope(memory_dimensions={"client_application_id": "10"})
         ),
     ):
+        assert bound.can_delete_current_scope()
         assert bound.delete_current_scope() == 1
 
     assert _remaining(store, ids) == set(ids) - {"member7"}
@@ -238,6 +241,7 @@ def test_current_scope_delete_refuses_unbounded_scopes(
     isolated = UserIsolatedMemoryStore(store)
 
     with UserContext(user_id), ExecutionScopeContext(scope):
+        assert not isolated.can_delete_current_scope()
         with pytest.raises(MemoryScopeTooBroadError):
             isolated.delete_current_scope()
 
@@ -250,6 +254,7 @@ def test_strict_owner_only_access_scope_refuses(store: MemoryStore) -> None:
         MemoryAccessScope(owner_user_id=1, memory_dimensions={}, strict_owner_only=True)
     )
 
+    assert not bound.can_delete_current_scope()
     with pytest.raises(MemoryScopeTooBroadError):
         bound.delete_current_scope()
 
@@ -299,14 +304,14 @@ def test_compact_physically_removes_deleted_rows(tmp_path: Path) -> None:
     assert store.add(_note(secret, 1, **MEMBER_7)).success
     # Merge everything into one large fragment first: that is the layout in
     # which a plain optimize() never materializes a 1-in-41 delete.
-    store.compact(cleanup_older_than=timedelta(0))
+    store._compact(timedelta(0))
     assert _files_containing(tmp_path, secret.encode())
 
     assert store.delete_for_scope(1, MEMBER_7) == 1
     # Soft-deleted: the text is still on disk until compaction.
     assert _files_containing(tmp_path, secret.encode())
 
-    store.compact(cleanup_older_than=timedelta(0))
+    store._compact(timedelta(0))
 
     assert _files_containing(tmp_path, secret.encode()) == []
     table = store._vector_store.get_raw_connection().open_table("memories")
@@ -318,14 +323,46 @@ def test_compact_physically_removes_deleted_rows(tmp_path: Path) -> None:
         assert len(isolated.search("member 8 note", k=100)) == 40
 
 
-def test_compact_with_retention_keeps_recent_versions(tmp_path: Path) -> None:
+def _table_version(store: LanceDBMemoryStore) -> int:
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    return int(table.version)
+
+
+def test_compact_keeps_recent_versions(tmp_path: Path) -> None:
+    """The public entry point never prunes young versions, so a concurrent
+    writer cannot lose the version it started from."""
     store = _lancedb_store(tmp_path)
     assert store.add(_note("kept", 1, **MEMBER_7)).success
+    assert store.add(_note("deleted", 1, **{**MEMBER_7, "end_user_id": "8"})).success
+    # Merge both rows into one fragment, so the delete leaves a deletion file
+    # (a fully deleted fragment is simply dropped) and compact() rewrites.
+    store._compact(timedelta(0))
+    assert store.delete_for_scope(1, {**MEMBER_7, "end_user_id": "8"}) == 1
     table = store._vector_store.get_raw_connection().open_table("memories")
-    versions_before = len(table.list_versions())
+    versions_before = {entry["version"] for entry in table.list_versions()}
 
     store.compact()
 
-    # The default retention prunes nothing this young, so concurrent writers
-    # never lose the version they started from.
-    assert len(table.list_versions()) > versions_before
+    versions_after = {entry["version"] for entry in table.list_versions()}
+    assert versions_before < versions_after
+
+
+def test_compact_skips_rewrite_without_deletions(tmp_path: Path) -> None:
+    store = _lancedb_store(tmp_path)
+    for index in range(3):
+        assert store.add(_note(f"note {index}", 1, **MEMBER_7)).success
+    assert store.add(
+        _note("other member", 1, **{**MEMBER_7, "end_user_id": "8"})
+    ).success
+    # First pass merges the single-row fragments into one.
+    store._compact(timedelta(0))
+    settled = _table_version(store)
+
+    # Nothing deleted since: no rewrite, and nothing for optimize() to merge.
+    store._compact(timedelta(0))
+    assert _table_version(store) == settled
+
+    assert store.delete_for_scope(1, MEMBER_7) == 3
+    deleted = _table_version(store)
+    store._compact(timedelta(0))
+    assert _table_version(store) > deleted

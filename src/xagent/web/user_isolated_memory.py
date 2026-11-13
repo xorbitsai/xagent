@@ -341,6 +341,30 @@ class UserIsolatedMemoryStore(MemoryStore):
         """
         return self._base_store.delete_for_scope(owner_user_id, dims)
 
+    def _current_scope_predicate(self) -> tuple[int, dict[str, str]] | None:
+        """The ``(owner, dimensions)`` bounding ``delete_current_scope``.
+
+        ``None`` when either is missing:
+
+        - no owner: the by-id path is ungated, so there is nothing to bound
+          the delete to;
+        - no memory dimensions: the owner may be shared by many principals
+          that are only told apart by their dimensions (one machine owner per
+          Slack workspace hosting every member), and a dimension-less
+          ``strict_memory_isolation`` scope (creator-direct tasks) cannot be
+          expressed as an ``owner + dimensions`` predicate at all.
+        """
+        owner_user_id = self._get_current_user_id()
+        scope = self._get_memory_scope()
+        dims = dict(scope.memory_dimensions) if scope is not None else {}
+        if owner_user_id is None or not dims:
+            return None
+        return owner_user_id, dims
+
+    def can_delete_current_scope(self) -> bool:
+        """Whether the current owner + scope bound a ``delete_current_scope``."""
+        return self._current_scope_predicate() is not None
+
     def delete_current_scope(self) -> int:
         """Delete every note in the current owner + execution scope.
 
@@ -348,27 +372,17 @@ class UserIsolatedMemoryStore(MemoryStore):
         from this scope, never wider: the current owner and *every* current
         memory dimension are all required (``_scope_permits`` semantics). It
         refuses with ``MemoryScopeTooBroadError`` -- and never falls back to
-        ``clear()`` -- when either is missing:
-
-        - no owner: the by-id path is ungated, so there is nothing to bound
-          the delete to;
-        - no memory dimensions: the owner may be shared by many principals
-          that are only told apart by their dimensions (one machine owner per
-          Slack workspace hosting every member), and a dimension-less
-          ``strict_memory_isolation`` scope cannot be expressed as an
-          ``owner + dimensions`` predicate at all.
+        ``clear()`` -- when ``_current_scope_predicate`` finds no bound.
 
         Returns:
             int: Number of notes deleted.
         """
-        owner_user_id = self._get_current_user_id()
-        scope = self._get_memory_scope()
-        dims = dict(scope.memory_dimensions) if scope is not None else {}
-        if owner_user_id is None or not dims:
+        predicate = self._current_scope_predicate()
+        if predicate is None:
             raise MemoryScopeTooBroadError(
                 "the current memory scope has no owner or no scope dimensions"
             )
-        return self._base_store.delete_for_scope(owner_user_id, dims)
+        return self._base_store.delete_for_scope(*predicate)
 
     def list_scope_dimension_values(self, dim_key: str) -> set[str]:
         """Distinct stamped values for one scope dimension, store-wide.

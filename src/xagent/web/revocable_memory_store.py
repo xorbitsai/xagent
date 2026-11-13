@@ -152,6 +152,11 @@ class RevocableMemoryStore(MemoryStore):
     def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
         return self._live().delete_for_scope(owner_user_id, dims)
 
+    def can_delete_current_scope(self) -> bool:
+        # Describes the binding without touching storage, like
+        # ``unwrapped_store``; the delete itself still fails closed.
+        return self._base_store.can_delete_current_scope()
+
     def delete_current_scope(self) -> int:
         return self._live().delete_current_scope()
 

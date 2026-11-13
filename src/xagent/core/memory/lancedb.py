@@ -45,10 +45,11 @@ from .vector_compatibility import (
 
 logger = logging.getLogger(__name__)
 
-# Default age past which ``compact()`` prunes superseded table versions. Long
-# enough that no in-flight memory operation (each opens the table fresh) can
-# still be reading or committing against a pruned version; see ``compact()``.
-DEFAULT_COMPACT_VERSION_RETENTION = timedelta(minutes=10)
+# Age past which ``compact()`` prunes superseded table versions. Long enough
+# that no in-flight memory operation (each opens the table fresh) can still be
+# reading or committing against a pruned version; shorter retentions can
+# silently lose a concurrent delete, see ``compact()``.
+COMPACT_VERSION_RETENTION = timedelta(minutes=10)
 
 
 class LanceDBMemoryStore(MemoryStore):
@@ -887,10 +888,7 @@ class LanceDBMemoryStore(MemoryStore):
         finally:
             _safe_close_table(table)
 
-    def compact(
-        self,
-        cleanup_older_than: timedelta = DEFAULT_COMPACT_VERSION_RETENTION,
-    ) -> None:
+    def compact(self) -> None:
         """Physically remove deleted rows from the memories table's files.
 
         A LanceDB delete only masks rows: their text, metadata and vectors stay
@@ -902,37 +900,52 @@ class LanceDBMemoryStore(MemoryStore):
         fragment survive any number of plain optimizations. This therefore runs
         two steps:
 
-        1. Rewrite every live row (a no-op ``update`` over the whole table), so
-           no live fragment still holds a soft-deleted row. Cost is O(table):
-           it rewrites all live data, vectors included.
-        2. ``optimize(cleanup_older_than=...)``: merge the rewritten fragments
-           and prune every version older than ``cleanup_older_than`` together
-           with the data files only those versions reference.
+        1. If the current version carries any deletion file, rewrite every
+           live row (a no-op ``update`` over the whole table), so no live
+           fragment still holds a soft-deleted row. Cost is O(table): it
+           rewrites all live data, vectors included. Skipped when nothing was
+           deleted since the last rewrite.
+        2. ``optimize()``: merge fragments and prune every version older than
+           ``COMPACT_VERSION_RETENTION`` together with the data files only
+           those versions reference.
 
         Physical removal guarantee: a row deleted before one ``compact()``
-        starts is gone from disk once every version older than that call's
-        rewrite is pruned -- by the same call when ``cleanup_older_than`` is
-        zero, otherwise by a later ``compact()`` started more than
-        ``cleanup_older_than`` after the first one returned. A host running
-        this periodically, with an interval longer than
-        ``cleanup_older_than``, erases a deleted row within two intervals.
+        starts is gone from disk after a later ``compact()`` started more than
+        ``COMPACT_VERSION_RETENTION`` after the first one returned (the first
+        call removes it from the current version, the later one prunes the
+        older versions still holding it). A host running this periodically
+        with an interval longer than the retention erases a deleted row within
+        two intervals.
 
         Concurrency: explicit host call only, never on a request path, and
         from at most one scheduler at a time (two concurrent compactions
-        conflict and one raises). Concurrent ordinary writers are safe as long
-        as no operation outlives ``cleanup_older_than``: LanceDB rebases a
-        commit whose read version is still on disk, but pruning the version a
-        writer started from makes that writer's commit fail (observed as a
-        panic surfaced through the binding). Hence the default retention;
-        pass ``timedelta(0)`` only inside a write-quiet window. Under heavy
-        write contention the rewrite can exhaust LanceDB's commit retries and
-        raise; nothing is lost, so the caller simply retries later.
+        conflict and one raises). Ordinary writers on any worker may run
+        concurrently. The retention is fixed rather than configurable because
+        pruning versions that a concurrent writer may still be committing
+        against is unsafe: with a short retention a concurrent delete can be
+        silently lost (it reports success but the row survives the rewrite)
+        or fail outright. Under heavy write contention the rewrite can exhaust
+        LanceDB's commit retries and raise; nothing is lost, so the caller
+        simply retries later.
+        """
+        self._compact(COMPACT_VERSION_RETENTION)
+
+    def _compact(self, cleanup_older_than: timedelta) -> None:
+        """``compact()`` with an explicit retention.
+
+        Private test hook: a retention below ``COMPACT_VERSION_RETENTION`` is
+        only safe with no concurrent writer, which production never has (see
+        ``compact()``).
         """
         table = self._vector_store.get_raw_connection().open_table(
             self._collection_name
         )
         try:
-            table.update(values_sql={"id": "id"})
+            # Each version's manifest summary counts the rows masked by
+            # deletion files; zero means there is nothing to materialize.
+            latest = max(table.list_versions(), key=lambda entry: entry["version"])
+            if int(latest["metadata"]["total_deletion_file_rows"]):
+                table.update(values_sql={"id": "id"})
             table.optimize(cleanup_older_than=cleanup_older_than)
         finally:
             _safe_close_table(table)

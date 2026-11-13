@@ -159,6 +159,9 @@ on:
       - 'src/xagent/web/models/custom_api.py'
       - 'tests/web/api/test_mcp_server_edit_lock_postgresql.py'
       - 'src/xagent/web/api/mcp.py'
+      - 'tests/web/api/test_v1_mcp_servers_lock_postgresql.py'
+      - 'src/xagent/web/api/v1/mcp_servers.py'
+      - 'src/xagent/web/services/mcp_server_management.py'
       - 'src/xagent/core/tools/core/mcp/model.py'
       - 'tests/web/services/test_connector_hook_session_boundary.py'
       - 'src/xagent/web/services/trace_message_storage.py'
@@ -394,6 +397,9 @@ jobs:
             src/xagent/web/models/custom_api.py
             tests/web/api/test_mcp_server_edit_lock_postgresql.py
             src/xagent/web/api/mcp.py
+            tests/web/api/test_v1_mcp_servers_lock_postgresql.py
+            src/xagent/web/api/v1/mcp_servers.py
+            src/xagent/web/services/mcp_server_management.py
             src/xagent/core/tools/core/mcp/model.py
             tests/web/services/test_connector_hook_session_boundary.py
             src/xagent/web/services/trace_message_storage.py
@@ -1045,6 +1051,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/api/test_mcp_server_edit_lock_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test v1 MCP server edit row lock (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_v1_mcp_servers_lock_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

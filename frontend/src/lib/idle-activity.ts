@@ -81,7 +81,8 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     reportNow: async () => {
       if (stopped || !options.getRecord()) return
       clearTimer()
-      if (inFlight) await inFlight
+      // The press on the continue button may already have started a report.
+      if (inFlight) return inFlight
       await send()
     },
     stop: () => {

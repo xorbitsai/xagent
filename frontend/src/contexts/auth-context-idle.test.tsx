@@ -287,3 +287,58 @@ describe("IdleSessionManager revalidation", () => {
     await waitFor(() => expect(verifyCalls()).toHaveLength(1))
   })
 })
+
+describe("IdleSessionManager expiry warning", () => {
+  it("warns before the deadline and keeps the session when the user continues", async () => {
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: 90 })
+    vi.mocked(apiRequest).mockImplementation(async url =>
+      String(url).endsWith("/api/auth/activity") ? json({ idle_session: idlePolicy({ idle_expires_in: 1800 }) }) : new Response(null, { status: 404 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    const dialog = await screen.findByRole("alertdialog")
+    expect(dialog).toHaveTextContent("session_idle.warning_title")
+    expect(dialog).toHaveTextContent("session_idle.warning_description")
+    fireEvent.click(screen.getByRole("button", { name: "session_idle.continue" }))
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull())
+    expect(activityCalls().length).toBeGreaterThan(0)
+    expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
+  })
+
+  it("lets the user sign out from the warning", async () => {
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: 90 })
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 200 })))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByRole("alertdialog")
+    fireEvent.click(screen.getByRole("button", { name: "session_idle.sign_out" }))
+    await waitFor(() => expect(screen.getByTestId("token")).toHaveTextContent("none"))
+    vi.unstubAllGlobals()
+  })
+
+  it.each([
+    ["the deadline is still far away", { idleExpiresIn: 600 }],
+    ["the switch is off", { enforced: false, idleExpiresIn: 90 }],
+  ])("does not warn when %s", async (_, overrides) => {
+    writeAuthCache()
+    writeIdleRecord(overrides)
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(screen.queryByRole("alertdialog")).toBeNull()
+  })
+
+  it("shortens the warning for very short thresholds so the dialog is not always open", async () => {
+    writeAuthCache()
+    writeIdleRecord({ idleTimeoutSeconds: 60, idleExpiresIn: 50 })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(screen.queryByRole("alertdialog")).toBeNull()
+    cleanup()
+    localStorage.clear()
+    writeAuthCache()
+    writeIdleRecord({ idleTimeoutSeconds: 60, idleExpiresIn: 25 })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    expect(await screen.findByRole("alertdialog")).toBeInTheDocument()
+  })
+})

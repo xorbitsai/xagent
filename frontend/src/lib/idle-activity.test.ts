@@ -108,12 +108,33 @@ describe("idle activity reporting", () => {
     reporter.stop()
   })
 
+  it("treats a report that throws like one that did not reach the server", async () => {
+    const report = vi.fn(async () => { throw new Error("offline") })
+    const { reporter, fire } = setup(record(), { report })
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(report).toHaveBeenCalledTimes(2)
+    reporter.stop()
+  })
+
   it("reports immediately on an explicit continue, even inside the interval", async () => {
     const { reporter, report, fire } = setup()
     fire("keydown")
     await vi.advanceTimersByTimeAsync(5_000)
     await reporter.reportNow()
     expect(report).toHaveBeenCalledTimes(2)
+    reporter.stop()
+  })
+
+  it("joins a report already in flight instead of sending a second one", async () => {
+    let finish!: (value: boolean) => void
+    const report = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve }))
+    const { reporter, fire } = setup(record(), { report })
+    fire("pointerdown")
+    const continued = reporter.reportNow()
+    finish(true)
+    await continued
+    expect(report).toHaveBeenCalledTimes(1)
     reporter.stop()
   })
 

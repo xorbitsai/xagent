@@ -221,7 +221,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return false
   }, [projection, t])
   refreshRef.current = refreshAccessToken
-  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}<IdleSessionManager sessionId={session.sessionId} /></AuthContext.Provider>
+  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}<IdleSessionManager sessionId={session.sessionId} onSignOut={logout} /></AuthContext.Provider>
 }
 /** Provides a stable anonymous projection for public routes without reading browser auth state. */
 export function AnonymousAuthProvider({ children }: { children: ReactNode }) {

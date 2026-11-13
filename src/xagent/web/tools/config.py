@@ -1420,7 +1420,29 @@ async def refresh_oauth_token_if_needed(
             if "access_token" in data:
                 oauth_account.access_token = data["access_token"]
                 if "refresh_token" in data:
-                    oauth_account.refresh_token = data["refresh_token"]
+                    refreshed_refresh_token = data["refresh_token"]
+                    if (
+                        isinstance(refreshed_refresh_token, str)
+                        and refreshed_refresh_token
+                    ):
+                        oauth_account.refresh_token = refreshed_refresh_token
+                    else:
+                        # A provider that rotates refresh tokens sends the new
+                        # one with each refresh; a null or empty value is not
+                        # a replacement. Overwriting with it would leave a
+                        # grant with a fresh access token and nothing to renew
+                        # it with, so the stored one stays.
+                        logger.warning(
+                            "Refresh response for %s (user %s) had a refresh_token "
+                            "that is %s; keeping the previously stored one",
+                            provider_name,
+                            oauth_account.user_id,
+                            "null"
+                            if refreshed_refresh_token is None
+                            else "empty"
+                            if refreshed_refresh_token == ""
+                            else "not a string",
+                        )
                 # An account-hosted grant stays bound to its account.
                 if "instance_url" in data and not request.account_hosted:
                     # Matches the code-exchange branch in api/auth.py:

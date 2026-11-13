@@ -6,6 +6,7 @@ from xagent.web.oauth_provider_quirks import (
     matches_provider_family,
     meta_invalid_token_error_code,
     requires_json_accept_header,
+    requires_refresh_token,
 )
 
 
@@ -123,3 +124,15 @@ def test_meta_invalid_token_error_code_rejects_non_mapping_and_non_oauth_shapes(
     assert (
         meta_invalid_token_error_code({"type": "OtherException", "code": 190}) is None
     )
+
+
+@pytest.mark.parametrize("provider", ["xero", "Xero", "xero-sandbox"])
+def test_requires_refresh_token_covers_xero_and_its_variant_rows(provider):
+    assert requires_refresh_token(provider) is True
+
+
+@pytest.mark.parametrize("provider", ["github", "notion", "xeroish", "google", ""])
+def test_requires_refresh_token_leaves_other_providers_alone(provider):
+    # A provider whose tokens do not expire issues no refresh token, and a
+    # provider name that merely starts with "xero" is not in the family.
+    assert requires_refresh_token(provider) is False

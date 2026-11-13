@@ -111,6 +111,7 @@ from ..oauth_provider_quirks import (
     matches_provider_family,
     requires_json_accept_header,
     requires_pkce,
+    requires_refresh_token,
 )
 from ..schemas.voice_preferences import VoiceConversationPreferences
 from ..services import gmail_provisioning
@@ -3340,6 +3341,24 @@ def _log_oauth_callback_rejection(
     )
 
 
+def _refresh_token_rejection_reason(token_data: dict[str, Any]) -> str | None:
+    """Why a token response carries no usable refresh token, as a log code.
+
+    None when it carries a non-empty string. Only the shape is reported
+    (absent, null, empty, not a string); the value itself never is.
+    """
+    if "refresh_token" not in token_data:
+        return "refresh_token_absent"
+    refresh_token = token_data["refresh_token"]
+    if refresh_token is None:
+        return "refresh_token_null"
+    if not isinstance(refresh_token, str):
+        return "refresh_token_not_a_string"
+    if not refresh_token:
+        return "refresh_token_empty"
+    return None
+
+
 def _oauth_popup_feedback_response(title: str, *paragraphs: str) -> HTMLResponse:
     """Render an actionable, uncacheable 400 page for the OAuth popup.
 
@@ -5329,6 +5348,34 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        refresh_token_rejection = (
+            _refresh_token_rejection_reason(token_data)
+            if requires_refresh_token(provider)
+            else None
+        )
+        if refresh_token_rejection is not None:
+            # A provider listed in oauth_provider_quirks issues short-lived
+            # access tokens and only renews them with a refresh token. Saving
+            # the grant without one would show "Connected" and stop working
+            # when the access token expires, and the delete-then-recreate
+            # below would also drop a prior working grant (and its refresh
+            # token) for this user and provider. Checked before that block,
+            # like the Salesforce instance_url check above.
+            _log_oauth_callback_rejection(
+                provider,
+                refresh_token_rejection,
+                app_id=app_id,
+                actor_flow=is_actor_flow,
+            )
+            return _oauth_popup_feedback_response(
+                f"Cannot connect {html.escape(provider)}",
+                f"{html.escape(provider)} did not grant long-lived access "
+                "(no refresh token was returned), so this connection would stop "
+                "working within minutes. Nothing was changed.",
+                "Close this window and try connecting again. If it keeps "
+                "happening, check that the connection requests offline access.",
+            )
+
         deputy_instance_url = (
             _normalize_deputy_endpoint(token_data.get("endpoint"))
             if is_deputy
@@ -5996,8 +6043,9 @@ def generic_oauth_callback(
             setattr(oauth_account, "email", email)
             if not google_shared_state:
                 setattr(oauth_account, "refresh_token", None)
-            if "refresh_token" in token_data:
-                setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+            returned_refresh_token = token_data.get("refresh_token")
+            if isinstance(returned_refresh_token, str) and returned_refresh_token:
+                setattr(oauth_account, "refresh_token", returned_refresh_token)
             # Salesforce returns the per-org API host here instead of using a
             # fixed domain -- no other provider (besides Deputy, handled
             # explicitly below) sends this key. A callback fully replaces

@@ -143,3 +143,27 @@ def requires_pkce(provider: str) -> bool:
     return any(
         matches_provider_family(provider, prefix) for prefix in _PKCE_PROVIDER_PREFIXES
     )
+
+
+# Providers whose access token is short-lived and that issue the means to renew
+# it only as a refresh token in the authorization-code response. A grant saved
+# without one stops working when its access token expires and can no longer be
+# renewed, although the connection showed as connected when it was made. Each
+# family is listed on purpose: other providers issue tokens that do not expire
+# and no refresh token at all (a classic GitHub OAuth app), and must keep
+# saving a grant without one.
+_REFRESH_TOKEN_REQUIRED_PROVIDER_PREFIXES = (
+    # Xero's access token lasts 30 minutes, and a refresh token is issued only
+    # when the offline_access scope was granted.
+    "xero",
+)
+
+
+def requires_refresh_token(provider: str) -> bool:
+    """True if `provider` is in a family listed in
+    _REFRESH_TOKEN_REQUIRED_PROVIDER_PREFIXES above (see that constant's own
+    comment for which families and why)."""
+    return any(
+        matches_provider_family(provider, prefix)
+        for prefix in _REFRESH_TOKEN_REQUIRED_PROVIDER_PREFIXES
+    )

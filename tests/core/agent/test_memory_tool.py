@@ -6,6 +6,7 @@ from typing import Any, cast
 import pytest
 
 from xagent.core.agent.context.memory_tool import (
+    FORGET_ALL_FALLBACK,
     DeleteMemoryTool,
     ForgetAllMyMemoriesTool,
     SearchMemoryTool,
@@ -34,6 +35,9 @@ class RecordingMemoryStore:
         self.add_success = add_success
         self.searches: list[dict[str, Any]] = []
         self.added: list[MemoryNote] = []
+
+    def can_delete_current_scope(self) -> bool:
+        return False
 
     def search(self, **kwargs: Any) -> list[Any]:
         self.searches.append(kwargs)
@@ -656,6 +660,7 @@ async def test_forget_all_my_memories_refuses_without_scope_dimensions(
     assert result["success"] is False
     assert result["deleted_count"] == 0
     assert "unavailable" in result["error"]
+    assert FORGET_ALL_FALLBACK in result["error"]
     assert all(base_store.get(id_).success for id_ in notes.values())
 
 
@@ -701,10 +706,41 @@ def test_build_memory_tools_composition() -> None:
         "search_memory",
         "update_memory",
         "delete_memory",
-        "forget_all_my_memories",
     ]
     assert "current user explicitly asks" in tools[3].description
-    assert "explicitly asks you to forget everything" in tools[4].description
+
+
+@pytest.mark.parametrize(
+    ("user_id", "scope", "expected"),
+    [
+        (1, _MEMBER_A, True),
+        # Creator-direct web task: strict and dimension-less.
+        (1, ExecutionScope(strict_memory_isolation=True), False),
+        (1, None, False),
+        (None, _MEMBER_A, False),
+    ],
+    ids=["external_member", "creator_direct", "unscoped", "ownerless"],
+)
+def test_build_memory_tools_offers_forget_all_only_for_bounded_scopes(
+    user_id: int | None, scope: ExecutionScope | None, expected: bool
+) -> None:
+    class Ctx:
+        def __init__(self) -> None:
+            self.metadata: dict[str, Any] = {}
+
+    context = Ctx()
+    store = UserIsolatedMemoryStore(InMemoryMemoryStore())
+
+    with UserContext(user_id), ExecutionScopeContext(scope):
+        tools = build_memory_tools(memory_store=store, task="task", context=context)
+
+    names = [tool.name for tool in tools]
+    assert ("forget_all_my_memories" in names) is expected
+    assert context.metadata["forget_all_memories_tool_enabled"] is expected
+    if expected:
+        assert names[-1] == "forget_all_my_memories"
+        assert "explicitly asks you to forget everything" in tools[-1].description
+        assert FORGET_ALL_FALLBACK in tools[-1].description
 
 
 @pytest.mark.asyncio
@@ -780,6 +816,7 @@ async def test_react_uses_selected_custom_memory_tool_factory() -> None:
     assert tools[1].name == "load_skill"
     assert factory_tools == [custom_tool]
     assert context.metadata["memory_tools_enabled"] is True
+    assert context.metadata["forget_all_memories_tool_enabled"] is False
     assert calls == [
         {
             "memory_store": store,

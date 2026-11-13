@@ -2221,7 +2221,11 @@ def test_custom_component_roundtrip_without_context_schema_change() -> None:
 
 
 def test_system_context_renders_memory_persistence_guidance() -> None:
-    from xagent.core.agent.context.memory_tool import MEMORY_TOOLS_METADATA_KEY
+    from xagent.core.agent.context.memory_tool import (
+        FORGET_ALL_FALLBACK,
+        FORGET_ALL_MEMORIES_METADATA_KEY,
+        MEMORY_TOOLS_METADATA_KEY,
+    )
 
     context = ExecutionContext(system_prompt="Base prompt.")
     context.add_user_message("hello")
@@ -2235,12 +2239,17 @@ def test_system_context_renders_memory_persistence_guidance() -> None:
     assert "store_memory" in with_flag
     assert "update_memory" in with_flag
     assert "current trusted user explicitly asks" in with_flag
-    assert "call forget_all_my_memories once" in with_flag
+    assert "forget_all_my_memories" not in with_flag
     assert "Long-term memory is separate from visible chat history" in with_flag
     assert (
         "Do not store the deletion request or the deleted fact again during the "
         "current turn"
     ) in with_flag
+
+    context.metadata[FORGET_ALL_MEMORIES_METADATA_KEY] = True
+    with_forget_all = context.get_messages_for_llm()[0]["content"]
+    assert "call forget_all_my_memories once" in with_forget_all
+    assert f"unavailable, {FORGET_ALL_FALLBACK}." in with_forget_all
 
 
 def _clock_context(timezone_name: str | None) -> ExecutionContext:

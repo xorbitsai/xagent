@@ -1684,6 +1684,84 @@ async def test_create_kb_from_file_leases_the_collection_while_it_ingests(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lose_on", [1, 2])
+async def test_create_kb_from_file_stops_the_run_when_its_lease_is_lost(
+    tmp_path, lose_on
+):
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    records = []
+    for index in range(2):
+        path = tmp_path / f"notes{index}.txt"
+        path.write_text("hello", encoding="utf-8")
+        records.append(
+            SimpleNamespace(
+                user_id=7,
+                filename=path.name,
+                storage_path=str(path),
+                file_id=f"file-{index}",
+            )
+        )
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = records
+    db = MagicMock()
+    db.query.return_value = query
+
+    def _ingest(*args, **kwargs):
+        if lose_on == ingest.call_count:
+            # The pipeline wraps a failed commit gate as an ordinary failed file.
+            migration_state._LEASE_SETS.get()[-1]._lost.append("gone")
+            raise RuntimeError("commit gate refused")
+        return IngestionResult(
+            status="success",
+            doc_id="doc-1",
+            parse_hash="parse-1",
+            chunk_count=1,
+            embedding_count=1,
+            vector_count=1,
+            completed_steps=[_ingestion_step("register_document", doc_id="doc-1")],
+            failed_step=None,
+            message="ok",
+            warnings=[],
+            file_id="file-0",
+        )
+
+    ingest = Mock(side_effect=_ingest)
+    service = MagicMock()
+    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.publish_collection = AsyncMock()
+    service.collection_exists = AsyncMock(return_value=False)
+    service.cleanup_failed_collection = AsyncMock()
+
+    def fake_get_db():
+        yield from _fake_db_generator(db)
+
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+            return_value=service,
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
+            new=ingest,
+        ),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["file-0", "file-1"], "collection_name": "agent_file_kb"}
+        )
+
+    assert result["success"] is False
+    assert "upgraded" in result["message"]
+    assert ingest.call_count == lose_on
+    service.publish_collection.assert_not_awaited()
+    service.cleanup_failed_collection.assert_not_awaited()
+    assert leases.live_leases("agent_file_kb") == []
+
+
+@pytest.mark.asyncio
 async def test_create_kb_from_file_releases_its_lease_when_ingestion_fails(
     tmp_path,
 ):

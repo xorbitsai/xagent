@@ -28,7 +28,7 @@ import pyarrow as pa  # type: ignore
 from xagent.core.utils.blocking import run_blocking
 
 from ..LanceDB.schema_manager import _safe_close_table
-from ..storage.factory import get_metadata_store, get_vector_index_store
+from ..storage.factory import get_metadata_store
 from ..utils.lancedb_query_utils import list_table_names
 from ..utils.string_utils import escape_lancedb_string
 
@@ -44,6 +44,8 @@ COMPACT_EVERY_ACQUIRES = 200
 EXPIRY_SKEW_MARGIN_SECONDS = 5.0
 LEASE_WRITE_RETRIES = 3
 GC_EVERY_RENEWALS = 60
+# Lease rows live for minutes; a week of versions would outgrow the rows.
+COMPACT_RETENTION = timedelta(minutes=10)
 
 logger = logging.getLogger(__name__)
 
@@ -93,14 +95,21 @@ def _ensure_table(conn: Any) -> None:
             raise
 
 
-def _compact() -> None:
+def _compact(store: Optional[Any] = None) -> None:
+    if not _compact_lock.acquire(blocking=False):
+        return
+    table = None
     try:
-        get_vector_index_store().trigger_reindex(LEASES_TABLE)
+        table = _store_connection(store).open_table(LEASES_TABLE)
+        table.optimize(cleanup_older_than=COMPACT_RETENTION)
     except Exception:  # noqa: BLE001 - compaction must never fail a write
         logger.exception("Failed to compact %s", LEASES_TABLE)
+    finally:
+        _safe_close_table(table)
+        _compact_lock.release()
 
 
-def _maybe_compact() -> None:
+def _maybe_compact(store: Optional[Any] = None) -> None:
     """Compact the lease table once every few hundred operations, off the caller.
 
     Rows are deleted on release, so the table only ever holds in-flight leases;
@@ -114,8 +123,9 @@ def _maybe_compact() -> None:
         due = _acquire_count % COMPACT_EVERY_ACQUIRES == 0
     if not due or _compact_lock.locked():
         return
-    with _compact_lock:
-        threading.Thread(target=_compact, name="kb-lease-compact", daemon=True).start()
+    threading.Thread(
+        target=_compact, args=(store,), name="kb-lease-compact", daemon=True
+    ).start()
 
 
 def acquire_lease(
@@ -157,7 +167,7 @@ def acquire_lease(
                 time.sleep(0.1 * (2**attempt))
     finally:
         _safe_close_table(table)
-    _maybe_compact()
+    _maybe_compact(store)
     return lease_id
 
 
@@ -198,10 +208,21 @@ def renew_leases(
             if expires_at >= target:
                 renewed += 1
                 continue
-            renewed += int(
-                getattr(table.update(where, {"expires_at": target}), "rows_updated", 0)
+            # The expiry test is repeated in the predicate: a row that expired
+            # between the read and this update is not extended.
+            live_where = (
+                f"{where} AND expires_at > TIMESTAMP '{now:%Y-%m-%d %H:%M:%S.%f}'"
+            )
+            updated = int(
+                getattr(
+                    table.update(live_where, {"expires_at": target}), "rows_updated", 0
+                )
                 or 0
             )
+            if updated:
+                renewed += 1
+            else:
+                lost.append(lease_id)
         return renewed, lost
     finally:
         _safe_close_table(table)
@@ -216,12 +237,17 @@ def release_leases(lease_ids: Iterable[str], *, store: Optional[Any] = None) -> 
     if LEASES_TABLE not in list_table_names(conn):
         return 0
     table = conn.open_table(LEASES_TABLE)
+    released = 0
     try:
         for lease_id in ids:
-            table.delete(f"lease_id = '{escape_lancedb_string(lease_id)}'")
+            try:
+                table.delete(f"lease_id = '{escape_lancedb_string(lease_id)}'")
+                released += 1
+            except Exception as exc:  # noqa: BLE001 - release the others anyway
+                logger.warning("Could not release lease %s: %s", lease_id, exc)
     finally:
         _safe_close_table(table)
-    return len(ids)
+    return released
 
 
 def live_leases(name: str, *, store: Optional[Any] = None) -> List[WriteLease]:
@@ -260,42 +286,29 @@ def purge_expired_leases(
 ) -> int:
     """Delete expired rows, of ``name`` or of every collection; live rows stay.
 
-    The delete repeats the expiry test in its own predicate, so a lease renewed
-    between the read and the delete is not removed.
+    One delete whose predicate repeats the expiry test (with the skew margin),
+    so a lease renewed between the caller's read and this call survives.
     """
     conn = _store_connection(store)
     if LEASES_TABLE not in list_table_names(conn):
         return 0
     table = conn.open_table(LEASES_TABLE)
     try:
+        cutoff = _now() - timedelta(seconds=EXPIRY_SKEW_MARGIN_SECONDS)
         where = (
             f"name = '{escape_lancedb_string(name)}'"
             if name is not None
             else "lease_id IS NOT NULL"
         )
-        rows = table.search().where(where).to_arrow().to_pylist()
-        cutoff = _now() - timedelta(seconds=EXPIRY_SKEW_MARGIN_SECONDS)
-        purged = 0
-        for row in rows:
-            lease_id = str(row.get("lease_id") or "")
-            expires_at = row.get("expires_at")
-            if not lease_id or not isinstance(expires_at, datetime):
-                continue
-            if expires_at > cutoff:
-                continue
-            lease_where = (
-                f"lease_id = '{escape_lancedb_string(lease_id)}' "
-                f"AND expires_at <= TIMESTAMP '{cutoff:%Y-%m-%d %H:%M:%S.%f}'"
-            )
-            try:
-                result = table.delete(lease_where)
-            except Exception as exc:  # noqa: BLE001 - a raced renewal keeps its row
-                # Usually a renewal between the read and the delete; anything
-                # else leaves an expired row behind, which is worth knowing.
-                logger.warning("Could not purge lease %s: %s", lease_id, exc)
-                continue
-            purged += int(getattr(result, "num_deleted_rows", 0) or 0)
-        return purged
+        delete_where = (
+            f"{where} AND expires_at <= TIMESTAMP '{cutoff:%Y-%m-%d %H:%M:%S.%f}'"
+        )
+        try:
+            result = table.delete(delete_where)
+        except Exception as exc:  # noqa: BLE001 - nothing is lost by retrying later
+            logger.warning("Could not purge expired leases: %s", exc)
+            return 0
+        return int(getattr(result, "num_deleted_rows", 0) or 0)
     finally:
         _safe_close_table(table)
 
@@ -360,9 +373,17 @@ class LeaseSet:
         self._ids: List[str] = []
         self._lost: List[str] = []
         self._renewals = 0
+        self._closed = False
+        # Last successful renewal + TTL - margin: verify() fails past it even
+        # when a stalled heartbeat has not recorded the loss yet.
+        self._alive_until = time.monotonic() + self._lifetime()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _lifetime(self) -> float:
+        ttl = float(self._ttl)
+        return ttl - min(EXPIRY_SKEW_MARGIN_SECONDS, ttl / 4.0)
 
     @property
     def lease_ids(self) -> List[str]:
@@ -377,6 +398,9 @@ class LeaseSet:
 
     def add(self, lease_id: str) -> None:
         with self._lock:
+            if self._closed:
+                # Its row was deleted (or is about to be): nothing renews it.
+                raise LeaseLostError("This lease scope is already closed")
             self._ids.append(lease_id)
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -390,14 +414,19 @@ class LeaseSet:
         interval = max(0.05, float(self._ttl) / 3.0)
         while not self._stop.wait(interval):
             ids = self.lease_ids
+            started = time.monotonic()
             try:
                 _renewed, lost = renew_leases(
                     ids, ttl_seconds=self._ttl, store=self._store
                 )
-            except Exception:  # noqa: BLE001 - keep trying until the scope ends
-                # A renewal we cannot perform is a lease we cannot prove we hold.
-                logger.exception("Failed to renew write leases")
-                lost = ids
+            except Exception:  # noqa: BLE001 - a transient store error is not loss
+                # The rows still have most of their TTL: keep trying, and let
+                # verify()'s local deadline decide when we can no longer claim them.
+                logger.warning("Failed to renew write leases; will retry")
+                self._renewals += 1
+                continue
+            with self._lock:
+                self._alive_until = started + self._lifetime()
             if lost:
                 with self._lock:
                     for lease_id in lost:
@@ -428,14 +457,21 @@ class LeaseSet:
         process would otherwise let it write while the migration believes the
         collection is quiet.
         """
+        if self._closed:
+            raise LeaseLostError("This lease scope was released")
         lost = self.lost
         if lost:
             raise LeaseLostError(
                 f"Lost {len(lost)} write lease(s): {', '.join(sorted(lost))}"
             )
+        if time.monotonic() > self._alive_until:
+            # No renewal landed within the TTL: the rows may already be gone.
+            raise LeaseLostError("Write leases were not renewed within their TTL")
 
     def stop(self) -> List[str]:
         """Stop renewing and return the ids; safe to call more than once."""
+        with self._lock:
+            self._closed = True
         self._stop.set()
         thread = self._thread
         if thread is not None:

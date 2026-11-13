@@ -311,21 +311,67 @@ def test_the_lease_table_is_compacted_periodically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     compacted: list = []
-
-    class _Store:
-        def trigger_reindex(self, table: str) -> bool:
-            compacted.append(table)
-            return True
-
-    monkeypatch.setattr(leases, "get_vector_index_store", lambda: _Store())
+    store = object()
+    monkeypatch.setattr(leases, "_compact", compacted.append)
+    monkeypatch.setattr(leases, "_store_connection", lambda s: _RealConn(s))
     monkeypatch.setattr(leases, "_acquire_count", leases.COMPACT_EVERY_ACQUIRES - 1)
 
-    acquire_lease("kb", "test")
+    acquire_lease("kb", "test", store=store)
 
     deadline = time.monotonic() + 3.0
     while not compacted and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert compacted == [LEASES_TABLE]
+    assert compacted == [store]
+
+
+class _RealConn:
+    """The default store's connection, whatever store the caller passed."""
+
+    def __init__(self, store: Any) -> None:
+        from xagent.core.tools.core.RAG_tools.storage.factory import (
+            get_metadata_store,
+        )
+
+        self._conn = get_metadata_store().get_raw_connection()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+
+def _optimize_recorder(calls: list) -> Any:
+    class _Table:
+        def optimize(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    class _Conn:
+        def open_table(self, name: str) -> Any:
+            calls.append(name)
+            return _Table()
+
+    return SimpleNamespace(get_raw_connection=lambda: _Conn())
+
+
+def test_compaction_uses_the_lease_store_and_a_short_retention() -> None:
+    calls: list = []
+
+    leases._compact(_optimize_recorder(calls))
+
+    assert calls == [
+        LEASES_TABLE,
+        {"cleanup_older_than": leases.COMPACT_RETENTION},
+    ]
+    assert leases.COMPACT_RETENTION < timedelta(hours=1)
+
+
+def test_compaction_skips_while_another_one_runs() -> None:
+    calls: list = []
+    assert leases._compact_lock.acquire(blocking=False)
+    try:
+        leases._compact(_optimize_recorder(calls))
+    finally:
+        leases._compact_lock.release()
+
+    assert calls == []
 
 
 def test_a_lease_just_past_expiry_still_counts_as_live() -> None:
@@ -449,10 +495,10 @@ async def test_admitted_async_hands_its_admission_back_to_the_outer_scope() -> N
     with pending_collection("kb"):
         async with admitted_async("kb"):
             pass
-        # The outer scope still owns the admission it granted.
+        _freeze()
+        # The outer scope still owns the admission the inner guard granted.
         ensure_collection_writable("kb")
 
-    _freeze()
     with pytest.raises(CollectionMigratingError):
         ensure_collection_writable("kb")
 
@@ -599,7 +645,7 @@ def test_the_heartbeat_collects_expired_rows_of_other_collections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     purged = []
-    monkeypatch.setattr(leases, "renew_leases", lambda ids, **kwargs: len(ids))
+    monkeypatch.setattr(leases, "renew_leases", lambda ids, **kwargs: (len(ids), []))
     monkeypatch.setattr(
         leases, "purge_expired_leases", lambda name=None, **kwargs: purged.append(name)
     )
@@ -618,12 +664,7 @@ def test_the_heartbeat_collects_expired_rows_of_other_collections(
 def test_compaction_does_not_delay_the_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class _SlowStore:
-        def trigger_reindex(self, table: str) -> bool:
-            time.sleep(1.0)
-            return True
-
-    monkeypatch.setattr(leases, "get_vector_index_store", lambda: _SlowStore())
+    monkeypatch.setattr(leases, "_compact", lambda store: time.sleep(1.0))
     monkeypatch.setattr(leases, "_acquire_count", leases.COMPACT_EVERY_ACQUIRES - 1)
 
     started = time.monotonic()
@@ -647,7 +688,33 @@ def test_renewing_an_expired_lease_reports_it_lost_instead_of_reviving_it(
     assert rows == []
 
 
-def test_a_renewal_that_raises_counts_every_lease_as_lost(
+def test_one_failed_renewal_is_retried_instead_of_losing_the_leases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list = []
+    real_renew = leases.renew_leases
+
+    def _flaky(ids: Any, **kwargs: Any) -> Any:
+        calls.append(len(ids))
+        if len(calls) == 1:
+            raise OSError("commit conflict")
+        return real_renew(ids, **kwargs)
+
+    monkeypatch.setattr(leases, "renew_leases", _flaky)
+    held = LeaseSet(ttl_seconds=0.6)
+    try:
+        held.add(acquire_lease("kb", "test"))
+        deadline = time.monotonic() + 5.0
+        while len(calls) < 3 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(calls) >= 3
+        assert held.lost == []
+        held.verify()
+    finally:
+        held.release()
+
+
+def test_renewals_failing_past_the_ttl_fail_the_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -658,14 +725,187 @@ def test_a_renewal_that_raises_counts_every_lease_as_lost(
     held = LeaseSet(ttl_seconds=0.2)
     try:
         held.add(acquire_lease("kb", "test"))
-        deadline = time.monotonic() + 5.0
-        while not held.lost and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert held.lost
+        time.sleep(0.4)
+        assert held.lost == []
         with pytest.raises(leases.LeaseLostError):
             held.verify()
     finally:
         held.release()
+
+
+def test_a_stalled_heartbeat_fails_the_check_at_the_local_deadline() -> None:
+    held = LeaseSet(ttl_seconds=120)
+    try:
+        held.add(acquire_lease("kb", "test"))
+        held.verify()
+        held._alive_until = time.monotonic() - 1
+        with pytest.raises(leases.LeaseLostError):
+            held.verify()
+    finally:
+        held.release()
+
+
+def test_a_released_set_fails_its_check_and_takes_no_more_leases() -> None:
+    held = LeaseSet(ttl_seconds=120)
+    held.add(acquire_lease("kb", "test"))
+    held.verify()
+    held.release()
+
+    with pytest.raises(leases.LeaseLostError):
+        held.verify()
+    with pytest.raises(leases.LeaseLostError):
+        held.add("late")
+
+
+def test_work_outliving_its_scope_cannot_pass_the_commit_gate() -> None:
+    from contextvars import copy_context
+
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    with pending_collection("kb"):
+        ensure_collection_writable("kb")
+        leftover = copy_context()
+
+    with pytest.raises(CollectionMigratingError):
+        leftover.run(migration_state.verify_active_leases, "kb")
+
+
+def test_one_failed_release_still_releases_the_other_leases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = [acquire_lease(name, "rename") for name in ("a", "b", "c")]
+
+    class _Flaky:
+        def __init__(self, table: Any) -> None:
+            self._table = table
+
+        def delete(self, where: str) -> Any:
+            if ids[0] in where:
+                raise OSError("commit conflict")
+            return self._table.delete(where)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._table, name)
+
+    real = leases._store_connection
+
+    class _Conn:
+        def __init__(self, conn: Any) -> None:
+            self._conn = conn
+
+        def open_table(self, name: str) -> Any:
+            return _Flaky(self._conn.open_table(name))
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(leases, "_store_connection", lambda s: _Conn(real(s)))
+
+    assert release_leases(ids) == 2
+    assert live_leases("b") == [] and live_leases("c") == []
+    assert [lease.lease_id for lease in live_leases("a")] == [ids[0]]
+
+
+def test_a_renewal_does_not_revive_a_row_that_expired_after_the_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease_id = acquire_lease("kb", "test")
+    _expire_lease("kb", lease_id, -1)
+    real = leases._store_connection
+
+    class _Racing:
+        def __init__(self, table: Any) -> None:
+            self._table = table
+
+        def update(self, where: str, values: Any) -> Any:
+            # The row expires between the renewal's read and its write.
+            _expire_lease("kb", lease_id, 30)
+            return self._table.update(where, values)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._table, name)
+
+    class _Conn:
+        def __init__(self, conn: Any) -> None:
+            self._conn = conn
+
+        def open_table(self, name: str) -> Any:
+            return _Racing(self._conn.open_table(name))
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(leases, "_store_connection", lambda s: _Conn(real(s)))
+
+    assert renew_leases([lease_id]) == (0, [lease_id])
+    monkeypatch.setattr(leases, "_store_connection", real)
+    assert live_leases("kb") == [] or live_leases("kb")[0].expires_at < datetime.now(
+        timezone.utc
+    ).replace(tzinfo=None)
+
+
+def test_a_cancelled_acquire_releases_the_row_it_inserted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    real = migration_state.acquire_lease_async
+
+    async def _slow(name: str, operation: str, **kwargs: Any) -> str:
+        await asyncio.sleep(0.2)
+        return await real(name, operation, **kwargs)
+
+    monkeypatch.setattr(migration_state, "acquire_lease_async", _slow)
+
+    async def _run() -> None:
+        async def _hold() -> None:
+            async with migration_state.holding_leases("kb", operation="test"):
+                pytest.fail("cancelled before admission")  # pragma: no cover
+
+        task = asyncio.create_task(_hold())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            if live_leases("kb") == [] and len(_inserted) > 0:
+                break
+
+    _inserted: list = []
+    monkeypatch.setattr(
+        migration_state,
+        "release_leases_async",
+        _tracking_release(migration_state.release_leases_async, _inserted),
+    )
+    asyncio.run(_run())
+
+    assert _inserted
+    assert live_leases("kb") == []
+
+
+def _tracking_release(real: Any, seen: list) -> Any:
+    async def _release(ids: Any, **kwargs: Any) -> Any:
+        ids = list(ids)
+        seen.extend(ids)
+        return await real(ids, **kwargs)
+
+    return _release
+
+
+def test_a_lost_handler_lease_stops_a_nested_holding_leases_scope() -> None:
+    from xagent.core.tools.core.RAG_tools.management import migration_state
+
+    async def _run() -> None:
+        async with migration_state.pending_collection_async("kb"):
+            await migration_state.ensure_collection_writable_async("kb")
+            async with migration_state.holding_leases("kb", operation="delete"):
+                migration_state._LEASE_SETS.get()[0]._lost.append("gone")
+                with pytest.raises(CollectionMigratingError):
+                    migration_state.verify_active_leases("kb")
+
+    asyncio.run(_run())
 
 
 def test_a_lease_slightly_past_expiry_still_counts_as_held(
@@ -681,8 +921,7 @@ def _mark_current_scope_lost() -> str:
     """Exactly the state a lost lease leaves: the set records the id."""
     from xagent.core.tools.core.RAG_tools.management import migration_state
 
-    lease_set = migration_state._LEASE_SET.get()
-    assert lease_set is not None
+    lease_set = migration_state._LEASE_SETS.get()[-1]
     lease_id = migration_state._LEASES.get()[-1][1]
     lease_set._lost.append(lease_id)
     return lease_id
@@ -784,7 +1023,7 @@ def test_a_scope_whose_lease_was_lost_fails_its_check() -> None:
     held = LeaseSet(ttl_seconds=0.2)
     # A row that does not exist: the first renewal finds it gone.
     held.add("not-a-real-lease")
-    set_token = migration_state._LEASE_SET.set(held)
+    set_token = migration_state._LEASE_SETS.set((held,))
     leases_token = migration_state._LEASES.set((("kb", "not-a-real-lease"),))
     try:
         deadline = time.monotonic() + 5.0
@@ -794,7 +1033,7 @@ def test_a_scope_whose_lease_was_lost_fails_its_check() -> None:
             migration_state.verify_active_leases("kb")
     finally:
         migration_state._LEASES.reset(leases_token)
-        migration_state._LEASE_SET.reset(set_token)
+        migration_state._LEASE_SETS.reset(set_token)
         held.release()
 
 

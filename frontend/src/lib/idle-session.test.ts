@@ -103,6 +103,14 @@ describe("idle session state bound to one login", () => {
     expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
   })
 
+  it("does not hand the stored idle state to a different browser login", async () => {
+    const snapshot = await login({ idle_session: idle() })
+    const stored = JSON.parse(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)!)
+    localStorage.setItem(IDLE_SESSION_STORAGE_KEY, JSON.stringify({ ...stored, sessionId: "another-login" }))
+    expect(readCurrentIdleSession()).toBeNull()
+    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle() })?.sessionId).toBe(snapshot.sessionId)
+  })
+
   it("updates the policy from a refresh and keeps another tab's report time for the same server login", async () => {
     const snapshot = await login({ idle_session: idle() })
     markIdleActivityReportedIfCurrent(snapshot)

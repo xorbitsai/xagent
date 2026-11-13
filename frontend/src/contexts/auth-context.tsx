@@ -4,6 +4,7 @@ import React, { createContext, useCallback, useContext, useEffect, useRef, useSt
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import { toast } from "@/components/ui/sonner"
+import { IdleSessionManager } from "@/components/auth/idle-session-manager"
 import { useI18n } from "@/contexts/i18n-context"
 import { authMutationUnavailableTranslationKey } from "@/lib/auth-pages"
 import {
@@ -214,7 +215,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return false
   }, [projection, t])
   refreshRef.current = refreshAccessToken
-  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}</AuthContext.Provider>
+  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}<IdleSessionManager sessionId={session.sessionId} /></AuthContext.Provider>
 }
 /** Provides a stable anonymous projection for public routes without reading browser auth state. */
 export function AnonymousAuthProvider({ children }: { children: ReactNode }) {

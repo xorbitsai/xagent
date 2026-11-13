@@ -2235,6 +2235,7 @@ def test_system_context_renders_memory_persistence_guidance() -> None:
     assert "store_memory" in with_flag
     assert "update_memory" in with_flag
     assert "current trusted user explicitly asks" in with_flag
+    assert "call forget_all_my_memories once" in with_flag
     assert "Long-term memory is separate from visible chat history" in with_flag
     assert (
         "Do not store the deletion request or the deleted fact again during the "

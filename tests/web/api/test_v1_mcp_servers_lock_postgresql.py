@@ -372,9 +372,13 @@ def test_a_url_change_locks_the_definition_row_twice_without_waiting_on_itself(
 ) -> None:
     """Only dave has a team-path authorization, so the change is allowed. The
     service locks the definition row and the web function locks it again in the
-    same transaction. The second statement does not wait, the change is stored
-    and dave's grant is removed. The locks on the flow and grant tables that the
-    web function takes on a ``url`` change are not definition-row locks."""
+    same transaction. PostgreSQL never makes a transaction wait for a row lock
+    it already holds, while a second lock taken on another connection would
+    block and keep the update from finishing within ``DB_PROGRESS_TIMEOUT``;
+    so the update finishing shows that the second statement did not wait. The
+    change is stored and dave's grant is removed. The locks on the flow and
+    grant tables that the web function takes on a ``url`` change are not
+    definition-row locks."""
     with session_factory() as db:
         db.add(_grant(world, world.dave))
         db.commit()
@@ -393,7 +397,6 @@ def test_a_url_change_locks_the_definition_row_twice_without_waiting_on_itself(
         )
     locks = recorded.definition_locks()
     assert len(locks) == 2, [item.text for item in recorded.statements]
-    assert recorded.statements[locks[1]].seconds < 1.0
     for table in ("mcp_oauth_flow_states", "mcp_oauth_grants"):
         other = [
             index

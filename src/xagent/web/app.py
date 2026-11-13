@@ -26,6 +26,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_composio_missing_account_interval_seconds,
     get_composio_reconcile_interval_seconds,
     get_cors_origins,
     get_environment,
@@ -902,6 +903,73 @@ async def stop_composio_reconcile_task(app_instance: FastAPI) -> None:
             pass
         except Exception as exc:
             logger.error("Composio reconcile loop stopped after failure", exc_info=exc)
+
+
+def start_composio_missing_account_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the loop that tombstones grants whose Composio account is gone.
+
+    Runs by default whenever an app's Composio config is complete; each pass
+    looks up the accounts this database's grants name and clears the grant
+    when Composio answers 404 ConnectedAccount_ResourceNotFound. It reads
+    only this database's grants and deletes nothing in Composio, so it does
+    not need the orphan cleanup's opt-in.
+    """
+    from .composio_auth import _configured_apps, run_missing_account_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "composio_missing_account_task", None),
+    )
+    if existing_task is not None and not existing_task.done():
+        return existing_task
+    app_instance.state.composio_missing_account_task = None
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping Composio missing-account loop (test environment)")
+        return None
+    if not _configured_apps():
+        return None
+    interval_seconds = get_composio_missing_account_interval_seconds()
+    if interval_seconds <= 0:
+        return None
+    stop_event = threading.Event()
+    app_instance.state.composio_missing_account_stop = stop_event
+    task = asyncio.create_task(
+        run_missing_account_loop(
+            interval_seconds=interval_seconds, stop_event=stop_event
+        )
+    )
+    app_instance.state.composio_missing_account_task = task
+    logger.info(
+        "Started Composio missing-account loop (interval=%ss)", interval_seconds
+    )
+    return task
+
+
+async def stop_composio_missing_account_task(app_instance: FastAPI) -> None:
+    """Stop this process's Composio missing-account loop.
+
+    The stop event reaches a pass running in its worker thread, which returns
+    at its next request boundary; the cancel ends the awaiting coroutine.
+    """
+    stop_event = getattr(app_instance.state, "composio_missing_account_stop", None)
+    app_instance.state.composio_missing_account_stop = None
+    if stop_event is not None:
+        stop_event.set()
+    task = getattr(app_instance.state, "composio_missing_account_task", None)
+    app_instance.state.composio_missing_account_task = None
+    if task is not None and not task.done():
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Composio missing-account loop stopped after failure", exc_info=exc
+            )
 
 
 def start_task_cleanup_retry_task(
@@ -2484,9 +2552,10 @@ async def _start_late_tasks() -> None:
     # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
     if auto_migrate:
         start_temp_file_cleanup_task(app)
-    # Last for the same reason: a Composio reconcile pass runs in an executor
-    # thread that only its stop event (set by shutdown_event) can end.
+    # Last for the same reason: a Composio pass runs in an executor thread
+    # that only its stop event (set by shutdown_event) can end.
     start_composio_reconcile_task(app)
+    start_composio_missing_account_task(app)
 
 
 async def _stop_runtime_loops() -> None:
@@ -2517,6 +2586,7 @@ async def _stop_runtime_loops() -> None:
 
     await stop_orphan_upload_gc_task(app)
     await stop_composio_reconcile_task(app)
+    await stop_composio_missing_account_task(app)
     await stop_retention_purge_task(app)
     await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
@@ -2775,7 +2845,7 @@ async def startup_event() -> None:
         await _preload_channel_modules_in_standby()
     await _run_or_defer("command dispatch and channels", _start_commands_and_channels)
 
-    await _run_or_defer("temp-file cleanup and Composio reconcile", _start_late_tasks)
+    await _run_or_defer("temp-file cleanup and Composio loops", _start_late_tasks)
     start_runtime_performance_monitor(app)
     report_unobserved_execution_events(
         telemetry_started=getattr(app.state, "runtime_performance_task", None)
@@ -2800,10 +2870,11 @@ async def retire_writers(
     thread or task that is in neither is not covered, whatever it does.
 
     **Stopped (tasks cancelled and awaited):** command dispatcher and its
-    detached prompt dispatches, orphan-upload GC, Composio reconcile,
-    retention purge, task-cleanup retry, uploaded-file recovery and reconcile,
-    auto-resume, lease recovery, sandbox idle sweep, startup file-storage
-    sync, LanceDB migration, trigger dispatcher, chat channels.
+    detached prompt dispatches, orphan-upload GC, Composio reconcile and
+    missing-account, retention purge, task-cleanup retry, uploaded-file
+    recovery and reconcile, auto-resume, lease recovery, sandbox idle sweep,
+    startup file-storage sync, LanceDB migration, trigger dispatcher, chat
+    channels.
 
     **Fenced:** socket-owned writes. After the fence no WebSocket handler
     starts a write (message/start commands, builder turns, ASR sessions,
@@ -2821,11 +2892,12 @@ async def retire_writers(
     (``services/triggers``), the LanceDB user-id, documents and
     uploaded-file-link backfills, the retention-purge batch, task-cleanup
     retry (workspace removal, live-id check, claim, settle), the Composio
-    reconcile pass, the socket command enqueue, the channel input
-    acceptance/claim/staging threads (Feishu, Slack, Telegram, shared channel
-    execution) and the blocking calls a builder chat turn makes through
-    ``xagent.core.utils.blocking.run_blocking`` (knowledge-base ingestion and
-    the knowledge-base coordinator, LanceDB metadata-table creation).
+    reconcile and missing-account passes, the socket command enqueue, the
+    channel input acceptance/claim/staging threads (Feishu, Slack, Telegram,
+    shared channel execution) and the blocking calls a builder chat turn makes
+    through ``xagent.core.utils.blocking.run_blocking`` (knowledge-base
+    ingestion and the knowledge-base coordinator, LanceDB metadata-table
+    creation).
 
     **Not covered -- the host must quiesce these itself:** HTTP producers
     (the API routes, including the A2A, triggers, MCP and file routes, and

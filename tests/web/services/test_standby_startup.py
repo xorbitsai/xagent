@@ -102,6 +102,7 @@ def _patch_startup(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> _Sandb
         "start_retention_purge_task",
         "start_task_cleanup_retry_task",
         "start_composio_reconcile_task",
+        "start_composio_missing_account_task",
         "start_runtime_performance_monitor",
         "start_app_process_diagnostics",
     ):
@@ -325,6 +326,7 @@ async def test_shutdown_cleans_sandboxes_only_when_it_owned_them(
     for name in (
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",

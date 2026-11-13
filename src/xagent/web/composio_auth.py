@@ -61,11 +61,13 @@ accounts from sign-ins begun before the switch are past the TTL plus grace
 (see ``example.env``).
 
 A stored grant whose connected account Composio answers 404
-``ConnectedAccount_ResourceNotFound`` for is tombstoned by the same pass
-(``tombstone_missing_composio_accounts``): the row stays, with its token
-cleared, so the grant no longer counts as connected and the user is offered
-to connect again. Every other answer, including any other 404, leaves the
-row alone.
+``ConnectedAccount_ResourceNotFound`` for is tombstoned by
+``tombstone_missing_composio_accounts``. That pass runs on its own interval,
+on by default (``XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS``): it only
+reads the grants this database stores and clears their local tokens, deleting
+nothing in Composio. The row stays, with its token cleared, so the grant no
+longer counts as connected and the user is offered to connect again. Every
+other answer, including any other 404, leaves the row alone.
 
 Disconnect: deleting a grant through ``delete_scoped_user_oauth_accounts``
 schedules its Composio account for deletion once the caller's outermost
@@ -1080,9 +1082,21 @@ def reconcile_orphan_accounts_isolated(
 
         session_factory = get_session_local()
     with session_factory() as db:
-        deleted = reconcile_orphan_accounts(db, stop_event=stop_event)
-        tombstone_missing_composio_accounts(db, stop_event=stop_event)
-        return deleted
+        return reconcile_orphan_accounts(db, stop_event=stop_event)
+
+
+def tombstone_missing_composio_accounts_isolated(
+    session_factory: Callable[[], Session] | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+) -> int:
+    """Run one missing-account pass in its own short-lived Session."""
+    if session_factory is None:
+        from .models.database import get_session_local
+
+        session_factory = get_session_local()
+    with session_factory() as db:
+        return tombstone_missing_composio_accounts(db, stop_event=stop_event)
 
 
 async def run_reconcile_loop(
@@ -1106,6 +1120,34 @@ async def run_reconcile_loop(
         except Exception as exc:
             logger.warning(
                 "Composio reconcile pass failed (exception_type=%s)",
+                type(exc).__name__,
+            )
+        await asyncio.sleep(interval_seconds)
+
+
+async def run_missing_account_loop(
+    *, interval_seconds: int, stop_event: threading.Event
+) -> None:
+    """Tombstone missing accounts on an interval; a failed pass is retried later.
+
+    Cancelling the task does not stop a pass already handed to a worker
+    thread, so shutdown sets ``stop_event`` first and the pass returns at its
+    next request boundary.
+    """
+    import asyncio
+
+    from .services.writer_workers import run_tracked
+
+    while not stop_event.is_set():
+        try:
+            await run_tracked(
+                tombstone_missing_composio_accounts_isolated, stop_event=stop_event
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Composio missing-account pass failed (exception_type=%s)",
                 type(exc).__name__,
             )
         await asyncio.sleep(interval_seconds)

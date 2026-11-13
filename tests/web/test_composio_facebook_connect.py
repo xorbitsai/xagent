@@ -1994,7 +1994,7 @@ def test_one_pass_is_capped_and_the_next_pass_continues(
     ]
 
 
-def test_the_isolated_pass_tombstones_missing_accounts(
+def test_the_orphan_pass_leaves_missing_accounts_to_their_own_loop(
     db_session, composio_env, composio, monkeypatch
 ):
     db, user = db_session
@@ -2005,7 +2005,80 @@ def test_the_isolated_pass_tombstones_missing_accounts(
 
     composio_auth.reconcile_orphan_accounts_isolated(session_factory=lambda: db)
 
+    assert _lookups(composio) == []
+    assert _grants(db)[0].access_token == "ca_gone"
+
+
+def test_the_isolated_missing_account_pass_tombstones_missing_accounts(
+    db_session, composio_env, composio, monkeypatch
+):
+    db, user = db_session
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    _store_composio_grant(db, user, account_id="ca_gone")
+    composio.account_lookup["ca_gone"] = (404, MISSING_ACCOUNT)
+
+    tombstoned = composio_auth.tombstone_missing_composio_accounts_isolated(
+        session_factory=lambda: db
+    )
+
+    assert tombstoned == 1
     assert _grants(db)[0].access_token == ""
+
+
+def test_the_missing_account_loop_needs_a_configured_app(monkeypatch):
+    from xagent.web.app import start_composio_missing_account_task
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv(composio_auth.COMPOSIO_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(
+        "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", raising=False
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert start_composio_missing_account_task(app) is None
+
+
+def test_the_missing_account_loop_is_off_at_zero(composio_env, monkeypatch):
+    from xagent.web.app import start_composio_missing_account_task
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", "0")
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    assert start_composio_missing_account_task(app) is None
+
+
+async def test_the_missing_account_loop_starts_with_its_variable_unset(
+    composio_env, monkeypatch
+):
+    import asyncio
+
+    from xagent.web.app import (
+        start_composio_missing_account_task,
+        stop_composio_missing_account_task,
+    )
+
+    started = threading.Event()
+
+    def pass_once(*, stop_event: threading.Event) -> int:
+        started.set()
+        return 0
+
+    monkeypatch.setattr(
+        composio_auth, "tombstone_missing_composio_accounts_isolated", pass_once
+    )
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv(
+        "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", raising=False
+    )
+    app = SimpleNamespace(state=SimpleNamespace())
+
+    task = start_composio_missing_account_task(app)
+    assert task is not None
+    await asyncio.to_thread(started.wait, 5)
+    await stop_composio_missing_account_task(app)
+
+    assert task.done()
 
 
 def test_the_reconcile_loop_is_off_unless_its_interval_is_set(

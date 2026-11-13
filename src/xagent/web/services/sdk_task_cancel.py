@@ -23,9 +23,9 @@ it starts fails its START and, for an appended turn, leaves the row -- the
 previous turn's result -- untouched. A queued START is a target only while
 it can still hand off (``start_can_hand_off``): one the START consumer would
 reject because the row moved on is treated as absent, and the row is judged
-as it stands. A repeat of a cancel that withdrew the newest turn is answered
-again for that turn (``_withdrawn_run_of_last_start``), since the row no
-longer shows it.
+as it stands. A repeat of a cancel that withdrew the newest turn rejoins
+that cancel's command and is answered for that turn
+(``_cancel_of_newest_turn``), since the row no longer shows it.
 
 Besides a queued turn only a RUNNING task is cancelled here. One waiting
 for the caller's answer and a paused one are refused as busy, without a
@@ -285,27 +285,29 @@ def _queued_start(db: Session, task_id: int) -> TaskExecutionCommand | None:
     )
 
 
-def _withdrawn_run_of_last_start(db: Session, task: Task) -> str | None:
-    """The run of the task's newest START when an SDK cancel withdrew it.
+def _cancel_of_newest_turn(db: Session, task: Task) -> TaskExecutionCommand | None:
+    """This endpoint's cancel command aimed at the task's newest START, if any.
 
-    The cancel that withdrew a queued turn left the task row on the turn
-    before it, so a repeat of that cancel finds no queued START and a row
-    that says nothing of the withdrawn run. The START itself is the record:
-    it is the newest one, it opens a run the row does not show, and a
-    completed SDK cancel command was aimed at exactly that run. Stopped
-    STARTs alone do not say so: other controls stop STARTs with the same
-    reason, and only a completed cancel command of this endpoint was
-    answered as a cancellation.
+    A cancel of a turn queued to start is persisted under an identity made of
+    that turn's run and the version the START was accepted against
+    (``_cancel_command_id``), so the newest START names the one command a
+    cancel of that turn can be. Once the command has withdrawn the turn, the
+    row still shows the turn before it (or, for a new task, holds no run) and
+    no START is queued, so a repeat finds the turn only through this
+    identity -- whatever state the command is in, including while it is
+    still being applied after the withdrawal was committed. A START stopped
+    some other way has no such command and is not found.
 
-    The record answers only while the row is still as that cancel left it:
-    withdrawing an appended turn does not move the row, so the cancel's
-    version is still the row's. A row that moved since -- for example the
-    turn before was resumed and runs again -- is answered from the row, as
-    any other call would be. A new task is the exception: its cancel wrote
-    the row itself, which then holds no run and reads as cancelled.
+    The command answers only while the row is still as that cancel found or
+    left it: withdrawing an appended turn does not move the row, so the
+    command's version is still the row's. A row that moved since -- for
+    example the turn before was resumed and runs again -- is answered from
+    the row, as any other call would be. A new task is the exception: its
+    cancel wrote the row itself, which then holds no run and reads as
+    cancelled.
     """
 
-    last = (
+    newest = (
         db.query(TaskExecutionCommand)
         .filter(
             TaskExecutionCommand.task_id == int(task.id),
@@ -315,35 +317,41 @@ def _withdrawn_run_of_last_start(db: Session, task: Task) -> str | None:
         .populate_existing()
         .first()
     )
-    if last is None or last.target_run_id is None:
+    if (
+        newest is None
+        or newest.target_run_id is None
+        or newest.target_state_version is None
+    ):
         return None
-    run_id = str(last.target_run_id)
+    run_id = str(newest.target_run_id)
     if run_id == _task_run_id(task):
         return None
-    filters = [
-        TaskExecutionCommand.task_id == int(task.id),
-        TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
-        TaskExecutionCommand.status == COMMAND_COMPLETED,
-        TaskExecutionCommand.target_run_id == run_id,
-    ]
+    accepted_version = int(newest.target_state_version)
     cancelled_new_task = _task_run_id(task) is None and is_sdk_cancelled(
         task.status, task.error_message
     )
-    if not cancelled_new_task:
-        filters.append(
-            TaskExecutionCommand.target_state_version == int(task.state_version or 0)
+    if not cancelled_new_task and accepted_version != int(task.state_version or 0):
+        return None
+    cancel = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == int(task.id),
+            TaskExecutionCommand.command_id
+            == _cancel_command_id(int(task.id), accepted_version, run_id),
+            TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
         )
-    cancels = db.query(TaskExecutionCommand).filter(*filters).populate_existing().all()
-    for cancel in cancels:
-        payload: dict[str, Any] = (
-            cancel.payload if isinstance(cancel.payload, dict) else {}
-        )
-        if (
-            payload.get("scope") == SDK_COMMAND_SCOPE
-            and payload.get("queued_run_id") == run_id
-        ):
-            return run_id
-    return None
+        .populate_existing()
+        .one_or_none()
+    )
+    if cancel is None:
+        return None
+    payload: dict[str, Any] = cancel.payload if isinstance(cancel.payload, dict) else {}
+    if (
+        payload.get("scope") != SDK_COMMAND_SCOPE
+        or payload.get("queued_run_id") != run_id
+    ):
+        return None
+    return cancel
 
 
 def _start_of_run(
@@ -393,8 +401,10 @@ def _prepare_cancel_sync(
     """Authorize, classify the target and persist its command, in one read.
 
     The target is the queued START that can still hand off, else the row. A
-    repeat of a cancel that already withdrew the newest turn finds neither
-    and is answered from the record of that withdrawal.
+    repeat of a cancel that already withdrew the newest turn finds no such
+    START and rejoins that cancel's command (``_cancel_of_newest_turn``):
+    the same command to poll while it is still being applied, the same
+    answer once it completed.
     """
 
     from .task_start import resolve_sdk_task
@@ -419,11 +429,25 @@ def _prepare_cancel_sync(
                     "cancelled yet; retry once it is running."
                 )
             return _stage_cancel(db, task, queued_run_id=str(queued.target_run_id))
-        # A cancel that withdrew the newest turn is answered again for that
-        # turn, not for whatever the row shows of the turn before it.
-        withdrawn_run_id = _withdrawn_run_of_last_start(db, task)
-        if withdrawn_run_id is not None:
-            return _result(db, task, cancelled=True, cancelled_run_id=withdrawn_run_id)
+        # A repeat of the cancel that withdrew the newest turn rejoins that
+        # command and is answered for that turn, not for whatever the row
+        # shows of the turn before it: polled like the first call while the
+        # command is still being applied, answered as cancelled once it
+        # completed. A failed command is not a cancellation, so the row
+        # decides.
+        cancel = _cancel_of_newest_turn(db, task)
+        if cancel is not None:
+            withdrawn_run_id = str(cancel.payload["queued_run_id"])
+            if cancel.status == COMMAND_COMPLETED:
+                return _result(
+                    db, task, cancelled=True, cancelled_run_id=withdrawn_run_id
+                )
+            if cancel.status in {COMMAND_PENDING, COMMAND_PROCESSING}:
+                return _CancelCommand(
+                    command_db_id=int(cancel.id),
+                    aimed_run_id=withdrawn_run_id,
+                    aimed_at_queued_turn=True,
+                )
         if is_sdk_cancelled(task.status, task.error_message):
             return _row_result(db, task)
         if _ended_without_cancel(db, task):
@@ -468,6 +492,24 @@ def _stage_cancel(
     )
 
 
+def _cancel_command_id(
+    task_id: int, target_state_version: int, queued_run_id: str | None
+) -> str:
+    """The identity of the cancel command for the state it is aimed at.
+
+    Keyed on the state the request read: a repeat against the same state is
+    the same command, and a repeat after the state moved is a new one aimed
+    at the new state. An appended turn does not move the row while it is
+    queued, so its run is part of the key; once such a turn is withdrawn,
+    ``_cancel_of_newest_turn`` finds the command again by this key.
+    """
+
+    command_id = f"cancel:{task_id}:{target_state_version}"
+    if queued_run_id is not None:
+        command_id = f"{command_id}:{queued_run_id}"
+    return command_id
+
+
 def _enqueue_cancel(
     db: Session,
     task: Task,
@@ -476,19 +518,13 @@ def _enqueue_cancel(
     queued_run_id: str | None,
 ) -> EnqueuedTaskCommand:
     task_id = int(task.id)
-    # Keyed on the state read here: a repeat against the same state is the
-    # same command, and a repeat after the state moved is a new one aimed at
-    # the new state. An appended turn does not move the row while it is
-    # queued, so its run is part of the key. Once such a turn is withdrawn a
-    # repeat is answered from that record and never reaches this key.
-    command_id = f"cancel:{task_id}:{target_state_version}"
+    command_id = _cancel_command_id(task_id, target_state_version, queued_run_id)
     payload: dict[str, Any] = {
         "agent_id": int(task.agent_id),
         "target_state_version": target_state_version,
         "scope": SDK_COMMAND_SCOPE,
     }
     if queued_run_id is not None:
-        command_id = f"{command_id}:{queued_run_id}"
         payload["queued_run_id"] = queued_run_id
     return enqueue_task_command(
         db,
@@ -595,10 +631,11 @@ async def request_sdk_task_cancel(
     Returns ``cancelled=True`` once the task is the outcome of a
     cancellation, including when it already was, once the command that
     cancelled the aimed run completed (``cancelled_run_id``), and when an
-    earlier call's command withdrew the newest turn, which names that turn. Returns
-    ``cancelled=False`` when the command was persisted but not applied
-    within ``SDK_CANCEL_REQUEST_WAIT_SECONDS``; calling again reaches the
-    same command. Raises ``SdkTaskNotCancellable`` when the aimed run ended
+    earlier call's command that withdrew the newest turn completed, which
+    names that turn. Returns ``cancelled=False`` when the command was
+    persisted but not applied within ``SDK_CANCEL_REQUEST_WAIT_SECONDS``;
+    calling again reaches the same command, including after it withdrew a
+    queued turn and before it is marked completed. Raises ``SdkTaskNotCancellable`` when the aimed run ended
     without being cancelled, whichever way the wait ends.
     """
 

@@ -30,6 +30,7 @@ import http.client
 import json
 from collections.abc import Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -486,7 +487,12 @@ def execute_batch(
         thread_name_prefix="google-api-proxy",
     )
     try:
-        futures = {request_id: executor.submit(run, request_id) for request_id in order}
+        # Each worker runs under the caller's context, so a Composio request
+        # count started for this tool call also sees the batch's requests.
+        futures = {
+            request_id: executor.submit(copy_context().run, run, request_id)
+            for request_id in order
+        }
         _, pending = wait(futures.values(), timeout=deadline)
         for future in pending:
             future.cancel()

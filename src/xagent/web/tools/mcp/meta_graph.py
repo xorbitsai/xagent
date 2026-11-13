@@ -373,6 +373,9 @@ def _composio_proxy_request(
             "Composio proxy returned a response that is not a JSON object",
             sensitive_values=sensitive_values,
         )
+    # Composio accepted this call; a Graph error in the body is the provider's
+    # answer, not a refusal, so the request is billed either way.
+    composio_proxy.record_accepted_request()
 
     upstream_data = body.get("data")
     _remember_proxy_response_secrets(upstream_data)

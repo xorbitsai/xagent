@@ -65,6 +65,7 @@ from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
 )
 from xagent.core.tools.core.mcp import tools as mcp_tools_module
+from xagent.core.tools.core.mcp.composio_requests import COMPOSIO_REQUESTS_META_KEY
 from xagent.core.tools.core.mcp.tools import _tools_with_raw_annotations
 
 
@@ -8295,13 +8296,17 @@ def _composio_adapter(connection: Optional[dict[str, Any]] = None) -> MCPToolAda
     )
 
 
-def _session_returning(text: str = "ok"):
+def _session_returning(text: str = "ok", *, meta: Any = None, is_error: bool = False):
     class _FakeSession:
         async def initialize(self):
             return None
 
         async def call_tool(self, name, arguments, **kwargs):
-            return CallToolResult(content=[TextContent(type="text", text=text)])
+            return CallToolResult(
+                content=[TextContent(type="text", text=text)],
+                isError=is_error,
+                _meta=meta,
+            )
 
     @asynccontextmanager
     async def _fake_create_session(_connection):
@@ -8310,8 +8315,38 @@ def _session_returning(text: str = "ok"):
     return _fake_create_session
 
 
+def _assert_composio_rows(details: list[dict[str, Any]], count: int) -> None:
+    assert len(details) == count
+    for row in details:
+        assert row["call_type"] == "composio"
+        assert row["unit"] == "requests"
+        assert row["quantity"] == 1.0
+        assert row["model_id"] == "platform/composio"
+
+
 @pytest.mark.asyncio
-async def test_composio_backed_call_records_one_composio_request(monkeypatch):
+async def test_a_composio_call_records_one_row_per_accepted_request(monkeypatch):
+    # A Gmail search on a Composio grant lists once and reads one message per
+    # request; the subprocess reports all eleven, and each is one row.
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "create_session",
+        _session_returning(meta={COMPOSIO_REQUESTS_META_KEY: 11}),
+    )
+    adapter = _composio_adapter()
+
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is False
+    # The private count the adapter read is not part of the model's result.
+    assert "_composio_requests" not in result
+    _assert_composio_rows(details, 11)
+
+
+@pytest.mark.asyncio
+async def test_a_composio_call_without_a_reported_count_records_nothing(monkeypatch):
     monkeypatch.setattr(mcp_adapter_module, "create_session", _session_returning())
     adapter = _composio_adapter()
 
@@ -8320,18 +8355,19 @@ async def test_composio_backed_call_records_one_composio_request(monkeypatch):
         details = manager.get_usage().details
 
     assert result["is_error"] is False
-    assert len(details) == 1
-    assert details[0]["call_type"] == "composio"
-    assert details[0]["unit"] == "requests"
-    assert details[0]["quantity"] == 1.0
-    assert details[0]["model_id"] == "platform/composio"
+    assert details == []
 
 
 @pytest.mark.asyncio
-async def test_a_native_connector_call_records_nothing(monkeypatch):
+async def test_a_native_connector_call_ignores_a_reported_count(monkeypatch):
     # A connector holding its own provider token runs natively: it reaches the
-    # provider directly and is not billed to Composio.
-    monkeypatch.setattr(mcp_adapter_module, "create_session", _session_returning())
+    # provider directly and is not billed to Composio. A `_meta` count on its
+    # result is not trusted.
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "create_session",
+        _session_returning(meta={COMPOSIO_REQUESTS_META_KEY: 11}),
+    )
     native_connection = {
         key: value for key, value in _COMPOSIO_CONNECTION.items() if key != "composio"
     }
@@ -8370,25 +8406,50 @@ async def test_a_composio_call_that_raises_records_nothing(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_retried_composio_call_is_still_one_request(monkeypatch):
-    """One model-chosen call is one row, however many times it was sent.
+async def test_a_composio_error_result_still_records_the_accepted_requests(monkeypatch):
+    # A call that failed after Composio had accepted requests brings its count
+    # back on the error result; those requests were billed and are recorded.
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "create_session",
+        _session_returning(
+            "connector failed", meta={COMPOSIO_REQUESTS_META_KEY: 2}, is_error=True
+        ),
+    )
+    adapter = _composio_adapter()
 
-    An authorization failure retries the call once with a refreshed connection;
-    the row must not double up for a single tool call.
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is True
+    _assert_composio_rows(details, 2)
+
+
+@pytest.mark.asyncio
+async def test_a_retried_composio_call_counts_only_the_retrys_requests(monkeypatch):
+    """A retry runs in a new subprocess, so its count is the whole bill.
+
+    The failed attempt's accepted requests were not brought back with the
+    exception, and the retry's requests must not be counted twice either.
     """
     calls: list[int] = []
 
     async def _failing_then_retried(_self, connection, tool_args, tool_meta):
         calls.append(1)
-        if len(calls) == 1:
-            raise RuntimeError("first attempt failed")
-        return {"content": [{"text": "ok"}], "is_error": False}
+        raise RuntimeError("first attempt failed")
 
     monkeypatch.setattr(MCPToolAdapter, "_execute_mcp_call", _failing_then_retried)
     monkeypatch.setattr(
         MCPToolAdapter,
         "_retry_after_authorization_failure",
-        AsyncMock(return_value={"content": [{"text": "ok"}], "is_error": False}),
+        AsyncMock(
+            return_value={
+                "content": [{"text": "ok"}],
+                "is_error": False,
+                "_composio_requests": 3,
+            }
+        ),
     )
     adapter = _composio_adapter()
 
@@ -8398,12 +8459,45 @@ async def test_a_retried_composio_call_is_still_one_request(monkeypatch):
 
     assert result["is_error"] is False
     assert len(calls) == 1
-    assert len(details) == 1
+    _assert_composio_rows(details, 3)
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        None,
+        {},
+        {COMPOSIO_REQUESTS_META_KEY: None},
+        {COMPOSIO_REQUESTS_META_KEY: "3"},
+        {COMPOSIO_REQUESTS_META_KEY: 3.0},
+        {COMPOSIO_REQUESTS_META_KEY: -1},
+        {COMPOSIO_REQUESTS_META_KEY: True},
+        {COMPOSIO_REQUESTS_META_KEY: [3]},
+    ],
+    ids=["none", "empty", "null", "str", "float", "negative", "bool", "list"],
+)
+@pytest.mark.asyncio
+async def test_a_malformed_reported_count_records_nothing(monkeypatch, meta):
+    monkeypatch.setattr(
+        mcp_adapter_module, "create_session", _session_returning(meta=meta)
+    )
+    adapter = _composio_adapter()
+
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async({})
+        details = manager.get_usage().details
+
+    assert result["is_error"] is False
+    assert details == []
 
 
 @pytest.mark.asyncio
 async def test_composio_metering_without_a_run_context_does_not_raise(monkeypatch):
-    monkeypatch.setattr(mcp_adapter_module, "create_session", _session_returning())
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "create_session",
+        _session_returning(meta={COMPOSIO_REQUESTS_META_KEY: 2}),
+    )
     adapter = _composio_adapter()
 
     result = await adapter.run_json_async({})

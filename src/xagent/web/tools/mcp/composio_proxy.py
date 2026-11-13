@@ -36,6 +36,7 @@ import logging
 import os
 import re
 from collections.abc import Collection, Iterable, Mapping
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -162,6 +163,36 @@ def serves_composio_grant() -> bool:
     """Whether this connector process serves a Composio-backed grant: it is
     launched with Composio's ids instead of a provider token."""
     return bool(os.environ.get(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
+
+
+# How many Proxy Execute requests Composio accepted during the MCP tool call
+# being handled. FastMCP handles calls concurrently in one process, so the
+# count is a context variable; outside a metered call (a host-issued call, a
+# direct client use) nothing is counted.
+_accepted_requests: ContextVar[list[int] | None] = ContextVar(
+    "composio_accepted_requests", default=None
+)
+
+
+def begin_request_count() -> Token[list[int] | None]:
+    """Start counting the requests Composio accepts for one tool call."""
+    return _accepted_requests.set([])
+
+
+def end_request_count(token: Token[list[int] | None]) -> int:
+    """Stop counting and return how many requests were accepted."""
+    counter = _accepted_requests.get() or []
+    _accepted_requests.reset(token)
+    return len(counter)
+
+
+def record_accepted_request() -> None:
+    """Count one request Composio accepted; a no-op outside a metered call."""
+    counter = _accepted_requests.get()
+    if counter is not None:
+        # ``list.append`` is atomic under the GIL, so a batch can count from
+        # its worker threads without a lock.
+        counter.append(1)
 
 
 def redact(value: Any) -> Any:
@@ -1023,6 +1054,9 @@ def proxy_request(
             "Composio proxy returned a binary answer in an unexpected shape",
             status=status,
         )
+    # Composio accepted this call (the provider's own status, success or not,
+    # is in ``provider_status``), so it is a billed request.
+    record_accepted_request()
     return ProxyResponse(
         status=provider_status,
         data=answer.get("data"),

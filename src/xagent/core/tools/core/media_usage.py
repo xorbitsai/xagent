@@ -4,8 +4,8 @@ TTS/ASR/video/music/sound-effect models don't return a normalised usage
 payload the way image/chat models do, and their adapters are factory-only, so
 the natural metering point is the tool call site where the request params and
 result are both in scope. This helper wraps ``add_media_usage`` so a failure in
-accounting can never break the underlying media call. Search providers use
-the same rule through the helper below.
+accounting can never break the underlying media call. Search providers and
+Composio-backed connectors use the same rule through the helpers below.
 
 Metering invariants
 -------------------
@@ -279,3 +279,15 @@ def record_web_search_usage(provider: str) -> None:
         logger.error("Unknown web search provider %r; dropping the usage row", provider)
         return
     record_media_usage(MediaCallType.WEB_SEARCH, 1, model_id=model_id)
+
+
+def record_composio_usage(requests: int) -> None:
+    """Record one ``composio`` row per request Composio accepted in a call.
+
+    Composio bills each Proxy Execute request, and one connector tool call can
+    make several: a Gmail search reads one message per request, and a batch
+    sends one request per item. A ``requests`` row bills quantity 1, so N
+    accepted requests are N rows.
+    """
+    for _ in range(requests):
+        record_media_usage(MediaCallType.COMPOSIO, 1, model_id="platform/composio")

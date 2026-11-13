@@ -89,7 +89,9 @@ class MediaCallType(str, Enum):
     RERANK = ("rerank", MediaUnit.REQUESTS)
     # Platform-metered requests with nothing finer to bill than the call
     # itself: one successful search against a search provider's key, and one
-    # connector action that ran on the platform's Composio grant.
+    # request Composio accepted on the platform's grant. A connector tool call
+    # can make several such requests, so a ``composio`` call is metered per
+    # request and the connector reports its count in the MCP result ``_meta``.
     WEB_SEARCH = ("web_search", MediaUnit.REQUESTS)
     COMPOSIO = ("composio", MediaUnit.REQUESTS)
 

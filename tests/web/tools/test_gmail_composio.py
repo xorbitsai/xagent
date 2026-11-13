@@ -12,14 +12,17 @@ import base64
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from email import policy
 from email.parser import BytesParser
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import httplib2
 import pytest
 from googleapiclient.discovery import build
+from mcp.types import CallToolResult
 
 from tests.web.tools.conftest import (
     ACCOUNT_ID,
@@ -27,6 +30,10 @@ from tests.web.tools.conftest import (
     COMPOSIO_USER,
     _Response,
 )
+from xagent.core.model.chat.token_context import TokenContextManager
+from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
+from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+from xagent.core.tools.core.mcp.composio_requests import COMPOSIO_REQUESTS_META_KEY
 from xagent.web.tools import config as tools_config
 from xagent.web.tools.mcp import composio_proxy, gmail, google_api_proxy
 
@@ -1042,3 +1049,164 @@ def test_a_group_send_echoed_with_rewritten_whitespace_stays_bounded(
     assert "A" * 64 not in text
     assert "@example.com" not in text
     assert elapsed < 1.0, "a rewritten echo must not multiply the body's cost"
+
+
+# --- Metering: one usage row per Composio request ----------------------------
+
+
+def _gmail_metering_adapter() -> MCPToolAdapter:
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="gmail_search_messages",
+            description="Search Gmail messages",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_results": {"type": "integer"},
+                    "label_ids": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        ),
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "composio": True,
+        },
+        name_prefix="mcp_Gmail_",
+        source_server="gmail",
+    )
+
+
+def _session_running_gmail():
+    """A session whose calls run the real Gmail MCP tool in this process."""
+
+    class _GmailSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return await gmail.mcp.call_tool(name, arguments)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _GmailSession()
+
+    return _fake_create_session
+
+
+def _answer_search(proxy, message_ids: list[str]) -> None:
+    """Answer one list request and one metadata read per message id."""
+    for message_id in message_ids:
+        proxy.answer(
+            f"/messages/{message_id}",
+            200,
+            {**_MESSAGE, "id": message_id, "threadId": f"t-{message_id}"},
+        )
+    proxy.answer("/messages", 200, {"messages": [{"id": m} for m in message_ids]})
+
+
+async def _search_through_the_adapter(monkeypatch, arguments: dict[str, Any]):
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _session_running_gmail())
+    adapter = _gmail_metering_adapter()
+    with TokenContextManager() as manager:
+        result = await adapter.run_json_async(arguments)
+        details = manager.get_usage().details
+    return result, details
+
+
+@pytest.mark.asyncio
+async def test_the_gmail_result_reports_the_requests_composio_accepted(
+    proxy, monkeypatch
+):
+    _answer_search(proxy, ["msg0", "msg1"])
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async with create_connected_server_and_client_session(
+        gmail.mcp._mcp_server
+    ) as session:
+        result = await session.call_tool("gmail_search_messages", {"max_results": 2})
+
+    assert isinstance(result, CallToolResult)
+    assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 3}
+    assert len(proxy.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_ten_message_search_records_its_eleven_requests(proxy, monkeypatch):
+    # One list plus one metadata read per message: eleven billed requests.
+    message_ids = [f"msg{number}" for number in range(10)]
+    _answer_search(proxy, message_ids)
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result, details = await _search_through_the_adapter(
+        monkeypatch, {"max_results": 10}
+    )
+
+    assert result["is_error"] is False
+    assert len(proxy.calls) == 11
+    assert len(details) == 11
+    assert {row["call_type"] for row in details} == {"composio"}
+    assert {row["unit"] for row in details} == {"requests"}
+    assert {row["quantity"] for row in details} == {1.0}
+    assert {row["model_id"] for row in details} == {"platform/composio"}
+
+
+@pytest.mark.asyncio
+async def test_a_composio_refusal_records_nothing(proxy, monkeypatch):
+    proxy.answer_with(500, {"error": {"message": "rate limited"}})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result, details = await _search_through_the_adapter(
+        monkeypatch, {"max_results": 10}
+    )
+
+    assert json.loads(result["content"][0]["text"])["status"] == "error"
+    assert len(proxy.calls) == 1
+    assert details == []
+
+
+@pytest.mark.asyncio
+async def test_a_search_refused_before_sending_records_nothing(proxy, monkeypatch):
+    # Two label ids are refused on a Composio grant before the list request.
+    proxy.answer("/messages", 200, {"messages": []})
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result, details = await _search_through_the_adapter(
+        monkeypatch, {"max_results": 1, "label_ids": ["INBOX", "STARRED"]}
+    )
+
+    assert json.loads(result["content"][0]["text"])["status"] == "error"
+    assert proxy.calls == []
+    assert details == []
+
+
+@pytest.mark.asyncio
+async def test_a_partly_failed_batch_records_only_the_accepted_requests(
+    proxy, monkeypatch
+):
+    # msg0 is read, msg1 answers 404 (Composio accepted and relayed it), and
+    # msg2 is refused by Composio itself. The list and the first two reads are
+    # billed; the refused read is not.
+    proxy.answer(
+        "/messages/msg0", 200, {**_MESSAGE, "id": "msg0", "threadId": "t-msg0"}
+    )
+    proxy.answer("/messages/msg1", 404, _NOT_FOUND)
+    proxy.by_endpoint.append(
+        ("/messages/msg2", _Response(500, {"error": {"message": "rate limited"}}))
+    )
+    proxy.answer(
+        "/messages",
+        200,
+        {"messages": [{"id": "msg0"}, {"id": "msg1"}, {"id": "msg2"}]},
+    )
+    monkeypatch.setattr(gmail, "get_gmail_service", lambda: _proxy_service())
+
+    result, details = await _search_through_the_adapter(monkeypatch, {"max_results": 3})
+
+    payload = json.loads(result["content"][0]["text"])
+    assert len(payload["errors"]) == 2
+    assert len(proxy.calls) == 4
+    assert len(details) == 3

@@ -5,9 +5,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
-
 from . import meta_graph
+from .composio_metering import ComposioMeteringFastMCP
 from .meta_graph import (
     GraphAPIError,
 )
@@ -24,7 +23,7 @@ logger = logging.getLogger("facebook-mcp")
 
 setup_proxy_env()
 
-mcp = FastMCP("facebook-mcp")
+mcp = ComposioMeteringFastMCP("facebook-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS"
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024

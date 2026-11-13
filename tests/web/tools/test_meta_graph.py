@@ -301,6 +301,34 @@ def test_proxy_get_maps_params_to_query_and_sends_no_authorization(
     }
 
 
+def test_proxy_posts_one_accepted_request(monkeypatch, composio_env):
+    _capture_proxy(monkeypatch, _proxy_response({"id": "fb-user-1"}))
+
+    token = composio_proxy.begin_request_count()
+    try:
+        meta_graph.graph_request("GET", "/me")
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert accepted == 1
+
+
+def test_a_refused_proxy_call_accepts_nothing(monkeypatch, composio_env):
+    body = {"error": {"message": "rate limited", "slug": "TooManyRequests"}}
+    _capture_proxy(
+        monkeypatch, MockResponse(body, text=json.dumps(body), status_code=429)
+    )
+
+    token = composio_proxy.begin_request_count()
+    try:
+        with pytest.raises(meta_graph.ComposioProxyError):
+            meta_graph.graph_request("GET", "/me")
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert accepted == 0
+
+
 @pytest.mark.parametrize(
     "kwargs, path",
     [

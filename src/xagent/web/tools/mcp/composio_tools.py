@@ -42,6 +42,7 @@ from .composio_proxy import (
     DEFAULT_TIMEOUT_SECONDS,
     _required_env,
     _truncated,
+    record_accepted_request,
     redact,
 )
 
@@ -185,6 +186,7 @@ def execute_tool(
     if not isinstance(successful, bool):
         raise ComposioToolError("Composio returned a tool answer without a result")
     error = answer.get("error")
+    record_accepted_request()
     return ToolResult(
         successful=successful,
         data=answer.get("data"),

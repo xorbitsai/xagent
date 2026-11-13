@@ -50,13 +50,13 @@ from ....file_ref import (
     parse_file_id_ref,
     sanitize_file_ref_for_context,
 )
-from ....model.chat.token_context import MediaCallType
 from ....utils.egress_proxy import get_trusted_proxy_url
 from ....utils.public_http_transport import (
     PublicHttpTransport,
     UnsafePublicHttpTarget,
 )
 from ....utils.security import PrivateNetworkHostError, redact_sensitive_text
+from ...core.mcp.composio_requests import COMPOSIO_REQUESTS_META_KEY
 from ...core.mcp.sessions import (
     Connection,
     SSEConnection,
@@ -64,7 +64,6 @@ from ...core.mcp.sessions import (
     create_session,
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
-from ...core.media_usage import record_media_usage
 from .base import AbstractBaseTool, ToolVisibility
 from .config import is_http_status_code
 from .connector_runtime import (
@@ -2248,6 +2247,28 @@ def _normalized_mcp_call_result(
     }
 
 
+# The private member ``_execute_mcp_call`` hands the subprocess-reported
+# Composio count back under. ``run_json_async`` records the rows and removes
+# it, so it never reaches the model.
+_COMPOSIO_REQUESTS_KEY = "_composio_requests"
+
+
+def _reported_composio_requests(meta: Any) -> int:
+    """How many Composio requests a connector reported for one tool call.
+
+    ``meta`` is the MCP result's ``_meta``, written by the connector
+    subprocess. Only a non-negative int is a count; a missing or malformed
+    value means no request was accepted (or the subprocess does not report
+    them), so nothing is recorded.
+    """
+    if not isinstance(meta, Mapping):
+        return 0
+    count = meta.get(COMPOSIO_REQUESTS_META_KEY)
+    if type(count) is not int or count < 0:
+        return 0
+    return count
+
+
 def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
     """Carry the Excel connector's allowlisted failure code to the runtime."""
     from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
@@ -2397,9 +2418,10 @@ class MCPToolAdapter(AbstractBaseTool):
         self._runtime_bindings = runtime_bindings_from_config(runtime_config)
         self._connector_runtime = connector_runtime_from_config(runtime_config)
         # Set by the server config only for a connector whose subprocess runs on
-        # a Composio grant, so a call that returns is metered as one Composio
-        # action. Absent for every native connector and every other server,
-        # which are not billed to Composio.
+        # a Composio grant. That subprocess reports how many Proxy Execute
+        # requests Composio accepted for each call, and the adapter records
+        # that many rows. Absent for every native connector and every other
+        # server, which are not billed to Composio.
         self._composio_backed = runtime_config.get("composio") is True
         self._signed_upload = self._usable_signed_upload(signed_upload)
         from .base import ToolCategory
@@ -3709,14 +3731,17 @@ class MCPToolAdapter(AbstractBaseTool):
                             raise
                         result = retry_result
                     if self._composio_backed:
-                        # The provider already answered, so the action is billed
-                        # even when a local check below fails it. One row per
-                        # model-chosen tool call: a retry above re-sent the same
-                        # call, and the subprocess may have issued several HTTP
-                        # requests for it.
-                        record_media_usage(
-                            MediaCallType.COMPOSIO, 1, model_id="platform/composio"
-                        )
+                        # Composio bills every Proxy Execute request it accepted,
+                        # so a call that listed once and read ten messages is
+                        # eleven rows. The connector subprocess counted them and
+                        # reported the count on the result's ``_meta``; a retry
+                        # above ran in a new subprocess, so only the retry's
+                        # accepted requests are counted here.
+                        # Local import: media_usage loads the model layer, and
+                        # the MCP loader is used without it.
+                        from ...core.media_usage import record_composio_usage
+
+                        record_composio_usage(result.pop(_COMPOSIO_REQUESTS_KEY, 0))
                     if (
                         self._workspace is not None
                         and self._workspace_download_field is not None
@@ -3865,6 +3890,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 normalized["failure_code"] = failure_code
                 normalized["success"] = False
                 normalized["is_error"] = True
+        if self._composio_backed:
+            normalized[_COMPOSIO_REQUESTS_KEY] = _reported_composio_requests(
+                getattr(result, "meta", None)
+            )
         return normalized
 
     async def _retry_after_authorization_failure(

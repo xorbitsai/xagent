@@ -36,7 +36,9 @@ from xagent.migrations.embedding.scope import (
     SKIP_NO_DOC_ID,
     SKIP_NO_SOURCE_MODEL,
     SKIP_OTHER_ENGINE,
+    SKIP_SOURCE_UNPINNED,
     SKIP_UNREADABLE_BINDING,
+    SOURCE_BINDING_PINNED,
     MigrationCliError,
     SearchableChunk,
     add_scope_args,
@@ -124,6 +126,7 @@ class CollectionReport:
     skipped: Dict[str, int] = field(default_factory=dict)
     failures: List[DocumentFailure] = field(default_factory=list)
     aborted: bool = False
+    source_binding_pinned: bool = False
 
 
 @dataclass
@@ -266,9 +269,21 @@ def embed_collection(
         try:
             writable_embeddings_table(model_id, conn=conn)
         except MigrationCliError as exc:
-            logger.error("%s: %s", name, exc)
-            report.collection_skip = SKIP_LEGACY_SHADOWED
-            return report
+            return _refuse(report, SKIP_LEGACY_SHADOWED, str(exc))
+        # Target rows must not reach search's table inference while the
+        # source is unbound: pin what search itself would persist.
+        try:
+            pinned = pin_source_binding(name)
+        except Exception as exc:  # noqa: BLE001 - refuse rather than write unpinned
+            return _refuse(report, SKIP_SOURCE_UNPINNED, str(exc))
+        if pinned is not None:
+            if pinned != report.source_model_id:
+                return _refuse(
+                    report,
+                    SKIP_SOURCE_UNPINNED,
+                    f"bound to '{pinned}', not the source '{report.source_model_id}'",
+                )
+            report.source_binding_pinned = True
     doc_ids, unaddressable = iter_source_doc_ids(
         name, report.source_model_id, conn=conn
     )
@@ -527,8 +542,26 @@ def _verify_written(
         logger.error("%s: %d documents lost chunks while writing", name, len(shortfall))
 
 
+def pin_source_binding(name: str) -> Optional[str]:
+    from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+        pin_inferred_embedding_binding,
+    )
+
+    return pin_inferred_embedding_binding(name)
+
+
+def _refuse(report: CollectionReport, reason: str, error: str) -> CollectionReport:
+    """A collection the run must not write: reported, and the exit is non-zero."""
+    logger.error("%s: %s", report.name, error)
+    report.collection_skip = reason
+    report.failures.append(DocumentFailure("*", error))
+    return report
+
+
 def _describe(report: CollectionReport, *, dry_run: bool) -> str:
     if report.collection_skip:
+        if report.failures:
+            return f"{report.name}: refused ({report.collection_skip})"
         return f"{report.name}: skipped ({report.collection_skip})"
     verb = "would copy" if dry_run else "copied"
     parts = [
@@ -539,6 +572,8 @@ def _describe(report: CollectionReport, *, dry_run: bool) -> str:
     ]
     if not dry_run:
         parts.append(f"{report.chunks_embedded} chunks")
+    if report.source_binding_pinned:
+        parts.append(SOURCE_BINDING_PINNED)
     if report.skipped:
         parts.append(
             "skipped "

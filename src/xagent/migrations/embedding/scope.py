@@ -38,6 +38,8 @@ SKIP_NO_DOC_ID = "no-doc-id"
 SKIP_NO_TEXT = "no-text"
 SKIP_LEGACY_SHADOWED = "legacy-table-shadowed"
 SKIP_NO_METADATA = "no-metadata"
+SKIP_SOURCE_UNPINNED = "source-binding-unpinned"
+SOURCE_BINDING_PINNED = "source-binding-pinned"
 
 # A table without one of these turns rows into skips that acceptance then
 # "confirms" on both sides; that is a broken table, not an empty collection.
@@ -57,6 +59,10 @@ CHUNK_COLUMNS = [
 
 class MigrationCliError(RuntimeError):
     """A scope or configuration problem that must stop the command."""
+
+
+class MissingCollectionError(MigrationCliError):
+    """The collection has no metadata row (never existed, or was just deleted)."""
 
 
 @dataclass(frozen=True)
@@ -84,10 +90,11 @@ class CollectionScope:
     chunks: int = 0
     missing_chunks: int = 0
     skipped: Dict[str, int] = field(default_factory=dict)
+    error: Optional[str] = None
 
     @property
     def usable(self) -> bool:
-        return self.skip_reason is None
+        return self.skip_reason is None and self.error is None
 
 
 def connection() -> Any:
@@ -108,53 +115,43 @@ def embeddings_table(model_id: str, conn: Optional[Any] = None) -> Optional[str]
     return None
 
 
-def source_embeddings_table(model_id: str, conn: Optional[Any] = None) -> Optional[str]:
-    """The table search actually reads for ``model_id``, legacy name included.
+def _searchable_tables(model_id: str) -> List[str]:
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        searchable_embeddings_table_names,
+    )
 
-    Mirrors ``LanceDBVectorIndexStore.open_embeddings_table``: the Hub-id
-    candidates first, then ``embeddings_{to_model_tag(model_name)}``.
-    """
-    conn = conn if conn is not None else connection()
-    table = embeddings_table(model_id, conn)
-    if table is not None:
-        return table
-    legacy = _legacy_table_name(model_id)
-    if legacy and legacy in table_names(conn):
-        return legacy
+    return searchable_embeddings_table_names(model_id)
+
+
+def source_embeddings_table(model_id: str, conn: Optional[Any] = None) -> Optional[str]:
+    """The table search actually reads for ``model_id``: the first that exists
+    in ``open_embeddings_table``'s own list."""
+    names = table_names(conn if conn is not None else connection())
+    for candidate in _searchable_tables(model_id):
+        if candidate in names:
+            return candidate
     return None
 
 
-def _legacy_table_name(model_id: str) -> Optional[str]:
-    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
-        legacy_embeddings_table_name,
-    )
-
-    return legacy_embeddings_table_name(model_id)
-
-
 def writable_embeddings_table(model_id: str, conn: Optional[Any] = None) -> str:
-    """The table the writer will use, refusing to shadow a populated legacy one.
+    """The table the writer will use, refusing to shadow a populated one.
 
-    Search prefers the canonical name, so writing there while a legacy table
-    holds rows would hide those rows from every collection on this model. An
-    empty legacy table shadows nothing; a populated one must be migrated first.
+    The writer always creates the first name search tries, so while it is
+    missing, any other table search can open for the model that holds rows
+    would be hidden from every collection on this model.
     """
-    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
-        embeddings_table_candidates,
-    )
-
     conn = conn if conn is not None else connection()
-    canonical = embeddings_table_candidates(model_id)[0]
+    tables = _searchable_tables(model_id)
+    canonical = tables[0]
     names = table_names(conn)
     if canonical in names:
         return canonical
-    legacy = _legacy_table_name(model_id)
-    if legacy and legacy != canonical and legacy in names:
-        if _row_count(conn, legacy) > 0:
+    for other in tables[1:]:
+        if other in names and _row_count(conn, other) > 0:
             raise MigrationCliError(
-                f"embeddings table '{legacy}' holds rows and the canonical "
+                f"embeddings table '{other}' holds rows and the canonical "
                 f"'{canonical}' does not exist; writing the canonical table "
-                f"would hide those rows from search. Migrate {legacy} to "
+                f"would hide those rows from search. Migrate {other} to "
                 f"{canonical} first."
             )
     return canonical
@@ -238,7 +235,9 @@ def collection_info(collection: str) -> Any:
     try:
         return get_collection_sync(collection)
     except ValueError as exc:
-        raise MigrationCliError(f"collection '{collection}' does not exist") from exc
+        raise MissingCollectionError(
+            f"collection '{collection}' does not exist"
+        ) from exc
 
 
 def collection_engine(info: Any) -> str:
@@ -530,13 +529,18 @@ def scope_report(
     for name in names:
         try:
             item = scope_collection(name, target_model_id, conn=conn)
-        except MigrationCliError as exc:
+        except MissingCollectionError as exc:
             if explicit:
-                # A name the operator typed must exist; a discovered one is
-                # reported so it cannot hide the rest.
                 raise
+            # Discovered, then gone before it was read: nothing to report on.
             logger.warning("%s: %s", name, exc)
             report.append(CollectionScope(name=name, skip_reason=SKIP_NO_METADATA))
+            continue
+        except MigrationCliError as exc:
+            # A collection that exists but cannot be read (a schema error) is a
+            # failure of the report, kept per collection so the rest still print.
+            logger.error("%s: %s", name, exc)
+            report.append(CollectionScope(name=name, error=str(exc)))
             continue
         if item.skip_reason:
             logger.warning("%s: skipped (%s)", name, item.skip_reason)
@@ -611,11 +615,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.warning("No collections in scope; check --collection/--team")
         return 1
     for item in report:
-        if item.usable:
+        if item.error:
+            logger.error("%s: failed: %s", item.name, item.error)
+        elif item.usable:
             logger.info("%s", describe(item))
         else:
             logger.info("%s: skipped (%s)", item.name, item.skip_reason)
-    return 0
+    return 1 if any(item.error for item in report) else 0
 
 
 if __name__ == "__main__":

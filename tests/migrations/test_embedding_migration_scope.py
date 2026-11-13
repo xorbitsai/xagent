@@ -567,7 +567,11 @@ def test_a_target_row_without_a_vector_is_still_missing(
 def test_a_legacy_named_table_is_read_like_search_reads_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mod, "_legacy_table_name", lambda model_id: "embeddings_legacy")
+    monkeypatch.setattr(
+        mod,
+        "_searchable_tables",
+        lambda model_id: ["embeddings_x", "embeddings_legacy"],
+    )
     conn = _conn({"embeddings_legacy": _Table([_row()])})
 
     chunks = list(mod.iter_source_chunks("kb", "old", conn=conn))
@@ -818,3 +822,62 @@ def test_an_explicit_model_is_resolved_like_embed(
 
     assert seen["model"] == "canonical-id"
     assert seen["dimension"] == 3
+
+
+def test_a_discovered_collection_with_a_schema_error_fails_the_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mod, "resolve_collection_names", lambda **kwargs: ["bad", "gone", "ok"]
+    )
+
+    def _scope(name: str, target: Any, *, conn: Any) -> Any:
+        if name == "bad":
+            raise mod.MigrationCliError("source table is missing column 'user_id'")
+        if name == "gone":
+            raise mod.MissingCollectionError("collection 'gone' does not exist")
+        return mod.CollectionScope(name=name)
+
+    monkeypatch.setattr(mod, "scope_collection", _scope)
+    monkeypatch.setattr(mod, "connection", lambda: object())
+
+    report = {item.name: item for item in mod.scope_report()}
+
+    assert "user_id" in (report["bad"].error or "")
+    assert not report["bad"].usable
+    assert report["gone"].skip_reason == mod.SKIP_NO_METADATA
+    assert report["gone"].error is None
+    assert report["ok"].usable
+    assert mod.main([]) == 1
+
+
+def test_a_collection_that_vanished_after_discovery_is_not_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        mod, "resolve_collection_names", lambda **kwargs: ["gone", "ok"]
+    )
+
+    def _scope(name: str, target: Any, *, conn: Any) -> Any:
+        if name == "gone":
+            raise mod.MissingCollectionError("collection 'gone' does not exist")
+        return mod.CollectionScope(name=name)
+
+    monkeypatch.setattr(mod, "scope_collection", _scope)
+    monkeypatch.setattr(mod, "connection", lambda: object())
+
+    assert mod.main([]) == 0
+
+
+def test_a_missing_collection_raises_the_missing_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    def _missing(name: str) -> Any:
+        raise ValueError(f"Collection '{name}' not found")
+
+    monkeypatch.setattr(cm, "get_collection_sync", _missing)
+
+    with pytest.raises(mod.MissingCollectionError):
+        mod.collection_info("kb")

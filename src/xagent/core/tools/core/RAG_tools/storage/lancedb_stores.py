@@ -1150,38 +1150,29 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..core.exceptions import DatabaseOperationError
         from ..LanceDB.model_tag_utils import (
             embeddings_table_candidates,
-            legacy_embeddings_table_name,
+            searchable_embeddings_table_names,
             written_embeddings_table_name,
         )
 
         conn = self._get_connection()
-        candidate_table_names = embeddings_table_candidates(model_tag)
-
-        tried_table_names = list(candidate_table_names)
-        for candidate_table_name in candidate_table_names:
+        candidate_table_names = set(embeddings_table_candidates(model_tag))
+        tried_table_names = searchable_embeddings_table_names(model_tag)
+        last_error: Optional[Exception] = None
+        for table_name in tried_table_names:
             try:
-                table = conn.open_table(candidate_table_name)
-                return table, candidate_table_name
-            except Exception as candidate_exc:
-                last_error = candidate_exc
-
-        # Try legacy fallback
-        legacy_table_name: Optional[str] = legacy_embeddings_table_name(model_tag)
-
-        if legacy_table_name and legacy_table_name not in tried_table_names:
-            tried_table_names.append(legacy_table_name)
-            try:
-                table = conn.open_table(legacy_table_name)
+                table = conn.open_table(table_name)
+            except Exception as exc:
+                last_error = exc
+                continue
+            if table_name not in candidate_table_names:
                 logger.info(
                     "Using legacy embeddings table '%s' for model_tag='%s'. "
                     "Consider migrating to '%s' for consistency.",
-                    legacy_table_name,
+                    table_name,
                     model_tag,
                     written_embeddings_table_name(model_tag),
                 )
-                return table, legacy_table_name
-            except Exception as legacy_exc:
-                last_error = legacy_exc
+            return table, table_name
 
         tried = ", ".join(f"'{name}'" for name in tried_table_names)
         raise DatabaseOperationError(

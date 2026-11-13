@@ -54,6 +54,15 @@ class _Table:
         pass
 
 
+_REAL_PIN = mod.pin_source_binding
+
+
+@pytest.fixture(autouse=True)
+def _bound_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Most collections here are bound; the pinning tests restore the real call."""
+    monkeypatch.setattr(mod, "pin_source_binding", lambda name: None)
+
+
 class _Query:
     """The slice of LanceDB's query builder ``iter_rows`` uses."""
 
@@ -1133,3 +1142,234 @@ def test_a_document_is_settled_once_across_many_chunks(
 
     assert written == [120]
     assert (report.documents_embedded, report.documents_total) == (1, 1)
+
+
+# --- round 2: every table search can open, and an inference-only source ---
+
+
+def _baai_target() -> EmbeddingModelConfig:
+    return EmbeddingModelConfig(
+        id="BAAI/bge-large-zh-v1.5", model_name="bge-large-zh-v1.5", dimension=2
+    )
+
+
+def test_a_populated_once_tagged_hub_table_is_refused_instead_of_shadowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        embeddings_table_candidates,
+        legacy_embeddings_table_name,
+        searchable_embeddings_table_names,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+    from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+    target = _baai_target()
+    monkeypatch.setattr(
+        model_resolver,
+        "resolve_embedding_adapter",
+        lambda model_id: (SimpleNamespace(model_name=target.model_name), object()),
+    )
+    canonical, once = embeddings_table_candidates(target.id)
+    legacy = legacy_embeddings_table_name(target.id)
+    assert (canonical, once, legacy) == (
+        "embeddings_baai_bge_large_zh_v1_5",
+        "embeddings_BAAI_bge_large_zh_v1_5",
+        "embeddings_bge_large_zh_v1_5",
+    )
+    assert searchable_embeddings_table_names(target.id) == [canonical, once, legacy]
+
+    _make_collection()
+    _install_source_stub(monkeypatch)
+    monkeypatch.setattr(mod, "_ensure_indexes", lambda *a, **k: None)
+    store = get_vector_index_store()
+    conn = store.get_raw_connection()
+    # c0 is held in the once-tagged table; c1..c3 are still pending.
+    held = _embedding_row("c0", target.id)
+    _create_embeddings_table(conn, once, [held])
+    assert scope.source_embeddings_table(target.id, conn) == once
+
+    adapter = _FixedAdapter()
+    report = mod.embed_collection(
+        "kb",
+        model_id=target.id,
+        embedding_config=target,
+        embedding_adapter=adapter,
+        cfg=_config(),
+        dry_run=False,
+        source="old-model",
+    )
+
+    assert report.collection_skip == mod.SKIP_LEGACY_SHADOWED
+    assert report.failures and once in report.failures[0].error
+    assert adapter.calls == []
+    assert scope.table_names(conn) & set(
+        searchable_embeddings_table_names(target.id)
+    ) == {once}
+
+
+def test_search_opens_tables_from_the_shared_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.LanceDB import model_tag_utils
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    store = get_vector_index_store()
+    _create_embeddings_table(
+        store.get_raw_connection(), "embeddings_listed", [_embedding_row("c0", "m")]
+    )
+    monkeypatch.setattr(
+        model_tag_utils,
+        "searchable_embeddings_table_names",
+        lambda tag: ["embeddings_absent", "embeddings_listed"],
+    )
+
+    assert store.open_embeddings_table("m")[1] == "embeddings_listed"
+
+
+def _hub(*ids: str) -> Any:
+    return {
+        model_id: EmbeddingModelConfig(id=model_id, model_name=model_id, dimension=2)
+        for model_id in ids
+    }
+
+
+def _inference_only_collection(monkeypatch: pytest.MonkeyPatch) -> Any:
+    import asyncio
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+    from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+    monkeypatch.setattr(mod, "pin_source_binding", _REAL_PIN)
+    monkeypatch.setattr(
+        model_resolver, "_list_model_hub_configs", lambda: _hub("a-target", "z-source")
+    )
+    monkeypatch.setattr(mod, "_ensure_indexes", lambda *a, **k: None)
+    asyncio.run(
+        cm.collection_manager.save_collection(CollectionInfo(name="kb", embeddings=4))
+    )
+    conn = get_vector_index_store().get_raw_connection()
+    # The target sorts before the source, so table inference would pick it.
+    _create_embeddings_table(
+        conn,
+        "embeddings_z_source",
+        [
+            {**_embedding_row(f"c{i}", "z-source"), "doc_id": f"doc-{i % 2}"}
+            for i in range(4)
+        ],
+    )
+    assert cm.resolve_effective_embedding_model_read_only("kb") == "z-source"
+    return conn
+
+
+def _embed_into_a_target() -> Any:
+    return mod.embed_collection(
+        "kb",
+        model_id="a-target",
+        embedding_config=EmbeddingModelConfig(
+            id="a-target", model_name="a-target", dimension=2
+        ),
+        embedding_adapter=_FixedAdapter(),
+        cfg=_config(),
+        dry_run=False,
+    )
+
+
+def test_an_inference_only_source_is_pinned_before_the_target_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    conn = _inference_only_collection(monkeypatch)
+
+    report = _embed_into_a_target()
+
+    assert report.failures == []
+    assert report.chunks_embedded == 4
+    assert report.source_binding_pinned is True
+    assert "source-binding-pinned" in mod._describe(report, dry_run=False)
+    assert "embeddings_a_target" in scope.table_names(conn)
+    assert cm.get_collection_sync("kb").embedding_model_id == "z-source"
+    assert cm.resolve_effective_embedding_model_sync("kb") == "z-source"
+
+
+def test_a_pin_that_lands_on_another_model_refuses_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_collection()
+    _install_source_stub(monkeypatch)
+    monkeypatch.setattr(mod, "pin_source_binding", lambda name: "someone-else")
+    adapter = _FixedAdapter()
+
+    report = mod.embed_collection(
+        "kb",
+        model_id="new-model",
+        embedding_config=EmbeddingModelConfig(
+            id="new-model", model_name="stub", dimension=2
+        ),
+        embedding_adapter=adapter,
+        cfg=_config(),
+        dry_run=False,
+        source="old-model",
+    )
+
+    assert report.collection_skip == mod.SKIP_SOURCE_UNPINNED
+    assert report.failures and adapter.calls == []
+
+
+def test_a_dry_run_pins_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_collection()
+    _install_source_stub(monkeypatch)
+    calls: List[str] = []
+    monkeypatch.setattr(mod, "pin_source_binding", calls.append)
+
+    mod.embed_collection(
+        "kb",
+        model_id="new-model",
+        embedding_config=EmbeddingModelConfig(
+            id="new-model", model_name="stub", dimension=2
+        ),
+        embedding_adapter=_FixedAdapter(),
+        cfg=_config(),
+        dry_run=True,
+        source="old-model",
+    )
+
+    assert calls == []
+
+
+def test_a_refused_collection_fails_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    refused = mod.CollectionReport(name="kb")
+    mod._refuse(refused, mod.SKIP_LEGACY_SHADOWED, "would shadow")
+    report = mod.EmbedReport(model_id="m", dry_run=False, collections=[refused])
+
+    assert report.failed
+
+
+def test_a_pin_that_could_not_be_stored_refuses_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    conn = _inference_only_collection(monkeypatch)
+
+    async def _fail(*args: Any, **kwargs: Any) -> bool:
+        raise OSError("metadata store unavailable")
+
+    monkeypatch.setattr(cm.collection_manager, "update_collection_fields", _fail)
+
+    report = _embed_into_a_target()
+
+    assert report.collection_skip == mod.SKIP_SOURCE_UNPINNED
+    assert report.chunks_embedded == 0
+    assert "embeddings_a_target" not in scope.table_names(conn)

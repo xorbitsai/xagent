@@ -1625,6 +1625,31 @@ def resolve_effective_embedding_model_read_only(
         return None
 
 
+def pin_inferred_embedding_binding(collection_name: str) -> Optional[str]:
+    """Persist the binding search would infer for an inference-only collection.
+
+    The same write search makes on its first query, without the access mark.
+    Returns the stored binding afterwards, or ``None`` when the collection
+    already resolves through a binding or its ingestion config. Raises
+    ``ValueError`` when nothing could be inferred or stored.
+    """
+    info = get_collection_sync(collection_name)
+    if info.is_initialized and _normalize_model_id(info.embedding_model_id):
+        return None
+    config = info.ingestion_config
+    if config is not None and _normalize_model_id(config.embedding_model_id):
+        return None
+    _effective_model_from_info(collection_name, info, None, persist=True)
+    stored = _normalize_model_id(
+        get_collection_sync(collection_name).embedding_model_id
+    )
+    if not stored:
+        raise ValueError(
+            f"Collection '{collection_name}': the inferred binding was not stored"
+        )
+    return stored
+
+
 def _effective_model_from_info(
     collection_name: str,
     collection_info: Any,

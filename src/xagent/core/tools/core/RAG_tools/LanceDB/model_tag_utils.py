@@ -10,6 +10,7 @@ __all__ = [
     "written_embeddings_table_name",
     "embeddings_table_candidates",
     "legacy_embeddings_table_name",
+    "searchable_embeddings_table_names",
 ]
 
 _INVALID_CHARS: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
@@ -67,3 +68,10 @@ def legacy_embeddings_table_name(model_tag: str) -> Optional[str]:
 def embeddings_table_candidates(model_name: str) -> list[str]:
     """Candidate tables: the writer's spelling first, de-duplicated."""
     return [f"embeddings_{tag}" for tag in model_tag_candidates(model_name)]
+
+
+def searchable_embeddings_table_names(model_tag: str) -> list[str]:
+    """Every table search may open for a model, in the order it tries them."""
+    names = embeddings_table_candidates(model_tag)
+    legacy = legacy_embeddings_table_name(model_tag)
+    return list(dict.fromkeys(names + ([legacy] if legacy else [])))

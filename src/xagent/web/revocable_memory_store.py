@@ -26,7 +26,7 @@ the wrappers (``get_store_info`` reporting ``store_type``) go through
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Protocol
+from typing import Any, List, Mapping, Optional, Protocol
 
 from ..core.memory.access_scope import MemoryAccessScope
 from ..core.memory.base import MemoryStore
@@ -148,6 +148,12 @@ class RevocableMemoryStore(MemoryStore):
 
     def list_scope_dimension_values(self, dim_key: str) -> set[str]:
         return self._live().list_scope_dimension_values(dim_key)
+
+    def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
+        return self._live().delete_for_scope(owner_user_id, dims)
+
+    def delete_current_scope(self) -> int:
+        return self._live().delete_current_scope()
 
 
 def unwrap_memory_store(store: Any) -> Any:

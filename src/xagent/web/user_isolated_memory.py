@@ -1,7 +1,7 @@
 """User-isolated memory store for web application."""
 
 import contextvars
-from typing import Any, List, Optional
+from typing import Any, List, Mapping, Optional
 
 from xagent.core.execution_scope import (
     MEMORY_DIMENSION_METADATA_PREFIX,
@@ -11,7 +11,7 @@ from xagent.core.execution_scope import (
     metadata_carries_scope_dimensions,
 )
 from xagent.core.memory.access_scope import MemoryAccessScope
-from xagent.core.memory.base import MemoryStore
+from xagent.core.memory.base import MemoryScopeTooBroadError, MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
@@ -327,6 +327,48 @@ class UserIsolatedMemoryStore(MemoryStore):
         tenant's notes.
         """
         return self._base_store.delete_by_scope_dimension(dim_key, value)
+
+    def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
+        """Bulk-delete ``owner_user_id``'s notes carrying every dimension in ``dims``.
+
+        Control-plane erasure primitive (e.g. "forget everything in this
+        workspace"), delegated straight to the base store and deliberately
+        not gated by the ambient user/scope: the explicit owner + non-empty
+        dimension predicate is what bounds it. Trusted-caller-only, for the
+        same reason as ``delete_by_scope_dimension`` -- never feed it owner or
+        dimension values taken from agent or end-user input. Agent-facing code
+        uses ``delete_current_scope`` instead.
+        """
+        return self._base_store.delete_for_scope(owner_user_id, dims)
+
+    def delete_current_scope(self) -> int:
+        """Delete every note in the current owner + execution scope.
+
+        The deleted set is exactly the notes the by-id ``delete`` could reach
+        from this scope, never wider: the current owner and *every* current
+        memory dimension are all required (``_scope_permits`` semantics). It
+        refuses with ``MemoryScopeTooBroadError`` -- and never falls back to
+        ``clear()`` -- when either is missing:
+
+        - no owner: the by-id path is ungated, so there is nothing to bound
+          the delete to;
+        - no memory dimensions: the owner may be shared by many principals
+          that are only told apart by their dimensions (one machine owner per
+          Slack workspace hosting every member), and a dimension-less
+          ``strict_memory_isolation`` scope cannot be expressed as an
+          ``owner + dimensions`` predicate at all.
+
+        Returns:
+            int: Number of notes deleted.
+        """
+        owner_user_id = self._get_current_user_id()
+        scope = self._get_memory_scope()
+        dims = dict(scope.memory_dimensions) if scope is not None else {}
+        if owner_user_id is None or not dims:
+            raise MemoryScopeTooBroadError(
+                "the current memory scope has no owner or no scope dimensions"
+            )
+        return self._base_store.delete_for_scope(owner_user_id, dims)
 
     def list_scope_dimension_values(self, dim_key: str) -> set[str]:
         """Distinct stamped values for one scope dimension, store-wide.

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable, List, Optional, Union
+from datetime import timedelta
+from typing import Any, Callable, List, Mapping, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -16,8 +17,8 @@ from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from ..utils.lancedb_sql import sql_string_literal
-from .base import MemoryStore
+from ..utils.lancedb_sql import sql_and, sql_string_literal
+from .base import MemoryStore, validate_scope_delete
 from .core import MemoryNote, MemoryResponse
 from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
 from .schema_migration import (
@@ -43,6 +44,11 @@ from .vector_compatibility import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default age past which ``compact()`` prunes superseded table versions. Long
+# enough that no in-flight memory operation (each opens the table fresh) can
+# still be reading or committing against a pruned version; see ``compact()``.
+DEFAULT_COMPACT_VERSION_RETENTION = timedelta(minutes=10)
 
 
 class LanceDBMemoryStore(MemoryStore):
@@ -840,6 +846,94 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to delete memories by scope dimension: {str(e)}",
                 metadata={"deleted_count": 0},
             )
+        finally:
+            _safe_close_table(table)
+
+    def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
+        """Bulk-delete the owner's notes carrying every dimension in ``dims``.
+
+        One predicate delete: ``user_id = owner`` AND one
+        ``array_contains(scope_dims, 'key=value')`` term per dimension, the
+        same column predicates a scoped search pushes into its prefilter, so
+        the deleted set is exactly the set that scope can read. See the base
+        class for the contract.
+
+        The returned count comes from a ``count_rows`` on the same predicate
+        just before the delete (LanceDB's ``delete()`` reports only the new
+        table version), so it is best-effort under concurrent writers. Unlike
+        ``delete_by_scope_dimension`` a backend failure raises: an erasure
+        request must never be reported as done when it was not.
+
+        Deleted rows stay readable in older table versions until
+        ``compact()`` prunes them.
+        """
+        # Validate before any SQL is built: the owner is interpolated as a
+        # bare integer, which is only safe once it is known to be an ``int``.
+        validated = validate_scope_delete(owner_user_id, dims)
+        where = sql_and(
+            [
+                f"{USER_ID_COLUMN} = {owner_user_id}",
+                *(scope_dim_where_term(key, value) for key, value in validated.items()),
+            ]
+        )
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            count = int(table.count_rows(where))
+            if count:
+                table.delete(where)
+            return count
+        finally:
+            _safe_close_table(table)
+
+    def compact(
+        self,
+        cleanup_older_than: timedelta = DEFAULT_COMPACT_VERSION_RETENTION,
+    ) -> None:
+        """Physically remove deleted rows from the memories table's files.
+
+        A LanceDB delete only masks rows: their text, metadata and vectors stay
+        in the data files of the current version (behind a deletion file) and of
+        every older version, which remain readable by version checkout.
+        ``optimize()`` alone does not fix this: it only rewrites a fragment once
+        more than 10% of its rows are deleted or it can merge it with a
+        neighbouring small fragment, so a few deletes in one large compacted
+        fragment survive any number of plain optimizations. This therefore runs
+        two steps:
+
+        1. Rewrite every live row (a no-op ``update`` over the whole table), so
+           no live fragment still holds a soft-deleted row. Cost is O(table):
+           it rewrites all live data, vectors included.
+        2. ``optimize(cleanup_older_than=...)``: merge the rewritten fragments
+           and prune every version older than ``cleanup_older_than`` together
+           with the data files only those versions reference.
+
+        Physical removal guarantee: a row deleted before one ``compact()``
+        starts is gone from disk once every version older than that call's
+        rewrite is pruned -- by the same call when ``cleanup_older_than`` is
+        zero, otherwise by a later ``compact()`` started more than
+        ``cleanup_older_than`` after the first one returned. A host running
+        this periodically, with an interval longer than
+        ``cleanup_older_than``, erases a deleted row within two intervals.
+
+        Concurrency: explicit host call only, never on a request path, and
+        from at most one scheduler at a time (two concurrent compactions
+        conflict and one raises). Concurrent ordinary writers are safe as long
+        as no operation outlives ``cleanup_older_than``: LanceDB rebases a
+        commit whose read version is still on disk, but pruning the version a
+        writer started from makes that writer's commit fail (observed as a
+        panic surfaced through the binding). Hence the default retention;
+        pass ``timedelta(0)`` only inside a write-quiet window. Under heavy
+        write contention the rewrite can exhaust LanceDB's commit retries and
+        raise; nothing is lost, so the caller simply retries later.
+        """
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            table.update(values_sql={"id": "id"})
+            table.optimize(cleanup_older_than=cleanup_older_than)
         finally:
             _safe_close_table(table)
 

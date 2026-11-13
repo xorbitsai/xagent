@@ -12,9 +12,9 @@ Provenance is descriptive only. It is never a namespace dimension: stores do
 not filter on it, it is not part of any scope fingerprint, and it cannot widen
 or narrow which memories a run may read.
 
-This module deliberately depends only on ``core.execution_scope`` so that
-light host-facing policy modules can import it without pulling in the agent
-runtime.
+Imports stay limited to ``core.execution_scope`` (plus the standard
+library) so that ``web.services.memory_policy`` does not have to import the
+agent runtime merely to validate a decision.
 """
 
 from __future__ import annotations
@@ -32,10 +32,14 @@ from ..execution_scope import validate_scope_component
 # is never mistaken for a namespace dimension by store filters.
 MEMORY_PROVENANCE_METADATA_KEY = "provenance"
 
-# Provenance values are identifiers (channel ids, kinds, task ids), never
-# prose: no whitespace and a bounded length structurally keep conversation
-# text out of a note that outlives its conversation (#2753).
-_PROVENANCE_VALUE_RE = re.compile(r"\S{1,256}")
+# Provenance values must look like ASCII identifiers (Slack ``C…``/``D…``/
+# ``G…`` ids, Teams ``19:…@thread.tacv2`` / ``a:1…`` ids, Feishu ``oc_…``
+# ids, numeric task ids). This is defense in depth against a host bug that
+# passes conversation text: it rejects whitespace, non-ASCII scripts (so
+# spaceless CJK sentences fail) and punctuation typical of prose, but it
+# cannot prove a value is not content -- the host remains responsible for
+# passing identifiers only (#2753).
+_PROVENANCE_VALUE_RE = re.compile(r"[A-Za-z0-9._:@/=+-]{1,256}")
 
 MemoryProvenance: TypeAlias = Mapping[str, str]
 """Non-content identifiers describing where a memory was learned, e.g.
@@ -46,10 +50,12 @@ def validate_memory_provenance(provenance: MemoryProvenance) -> MemoryProvenance
     """Validate host provenance and return an immutable copy.
 
     Keys follow the execution-scope component grammar
-    (``[a-zA-Z0-9_-]{1,63}``); values must be whitespace-free strings of at
-    most 256 characters. The value grammar is what enforces the "identifiers,
-    never conversation text" contract: a sentence cannot pass it. An empty
-    mapping is rejected too -- a host with nothing to record passes ``None``.
+    (``[a-zA-Z0-9_-]{1,63}``); values must match the ASCII identifier grammar
+    ``[A-Za-z0-9._:@/=+-]{1,256}``. The value grammar is defense in depth: it
+    catches a host bug that passes free text (whitespace, non-ASCII scripts,
+    prose punctuation), but an identifier-shaped string can still be content,
+    so hosts must pass identifiers only. An empty mapping is rejected too -- a
+    host with nothing to record passes ``None``.
 
     Raises:
         TypeError: ``provenance`` is not a mapping, is empty, or a value is
@@ -66,8 +72,8 @@ def validate_memory_provenance(provenance: MemoryProvenance) -> MemoryProvenance
             raise TypeError(f"memory provenance value for {key!r} must be a string")
         if not _PROVENANCE_VALUE_RE.fullmatch(value):
             raise ValueError(
-                f"memory provenance value for {key!r} must be a whitespace-free "
-                "identifier of at most 256 characters"
+                f"memory provenance value for {key!r} must be an ASCII "
+                "identifier matching [A-Za-z0-9._:@/=+-]{1,256}"
             )
         validated[key] = value
     return MappingProxyType(validated)

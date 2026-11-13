@@ -382,7 +382,7 @@ def _compose_memory_binding(
     policy_scope: MemoryAccessScope | None,
     enabled: bool,
     availability_reason: str | None,
-    provenance: MemoryProvenance | None = None,
+    provenance: MemoryProvenance | None,
 ) -> AgentServiceMemoryPolicy:
     """Combine backend selection with the legacy eligibility authority.
 

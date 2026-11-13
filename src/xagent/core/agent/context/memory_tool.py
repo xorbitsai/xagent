@@ -84,10 +84,11 @@ class StoreMemoryTool:
     """Execution-scoped ``store_memory`` tool bound to a memory store.
 
     ``provenance`` is an optional host mapping, already validated by
-    ``core.memory.provenance.validate_memory_provenance``, that is copied into
-    every stored note's metadata under ``MEMORY_PROVENANCE_METADATA_KEY``. It is fixed for the
-    tool's lifetime because a tool instance never outlives the run (and so
-    the task/channel) it was built for. Without it the stored metadata is
+    ``core.memory.provenance.validate_memory_provenance``, that is copied
+    into every stored note's metadata under
+    ``MEMORY_PROVENANCE_METADATA_KEY``. It is fixed for the tool's lifetime
+    because a tool instance never outlives the run (and so the task/channel)
+    it was built for. Without it the stored metadata is
     exactly ``{kind, source}``, as before provenance existed.
     """
 
@@ -218,7 +219,7 @@ class StoreMemoryTool:
     def _add(self, content: str, kind: str) -> str | None:
         # No request text here: it is conversation content, and a note
         # outlives the conversation it came from (#2753). Provenance carries
-        # identifiers only (enforced by ``validate_memory_provenance``).
+        # identifiers only (grammar-checked by ``validate_memory_provenance``).
         metadata: dict[str, Any] = {
             "kind": kind,
             "source": STORE_MEMORY_TOOL_NAME,

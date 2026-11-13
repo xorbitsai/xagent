@@ -20,10 +20,23 @@ def test_validate_memory_provenance_returns_frozen_copy() -> None:
     assert validated["channel_id"] == "D123ABC"
 
 
-def test_validate_memory_provenance_accepts_non_slack_identifiers() -> None:
-    teams_id = "19:abcDEF0123@thread.tacv2"
-    assert validate_memory_provenance({"channel_id": teams_id})["channel_id"] == (
-        teams_id
+@pytest.mark.parametrize(
+    "identifier",
+    [
+        "C0123ABCD",  # Slack public channel
+        "D0123ABCD",  # Slack DM
+        "G0123ABCD",  # Slack group DM / private channel
+        "19:abcDEF0123@thread.tacv2",  # Teams channel conversation
+        "a:1Xyz-AbC_dEf+gh/ij=",  # Teams personal conversation
+        "oc_5ad11d72b830411d72b836c20",  # Feishu chat
+        "42",  # task id
+    ],
+)
+def test_validate_memory_provenance_accepts_platform_identifiers(
+    identifier: str,
+) -> None:
+    assert validate_memory_provenance({"channel_id": identifier})["channel_id"] == (
+        identifier
     )
 
 
@@ -33,6 +46,10 @@ def test_validate_memory_provenance_accepts_non_slack_identifiers() -> None:
         # Conversation text can never pass the identifier grammar (#2753).
         {"channel_id": "please remember my salary is 100k"},
         {"note": "line\nbreak"},
+        # Spaceless prose: non-ASCII scripts and prose punctuation fail too.
+        {"channel_id": "我的银行卡密码是123456请帮我记住"},
+        {"channel_id": "remember_this,it's_my_pin!"},
+        {"channel_id": "café"},
         {"channel_id": ""},
         {"channel_id": "x" * 257},
         {"bad key": "C1"},

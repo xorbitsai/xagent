@@ -208,6 +208,7 @@ def test_compose_memory_binding_preserves_matching_scope_authority() -> None:
         policy_scope=scope,
         enabled=True,
         availability_reason=None,
+        provenance=None,
     )
 
     assert policy.memory is binding.store
@@ -231,6 +232,7 @@ def test_compose_memory_binding_binds_policy_scope_when_binding_has_none() -> No
         policy_scope=scope,
         enabled=True,
         availability_reason=None,
+        provenance=None,
     )
 
     assert policy.memory is not binding.store
@@ -257,6 +259,7 @@ def test_compose_memory_binding_rejects_conflicting_scope_authorities() -> None:
         ),
         enabled=True,
         availability_reason=None,
+        provenance=None,
     )
 
     assert policy.memory_enabled is False

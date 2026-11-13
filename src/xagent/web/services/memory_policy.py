@@ -42,10 +42,16 @@ class MemoryPolicyDecision:
     this task are learned (e.g. ``{"channel_kind": "dm", "channel_id": "D1"}``).
     The ``store_memory`` tool copies it into each new note's metadata under
     ``"provenance"``; see ``core.memory.provenance``. It is validated and
-    frozen on construction, so a value that could carry conversation text
-    fails the resolver (and therefore memory) closed. It is descriptive only:
-    it never affects which memories the task may read, and requires enabled,
-    available memory just like ``memory_access_scope``.
+    frozen on construction: a value outside the ASCII identifier grammar fails
+    the resolver (and therefore memory) closed. That grammar is defense in
+    depth, not proof a value is not content; hosts must pass identifiers
+    only. It is descriptive only and never affects which memories the task
+    may read.
+
+    Like ``memory_access_scope``, it requires enabled, available memory:
+    hosts must leave ``memory_provenance`` unset (``None``) whenever they
+    return ``enabled=False`` or ``available=False``, otherwise the decision
+    is rejected and memory fails closed for the task.
     """
 
     enabled: bool

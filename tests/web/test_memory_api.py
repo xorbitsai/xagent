@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import Mock
 from urllib.parse import quote
@@ -366,8 +366,8 @@ class TestMemoryListEndpoint:
     def test_list_and_get_surface_provenance_and_utc_timestamp(
         self, client, mock_memory_store, auth_headers
     ):
-        """Provenance lives in metadata and is returned verbatim; aware UTC
-        timestamps serialize with their offset next to naive legacy ones."""
+        """Provenance lives in metadata and is returned verbatim; every
+        timestamp, including a naive legacy one, is serialized as aware UTC."""
         provenance = {"channel_kind": "dm", "channel_id": "D123", "task_id": "9"}
         aware = MemoryNote(
             id=MEMORY_ID_1,
@@ -395,10 +395,15 @@ class TestMemoryListEndpoint:
 
         first, second = listed["memories"]
         assert first["metadata"]["provenance"] == provenance
-        assert datetime.fromisoformat(first["timestamp"]).utcoffset() is not None
-        assert datetime.fromisoformat(second["timestamp"]).tzinfo is None
+        # Both the aware row and the naive legacy row are emitted as aware
+        # UTC, so browsers never reinterpret a legacy row in viewer-local time.
+        assert datetime.fromisoformat(first["timestamp"]) == aware.timestamp
+        legacy_utc = datetime.fromisoformat(second["timestamp"])
+        assert legacy_utc.utcoffset() == timedelta(0)
+        assert legacy_utc == legacy.timestamp.astimezone(timezone.utc)
         assert fetched.status_code == 200
         assert fetched.json()["metadata"]["provenance"] == provenance
+        assert datetime.fromisoformat(fetched.json()["timestamp"]) == (aware.timestamp)
 
     def test_list_memories_with_category_filter(
         self, client, mock_memory_store, auth_headers

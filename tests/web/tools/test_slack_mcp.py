@@ -222,8 +222,18 @@ def test_list_channels_returns_flat_list(monkeypatch):
                 {
                     "ok": True,
                     "channels": [
-                        {"id": "C1", "name": "general", "is_archived": False},
-                        {"id": "C2", "name": "incidents", "is_archived": False},
+                        {
+                            "id": "C1",
+                            "name": "general",
+                            "is_archived": False,
+                            "is_member": True,
+                        },
+                        {
+                            "id": "C2",
+                            "name": "incidents",
+                            "is_archived": False,
+                            "is_member": False,
+                        },
                     ],
                 }
             )
@@ -234,10 +244,67 @@ def test_list_channels_returns_flat_list(monkeypatch):
 
     assert result["status"] == "success"
     assert result["channels"] == [
-        {"id": "C1", "name": "general", "is_archived": False},
-        {"id": "C2", "name": "incidents", "is_archived": False},
+        {"id": "C1", "name": "general", "is_archived": False, "is_member": True},
+        {"id": "C2", "name": "incidents", "is_archived": False, "is_member": False},
     ]
     assert result["truncated"] is False
+
+
+def test_list_channels_reports_whether_the_bot_is_a_member(monkeypatch):
+    """A bot token reads only channels the bot is in, so the listing must say
+    which those are. Slack's own value passes through; a channel Slack sent
+    without the field is unknown (null), never "not a member", because a
+    wrong false would make the agent refuse a channel it can read."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "ok": True,
+                    "channels": [
+                        {"id": "C1", "name": "general", "is_member": True},
+                        {"id": "C2", "name": "random", "is_member": False},
+                        {"id": "C3", "name": "announcements"},
+                    ],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(slack.slack_list_channels())
+
+    assert {c["id"]: c["is_member"] for c in result["channels"]} == {
+        "C1": True,
+        "C2": False,
+        "C3": None,
+    }
+
+
+def test_list_channels_keeps_membership_when_filtering_by_name(monkeypatch):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "ok": True,
+                    "channels": [
+                        {"id": "C1", "name": "support-eu", "is_member": True},
+                        {"id": "C2", "name": "general", "is_member": True},
+                        {"id": "C3", "name": "support-us", "is_member": False},
+                    ],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(slack.slack_list_channels(name_contains="support"))
+
+    assert [(c["id"], c["is_member"]) for c in result["channels"]] == [
+        ("C1", True),
+        ("C3", False),
+    ]
 
 
 @pytest.mark.parametrize(("value", "serialized"), [(True, "true"), (False, "false")])
@@ -914,6 +981,15 @@ async def test_join_channel_is_discoverable_via_mcp_list_tools():
     assert "explicitly confirmed" in (tool.description or "")
 
 
+async def _tool_descriptions() -> dict[str, str]:
+    # Collapse the docstring line wrapping so the assertions pin phrases, not
+    # where a sentence happens to break across lines.
+    return {
+        t.name: " ".join((t.description or "").split())
+        for t in await slack.mcp.list_tools()
+    }
+
+
 async def test_read_tools_expose_channel_scope_rule_via_mcp_list_tools():
     """The read/list tools' docstrings are the only thing steering the agent
     away from sweeping every listed conversation: a broad request ("check my
@@ -921,12 +997,7 @@ async def test_read_tools_expose_channel_scope_rule_via_mcp_list_tools():
     selected ones, and a selection must exclude unselected conversations
     even when the bot can already read them. Pin the phrases the agent
     relies on so a docstring rewrite can't silently drop the rule."""
-    # Collapse the docstring line wrapping so the assertions pin phrases, not
-    # where a sentence happens to break across lines.
-    tools = {
-        t.name: " ".join((t.description or "").split())
-        for t in await slack.mcp.list_tools()
-    }
+    tools = await _tool_descriptions()
 
     # slack_get_channel_history carries the canonical rule; the other
     # conversation-reading tools point at it by name rather than repeating it.
@@ -952,6 +1023,79 @@ async def test_read_tools_expose_channel_scope_rule_via_mcp_list_tools():
     for name in ("slack_list_channels", "slack_list_direct_messages"):
         assert "discovery, not permission" in tools[name], name
     assert "does not put it in scope for reading" in tools["slack_join_channel"]
+
+
+async def test_read_tools_expose_membership_rule_via_mcp_list_tools():
+    """A bot token reads a public channel only while the bot is in it, and
+    nothing but these docstrings tells the agent to check slack_list_channels'
+    is_member before reading. Without the rule the agent reads one listed
+    channel after another and each fails with not_in_channel. Pin the phrases
+    it relies on, the way the scope rule is pinned above."""
+    tools = await _tool_descriptions()
+
+    canonical = tools["slack_get_channel_history"]
+    assert "this connector reads with a bot token" in canonical
+    assert "a bot can read a public channel only while it is a member" in canonical
+    assert "is_member false cannot be read yet" in canonical
+    # Only the message reads need membership; slack_get_channel_info stays
+    # usable for a channel the bot is not in.
+    assert (
+        "do not call slack_get_channel_history, slack_get_thread_replies or "
+        "slack_search_messages on it" in canonical
+    )
+    assert "An archived channel cannot be joined or invited into" in canonical
+    assert "`/invite @<this app's bot name>`" in canonical
+    # A listing taken before the user added the bot must not block the read.
+    assert "an earlier listing may be stale" in canonical
+    # Joining stays user-gated where the tool exists (#1663).
+    assert "call it only once the user agrees" in canonical
+    # The join offer comes first, so "instead" in it cannot read as offering
+    # to join an archived channel.
+    assert canonical.index("When slack_join_channel is available") < (
+        canonical.index("An archived channel cannot be joined")
+    )
+
+    assert "is_member" in tools["slack_list_channels"]
+    for name in (
+        "slack_list_channels",
+        "slack_get_thread_replies",
+        "slack_get_channel_info",
+        "slack_search_messages",
+    ):
+        assert "slack_get_channel_history's membership rule" in tools[name], name
+
+
+async def test_membership_rule_does_not_block_channel_info():
+    """The rule stops message reads only. Slack's conversations.info is not a
+    message read, so its docstring must say the rule does not block it rather
+    than point at a rule that names other tools."""
+    tools = await _tool_descriptions()
+
+    assert "membership rule does not block this call" in tools["slack_get_channel_info"]
+
+
+async def test_read_tools_mention_join_only_when_it_is_available():
+    """A server under a runtime policy drops slack_join_channel, so a read
+    tool's docstring that tells the agent to call it points at a tool the
+    agent may not have. Every mention must be the conditional one."""
+    tools = await _tool_descriptions()
+
+    read_tools = set(tools) - slack._WRITE_TOOL_NAMES
+    # Guard against a vacuous pass if the derivation ever yields too little.
+    assert {
+        "slack_list_channels",
+        "slack_list_direct_messages",
+        "slack_get_channel_history",
+        "slack_get_thread_replies",
+        "slack_get_channel_info",
+        "slack_search_messages",
+    } <= read_tools
+
+    for name in sorted(read_tools):
+        description = tools[name]
+        assert description.count("slack_join_channel") == description.count(
+            "When slack_join_channel is available"
+        ), name
 
 
 def test_join_channel_sends_expected_payload(monkeypatch):
@@ -1241,6 +1385,27 @@ def test_get_channel_history_reports_actionable_error_when_not_a_member(monkeypa
     assert result["status"] == "error"
     assert "slack_join_channel" in result["message"]
     assert mock_request.call_count == 1
+
+
+def test_get_channel_history_no_policy_not_a_member_message_is_unchanged(monkeypatch):
+    """Pins the exact no-policy advice text, so an edit made for the policy
+    variant cannot change it unnoticed."""
+    monkeypatch.delenv(slack._CHANNEL_ACCESS_POLICY_ENV_VAR, raising=False)
+    mock_request = Mock(
+        return_value=MockResponse({"ok": False, "error": "not_in_channel"})
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_get_channel_history("C0123456789"))
+
+    assert result["message"] == (
+        "not_in_channel: the bot cannot access this channel — because the "
+        "bot isn't a member of it. If the channel is genuinely there: ask the "
+        "user whether to add the bot to it; if they agree, call "
+        "slack_join_channel (only works for a public channel) — for a "
+        "private channel or DM, a member needs to run `/invite @<this app's "
+        "bot name>` instead."
+    )
 
 
 # (conversations.history's channel_not_found handling was flipped to

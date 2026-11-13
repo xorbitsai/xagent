@@ -46,12 +46,15 @@ describe("idle session policy", () => {
   it("parses the top-level idle_session object and treats an absent or malformed one as unsupported", () => {
     expect(parseIdleSession({ idle_session: idle() })).toEqual({
       enforced: true, sid: "sid-a", idleTimeoutSeconds: 1800, idleExpiresIn: 1734,
-      absoluteExpiresIn: null, activityMinIntervalSeconds: 60,
+      absoluteExpiresIn: null, activityMinIntervalSeconds: 60, serverTime: Date.parse("2026-11-13T10:00:00Z"),
     })
     // A legacy token while the switch is off has no server login yet.
     expect(parseIdleSession({ idle_session: idle({ enforced: false, sid: null }) })?.sid).toBeNull()
     expect(parseIdleSession({ access_token: "x" })).toBeNull()
     expect(parseIdleSession(null)).toBeNull()
+    // The server time only orders responses; an unreadable one is not a reason to drop the policy.
+    expect(parseIdleSession({ idle_session: idle({ server_time: "not a time" }) })?.serverTime).toBeNull()
+    expect(parseIdleSession({ idle_session: idle({ server_time: 1_700_000_000_000 }) })?.serverTime).toBe(1_700_000_000_000)
     expect(parseIdleSession({ idle_session: "on" })).toBeNull()
     expect(parseIdleSession({ data: { idle_session: idle() } })).toBeNull()
     for (const bad of [
@@ -156,13 +159,35 @@ describe("idle session state bound to one login", () => {
     expect(readCurrentIdleSession()).toBeNull()
   })
 
-  it("does not let a late response move the deadline back for the same server login", async () => {
-    const snapshot = await login({ idle_session: idle({ idle_expires_in: 1800 }) })
+  it("ignores a response the server produced before the stored one", async () => {
+    const snapshot = await login({ idle_session: idle({ idle_expires_in: 1800, server_time: "2026-11-13T10:00:30Z" }) })
     // A verify sent before the activity report arrives after it.
-    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 300 }) })?.idleExpiresIn).toBe(1800)
+    const late = idle({ idle_expires_in: 1770, server_time: "2026-11-13T10:00:00Z" })
+    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: late })?.idleExpiresIn).toBe(1800)
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
-    // A later deadline, or a change of switch state, is taken as is.
-    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 1790, enforced: false }) })?.enforced).toBe(false)
+  })
+
+  it.each([
+    // Stored at 10:00:30 (deadline 10:30:30). Each response arrives within a minute.
+    ["a newer response with a shorter threshold", "2026-11-13T10:01:00Z",
+      { idle_timeout_seconds: 900, idle_expires_in: 900, server_time: "2026-11-13T10:01:00Z" }],
+    // The client clock moved back 30 s after 40 s; the server deadline is unchanged.
+    ["a newer response after the client clock moved backwards", "2026-11-13T10:00:40Z",
+      { idle_expires_in: 1760, server_time: "2026-11-13T10:01:10Z" }],
+    ["a response without a server time", "2026-11-13T10:00:40Z",
+      { idle_expires_in: 1700, server_time: undefined }],
+    ["a change of switch state", "2026-11-13T10:00:40Z",
+      { enforced: false, idle_expires_in: 1700, server_time: "2026-11-13T10:00:00Z" }],
+  ])("takes %s as is", async (_, receivedAt, overrides) => {
+    vi.useFakeTimers({ now: new Date("2026-11-13T10:00:30Z") })
+    try {
+      const snapshot = await login({ idle_session: idle({ idle_expires_in: 1800, server_time: "2026-11-13T10:00:30Z" }) })
+      vi.setSystemTime(new Date(receivedAt))
+      const next = idle(overrides)
+      expect(recordIdleSessionIfCurrent(snapshot, { idle_session: next })?.idleExpiresIn).toBe(next.idle_expires_in)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("does not hand the stored idle state to a different browser login", async () => {

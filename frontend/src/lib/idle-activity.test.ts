@@ -7,7 +7,7 @@ function record(overrides: Partial<IdleSessionRecord> = {}): IdleSessionRecord {
   return {
     schemaVersion: 1, sessionId: "browser-login", enforced: true, sid: "sid-a",
     idleTimeoutSeconds: 1800, idleExpiresIn: 1700, absoluteExpiresIn: null, activityMinIntervalSeconds: 60,
-    observedAt: Date.now(), lastReportAt: null, ...overrides,
+    observedAt: Date.now(), lastReportAt: null, serverTime: null, ...overrides,
   }
 }
 
@@ -125,7 +125,8 @@ describe("idle activity reporting", () => {
     const { reporter, fire } = setup(record(), { report })
     fire("keydown")
     await vi.advanceTimersByTimeAsync(40 * 60_000)
-    expect(report.mock.calls.length).toBeLessThanOrEqual(2)
+    // The first attempt and one retry within the interval; then the input is stale.
+    expect(report).toHaveBeenCalledTimes(2)
     reporter.stop()
   })
 

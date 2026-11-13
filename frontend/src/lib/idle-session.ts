@@ -27,6 +27,8 @@ export interface IdleSessionPolicy {
   idleExpiresIn: number
   absoluteExpiresIn: number | null
   activityMinIntervalSeconds: number
+  /** Server clock when the response was produced (ms), used only to order responses. */
+  serverTime: number | null
 }
 
 export interface IdleSessionRecord extends IdleSessionPolicy {
@@ -51,6 +53,13 @@ function isTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
 }
 
+function parseServerTime(value: unknown): number | null {
+  if (typeof value === "number") return isTimestamp(value) ? value : null
+  if (typeof value !== "string") return null
+  const parsed = Date.parse(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
 function parsePolicy(value: unknown): IdleSessionPolicy | null {
   if (typeof value !== "object" || value === null) return null
   const data = value as Record<string, unknown>
@@ -68,6 +77,7 @@ function parsePolicy(value: unknown): IdleSessionPolicy | null {
     idleExpiresIn: data.idle_expires_in,
     absoluteExpiresIn: absolute,
     activityMinIntervalSeconds: data.activity_min_interval_seconds,
+    serverTime: parseServerTime(data.server_time),
   }
 }
 
@@ -92,7 +102,7 @@ function parseRecord(raw: string | null): IdleSessionRecord | null {
     const policy = parsePolicy({
       enforced: data.enforced, sid: data.sid, idle_timeout_seconds: data.idleTimeoutSeconds,
       idle_expires_in: data.idleExpiresIn, absolute_expires_in: data.absoluteExpiresIn,
-      activity_min_interval_seconds: data.activityMinIntervalSeconds,
+      activity_min_interval_seconds: data.activityMinIntervalSeconds, server_time: data.serverTime,
     })
     if (!policy) return null
     return { ...policy, schemaVersion: IDLE_SESSION_SCHEMA_VERSION, sessionId: data.sessionId, observedAt: data.observedAt, lastReportAt: data.lastReportAt ?? null }
@@ -112,7 +122,7 @@ export function readIdleSessionRecord(storage: Storage, sessionId: string | null
  */
 export function writeIdleSessionRecord(storage: Storage, sessionId: string, policy: IdleSessionPolicy, now = Date.now()): IdleSessionRecord {
   const previous = readIdleSessionRecord(storage, sessionId)
-  if (previous && isOutOfOrder(previous, policy, now)) return previous
+  if (previous && isOutOfOrder(previous, policy)) return previous
   const record: IdleSessionRecord = {
     ...policy,
     schemaVersion: IDLE_SESSION_SCHEMA_VERSION,
@@ -124,21 +134,17 @@ export function writeIdleSessionRecord(storage: Storage, sessionId: string, poli
   return record
 }
 
-/** Window in which two responses for the same login may arrive out of order. */
-const OUT_OF_ORDER_WINDOW_MS = 60_000
-
 /**
- * The server deadline of one login only moves forward (activity) until it
- * expires (a 401, not a policy). A response that arrives shortly after a newer
- * one and implies an earlier deadline was produced before it, so it is ignored.
- * Outside that short window, for example after a clock change, the newest
- * response wins.
+ * Responses for one login can arrive out of order (a verify sent before an
+ * activity report may land after it). One that the server produced earlier
+ * than the stored one, and that implies an earlier deadline, is stale and is
+ * ignored. Ordering uses the server's clock, never the browser's; without a
+ * server time the newest arrival wins.
  */
-function isOutOfOrder(previous: IdleSessionRecord, policy: IdleSessionPolicy, now: number): boolean {
+function isOutOfOrder(previous: IdleSessionRecord, policy: IdleSessionPolicy): boolean {
   if (previous.sid !== policy.sid || previous.enforced !== policy.enforced) return false
-  const age = now - previous.observedAt
-  if (age < 0 || age > OUT_OF_ORDER_WINDOW_MS) return false
-  return now + policy.idleExpiresIn * 1000 < previous.observedAt + previous.idleExpiresIn * 1000 - 1_000
+  if (previous.serverTime === null || policy.serverTime === null || policy.serverTime >= previous.serverTime) return false
+  return policy.serverTime + policy.idleExpiresIn * 1000 < previous.serverTime + previous.idleExpiresIn * 1000
 }
 
 export function markIdleActivityReported(storage: Storage, sessionId: string, now = Date.now()): void {

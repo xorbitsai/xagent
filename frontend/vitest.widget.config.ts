@@ -297,6 +297,7 @@ export default defineConfig({
       "src/lib/auth-cache.test.ts",
       "src/lib/idle-session.test.ts",
       "src/lib/idle-activity.test.ts",
+      "src/lib/idle-session-client.test.ts",
       "src/ci/dependency-security.test.ts",
       "src/test-utils/widget-script.test.ts",
       "src/lib/websocket-auth.test.ts",

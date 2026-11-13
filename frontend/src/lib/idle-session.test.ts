@@ -32,6 +32,10 @@ async function login(body: Record<string, unknown> = {}): Promise<AuthSessionSna
   if (result.status !== "created") throw new Error("expected creation")
   return result.projection.snapshot
 }
+const emptySnapshot: AuthSessionSnapshot = {
+  sessionId: null, credentialRevision: null, profileRevision: null, userId: null,
+  accessToken: null, refreshToken: null, profileFingerprint: null,
+}
 const refreshBody = (body: Record<string, unknown> = {}) => ({
   success: true, access_token: "access-2", refresh_token: "refresh-2", expires_in: 7200, refresh_expires_in: 604800, ...body,
 })
@@ -47,6 +51,8 @@ describe("idle session policy", () => {
     // A legacy token while the switch is off has no server login yet.
     expect(parseIdleSession({ idle_session: idle({ enforced: false, sid: null }) })?.sid).toBeNull()
     expect(parseIdleSession({ access_token: "x" })).toBeNull()
+    expect(parseIdleSession(null)).toBeNull()
+    expect(parseIdleSession({ idle_session: "on" })).toBeNull()
     expect(parseIdleSession({ data: { idle_session: idle() } })).toBeNull()
     for (const bad of [
       { enforced: "true" }, { idle_timeout_seconds: 0 }, { idle_expires_in: -1 },
@@ -76,6 +82,8 @@ describe("idle session policy", () => {
     expect(readSessionEndNotice(localStorage, 5_001 + SESSION_END_NOTICE_TTL_MS)).toBeNull()
     localStorage.setItem(SESSION_END_NOTICE_KEY, "{bad")
     expect(readSessionEndNotice(localStorage)).toBeNull()
+    localStorage.setItem(SESSION_END_NOTICE_KEY, JSON.stringify({ reason: "something_else", at: Date.now() }))
+    expect(readSessionEndNotice(localStorage)).toBeNull()
   })
 })
 
@@ -101,6 +109,42 @@ describe("idle session state bound to one login", () => {
     await login()
     expect(readCurrentIdleSession()).toBeNull()
     expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
+  })
+
+  it("has no idle state without a current login", () => {
+    expect(readCurrentIdleSession()).toBeNull()
+    markIdleActivityReportedIfCurrent({ ...emptySnapshot })
+    expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
+  })
+
+  it.each([
+    ["not JSON", "{bad"],
+    ["not an object", "5"],
+    ["an unknown schema", { schemaVersion: 2 }],
+    ["an invalid observation time", { observedAt: -1 }],
+    ["an invalid report time", { lastReportAt: "now" }],
+    ["an invalid policy", { idleTimeoutSeconds: 0 }],
+  ])("treats a stored record with %s as absent", async (_, value) => {
+    const snapshot = await login({ idle_session: idle() })
+    const stored = JSON.parse(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)!)
+    localStorage.setItem(IDLE_SESSION_STORAGE_KEY, typeof value === "string" ? value : JSON.stringify({ ...stored, ...value }))
+    expect(readCurrentIdleSession()).toBeNull()
+    // Reporting against an unreadable record writes nothing.
+    markIdleActivityReportedIfCurrent(snapshot)
+    expect(readCurrentIdleSession()).toBeNull()
+  })
+
+  it("does not record a response without idle_session, and records best effort when storage refuses", async () => {
+    const snapshot = await login({ idle_session: idle() })
+    expect(recordIdleSessionIfCurrent(snapshot, { success: true })).toBeNull()
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => { throw new Error("quota") })
+    try {
+      expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 5 }) })).toBeNull()
+      expect(() => markIdleActivityReportedIfCurrent(snapshot)).not.toThrow()
+    } finally {
+      setItem.mockRestore()
+    }
+    expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1734)
   })
 
   it("does not hand the stored idle state to a different browser login", async () => {

@@ -14,6 +14,13 @@ export const IDLE_ACTIVITY_EVENTS = ["keydown", "pointerdown", "wheel"] as const
  * the server failed) is dropped: an overdue timer must never renew the login.
  */
 const STALE_INPUT_TOLERANCE_MS = 5_000
+/**
+ * The server measures its write interval between request arrivals. A report
+ * sent exactly one interval after the previous send can arrive a few
+ * milliseconds short of it and be dropped, so every other write would be lost.
+ * Waiting this much longer keeps one write per interval.
+ */
+const SERVER_INTERVAL_MARGIN_MS = 2_000
 
 export function isUserActivityEvent(event: Event): boolean {
   return event.isTrusted
@@ -79,7 +86,7 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     }
     // A report time in the future means the clock moved backwards; ignore it.
     const lastReportAt = record.lastReportAt !== null && record.lastReportAt <= now ? record.lastReportAt : 0
-    const wait = lastReportAt + intervalMs - now
+    const wait = lastReportAt === 0 ? 0 : lastReportAt + intervalMs + SERVER_INTERVAL_MARGIN_MS - now
     if (wait > 0) {
       timer = setTimeout(() => { timer = null; schedule() }, wait)
       return

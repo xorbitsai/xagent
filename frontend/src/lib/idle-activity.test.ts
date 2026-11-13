@@ -62,7 +62,9 @@ describe("idle activity reporting", () => {
     fire("keydown")
     await vi.advanceTimersByTimeAsync(0)
     for (let i = 0; i < 50; i += 1) fire("pointerdown")
-    await vi.advanceTimersByTimeAsync(59_000)
+    // The trailing report waits slightly past the server interval, so the
+    // server sees a full interval since its last write and does not drop it.
+    await vi.advanceTimersByTimeAsync(61_000)
     expect(report).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1_000)
     expect(report).toHaveBeenCalledTimes(2)
@@ -75,7 +77,7 @@ describe("idle activity reporting", () => {
   it("respects a report another tab of the same login sent recently", async () => {
     const { reporter, report, fire } = setup(record({ lastReportAt: Date.now() - 20_000 }))
     fire("keydown")
-    await vi.advanceTimersByTimeAsync(39_000)
+    await vi.advanceTimersByTimeAsync(41_000)
     expect(report).not.toHaveBeenCalled()
     await vi.advanceTimersByTimeAsync(1_000)
     expect(report).toHaveBeenCalledTimes(1)
@@ -101,7 +103,7 @@ describe("idle activity reporting", () => {
     fire("keydown")
     await vi.advanceTimersByTimeAsync(0)
     expect(report).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(59_000)
+    await vi.advanceTimersByTimeAsync(61_000)
     expect(report).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(1_000)
     expect(report).toHaveBeenCalledTimes(2)
@@ -142,7 +144,7 @@ describe("idle activity reporting", () => {
     const report = vi.fn(async () => { throw new Error("offline") })
     const { reporter, fire } = setup(record(), { report })
     fire("keydown")
-    await vi.advanceTimersByTimeAsync(60_000)
+    await vi.advanceTimersByTimeAsync(62_000)
     expect(report).toHaveBeenCalledTimes(2)
     reporter.stop()
   })

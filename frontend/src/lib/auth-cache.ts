@@ -1,3 +1,8 @@
+import {
+  IDLE_SESSION_STORAGE_KEY, SESSION_END_NOTICE_KEY, markIdleActivityReported, parseIdleSession,
+  readIdleSessionRecord, writeIdleSessionRecord, writeSessionEndNotice, type IdleSessionRecord,
+} from "@/lib/idle-session"
+
 export const AUTH_CACHE_KEY = "auth_cache"
 export const AUTH_LOGIN_INTENT_KEY = "auth_login_intent"
 export const AUTH_REVOKED_LOGIN_INTENT_KEY = "auth_revoked_login_intent"
@@ -85,6 +90,7 @@ const AUTH_OWNED_LOCAL_STORAGE_KEYS = [
   AUTH_REVOKED_LOGIN_INTENT_KEY,
   LEGACY_AUTH_TOKEN_KEY,
   LEGACY_AUTH_USER_KEY,
+  IDLE_SESSION_STORAGE_KEY,
 ] as const
 
 const EMPTY_SNAPSHOT: AuthSessionSnapshot = {
@@ -399,6 +405,8 @@ function writeNewSession(storage: AuthStorage, payload: AuthTokenPayload, markAu
     user: payload.user as AuthCacheUser, token: payload.access_token, refreshToken: payload.refresh_token || null,
     timestamp: now, expiresAt, refreshExpiresAt,
   }
+  // Idle state is bound to one login; a new lineage never inherits it.
+  storage.removeItem(IDLE_SESSION_STORAGE_KEY)
   persist(storage, cache, markAuthUpdated)
   return projectionFromCache(cache)
 }
@@ -498,7 +506,11 @@ export async function createAuthSession(value: unknown, intent?: AuthLoginIntent
     if (!intent || !hasAuthLoginIntent(storage, intent)) return { status: "superseded" as const }
     // Consume this one-shot capability before persisting its bearer response.
     replaceAuthLoginIntent(storage)
-    return { status: "created" as const, projection: writeNewSession(storage, payload, markAuthUpdated) }
+    const projection = writeNewSession(storage, payload, markAuthUpdated)
+    const idle = parseIdleSession(value)
+    if (idle) writeIdleSessionRecord(storage, projection.snapshot.sessionId!, idle)
+    storage.removeItem(SESSION_END_NOTICE_KEY)
+    return { status: "created" as const, projection }
   })
   return result.status === "completed" ? result.value : unavailable(result.reason)
 }
@@ -558,7 +570,10 @@ export async function commitAuthSessionRefresh(captured: AuthSessionSnapshot, va
     if (!isExactCredential(comparison)) return { status: comparison.status as "replaced" | "absent" | "expired" | "invalid" }
     const payload = parseRefreshCommitPayload(value)
     if (!payload) return { status: "invalid" as const }
-    return advanceExact(storage, comparison.projection!.cache, payload, markAuthUpdated)
+    const result = advanceExact(storage, comparison.projection!.cache, payload, markAuthUpdated)
+    const idle = parseIdleSession(value)
+    if (result.status === "updated" && idle) writeIdleSessionRecord(storage, result.projection.snapshot.sessionId!, idle)
+    return result
   })
   return result.status === "completed" ? result.value : unavailable(result.reason)
 }
@@ -596,9 +611,49 @@ export async function clearAuthSessionIfCurrent(captured: AuthSessionSnapshot): 
   const result = await withMutationLock(true, async ({ storage, markAuthUpdated }) => {
     const comparison = compareCredentialSession(captured)
     if (!isExactCredential(comparison)) return { status: "not_current" as const }
-    storage.removeItem(AUTH_CACHE_KEY); markAuthUpdated(); return { status: "cleared" as const }
+    storage.removeItem(AUTH_CACHE_KEY); storage.removeItem(IDLE_SESSION_STORAGE_KEY)
+    markAuthUpdated(); return { status: "cleared" as const }
   })
   return result.status === "completed" ? result.value : result
+}
+/**
+ * Ends the captured login after the server reported idle expiry. Only that
+ * exact login is cleared; a replacement login is left untouched and gets no
+ * sign-in-again notice.
+ */
+export async function endExpiredAuthSession(captured: AuthSessionSnapshot): Promise<AuthConditionalClearResult> {
+  const result = await withMutationLock(true, async ({ storage, markAuthUpdated }) => {
+    const comparison = compareCredentialSession(captured)
+    if (!isExactCredential(comparison)) return { status: "not_current" as const }
+    storage.removeItem(AUTH_CACHE_KEY); storage.removeItem(IDLE_SESSION_STORAGE_KEY)
+    writeSessionEndNotice(storage, "session_expired")
+    markAuthUpdated(); return { status: "cleared" as const }
+  })
+  return result.status === "completed" ? result.value : result
+}
+/** The stored idle policy of the login that is current in this browser, if the server supplied one. */
+export function readCurrentIdleSession(): IdleSessionRecord | null {
+  const storage = getAuthStorage()
+  const inspection = inspectAuthSession()
+  if (!storage || inspection.status !== "valid") return null
+  try { return readIdleSessionRecord(storage, inspection.projection.snapshot.sessionId) } catch { return null }
+}
+/**
+ * Records the `idle_session` of a verify or activity response, but only while
+ * the login that sent the request is still the current one.
+ */
+export function recordIdleSessionIfCurrent(captured: AuthSessionSnapshot, body: unknown): IdleSessionRecord | null {
+  const storage = getAuthStorage()
+  const idle = parseIdleSession(body)
+  if (!storage || !idle || !captured.sessionId) return null
+  if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return null
+  try { return writeIdleSessionRecord(storage, captured.sessionId, idle) } catch { return null }
+}
+export function markIdleActivityReportedIfCurrent(captured: AuthSessionSnapshot): void {
+  const storage = getAuthStorage()
+  if (!storage || !captured.sessionId) return
+  if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return
+  try { markIdleActivityReported(storage, captured.sessionId) } catch { /* best effort: the server rate-limits writes anyway */ }
 }
 /** Explicit logout is serialized when possible, and remains available without Web Locks. */
 export async function clearStoredAuth(): Promise<AuthLogoutResult> {
@@ -629,6 +684,7 @@ export async function clearStoredAuth(): Promise<AuthLogoutResult> {
     let credentialsCleared = true
     try {
       storage.removeItem(AUTH_CACHE_KEY)
+      storage.removeItem(IDLE_SESSION_STORAGE_KEY)
       markAuthUpdated()
     } catch {
       credentialsCleared = false

@@ -11,6 +11,7 @@ import {
   type AuthCacheUser, type AuthSessionProjection, type AuthSessionSnapshot,
   clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
   claimAuthLoginIntent, createAuthSession, inspectAuthSession, migrateLegacyAuthSession,
+  recordIdleSessionIfCurrent,
 } from "@/lib/auth-cache"
 
 type TeamRole = "admin" | "member" | null
@@ -167,6 +168,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const operation = ++operationRef.current
     try {
       const response = await apiRequest(`${getApiUrl()}/api/auth/verify`, { headers: { "X-Username": before.cache.user.username } })
+      if (response.ok) recordIdleSessionIfCurrent(captured, await response.clone().json().catch(() => null))
       const current = currentProjection()
       if (mountedRef.current && operation === operationRef.current) { setProjection(current); setLastCheck({ key, at: now }) }
       if (!current) return false

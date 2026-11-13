@@ -268,24 +268,29 @@ def test_policy_lists_an_allowed_channel_the_bot_is_not_in(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "read",
+    "read, slack_error",
     [
-        lambda: slack.slack_get_channel_history(ALLOWED),
-        lambda: slack.slack_get_thread_replies(ALLOWED, "1700000000.000100"),
-        lambda: slack.slack_get_channel_info(ALLOWED),
-        lambda: slack.slack_search_messages(ALLOWED, "deploy"),
+        (lambda: slack.slack_get_channel_history(ALLOWED), "not_in_channel"),
+        (
+            lambda: slack.slack_get_thread_replies(ALLOWED, "1700000000.000100"),
+            "not_in_channel",
+        ),
+        # Slack documents channel_not_found, not not_in_channel, for
+        # conversations.info.
+        (lambda: slack.slack_get_channel_info(ALLOWED), "channel_not_found"),
+        (lambda: slack.slack_search_messages(ALLOWED, "deploy"), "not_in_channel"),
     ],
     ids=["history", "thread_replies", "channel_info", "search"],
 )
 def test_not_a_member_error_under_a_policy_asks_for_invite_not_join(
-    monkeypatch, read
+    monkeypatch, read, slack_error
 ) -> None:
     # A policy server drops slack_join_channel at startup, so the error must
     # not send the agent to it; adding the bot is left to a channel member.
     _install_policy(monkeypatch)
     response = Mock(
         status_code=200,
-        json=Mock(return_value={"ok": False, "error": "not_in_channel"}),
+        json=Mock(return_value={"ok": False, "error": slack_error}),
         raise_for_status=Mock(),
     )
     monkeypatch.setattr(slack.requests, "request", Mock(return_value=response))

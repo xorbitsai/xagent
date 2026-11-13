@@ -1049,6 +1049,11 @@ async def test_read_tools_expose_membership_rule_via_mcp_list_tools():
     assert "an earlier listing may be stale" in canonical
     # Joining stays user-gated where the tool exists (#1663).
     assert "call it only once the user agrees" in canonical
+    # The join offer comes first, so "instead" in it cannot read as offering
+    # to join an archived channel.
+    assert canonical.index("When slack_join_channel is available") < (
+        canonical.index("An archived channel cannot be joined")
+    )
 
     assert "is_member" in tools["slack_list_channels"]
     for name in (
@@ -1060,20 +1065,33 @@ async def test_read_tools_expose_membership_rule_via_mcp_list_tools():
         assert "slack_get_channel_history's membership rule" in tools[name], name
 
 
+async def test_membership_rule_does_not_block_channel_info():
+    """The rule stops message reads only. Slack's conversations.info is not a
+    message read, so its docstring must say the rule does not block it rather
+    than point at a rule that names other tools."""
+    tools = await _tool_descriptions()
+
+    assert "membership rule does not block this call" in tools["slack_get_channel_info"]
+
+
 async def test_read_tools_mention_join_only_when_it_is_available():
     """A server under a runtime policy drops slack_join_channel, so a read
     tool's docstring that tells the agent to call it points at a tool the
     agent may not have. Every mention must be the conditional one."""
     tools = await _tool_descriptions()
 
-    for name in (
+    read_tools = set(tools) - slack._WRITE_TOOL_NAMES
+    # Guard against a vacuous pass if the derivation ever yields too little.
+    assert {
         "slack_list_channels",
         "slack_list_direct_messages",
         "slack_get_channel_history",
         "slack_get_thread_replies",
         "slack_get_channel_info",
         "slack_search_messages",
-    ):
+    } <= read_tools
+
+    for name in sorted(read_tools):
         description = tools[name]
         assert description.count("slack_join_channel") == description.count(
             "When slack_join_channel is available"
@@ -1367,6 +1385,27 @@ def test_get_channel_history_reports_actionable_error_when_not_a_member(monkeypa
     assert result["status"] == "error"
     assert "slack_join_channel" in result["message"]
     assert mock_request.call_count == 1
+
+
+def test_get_channel_history_no_policy_not_a_member_message_is_unchanged(monkeypatch):
+    """Pins the exact no-policy advice text, so an edit made for the policy
+    variant cannot change it unnoticed."""
+    monkeypatch.delenv(slack._CHANNEL_ACCESS_POLICY_ENV_VAR, raising=False)
+    mock_request = Mock(
+        return_value=MockResponse({"ok": False, "error": "not_in_channel"})
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_get_channel_history("C0123456789"))
+
+    assert result["message"] == (
+        "not_in_channel: the bot cannot access this channel — because the "
+        "bot isn't a member of it. If the channel is genuinely there: ask the "
+        "user whether to add the bot to it; if they agree, call "
+        "slack_join_channel (only works for a public channel) — for a "
+        "private channel or DM, a member needs to run `/invite @<this app's "
+        "bot name>` instead."
+    )
 
 
 # (conversations.history's channel_not_found handling was flipped to

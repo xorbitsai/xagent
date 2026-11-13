@@ -517,13 +517,15 @@ def _request_requiring_membership(
     json_data: dict[str, Any] | None = None,
     membership_already_proven: bool = False,
 ) -> dict[str, Any]:
-    """Call a Slack endpoint that requires the bot to already be a channel
-    member, and raise an actionable error if it isn't yet.
+    """Call a Slack endpoint that can fail because the bot is not a member of
+    the channel, and raise an actionable error if it does.
 
-    This covers conversations.history/replies/info (regardless of which
-    *:history scopes are granted), reactions.add/remove, and
-    files.completeUploadExternal — none of them work for a channel the bot
-    hasn't joined. chat.postMessage is the one exception for a *public*
+    conversations.history/replies (regardless of which *:history scopes are
+    granted), reactions.add/remove, and files.completeUploadExternal need
+    membership: none of them work for a channel the bot hasn't joined.
+    conversations.info is routed through here too, because a conversation
+    hidden from the bot fails it with the same codes (e.g.
+    channel_not_found). chat.postMessage is the one exception for a *public*
     channel (chat:write.public lets a bot post there without joining), but
     can still hit this for a private channel/DM, so slack_post_message uses
     this too.
@@ -848,9 +850,9 @@ def slack_get_channel_history(
     do not call slack_get_channel_history, slack_get_thread_replies or
     slack_search_messages on it — tell the user the bot has to be added
     first (a member of the channel runs `/invite @<this app's bot name>`).
-    An archived channel cannot be joined or invited into; say so instead.
     When slack_join_channel is available, you may instead offer to add the
-    bot with it, and call it only once the user agrees. If the user says the
+    bot with it, and call it only once the user agrees. An archived channel
+    cannot be joined or invited into; say so instead. If the user says the
     bot has since been added, list the channels again or read once: an
     earlier listing may be stale. For a conversation the listing does not
     cover (a private channel, a DM, an id passed directly, or a channel
@@ -963,8 +965,8 @@ def slack_get_channel_info(channel: str) -> str:
     """
     Get metadata for a channel, private channel, or DM — including its
     topic, purpose, member count, and archived/private flags.
-    If the bot isn't a member of the channel, see
-    slack_get_channel_history's membership rule.
+    slack_get_channel_history's membership rule does not block this call; if
+    it fails because the bot isn't a member, follow the error.
     """
     try:
         channel_id = _resolve_channel_id(channel)

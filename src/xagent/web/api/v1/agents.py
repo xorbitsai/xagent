@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, Path, Request
 
 from ...schemas.v1 import (
     RuntimeKeyResponse,
+    V1AgentConnectorsResponse,
+    V1AgentConnectorsUpdateRequest,
     V1AgentCreateRequest,
     V1AgentCreateResponse,
     V1AgentResponse,
@@ -14,11 +16,15 @@ from ...schemas.v1 import (
     V1AgentTemplateCreateRequest,
 )
 from ...services.agent_management import (
+    AgentConnectorsNotSharedError,
+    AgentConnectorsSnapshot,
     AgentCreateSpec,
     AgentManagementRuntime,
     AgentResponseSnapshot,
     AgentSummarySnapshot,
+    AgentToolsUnconfiguredError,
     DuplicateAgentNameError,
+    InvalidAgentConnectorsError,
     InvalidAgentModelConfigError,
     InvalidAgentSkillNamesError,
     InvalidKnowledgeBaseError,
@@ -262,3 +268,67 @@ async def set_agent_skills(
         skills=list(result.skills),
         unresolved_for_caller=list(result.unresolved_for_caller),
     )
+
+
+def _connectors_response(
+    agent_id: int, selection: AgentConnectorsSnapshot
+) -> V1AgentConnectorsResponse:
+    return V1AgentConnectorsResponse(
+        agent_id=agent_id,
+        connectors=list(selection.connectors),
+        all_connectors=selection.all_connectors,
+        unresolved=list(selection.unresolved),
+    )
+
+
+@router.get("/{agent_id}/connectors", response_model=V1AgentConnectorsResponse)
+async def get_agent_connectors(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentConnectorsResponse:
+    """Read the connectors of an agent the key holder can see."""
+    user, _key = authed
+    selection = await AgentManagementRuntime().get_agent_connectors(
+        user_id=int(user.id), agent_id=agent_id
+    )
+    if selection is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _connectors_response(agent_id, selection)
+
+
+@router.put("/{agent_id}/connectors", response_model=V1AgentConnectorsResponse)
+async def set_agent_connectors(
+    request: V1AgentConnectorsUpdateRequest,
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentConnectorsResponse:
+    """Replace the connectors of an agent the key holder can see."""
+    user, key = authed
+    try:
+        selection = await AgentManagementRuntime().set_agent_connectors(
+            user_id=int(user.id),
+            key_prefix=key.key_prefix,
+            agent_id=agent_id,
+            connectors=request.connectors,
+            all_connectors=request.all_connectors,
+        )
+    except AgentToolsUnconfiguredError:
+        raise V1ApiError(V1ErrorCode.AGENT_TOOLS_UNCONFIGURED, 409)
+    except InvalidAgentConnectorsError as e:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 400, str(e))
+    except AgentConnectorsNotSharedError as e:
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_NOT_SHARED,
+            400,
+            str(e),
+            details={"connectors": e.connectors},
+        )
+    if selection is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _connectors_response(agent_id, selection)

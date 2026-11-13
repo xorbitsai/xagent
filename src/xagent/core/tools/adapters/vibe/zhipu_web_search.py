@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
-from ...core.media_usage import record_web_search_usage
 from ...core.zhipu_web_search import ZhipuWebSearchCore
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -103,7 +102,6 @@ class ZhipuWebSearchTool(AbstractBaseTool):
             request_id=search_args.request_id,
             user_id=search_args.user_id,
         )
-        record_web_search_usage("platform/zhipu-web-search")
 
         results = ZhipuWebSearchCore.normalize_results(
             response, include_content=search_args.include_content

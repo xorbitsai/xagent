@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Mapping, Type
 
 from pydantic import BaseModel, Field
 
-from ...core.media_usage import record_web_search_usage
 from ...core.tavily_web_search import TavilyWebSearchCore
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -77,6 +76,5 @@ class TavilyWebSearchTool(AbstractBaseTool):
             max_results=search_args.num_results,
             include_content=search_args.include_content,
         )
-        record_web_search_usage("platform/tavily-search")
 
         return TavilyWebSearchResult(results=results).model_dump()

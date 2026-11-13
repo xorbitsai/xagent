@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from .media_usage import record_web_search_usage
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,6 +86,9 @@ class TavilyWebSearchCore:
                     )
 
                 response.raise_for_status()
+                # Tavily billed this request as soon as it answered 2xx, so
+                # record it before reading the body.
+                record_web_search_usage("tavily")
                 data = response.json()
 
                 logger.info("✅ Tavily API request successful")

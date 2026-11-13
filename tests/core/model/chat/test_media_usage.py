@@ -358,7 +358,7 @@ def test_web_search_and_composio_bill_in_requests() -> None:
     ("call_type", "model_id"),
     [
         # The plain string the search tools pass, and the member itself.
-        ("web_search", "platform/tavily-search"),
+        ("web_search", "platform/web-search-tavily"),
         (MediaCallType.COMPOSIO, "platform/composio"),
     ],
 )

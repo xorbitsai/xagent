@@ -1,10 +1,11 @@
-"""Best-effort media-usage recording for media generation tools.
+"""Best-effort usage recording for media generation and other metered calls.
 
 TTS/ASR/video/music/sound-effect models don't return a normalised usage
 payload the way image/chat models do, and their adapters are factory-only, so
 the natural metering point is the tool call site where the request params and
 result are both in scope. This helper wraps ``add_media_usage`` so a failure in
-accounting can never break the underlying media call.
+accounting can never break the underlying media call. Search providers use
+the same rule through the helper below.
 
 Metering invariants
 -------------------
@@ -249,14 +250,32 @@ def record_media_seconds(
     )
 
 
-def record_web_search_usage(model_id: str) -> None:
-    """Record one web search the search provider answered.
+# One platform identity per built-in search provider, keyed by the provider
+# name that ``XAGENT_WEB_SEARCH_PROVIDER`` accepts. Search keys belong to the
+# deployment, so every id is in the platform namespace and a deployment can
+# price each provider separately. A new provider adds one line here; nothing
+# else names a search id.
+WEB_SEARCH_MODEL_IDS: dict[str, str] = {
+    "zhipu": "platform/web-search-zhipu",
+    "tavily": "platform/web-search-tavily",
+    "exa": "platform/web-search-exa",
+    "google": "platform/web-search-google",
+}
 
-    Call it after the provider call returns: a search that raised -- a missing
-    key, a timeout, an HTTP error -- never reached the provider's bill, so it
-    records nothing. Every returned search is one ``requests``-billed call.
-    ``model_id`` is the provider's platform identity (``platform/<provider>``)
-    rather than a user-configured model, because the platform's own search key
-    pays for it.
+
+def record_web_search_usage(provider: str) -> None:
+    """Record one search the provider accepted with a 2xx answer.
+
+    Call it as soon as the provider's answer is known to be successful, before
+    the body is parsed and before any result page is fetched: the provider
+    bills the request whether or not the body turns out usable. A search that
+    raised -- a missing key, a timeout, an HTTP error -- never reached the
+    provider's bill, so it records nothing. ``provider`` is the name in
+    ``XAGENT_WEB_SEARCH_PROVIDER``; the platform's own search key pays, so the
+    row carries that provider's platform id rather than a user's model.
     """
+    model_id = WEB_SEARCH_MODEL_IDS.get(provider)
+    if model_id is None:
+        logger.error("Unknown web search provider %r; dropping the usage row", provider)
+        return
     record_media_usage(MediaCallType.WEB_SEARCH, 1, model_id=model_id)

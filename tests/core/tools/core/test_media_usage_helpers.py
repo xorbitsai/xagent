@@ -6,9 +6,11 @@ unusable if the same model sometimes reports "seconds" and sometimes
 "requests".
 """
 
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from xagent.core.model.chat import token_context
@@ -19,12 +21,10 @@ from xagent.core.model.chat.token_context import (
     aggregate_media_usage_by_model,
     get_token_usage,
 )
-from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
-from xagent.core.tools.adapters.vibe.tavily_web_search import TavilyWebSearchTool
-from xagent.core.tools.adapters.vibe.web_search import WebSearchTool
-from xagent.core.tools.adapters.vibe.zhipu_web_search import ZhipuWebSearchTool
+from xagent.core.tools.core import zhipu_web_search as zhipu_web_search_module
 from xagent.core.tools.core.exa_web_search import ExaWebSearchCore
 from xagent.core.tools.core.media_usage import (
+    WEB_SEARCH_MODEL_IDS,
     coerce_duration,
     record_media_seconds,
     record_media_usage,
@@ -302,86 +302,247 @@ def test_record_media_seconds_leaves_empty_call_types_to_the_primitive(empty) ->
         assert manager.get_usage().details == []
 
 
-# --- Web search: one row per search the provider answered ---------------------
+# --- Web search: one row per search the provider accepted ---------------------
 
-# Every registered search tool, the core class it calls and the identity its
-# rows carry. The platform's own search key pays the provider, so the identity
-# is the provider itself rather than a user-configured model.
-WEB_SEARCH_PROVIDERS = [
-    (TavilyWebSearchTool, TavilyWebSearchCore, "platform/tavily-search"),
-    (ZhipuWebSearchTool, ZhipuWebSearchCore, "platform/zhipu-web-search"),
-    (ExaWebSearchTool, ExaWebSearchCore, "platform/exa-search"),
-    (WebSearchTool, WebSearchCore, "platform/google-custom-search"),
-]
-WEB_SEARCH_PROVIDER_IDS = ["tavily", "zhipu", "exa", "google"]
+# Every provider's id lives in one map; the cores name the provider, never the
+# id. The platform's own search key pays the provider, so the identity is the
+# provider's platform id rather than a user-configured model.
+WEB_SEARCH_PROVIDERS = ["zhipu", "tavily", "exa", "google"]
 
 
-def _provider_answer(core_class: Any) -> Any:
-    """A success payload in the shape ``core_class.search`` really returns."""
-    if core_class is ZhipuWebSearchCore:
-        # Zhipu answers one response object, which the tool normalises itself.
-        return {"search_result": [{"title": "t", "link": "https://example.com"}]}
-    return [{"title": "t", "link": "https://example.com", "snippet": "s"}]
+class _ProviderAnswer:
+    """The ``httpx`` response shape the three HTTP cores read."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        payload: Any = None,
+        json_error: Exception | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self._json_error = json_error
+
+    def raise_for_status(self) -> None:
+        if self.status_code < 400:
+            return
+        request = httpx.Request("GET", "https://provider.example.test")
+        raise httpx.HTTPStatusError(
+            "provider error",
+            request=request,
+            response=httpx.Response(self.status_code, request=request),
+        )
+
+    def json(self) -> Any:
+        if self._json_error is not None:
+            raise self._json_error
+        return self._payload
 
 
-def test_record_web_search_usage_records_the_provider_identity() -> None:
+class _FakeAsyncClient:
+    """What ``create_public_async_client`` yields, with one fake ``post``."""
+
+    def __init__(self, answer: Any) -> None:
+        self._answer = answer
+
+    async def __aenter__(self) -> "_FakeAsyncClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def post(self, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(self._answer, BaseException):
+            raise self._answer
+        return self._answer
+
+
+def _answered(provider: str) -> Any:
+    """A 2xx answer in the shape that provider's core really reads."""
+    if provider == "zhipu":
+        return _ProviderAnswer(
+            200,
+            {"search_result": [{"title": "t", "link": "https://example.com"}]},
+        )
+    if provider == "exa":
+        return SimpleNamespace(
+            results=[
+                SimpleNamespace(
+                    title="t",
+                    url="https://example.com",
+                    highlights=None,
+                    text="",
+                    summary="",
+                )
+            ]
+        )
+    if provider == "google":
+        return _ProviderAnswer(
+            200,
+            {"items": [{"title": "t", "link": "https://example.com", "snippet": "s"}]},
+        )
+    return _ProviderAnswer(
+        200, {"results": [{"title": "t", "url": "https://example.com", "content": "s"}]}
+    )
+
+
+def _http_mock(answer: Any) -> AsyncMock:
+    if isinstance(answer, BaseException):
+        return AsyncMock(side_effect=answer)
+    return AsyncMock(return_value=answer)
+
+
+async def _search_once(
+    provider: str, answer: Any, *, include_content: bool = False
+) -> None:
+    """Run one real core search with the provider's transport faked.
+
+    ``answer`` is a response object, or an exception the transport raises.
+    """
+    if provider == "google":
+        with patch("httpx.AsyncClient.get", new=_http_mock(answer)):
+            await WebSearchCore(api_key="k", cse_id="c").search(
+                "q", include_content=include_content
+            )
+        return
+    if provider == "tavily":
+        with patch("httpx.AsyncClient.post", new=_http_mock(answer)):
+            await TavilyWebSearchCore(api_key="k").search("q")
+        return
+    if provider == "zhipu":
+        client = _FakeAsyncClient(answer)
+        with patch.object(
+            zhipu_web_search_module,
+            "create_public_async_client",
+            lambda **kwargs: client,
+        ):
+            await ZhipuWebSearchCore(api_key="k").search("q")
+        return
+    client = MagicMock()
+    client.headers = {}
+    if isinstance(answer, BaseException):
+        client.search.side_effect = answer
+        client.search_and_contents.side_effect = answer
+    else:
+        client.search.return_value = answer
+        client.search_and_contents.return_value = answer
+    with patch("exa_py.Exa", return_value=client):
+        await ExaWebSearchCore(api_key="k").search("q")
+
+
+@pytest.mark.parametrize(("provider", "model_id"), sorted(WEB_SEARCH_MODEL_IDS.items()))
+def test_each_provider_has_one_platform_id(provider: str, model_id: str) -> None:
+    assert model_id == f"platform/web-search-{provider}"
+
+
+@pytest.mark.parametrize(("provider", "model_id"), sorted(WEB_SEARCH_MODEL_IDS.items()))
+def test_record_web_search_usage_records_the_provider_id(
+    provider: str, model_id: str
+) -> None:
     with TokenContextManager() as manager:
-        record_web_search_usage("platform/exa-search")
+        record_web_search_usage(provider)
         details = manager.get_usage().details
 
     assert len(details) == 1
     assert details[0]["call_type"] == MediaCallType.WEB_SEARCH
     assert details[0]["unit"] == "requests"
     assert details[0]["quantity"] == 1.0
-    assert details[0]["model_id"] == "platform/exa-search"
+    assert details[0]["model_id"] == model_id
 
 
-@pytest.mark.parametrize(
-    ("tool_class", "core_class", "model_id"),
-    WEB_SEARCH_PROVIDERS,
-    ids=WEB_SEARCH_PROVIDER_IDS,
-)
-@pytest.mark.asyncio
-async def test_each_provider_search_records_exactly_one_row(
-    monkeypatch, tool_class, core_class, model_id
-) -> None:
-    monkeypatch.setattr(
-        core_class, "search", AsyncMock(return_value=_provider_answer(core_class))
-    )
-
+def test_an_unknown_web_search_provider_records_nothing() -> None:
     with TokenContextManager() as manager:
-        await tool_class().run_json_async({"query": "xagent"})
+        record_web_search_usage("not-a-provider")
+        details = manager.get_usage().details
+
+    assert details == []
+
+
+@pytest.mark.parametrize("provider", WEB_SEARCH_PROVIDERS)
+@pytest.mark.asyncio
+async def test_a_provider_answer_records_exactly_one_row(provider: str) -> None:
+    with TokenContextManager() as manager:
+        await _search_once(provider, _answered(provider))
         details = manager.get_usage().details
 
     assert len(details) == 1
     assert details[0]["call_type"] == "web_search"
     assert details[0]["unit"] == "requests"
     assert details[0]["quantity"] == 1.0
-    assert details[0]["model_id"] == model_id
+    assert details[0]["model_id"] == WEB_SEARCH_MODEL_IDS[provider]
 
 
-@pytest.mark.parametrize(
-    ("tool_class", "core_class", "model_id"),
-    WEB_SEARCH_PROVIDERS,
-    ids=WEB_SEARCH_PROVIDER_IDS,
-)
+def _provider_failures() -> list[Any]:
+    """One case per auth/rate/network failure, in each provider's terms."""
+    cases: list[Any] = []
+    for provider in WEB_SEARCH_PROVIDERS:
+        for status in (401, 403, 429):
+            answer: Any
+            if provider == "exa":
+                # The SDK reports these as its own exception, not a response.
+                answer = RuntimeError(f"Exa answered {status}")
+            else:
+                answer = _ProviderAnswer(status)
+            cases.append(pytest.param(provider, answer, id=f"{provider}-{status}"))
+        cases.append(
+            pytest.param(
+                provider, httpx.ConnectError("network down"), id=f"{provider}-network"
+            )
+        )
+    return cases
+
+
+@pytest.mark.parametrize(("provider", "answer"), _provider_failures())
 @pytest.mark.asyncio
-async def test_a_failed_search_records_nothing(
-    monkeypatch, tool_class, core_class, model_id
-) -> None:
-    # A missing key, a timeout or an HTTP error means the provider never billed
-    # the request, so there is no call to record. The tool still reports the
-    # failure to the model exactly as it did before metering existed.
-    monkeypatch.setattr(
-        core_class, "search", AsyncMock(side_effect=ValueError("search failed"))
-    )
-
+async def test_a_failed_search_records_nothing(provider: str, answer: Any) -> None:
+    # A missing key, a timeout, an auth failure or an HTTP error means the
+    # provider never billed the request, so there is no call to record. The
+    # search still reports the failure to the model exactly as before.
     with TokenContextManager() as manager:
-        with pytest.raises(ValueError, match="search failed"):
-            await tool_class().run_json_async({"query": "xagent"})
+        with pytest.raises(ValueError):
+            await _search_once(provider, answer)
         details = manager.get_usage().details
 
     assert details == []
+
+
+def _unreadable_answer(provider: str) -> Any:
+    """A 2xx whose body cannot be turned into results."""
+    if provider == "exa":
+        return SimpleNamespace(results=None)
+    return _ProviderAnswer(200, json_error=ValueError("unusable body"))
+
+
+@pytest.mark.parametrize("provider", WEB_SEARCH_PROVIDERS)
+@pytest.mark.asyncio
+async def test_a_2xx_with_an_unreadable_body_is_still_recorded(provider: str) -> None:
+    # The provider billed the request when it answered 2xx, so the row is
+    # written before the body is parsed. A parse failure must not lose it.
+    with TokenContextManager() as manager:
+        with pytest.raises((TypeError, ValueError)):
+            await _search_once(provider, _unreadable_answer(provider))
+        details = manager.get_usage().details
+
+    assert len(details) == 1
+    assert details[0]["model_id"] == WEB_SEARCH_MODEL_IDS[provider]
+
+
+@pytest.mark.asyncio
+async def test_google_records_before_fetching_page_content() -> None:
+    # include_content fetches a page per result after Google answered. A page
+    # fetch that fails cannot un-bill the search.
+    answer = _answered("google")
+    with patch(
+        "xagent.core.tools.core.web_search.WebContentFetcher.fetch_text",
+        new=AsyncMock(side_effect=RuntimeError("page fetch failed")),
+    ):
+        with TokenContextManager() as manager:
+            with pytest.raises(ValueError):
+                await _search_once("google", answer, include_content=True)
+            details = manager.get_usage().details
+
+    assert len(details) == 1
+    assert details[0]["model_id"] == "platform/web-search-google"
 
 
 def test_search_metering_without_a_run_context_does_not_raise() -> None:
@@ -390,7 +551,7 @@ def test_search_metering_without_a_run_context_does_not_raise() -> None:
     # the search itself is unaffected.
     token_context.token_context.set(None)
     try:
-        record_web_search_usage("platform/tavily-search")
+        record_web_search_usage("tavily")
         usage = get_token_usage()
     finally:
         token_context.token_context.set(None)

@@ -110,6 +110,18 @@ describe("idle activity reporting", () => {
     reporter.stop()
   })
 
+  it("still sends a trailing report whose timer runs a few seconds late", async () => {
+    const { reporter, report, fire } = setup()
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
+    fire("keydown")
+    // The trailing timer is due 62 s after the report; it runs 4 s late.
+    vi.setSystemTime(Date.now() + 4_000)
+    await vi.advanceTimersByTimeAsync(62_000)
+    expect(report).toHaveBeenCalledTimes(2)
+    reporter.stop()
+  })
+
   it("drops a trailing report when the device slept past the interval", async () => {
     const { reporter, report, fire } = setup()
     fire("keydown")

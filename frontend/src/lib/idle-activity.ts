@@ -80,7 +80,8 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     }
     const intervalMs = record.activityMinIntervalSeconds * 1000
     const now = Date.now()
-    if (now - lastInputAt > intervalMs + STALE_INPUT_TOLERANCE_MS) {
+    // A normal trailing report runs interval + margin after the last report.
+    if (now - lastInputAt > intervalMs + SERVER_INTERVAL_MARGIN_MS + STALE_INPUT_TOLERANCE_MS) {
       pending = false
       return
     }

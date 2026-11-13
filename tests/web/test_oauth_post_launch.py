@@ -358,3 +358,31 @@ def test_existing_invitation_password_hash_helper_remains_importable(proof):
         auth.hash_password_reset_token(proof)
         == hashlib.sha256(proof.encode()).hexdigest()
     )
+
+
+def test_launch_ticket_follows_the_browser_idle_policy(launch, monkeypatch):
+    """The ticket carries its login's sid and dies with that login (#3771)."""
+    from datetime import datetime, timedelta, timezone
+
+    from xagent.web import browser_idle
+    from xagent.web.models.browser_session import BrowserSession
+
+    client, db, user, _, _ = launch
+    sid = browser_idle.new_browser_session_id()
+    browser_idle.add_browser_session(db, int(user.id), sid)
+    db.commit()
+    token = auth.create_access_token(
+        {**user_session_claims(user), **browser_idle.browser_session_claims(sid)}
+    )
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    response = _post(client, token, redirect="https://frontend.example/tools")
+    assert response.status_code == 200
+    launch_url = response.json()["authorization_url"]
+    ticket = parse_qs(urlsplit(launch_url).query)["ticket"][0]
+    assert auth.verify_token(ticket)["sid"] == sid
+
+    db.get(BrowserSession, sid).last_activity_at = datetime.now(
+        timezone.utc
+    ) - timedelta(minutes=31)
+    db.commit()
+    assert client.get(launch_url, follow_redirects=False).status_code == 401

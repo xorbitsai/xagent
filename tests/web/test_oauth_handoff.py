@@ -260,3 +260,41 @@ def test_old_frontend_keeps_legacy_response(setup, monkeypatch, enabled, version
     data = json.loads(response.body)
     assert "launch_mode" not in data
     assert data["authorization_url"].startswith("/api/auth/sample/login?ticket=")
+
+
+def test_handoff_ticket_follows_the_browser_idle_policy(setup, monkeypatch):
+    """A ticket is bound to its browser login and dies with it (#3771)."""
+    from datetime import datetime, timedelta, timezone
+
+    from xagent.web import browser_idle
+    from xagent.web.models.browser_session import BrowserSession
+
+    client, db, _, app = setup
+    user = db.query(User).one()
+    sid = browser_idle.new_browser_session_id()
+    browser_idle.add_browser_session(db, int(user.id), sid)
+    db.commit()
+    browser_idle.remember_request_session(user, sid)
+    req = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [(b"host", b"tobybot.ai")],
+            "app": app,
+        }
+    )
+    launch = issue_handoff(
+        req,
+        user,
+        kind="builtin",
+        resource={"provider": "sample", "options": {"redirect": NEW}},
+    )
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    assert client.get(launch["authorization_url"]).status_code == 200
+
+    db.get(BrowserSession, sid).last_activity_at = datetime.now(
+        timezone.utc
+    ) - timedelta(minutes=31)
+    db.commit()
+    assert client.get(launch["authorization_url"]).status_code == 401

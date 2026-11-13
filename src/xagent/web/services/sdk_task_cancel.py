@@ -63,7 +63,11 @@ from .task_command_transport import (
     load_task_command,
     retry_failed_task_command,
 )
-from .task_execution_admission import waiting_admission
+from .task_execution_admission import (
+    STOPPED_BEFORE_START,
+    STOPPED_BEFORE_START_REASON,
+    waiting_admission,
+)
 from .task_execution_controller import (
     StaleTaskRunError,
     TaskControlState,
@@ -109,9 +113,6 @@ _COMMAND_POLL_SECONDS = 0.05
 _AIMED_RUN_ENDED_MESSAGE = "The run this cancel was aimed at has already ended."
 
 _TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
-
-STOPPED_BEFORE_START_REASON = "cancelled_before_admission"
-STOPPED_BEFORE_START = "Task stopped before execution started."
 
 
 def is_sdk_cancelled(status: object, error_message: object) -> bool:
@@ -274,13 +275,11 @@ def _queued_start(db: Session, task_id: int) -> TaskExecutionCommand | None:
     """The START of ``task_id`` not handed off yet, as ``has_queued_start``
     counts it (at most one exists)."""
 
+    from .task_start_protocol import queued_start_conditions
+
     return (
         db.query(TaskExecutionCommand)
-        .filter(
-            TaskExecutionCommand.task_id == task_id,
-            TaskExecutionCommand.kind == TaskCommandKind.START.value,
-            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
-        )
+        .filter(*queued_start_conditions(task_id))
         .order_by(TaskExecutionCommand.id.desc())
         .first()
     )

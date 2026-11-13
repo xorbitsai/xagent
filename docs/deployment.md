@@ -1019,7 +1019,9 @@ A running task created through `/v1` can now be cancelled. The cancelled task re
 ### Client-visible changes
 
 - A new task cancelled before it starts answers 200 and reads `failed` with `error_code` `task_cancelled` and no `run_id`.
-- A turn appended to a finished task and cancelled before it starts is withdrawn: the call answers 200 with `cancelled_run_id` naming the withdrawn run, and the task keeps reading as the turn before it.
+- A turn appended to a finished or paused task and cancelled before it starts is withdrawn: the call answers 200 with `cancelled_run_id` naming the withdrawn run, and the task keeps reading as the turn before it. Calling again answers the same 200. A paused task whose appended turn was withdrawn reads `failed` on `GET`, as it does when that turn cannot be started, and the answer reads `failed` too.
+- When the task has since moved to another run, so the queued turn can no longer start, the cancel acts on the task as it is now: a running task has that running run cancelled, and the response names it as `cancelled_run_id`.
+- A task that is waiting for an answer or paused, with no turn queued to start, still answers 409 `task_busy`.
 - A cancel that reaches a queued turn after it started cancels it as a running task.
 - A turn queued before it has a run of its own still answers 409 `task_busy`.
 - While a later turn is queued after a completed or failed run, a 200 answer reads `status` `pending` with a null `error_code`, as `GET /v1/chat/tasks/{task_id}` does; `cancelled_run_id` still names the cancelled run. The earlier entry's 200 answered `failed` with `task_cancelled` in that case.

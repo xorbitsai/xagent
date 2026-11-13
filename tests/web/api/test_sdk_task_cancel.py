@@ -1445,3 +1445,51 @@ def test_a_start_handed_off_while_it_was_being_stopped_is_cancelled_as_running(
 
     assert stops == [start_id]
     assert target == sdk_task_cancel._CancelTarget(QUEUED_RUN, 7, TaskStatus.RUNNING)
+
+
+@pytest.mark.parametrize(
+    ("status", "queued"),
+    [("pending", True), ("processing", True), ("completed", False), ("failed", False)],
+)
+def test_the_queued_start_lookup_and_the_task_read_share_one_definition(
+    status: str, queued: bool
+) -> None:
+    from xagent.web.services.task_start_protocol import has_queued_start
+
+    task_id, _agent_id, owner_user_id = _create_task(
+        run_id="run-before", status=TaskStatus.COMPLETED, control_state="completed"
+    )
+    _stage_start(task_id, owner_user_id, status=status)
+    db = _direct_db_session()
+    try:
+        assert has_queued_start(db, task_id) is queued
+        assert (sdk_task_cancel._queued_start(db, task_id) is not None) is queued
+    finally:
+        db.close()
+
+
+def test_the_stopped_before_start_wording_has_one_definition() -> None:
+    """The cancel stops a START with the wording every other control uses, so
+    it imports it from where the others write it."""
+    import ast
+    import pathlib
+
+    from xagent.web.services import task_execution_admission
+
+    assert (
+        task_execution_admission.STOPPED_BEFORE_START_REASON
+        == "cancelled_before_admission"
+    )
+    tree = ast.parse(pathlib.Path(sdk_task_cancel.__file__).read_text())
+    assigned = {
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert not assigned & {"STOPPED_BEFORE_START", "STOPPED_BEFORE_START_REASON"}
+    assert (
+        sdk_task_cancel.STOPPED_BEFORE_START_REASON
+        == task_execution_admission.STOPPED_BEFORE_START_REASON
+    )

@@ -11,6 +11,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
@@ -182,6 +183,19 @@ def stage_task_start_command(
 QUEUED_START_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 
 
+def queued_start_conditions(task_id: int) -> tuple[ColumnElement[bool], ...]:
+    """Row conditions that select the STARTs of ``task_id`` not handed off.
+
+    The one definition of "queued": ``has_queued_start`` and the SDK cancel's
+    lookup of the queued START both filter with it.
+    """
+    return (
+        TaskExecutionCommand.task_id == task_id,
+        TaskExecutionCommand.kind == TaskCommandKind.START.value,
+        TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+    )
+
+
 def has_queued_start(db: Session, task_id: int) -> bool:
     """Whether an accepted START of ``task_id`` has not been handed off yet.
 
@@ -193,11 +207,7 @@ def has_queued_start(db: Session, task_id: int) -> bool:
     return (
         db.execute(
             select(TaskExecutionCommand.id)
-            .where(
-                TaskExecutionCommand.task_id == task_id,
-                TaskExecutionCommand.kind == TaskCommandKind.START.value,
-                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
-            )
+            .where(*queued_start_conditions(task_id))
             .limit(1)
         ).first()
         is not None

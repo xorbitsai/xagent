@@ -1230,8 +1230,10 @@ class CancelTaskResponse(BaseModel):
             "turn's status when a queued turn was withdrawn before it started, "
             "the status of a turn that started after the cancel, or, on 202, "
             "the status the cancel is still being applied to. While a turn is "
-            "queued after a completed or failed run it reads 'pending', as "
-            "GET /v1/chat/tasks/{task_id} does."
+            "queued after a completed or failed run it reads 'pending', and a "
+            "paused task that has stopped for good (for example, its appended "
+            "turn was withdrawn) reads 'failed', as GET /v1/chat/tasks/{task_id} "
+            "does."
         ),
     )
     run_id: Optional[str] = Field(..., description="Current execution run identity.")

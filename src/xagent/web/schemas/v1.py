@@ -1100,6 +1100,43 @@ class CancelQuestionResponse(BaseModel):
     )
 
 
+class CancelTaskResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/cancel`` -> 200 / 202 response.
+
+    200: the task is cancelled -- it reads ``failed`` with
+    ``error_code='task_cancelled'`` -- whether this call did it or an
+    earlier one already had. 202: the cancel was recorded but not applied
+    yet; ``status`` is still the task's current one and ``cancelled_run_id``
+    is null. Calling again reaches the same request.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    status: str = Field(
+        ...,
+        description=(
+            "Task status as stored: 'failed' once cancelled, otherwise the "
+            "status the cancel is still being applied to."
+        ),
+    )
+    run_id: Optional[str] = Field(..., description="Current execution run identity.")
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    cancelled_run_id: Optional[str] = Field(
+        ...,
+        description=(
+            "The run that was cancelled. Null while the cancel has not been applied."
+        ),
+    )
+    error_code: Optional[str] = Field(
+        ...,
+        description=(
+            "'task_cancelled' once the task is cancelled, null before; the "
+            "same value GET /v1/chat/tasks/{task_id} reports."
+        ),
+    )
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 
@@ -1270,6 +1307,16 @@ class TaskInfoResponse(BaseModel):
         description=(
             "Last failure reason when status='failed'. For a derived failed, "
             "a fixed text saying why automatic resume stopped."
+        ),
+    )
+    error_code: Optional[str] = Field(
+        None,
+        description=(
+            "Machine-readable reason for status='failed', when one is "
+            "defined: 'task_cancelled' for a task stopped through "
+            "POST /v1/chat/tasks/{task_id}/cancel. Null for every other "
+            "failure, for a derived failed, and whenever status is not "
+            "'failed'."
         ),
     )
     created_at: datetime

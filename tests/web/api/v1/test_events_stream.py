@@ -100,10 +100,15 @@ def mock_start_task():
         yield mocked
 
 
-# The raw structured output values of a snapshot that has none, and the fields
-# a conclusion frame then carries.
-NO_STRUCTURED_OUTPUT = {"structured_output_record": None, "format_configured": False}
+# The raw structured output values of a snapshot that has none and was not
+# cancelled, and the fields a conclusion frame then carries.
+NO_STRUCTURED_OUTPUT = {
+    "structured_output_record": None,
+    "format_configured": False,
+    "error_code": None,
+}
 NULL_STRUCTURED_OUTPUT_FIELDS = {
+    "error_code": None,
     "structured_output": None,
     "structured_output_status": None,
     "structured_output_reason": None,

@@ -536,20 +536,28 @@ class _DeferredInjectionRejectedRetryableError(RuntimeError):
         self.fenced = fenced
 
 
-def _resume_cancel_settlement_error(task_source: str | None) -> str:
+def _resume_cancel_settlement_error(
+    task_source: str | None, *, explicit_cancel: bool = False
+) -> str:
     """Settlement text for a cancelled resume, matching a cancelled run.
 
     An external visitor reads this text in the transcript, and the external
-    cancel command recognizes it as its own settled outcome.
+    cancel command recognizes it as its own settled outcome. An SDK resume
+    stopped by an explicit cancel (``explicit_cancel``) settles with the
+    text the SDK cancel command recognizes.
     """
     from .external_task_cancel import (
         EXTERNAL_TASK_SOURCE,
         EXTERNAL_TURN_INTERRUPTED_MESSAGE,
     )
+    from .sdk_task_cancel import sdk_cancel_settlement_text
 
     if task_source == EXTERNAL_TASK_SOURCE:
         return EXTERNAL_TURN_INTERRUPTED_MESSAGE
-    return "resume execution cancelled"
+    return (
+        sdk_cancel_settlement_text(task_source, explicit_cancel=explicit_cancel)
+        or "resume execution cancelled"
+    )
 
 
 def client_safe_error_message(
@@ -4132,6 +4140,8 @@ async def execute_resume_background(
             )
 
         if lease is None:
+            from .sdk_task_cancel import sdk_cancel_settlement_text
+
             prior_status_box: list[TaskStatus] = []
             run_not_resumable_box: list[bool] = []
             ended_status_box: list[TaskStatus] = []
@@ -4147,9 +4157,21 @@ async def execute_resume_background(
                     ended_status_out=ended_status_box,
                     history_turn_id_out=history_turn_id_box,
                 ),
+                # Evaluated when the cleanup runs, after the cancellation
+                # that triggers it has been recorded as explicit or not.
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
-                    error_message="resume cancelled during lease acquisition",
+                    error_message=(
+                        sdk_cancel_settlement_text(
+                            trusted_task_source,
+                            explicit_cancel=(
+                                background_task_manager.cancel_was_requested(
+                                    resume_owner_task
+                                )
+                            ),
+                        )
+                        or "resume cancelled during lease acquisition"
+                    ),
                     turn_id=delivery_turn_id,
                 ),
             )
@@ -4881,7 +4903,12 @@ async def execute_resume_background(
         )
         return
     except asyncio.CancelledError:
-        settlement_error = _resume_cancel_settlement_error(trusted_task_source)
+        settlement_error = _resume_cancel_settlement_error(
+            trusted_task_source,
+            explicit_cancel=background_task_manager.cancel_was_requested(
+                resume_owner_task
+            ),
+        )
         logger.info(f"V2 resume background task {task_id} cancelled")
         await record_accepted_delivery()
         if delivery_turn_id is not None and not delivery_was_dispatched:
@@ -5243,7 +5270,10 @@ async def execute_resume_background(
                             # one is never resendable).
                             settlement_error = (
                                 settlement_error
-                                or _resume_cancel_settlement_error(trusted_task_source)
+                                or _resume_cancel_settlement_error(
+                                    trusted_task_source,
+                                    explicit_cancel=explicit_cancel,
+                                )
                             )
                         settlement_report = SettlementReport()
                         if pause_for_input and not explicit_cancel:

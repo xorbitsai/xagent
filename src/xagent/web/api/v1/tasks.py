@@ -45,6 +45,7 @@ from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
     CancelQuestionResponse,
+    CancelTaskResponse,
     CreateTaskRequest,
     CreateTaskResponse,
     DeleteTaskResponse,
@@ -82,6 +83,7 @@ from ...services.response_format import (
     normalize_response_format,
     violation_message,
 )
+from ...services.sdk_task_cancel import sdk_cancel_error_code
 from ...services.structured_output_projection import (
     project_structured_output,
     response_format_configured,
@@ -590,6 +592,10 @@ class _TaskInfoSnapshot:
     # ``project_structured_output`` applied to the effective status.
     structured_output_record: Any = None
     format_configured: bool = False
+    # ``task_cancelled`` when the stored row is the outcome of a cancel
+    # request, ``None`` for every other row. Cleared like ``error`` wherever
+    # the status shown is not the stored one.
+    error_code: str | None = None
 
 
 # Terminal statuses an append is accepted from. With shared execution the row
@@ -618,6 +624,7 @@ def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
             status=TaskStatus.PENDING,
             output=None,
             error=None,
+            error_code=None,
         )
     view = snapshot.view
     if view is None:
@@ -628,6 +635,7 @@ def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
         control_state=TaskStatus.FAILED.value,
         output=None,
         error=view.error,
+        error_code=None,
     )
 
 
@@ -864,6 +872,9 @@ def _load_task_info_snapshot(
             start_queued=start_queued,
             structured_output_record=task.structured_output_record,
             format_configured=response_format_configured(task.agent_config),
+            error_code=sdk_cancel_error_code(
+                task.status, cast(str | None, task.error_message)
+            ),
         )
 
 
@@ -1030,6 +1041,7 @@ def _get_chat_task_sync(
             status=effective.status.value,
             output=effective.output,
             error=effective.error,
+            error_code=effective.error_code,
             completed_at=None,
         )
     if task.view is not None:
@@ -1039,6 +1051,7 @@ def _get_chat_task_sync(
             control_state=effective.control_state,
             output=effective.output,
             error=effective.error,
+            error_code=effective.error_code,
             completed_at=task.view.stopped_at,
         )
     # Applied on every read, never cached: the record can change without the
@@ -1072,6 +1085,7 @@ def _get_chat_task_sync(
         input=task.input,
         output=task.output,
         error=task.error,
+        error_code=task.error_code,
         created_at=task.created_at,
         completed_at=completed_at,
     )
@@ -1475,6 +1489,89 @@ async def cancel_waiting_task_question(
         status=result.status,
         run_id=result.run_id,
         state_version=result.state_version,
+    )
+
+
+@router.post(
+    "/chat/tasks/{task_id}/cancel",
+    response_model=CancelTaskResponse,
+    responses={
+        202: {
+            "model": CancelTaskResponse,
+            "description": "The cancel is recorded but not applied yet.",
+        }
+    },
+)
+async def cancel_chat_task(
+    task_id: int,
+    response: Response,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> CancelTaskResponse:
+    """Stop a task that is still running.
+
+    Reuses ``GET``'s ownership rule (another agent's task, another user's
+    agent, a missing id, or a non-SDK task all answer 404) before anything
+    about the task's state is read. The cancelled task reads ``failed``
+    with ``error_code='task_cancelled'``, and accepts
+    ``POST /v1/chat/tasks/{id}/messages`` like any failed task. A workforce
+    run is one task: cancelling it stops its members too.
+
+    The call waits a bounded time for the cancel to be applied. 200 means
+    the task is cancelled, including when an earlier call already cancelled
+    it; 202 means the cancel is recorded but not applied yet, and calling
+    again reaches the same request.
+
+    Only a running task is cancelled. One that is waiting for an answer,
+    paused, or whose turn is still queued to start answers 409
+    ``task_busy`` and is left untouched.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing, not owned by the key, or not SDK-created.
+        V1ApiError 409: ``task_not_cancellable`` for a task that already
+            ended without being cancelled; ``task_busy`` when the task
+            cannot be cancelled in its current state or changed state while
+            the cancel was applied -- retry.
+        V1ApiError 410: ``task_expired`` for a retention-expired task.
+        V1ApiError 503: the cancel could not be applied; retry.
+    """
+    from ...services.sdk_task_cancel import (
+        SdkTaskCancelBusy,
+        SdkTaskCancelFailed,
+        SdkTaskNotCancellable,
+        request_sdk_task_cancel,
+    )
+
+    try:
+        result = await request_sdk_task_cancel(
+            task_id=task_id,
+            scope=_sdk_task_scope(principal),
+        )
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
+    except SdkTaskNotCancellable as exc:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_CANCELLABLE, 409) from exc
+    except SdkTaskCancelBusy as exc:
+        raise V1ApiError(V1ErrorCode.TASK_BUSY, 409, message=str(exc)) from exc
+    except SdkTaskCancelFailed as exc:
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            503,
+            message="The cancel could not be applied; retry.",
+        ) from exc
+
+    await record_principal_usage(
+        principal, route="cancel_task", task_id=result.task_id, agent_id=None
+    )
+    if not result.cancelled:
+        response.status_code = 202
+    return CancelTaskResponse(
+        task_id=result.task_id,
+        status=result.status,
+        run_id=result.run_id,
+        state_version=result.state_version,
+        cancelled_run_id=result.cancelled_run_id,
+        error_code=result.error_code,
     )
 
 

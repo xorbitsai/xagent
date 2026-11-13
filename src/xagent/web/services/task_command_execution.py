@@ -149,6 +149,7 @@ from .managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from .sdk_task_cancel import SDK_COMMAND_SCOPE, cancel_sdk_task_unserialized
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
     TerminalTaskEventMessageCode,
@@ -4943,6 +4944,7 @@ async def _execute_durable_task_command(
                 if (
                     scope_value is not EXTERNAL_COMMAND_SCOPE_ABSENT
                     and scope_value != EXTERNAL_COMMAND_SCOPE
+                    and scope_value != SDK_COMMAND_SCOPE
                 ):
                     raise TaskCommandRejected(
                         f"Cancel command {command.command_id} names task scope "
@@ -4950,7 +4952,14 @@ async def _execute_durable_task_command(
                         reason="unsupported_scope",
                     )
                 async with task_execution_controller.command(command.task_id):
-                    if scope_value == EXTERNAL_COMMAND_SCOPE:
+                    if scope_value == SDK_COMMAND_SCOPE:
+                        await cancel_sdk_task_unserialized(
+                            task_id=command.task_id,
+                            agent_id=agent_id,
+                            expected_run_id=command.target_run_id,
+                            expected_state_version=target_state_version,
+                        )
+                    elif scope_value == EXTERNAL_COMMAND_SCOPE:
                         await cancel_external_task_unserialized(
                             task_id=command.task_id,
                             agent_id=agent_id,

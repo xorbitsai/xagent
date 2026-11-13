@@ -110,6 +110,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
 from .release_hold import release_hold
+from .sdk_task_cancel import sdk_cancel_result_fact, sdk_cancel_settlement_text
 from .task_auto_recovery import (
     InterruptionDecision,
     InterruptionOutcome,
@@ -2249,7 +2250,7 @@ def _settle_task_lease_attempt(
                     witness = stage_result_fact_no_commit(
                         settle_db,
                         task,
-                        {"error": error_message},
+                        sdk_cancel_result_fact(error_message),
                         turn_id=history_turn_id,
                     )
                     if attempt is not None:
@@ -2861,7 +2862,19 @@ def _schedule_bg(
                     client_history_error_message = settlement_error
                     client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                 else:
-                    settlement_error = "task execution cancelled"
+                    # An SDK run stopped by an explicit cancel settles with
+                    # the text its cancel command recognizes as its outcome.
+                    settlement_error = (
+                        sdk_cancel_settlement_text(
+                            task_source,
+                            explicit_cancel=(
+                                background_task_manager.cancel_was_requested(
+                                    asyncio.current_task()
+                                )
+                            ),
+                        )
+                        or "task execution cancelled"
+                    )
                 shutdown_handoff_candidate = (
                     get_shutdown_handoff_enabled()
                     and not background_task_manager.cancel_was_requested(

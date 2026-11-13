@@ -216,6 +216,12 @@ class V1ErrorCode(str, Enum):
     # current run (pending / paused / completed normally / failed). 409.
     TASK_NOT_WAITING = "task_not_waiting"
 
+    # ``POST /v1/chat/tasks/{id}/cancel`` was called on a task that already
+    # ended without being cancelled (completed, or failed on its own). 409,
+    # not retryable -- a task that can be cancelled later answers
+    # ``task_busy`` instead.
+    TASK_NOT_CANCELLABLE = "task_not_cancellable"
+
     # A reply's saved progress could not be read due to a transient
     # infrastructure failure. 503, retryable -- distinct from
     # ``interaction_not_resumable`` (which means resuming can never
@@ -320,6 +326,9 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     ),
     V1ErrorCode.TASK_NOT_WAITING: (
         "This task is not waiting for an answer to a question."
+    ),
+    V1ErrorCode.TASK_NOT_CANCELLABLE: (
+        "This task has already ended and cannot be cancelled."
     ),
     V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
         "Reply was accepted but its outcome is not yet known. "

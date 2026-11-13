@@ -49,7 +49,7 @@ from xagent.web.models.database import get_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery
 from xagent.web.models.user import User
-from xagent.web.services import task_auto_resume, task_event_bridge
+from xagent.web.services import sdk_task_cancel, task_auto_resume, task_event_bridge
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
     cache_get,
@@ -294,7 +294,15 @@ def test_view_call_sites():
     defining = pathlib.Path(task_auto_resume.__file__).resolve()
 
     computed = [c for c in _calls("status_only_terminal_view") if c[0] != defining]
-    assert computed == [(tasks_py, "_load_task_info_snapshot")]
+    # The read surface derives the failed status; the cancel request consults
+    # the same view so it refuses exactly the tasks that read as failed.
+    cancel_py = pathlib.Path(sdk_task_cancel.__file__).resolve()
+    assert sorted(computed) == sorted(
+        [
+            (tasks_py, "_load_task_info_snapshot"),
+            (cancel_py, "_prepare_cancel_sync"),
+        ]
+    )
 
     overlaid = _calls("effective_task_snapshot")
     assert overlaid, "the events endpoint must overlay its snapshots"
@@ -311,6 +319,7 @@ ALLOWLIST = {
     ("POST", "/v1/chat/tasks/{task_id}/messages"),
     ("POST", "/v1/chat/tasks/{task_id}/reply"),
     ("POST", "/v1/chat/tasks/{task_id}/cancel-question"),
+    ("POST", "/v1/chat/tasks/{task_id}/cancel"),
     ("POST", "/v1/workforces/{workforce_id}/runs"),
 }
 EXCLUDE = {

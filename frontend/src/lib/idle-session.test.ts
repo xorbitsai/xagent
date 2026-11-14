@@ -107,16 +107,16 @@ describe("idle session state bound to one login", () => {
 
   it("never lets a new login read the idle state of the previous one", async () => {
     const first = await login({ idle_session: idle() })
-    markIdleActivityReportedIfCurrent(first)
+    await markIdleActivityReportedIfCurrent(first)
     expect(readCurrentIdleSession()?.lastReportAt).not.toBeNull()
     await login()
     expect(readCurrentIdleSession()).toBeNull()
     expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
   })
 
-  it("has no idle state without a current login", () => {
+  it("has no idle state without a current login", async () => {
     expect(readCurrentIdleSession()).toBeNull()
-    markIdleActivityReportedIfCurrent({ ...emptySnapshot })
+    await markIdleActivityReportedIfCurrent({ ...emptySnapshot })
     expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
   })
 
@@ -133,17 +133,17 @@ describe("idle session state bound to one login", () => {
     localStorage.setItem(IDLE_SESSION_STORAGE_KEY, typeof value === "string" ? value : JSON.stringify({ ...stored, ...value }))
     expect(readCurrentIdleSession()).toBeNull()
     // Reporting against an unreadable record writes nothing.
-    markIdleActivityReportedIfCurrent(snapshot)
+    await markIdleActivityReportedIfCurrent(snapshot)
     expect(readCurrentIdleSession()).toBeNull()
   })
 
   it("ignores an unreadable response body, and records best effort when storage refuses", async () => {
     const snapshot = await login({ idle_session: idle() })
-    expect(recordIdleSessionIfCurrent(snapshot, null)).toBeNull()
+    expect(await recordIdleSessionIfCurrent(snapshot, null)).toBeNull()
     const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => { throw new Error("quota") })
     try {
-      expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 1800 }) })).toBeNull()
-      expect(() => markIdleActivityReportedIfCurrent(snapshot)).not.toThrow()
+      expect(await recordIdleSessionIfCurrent(snapshot, { idle_session: idle({ idle_expires_in: 1800 }) })).toBeNull()
+      await expect(markIdleActivityReportedIfCurrent(snapshot)).resolves.toBeUndefined()
     } finally {
       setItem.mockRestore()
     }
@@ -152,18 +152,50 @@ describe("idle session state bound to one login", () => {
 
   it("forgets the idle state when a successful response says the server no longer supports it", async () => {
     const snapshot = await login({ idle_session: idle() })
-    expect(recordIdleSessionIfCurrent(snapshot, { success: true })).toBeNull()
+    expect(await recordIdleSessionIfCurrent(snapshot, { success: true })).toBeNull()
     expect(readCurrentIdleSession()).toBeNull()
     const again = await login({ idle_session: idle() })
     await commitAuthSessionRefresh(again, refreshBody())
     expect(readCurrentIdleSession()).toBeNull()
   })
 
+  it("keeps the newer observation when an older response rounds to the same deadline", async () => {
+    // Both describe a 10:02:00 deadline: idle_expires_in is truncated, server_time is not.
+    const snapshot = await login({ idle_session: idle({ idle_expires_in: 109, server_time: "2026-11-13T10:00:10.100Z" }) })
+    const older = idle({ idle_expires_in: 119, server_time: "2026-11-13T10:00:00.900Z" })
+    expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: older }))?.serverTime).toBe(Date.parse("2026-11-13T10:00:10.100Z"))
+    expect(readCurrentIdleSession()?.idleExpiresIn).toBe(109)
+  })
+
+  it("waits for the auth lock, and does not touch a login another tab committed meanwhile", async () => {
+    const first = await login({ idle_session: idle() })
+    const before = localStorage.getItem(IDLE_SESSION_STORAGE_KEY)
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: vi.fn((_: string, action: () => Promise<unknown>) => held.then(action)) },
+    })
+    const recorded = recordIdleSessionIfCurrent(first, { idle_session: idle({ server_time: "2026-11-13T10:05:00Z" }) })
+    const marked = markIdleActivityReportedIfCurrent(first)
+    // Nothing is written while another holder has the lock.
+    expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBe(before)
+    // Another tab commits login B under that lock.
+    const cache = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY)!)
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({ ...cache, sessionId: "login-b", token: "access-b" }))
+    const recordB = { ...JSON.parse(before!), sessionId: "login-b", sid: "sid-b", lastReportAt: null }
+    localStorage.setItem(IDLE_SESSION_STORAGE_KEY, JSON.stringify(recordB))
+    release()
+    expect(await recorded).toBeNull()
+    await marked
+    expect(JSON.parse(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)!)).toEqual(recordB)
+  })
+
   it("ignores a response the server produced before the stored one", async () => {
     const snapshot = await login({ idle_session: idle({ idle_expires_in: 1800, server_time: "2026-11-13T10:00:30Z" }) })
     // A verify sent before the activity report arrives after it.
     const late = idle({ idle_expires_in: 1770, server_time: "2026-11-13T10:00:00Z" })
-    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: late })?.idleExpiresIn).toBe(1800)
+    expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: late }))?.idleExpiresIn).toBe(1800)
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
   })
 
@@ -184,7 +216,7 @@ describe("idle session state bound to one login", () => {
       const snapshot = await login({ idle_session: idle({ idle_expires_in: 1800, server_time: "2026-11-13T10:00:30Z" }) })
       vi.setSystemTime(new Date(receivedAt))
       const next = idle(overrides)
-      expect(recordIdleSessionIfCurrent(snapshot, { idle_session: next })?.idleExpiresIn).toBe(next.idle_expires_in)
+      expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: next }))?.idleExpiresIn).toBe(next.idle_expires_in)
     } finally {
       vi.useRealTimers()
     }
@@ -195,12 +227,12 @@ describe("idle session state bound to one login", () => {
     const stored = JSON.parse(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)!)
     localStorage.setItem(IDLE_SESSION_STORAGE_KEY, JSON.stringify({ ...stored, sessionId: "another-login" }))
     expect(readCurrentIdleSession()).toBeNull()
-    expect(recordIdleSessionIfCurrent(snapshot, { idle_session: idle() })?.sessionId).toBe(snapshot.sessionId)
+    expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: idle() }))?.sessionId).toBe(snapshot.sessionId)
   })
 
   it("updates the policy from a refresh and keeps another tab's report time for the same server login", async () => {
     const snapshot = await login({ idle_session: idle() })
-    markIdleActivityReportedIfCurrent(snapshot)
+    await markIdleActivityReportedIfCurrent(snapshot)
     const reportedAt = readCurrentIdleSession()!.lastReportAt
     const result = await commitAuthSessionRefresh(snapshot, refreshBody({ idle_session: idle({ idle_expires_in: 1800 }) }))
     expect(result.status).toBe("updated")
@@ -209,7 +241,7 @@ describe("idle session state bound to one login", () => {
 
   it("starts a fresh report history when a legacy login receives its first server login id", async () => {
     const snapshot = await login({ idle_session: idle({ enforced: false, sid: null }) })
-    markIdleActivityReportedIfCurrent(snapshot)
+    await markIdleActivityReportedIfCurrent(snapshot)
     await commitAuthSessionRefresh(snapshot, refreshBody({ idle_session: idle({ enforced: false, sid: "sid-new" }) }))
     expect(readCurrentIdleSession()).toMatchObject({ sid: "sid-new", lastReportAt: null })
   })
@@ -217,10 +249,10 @@ describe("idle session state bound to one login", () => {
   it("ignores a verify or activity response that arrives after another login replaced this one", async () => {
     const first = await login({ idle_session: idle() })
     const second = await login({ idle_session: idle({ sid: "sid-b" }) })
-    expect(recordIdleSessionIfCurrent(first, { idle_session: idle({ idle_expires_in: 5 }) })).toBeNull()
-    markIdleActivityReportedIfCurrent(first)
+    expect(await recordIdleSessionIfCurrent(first, { idle_session: idle({ idle_expires_in: 5 }) })).toBeNull()
+    await markIdleActivityReportedIfCurrent(first)
     expect(readCurrentIdleSession()).toMatchObject({ sessionId: second.sessionId, sid: "sid-b", lastReportAt: null })
-    expect(recordIdleSessionIfCurrent(second, { idle_session: idle({ sid: "sid-b", idle_expires_in: 1800 }) })?.idleExpiresIn).toBe(1800)
+    expect((await recordIdleSessionIfCurrent(second, { idle_session: idle({ sid: "sid-b", idle_expires_in: 1800 }) }))?.idleExpiresIn).toBe(1800)
   })
 
   it.each([

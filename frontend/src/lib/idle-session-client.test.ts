@@ -31,6 +31,10 @@ describe("idle session client", () => {
   beforeEach(() => {
     localStorage.clear()
     vi.mocked(apiRequest).mockReset()
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: vi.fn(async (_: string, action: () => Promise<unknown>) => action()) },
+    })
   })
 
   it("reports activity with the current credential and stores the new deadline", async () => {

@@ -33,18 +33,22 @@ describe("idle activity reporting", () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-13T10:00:00Z")) })
   afterEach(() => { vi.useRealTimers() })
 
-  it("reports keyboard, pointer and wheel input but not mouse movement, scrolling or focus", () => {
+  it("reports keyboard, pointer and wheel input but not mouse movement, scrolling or focus", async () => {
     const { reporter, report, fire } = setup()
     for (const type of ["mousemove", "scroll", "focus", "visibilitychange", "pointermove"]) fire(type)
+    await vi.advanceTimersByTimeAsync(0)
     expect(report).not.toHaveBeenCalled()
     fire("keydown")
+    // The report time is recorded (under the auth lock) before the request is sent.
+    await vi.advanceTimersByTimeAsync(0)
     expect(report).toHaveBeenCalledTimes(1)
     reporter.stop()
   })
 
-  it.each(["pointerdown", "wheel"])("treats %s as user activity", type => {
+  it.each(["pointerdown", "wheel"])("treats %s as user activity", async type => {
     const { reporter, report, fire } = setup()
     fire(type)
+    await vi.advanceTimersByTimeAsync(0)
     expect(report).toHaveBeenCalledTimes(1)
     reporter.stop()
   })
@@ -93,6 +97,7 @@ describe("idle activity reporting", () => {
 
     const off = setup(record({ enforced: false }))
     off.fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
     expect(off.report).toHaveBeenCalledTimes(1)
     off.reporter.stop()
   })
@@ -119,6 +124,18 @@ describe("idle activity reporting", () => {
     vi.setSystemTime(Date.now() + 4_000)
     await vi.advanceTimersByTimeAsync(62_000)
     expect(report).toHaveBeenCalledTimes(2)
+    reporter.stop()
+  })
+
+  it("drops input whose age turns negative after a sleep and a backward clock correction", async () => {
+    const { reporter, report, fire } = setup()
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
+    fire("keydown")
+    // The device sleeps for 3 minutes, then its clock is corrected 10 minutes back.
+    vi.setSystemTime(Date.now() + 3 * 60_000 - 10 * 60_000)
+    await vi.advanceTimersByTimeAsync(62_000)
+    expect(report).toHaveBeenCalledTimes(1)
     reporter.stop()
   })
 
@@ -175,6 +192,7 @@ describe("idle activity reporting", () => {
     const report = vi.fn(() => new Promise<boolean>(resolve => { finish = resolve }))
     const { reporter, fire } = setup(record(), { report })
     fire("pointerdown")
+    await vi.advanceTimersByTimeAsync(0)
     const continued = reporter.reportNow()
     finish(true)
     await continued

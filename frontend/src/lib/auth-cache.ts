@@ -644,25 +644,31 @@ export function readCurrentIdleSession(): IdleSessionRecord | null {
 }
 /**
  * Records the `idle_session` of a verify or activity response, but only while
- * the login that sent the request is still the current one.
+ * the login that sent the request is still the current one. The lineage check
+ * and the write run under the same lock as login, refresh and clear, so a
+ * replacement login committed by another tab cannot be overwritten.
  */
-export function recordIdleSessionIfCurrent(captured: AuthSessionSnapshot, body: unknown): IdleSessionRecord | null {
-  const storage = getAuthStorage()
-  if (!storage || !captured.sessionId || typeof body !== "object" || body === null) return null
-  if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return null
+export async function recordIdleSessionIfCurrent(captured: AuthSessionSnapshot, body: unknown): Promise<IdleSessionRecord | null> {
+  const sessionId = captured.sessionId
+  if (!sessionId || typeof body !== "object" || body === null) return null
   const idle = parseIdleSession(body)
-  try {
-    if (idle) return writeIdleSessionRecord(storage, captured.sessionId, idle)
+  const result = await withMutationLock(true, async ({ storage }) => {
+    if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return null
+    if (idle) return writeIdleSessionRecord(storage, sessionId, idle)
     // A successful response without idle_session: the server no longer has the feature.
     storage.removeItem(IDLE_SESSION_STORAGE_KEY)
-  } catch { /* best effort */ }
-  return null
+    return null
+  })
+  return result.status === "completed" ? result.value : null
 }
-export function markIdleActivityReportedIfCurrent(captured: AuthSessionSnapshot): void {
-  const storage = getAuthStorage()
-  if (!storage || !captured.sessionId) return
-  if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return
-  try { markIdleActivityReported(storage, captured.sessionId) } catch { /* best effort: the server rate-limits writes anyway */ }
+export async function markIdleActivityReportedIfCurrent(captured: AuthSessionSnapshot): Promise<void> {
+  const sessionId = captured.sessionId
+  if (!sessionId) return
+  // Best effort: the server rate-limits writes anyway.
+  await withMutationLock(true, async ({ storage }) => {
+    if (compareAuthSessionLineage(captured, readAuthSessionSnapshot()) !== "same") return
+    markIdleActivityReported(storage, sessionId)
+  })
 }
 /** Explicit logout is serialized when possible, and remains available without Web Locks. */
 export async function clearStoredAuth(): Promise<AuthLogoutResult> {

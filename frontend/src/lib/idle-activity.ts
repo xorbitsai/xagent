@@ -31,7 +31,7 @@ export interface IdleActivityReporterOptions {
   /** The current login's stored policy; null means the server has no idle support. */
   getRecord: () => IdleSessionRecord | null
   /** Records the report time for every tab of this login before the request is sent. */
-  markReported: () => void
+  markReported: () => void | Promise<void>
   /** Sends the activity report; resolves false when it did not reach the server. */
   report: () => Promise<boolean>
   isUserEvent?: (event: Event) => boolean
@@ -61,8 +61,10 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
   }
   const send = (): Promise<void> => {
     pending = false
-    options.markReported()
-    inFlight = options.report()
+    inFlight = Promise.resolve()
+      .then(() => options.markReported())
+      .catch(() => undefined)
+      .then(() => options.report())
       .catch(() => false)
       .then(delivered => {
         inFlight = null
@@ -81,7 +83,10 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     const intervalMs = record.activityMinIntervalSeconds * 1000
     const now = Date.now()
     // A normal trailing report runs interval + margin after the last report.
-    if (now - lastInputAt > intervalMs + SERVER_INTERVAL_MARGIN_MS + STALE_INPUT_TOLERANCE_MS) {
+    // A negative age means the clock moved backwards since the input, so its
+    // real age is unknown and it is treated as stale.
+    const inputAge = now - lastInputAt
+    if (inputAge < 0 || inputAge > intervalMs + SERVER_INTERVAL_MARGIN_MS + STALE_INPUT_TOLERANCE_MS) {
       pending = false
       return
     }

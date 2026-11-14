@@ -64,9 +64,9 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
       target: window,
       isUserEvent: isUserActivityEvent,
       getRecord,
-      markReported: () => {
+      markReported: async () => {
         const current = readAuthSessionSnapshot()
-        if (current.sessionId === sessionId) markIdleActivityReportedIfCurrent(current)
+        if (current.sessionId === sessionId) await markIdleActivityReportedIfCurrent(current)
       },
       report: () => reportIdleActivity(sessionId),
     })
@@ -77,7 +77,10 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
     const revalidate = (requireEnforced: boolean) => {
       const record = getRecord()
       if (!record || (requireEnforced && !record.enforced)) return
-      if (inFlight || Date.now() - lastCheckAt < REVALIDATE_MIN_GAP_MS) return
+      // A negative gap means the clock moved backwards: the gap no longer
+      // says anything, so a fresh server answer is allowed.
+      const sinceLastCheck = Date.now() - lastCheckAt
+      if (inFlight || (sinceLastCheck >= 0 && sinceLastCheck < REVALIDATE_MIN_GAP_MS)) return
       inFlight = true
       lastCheckAt = Date.now()
       void revalidateIdleSession(sessionId).finally(() => { inFlight = false })

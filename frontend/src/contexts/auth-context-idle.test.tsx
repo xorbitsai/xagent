@@ -288,6 +288,21 @@ describe("IdleSessionManager revalidation", () => {
     expect(verifyCalls()).toHaveLength(0)
   })
 
+  it("asks the server after the device clock moves backwards, even right after a check", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    vi.mocked(apiRequest).mockImplementation(async url =>
+      String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy({ idle_expires_in: 1500 }) }) : new Response(null, { status: 404 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+    vi.setSystemTime(Date.now() - 10 * 60_000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(2))
+  })
+
   it("leaves servers without idle support alone", async () => {
     writeAuthCache()
     render(<AuthProvider><CheckProbe /></AuthProvider>)

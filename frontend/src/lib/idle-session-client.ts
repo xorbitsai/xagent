@@ -13,7 +13,7 @@ export async function reportIdleActivity(sessionId: string): Promise<boolean> {
   try {
     const response = await apiRequest(`${getApiUrl()}/api/auth/activity`, { method: "POST" }, captured)
     if (response.ok) {
-      recordIdleSessionIfCurrent(captured, await response.json().catch(() => null))
+      await recordIdleSessionIfCurrent(captured, await response.json().catch(() => null))
       return true
     }
     return response.status < 500
@@ -37,7 +37,7 @@ export async function revalidateIdleSession(sessionId: string): Promise<void> {
       username ? { headers: { "X-Username": username } } : {},
       captured,
     )
-    if (response.ok) recordIdleSessionIfCurrent(captured, await response.json().catch(() => null))
+    if (response.ok) await recordIdleSessionIfCurrent(captured, await response.json().catch(() => null))
   } catch {
     // Unknown is not expired: the next deadline check or server response decides.
   }

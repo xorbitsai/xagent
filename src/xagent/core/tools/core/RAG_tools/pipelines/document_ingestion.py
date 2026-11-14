@@ -23,6 +23,7 @@ from ..core.config import (
     DEFAULT_TIKTOKEN_ENCODING,
 )
 from ..core.exceptions import (
+    CollectionMigratingError,
     DatabaseOperationError,
     DocumentValidationError,
     EmbeddingAdapterError,
@@ -48,7 +49,12 @@ from ..management.collection_manager import (
     update_collection_stats_sync,
     validate_document_processing_sync,
 )
-from ..management.migration_state import ensure_collection_writable
+from ..management.migration_state import (
+    ensure_collection_writable,
+    holds_lease,
+    leased_collections,
+    verify_active_leases,
+)
 from ..management.status import write_ingestion_status
 from ..parse.parse_document import parse_document
 from ..progress import ProgressManager, ProgressTracker
@@ -783,6 +789,8 @@ def embed_document_chunks(
                     try:
                         if commit_gate is not None:
                             commit_gate()
+                        # A lost lease means a migration may already be switching.
+                        verify_active_leases(collection)
                         write_response = write_vectors_to_db(
                             collection=collection,
                             embeddings=embeddings_batch_async,
@@ -798,6 +806,9 @@ def embed_document_chunks(
                             else EmbeddingWriteResponse.model_validate(write_response)
                         )
                         result.current_step = "compute_embeddings"
+                    except CollectionMigratingError:
+                        # Not a store failure: the writer must stop, untouched.
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         result.embedding_count = total_embedding_count
                         raise DatabaseOperationError(
@@ -943,6 +954,8 @@ def embed_document_chunks(
                     try:
                         if commit_gate is not None:
                             commit_gate()
+                        # A lost lease means a migration may already be switching.
+                        verify_active_leases(collection)
                         write_response = write_vectors_to_db(
                             collection=collection,
                             embeddings=embeddings_batch,
@@ -955,6 +968,9 @@ def embed_document_chunks(
                             else EmbeddingWriteResponse.model_validate(write_response)
                         )
                         result.current_step = "compute_embeddings"
+                    except CollectionMigratingError:
+                        # Not a store failure: the writer must stop, untouched.
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         result.embedding_count = total_embedding_count
                         raise DatabaseOperationError(
@@ -1214,6 +1230,22 @@ def _process_document_impl(
         - Downstream API layers should surface `result.failed_step` and
           `result.warnings` to callers for better observability.
     """
+    if not holds_lease(collection):
+        # One lease for the whole ingestion, so a migration that starts after
+        # the admission check sees this writer and waits for it.
+        with leased_collections(collection, operation="document-ingestion"):
+            return process_document(
+                collection,
+                source_path,
+                config=config,
+                progress_manager=progress_manager,
+                user_id=user_id,
+                is_admin=is_admin,
+                file_id=file_id,
+                metadata_source_path=metadata_source_path,
+                commit_gate=commit_gate,
+            )
+
     cfg = _apply_spreadsheet_ingestion_safeguards(
         coerce_ingestion_config(config),
         source_path,

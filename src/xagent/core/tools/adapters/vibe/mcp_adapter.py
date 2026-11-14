@@ -79,6 +79,7 @@ from .connector_runtime import (
     runtime_bindings_from_config,
 )
 from .mcp_approval_gate import gate_mcp_tools
+from .mcp_error_envelope import is_error_envelope, speaks_error_envelope
 from .mcp_result_integrity import MCPResultIntegrityGuard
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
@@ -2386,6 +2387,20 @@ class MCPToolAdapter(AbstractBaseTool):
         self._detect_legacy_plain_text_error = (
             str(source_server or "").casefold() == "xero"
         )
+        # In-repo servers return a vendor error as a {"status": "error"}
+        # envelope with isError unset; see mcp_error_envelope. Only a tool
+        # whose wire annotations declare that a repeat adds no effect (read-only
+        # or idempotent) is reclassified. A write's envelope can follow a request
+        # that went out; a failed result reopens normal tools in flash mode, and
+        # the duplicate-write guard covers only declared non-idempotent tools.
+        # An undeclared tool is treated as a write, as classify_write_hint says.
+        self._detect_error_envelope = speaks_error_envelope(connection) and (
+            self.write_hint is MCPWriteHint.READ_ONLY
+            or (
+                isinstance(raw_annotations, Mapping)
+                and raw_annotations.get(_IDEMPOTENT_HINT) is True
+            )
+        )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -3843,6 +3858,12 @@ class MCPToolAdapter(AbstractBaseTool):
             result,
             detect_legacy_plain_text_error=self._detect_legacy_plain_text_error,
         )
+        if (
+            self._detect_error_envelope
+            and not normalized["is_error"]
+            and is_error_envelope(normalized["content"])
+        ):
+            normalized["success"] = False
         if self._is_excel_tool:
             failure_code = _excel_failure_code(normalized)
             if failure_code is not None:

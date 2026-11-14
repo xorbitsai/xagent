@@ -1669,6 +1669,31 @@ async def _cancel_as_read(task_id: int, agent_id: int) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_waiting_run_is_not_waited_on_before_its_cancel_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run waiting for an answer has no coroutine to wait for, so the core
+    writes the row without first stopping one: a resume that started after
+    the target was read must not be cancelled as if it were the aimed run.
+    Only the stop after the write, for a coroutine registered since, runs."""
+    task_id, agent_id, _owner = _waiting_task()
+    _broadcast_manager(monkeypatch)
+    statuses: list[TaskStatus] = []
+
+    async def record_status(_task_id: int, **_kwargs: object) -> SimpleNamespace:
+        statuses.append(_load_task(task_id).status)
+        return SimpleNamespace(requested=False)
+
+    monkeypatch.setattr(
+        task_execution_service.background_task_manager, "cancel_task", record_status
+    )
+
+    await _cancel_as_read(task_id, agent_id)
+
+    assert statuses == [TaskStatus.FAILED]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("storage_version", [1, 2])
 async def test_a_waiting_run_is_cancelled_and_its_question_closed(
     monkeypatch: pytest.MonkeyPatch, storage_version: int

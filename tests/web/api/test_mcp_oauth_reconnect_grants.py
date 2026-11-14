@@ -642,7 +642,14 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     engine, db_session, monkeypatch, provider
 ):
     """A refresh of the earlier grant that is in flight while the callback
-    replaces it selects the new grant instead of failing."""
+    replaces it selects the new grant instead of failing.
+
+    The refresh is answered with a rotated pair that nothing stores, but it is
+    not revoked: the callback replaced the grant on purpose, without revoking,
+    and the provider here ends the whole authorization (user, application and
+    audience) when any token is revoked, as Auth0 does with "Refresh Token
+    Revocation Deletes Grant". Revoking the rotated pair would end the new
+    grant's authorization too."""
     db, user = db_session
     server = _add_server(db, user, AUTH)
     client = _add_client(db, server)
@@ -653,6 +660,17 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     _token_response(monkeypatch, {**ISSUED_TOKENS, "scope": NARROW})
     callback_db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
     refreshed_tokens: list[str] = []
+    authorization = {"alive": True, "revoked": []}
+
+    async def revoke_the_whole_authorization(snapshot):
+        authorization["revoked"].append(snapshot.refresh_token)
+        authorization["alive"] = False
+
+    monkeypatch.setattr(
+        mcp_api,
+        "_revoke_mcp_oauth_issued_token_externally",
+        revoke_the_whole_authorization,
+    )
 
     async def reconnect_during_refresh(
         _client, *, refresh_token, resource, client=None, **_kwargs
@@ -662,7 +680,11 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
             _callback_request("state-inflight"), callback_db
         )
         assert _redirect_query(response) == {"mcp_oauth_success": ["1"]}
-        return {"access_token": "refreshed-earlier-access-token", "scope": FULL}
+        return {
+            "access_token": "refreshed-earlier-access-token",
+            "refresh_token": "rotated-earlier-refresh-token",
+            "scope": FULL,
+        }
 
     monkeypatch.setattr(
         mcp_oauth_service, "_refresh_mcp_oauth_grant", reconnect_during_refresh
@@ -685,6 +707,9 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     assert runtime_auth.grant_id == int(grant.id) != earlier_id
     assert runtime_auth.access_token == "issued-access-token"
     assert runtime_auth.refreshed is False
+    assert authorization == {"alive": True, "revoked": []}
+    assert grant.status == "active"
+    assert decrypt_value(grant.refresh_token) == "issued-refresh-token"
 
 
 REFRESHED_TOKENS = {

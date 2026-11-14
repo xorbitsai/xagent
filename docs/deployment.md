@@ -1011,3 +1011,26 @@ A running task created through `/v1` can now be cancelled. The cancelled task re
 ### Rollback
 
 - A task cancelled before the rollback stays `failed`; an older process does not report `error_code`, so that field is absent from its reads. The cancel endpoint answers 404 again.
+
+## 2026-11-13 — SDK tasks: cancelling a turn that is still queued to start
+
+`POST /v1/chat/tasks/{task_id}/cancel` now also cancels a turn whose start is still queued, instead of answering 409 `task_busy`.
+
+### Client-visible changes
+
+- A new task cancelled before it starts answers 200 and reads `failed` with `error_code` `task_cancelled` and no `run_id`.
+- A turn appended to a finished or paused task and cancelled before it starts is withdrawn: the call answers 200 with `cancelled_run_id` naming the withdrawn run, and the task keeps reading as the turn before it. Calling again answers the same 200. A task paused by an interruption whose appended turn was withdrawn reads `failed` on `GET`, as it does when that turn cannot be started, and the answer reads `failed` too; a task paused on request keeps reading `paused`.
+- When the task has moved since the turn was queued (another run, or a newer version of the same one), so the queued turn can no longer start, the cancel acts on the task as it is now: a running task has that running run cancelled, and the response names it as `cancelled_run_id`.
+- A task that is waiting for an answer or paused, with no turn queued to start, still answers 409 `task_busy`.
+- A cancel that reaches a queued turn after it started cancels it as a running task.
+- A turn queued before it has a run of its own still answers 409 `task_busy`.
+- While a later turn is queued after a completed or failed run, a 200 answer reads `status` `pending` with a null `error_code`, as `GET /v1/chat/tasks/{task_id}` does; `cancelled_run_id` still names the cancelled run. The earlier entry's 200 answered `failed` with `task_cancelled` in that case.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Mixed versions: a cancel aimed at a queued turn names that turn's run, so an older process rejects it as a changed run without writing anything and the endpoint answers 409 `task_busy`, as before. Once the turn has started, a process that predates the cancel endpoint answers 503, as in the earlier entry.
+
+### Rollback
+
+- A queued turn answers 409 `task_busy` again. Turns already withdrawn stay withdrawn.

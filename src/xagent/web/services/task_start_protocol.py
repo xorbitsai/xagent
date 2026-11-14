@@ -11,6 +11,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
@@ -172,6 +173,29 @@ def stage_task_start_command(
     )
 
 
+# Terminal statuses an append is accepted from. With shared execution the row
+# keeps one of them, and the previous turn's output and error, until the
+# queued START is handed off, so a caller waiting for a terminal status would
+# take the previous turn as the new one; such a row reads as ``pending``. A
+# PAUSED row keeps reading as paused, which callers already wait on. A RUNNING
+# or WAITING_FOR_USER row has moved since the START was queued, and a PENDING
+# row already reads as pending.
+QUEUED_START_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+
+
+def queued_start_conditions(task_id: int) -> tuple[ColumnElement[bool], ...]:
+    """Row conditions that select the STARTs of ``task_id`` not handed off.
+
+    The one definition of "queued": ``has_queued_start`` and the SDK cancel's
+    lookup of the queued START both filter with it.
+    """
+    return (
+        TaskExecutionCommand.task_id == task_id,
+        TaskExecutionCommand.kind == TaskCommandKind.START.value,
+        TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+    )
+
+
 def has_queued_start(db: Session, task_id: int) -> bool:
     """Whether an accepted START of ``task_id`` has not been handed off yet.
 
@@ -183,14 +207,43 @@ def has_queued_start(db: Session, task_id: int) -> bool:
     return (
         db.execute(
             select(TaskExecutionCommand.id)
-            .where(
-                TaskExecutionCommand.task_id == task_id,
-                TaskExecutionCommand.kind == TaskCommandKind.START.value,
-                TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
-            )
+            .where(*queued_start_conditions(task_id))
             .limit(1)
         ).first()
         is not None
+    )
+
+
+def start_can_hand_off(command: TaskExecutionCommand, task: Task) -> bool:
+    """Whether the START ``command`` can still begin its run on ``task``.
+
+    The conditions the START consumer applies before it hands a START off
+    that depend on the command and the task row: the payload decodes and
+    matches its command's envelope (``read_task_start_command``), the
+    command's own version and the payload's agree, the row is still the run
+    and version the START was accepted against, nothing is running, and a
+    CREATE finds its task still pending. A START that fails them is rejected
+    when it is claimed and never starts, so a control that aims at it would
+    be aimed at nothing.
+
+    Two consumer checks are not repeated here. ``command_identity_matches_task``
+    re-validates the issuing user's access, and a single-process consumer
+    refuses a START that is not ``existing``. A START either of them rejects
+    never starts either, so treating it as one that can still start only
+    lets a cancel withdraw a turn that would not have run.
+    """
+    try:
+        start = TaskStartPayload.model_validate(command.payload)
+    except ValueError:
+        return False
+    return not (
+        start.run_id != command.target_run_id
+        or start.turn_id != command.command_id
+        or command.target_state_version != start.state_version
+        or task.run_id != start.expected_run_id
+        or task.state_version != start.state_version
+        or task.status == TaskStatus.RUNNING
+        or (start.kind == "create" and task.status != TaskStatus.PENDING)
     )
 
 

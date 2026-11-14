@@ -4706,10 +4706,20 @@ async def _execute_durable_task_command(
     auto_resume = command.kind == TaskCommandKind.RESUME and (
         command.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX)
     )
+    # An SDK cancel aimed at a turn that was still queued when it was
+    # requested targets that turn's run while the row holds the run before
+    # it, or none. Its core compares the target itself, against the run the
+    # payload names.
+    sdk_queued_cancel = (
+        command.kind == TaskCommandKind.CANCEL
+        and command.payload.get("scope") == SDK_COMMAND_SCOPE
+        and _sdk_queued_run_id(command.payload) is not None
+    )
     if (
         command.kind != TaskCommandKind.MESSAGE
         and command.target_run_id is not None
         and not auto_resume
+        and not sdk_queued_cancel
     ):
         current_run_id = await run_db_io_cancellation_safe(
             lambda: _load_command_task_run_id(command.task_id)
@@ -4958,6 +4968,7 @@ async def _execute_durable_task_command(
                             agent_id=agent_id,
                             expected_run_id=command.target_run_id,
                             expected_state_version=target_state_version,
+                            queued_run_id=_sdk_queued_run_id(message_data),
                         )
                     elif scope_value == EXTERNAL_COMMAND_SCOPE:
                         await cancel_external_task_unserialized(
@@ -4994,6 +5005,13 @@ async def _execute_durable_task_command(
     if resume_result is not None:
         result["resume_outcome"] = resume_result.outcome.value
     return result
+
+
+def _sdk_queued_run_id(message_data: dict[str, Any]) -> str | None:
+    """The queued run an SDK cancel names, or ``None`` when it names none."""
+
+    raw = message_data.get("queued_run_id")
+    return raw if isinstance(raw, str) and raw else None
 
 
 def _command_scope(command: ClaimedTaskCommand) -> str | None:

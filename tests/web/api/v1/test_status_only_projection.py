@@ -48,6 +48,7 @@ from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import get_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
 from xagent.web.services import sdk_task_cancel, task_auto_resume, task_event_bridge
 from xagent.web.services.hot_path_cache import (
@@ -59,6 +60,7 @@ from xagent.web.services.hot_path_cache import (
 from xagent.web.services.task_auto_recovery import current_auto_recovery_view
 from xagent.web.services.task_auto_resume import TerminalView, run_auto_resume_tick
 from xagent.web.services.task_lease_service import utc_now
+from xagent.web.services.task_start import SdkTaskScope
 
 from ..conftest import (
     _admin_headers,
@@ -295,12 +297,13 @@ def test_view_call_sites():
 
     computed = [c for c in _calls("status_only_terminal_view") if c[0] != defining]
     # The read surface derives the failed status; the cancel request consults
-    # the same view so it refuses exactly the tasks that read as failed.
+    # the same view, in one place, so it refuses exactly the tasks that read
+    # as failed and answers with the status the read reports.
     cancel_py = pathlib.Path(sdk_task_cancel.__file__).resolve()
     assert sorted(computed) == sorted(
         [
             (tasks_py, "_load_task_info_snapshot"),
-            (cancel_py, "_ended_without_cancel"),
+            (cancel_py, "_paused_reads_failed"),
         ]
     )
 
@@ -733,4 +736,55 @@ def test_web_reads_unchanged_for_sdk(api_db):
     assert info["data"]["status"] == "paused"
     assert info["data"]["auto_recovery"]["auto_resume"]["stop_reason"] == (
         "limit_reached"
+    )
+
+
+@pytest.mark.parametrize("row", ["scheduled", "exhausted"])
+def test_a_withdrawn_append_reads_the_same_in_the_cancel_answer_and_the_task_read(
+    factory, shared_mode, row
+):
+    """Withdrawing an appended turn fails its START, and the task read then
+    reports the paused row as ``failed`` ("the new message could not be
+    started"). The cancel answer, first and repeated, reports that status
+    too, not the stored ``paused``."""
+    tid, principal = _sdk_task(factory, total=20)
+    if row == "exhausted":
+        run_auto_resume_tick()
+    prepared = _accept(factory, tid)
+    scope = SdkTaskScope(agent_id=principal.agent.id, workforce_id=None)
+    with factory() as db:
+        run_id = str(db.get(TaskExecutionCommand, prepared.command_db_id).target_run_id)
+        task = db.get(Task, tid)
+        cancel = sdk_task_cancel._enqueue_cancel(
+            db, task, int(task.state_version), queued_run_id=run_id
+        )
+    assert (
+        sdk_task_cancel._resolve_queued_cancel_target_sync(
+            task_id=tid, agent_id=principal.agent.id, queued_run_id=run_id
+        )
+        is None
+    )
+    with factory() as db:
+        db.get(TaskExecutionCommand, cancel.command_id).status = "completed"
+        db.commit()
+
+    read = v1_tasks._get_chat_task_sync(tid, principal)
+    first = sdk_task_cancel._load_result_sync(
+        task_id=tid,
+        scope=scope,
+        aimed_run_id=run_id,
+        aimed_at_queued_turn=True,
+        command_completed=True,
+    )
+    repeated = sdk_task_cancel._prepare_cancel_sync(task_id=tid, scope=scope)
+
+    assert read.status == "failed"
+    assert read.error == NEW_TURN
+    assert repeated == first
+    assert first.cancelled and first.cancelled_run_id == run_id
+    assert (first.status, first.run_id, first.state_version, first.error_code) == (
+        read.status,
+        read.run_id,
+        read.state_version,
+        read.error_code,
     )

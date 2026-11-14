@@ -107,7 +107,7 @@ from ...services.task_orchestrator import (
     TaskTurnFileBindingError,
     TaskTurnNotFoundError,
 )
-from ...services.task_start_protocol import has_queued_start
+from ...services.task_start_protocol import QUEUED_START_STATUSES, has_queued_start
 from ...services.uploaded_file_store import (
     UploadedFileVersionSnapshot,
     snapshot_uploaded_file_version,
@@ -586,7 +586,7 @@ class _TaskInfoSnapshot:
     # :func:`effective_task_snapshot` and the GET response apply the view.
     view: TerminalView | None = None
     # Set when an appended turn's START is queued and the row still holds the
-    # previous turn (see ``_QUEUED_START_STATUSES``). Applied like ``view``.
+    # previous turn (see ``QUEUED_START_STATUSES``). Applied like ``view``.
     start_queued: bool = False
     # Read from the same row as ``status`` and ``run_id``: the stored
     # structured result of the run the row shows, and whether the task has a
@@ -603,15 +603,6 @@ class _TaskInfoSnapshot:
     # carries a completion_outcome key at all.
     completion_outcome: Any = None
     accept_partial: bool = False
-
-
-# Terminal statuses an append is accepted from. With shared execution the row
-# keeps one of them, and the previous turn's output and error, until the
-# queued START is handed off, so a caller waiting for a terminal status would
-# take the previous turn as the new one. A PAUSED row keeps reading as paused,
-# which callers already wait on. A RUNNING or WAITING_FOR_USER row has moved
-# since the START was queued, and a PENDING row already reads as pending.
-_QUEUED_START_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 
 
 def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
@@ -849,7 +840,7 @@ def _load_task_info_snapshot(
                 db, task
             )
         view: TerminalView | None = None
-        start_queued = queued_before_row and task.status in _QUEUED_START_STATUSES
+        start_queued = queued_before_row and task.status in QUEUED_START_STATUSES
         # The view re-checks both inside its own statement; this only skips
         # the query for reads that cannot be terminal.
         if (
@@ -1540,12 +1531,22 @@ async def cancel_chat_task(
     to stop. 200 means the task is cancelled, including when an earlier
     call already cancelled it; if a new turn has started since, ``status``
     and ``run_id`` describe that turn and ``cancelled_run_id`` names the
-    cancelled one. 202 means the cancel is recorded but not applied yet,
-    and calling again reaches the same request.
+    cancelled one; while a later turn is queued after a completed or failed
+    run the task reads ``pending`` with a null ``error_code``, as ``GET``
+    reads it. 202 means the cancel is recorded but not applied yet, and
+    calling again reaches the same request.
 
-    Only a running task is cancelled. One that is waiting for an answer,
-    paused, or whose turn is still queued to start answers 409
-    ``task_busy`` and is left untouched.
+    A turn still queued to start is cancelled too. For a new task that
+    leaves the task cancelled with no ``run_id``. For a turn appended to a
+    finished or paused task it only withdraws that turn: the task keeps
+    reading as the turn before it, and ``cancelled_run_id`` names the
+    withdrawn run. A queued turn that can no longer start, because the
+    task has moved since it was queued (another run, or a newer version of
+    the same one), is not the target: a running run is cancelled, and any
+    other state is answered as if no turn were queued.
+
+    A task that is waiting for an answer or paused, with no turn queued to
+    start, answers 409 ``task_busy`` and is left untouched.
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.

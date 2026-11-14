@@ -125,6 +125,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    WEB_SEARCH_PROVIDERS,
     XROUTER_EXCLUDED_MODELS,
     ExternalUploadsDirConfigurationError,
     format_file_size,
@@ -240,6 +241,7 @@ from xagent.config import (
     get_uploads_dir,
     get_web_crawl_tls_impersonate,
     get_web_dir,
+    get_brave_search_endpoint,
     get_web_search_provider,
     get_xrouter_excluded_models,
     in_sandbox_tool_runner,
@@ -1024,9 +1026,35 @@ class TestGetWebSearchProvider:
         monkeypatch.setenv(WEB_SEARCH_PROVIDER, " Google ")
         assert get_web_search_provider() == "google"
 
-    def test_invalid_web_search_provider_falls_back_to_auto(self, monkeypatch):
-        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "bing")
+    def test_brave_web_search_provider(self, monkeypatch):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "Brave")
+        assert get_web_search_provider() == "brave"
+
+    def test_empty_web_search_provider_means_auto(self, monkeypatch):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "  ")
         assert get_web_search_provider() == "auto"
+
+    def test_invalid_web_search_provider_fails_closed(self, monkeypatch, caplog):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "bing")
+        with caplog.at_level("ERROR"):
+            provider = get_web_search_provider()
+        assert provider not in WEB_SEARCH_PROVIDERS
+        assert provider != "auto"
+        assert WEB_SEARCH_PROVIDER in caplog.text
+
+
+class TestGetBraveSearchEndpoint:
+    def test_default_and_values(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_BRAVE_SEARCH_ENDPOINT", raising=False)
+        assert get_brave_search_endpoint() == "web"
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", " LLM_Context ")
+        assert get_brave_search_endpoint() == "llm_context"
+
+    def test_unknown_value_uses_web_and_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", "bogus")
+        with caplog.at_level("WARNING"):
+            assert get_brave_search_endpoint() == "web"
+        assert "XAGENT_BRAVE_SEARCH_ENDPOINT" in caplog.text
 
 
 class TestGetWebCrawlTlsImpersonate:

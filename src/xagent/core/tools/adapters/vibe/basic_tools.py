@@ -32,13 +32,14 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
             logger.warning("Skipping %s: stored credential is unreadable", tool_name)
             return [None for _ in fields]
 
-    # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> none
+    # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> Brave -> none
     zhipu_api_key, zhipu_base_url = credentials(
         "zhipu_web_search", "api_key", "base_url"
     )
     (tavily_api_key,) = credentials("tavily_web_search", "api_key")
     google_api_key, google_cse_id = credentials("web_search", "api_key", "cse_id")
     (exa_api_key,) = credentials("exa_web_search", "api_key")
+    (brave_api_key,) = credentials("brave_web_search", "api_key")
     provider = get_web_search_provider()
 
     if provider in ("auto", "zhipu") and zhipu_api_key:
@@ -57,6 +58,10 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
         from .web_search import WebSearchTool
 
         tools.append(WebSearchTool(api_key=google_api_key, cse_id=google_cse_id))
+    elif provider in ("auto", "brave") and brave_api_key:
+        from .brave_web_search import BraveWebSearchTool
+
+        tools.append(BraveWebSearchTool(api_key=brave_api_key))
 
     from .fetch_web_content import FetchWebContentTool
 

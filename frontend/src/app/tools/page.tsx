@@ -868,6 +868,7 @@ function ToolsPageContent() {
     if (tool.name === 'web_search') {
       const description = tool.description.toLowerCase()
       if (description.includes('tavily')) return 'tavily_web_search'
+      if (description.includes('brave')) return 'brave_web_search'
       return 'web_search'
     }
 
@@ -898,6 +899,9 @@ function ToolsPageContent() {
     }
     if (toolName === 'tavily_web_search') {
       return 'Configure Tavily credentials to enable web search without Google setup.'
+    }
+    if (toolName === 'brave_web_search') {
+      return 'Configure Brave Search credentials to enable web search without Google setup.'
     }
     if (toolName === 'web_search') {
       return 'Configure Google Search credentials to enable the web search runtime tool.'

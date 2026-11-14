@@ -921,26 +921,35 @@ async def delete_connected_account(
     ):
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # Snapshot before the delete: it's a bulk-free single-row delete here,
-    # but the same "read the token before it's gone" constraint applies as
-    # in mcp.py's disconnect endpoints -- this must run before db.delete,
-    # while the row (and its access_token) still exists.
-    from .auth import resolve_builtin_oauth_revocation
-
-    revocation = resolve_builtin_oauth_revocation(
-        db,
-        provider=str(account.provider),
-        access_token=str(account.access_token) if account.access_token else "",
-        provider_user_id=(
-            str(account.provider_user_id)
-            if account.provider_user_id is not None
-            else None
-        ),
-    )
-
     from ..services.google_oauth_grants import (
+        GOOGLE_SHARED_OAUTH_PROVIDER,
         detach_google_shared_oauth_legacy_account,
     )
+    from .auth import (
+        _builtin_oauth_provider_for_key,
+        revoke_builtin_oauth_grants,
+        snapshot_builtin_oauth_revocations,
+    )
+
+    # Snapshot before the delete, while the row (and its tokens) still
+    # exists -- the same "read the token before it's gone" constraint as in
+    # mcp.py's disconnect endpoints. Detaching a Google legacy account's last
+    # shared link also deletes the shared ``google`` credential, which this
+    # request never selected, so the user's shared credentials are
+    # snapshotted too; one that survives the detach is still there for the
+    # post-commit reference check, which then skips its revoke. Any other
+    # provider's account has no shared Google link to detach, so it skips
+    # that extra fence and reference work.
+    snapshotted = [account]
+    if _builtin_oauth_provider_for_key(db, str(account.provider)) == "google":
+        snapshotted += (
+            scoped_user_oauth_query(
+                db, user_id=cast(int, user.id), resource_owner_key=None
+            )
+            .filter(UserOAuth.provider == GOOGLE_SHARED_OAUTH_PROVIDER)
+            .all()
+        )
+    revocations = snapshot_builtin_oauth_revocations(db, snapshotted)
 
     detach_google_shared_oauth_legacy_account(
         db,
@@ -950,12 +959,9 @@ async def delete_connected_account(
     db.delete(account)
     db.commit()
 
-    if revocation is not None:
-        from .auth import revoke_builtin_oauth_grants
-
-        await revoke_builtin_oauth_grants(
-            db, [revocation], context=f"deleting connected account {account_id}"
-        )
+    await revoke_builtin_oauth_grants(
+        db, revocations, context=f"deleting connected account {account_id}"
+    )
 
     return {"success": True, "message": "Account deleted successfully"}
 

@@ -157,8 +157,19 @@ def _roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     get_unscoped_file_storage.cache_clear()
     register_scope_resolver(None)
     set_execution_scope_snapshot_loader(load_task_execution_scope_snapshot)
+    # The manager is process-wide and every test here reuses task id 1 on a
+    # fresh database. A run id (or generation, build lock, or runtime boundary)
+    # another test module left behind for that id would make the cleanup fence
+    # skip the runtime as "stale", so reset the cached runtimes and all their
+    # bookkeeping, not just the agents.
     _drop_instance_patches()
-    get_agent_manager()._agents.clear()
+    manager = get_agent_manager()
+    for tracked in (
+        *manager._runtime_bookkeeping_maps(),
+        manager._agent_build_locks,
+        manager._runtime_boundary,
+    ):
+        tracked.clear()
 
     yield uploads
 

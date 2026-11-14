@@ -67,7 +67,7 @@ NETWORK = "Outbound network call (DNS, provider or Google API read): writes no l
 ALLOWED: dict[str, tuple[int, str]] = {
     # -- web/api: HTTP routes ---------------------------------------------------
     "web/api/admin_users.py": (6, HTTP),
-    "web/api/auth.py": (11, HTTP),
+    "web/api/auth.py": (10, HTTP),
     "web/api/chat.py": (8, HTTP),
     "web/api/files.py": (7, HTTP),
     "web/api/kb.py": (16, HTTP),

@@ -307,3 +307,92 @@ async def test_console_trace_leaves_other_tools_alone(caplog):
     with caplog.at_level(logging.INFO):
         await ConsoleTraceHandler().handle_event(event)
     assert EMAIL in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# --- redaction failure fails closed ------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["google", "tavily", "zhipu"])
+async def test_redactor_failure_sends_nothing(provider, monkeypatch, caplog):
+    import xagent.core.tools.core.search_query_redaction as redaction
+    from xagent.core.tools.core.web_search_guard import SearchQueryRedactionError
+
+    events: List[SearchAuditEvent] = []
+    set_search_audit_hook(events.append)
+    monkeypatch.setattr(
+        redaction, "_sub", lambda *a, **k: (_ for _ in ()).throw(RuntimeError(EMAIL))
+    )
+    sent: List[httpx.Request] = []
+    module = {
+        "google": web_search,
+        "tavily": tavily_web_search,
+        "zhipu": zhipu_web_search,
+    }[provider]
+    wire = _install_http(monkeypatch, module, {})
+    core = {
+        "google": WebSearchCore,
+        "tavily": TavilyWebSearchCore,
+        "zhipu": ZhipuWebSearchCore,
+    }[provider]()
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(SearchQueryRedactionError) as info:
+            await core.search(QUERY)
+
+    assert wire.requests == [] and sent == []
+    assert EMAIL not in str(info.value) and "Acme" not in str(info.value)
+    assert len(events) == 1
+    assert events[0].outcome == "failure"
+    assert events[0].failure_kind == "redaction_error"
+    assert events[0].query == "[REDACTED]"
+    assert EMAIL not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_redactor_failure_sends_nothing_exa(monkeypatch):
+    import xagent.core.tools.core.search_query_redaction as redaction
+    from xagent.core.tools.core.web_search_guard import SearchQueryRedactionError
+
+    sent = _install_exa(monkeypatch)
+    monkeypatch.setattr(
+        redaction, "_sub", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+    )
+    with pytest.raises(SearchQueryRedactionError):
+        await ExaWebSearchCore().search(QUERY)
+    assert sent == []
+
+
+# --- hook runs in the tool call's own context --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hook_sees_contextvars_of_the_search_call(monkeypatch):
+    import contextvars
+
+    marker: contextvars.ContextVar[str] = contextvars.ContextVar("marker")
+    seen: List[str] = []
+
+    async def hook(event: SearchAuditEvent) -> None:
+        seen.append(f"async:{marker.get()}")
+
+    def sync_hook(event: SearchAuditEvent) -> None:
+        seen.append(f"sync:{marker.get()}")
+
+    token = marker.set("task-42")
+    try:
+        set_search_audit_hook(hook)
+        with monkeypatch.context() as m:
+            await _run_provider("tavily", m)
+        set_search_audit_hook(sync_hook)
+        with monkeypatch.context() as m:
+            await _run_provider("tavily", m)
+        # a failing call reports from the same context too
+        with monkeypatch.context() as m:
+            _install_http(m, tavily_web_search, {}, status=500)
+            with pytest.raises(ValueError):
+                await TavilyWebSearchCore().search(QUERY)
+    finally:
+        marker.reset(token)
+
+    assert seen == ["async:task-42", "sync:task-42", "sync:task-42"]

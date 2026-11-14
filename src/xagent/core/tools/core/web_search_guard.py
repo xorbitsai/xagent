@@ -3,7 +3,8 @@
 Every provider core routes its ``search`` through :func:`run_guarded_search`:
 
 1. the query is redacted (:mod:`.search_query_redaction`),
-2. the provider is called with the redacted text only,
+2. the provider is called with the redacted text only (if redaction itself
+   fails, nothing is sent: the search fails with ``SearchQueryRedactionError``),
 3. the optional audit hook is called with the redacted query.
 
 The unredacted query exists only inside this function and the caller's
@@ -25,7 +26,7 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Literal, Optional, Tuple, TypeVar, Union
 
-from .search_query_redaction import redact_search_query
+from .search_query_redaction import REDACTION_ERROR, redact_search_query
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,13 @@ class SearchAuditEvent:
     # On failure: the class name of the underlying error (the cause when the
     # core wrapped it, e.g. "ConnectTimeout", "HTTPStatusError"); else None.
     failure_kind: Optional[str] = None
+
+
+class SearchQueryRedactionError(ValueError):
+    """The query could not be redacted, so the search was not sent.
+
+    The message deliberately carries no query text.
+    """
 
 
 SearchAuditHook = Callable[[SearchAuditEvent], Union[None, Awaitable[None]]]
@@ -104,6 +112,23 @@ async def run_guarded_search(
         count_results: Maps the provider's return value to a result count.
     """
     redacted = redact_search_query(query)
+    if REDACTION_ERROR in redacted.entities:
+        # Fail closed: never fall back to the raw query, and never call the
+        # provider with the placeholder either.
+        error = SearchQueryRedactionError(
+            "Web search was not sent because the query could not be redacted."
+        )
+        await _emit(
+            SearchAuditEvent(
+                provider=provider,
+                query=redacted.text,
+                entities=redacted.entities,
+                result_count=None,
+                outcome="failure",
+                failure_kind=REDACTION_ERROR,
+            )
+        )
+        raise error
     try:
         result = await call(redacted.text)
     except Exception as exc:

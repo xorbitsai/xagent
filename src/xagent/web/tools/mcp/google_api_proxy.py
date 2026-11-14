@@ -44,6 +44,7 @@ from .composio_proxy import (
     ProxyResponse,
     check_json_body_size,
     proxy_request,
+    register_pending_batch_requests,
 )
 
 # How many batch requests may be in flight at once. A Gmail message search
@@ -435,7 +436,10 @@ def execute_batch(
 
     A request still unanswered at ``deadline`` reaches its callback as a
     ``TimeoutError``; the batch's own threads are abandoned rather than
-    awaited, so the caller returns inside its budget.
+    awaited, so the caller returns inside its budget. A request that was
+    already sent keeps running under its own proxy timeout and can still be
+    accepted, so a metered Composio tool call registers it and waits for it
+    before it reports how many requests were accepted.
     """
     # BatchHttpRequest keeps its requests, their order and its callbacks in
     # these attributes and googleapiclient has no public accessor for them. A
@@ -496,6 +500,16 @@ def execute_batch(
         _, pending = wait(futures.values(), timeout=deadline)
         for future in pending:
             future.cancel()
+        # A request that is neither cancelled nor finished has started and is
+        # still running past the deadline, so it can still be accepted: a
+        # metered tool call waits for it before it reports its count. A
+        # cancelled request was never sent and can never be accepted, so it is
+        # not registered.
+        register_pending_batch_requests(
+            future
+            for future in futures.values()
+            if not future.cancelled() and not future.done()
+        )
         for request_id, future in futures.items():
             # ``pending`` is a snapshot taken when ``wait`` returned: a
             # request can finish between that snapshot and this loop, and

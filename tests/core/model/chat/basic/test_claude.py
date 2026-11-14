@@ -6,6 +6,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from xagent.core.model.chat.basic.claude import (
+    DEFAULT_CLAUDE_MODEL,
     ClaudeLLM,
     _anthropic_input_usage,
     _fix_pydantic_schema_for_claude,
@@ -34,6 +35,33 @@ class TestClaudeLLM:
     def llm(self, claude_llm_config):
         """Fixture providing Claude LLM instance."""
         return ClaudeLLM(**claude_llm_config)
+
+    def test_default_model_is_not_retired(self):
+        llm = ClaudeLLM(api_key="test-key")
+        assert llm.model_name == DEFAULT_CLAUDE_MODEL
+        assert "claude-3-5-sonnet" not in llm.model_name
+
+    @pytest.mark.asyncio
+    async def test_default_model_request_omits_rejected_params(self, mocker):
+        llm = ClaudeLLM(api_key="test-key")
+        client = mocker.AsyncMock()
+        client.messages.create.return_value = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="Done")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+        llm._client = client
+
+        await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            temperature=0.1,
+            thinking={"type": "enabled", "budget_tokens": 2048},
+        )
+
+        kwargs = client.messages.create.call_args.kwargs
+        assert kwargs["model"] == DEFAULT_CLAUDE_MODEL
+        assert "temperature" not in kwargs
+        assert kwargs["thinking"] == {"type": "adaptive"}
 
     @pytest.mark.asyncio
     async def test_auto_only_model_normalizes_required_tool_choice(self, mocker):

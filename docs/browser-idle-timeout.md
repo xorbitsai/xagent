@@ -48,9 +48,10 @@ refresh token (below) starts a new clock. Refresh, polling,
 and all other requests, including writes, do not.
 
 The browser decides which interactions to report. The server writes at most
-once per login per 60 seconds; extra reports return 200 without a write, so the
-deadline can be up to 60 seconds earlier than the last interaction plus the
-threshold. A report for an expired login is rejected and writes nothing.
+once per login per 60 seconds, enforced in the UPDATE itself, so concurrent
+reports never write twice or move the time backward; extra reports return 200
+without a write, so the deadline can be up to 60 seconds earlier than the last
+interaction plus the threshold. A report for an expired login is rejected and writes nothing.
 
 ## Responses
 
@@ -73,6 +74,9 @@ Login, refresh, Google OIDC exchange, `GET /api/auth/verify` and
 - `enforced: false`: the switch is off. `idle_expires_in` is informational;
   do not log the user out because of it. Keep reporting activity so the data is
   accurate when the switch is turned on.
+- `idle_timeout_seconds` and `idle_expires_in` are the threshold admission
+  enforces, including the stricter set during a rolling change (adapters:
+  `effective_idle_timeout(db, is_platform_admin=...)`).
 - Use `idle_expires_in` (server clock), not a deadline derived from the client
   clock.
 - `absolute_expires_in` is always `null` in Xagent; a deployment with an
@@ -80,9 +84,12 @@ Login, refresh, Google OIDC exchange, `GET /api/auth/verify` and
 
 ## Revocation and rejections
 
-While the switch is on, a login is revoked (`revoked_at`) when a request
-carrying its `sid` arrives after its deadline, when the sweep finds it past its
-deadline, or when it logs out. Every replica runs the sweep every 60 seconds;
+While the switch is on, a login is revoked (`revoked_at`) when the sweep finds
+it past its deadline or when it logs out. A request that finds a login expired
+rejects it without writing: before rejecting it re-reads the committed row, so a
+stale read cannot reject a login another request has just kept alive, and it
+never needs a second database connection. The sweep decides and writes in one
+conditional UPDATE. Every replica runs the sweep every 60 seconds;
 it also deletes rows whose last use is older than the refresh-token lifetime
 plus the access-token lifetime plus one day, when no token for them can still
 be valid. Revocation is keyed by `sid`, so it never affects another login of
@@ -97,7 +104,8 @@ the user.
 
 Once a login is rejected, access-token requests carrying its `sid` and
 refreshes with the user's current refresh token keep returning
-`SessionIdleExpired`. An access token past its own expiry still gets
+`SessionIdleExpired`, except that with the switch on a login not yet revoked by
+the sweep is judged again on each request (see "Rolling threshold change"). An access token past its own expiry still gets
 `TokenExpired`, and a refresh token already replaced by a newer login gets the
 existing invalid-refresh-token error.
 
@@ -117,7 +125,7 @@ switch on renews, every 5 seconds and in a loop of its own, a lease in
 `browser_idle_enforcement`: "these thresholds are enforced until now + 15
 seconds". Each threshold set has its own row, so replicas running different
 thresholds during a rolling change do not overwrite each other; a row only
-moves forward. With the switch off, a replica rejects and revokes a login if,
+moves forward. With the switch off, a replica rejects a login if,
 under any recorded threshold set, its deadline has passed and fell before that
 set's lease ended. A login still valid when the last enforcing replica stopped
 is free at once, and its later activity is recorded as usual. While any
@@ -162,7 +170,13 @@ replica is still enforcing (its lease has not ended), and its activity and
 refresh writes apply the same test. During a rolling change the stricter set
 therefore governs, until replicas with the old set stop renewing; their lease
 ends at most 15 seconds later. With the switch on, a login idle for more than a
-minute adds the same small lease query per decision.
+minute adds the same small lease query per decision, and every response that
+carries `idle_session` reads the leases once.
+
+Because requests reject without revoking, a login that expired and was not yet
+revoked by the sweep (it runs every 60 seconds) is judged again on each request:
+loosening a threshold, or demoting a platform admin, within that interval
+re-admits it under the new threshold, whether or not a request saw it expire.
 
 ## Logout
 

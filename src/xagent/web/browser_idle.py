@@ -220,6 +220,11 @@ def enforcement_leases(db: Session) -> list[EnforcementLease]:
     ]
 
 
+def _active_leases(db: Session, now: datetime) -> list[EnforcementLease]:
+    """Threshold sets some replica is still enforcing (lease not yet ended)."""
+    return [lease for lease in enforcement_leases(db) if lease.until > now]
+
+
 def enforced_until(db: Session) -> datetime | None:
     """The latest lease end over all threshold sets, or None if never enforced."""
     leases = enforcement_leases(db)
@@ -317,12 +322,17 @@ def _alive_condition(
     write cannot revive a login an enforcing replica rejects. Never enforced:
     no condition.
     """
+    current = bool(user.is_admin)
     if policy.enabled:
-        return BrowserSession.last_activity_at > now - idle_timeout(user, policy)
+        # During a rolling threshold change the stricter of this replica's
+        # threshold and every set still being enforced elsewhere governs.
+        cutoff = now - idle_timeout(user, policy)
+        for lease in _active_leases(db, now):
+            cutoff = max(cutoff, now - lease.timeout(current))
+        return BrowserSession.last_activity_at > cutoff
     leases = enforcement_leases(db)
     if not leases:
         return None
-    current = bool(user.is_admin)
     conditions = []
     for lease in leases:
         cutoff_end = min(now, lease.until)
@@ -360,6 +370,14 @@ def _rejects(
     last = _as_utc(cast(datetime, row.last_activity_at))
     if policy.enabled:
         expired = last + idle_timeout(user, policy) <= now
+        if not expired and last <= now - _MIN_THRESHOLD:
+            # During a rolling threshold change the stricter of this
+            # replica's threshold and every set still being enforced governs.
+            current = bool(user.is_admin)
+            expired = any(
+                last + lease.timeout(current) <= now
+                for lease in _active_leases(db, now)
+            )
     else:
         # Switched off: only a login that expired while the policy was still
         # enforced stays dead. A login alive at switch-off is free. No

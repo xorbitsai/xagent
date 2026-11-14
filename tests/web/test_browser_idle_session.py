@@ -524,6 +524,59 @@ def test_a_demotion_while_enforced_never_revives_an_expired_login(enforced):
     _assert_idle_rejection(_refresh(admin))
 
 
+def test_a_demotion_never_revives_a_login_whose_lease_lapsed_at_its_deadline(
+    enforced,
+):
+    """Renewal had stopped before the admin's 15-minute deadline (an outage).
+
+    The lease cannot vouch for that deadline, so the recorded admin role must:
+    demotion does not move the login to the 30-minute threshold.
+    """
+    _users()
+    admin = _login("administrator")
+    _lease_until(datetime.now(timezone.utc) - timedelta(minutes=10))
+    _idle_for(admin, 20)
+    _assert_idle_rejection(_verify(admin))
+
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="administrator").one().is_admin = False
+        session.commit()
+    _assert_idle_rejection(_verify(admin))
+    _assert_idle_rejection(_refresh(admin))
+
+
+@pytest.mark.parametrize(
+    ("switch_on", "lease_ended_minutes_ago"),
+    [
+        # Only the recorded set's lease vouches for the 15-minute deadline.
+        (False, 1),
+        # Only this replica's threshold does: renewal had lapsed before it.
+        (True, 10),
+    ],
+)
+def test_writes_cannot_revive_a_demoted_login(
+    monkeypatch, switch_on, lease_ended_minutes_ago
+):
+    """Each write-fence condition applies the recorded admin role on its own."""
+    _switch(monkeypatch, switch_on)
+    _users()
+    admin = _login("administrator")
+    sid = _sid(admin)
+    _lease_until(
+        datetime.now(timezone.utc) - timedelta(minutes=lease_ended_minutes_ago)
+    )
+    idle_since = _idle_for(admin, 20)
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).filter_by(username="administrator").one()
+        user.is_admin = False
+        session.commit()
+        assert not browser_idle.fence_browser_session_for_refresh(session, user, sid)
+        session.rollback()
+        with pytest.raises(browser_idle.BrowserSessionRejected):
+            browser_idle.record_activity(session, user, sid)
+    assert _as_utc(_row(sid).last_activity_at) == idle_since
+
+
 def test_an_activity_write_during_a_threshold_rollout_follows_the_stricter_set(
     monkeypatch,
 ):

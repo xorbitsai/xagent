@@ -20,8 +20,8 @@ from tests.core.agent.test_react import (
     _tool_call_response,
 )
 from tests.core.agent.test_react_deferred_builtin_schemas import (
-    BuiltinTool,
     CATEGORIES,
+    BuiltinTool,
 )
 from tests.core.agent.test_react_deferred_connector_schemas import ConnectorTool
 from xagent.core.agent.context.execution import ExecutionContext

@@ -72,7 +72,12 @@ PRIORITY_MAX = 10
 
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
-_STOPPED_BEFORE_START = "Task stopped before execution started."
+# What a START stopped before it began records: ``STOPPED_BEFORE_START`` as
+# its error when it is the stopped command itself, and always
+# ``STOPPED_BEFORE_START_REASON`` as the ``rejection_reason`` of its result,
+# by which a reader recognises it.
+STOPPED_BEFORE_START = "Task stopped before execution started."
+STOPPED_BEFORE_START_REASON = "cancelled_before_admission"
 _CONTROL_STOPPED_COMMAND = "Task command stopped by a control request."
 
 
@@ -871,9 +876,9 @@ def settle_queued_start_for_pause(
             )
             .values(
                 status="failed",
-                error=_STOPPED_BEFORE_START,
+                error=STOPPED_BEFORE_START,
                 completed_at=func.now(),
-                result={"rejection_reason": "cancelled_before_admission"},
+                result={"rejection_reason": STOPPED_BEFORE_START_REASON},
             )
             .returning(TaskExecutionCommand.id)
         )
@@ -937,7 +942,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
             status="failed",
             error=_CONTROL_STOPPED_COMMAND,
             completed_at=func.now(),
-            result={"rejection_reason": "cancelled_before_admission"},
+            result={"rejection_reason": STOPPED_BEFORE_START_REASON},
         )
         .returning(TaskExecutionCommand.id)
     ).all()
@@ -1035,7 +1040,7 @@ def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> 
             status="failed",
             error=_CONTROL_STOPPED_COMMAND,
             completed_at=func.now(),
-            result={"rejection_reason": "cancelled_before_admission"},
+            result={"rejection_reason": STOPPED_BEFORE_START_REASON},
         )
         .returning(TaskExecutionCommand.id)
     ).all()

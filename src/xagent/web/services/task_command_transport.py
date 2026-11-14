@@ -864,8 +864,12 @@ def enqueue_task_command(
     payload: dict[str, Any],
     reply_host_id: str | None = None,
     reply_origin: str | None = None,
+    target_run_id: str | None = None,
 ) -> EnqueuedTaskCommand:
     """Commit an idempotent command and return only after it is durable.
+
+    ``target_run_id`` names the run the command is aimed at when it is not
+    the run the task row shows now, as for a turn whose START is queued.
 
     TaskCommandOwnerStateError from stage_task_command's owner pre-flush
     propagates uncaught -- it is deliberately not caught alongside
@@ -884,6 +888,7 @@ def enqueue_task_command(
             payload=payload,
             reply_host_id=reply_host_id,
             reply_origin=reply_origin,
+            target_run_id=target_run_id,
         )
         # Only a newly created row is worth committing, and the commit stays
         # inside this try so that a constraint failure surfacing there rather

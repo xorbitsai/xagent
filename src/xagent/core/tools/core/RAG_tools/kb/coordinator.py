@@ -30,7 +30,11 @@ from ..core.schemas import (
     RegisterDocumentResponse,
     SparseSearchResponse,
 )
-from ..management.migration_state import ensure_collection_writable_async
+from ..management.migration_state import (
+    ensure_collection_writable_async,
+    holding_leases,
+    verify_active_leases,
+)
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
@@ -1031,6 +1035,24 @@ class KBCoordinator:
             hide_missing=True,
         )
         collection = request.collection
+        store = (await self.get_context(request)).metadata_store
+        async with holding_leases(
+            collection, operation="collection-delete", store=store
+        ):
+            return await self._delete_collection_body(
+                request, doc_ids, warnings_out, delete_orphaned_metadata
+            )
+
+    async def _delete_collection_body(
+        self,
+        request: KBContextRequest,
+        doc_ids: list[str] | None,
+        warnings_out: list[str] | None,
+        delete_orphaned_metadata: bool,
+    ) -> CollectionOperationResult:
+        collection = request.collection
+        int_user_id = request.user_id
+        is_admin = request.is_admin
         await self._ensure_writable(request, collection)
 
         handle = await self.open_collection(request)
@@ -1078,6 +1100,7 @@ class KBCoordinator:
         if not is_admin and effective_doc_ids is None:
             effective_doc_ids = affected_doc_ids
 
+        verify_active_leases(collection)
         try:
             if is_admin:
                 result_counts = await run_blocking(
@@ -1230,6 +1253,26 @@ class KBCoordinator:
         )
         old_name = request.collection
         # Source and target (as given and stripped): a frozen row can outlive its collection.
+        store = (await self.get_context(request)).metadata_store
+        async with holding_leases(
+            old_name,
+            new_name,
+            new_name.strip(),
+            operation="collection-rename",
+            store=store,
+        ):
+            return await self._rename_collection_body(
+                request, old_name, new_name, int_user_id, is_admin
+            )
+
+    async def _rename_collection_body(
+        self,
+        request: KBContextRequest,
+        old_name: str,
+        new_name: str,
+        int_user_id: Optional[int],
+        is_admin: bool,
+    ) -> list[str]:
         await self._ensure_writable(request, old_name, new_name, new_name.strip())
 
         handle = await self.open_collection(request)
@@ -1243,6 +1286,8 @@ class KBCoordinator:
         # gate: a hard exception (e.g. no DB connection) propagates out, and
         # per-table failures are returned as a non-empty warnings list (the store
         # catches them per table rather than raising) — short-circuit on those too.
+        verify_active_leases(old_name)
+        verify_active_leases(new_name)
         data_warnings = await run_blocking(
             handle.rename_collection_data,
             new_name,

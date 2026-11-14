@@ -1244,21 +1244,37 @@ class CancelTaskResponse(BaseModel):
 
     200: the run named by ``cancelled_run_id`` is cancelled, whether this
     call did it or an earlier one already had. The other fields describe
-    the task now: it reads ``failed`` with ``error_code='task_cancelled'``
-    unless a new turn has started since, in which case ``status``,
-    ``run_id``, ``state_version`` and ``error_code`` describe that turn.
+    the task now: ``failed`` with ``error_code='task_cancelled'``, unless a
+    new turn has started since, in which case ``status``, ``run_id``,
+    ``state_version`` and ``error_code`` describe that turn, or a later
+    turn is queued to start after a completed or failed run, in which case
+    it reads ``pending`` with a null ``error_code``, as
+    ``GET /v1/chat/tasks/{task_id}`` does. A turn
+    withdrawn before it started leaves the task showing the turn before
+    it, so ``cancelled_run_id`` differs from ``run_id``; calling again
+    answers the same while the task has not moved since.
     202: the cancel was recorded but not applied yet; ``status`` is still
-    the task's current one and ``cancelled_run_id`` is null. Calling again
-    reaches the same request.
+    the task's current one, as ``GET`` reads it, and ``cancelled_run_id``
+    is null. Calling again reaches the same request, including after a
+    queued turn was withdrawn and before the cancel is marked done. A
+    paused task whose automatic resume gave up while the cancel waited,
+    and has not moved since, reads ``failed`` here and is still cancelled
+    by it; calling again reaches the same cancel and answers 200 once it
+    is applied.
     """
 
     task_id: int = Field(..., description="Existing task primary key.")
     status: str = Field(
         ...,
         description=(
-            "Task status as stored: 'failed' once cancelled, the status of a "
-            "turn that started after the cancel, or, on 202, the status the "
-            "cancel is still being applied to."
+            "Task status as stored: 'failed' once cancelled, the previous "
+            "turn's status when a queued turn was withdrawn before it started, "
+            "the status of a turn that started after the cancel, or, on 202, "
+            "the status the cancel is still being applied to. While a turn is "
+            "queued after a completed or failed run it reads 'pending', and a "
+            "task paused by an interruption that automatic resume will no "
+            "longer pick up (for example, after its appended turn was "
+            "withdrawn) reads 'failed', as GET /v1/chat/tasks/{task_id} does."
         ),
     )
     run_id: Optional[str] = Field(..., description="Current execution run identity.")
@@ -1268,15 +1284,18 @@ class CancelTaskResponse(BaseModel):
     cancelled_run_id: Optional[str] = Field(
         ...,
         description=(
-            "The run that was cancelled. Null while the cancel has not been applied."
+            "The run that was cancelled. Differs from run_id when a queued "
+            "turn was withdrawn before it started: the task then still shows "
+            "the turn before it. Null while the cancel has not been applied."
         ),
     )
     error_code: Optional[str] = Field(
         ...,
         description=(
             "'task_cancelled' while the task reads as cancelled, otherwise "
-            "null (before the cancel is applied, or once a later turn has "
-            "started); the same value GET /v1/chat/tasks/{task_id} reports."
+            "null (before the cancel is applied, while a later turn is "
+            "queued, or once a later turn has started); the same value "
+            "GET /v1/chat/tasks/{task_id} reports."
         ),
     )
 

@@ -129,8 +129,10 @@ UPDATE.
   activity or refresh, and enforcing replicas mark the live logins of current
   admins with every lease renewal. With the switch off the stricter of the
   recorded and the current role applies, so a demotion after switch-off revives
-  nothing, except for a promotion made within one renewal interval (5 seconds)
-  before switch-off. Errors go only toward signing out: a user demoted while the
+  nothing. Exception: a promotion made within the last renewal interval
+  (5 seconds) before switch-off can go unrecorded; that interval bounds when a
+  promotion can be missed, not how long such a login stays usable after a
+  later demotion. Errors go only toward signing out: a user demoted while the
   switch was on, or promoted after it, whose login is idle between the two
   thresholds is signed out once more.
 - **Cost with the switch off**: decisions read the lease rows directly, with no
@@ -153,6 +155,14 @@ UPDATE.
   access token is accepted again after switch-off until its own expiry.
 - **Turning it back on**: logins idle beyond the threshold during the off
   period expire at once.
+
+**Rolling threshold change.** While the switch is on, a replica rejects a login
+that expired under its own thresholds or under any threshold set another
+replica is still enforcing (its lease has not ended), and its activity and
+refresh writes apply the same test. During a rolling change the stricter set
+therefore governs, until replicas with the old set stop renewing; their lease
+ends at most 15 seconds later. With the switch on, a login idle for more than a
+minute adds the same small lease query per decision.
 
 ## Logout
 

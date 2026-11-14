@@ -135,8 +135,8 @@ describe("api-wrapper idle expiry", () => {
     expect(response.status).toBe(401)
     expect(beforeReplay).toHaveBeenCalledTimes(1)
     expect(fetchMock.mock.calls.filter(([input]) => !isRefresh(input))).toHaveLength(1)
-    // The login itself is kept; only this request is dropped.
-    expect(readAuthCache()).not.toBeNull()
+    // The login itself is kept with its newer credentials; only this request is dropped.
+    expect(readAuthCache()?.token).toBe(scenario === "rotated" ? "rotated-access" : "new-access")
   })
 
   it("tells the caller that a refresh was refused because the login expired", async () => {

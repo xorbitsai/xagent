@@ -1600,7 +1600,10 @@ def _resolve_effective_embedding_model_sync_impl(
 
 
 def resolve_effective_embedding_model_read_only(
-    collection_name: str, config_model_id: Optional[str] = None
+    collection_name: str,
+    config_model_id: Optional[str] = None,
+    *,
+    collection_info: Optional[Any] = None,
 ) -> Optional[str]:
     """The model search resolves for ``collection_name``, writing nothing.
 
@@ -1608,15 +1611,17 @@ def resolve_effective_embedding_model_read_only(
     model, ingestion config, table inference, config — but without the access
     mark and without persisting an inferred binding, so a migration report or a
     dry run leaves ``collection_metadata`` untouched. ``None`` when nothing
-    resolves.
+    resolves. A caller that already read the row strictly passes it as
+    ``collection_info``, so a failed re-read cannot pass for a missing row.
     """
     config_model_id = _normalize_model_id(config_model_id)
-    try:
-        collection_info = get_collection_sync(collection_name)
-    except ValueError as e:
-        if "not found" in str(e):
-            return config_model_id
-        raise
+    if collection_info is None:
+        try:
+            collection_info = get_collection_sync(collection_name)
+        except ValueError as e:
+            if "not found" in str(e):
+                return config_model_id
+            raise
     try:
         return _effective_model_from_info(
             collection_name, collection_info, config_model_id, persist=False
@@ -1625,13 +1630,20 @@ def resolve_effective_embedding_model_read_only(
         return None
 
 
-def pin_inferred_embedding_binding(collection_name: str) -> Optional[str]:
-    """Persist the binding search would infer for an inference-only collection.
+def pin_inferred_embedding_binding(
+    collection_name: str,
+    *,
+    measure_dimension: Optional[Callable[[], Optional[int]]] = None,
+) -> Optional[str]:
+    """Bind an inference-only collection to the model search infers for it.
 
-    The same write search makes on its first query, without the access mark.
-    Returns the stored binding afterwards, or ``None`` when the collection
-    already resolves through a binding or its ingestion config. Raises
-    ``ValueError`` when nothing could be inferred or stored.
+    The binding is written with the same ``require_uninitialized`` compare-and-
+    set search uses, but complete: search ignores a binding without a dimension,
+    so the stored vectors are measured with ``measure_dimension`` (a
+    variable-length column has no ``list_size`` to infer from). Returns the stored
+    model, or ``None`` when the collection already resolves through a complete
+    binding or its ingestion config. Raises ``ValueError`` unless a complete
+    binding is stored afterwards.
     """
     info = get_collection_sync(collection_name)
     if info.is_initialized and _normalize_model_id(info.embedding_model_id):
@@ -1639,13 +1651,32 @@ def pin_inferred_embedding_binding(collection_name: str) -> Optional[str]:
     config = info.ingestion_config
     if config is not None and _normalize_model_id(config.embedding_model_id):
         return None
-    _effective_model_from_info(collection_name, info, None, persist=True)
-    stored = _normalize_model_id(
-        get_collection_sync(collection_name).embedding_model_id
+    from ..utils.migration_utils import _infer_embedding_config_from_collection
+
+    inferred, inferred_dimension = _infer_embedding_config_from_collection(
+        collection_name
     )
-    if not stored:
+    inferred = _normalize_model_id(inferred)
+    if not inferred:
+        raise ValueError(f"Collection '{collection_name}': no model could be inferred")
+    dimension = measure_dimension() if measure_dimension is not None else None
+    if inferred_dimension is None:
+        inferred_dimension = dimension
+    elif dimension is not None and dimension != inferred_dimension:
         raise ValueError(
-            f"Collection '{collection_name}': the inferred binding was not stored"
+            f"Collection '{collection_name}': table dimension {inferred_dimension} "
+            f"differs from the stored vectors' {dimension}"
+        )
+    if inferred_dimension is None:
+        raise ValueError(
+            f"Collection '{collection_name}': the dimension of '{inferred}' is unknown"
+        )
+    _persist_inferred_binding(collection_name, info, inferred, inferred_dimension)
+    fresh = get_collection_sync(collection_name)
+    stored = _normalize_model_id(fresh.embedding_model_id)
+    if not fresh.is_initialized or not stored:
+        raise ValueError(
+            f"Collection '{collection_name}': no complete binding was stored"
         )
     return stored
 

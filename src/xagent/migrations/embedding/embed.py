@@ -19,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
@@ -43,13 +43,16 @@ from xagent.migrations.embedding.scope import (
     SearchableChunk,
     add_scope_args,
     collection_engine,
+    collection_filter,
     collection_info,
     connection,
     embeddings_table,
+    iter_rows,
     iter_source_chunks,
     iter_source_doc_ids,
     resolve_collection_names,
     skip_reason,
+    source_embeddings_table,
     source_model_id,
     target_chunk_ids,
     writable_embeddings_table,
@@ -243,7 +246,7 @@ def embed_collection(
     """Copy one collection's searchable chunks the target model lacks."""
     conn = conn if conn is not None else connection()
     report = CollectionReport(name=name)
-    info = collection_info(name)
+    info = collection_info(name, conn)
     report.engine = collection_engine(info)
     if not report.engine:
         report.collection_skip = SKIP_UNREADABLE_BINDING
@@ -273,7 +276,10 @@ def embed_collection(
         # Target rows must not reach search's table inference while the
         # source is unbound: pin what search itself would persist.
         try:
-            pinned = pin_source_binding(name)
+            source = report.source_model_id
+            pinned = pin_source_binding(
+                name, lambda: source_dimension(name, source, conn=conn)
+            )
         except Exception as exc:  # noqa: BLE001 - refuse rather than write unpinned
             return _refuse(report, SKIP_SOURCE_UNPINNED, str(exc))
         if pinned is not None:
@@ -542,12 +548,31 @@ def _verify_written(
         logger.error("%s: %d documents lost chunks while writing", name, len(shortfall))
 
 
-def pin_source_binding(name: str) -> Optional[str]:
+def pin_source_binding(
+    name: str, measure_dimension: Callable[[], Optional[int]]
+) -> Optional[str]:
     from xagent.core.tools.core.RAG_tools.management.collection_manager import (
         pin_inferred_embedding_binding,
     )
 
-    return pin_inferred_embedding_binding(name)
+    return pin_inferred_embedding_binding(name, measure_dimension=measure_dimension)
+
+
+def source_dimension(name: str, model_id: str, *, conn: Any) -> Optional[int]:
+    """Length of the collection's stored source vectors, when they agree."""
+    table = source_embeddings_table(model_id, conn)
+    if table is None:
+        return None
+    lengths = {
+        len(row["vector"])
+        for row in iter_rows(conn, table, collection_filter(name), ["vector"])
+        if row.get("vector") is not None
+    }
+    if len(lengths) > 1:
+        raise MigrationCliError(
+            f"source vectors of '{name}' have mixed lengths {sorted(lengths)}"
+        )
+    return lengths.pop() if lengths else None
 
 
 def _refuse(report: CollectionReport, reason: str, error: str) -> CollectionReport:

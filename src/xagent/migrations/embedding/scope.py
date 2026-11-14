@@ -219,6 +219,7 @@ def source_model_id(collection: str, info: Any) -> Optional[str]:
         resolved = resolve_effective_embedding_model_read_only(
             collection,
             config_model_id=getattr(info, "embedding_model_id", None),
+            collection_info=info,
         )
     except ValueError as exc:
         logger.warning("%s: no effective embedding model: %s", collection, exc)
@@ -226,17 +227,35 @@ def source_model_id(collection: str, info: Any) -> Optional[str]:
     return _normalize_model_id(resolved) or None
 
 
-def collection_info(collection: str) -> Any:
-    """The collection's metadata row; a missing collection is a hard error."""
-    from xagent.core.tools.core.RAG_tools.management.collection_manager import (
-        get_collection_sync,
-    )
+def collection_info(collection: str, conn: Optional[Any] = None) -> Any:
+    """The collection's metadata row, read strictly.
 
+    ``get_collection`` reports every store or decoding failure as "not found";
+    here only an absent row is :class:`MissingCollectionError`. A failed read
+    raises as itself, and a row that does not decode is a ``MigrationCliError``.
+    """
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    conn = conn if conn is not None else connection()
+    if METADATA_TABLE not in table_names(conn):
+        raise MissingCollectionError(f"collection '{collection}' does not exist")
+    table = conn.open_table(METADATA_TABLE)
     try:
-        return get_collection_sync(collection)
-    except ValueError as exc:
-        raise MissingCollectionError(
-            f"collection '{collection}' does not exist"
+        rows = (
+            table.search()
+            .where(f"name = '{escape_lancedb_string(collection)}'")
+            .to_arrow()
+            .to_pylist()
+        )
+    finally:
+        _safe_close_table(table)
+    if not rows:
+        raise MissingCollectionError(f"collection '{collection}' does not exist")
+    try:
+        return CollectionInfo.from_storage(rows[0])
+    except Exception as exc:  # noqa: BLE001 - reported on the collection
+        raise MigrationCliError(
+            f"collection '{collection}' metadata does not decode: {exc}"
         ) from exc
 
 
@@ -274,8 +293,10 @@ def iter_source_doc_ids(
         collection_filter(collection),
         ["doc_id", "chunk_id"],
     ):
+        # A chunkless row is counted when its document is read; counting it
+        # here too would count it twice.
         doc_id = str(row.get("doc_id") or "").strip()
-        if not doc_id or not str(row.get("chunk_id") or "").strip():
+        if not doc_id:
             unaddressable += 1
             continue
         ids.add(doc_id)
@@ -476,13 +497,18 @@ def resolve_target(model_id: str) -> Tuple[str, Optional[int]]:
 
 
 def scope_collection(
-    name: str, target_model_id: Optional[str] = None, *, conn: Optional[Any] = None
+    name: str,
+    target_model_id: Optional[str] = None,
+    *,
+    conn: Optional[Any] = None,
+    target: Optional[Tuple[str, Optional[int]]] = None,
 ) -> CollectionScope:
     """Count what a migration would copy for one collection."""
-    target_dimension: Optional[int] = None
-    if target_model_id:
-        target_model_id, target_dimension = resolve_target(target_model_id)
-    info = collection_info(name)
+    if target is None and target_model_id:
+        target = resolve_target(target_model_id)
+    target_model_id, target_dimension = target if target else (None, None)
+    conn = conn if conn is not None else connection()
+    info = collection_info(name, conn)
     item = CollectionScope(name=name, engine=collection_engine(info))
     if not item.engine:
         item.skip_reason = SKIP_UNREADABLE_BINDING
@@ -495,7 +521,6 @@ def scope_collection(
         item.skip_reason = SKIP_NO_SOURCE_MODEL
         return item
 
-    conn = conn if conn is not None else connection()
     have = (
         target_chunk_ids(name, target_model_id, conn=conn, dimension=target_dimension)
         if target_model_id
@@ -524,11 +549,13 @@ def scope_report(
     """Count what a migration would copy, per collection, changing nothing."""
     names = resolve_collection_names(collections=collections, team=team)
     explicit = bool(collections)
+    # Once, before the loop: an unresolvable target stops the run (exit 2).
+    target = resolve_target(target_model_id) if target_model_id else None
     conn = connection()
     report: List[CollectionScope] = []
     for name in names:
         try:
-            item = scope_collection(name, target_model_id, conn=conn)
+            item = scope_collection(name, conn=conn, target=target)
         except MissingCollectionError as exc:
             if explicit:
                 raise
@@ -536,11 +563,13 @@ def scope_report(
             logger.warning("%s: %s", name, exc)
             report.append(CollectionScope(name=name, skip_reason=SKIP_NO_METADATA))
             continue
-        except MigrationCliError as exc:
-            # A collection that exists but cannot be read (a schema error) is a
-            # failure of the report, kept per collection so the rest still print.
+        except Exception as exc:  # noqa: BLE001 - kept on the collection, exit 1
+            # A collection that exists but cannot be read is a failure of the
+            # report, kept per collection so the rest are still checked.
             logger.error("%s: %s", name, exc)
-            report.append(CollectionScope(name=name, error=str(exc)))
+            report.append(
+                CollectionScope(name=name, error=f"{type(exc).__name__}: {exc}")
+            )
             continue
         if item.skip_reason:
             logger.warning("%s: skipped (%s)", name, item.skip_reason)

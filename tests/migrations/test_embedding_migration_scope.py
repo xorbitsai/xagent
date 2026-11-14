@@ -12,6 +12,14 @@ from xagent.migrations.embedding import scope as mod
 from xagent.migrations.embedding.scope import MigrationCliError, SearchableChunk
 
 
+def _bound_info(bound: Optional[str]) -> Any:
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    return CollectionInfo(
+        name="kb", embedding_model_id=bound, embedding_dimension=2 if bound else None
+    )
+
+
 @pytest.fixture(autouse=True)
 def _stub_target(monkeypatch: pytest.MonkeyPatch) -> None:
     """--model resolution needs the model hub; tests pin it to a 2-d stub."""
@@ -187,10 +195,10 @@ def _wire_collection(
     bound: Optional[str] = "old",
     info_error: Optional[BaseException] = None,
 ) -> None:
-    def _info(name: str) -> Any:
+    def _info(name: str, conn: Any = None) -> Any:
         if info_error is not None:
             raise info_error
-        return SimpleNamespace(embedding_model_id=bound)
+        return _bound_info(bound)
 
     monkeypatch.setattr(mod, "collection_info", _info)
     monkeypatch.setattr(mod, "collection_engine", lambda info: engine)
@@ -295,38 +303,6 @@ def test_an_unreadable_binding_does_not_stop_the_run(
     monkeypatch.setattr(coordinator_mod, "resolve_collection_backend", _explode)
 
     assert mod.collection_engine(SimpleNamespace()) == ""
-
-
-def test_collection_info_reports_a_missing_collection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from xagent.core.tools.core.RAG_tools.management import (
-        collection_manager as collection_manager_mod,
-    )
-
-    def _missing(name: str) -> Any:
-        raise ValueError("Collection not found")
-
-    monkeypatch.setattr(collection_manager_mod, "get_collection_sync", _missing)
-
-    with pytest.raises(MigrationCliError, match="does not exist"):
-        mod.collection_info("kb")
-
-
-def test_collection_info_does_not_hide_other_read_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from xagent.core.tools.core.RAG_tools.management import (
-        collection_manager as collection_manager_mod,
-    )
-
-    def _broken(name: str) -> Any:
-        raise OSError("disk gone")
-
-    monkeypatch.setattr(collection_manager_mod, "get_collection_sync", _broken)
-
-    with pytest.raises(OSError):
-        mod.collection_info("kb")
 
 
 def test_explicit_collections_are_trimmed_and_deduplicated() -> None:
@@ -588,18 +564,20 @@ def test_the_source_model_falls_back_to_the_configuration(
 
     calls: List[Any] = []
 
-    def _resolve(name: str, config_model_id: Optional[str] = None) -> str:
-        calls.append((name, config_model_id))
+    def _resolve(
+        name: str, config_model_id: Optional[str] = None, collection_info: Any = None
+    ) -> str:
+        calls.append((name, config_model_id, collection_info))
         return "from-config"
 
     monkeypatch.setattr(
         collection_manager_mod, "resolve_effective_embedding_model_read_only", _resolve
     )
 
-    assert mod.source_model_id("kb", SimpleNamespace(embedding_model_id=None)) == (
-        "from-config"
-    )
-    assert calls == [("kb", None)]
+    info = SimpleNamespace(embedding_model_id=None)
+    assert mod.source_model_id("kb", info) == "from-config"
+    # The strictly read row is used, not re-read through the lenient manager.
+    assert calls == [("kb", None, info)]
 
 
 @pytest.mark.parametrize("missing", ["text", "user_id", "doc_id", "chunk_id"])
@@ -789,7 +767,7 @@ def test_scope_and_dry_run_write_nothing_to_collection_metadata(
         [_chunk_row(), _chunk_row(chunk_id="chunk-2")],
     )
     monkeypatch.setattr(
-        mod, "collection_info", lambda name: cm.get_collection_sync(name)
+        mod, "collection_info", lambda name, conn=None: cm.get_collection_sync(name)
     )
     before = _metadata_snapshot()
 
@@ -813,7 +791,9 @@ def test_an_explicit_model_is_resolved_like_embed(
         )
         or set(),
     )
-    monkeypatch.setattr(mod, "collection_info", lambda name: SimpleNamespace())
+    monkeypatch.setattr(
+        mod, "collection_info", lambda name, conn=None: _bound_info(None)
+    )
     monkeypatch.setattr(mod, "collection_engine", lambda info: "lancedb")
     monkeypatch.setattr(mod, "source_model_id", lambda name, info: "source-model")
     monkeypatch.setattr(mod, "iter_source_chunks", lambda *a, **k: iter([]))
@@ -831,7 +811,7 @@ def test_a_discovered_collection_with_a_schema_error_fails_the_report(
         mod, "resolve_collection_names", lambda **kwargs: ["bad", "gone", "ok"]
     )
 
-    def _scope(name: str, target: Any, *, conn: Any) -> Any:
+    def _scope(name: str, target: Any = None, *, conn: Any, **kwargs: Any) -> Any:
         if name == "bad":
             raise mod.MigrationCliError("source table is missing column 'user_id'")
         if name == "gone":
@@ -858,7 +838,7 @@ def test_a_collection_that_vanished_after_discovery_is_not_a_failure(
         mod, "resolve_collection_names", lambda **kwargs: ["gone", "ok"]
     )
 
-    def _scope(name: str, target: Any, *, conn: Any) -> Any:
+    def _scope(name: str, target: Any = None, *, conn: Any, **kwargs: Any) -> Any:
         if name == "gone":
             raise mod.MissingCollectionError("collection 'gone' does not exist")
         return mod.CollectionScope(name=name)
@@ -869,15 +849,125 @@ def test_a_collection_that_vanished_after_discovery_is_not_a_failure(
     assert mod.main([]) == 0
 
 
-def test_a_missing_collection_raises_the_missing_error(
+# --- round 3: a strict metadata read, and per-collection read failures ---
+
+
+def _saved(name: str = "kb") -> None:
+    import asyncio
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(name=name, embedding_model_id="old", embedding_dimension=2)
+        )
+    )
+
+
+def test_an_absent_row_is_the_only_missing_collection() -> None:
+    with pytest.raises(mod.MissingCollectionError):
+        mod.collection_info("kb")
+    _saved("other")
+    with pytest.raises(mod.MissingCollectionError):
+        mod.collection_info("kb")
+    assert mod.collection_info("other").embedding_model_id == "old"
+
+
+def test_a_row_that_does_not_decode_is_not_a_missing_collection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
 
-    def _missing(name: str) -> Any:
-        raise ValueError(f"Collection '{name}' not found")
-
-    monkeypatch.setattr(cm, "get_collection_sync", _missing)
-
-    with pytest.raises(mod.MissingCollectionError):
+    _saved()
+    mod.connection().open_table(mod.METADATA_TABLE).update(
+        "name = 'kb'", {"extra_metadata": "{not json"}
+    )
+    # The manager reports this row as "not found"; the strict read must not.
+    with pytest.raises(ValueError, match="not found"):
+        cm.get_collection_sync("kb")
+    with pytest.raises(mod.MigrationCliError) as raised:
         mod.collection_info("kb")
+    assert not isinstance(raised.value, mod.MissingCollectionError)
+
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+    (item,) = mod.scope_report()
+    assert item.error and item.skip_reason is None
+    assert mod.main([]) == 1
+
+
+def test_a_metadata_store_failure_is_kept_on_the_collection_and_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _saved("ok")
+    _saved("bad")
+    real = mod.connection()
+
+    class _Conn:
+        def open_table(self, name: str) -> Any:
+            table = real.open_table(name)
+            if name != mod.METADATA_TABLE:
+                return table
+
+            class _Broken:
+                def search(self) -> Any:
+                    class _Q:
+                        def where(self, where: str) -> Any:
+                            if "'bad'" in where:
+                                raise OSError("metadata store unavailable")
+                            return table.search().where(where)
+
+                    return _Q()
+
+                def __getattr__(self, attr: str) -> Any:
+                    return getattr(table, attr)
+
+            return _Broken()
+
+        def __getattr__(self, attr: str) -> Any:
+            return getattr(real, attr)
+
+    monkeypatch.setattr(mod, "connection", lambda: _Conn())
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["bad", "ok"])
+
+    report = {item.name: item for item in mod.scope_report()}
+
+    assert "metadata store unavailable" in (report["bad"].error or "")
+    assert report["bad"].skip_reason is None
+    assert report["ok"].error is None
+    assert mod.main([]) == 1
+
+
+def test_a_reader_failure_does_not_stop_the_other_collections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["a", "b"])
+
+    def _scope(name: str, target: Any = None, *, conn: Any, **kwargs: Any) -> Any:
+        if name == "a":
+            raise RuntimeError("batch read failed")
+        return mod.CollectionScope(name=name)
+
+    monkeypatch.setattr(mod, "scope_collection", _scope)
+    monkeypatch.setattr(mod, "connection", lambda: object())
+
+    report = mod.scope_report()
+
+    assert [item.name for item in report] == ["a", "b"]
+    assert "batch read failed" in (report[0].error or "")
+    assert mod.main([]) == 1
+
+
+def test_an_unresolvable_target_stops_the_run_before_any_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _unknown(model_id: str) -> Any:
+        raise mod.MigrationCliError("no such model")
+
+    monkeypatch.setattr(mod, "resolve_target", _unknown)
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["a"])
+    monkeypatch.setattr(
+        mod, "scope_collection", lambda *a, **k: pytest.fail("not reached")
+    )
+
+    assert mod.main(["--model", "nope"]) == 2

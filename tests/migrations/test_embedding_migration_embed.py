@@ -14,6 +14,14 @@ from xagent.migrations.embedding import scope
 from xagent.migrations.embedding.scope import MigrationCliError
 
 
+def _bound_info(bound: Optional[str]) -> Any:
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+
+    return CollectionInfo(
+        name="kb", embedding_model_id=bound, embedding_dimension=2 if bound else None
+    )
+
+
 class _StubAdapter(BaseEmbedding):
     def __init__(self) -> None:
         self.calls: List[Union[str, List[str]]] = []
@@ -60,7 +68,7 @@ _REAL_PIN = mod.pin_source_binding
 @pytest.fixture(autouse=True)
 def _bound_source(monkeypatch: pytest.MonkeyPatch) -> None:
     """Most collections here are bound; the pinning tests restore the real call."""
-    monkeypatch.setattr(mod, "pin_source_binding", lambda name: None)
+    monkeypatch.setattr(mod, "pin_source_binding", lambda name, measure: None)
 
 
 class _Query:
@@ -133,7 +141,7 @@ def _wire(
     monkeypatch.setattr(
         mod,
         "collection_info",
-        lambda name: __import__("types").SimpleNamespace(embedding_model_id=bound),
+        lambda name, conn=None: _bound_info(bound),
     )
     monkeypatch.setattr(mod, "collection_engine", lambda info: engine)
     monkeypatch.setattr(
@@ -363,10 +371,10 @@ def test_one_collection_crashing_does_not_stop_the_run(
     _wire(monkeypatch, conn)
     monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["a", "b"])
 
-    def _info(name: str) -> Any:
+    def _info(name: str, conn: Any = None) -> Any:
         if name == "a":
             raise OSError("metadata gone")
-        return __import__("types").SimpleNamespace(embedding_model_id="old")
+        return _bound_info("old")
 
     monkeypatch.setattr(mod, "collection_info", _info)
 
@@ -641,7 +649,7 @@ def test_a_short_vector_batch_is_a_failure(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(
         mod,
         "collection_info",
-        lambda name: __import__("types").SimpleNamespace(embedding_model_id="old"),
+        lambda name, conn=None: _bound_info("old"),
     )
     monkeypatch.setattr(mod, "collection_engine", lambda info: "lancedb")
     monkeypatch.setattr(
@@ -953,7 +961,9 @@ def _legacy_name(model_id: str) -> Any:
     return legacy_embeddings_table_name(model_id)
 
 
-def _create_embeddings_table(conn: Any, name: str, rows: Any) -> None:
+def _create_embeddings_table(
+    conn: Any, name: str, rows: Any, *, variable: bool = False
+) -> None:
     schema = pa.schema(
         [
             ("collection", pa.string()),
@@ -964,10 +974,18 @@ def _create_embeddings_table(conn: Any, name: str, rows: Any) -> None:
             ("text", pa.string()),
             ("chunk_hash", pa.string()),
             ("metadata", pa.string()),
-            ("vector", pa.list_(pa.float32(), 2)),
+            (
+                "vector",
+                pa.list_(pa.float32()) if variable else pa.list_(pa.float32(), 2),
+            ),
         ]
     )
-    conn.create_table(name, data=pa.Table.from_pylist(rows, schema=schema))
+    data = pa.Table.from_pylist(rows, schema=schema)
+    if variable:
+        # Created from data, LanceDB narrows a uniform list to a fixed size.
+        conn.create_table(name, schema=schema).add(data)
+    else:
+        conn.create_table(name, data=data)
 
 
 def _embedding_row(chunk_id: str, model_id: str) -> Any:
@@ -1240,7 +1258,9 @@ def _hub(*ids: str) -> Any:
     }
 
 
-def _inference_only_collection(monkeypatch: pytest.MonkeyPatch) -> Any:
+def _inference_only_collection(
+    monkeypatch: pytest.MonkeyPatch, *, variable: bool = False
+) -> Any:
     import asyncio
 
     from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
@@ -1267,6 +1287,7 @@ def _inference_only_collection(monkeypatch: pytest.MonkeyPatch) -> Any:
             {**_embedding_row(f"c{i}", "z-source"), "doc_id": f"doc-{i % 2}"}
             for i in range(4)
         ],
+        variable=variable,
     )
     assert cm.resolve_effective_embedding_model_read_only("kb") == "z-source"
     return conn
@@ -1308,7 +1329,7 @@ def test_a_pin_that_lands_on_another_model_refuses_the_write(
 ) -> None:
     _make_collection()
     _install_source_stub(monkeypatch)
-    monkeypatch.setattr(mod, "pin_source_binding", lambda name: "someone-else")
+    monkeypatch.setattr(mod, "pin_source_binding", lambda name, measure: "someone-else")
     adapter = _FixedAdapter()
 
     report = mod.embed_collection(
@@ -1331,7 +1352,9 @@ def test_a_dry_run_pins_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     _make_collection()
     _install_source_stub(monkeypatch)
     calls: List[str] = []
-    monkeypatch.setattr(mod, "pin_source_binding", calls.append)
+    monkeypatch.setattr(
+        mod, "pin_source_binding", lambda name, measure: calls.append(name)
+    )
 
     mod.embed_collection(
         "kb",
@@ -1373,3 +1396,153 @@ def test_a_pin_that_could_not_be_stored_refuses_the_write(
     assert report.collection_skip == mod.SKIP_SOURCE_UNPINNED
     assert report.chunks_embedded == 0
     assert "embeddings_a_target" not in scope.table_names(conn)
+
+
+def test_a_variable_length_source_is_pinned_complete_before_the_first_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+    from xagent.core.tools.core.RAG_tools.utils.migration_utils import (
+        _infer_embedding_config_from_collection,
+    )
+
+    _inference_only_collection(monkeypatch, variable=True)
+    # No list_size: inference alone cannot say how wide the vectors are.
+    assert _infer_embedding_config_from_collection("kb")[1] is None
+    routed: List[Any] = []
+    real_write = mod._write_chunks
+
+    def _write_then_search(*args: Any, **kwargs: Any) -> None:
+        real_write(*args, **kwargs)
+        info = cm.get_collection_sync("kb")
+        routed.append(
+            (
+                cm.resolve_effective_embedding_model_sync("kb"),
+                info.embedding_model_id,
+                info.embedding_dimension,
+            )
+        )
+
+    monkeypatch.setattr(mod, "_write_chunks", _write_then_search)
+
+    report = _embed_into_a_target()
+
+    assert report.failures == [] and report.source_binding_pinned
+    assert routed and routed[0] == ("z-source", "z-source", 2)
+    assert all(item[0] == "z-source" for item in routed)
+
+
+def test_a_source_without_a_measurable_dimension_is_refused_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _inference_only_collection(monkeypatch, variable=True)
+    monkeypatch.setattr(mod, "source_dimension", lambda *a, **k: None)
+
+    report = _embed_into_a_target()
+
+    assert report.collection_skip == mod.SKIP_SOURCE_UNPINNED
+    assert "embeddings_a_target" not in scope.table_names(conn)
+
+
+def test_mixed_length_source_vectors_are_refused() -> None:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    conn = get_vector_index_store().get_raw_connection()
+    _create_embeddings_table(
+        conn,
+        "embeddings_mixed",
+        [
+            {**_embedding_row("c0", "m"), "vector": [0.5, 0.5]},
+            {**_embedding_row("c1", "m"), "vector": [0.5, 0.5, 0.5]},
+        ],
+        variable=True,
+    )
+    from unittest.mock import patch
+
+    with patch.object(mod, "source_embeddings_table", lambda m, c: "embeddings_mixed"):
+        with pytest.raises(MigrationCliError, match="mixed lengths"):
+            mod.source_dimension("kb", "m", conn=conn)
+
+
+def test_excluded_rows_are_counted_once_and_as_scope_counts_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        embeddings_table_candidates,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    _make_collection()
+    conn = get_vector_index_store().get_raw_connection()
+    rows = [
+        _embedding_row("c0", "old-model"),
+        # Same document, no chunk id: excluded once, in the document's pass.
+        {**_embedding_row("c1", "old-model"), "chunk_id": None},
+        # No document at all: excluded once, before any document is read.
+        {**_embedding_row("c2", "old-model"), "doc_id": None},
+        # A document whose only row is excluded.
+        {**_embedding_row("c3", "old-model"), "doc_id": "doc-x", "chunk_id": None},
+    ]
+    _create_embeddings_table(conn, embeddings_table_candidates("old-model")[0], rows)
+
+    report = mod.embed_collection(
+        "kb",
+        model_id="new-model",
+        embedding_config=EmbeddingModelConfig(
+            id="new-model", model_name="stub", dimension=2
+        ),
+        embedding_adapter=_FixedAdapter(),
+        cfg=_config(),
+        dry_run=True,
+        source="old-model",
+    )
+    scoped = scope.scope_collection("kb", conn=conn, target=("new-model", 2))
+
+    assert report.skipped == {scope.SKIP_NO_DOC_ID: 3}
+    assert scoped.skipped == report.skipped
+    assert report.chunks_pending == scoped.missing_chunks == 1
+
+
+def test_a_pin_with_an_unknown_dimension_stores_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    _inference_only_collection(monkeypatch, variable=True)
+
+    with pytest.raises(ValueError, match="unknown"):
+        cm.pin_inferred_embedding_binding("kb", measure_dimension=lambda: None)
+    assert cm.get_collection_sync("kb").embedding_model_id is None
+
+
+def test_a_pin_that_stored_no_dimension_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    _inference_only_collection(monkeypatch, variable=True)
+    real = cm._persist_inferred_binding
+    monkeypatch.setattr(
+        cm,
+        "_persist_inferred_binding",
+        lambda name, info, model, dimension: real(name, info, model, None),
+    )
+
+    with pytest.raises(ValueError, match="complete binding"):
+        cm.pin_inferred_embedding_binding("kb", measure_dimension=lambda: 2)
+
+
+def test_a_measured_dimension_that_contradicts_the_table_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    _inference_only_collection(monkeypatch)
+
+    with pytest.raises(ValueError, match="differs"):
+        cm.pin_inferred_embedding_binding("kb", measure_dimension=lambda: 3)
+    assert cm.get_collection_sync("kb").embedding_model_id is None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from typing import Any, List, Optional
 
@@ -13,11 +14,16 @@ class InMemoryMemoryStore(MemoryStore):
 
     def __init__(self) -> None:
         self._store: dict[str, MemoryNote] = {}
+        # Serializes the check-then-write of ``update`` against ``delete``, so
+        # an update never re-creates a note deleted while it ran (the same
+        # contract as ``LanceDBMemoryStore.update``).
+        self._lock = threading.Lock()
 
     def add(self, note: MemoryNote) -> MemoryResponse:
         note_id = note.id or str(uuid.uuid4())
         note.id = note_id
-        self._store[note_id] = note
+        with self._lock:
+            self._store[note_id] = note
         return MemoryResponse(success=True, memory_id=note_id)
 
     def get(self, note_id: str) -> MemoryResponse:
@@ -30,21 +36,23 @@ class InMemoryMemoryStore(MemoryStore):
             )
 
     def update(self, note: MemoryNote) -> MemoryResponse:
-        if note.id is None or note.id not in self._store:
-            return MemoryResponse(
-                success=False, error="Note not found or ID missing", memory_id=note.id
-            )
-        self._store[note.id] = note
+        """Replace a stored note, only while it still exists (never re-creates it)."""
+        with self._lock:
+            if note.id is None or note.id not in self._store:
+                return MemoryResponse(
+                    success=False,
+                    error="Note not found or ID missing",
+                    memory_id=note.id,
+                )
+            self._store[note.id] = note
         return MemoryResponse(success=True, memory_id=note.id)
 
     def delete(self, note_id: str) -> MemoryResponse:
-        if note_id in self._store:
-            del self._store[note_id]
+        with self._lock:
+            deleted = self._store.pop(note_id, None) is not None
+        if deleted:
             return MemoryResponse(success=True, memory_id=note_id)
-        else:
-            return MemoryResponse(
-                success=False, error="Note not found", memory_id=note_id
-            )
+        return MemoryResponse(success=False, error="Note not found", memory_id=note_id)
 
     def search(
         self,
@@ -64,7 +72,8 @@ class InMemoryMemoryStore(MemoryStore):
         return results[:k]
 
     def clear(self) -> None:
-        self._store.clear()
+        with self._lock:
+            self._store.clear()
 
     def list_all(self, filters: Optional[dict[str, Any]] = None) -> List[MemoryNote]:
         if filters:

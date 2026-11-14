@@ -90,6 +90,14 @@ class _RetryRuntimeGrantSelection(RuntimeError):
         self.message = message
 
 
+class _RefreshedGrantGone(_RetryRuntimeGrantSelection):
+    """The grant was deleted or revoked while its refresh request was in flight.
+
+    The token endpoint has already issued a replacement for it that no row can
+    hold any more.
+    """
+
+
 class _InvalidGrantRefreshError(MCPOAuthRuntimeError):
     """The token endpoint answered ``invalid_grant`` for the grant being refreshed."""
 
@@ -822,6 +830,10 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
         encrypted_refresh_token = str(grant.refresh_token)
         refresh_token = decrypt_value(encrypted_refresh_token)
         refresh_resource = str(grant.resource)
+        # What a reconnect that replaces this grant keeps equal (see
+        # ``_replaced_by_an_active_grant``), read while the row still exists.
+        grant_client_id = int(grant.mcp_oauth_client_id)
+        grant_issuer = str(grant.issuer)
         oauth_client_snapshot = SimpleNamespace(
             token_endpoint=str(grant.oauth_client.token_endpoint),
             client_id=str(grant.oauth_client.client_id),
@@ -829,6 +841,10 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
             token_endpoint_auth_method=str(
                 grant.oauth_client.token_endpoint_auth_method or "none"
             ),
+            # Read now: the client row can be deleted with its server while
+            # the request below is in flight, and the revocation after a
+            # refresh that lost its grant needs the revocation endpoint.
+            metadata_json=grant.oauth_client.metadata_json,
         )
         refresh_db.rollback()
 
@@ -914,7 +930,29 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                 .with_for_update()
                 .first()
             )
-            if locked_grant is None or not _runtime_grant_matches(
+            if locked_grant is None or locked_grant.status != "active":
+                if _replaced_by_an_active_grant(
+                    refresh_db,
+                    grant_id=grant_id,
+                    server_id=server_id,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    client_id=grant_client_id,
+                    issuer=grant_issuer,
+                    resource=refresh_resource,
+                ):
+                    # Reconnected meanwhile: the successor is the live
+                    # authorization, so the retry selects it and the response
+                    # is dropped unrevoked.
+                    raise _RetryRuntimeGrantSelection(
+                        "authorization_required",
+                        "MCP OAuth grant changed while preparing runtime authorization",
+                    )
+                raise _RefreshedGrantGone(
+                    "authorization_required",
+                    "MCP OAuth grant changed while preparing runtime authorization",
+                )
+            if not _runtime_grant_matches(
                 locked_grant,
                 server_id=server_id,
                 user_id=user_id,
@@ -997,8 +1035,111 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
             )
 
         return runtime_auth
+    except _RefreshedGrantGone:
+        # ``refresh_db.begin()`` rolled back on the way out, so no database
+        # lock is held while the provider is called.
+        await _revoke_tokens_issued_to_a_gone_grant(
+            oauth_client_snapshot, grant_id=grant_id, token_data=token_data
+        )
+        raise
     finally:
         refresh_db.close()
+
+
+def _replaced_by_an_active_grant(  # noqa: PLR0913
+    db: Any,
+    *,
+    grant_id: int,
+    server_id: int,
+    user_id: int,
+    resource_owner_key: str,
+    client_id: int,
+    issuer: str,
+    resource: str,
+) -> bool:
+    """Whether the owner holds another active grant in place of ``grant_id``.
+
+    A reconnect that grants a different scope deletes the earlier grant as
+    superseded and stores its successor in one callback transaction
+    (``_delete_superseded_mcp_oauth_grants``), deliberately without revoking at
+    the provider: a provider whose revocation ends the whole authorization (a
+    user, application and audience grant) would take the successor with it.
+    The key is the one that supersession matches on.
+
+    Call it after the locked re-read has found ``grant_id`` deleted or
+    inactive. The deletion and the successor commit together, so a read that
+    sees the grant gone starts after that commit and sees the successor too.
+
+    One window stays, accepted because it is narrow: a grant that was really
+    deleted (a disconnect) and then a brand-new reconnect that commits
+    between this read and the provider call in
+    ``_revoke_tokens_issued_to_a_gone_grant``. That call then revokes tokens
+    the new authorization may share. Closing it would need coordination
+    between reconnect and refresh that this deliberately does not add.
+    """
+    from ..models.mcp_oauth import MCPOAuthGrant
+
+    return (
+        db.query(MCPOAuthGrant.id)
+        .filter(
+            MCPOAuthGrant.id != grant_id,
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource_owner_key == resource_owner_key,
+            MCPOAuthGrant.mcp_oauth_client_id == client_id,
+            MCPOAuthGrant.issuer == issuer,
+            MCPOAuthGrant.resource == resource,
+            MCPOAuthGrant.status == "active",
+        )
+        .first()
+        is not None
+    )
+
+
+async def _revoke_tokens_issued_to_a_gone_grant(
+    oauth_client: Any, *, grant_id: int, token_data: dict[str, Any]
+) -> None:
+    """Revoke the token pair a refresh issued after its grant was deleted or revoked.
+
+    The grant was deleted (a server disconnect, a workspace removal) or revoked
+    while the token endpoint request was in flight, so the replacement pair
+    that came back is persisted nowhere and nobody can revoke it later. A
+    provider that rotates refresh tokens has invalidated the old one but left
+    the new pair usable, and revoking only the old token at disconnect time
+    does not touch it. Best effort, like every other revocation here: a
+    failure is logged and never raised into the refresh caller.
+
+    Only for a grant that is gone with no successor
+    (``_replaced_by_an_active_grant``): a reconnect that replaced it owns the
+    live authorization, which revoking this response could end.
+
+    Reuses the revocation of a token whose final persistence failed
+    (``_revoke_mcp_oauth_issued_token_externally``); ``flow_id`` is only the
+    label that helper logs, here the grant's id.
+    """
+    from ..api.mcp import (
+        _mcp_oauth_issued_token_snapshot,
+        _revoke_mcp_oauth_issued_token_externally,
+    )
+
+    logger.warning(
+        "MCP OAuth grant %s was deleted or revoked while its token refresh was "
+        "in flight; revoking the tokens the refresh issued",
+        grant_id,
+    )
+    try:
+        await _revoke_mcp_oauth_issued_token_externally(
+            _mcp_oauth_issued_token_snapshot(
+                client=oauth_client, flow_id=grant_id, token_data=token_data
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Revoking the tokens a refresh issued for gone MCP OAuth grant %s "
+            "failed (exception_type=%s)",
+            grant_id,
+            type(exc).__name__,
+        )
 
 
 def select_mcp_oauth_owner(

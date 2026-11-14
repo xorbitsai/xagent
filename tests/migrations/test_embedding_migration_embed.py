@@ -870,7 +870,7 @@ def test_a_target_fallback_table_holding_the_collection_refuses_the_migration(
     monkeypatch.setattr(
         scope,
         "_legacy_spelling",
-        lambda model_id: ("embeddings_new_legacy" if model_id == "new-model" else None),
+        lambda model_id: "embeddings_new_legacy" if model_id == "new-model" else None,
     )
 
     assert (
@@ -929,25 +929,27 @@ def test_a_delete_that_takes_the_core_rows_leaves_no_target_row(
     real = mod.write_vectors_to_db
     injected = {"done": False}
 
-    def _delete_core_rows_then_write(**kwargs: Any) -> Any:
+    def _delete_the_document_then_write(**kwargs: Any) -> Any:
         if not injected["done"]:
             injected["done"] = True
-            # The cascade deletes the core rows first and sweeps embedding
-            # tables it can see; this target table does not exist yet.
+            # A document delete takes the vectors first and the core rows after;
+            # this target table does not exist yet, so its sweep cannot see it.
+            _store().delete_embedding_records(
+                "kb", "d1", model_tag=SOURCE_MODEL, is_admin=True
+            )
             scope.connection().open_table("chunks").delete("doc_id = 'd1'")
         return real(**kwargs)
 
-    monkeypatch.setattr(mod, "write_vectors_to_db", _delete_core_rows_then_write)
+    monkeypatch.setattr(mod, "write_vectors_to_db", _delete_the_document_then_write)
 
     report = _run()
 
     assert report.failures == []
     remaining = {row["doc_id"] for row in _rows_in(scope.source_table(TARGET.id))}
     assert remaining == {"d2"}
-    # The source row is still there: only the core table says the chunk is gone.
+    # Both sides are gone, so the write the copy landed is the one to remove.
     assert {row["doc_id"] for row in _rows_in(scope.source_table(SOURCE_MODEL))} == {
-        "d1",
-        "d2",
+        "d2"
     }
 
 
@@ -1209,3 +1211,317 @@ def test_a_retirement_sweeps_a_target_table_a_precompute_created_meanwhile(
     assert report.failures == []
     target = {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))}
     assert "c1" not in target
+
+
+# --- a delete or a retirement that fails can be retried whole ---
+
+_CORE_SCHEMA = pa.schema(
+    [
+        ("collection", pa.string()),
+        ("doc_id", pa.string()),
+        ("chunk_id", pa.string()),
+        ("user_id", pa.int64()),
+    ]
+)
+
+
+def _core(rows: List[Dict[str, Any]]) -> None:
+    _table("chunks", rows, schema=_CORE_SCHEMA)
+
+
+def _store() -> Any:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    return get_vector_index_store()
+
+
+def _emb(doc_id: str, chunk_id: str) -> Dict[str, Any]:
+    return {
+        "collection": "kb",
+        "doc_id": doc_id,
+        "chunk_id": chunk_id,
+        "parse_hash": "p",
+        "model": "m1",
+        "vector": [0.1, 0.2],
+        "vector_dimension": 2,
+        "text": f"secret {chunk_id}",
+        "chunk_hash": "h",
+        "created_at": datetime.now(timezone.utc),
+        "metadata": "{}",
+        "user_id": None,
+    }
+
+
+def _emb_rows(doc_id: str) -> List[str]:
+    conn = scope.connection()
+    return sorted(
+        row["chunk_id"]
+        for row in conn.open_table("embeddings_m1")
+        .search()
+        .where(f"doc_id = '{doc_id}'")
+        .to_arrow()
+        .to_pylist()
+    )
+
+
+def _doc_rows(doc_id: str) -> int:
+    conn = scope.connection()
+    return conn.open_table("documents").count_rows(f"doc_id = '{doc_id}'")
+
+
+def _chunk_rows(doc_id: str) -> int:
+    conn = scope.connection()
+    return conn.open_table("chunks").count_rows(f"doc_id = '{doc_id}'")
+
+
+def test_a_document_delete_that_fails_on_embeddings_can_be_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collections as mc
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    _save_collection()
+    _seed_retirable_core()
+    store = _store()
+    store.upsert_embeddings("m1", [_emb("d1", "c1"), _emb("d1", "c2")])
+    real = lancedb_stores._vis_delete_rows_by_filters
+    failed = {"once": False}
+
+    def _fail_embeddings(table: Any, filters: List[str]) -> int:
+        if getattr(table, "name", "").startswith("embeddings_") and not failed["once"]:
+            failed["once"] = True
+            raise OSError("injected embedding delete failure")
+        return real(table, filters)
+
+    monkeypatch.setattr(lancedb_stores, "_vis_delete_rows_by_filters", _fail_embeddings)
+
+    with pytest.raises(Exception):
+        store.delete_documents_data("kb", ["d1"], None, True)
+
+    # Vectors go first: the failed attempt left every core row, document
+    # included, so nothing a retry reads is gone.
+    assert _doc_rows("d1") == 1
+    assert _chunk_rows("d1") == 2
+    assert _emb_rows("d1") == ["c1", "c2"]
+    monkeypatch.setattr(lancedb_stores, "_vis_delete_rows_by_filters", real)
+
+    result = mc.delete_document("kb", "d1", 1, is_admin=True)
+
+    assert result.status == "success", result.message
+    assert _doc_rows("d1") == 0
+    assert _emb_rows("d1") == []
+
+
+def test_a_retirement_that_fails_on_vectors_can_be_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+
+    _save_collection()
+    _seed_retirable_core()
+    _store().upsert_embeddings("m1", [_emb("d1", "c1"), _emb("d1", "c2")])
+    real = LanceDBCollectionHandle.delete_embedding_records
+    failed = {"once": False}
+
+    def _fail_once(handle: Any, doc_id: str, **kwargs: Any) -> int:
+        if not failed["once"]:
+            failed["once"] = True
+            raise OSError("injected")
+        return real(handle, doc_id, **kwargs)
+
+    monkeypatch.setattr(LanceDBCollectionHandle, "delete_embedding_records", _fail_once)
+
+    with pytest.raises(OSError):
+        _handle().retire_superseded_chunks("d1", "p")
+
+    # The chunk rows are still there, so the retry can find the stale chunk.
+    assert _handle().stale_chunks("d1", "p") == {("p", "cfg-old"): ["c1"]}
+    assert _emb_rows("d1") == ["c1", "c2"]
+
+    assert _handle().retire_superseded_chunks("d1", "p") == ["c1"]
+    assert "c1" not in _emb_rows("d1")
+
+
+def test_a_delete_reports_no_success_when_the_final_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management import collections as mc
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_cleanup_filters
+
+    _save_collection()
+    _seed_retirable_core()
+    store = _store()
+    store.upsert_embeddings("m1", [_emb("d1", "c1"), _emb("d1", "c2")])
+    real = lancedb_cleanup_filters.select_embedding_tables
+    calls = {"n": 0}
+
+    def _flaky(conn: Any, model_tag: Optional[str] = None) -> List[str]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("listing failed")
+        return real(conn, model_tag=model_tag)
+
+    monkeypatch.setattr(lancedb_cleanup_filters, "select_embedding_tables", _flaky)
+
+    with pytest.raises(Exception):
+        store.delete_documents_data("kb", ["d1"], None, True)
+
+    assert calls["n"] == 2
+    monkeypatch.setattr(lancedb_cleanup_filters, "select_embedding_tables", real)
+
+    # Not reported as a success, and still deletable through the document's row.
+    assert _doc_rows("d1") == 1
+    result = mc.delete_document("kb", "d1", 1, is_admin=True)
+    assert result.status == "success", result.message
+    assert _doc_rows("d1") == 0
+    assert _emb_rows("d1") == []
+
+
+def test_the_generic_cascade_sweeps_a_table_a_writer_created_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    _save_collection()
+    _seed_retirable_core()
+    store = _store()
+    store.upsert_embeddings("m1", [_emb("d1", "c1")])
+    late = scope.source_table(TARGET.id)
+    real = lancedb_stores._vis_delete_rows_by_filters
+    created: List[str] = []
+
+    def _writer_commits_during_the_core_delete(table: Any, filters: List[str]) -> int:
+        if not created and getattr(table, "name", "") == "chunks":
+            # A copy that sampled the source while the core rows still existed
+            # creates its table while this delete runs.
+            scope.connection().create_table(
+                late,
+                data=pa.Table.from_pylist(
+                    [_row("c1", model=TARGET.id)], schema=_SCHEMA
+                ),
+            )
+            created.append(late)
+        return real(table, filters)
+
+    monkeypatch.setattr(
+        lancedb_stores,
+        "_vis_delete_rows_by_filters",
+        _writer_commits_during_the_core_delete,
+    )
+
+    result = store.cascade_delete(
+        target="document",
+        collection="kb",
+        doc_id="d1",
+        is_admin=True,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert created == [late]
+    assert _rows_in(late) == []
+    assert result["documents"] == 1
+
+
+# --- a precompute run that ends early still removes what it left ---
+
+
+def test_a_write_that_fails_partway_leaves_no_target_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _core(
+        [
+            {"collection": "kb", "doc_id": "d1", "chunk_id": chunk_id, "user_id": 7}
+            for chunk_id in ("c1", "c2", "c3")
+        ]
+    )
+    _source([_row("c1"), _row("c2"), _row("c3")])
+    real = mod.write_vectors_to_db
+    state = {"n": 0}
+
+    def _delete_then_write(**kwargs: Any) -> Any:
+        state["n"] += 1
+        if state["n"] == 1:
+            scope.connection().open_table("chunks").delete("doc_id = 'd1'")
+            _delete_document("d1", everywhere=True)
+        return real(**kwargs)
+
+    monkeypatch.setattr(mod, "write_vectors_to_db", _delete_then_write)
+
+    report = _run(_Adapter(fail_on=["text c3"]), batch_size=2)
+
+    assert [failure.doc_id for failure in report.failures] == ["d1"]
+    assert _rows_in(scope.source_table(TARGET.id)) == []
+
+    monkeypatch.setattr(mod, "write_vectors_to_db", real)
+    _run()
+    assert _rows_in(scope.source_table(TARGET.id)) == []
+
+
+def test_an_interrupted_run_sweeps_the_rows_it_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _core([{"collection": "kb", "doc_id": "d1", "chunk_id": "c1", "user_id": 7}])
+    _source([_row("c1")])
+    real = mod._verify_written
+
+    def _delete_the_document_then_interrupt(*args: Any, **kwargs: Any) -> None:
+        # A delete completes after the copy's last per-document reconcile, and
+        # then the run is stopped: only the sweep on the way out sees the row.
+        real(*args, **kwargs)
+        _store().delete_embedding_records(
+            "kb", "d1", model_tag=SOURCE_MODEL, is_admin=True
+        )
+        scope.connection().open_table("chunks").delete("doc_id = 'd1'")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(mod, "_verify_written", _delete_the_document_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run()
+
+    assert _rows_in(scope.source_table(TARGET.id)) == []
+
+
+def test_a_rerun_removes_the_rows_of_a_document_that_is_gone() -> None:
+    _save_collection()
+    _seed_target(["c1"])
+    _core([{"collection": "kb", "doc_id": "d2", "chunk_id": "c2", "user_id": 7}])
+    _source([_row("c2", doc_id="d2")])
+
+    report = _run()
+
+    assert report.failures == []
+    assert report.chunks_removed >= 1
+    remaining = {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert remaining == {"c2"}
+
+
+def test_a_document_the_core_table_never_had_is_reported_not_emptied() -> None:
+    _save_collection()
+    _core([{"collection": "kb", "doc_id": "other", "chunk_id": "x", "user_id": 7}])
+    _source([_row("c1"), _row("c2")])
+    adapter = _Adapter()
+
+    report = _run(adapter)
+
+    assert [failure.doc_id for failure in report.failures] == ["d1"]
+    assert "UnknownLiveness" in report.failures[0].error
+    assert report.chunks_embedded == 0
+    # Kept: a store that never had the chunk rows must not lose its vectors.
+    assert {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))} == {
+        "c1",
+        "c2",
+    }
+
+    rerun = _Adapter()
+    second = _run(rerun)
+
+    assert rerun.calls == []
+    assert second.failures == []

@@ -533,8 +533,11 @@ def core_chunk_ids(
     """The document's chunk ids in the core chunks table, or ``None`` without one.
 
     A document delete and a retirement delete these rows before they sweep
-    embedding tables, so they — not the embeddings ledger a copy sampled
-    earlier — say whether a chunk was deleted while it was being encoded.
+    embedding tables, so these — not the embeddings ledger a copy sampled
+    earlier — say whether a chunk was deleted while it was being encoded. An
+    empty set for a document the source still has is no such evidence: the
+    document may never have been written here at all (see
+    :func:`embed._live_chunk_ids`).
     """
     conn = conn if conn is not None else connection()
     if CORE_TABLE not in table_names(conn):
@@ -546,6 +549,39 @@ def core_chunk_ids(
     return {
         str(row.get("chunk_id") or "")
         for row in iter_rows(conn, CORE_TABLE, where, ["chunk_id"])
+    }
+
+
+def core_chunk_pairs(
+    collection: str, *, conn: Optional[Any] = None
+) -> Optional[Set[Tuple[str, str]]]:
+    """Every ``(doc_id, chunk_id)`` the core chunks table holds, or ``None`` without one."""
+    conn = conn if conn is not None else connection()
+    if CORE_TABLE not in table_names(conn):
+        return None
+    return {
+        (str(row.get("doc_id") or ""), str(row.get("chunk_id") or ""))
+        for row in iter_rows(
+            conn,
+            CORE_TABLE,
+            collection_filter(collection),
+            ["doc_id", "chunk_id"],
+        )
+    }
+
+
+def source_doc_ids(
+    collection: str, model_id: str, *, conn: Optional[Any] = None
+) -> Set[str]:
+    """Every document the source table still has a row for, excluded ones included."""
+    conn = conn if conn is not None else connection()
+    table = source_table(model_id)
+    if table not in table_names(conn):
+        return set()
+    return {
+        str(row.get("doc_id") or "").strip()
+        for row in iter_rows(conn, table, collection_filter(collection), ["doc_id"])
+        if row.get("doc_id")
     }
 
 
@@ -575,6 +611,7 @@ def target_chunk_ids(
     *,
     conn: Optional[Any] = None,
     dimension: Optional[int] = None,
+    rows_out: Optional[List[Dict[str, Any]]] = None,
 ) -> Set[str]:
     """The chunk_ids the target model already holds *with a usable vector*.
 
@@ -582,22 +619,26 @@ def target_chunk_ids(
     read failure: the migration creates the table on its first write. A row
     counts only when its ``model`` column names the target and its vector is
     finite, non-zero and the right dimension; anything else is not held, so a
-    rerun repairs it.
+    rerun repairs it. ``rows_out`` collects the rows this model wrote, with
+    their table, so a sweep can reuse this scan.
     """
     from xagent.migrations.embedding.embed import _validate_vector
 
     conn = conn if conn is not None else connection()
     names = table_names(conn)
     held: Set[str] = set()
+    columns = ["chunk_id", "vector", "model"]
+    if rows_out is not None:
+        columns += ["doc_id", "user_id", "text"]
     for table in readable_tables(model_id):
         if table not in names:
             continue
-        for row in iter_rows(
-            conn, table, collection_filter(collection), ["chunk_id", "vector", "model"]
-        ):
+        for row in iter_rows(conn, table, collection_filter(collection), columns):
             chunk_id = str(row.get("chunk_id") or "")
             if not chunk_id or not written_by(row, model_id):
                 continue
+            if rows_out is not None:
+                rows_out.append({**row, "table": table})
             try:
                 _validate_vector(row.get("vector"), dimension)
                 dimension = len(row["vector"])

@@ -12,6 +12,7 @@ lacks and the switch phase can re-run it to pick up writes since.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import math
 import sys
@@ -39,15 +40,18 @@ from xagent.migrations.embedding.scope import (
     collection_filter,
     connection,
     core_chunk_ids,
+    core_chunk_pairs,
     iter_rows,
     iter_source_chunks,
     resolve_collection_names,
     scan_source,
     skip_reason,
+    source_doc_ids,
     source_eligibility,
     source_table,
     table_names,
     target_chunk_ids,
+    written_by,
 )
 
 logger = logging.getLogger(__name__)
@@ -250,104 +254,162 @@ def embed_collection(
         logger.warning("%s: skipped (%s)", name, SKIP_TARGET_IS_SOURCE)
         return report
 
+    target_rows: List[Dict[str, Any]] = []
     have = target_chunk_ids(
-        name, model_id, conn=conn, dimension=embedding_config.dimension
+        name,
+        model_id,
+        conn=conn,
+        dimension=embedding_config.dimension,
+        rows_out=None if dry_run else target_rows,
     )
     scan = scan_source(name, report.source_model_id, have=have, conn=conn)
     report.skipped.update(scan.skipped)
     report.documents_total = len(scan.documents)
     report.chunks_pending = scan.chunks_pending
+    if not dry_run and target_rows:
+        # A run that died partway leaves target rows no core chunk backs, and
+        # nothing else ever visits those documents again.
+        report.chunks_removed += _sweep_target(
+            name,
+            model_id,
+            report.source_model_id,
+            conn=conn,
+            rows=target_rows,
+        )
     consecutive_failures = 0
     # (doc_id, chunk_id) only: the text is not kept after its write.
     written: List[Tuple[str, str]] = []
-    # One document at a time: its rows are not contiguous in the table, so a
-    # window of documents would split its counts and failures across windows.
-    for doc_id in sorted(scan.usable_documents):
-        if doc_id not in scan.pending:
-            report.documents_unchanged += 1
-            continue
-        if dry_run:
-            report.documents_embedded += 1
-            continue
-        items = [
-            chunk
-            for chunk in iter_source_chunks(
-                name, report.source_model_id, conn=conn, doc_id=doc_id
-            )
-            if skip_reason(chunk) is None and chunk.chunk_id not in have
-        ]
-        if not items:
-            continue
-        try:
-            _write_chunks(
-                name,
-                items,
-                model_id=model_id,
-                embedding_config=embedding_config,
-                embedding_adapter=embedding_adapter,
-                cfg=cfg,
-            )
-            removed = _reconcile_document(
-                name,
-                doc_id,
-                source_model_id=report.source_model_id,
-                model_id=model_id,
-                conn=conn,
-                report=report,
-            )
-        except Exception as exc:  # noqa: BLE001 - continue with the next document
-            consecutive_failures += 1
-            report.failures.append(
-                DocumentFailure(doc_id, f"{type(exc).__name__}: {exc}")
-            )
-            logger.error(
-                "%s/%s: embedding failed: %s", name, doc_id, exc, exc_info=True
-            )
-            if consecutive_failures >= MAX_CONSECUTIVE_DOCUMENT_FAILURES:
-                report.aborted = True
-                logger.error(
-                    "%s: aborting after %d consecutive document failures",
-                    name,
-                    consecutive_failures,
+    try:
+        # One document at a time: its rows are not contiguous in the table, so a
+        # window of documents would split its counts and failures across windows.
+        for doc_id in sorted(scan.usable_documents):
+            if doc_id not in scan.pending:
+                report.documents_unchanged += 1
+                continue
+            if dry_run:
+                report.documents_embedded += 1
+                continue
+            items = [
+                chunk
+                for chunk in iter_source_chunks(
+                    name, report.source_model_id, conn=conn, doc_id=doc_id
                 )
-                return report
-            continue
-        consecutive_failures = 0
-        written.extend(
-            (chunk.doc_id, chunk.chunk_id)
-            for chunk in items
-            if chunk.chunk_id not in removed
-        )
-        report.documents_embedded += 1
-        report.chunks_embedded += len(items)
+                if skip_reason(chunk) is None and chunk.chunk_id not in have
+            ]
+            if not items:
+                continue
+            try:
+                try:
+                    _write_chunks(
+                        name,
+                        items,
+                        model_id=model_id,
+                        embedding_config=embedding_config,
+                        embedding_adapter=embedding_adapter,
+                        cfg=cfg,
+                    )
+                except BaseException:
+                    # Whatever landed before the failure must not outlive the
+                    # document; the sweep after this run is the backstop.
+                    with contextlib.suppress(Exception):
+                        _reconcile_document(
+                            name,
+                            doc_id,
+                            source_model_id=report.source_model_id,
+                            model_id=model_id,
+                            conn=conn,
+                            report=report,
+                        )
+                    raise
+                removed = _reconcile_document(
+                    name,
+                    doc_id,
+                    source_model_id=report.source_model_id,
+                    model_id=model_id,
+                    conn=conn,
+                    report=report,
+                )
+            except Exception as exc:  # noqa: BLE001 - continue with the next document
+                consecutive_failures += 1
+                report.failures.append(
+                    DocumentFailure(doc_id, f"{type(exc).__name__}: {exc}")
+                )
+                logger.error(
+                    "%s/%s: embedding failed: %s", name, doc_id, exc, exc_info=True
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_DOCUMENT_FAILURES:
+                    report.aborted = True
+                    logger.error(
+                        "%s: aborting after %d consecutive document failures",
+                        name,
+                        consecutive_failures,
+                    )
+                    return report
+                continue
+            consecutive_failures = 0
+            still_written = [chunk for chunk in items if chunk.chunk_id not in removed]
+            written.extend((chunk.doc_id, chunk.chunk_id) for chunk in still_written)
+            report.documents_embedded += 1
+            report.chunks_embedded += len(still_written)
 
-    if dry_run:
+        if dry_run:
+            return report
+        _verify_written(
+            name,
+            model_id,
+            written,
+            report,
+            conn=conn,
+            dimension=embedding_config.dimension,
+            source_model_id=report.source_model_id,
+        )
+        _ensure_indexes(name, model_id, report, conn=conn)
         return report
-    _verify_written(
-        name,
-        model_id,
-        written,
-        report,
-        conn=conn,
-        dimension=embedding_config.dimension,
-        source_model_id=report.source_model_id,
-    )
-    _ensure_indexes(name, model_id, report, conn=conn)
-    return report
+    finally:
+        if not dry_run:
+            # Runs on the way out of any failure, Ctrl-C included: no target
+            # row survives the run whose core chunk rows are gone.
+            try:
+                report.chunks_removed += _sweep_target(
+                    name,
+                    model_id,
+                    report.source_model_id,
+                    conn=conn,
+                )
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                report.failures.append(
+                    DocumentFailure(
+                        "*", f"final sweep failed: {type(exc).__name__}: {exc}"
+                    )
+                )
+                logger.error("%s: final sweep failed: %s", name, exc, exc_info=True)
+
+
+class UnknownLiveness(RuntimeError):
+    """The core chunks table never had this document, so a delete cannot be told apart."""
 
 
 def _live_chunk_ids(
     name: str, doc_id: str, source_model_id: str, conn: Any
-) -> Set[str]:
-    """The document's chunk ids a delete of it would have taken away."""
+) -> Optional[Set[str]]:
+    """The document's chunk ids a delete of it would have taken away, or ``None``.
+
+    ``None`` means the core chunks table exists but holds no row of this
+    document while the source still does: a delete that took the core rows and
+    a document that was never chunked look the same, so nothing here can call
+    the target rows stale.
+    """
     live = core_chunk_ids(name, doc_id, conn=conn)
-    if live is not None:
+    if live:
         return live
-    # No core chunks table: fall back to what search itself reads.
-    return {
+    source = {
         chunk.chunk_id
         for chunk in iter_source_chunks(name, source_model_id, conn=conn, doc_id=doc_id)
     }
+    if live is None:
+        # No core chunks table: fall back to what search itself reads.
+        return source
+    return None if source else set()
 
 
 def _reconcile_document(
@@ -359,14 +421,14 @@ def _reconcile_document(
     conn: Any,
     report: CollectionReport,
 ) -> Set[str]:
-    """Delete the target rows this document no longer has.
+    """Delete the target rows this document's core chunk rows no longer back.
 
-    The rows just written were read before provider work, and a delete or a
-    retirement that lands meanwhile removes the core chunks first, then sweeps
-    the embedding tables it enumerates after that — the target's included only
-    if it already existed. Liveness is read from the core table here, after the
-    write, so either the sweep or this pass removes what the other did not see.
-    Returns the chunk ids removed, so the caller does not count them as lost.
+    Liveness is read from the core chunks table after the write, so a delete or
+    a retirement that landed during the provider work is seen here. When that
+    table holds no row of the document at all, this raises
+    :class:`UnknownLiveness` and deletes nothing: the rows just written are
+    kept and the document is reported instead of being guessed at. Returns the
+    chunk ids removed, so the caller does not count them as embedded.
     """
     from xagent.core.tools.core.RAG_tools.utils.string_utils import (
         escape_lancedb_string,
@@ -376,6 +438,10 @@ def _reconcile_document(
     table = source_table(model_id)
     if table not in table_names(conn):
         return set()
+    if live is None:
+        raise UnknownLiveness(
+            f"core chunks hold no row of {doc_id} while the source still has it"
+        )
     where = f"{collection_filter(name)} AND doc_id = '{escape_lancedb_string(doc_id)}'"
     stale = {
         str(row.get("chunk_id") or "")
@@ -394,12 +460,80 @@ def _reconcile_document(
     )
     report.chunks_removed += deleted or len(stale)
     logger.warning(
-        "%s/%s: removed %d target rows the source no longer has",
-        name,
-        doc_id,
-        len(stale),
+        "%s/%s: removed %d target rows no core chunk backs", name, doc_id, len(stale)
     )
     return stale
+
+
+def _sweep_target(
+    name: str,
+    model_id: str,
+    source_model_id: str,
+    *,
+    conn: Any,
+    rows: Optional[List[Dict[str, Any]]] = None,
+) -> int:
+    """Delete every target row of this collection no core chunk backs.
+
+    ``rows`` are the target rows a caller already read (``target_chunk_ids``
+    collects them); without it the target's writer table is scanned. A
+    document the core table has no row of is skipped while the source still has
+    it: its liveness is unknown, and removing rows there would make a store
+    that never kept chunk rows lose its vectors.
+    """
+    writer = source_table(model_id)
+    if rows is None:
+        if writer not in table_names(conn):
+            return 0
+        rows = [
+            {**row, "table": writer}
+            for row in iter_rows(
+                conn,
+                writer,
+                collection_filter(name),
+                ["doc_id", "chunk_id", "model", "user_id", "text"],
+            )
+        ]
+    pairs = core_chunk_pairs(name, conn=conn)
+    if pairs is None:
+        return 0
+    core_docs = {doc_id for doc_id, _ in pairs}
+    source_docs = source_doc_ids(name, source_model_id, conn=conn)
+    stale: Dict[str, List[str]] = {}
+    for row in rows:
+        chunk_id = str(row.get("chunk_id") or "")
+        doc_id = str(row.get("doc_id") or "")
+        if (
+            row.get("table") != writer
+            or not doc_id
+            or not chunk_id
+            or not written_by(row, model_id)
+            or row.get("user_id") is None
+            or not row.get("text")
+        ):
+            continue
+        if (doc_id, chunk_id) in pairs:
+            continue
+        if doc_id not in core_docs and doc_id in source_docs:
+            continue
+        stale.setdefault(doc_id, []).append(chunk_id)
+    removed = 0
+    for doc_id, chunk_ids in stale.items():
+        deleted = _vector_store().delete_embedding_records(
+            name,
+            doc_id,
+            chunk_ids=sorted(chunk_ids),
+            model_tag=model_id,
+            is_admin=True,
+        )
+        removed += deleted or len(chunk_ids)
+        logger.warning(
+            "%s/%s: removed %d target rows no core chunk backs",
+            name,
+            doc_id,
+            len(chunk_ids),
+        )
+    return removed
 
 
 def _vector_store() -> Any:
@@ -565,8 +699,9 @@ def _verify_written(
 ) -> None:
     """A dropped chunk is a failure, not a success: check the target holds it.
 
-    A chunk the core tables no longer have is not a dropped one: a delete that
-    landed after the copy took it from both sides.
+    A chunk the core table no longer has is not a dropped one: a delete that
+    landed after the copy took it from both sides. A document the core table
+    never had cannot be judged at all, so it is left out.
     """
     if not written:
         return
@@ -578,6 +713,8 @@ def _verify_written(
     shortfall: Dict[str, int] = {}
     for doc_id, chunk_ids in absent.items():
         live = _live_chunk_ids(name, doc_id, source_model_id, conn)
+        if live is None:
+            continue
         lost = [chunk_id for chunk_id in chunk_ids if chunk_id in live]
         if lost:
             shortfall[doc_id] = len(lost)

@@ -1,9 +1,9 @@
 """An ordinary (web) connect completes through Composio-hosted auth.
 
-No start emits such a state yet, so these tests mint it the way the later
-start will: the Composio auth-backend claim, no ``resource_owner_key``, the
-ordinary browser proof cookie named by the state's ``browser_nonce_hash``
-claim, and a single-use flow row the verify or denied trip spends.
+These tests mint the state by hand, matching what a Composio web start emits:
+the Composio auth-backend claim, no ``resource_owner_key``, the ordinary
+browser proof cookie named by the state's ``browser_nonce_hash`` claim, and a
+single-use flow row the verify or denied trip spends.
 
 Composio is faked by the Facebook connect tests; no request leaves the
 process.

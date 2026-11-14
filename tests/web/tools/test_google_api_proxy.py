@@ -1168,3 +1168,45 @@ def test_the_transport_can_override_the_shared_body_limit(proxy):
         )
 
     assert proxy.calls == []
+
+
+def test_a_binary_download_runs_under_the_requests_deadline(proxy, monkeypatch):
+    """The count is settled when the proxy call returns, before the binary body
+    is fetched, and the download shares the request's end-to-end deadline: a
+    download that keeps arriving cannot hold the caller past it."""
+
+    def trickling(url: str, timeout: float, **kwargs: Any) -> _Download:
+        trickling_until = time.monotonic() + 1.5
+        while time.monotonic() < trickling_until:
+            time.sleep(0.02)
+        return _Download(200, b"late bytes")
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", trickling)
+    proxy.answer_with(
+        200,
+        {
+            "status": 200,
+            "data": None,
+            "binary_data": {
+                "url": "https://files.composio.dev/signed",
+                "content_type": "application/pdf",
+                "size": 10,
+            },
+        },
+    )
+
+    token = composio_proxy.begin_request_count()
+    started = time.monotonic()
+    try:
+        with pytest.raises(composio_proxy.ComposioProxyError):
+            google_api_proxy.GoogleApiProxyHttp(
+                allowed_hosts=GMAIL_HOSTS, timeout=0.3
+            ).request(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
+            )
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+    elapsed = time.monotonic() - started
+
+    assert accepted == 1, "Composio accepted the proxy call before the download"
+    assert elapsed < 2 * 0.3, "the download must not outlive the request's deadline"

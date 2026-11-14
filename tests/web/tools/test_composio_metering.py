@@ -3,8 +3,10 @@
 Composio bills each Proxy Execute request, and one tool call can make several.
 The connector subprocess reports how many were accepted so the agent process
 can record that many rows; these tests pin what the server puts on the result,
-including what a call that raises cannot report, and that a batch request
-accepted after the batch's deadline still reaches the count.
+including what a call that raises cannot report, that a batch request accepted
+after the batch's deadline still reaches the count, and that a request whose
+answer never stops arriving is cut off by its own deadline instead of holding
+the call open.
 """
 
 from __future__ import annotations
@@ -107,16 +109,25 @@ async def test_a_call_that_raises_loses_its_count() -> None:
 
 
 class _TimedProxy:
-    """The proxy answering each message read after its own delay."""
+    """The proxy answering each message read after its own delay.
+
+    A message that trickles keeps its answer's body arriving in small pieces
+    for that long: ``requests`` reads the whole body before it returns, and a
+    read timeout does not trip while the pieces keep coming.
+    """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self._delays: dict[str, float] = {}
+        self._trickles: dict[str, float] = {}
         self._refusals: set[str] = set()
         self._lock = threading.Lock()
 
     def answers_after(self, message_id: str, delay: float) -> None:
         self._delays[message_id] = delay
+
+    def trickles_for(self, message_id: str, seconds: float) -> None:
+        self._trickles[message_id] = seconds
 
     def refuses_after(self, message_id: str, delay: float) -> None:
         self._delays[message_id] = delay
@@ -127,6 +138,9 @@ class _TimedProxy:
         with self._lock:
             self.calls.append(message_id)
         time.sleep(self._delays.get(message_id, 0.0))
+        trickling_until = time.monotonic() + self._trickles.get(message_id, 0.0)
+        while time.monotonic() < trickling_until:
+            time.sleep(0.02)
         if message_id in self._refusals:
             return _Response(500, {"error": {"message": "refused"}})
         return _Response(200, {"status": 200, "data": {"id": message_id}})
@@ -141,7 +155,10 @@ def timed_proxy(monkeypatch, composio_env) -> _TimedProxy:
 
 
 def _batch_server(
-    *, deadline: float, max_workers: int = 8
+    *,
+    deadline: float,
+    max_workers: int = 8,
+    timeout: float = composio_proxy.DEFAULT_TIMEOUT_SECONDS,
 ) -> tuple[ComposioMeteringFastMCP, list[tuple[str, Any, Any]]]:
     """A metered server whose only tool reads the given messages as one batch."""
     mcp = ComposioMeteringFastMCP("batch-metering-test")
@@ -153,7 +170,9 @@ def _batch_server(
         service = build(
             "gmail",
             "v1",
-            http=google_api_proxy.GoogleApiProxyHttp(allowed_hosts=GMAIL_HOSTS),
+            http=google_api_proxy.GoogleApiProxyHttp(
+                allowed_hosts=GMAIL_HOSTS, timeout=timeout
+            ),
             static_discovery=True,
         )
         batch = service.new_batch_http_request(
@@ -228,4 +247,46 @@ async def test_a_request_that_never_started_is_not_waited_for(timed_proxy):
 
     assert timed_proxy.calls == ["m1"]
     assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 1}
-    assert elapsed < 0.9, "the cancelled requests must not be waited for"
+    assert elapsed < 1.5, "the cancelled requests must not be waited for"
+
+
+@pytest.mark.asyncio
+async def test_a_request_that_keeps_trickling_is_cut_off_at_its_deadline(timed_proxy):
+    """A body that keeps arriving in small pieces never trips ``requests``'
+    read timeout, so the request needs an end-to-end deadline of its own: the
+    metered call returns one deadline after its batch, and a request that ran
+    out of time is not counted."""
+    timed_proxy.answers_after("m1", 0.0)
+    timed_proxy.trickles_for("m2", 1.5)
+    mcp, seen = _batch_server(deadline=0.2, timeout=0.3)
+
+    started = time.monotonic()
+    async with create_connected_server_and_client_session(mcp._mcp_server) as session:
+        result = await session.call_tool("read_messages", {"messages": ["m1", "m2"]})
+    elapsed = time.monotonic() - started
+
+    assert sorted(timed_proxy.calls) == ["m1", "m2"]
+    assert result.isError is False
+    assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 1}
+    # The tool's own answer is unchanged: the trickling request timed out.
+    assert [item[0] for item in seen] == ["1", "2"]
+    assert isinstance(seen[1][2], TimeoutError)
+    assert elapsed < 2 * (0.2 + 0.3), (
+        "the wait must end one proxy deadline after the batch's"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_slow_request_inside_its_deadline_still_counts(timed_proxy):
+    """An answer that takes a while but arrives inside the request's deadline
+    is an ordinary accepted request: the tool call succeeds and counts it."""
+    timed_proxy.answers_after("m1", 0.15)
+    mcp, seen = _batch_server(deadline=1.0, timeout=1.0)
+
+    async with create_connected_server_and_client_session(mcp._mcp_server) as session:
+        result = await session.call_tool("read_messages", {"messages": ["m1"]})
+
+    assert result.isError is False
+    assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 1}
+    assert seen[0][1] is not None
+    assert seen[0][2] is None

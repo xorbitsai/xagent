@@ -9,8 +9,13 @@ in ``MCPToolAdapter`` and records one row per accepted request.
 
 A batch returns at its deadline without waiting for the requests it has
 already sent, and each of those can still be accepted by Composio afterwards.
-The count therefore waits for those requests to finish before it is taken, so
-a late acceptance is still reported.
+The count therefore waits for those requests to settle before it is taken, so
+a late acceptance is still reported. That wait is bounded: every proxied
+request has an end-to-end deadline of its own (30 seconds by default, the same
+length as a batch's), covering however its answer's body is delivered and a
+binary download, so a request still running when its batch hits the deadline
+settles within one more deadline. One that runs out of time fails like a
+timeout and is not counted.
 
 Only the connector servers that can run on a Composio grant use this class; a
 native grant runs on the same module and makes no proxy call, so its count is
@@ -41,9 +46,11 @@ class ComposioMeteringFastMCP(FastMCP):
         try:
             result = await super().call_tool(name, arguments)
             # A batch that hit its deadline has already-sent requests still
-            # running; each is bounded by its own proxy timeout and can still
-            # be accepted, so they have to finish before the count is taken.
-            # One that fails is not this tool call's failure.
+            # running. Each has an end-to-end deadline of its own and can
+            # still be accepted before it runs out, so waiting for them settles
+            # every request before the count is taken. One that fails or runs
+            # out of time is neither this tool call's failure nor a counted
+            # request.
             await asyncio.gather(
                 *(asyncio.wrap_future(future) for future in pending_batch_requests()),
                 return_exceptions=True,

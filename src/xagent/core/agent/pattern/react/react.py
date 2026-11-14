@@ -98,6 +98,7 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     bind_tool_call_execution_context,
 )
 from ....tools.tool_result_spill import (
+    SPILL_READ_AVAILABLE_NOTE,
     SPILL_READ_TOOL_NAME,
     SPILL_RESERVED_RESULT_KEY,
     normalize_spilled_relative_path,
@@ -821,6 +822,9 @@ class ReActPattern(AgentPattern):
             for c in (defer_builtin_tool_categories or ())
             if isinstance(c, str) and c.strip()
         )
+        # Whether this run has a stored-result reader tool (offered only
+        # after a result is stored). Fixed per run so the system text is too.
+        self._spill_reader_present = False
         self._deferred_tool_names: frozenset[str] = frozenset()
         self._deferred_order: tuple[str, ...] = ()
         # Deferred built-in tools: category -> names in tool order.
@@ -1096,6 +1100,7 @@ class ReActPattern(AgentPattern):
                 None,
             )
         )
+        self._spill_reader_present = spill_read_tool is not None
         spill_read_schema = (
             None
             if spill_read_tool is None
@@ -2097,8 +2102,13 @@ class ReActPattern(AgentPattern):
             # after it) would change on the call that follows a load. Loaded
             # deferred tools are therefore left out of the list below and the
             # inventory is built from the whole deferred index.
+            # The stored-result reader joins the schema mid-run, once a result
+            # has been stored, so it is kept out of the names too and the
+            # sentence below states its availability instead.
             stable_tool_names = [
-                n for n in active_tool_names if n not in self._deferred_tool_names
+                n
+                for n in active_tool_names
+                if n not in self._deferred_tool_names and n != SPILL_READ_TOOL_NAME
             ]
             inventory_tool_names = [*stable_tool_names, *self._deferred_order]
             available_tools = ", ".join(stable_tool_names) or "(none)"
@@ -2207,6 +2217,7 @@ class ReActPattern(AgentPattern):
                 f"\n\nAvailable tool names for this LLM call are exactly: {available_tools}. "
                 "Never call a tool name that is not in this list."
                 f"{AVAILABLE_NAMES_SUFFIX if self._deferred_tool_names else ''}"
+                f"{SPILL_READ_AVAILABLE_NOTE if self._spill_reader_present else ''}"
             )
             access_context = tool_access_context(
                 self._connector_tool_sources,

@@ -297,14 +297,14 @@ def holds_rows(conn: Any, table: str, collection: str) -> bool:
 def _holds_rows_written_elsewhere(
     conn: Any, table: str, collection: str, model: str
 ) -> bool:
-    """Whether ``table`` holds this collection's rows written by another model.
+    """Whether ``table`` holds rows of this collection the copy did not write.
 
-    A table without the column cannot attribute its rows to ``model``, so it is
-    treated as holding someone else's: search would serve them after the flip
-    and the copy never measured them.
+    A table without the column cannot attribute its rows to a collection, so
+    its rows may be served by search after the flip without ever being copied:
+    any row in it counts, not just this collection's.
     """
     if "collection" not in schema_names(conn, table):
-        return False
+        return _count_rows(conn, table) > 0
     if "model" not in schema_names(conn, table):
         return _count_rows(conn, table, collection_filter(collection)) > 0
     foreign = (
@@ -532,9 +532,9 @@ def core_chunk_ids(
 ) -> Optional[Set[str]]:
     """The document's chunk ids in the core chunks table, or ``None`` without one.
 
-    The delete contract deletes these rows before it sweeps embedding tables, so
-    they — not the embeddings ledger a copy sampled earlier — say whether a
-    chunk was deleted while it was being encoded.
+    A document delete and a retirement delete these rows before they sweep
+    embedding tables, so they — not the embeddings ledger a copy sampled
+    earlier — say whether a chunk was deleted while it was being encoded.
     """
     conn = conn if conn is not None else connection()
     if CORE_TABLE not in table_names(conn):

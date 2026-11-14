@@ -782,6 +782,48 @@ def test_a_target_whose_other_table_holds_another_collection_is_fine(
     assert mod.source_eligibility("kb", target_model_id="new-model").reason is None
 
 
+# --- a target table whose rows cannot be attributed to a collection ---
+
+_NO_COLLECTION_COLUMN = ["doc_id", "chunk_id", "user_id", "text", "model", "vector"]
+
+
+def test_a_target_table_that_cannot_name_its_collection_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without the column a row cannot be proven foreign, so it may be served by
+    # search after the flip without the copy ever measuring it.
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound()]),
+            _writer(): _Table([_row("c1")]),
+            mod.source_table("new-model"): _Table(
+                [_row("c9")], names=_NO_COLLECTION_COLUMN
+            ),
+        }
+    )
+    _wire(monkeypatch, conn)
+
+    assert (
+        mod.source_eligibility("kb", target_model_id="new-model").reason
+        == mod.SKIP_TARGET_ROWS_IN_OTHER_TABLE
+    )
+
+
+def test_an_empty_target_table_without_the_column_does_not_refuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound()]),
+            _writer(): _Table([_row("c1")]),
+            mod.source_table("new-model"): _Table([], names=_NO_COLLECTION_COLUMN),
+        }
+    )
+    _wire(monkeypatch, conn)
+
+    assert mod.source_eligibility("kb", target_model_id="new-model").reason is None
+
+
 def test_an_empty_collection_switches_even_with_an_absent_source_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

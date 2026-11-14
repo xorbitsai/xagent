@@ -166,6 +166,13 @@ describe("idle session state bound to one login", () => {
     expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: older }))?.idleTimeoutSeconds).toBe(900)
   })
 
+  it("orders responses by the full microsecond server time", async () => {
+    // Same millisecond, different microseconds; both describe a 10:02:00.123456 deadline.
+    const snapshot = await login({ idle_session: idle({ idle_expires_in: 109, server_time: "2026-11-13T10:00:10.123900Z" }) })
+    const older = idle({ idle_expires_in: 110, server_time: "2026-11-13T10:00:10.123100Z" })
+    expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: older }))?.idleExpiresIn).toBe(109)
+  })
+
   it("keeps the newer observation when an older response rounds to the same deadline", async () => {
     // Both describe a 10:02:00 deadline: idle_expires_in is truncated, server_time is not.
     const snapshot = await login({ idle_session: idle({ idle_expires_in: 109, server_time: "2026-11-13T10:00:10.100Z" }) })

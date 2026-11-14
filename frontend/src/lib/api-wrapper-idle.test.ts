@@ -56,6 +56,41 @@ describe("api-wrapper idle expiry", () => {
     expect(readSessionEndNotice(localStorage)).toBe("session_expired")
   })
 
+  it("signs out when the replay after a refresh reports idle expiry", async () => {
+    writeAuthCache("old-access", "old-refresh")
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (isRefresh(input)) {
+        return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 120, refresh_expires_in: 240 }), { headers: { "Content-Type": "application/json" } })
+      }
+      return new Headers(options?.headers).get("Authorization") === "Bearer new-access"
+        ? idleExpired()
+        : new Response(null, { status: 401, headers: { "Error-Type": "TokenExpired" } })
+    })
+
+    const response = await apiRequest("http://api.local/protected")
+
+    expect(response.status).toBe(401)
+    expect(readAuthCache()).toBeNull()
+    expect(readSessionEndNotice(localStorage)).toBe("session_expired")
+  })
+
+  it("signs out when the replay with another tab's rotated token reports idle expiry", async () => {
+    writeAuthCache("old-access", "old-refresh", "same-login")
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, options) => {
+      if (new Headers(options?.headers).get("Authorization") === "Bearer rotated-access") return idleExpired()
+      // Another tab rotated the same login's credentials while this request was in flight.
+      const cache = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY)!)
+      localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({ ...cache, credentialRevision: 1, token: "rotated-access", refreshToken: "rotated-refresh" }))
+      return new Response(null, { status: 401, headers: { "Error-Type": "TokenExpired" } })
+    })
+
+    const response = await apiRequest("http://api.local/protected")
+
+    expect(response.status).toBe(401)
+    expect(readAuthCache()).toBeNull()
+    expect(readSessionEndNotice(localStorage)).toBe("session_expired")
+  })
+
   it("tells the caller that a refresh was refused because the login expired", async () => {
     writeAuthCache("old-access", "old-refresh")
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => idleExpired())

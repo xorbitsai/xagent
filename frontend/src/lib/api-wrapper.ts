@@ -154,6 +154,13 @@ export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): 
 function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
+/** The one allowed replay can still meet idle expiry; end the login whose credentials were sent. */
+async function finishReplay(replay: Response, sent: AuthSessionSnapshot): Promise<Response> {
+  if (isIdleSessionExpiredResponse(replay) && (await endExpiredAuthSession(sent)).status === "cleared") {
+    window.location.href = "/login"
+  }
+  return replay
+}
 /** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
 export async function apiRequest(
   url: string,
@@ -167,7 +174,9 @@ export async function apiRequest(
   const afterResponse = compareAuthSession(session)
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {
     const advanced = afterResponse.projection.snapshot
-    if (compareCredentialSession(advanced).status === "exact_credentials") return fetch(url, withBearer(options, advanced.accessToken!))
+    if (compareCredentialSession(advanced).status === "exact_credentials") {
+      return finishReplay(await fetch(url, withBearer(options, advanced.accessToken!)), advanced)
+    }
     return response
   }
   if (afterResponse.status !== "exact" && afterResponse.status !== "profile_advanced") return response
@@ -186,7 +195,7 @@ export async function apiRequest(
     case "refreshed":
     case "advanced":
       if (compareCredentialSession(refreshed.session).status === "exact_credentials") {
-        return fetch(url, withBearer(options, refreshed.accessToken))
+        return finishReplay(await fetch(url, withBearer(options, refreshed.accessToken)), refreshed.session)
       }
       return response
     case "rejected":

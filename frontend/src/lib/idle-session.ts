@@ -53,11 +53,18 @@ function isTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
 }
 
+/**
+ * Server time in milliseconds, keeping the sub-millisecond digits the server
+ * sends (`Date.parse` truncates microseconds, which would make two responses
+ * from the same millisecond look simultaneous).
+ */
 function parseServerTime(value: unknown): number | null {
-  if (typeof value === "number") return isTimestamp(value) ? value : null
+  if (typeof value === "number") return Number.isFinite(value) && value > 0 ? value : null
   if (typeof value !== "string") return null
-  const parsed = Date.parse(value)
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+  const match = /^(.+T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/.exec(value)
+  const whole = Date.parse(match ? match[1] + match[3] : value)
+  if (!Number.isFinite(whole) || whole <= 0) return null
+  return match?.[2] ? whole + Number(`0.${match[2]}`) * 1000 : whole
 }
 
 function parsePolicy(value: unknown): IdleSessionPolicy | null {

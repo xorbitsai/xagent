@@ -51,6 +51,9 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
   const isUserEvent = options.isUserEvent ?? isUserActivityEvent
   let pending = false
   let lastInputAt = Number.NEGATIVE_INFINITY
+  // This tab's own last attempt, so retries stay paced even when the shared
+  // report time cannot be written.
+  let lastAttemptAt = Number.NEGATIVE_INFINITY
   let inFlight: Promise<void> | null = null
   let timer: ReturnType<typeof setTimeout> | null = null
   let stopped = false
@@ -59,12 +62,27 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     if (timer !== null) clearTimeout(timer)
     timer = null
   }
+  const freshnessWindowMs = (record: IdleSessionRecord) =>
+    record.activityMinIntervalSeconds * 1000 + SERVER_INTERVAL_MARGIN_MS + STALE_INPUT_TOLERANCE_MS
+  // A negative age means the clock moved backwards since the input, so its
+  // real age is unknown and it is treated as stale.
+  const inputIsFresh = (record: IdleSessionRecord, now: number) => {
+    const inputAge = now - lastInputAt
+    return inputAge >= 0 && inputAge <= freshnessWindowMs(record)
+  }
   const send = (): Promise<void> => {
     pending = false
+    lastAttemptAt = Date.now()
     inFlight = Promise.resolve()
       .then(() => options.markReported())
       .catch(() => undefined)
-      .then(() => options.report())
+      .then(() => {
+        // The page may have been suspended while waiting for the auth lock:
+        // check again that the input is still recent before reporting it.
+        const record = options.getRecord()
+        if (!record || !inputIsFresh(record, Date.now())) return true
+        return options.report()
+      })
       .catch(() => false)
       .then(delivered => {
         inFlight = null
@@ -83,16 +101,15 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     const intervalMs = record.activityMinIntervalSeconds * 1000
     const now = Date.now()
     // A normal trailing report runs interval + margin after the last report.
-    // A negative age means the clock moved backwards since the input, so its
-    // real age is unknown and it is treated as stale.
-    const inputAge = now - lastInputAt
-    if (inputAge < 0 || inputAge > intervalMs + SERVER_INTERVAL_MARGIN_MS + STALE_INPUT_TOLERANCE_MS) {
+    if (!inputIsFresh(record, now)) {
       pending = false
       return
     }
-    // A report time in the future means the clock moved backwards; ignore it.
-    const lastReportAt = record.lastReportAt !== null && record.lastReportAt <= now ? record.lastReportAt : 0
-    const wait = lastReportAt === 0 ? 0 : lastReportAt + intervalMs + SERVER_INTERVAL_MARGIN_MS - now
+    // Times in the future mean the clock moved backwards; ignore them.
+    const sharedLast = record.lastReportAt !== null && record.lastReportAt <= now ? record.lastReportAt : 0
+    const localLast = lastAttemptAt <= now ? lastAttemptAt : 0
+    const lastReportAt = Math.max(sharedLast, localLast)
+    const wait = lastReportAt <= 0 ? 0 : lastReportAt + intervalMs + SERVER_INTERVAL_MARGIN_MS - now
     if (wait > 0) {
       timer = setTimeout(() => { timer = null; schedule() }, wait)
       return
@@ -111,6 +128,8 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
     reportNow: async () => {
       if (stopped || !options.getRecord()) return
       clearTimer()
+      // The press on "Continue session" is itself recent input.
+      lastInputAt = Date.now()
       // The press on the continue button may already have started a report.
       if (inFlight) return inFlight
       await send()

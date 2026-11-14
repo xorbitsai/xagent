@@ -11,6 +11,10 @@ function record(overrides: Partial<IdleSessionRecord> = {}): IdleSessionRecord {
   }
 }
 
+// Every reporter is stopped after each test, so a failing assertion cannot
+// leave window listeners behind that affect later tests.
+const started: Array<{ stop: () => void }> = []
+
 function setup(initial: IdleSessionRecord | null = record(), overrides: Partial<IdleActivityReporterOptions> = {}) {
   let current = initial
   const report = vi.fn(async () => true)
@@ -22,6 +26,7 @@ function setup(initial: IdleSessionRecord | null = record(), overrides: Partial<
     report,
     ...overrides,
   })
+  started.push(reporter)
   return {
     reporter, report,
     setRecord: (next: IdleSessionRecord | null) => { current = next },
@@ -31,7 +36,10 @@ function setup(initial: IdleSessionRecord | null = record(), overrides: Partial<
 
 describe("idle activity reporting", () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date("2026-11-13T10:00:00Z")) })
-  afterEach(() => { vi.useRealTimers() })
+  afterEach(() => {
+    for (const reporter of started.splice(0)) reporter.stop()
+    vi.useRealTimers()
+  })
 
   it("reports keyboard, pointer and wheel input but not mouse movement, scrolling or focus", async () => {
     const { reporter, report, fire } = setup()
@@ -165,6 +173,30 @@ describe("idle activity reporting", () => {
     const { reporter, report, fire } = setup(record({ lastReportAt: Date.now() + 60 * 60_000 }))
     fire("keydown")
     await vi.advanceTimersByTimeAsync(0)
+    expect(report).toHaveBeenCalledTimes(1)
+    reporter.stop()
+  })
+
+  it("does not send the report when the wait for the report-time write outlasts the freshness window", async () => {
+    // The browser suspends the page while the report waits for the auth lock.
+    const markReported = vi.fn(async () => { vi.setSystemTime(Date.now() + 5 * 60_000) })
+    const { reporter, report, fire } = setup(record(), { markReported })
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
+    expect(markReported).toHaveBeenCalledTimes(1)
+    expect(report).not.toHaveBeenCalled()
+    reporter.stop()
+  })
+
+  it("paces retries itself when the shared report time cannot be written", async () => {
+    // Stops after 5 attempts so an unpaced loop ends instead of hanging the test.
+    const report: ReturnType<typeof vi.fn> = vi.fn(async () => report.mock.calls.length >= 5)
+    const { reporter, fire } = setup(record(), {
+      report: report as () => Promise<boolean>,
+      markReported: () => Promise.reject(new Error("lock unavailable")),
+    })
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(report).toHaveBeenCalledTimes(1)
     reporter.stop()
   })

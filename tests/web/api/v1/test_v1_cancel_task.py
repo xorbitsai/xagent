@@ -582,6 +582,70 @@ def test_a_task_that_reads_failed_after_automatic_resume_gave_up_is_not_cancella
     assert _cancel_commands(task_id) == []
 
 
+def test_a_paused_cancel_staged_after_its_row_moved_is_not_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An accepted append moves the paused row between the request's read and
+    the command's staging, so the command aims at the old version while its
+    row column records the new one; the append's START then fails and the
+    task reads ``failed``. The executor fences on the aimed version and will
+    reject the command, so the deadline does not answer 202, and a repeat
+    answers the same 409 without staging another command."""
+    task_id, _agent_id, key = _running_task()
+    _update(
+        task_id,
+        status=TaskStatus.PAUSED,
+        control_state=TaskControlState.PAUSED.value,
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    aimed_version = _row(task_id)["state_version"]
+    original_enqueue = sdk_task_cancel._enqueue_cancel
+
+    def staged_after_an_append(
+        db: Any, task: Any, target_state_version: int, *, queued_run_id: Any
+    ) -> Any:
+        _update(task_id, state_version=aimed_version + 1)
+        return original_enqueue(
+            db, task, target_state_version, queued_run_id=queued_run_id
+        )
+
+    monkeypatch.setattr(sdk_task_cancel, "_enqueue_cancel", staged_after_an_append)
+    start_failed: list[bool] = []
+    monkeypatch.setattr(
+        task_auto_resume,
+        "status_only_terminal_view",
+        lambda _db, _task_id: SimpleNamespace(state="manual") if start_failed else None,
+    )
+
+    async def unapplied_while_the_start_fails(*_args: Any, **_kwargs: Any) -> bool:
+        start_failed.append(True)
+        return False
+
+    monkeypatch.setattr(
+        sdk_task_cancel,
+        "dispatch_one_task_command",
+        AsyncMock(side_effect=unapplied_while_the_start_fails),
+    )
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    (command,) = _cancel_commands(task_id)
+    assert command.payload["target_state_version"] == aimed_version
+    assert command.target_state_version == aimed_version + 1
+    again = _cancel(task_id, key)
+    assert again.status_code == 409, again.text
+    assert _error(again) == "task_not_cancellable"
+    assert len(_cancel_commands(task_id)) == 1
+    row = _row(task_id)
+    assert (row["status"], row["state_version"]) == (
+        TaskStatus.PAUSED,
+        aimed_version + 1,
+    )
+
+
 @pytest.mark.parametrize(
     "ended", ["automatic_resume_gave_up", "gave_up_after_the_row_moved", "completed"]
 )

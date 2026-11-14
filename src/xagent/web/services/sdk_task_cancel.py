@@ -642,7 +642,7 @@ def _load_result_sync(
       turn is queued behind it. The exception is a paused run that reads
       ``failed`` while the command is still pending or processing (the
       deadline's read, which passes ``command_db_id``) and the row is still
-      at the version the command was recorded against: its automatic resume
+      at the version the command is aimed at: its automatic resume
       gave up during the wait, which does not move that version or stop the
       command from cancelling it, so the call answers that the cancel is
       still being applied.
@@ -697,23 +697,18 @@ def _still_cancels_paused_row(
     db: Session, task: Task, command_db_id: int | None
 ) -> bool:
     """Whether the unapplied command ``command_db_id`` still cancels this
-    paused row: it is pending or processing and was recorded against the
-    version the row is still at."""
+    paused row: it is the pending or processing cancel aimed at the version
+    the row is at now, the same command a repeat call rejoins.
+
+    The command is matched by its identity, which carries the version its
+    executor fences on. The command row's own version column is read when
+    the command is staged and can already be past the version the request
+    aimed at, so it does not say what the command will cancel."""
 
     if command_db_id is None or task.status != TaskStatus.PAUSED:
         return False
-    command = (
-        db.query(TaskExecutionCommand)
-        .filter(TaskExecutionCommand.id == command_db_id)
-        .populate_existing()
-        .one_or_none()
-    )
-    return bool(
-        command is not None
-        and command.status in {COMMAND_PENDING, COMMAND_PROCESSING}
-        and command.target_state_version is not None
-        and int(command.target_state_version) == int(task.state_version or 0)
-    )
+    cancel = _unapplied_cancel_of_row(db, task)
+    return cancel is not None and int(cancel.id) == command_db_id
 
 
 async def request_sdk_task_cancel(
@@ -740,7 +735,7 @@ async def request_sdk_task_cancel(
     ``SdkTaskNotCancellable`` when the aimed run ended without being
     cancelled, whichever way the wait ends, except a paused run whose
     automatic resume gave up while the command is still unapplied at the
-    deadline and the row is still at the command's version: the command
+    deadline and the row is still at the version the command is aimed at: the command
     still cancels it, so that answer is ``cancelled=False``, and calling
     again rejoins the same command.
     """

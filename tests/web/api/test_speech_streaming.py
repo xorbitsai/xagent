@@ -17,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from tests.web.auth_token_cases import build_access_token
+from xagent.config import get_cors_origins
 from xagent.core.model.asr.base import ASRStreamEvent, ASRStreamSession
 from xagent.core.model.chat.token_context import MediaCallType
 from xagent.core.model.media_metering import record_provider_usage
@@ -741,9 +742,9 @@ def test_tts_stream_has_audio_metadata_and_exactly_one_usage_delivery(api):
     assert response.status_code == 200, response.text
     assert response.content == b"firstsecond"
     assert response.headers["content-type"] == "audio/pcm"
+    assert response.headers["x-audio-format"] == "pcm"
     assert response.headers["x-audio-sample-rate"] == "24000"
     assert response.headers["cache-control"] == "no-store"
-    assert "X-Audio-Sample-Rate" in response.headers["access-control-expose-headers"]
     assert api.tts.calls == [
         {"text": "Hello", "voice": "override", "format": "pcm", "sample_rate": 24000}
     ]
@@ -1028,6 +1029,7 @@ async def test_tts_session_timeout_before_audio_is_a_504(api, monkeypatch):
 async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, failure):
     from xagent.web.app import app
 
+    origin = get_cors_origins()[0].encode()
     if failure == "provider":
         api.tts.error_after_first = RuntimeError("synthetic-provider-secret")
     elif failure:
@@ -1054,6 +1056,7 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
         "headers": [
             (b"authorization", api.headers["Authorization"].encode()),
             (b"content-type", b"application/json"),
+            (b"origin", origin),
         ],
         "server": ("testserver", 80),
         "client": ("127.0.0.1", 1234),
@@ -1073,6 +1076,12 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
         await asyncio.wait_for(app(scope, incoming.get, send), 10)
     assert messages[0]["status"] == 200
     headers = dict(messages[0]["headers"])
+    assert headers[b"access-control-allow-origin"] == origin
+    exposed_headers = {
+        name.strip().lower()
+        for name in headers[b"access-control-expose-headers"].split(b",")
+    }
+    assert {b"x-audio-format", b"x-audio-sample-rate"} <= exposed_headers
     assert headers[b"x-content-type-options"] == b"nosniff"
     assert headers[b"x-frame-options"] == b"DENY"
     assert any(message.get("body") == b"first" for message in messages)

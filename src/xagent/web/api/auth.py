@@ -4308,7 +4308,9 @@ def _generic_oauth_login(
         # Repeated prompt=consent calls mint additional refresh tokens until
         # Google evicts an older one. Once this owner/client boundary has a
         # reusable token, account selection is enough; incremental scopes are
-        # requested explicitly above and the callback preserves that token.
+        # requested explicitly above, and the callback keeps that token only
+        # when Google confirms it covers them (otherwise it restarts this
+        # request with a forced consent).
         params["prompt"] = (
             "select_account"
             if google_shared_mode
@@ -4533,6 +4535,111 @@ def _oauth_success_response(
             </body>
         </html>
         """
+    )
+
+
+class _StoredGoogleRefresh(NamedTuple):
+    """A stored Google refresh token and what Google confirmed it yields."""
+
+    token: str
+    # None when the request names no connector scope, so nothing was asked.
+    confirmed_scopes: frozenset[str] | None
+
+
+def _verify_stored_google_refresh_token(
+    *,
+    token_url: str,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    requested_scopes: list[str],
+) -> _StoredGoogleRefresh | None:
+    """Ask Google whether a stored refresh token still yields the requested scopes.
+
+    Google issues a refresh token only on the first consent, so an incremental
+    authorization often has none of its own and the callback would reuse the
+    stored one. Whether that token covers the new scopes is Google's to say: the
+    ``scope`` of a refresh response lists what the access token it mints is
+    allowed to do. Anything short of a clear yes (a revoked token, an outage, a
+    response without scopes) returns None, which sends the user through the
+    consent page, where Google issues a token for the whole request.
+    """
+    from ..services.google_oauth_grants import (
+        google_connector_scopes,
+        normalize_google_oauth_scopes,
+    )
+
+    required = google_connector_scopes(requested_scopes)
+    if not required:
+        return _StoredGoogleRefresh(refresh_token, None)
+    try:
+        response = requests.post(
+            token_url,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=10.0,
+        )
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        logger.warning("Google refresh check failed: no usable response")
+        return None
+    if response.status_code != 200 or not isinstance(payload, dict):
+        logger.warning(
+            "Google refresh check failed: status=%s error=%s",
+            response.status_code,
+            str(payload.get("error", "unknown"))[:_OAUTH_ERROR_MESSAGE_LIMIT]
+            if isinstance(payload, dict)
+            else "unparsable",
+        )
+        return None
+    confirmed = normalize_google_oauth_scopes(payload.get("scope"))
+    missing = required - confirmed
+    if missing:
+        logger.warning(
+            "Stored Google refresh token does not cover %d requested scope(s)",
+            len(missing),
+        )
+        return None
+    return _StoredGoogleRefresh(refresh_token, confirmed)
+
+
+def _same_subject_legacy_oauth_account(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    connector_key: str,
+    provider_user_id: str,
+) -> UserOAuth | None:
+    """The app's own row for this Google subject, the one a callback reuses.
+
+    A Composio grant of the same subject holds no Google token to reuse, so it is
+    never returned.
+    """
+    return (
+        scoped_user_oauth_query(
+            db,
+            user_id=user_id,
+            resource_owner_key=resource_owner_key,
+        )
+        .filter(
+            UserOAuth.provider == connector_key,
+            UserOAuth.provider_user_id == provider_user_id,
+            or_(
+                UserOAuth.token_type.is_(None),
+                UserOAuth.token_type != COMPOSIO_TOKEN_TYPE,
+            ),
+        )
+        .order_by(UserOAuth.id.desc())
+        .first()
     )
 
 
@@ -5714,6 +5821,68 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        google_shared_scopes_claim = payload.get("google_shared_scopes")
+        google_shared_state = bool(
+            provider.lower() == "google"
+            and payload.get("google_shared_mode") is True
+            and isinstance(app_id, str)
+            and app_id.strip()
+            and target_app_info is not None
+            and isinstance(google_shared_scopes_claim, list)
+            and google_shared_scopes_claim
+            and all(
+                isinstance(scope, str) and bool(scope.strip())
+                for scope in google_shared_scopes_claim
+            )
+        )
+        google_shared_callback = bool(
+            get_google_shared_oauth_grants_enabled() and google_shared_state
+        )
+
+        # Google issues a refresh token only on the first consent, so a callback
+        # without one would reuse the stored token. Ask Google whether that token
+        # covers this request now, before the locks below: the check is a network
+        # call with a 10 second timeout and must not hold a database lock.
+        stored_google_refresh: _StoredGoogleRefresh | None = None
+        if (
+            google_shared_callback
+            and user_id
+            and provider_user_id
+            and not token_data.get("refresh_token")
+        ):
+            from ..services.google_oauth_grants import (
+                stored_google_refresh_token_for_callback,
+            )
+
+            same_subject_legacy = _same_subject_legacy_oauth_account(
+                db,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+                connector_key=cast(str, app_id),
+                provider_user_id=str(provider_user_id),
+            )
+            stored_refresh_token = stored_google_refresh_token_for_callback(
+                db,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+                oauth_client_id=client_id,
+                google_subject=str(provider_user_id),
+                legacy_refresh_token=(
+                    str(same_subject_legacy.refresh_token)
+                    if same_subject_legacy is not None
+                    and same_subject_legacy.refresh_token
+                    else None
+                ),
+            )
+            if stored_refresh_token:
+                stored_google_refresh = _verify_stored_google_refresh_token(
+                    token_url=token_url,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    refresh_token=stored_refresh_token,
+                    requested_scopes=cast(list[str], google_shared_scopes_claim),
+                )
+
         if is_actor_flow:
             assert user_id is not None
             assert isinstance(app_id, str)
@@ -5764,23 +5933,6 @@ def generic_oauth_callback(
                 return HTMLResponse(
                     content="<h1>Error: Invalid or expired state</h1>", status_code=400
                 )
-            google_shared_scopes_claim = payload.get("google_shared_scopes")
-            google_shared_state = bool(
-                provider.lower() == "google"
-                and payload.get("google_shared_mode") is True
-                and isinstance(app_id, str)
-                and app_id.strip()
-                and target_app_info is not None
-                and isinstance(google_shared_scopes_claim, list)
-                and google_shared_scopes_claim
-                and all(
-                    isinstance(scope, str) and bool(scope.strip())
-                    for scope in google_shared_scopes_claim
-                )
-            )
-            google_shared_callback = bool(
-                get_google_shared_oauth_grants_enabled() and google_shared_state
-            )
             if google_shared_callback and not provider_user_id:
                 db.rollback()
                 _log_oauth_callback_rejection(
@@ -5806,22 +5958,12 @@ def generic_oauth_callback(
                 # the same subject holds no Google token to reuse; it is
                 # replaced below through the delete path, which also deletes
                 # its Composio account.
-                oauth_account = (
-                    scoped_user_oauth_query(
-                        db,
-                        user_id=user_id,
-                        resource_owner_key=resource_owner_key,
-                    )
-                    .filter(
-                        UserOAuth.provider == connector_key,
-                        UserOAuth.provider_user_id == str(provider_user_id),
-                        or_(
-                            UserOAuth.token_type.is_(None),
-                            UserOAuth.token_type != COMPOSIO_TOKEN_TYPE,
-                        ),
-                    )
-                    .order_by(UserOAuth.id.desc())
-                    .first()
+                oauth_account = _same_subject_legacy_oauth_account(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    connector_key=connector_key,
+                    provider_user_id=str(provider_user_id),
                 )
                 if oauth_account is None:
                     oauth_account = _matching_gmail_reconnect_tombstone(
@@ -6034,8 +6176,22 @@ def generic_oauth_callback(
                 from ..services.google_oauth_grants import (
                     GoogleOAuthRefreshTokenRequired,
                     GoogleOAuthScopeConsentRequired,
+                    google_scopes_confirmed_by_refresh,
                     write_google_shared_oauth_callback,
                 )
+
+                # Without a refresh token of its own the stored one is reused,
+                # so only the token Google confirmed above may be, and only the
+                # connector scopes it was shown to yield are recorded.
+                verified_refresh_token: str | None = None
+                scopes_to_record: Any = token_scope
+                if stored_google_refresh is not None and not token_data.get(
+                    "refresh_token"
+                ):
+                    verified_refresh_token = stored_google_refresh.token
+                    scopes_to_record = google_scopes_confirmed_by_refresh(
+                        token_scope, stored_google_refresh.confirmed_scopes
+                    )
 
                 try:
                     _shared_account, oauth_account, _association = (
@@ -6052,7 +6208,7 @@ def generic_oauth_callback(
                                 if token_data.get("refresh_token")
                                 else None
                             ),
-                            granted_scopes=token_scope,
+                            granted_scopes=scopes_to_record,
                             requested_scopes=cast(
                                 list[str], google_shared_scopes_claim
                             ),
@@ -6060,6 +6216,7 @@ def generic_oauth_callback(
                             token_type=str(token_data.get("token_type", "Bearer")),
                             expires_at=cast(datetime | None, oauth_account.expires_at),
                             legacy_oauth_account=oauth_account,
+                            verified_refresh_token=verified_refresh_token,
                         )
                     )
                     if resource_owner_key is None:

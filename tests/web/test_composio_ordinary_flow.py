@@ -245,7 +245,6 @@ def test_an_ordinary_connect_associates_the_connector(ordinary):
     """A first-time member's listing says connected only with a grant and the
     user's server association, so the ordinary store writes both."""
     db, user, composio = ordinary
-    db.query(UserMCPServer).delete()
     db.query(MCPServer).delete()
     db.commit()
     assert _listed_app(db, user)["is_connected"] is False
@@ -307,8 +306,6 @@ def test_a_failed_association_stores_nothing_and_its_account_is_deleted(
     ordinary, monkeypatch
 ):
     db, user, composio = ordinary
-    db.query(UserMCPServer).delete()
-    db.commit()
 
     def conflict(*_args, **_kwargs):
         raise ValueError("catalog metadata conflict")

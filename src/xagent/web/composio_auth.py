@@ -1310,12 +1310,7 @@ def _verified_ordinary_flow(
     if not isinstance(nonce, str) or _FLOW_NONCE_RE.fullmatch(nonce) is None:
         raise _reject("claims_invalid", False)
     browser_nonce_hash = payload.get("browser_nonce_hash")
-    if (
-        not isinstance(browser_nonce_hash, str)
-        or _FLOW_NONCE_RE.fullmatch(browser_nonce_hash) is None
-    ):
-        raise _reject("claims_invalid", False)
-    if not secrets.compare_digest(nonce, browser_nonce_hash):
+    if browser_nonce_hash != nonce:
         raise _reject("claims_invalid", False)
     cookie_value = request.cookies.get(_ordinary_oauth_cookie_name(browser_nonce_hash))
     if not isinstance(cookie_value, str) or not cookie_value:
@@ -1815,9 +1810,7 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
         _log_rejection(
             rejected.reason,
             app_id,
-            actor_flow=(
-                actor_flow if rejected.actor_flow is None else rejected.actor_flow
-            ),
+            actor_flow=rejected.actor_flow,
         )
         delete_account(config.api_key, account_id)
         return _clear_flow_cookies(rejected.response, callback, dead)

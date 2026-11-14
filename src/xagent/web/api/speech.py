@@ -407,7 +407,6 @@ class _TTSAudioResponse(StreamingResponse):
                     "Cache-Control": "no-store",
                     "X-Accel-Buffering": "no",
                     "X-Audio-Format": first.format,
-                    "Access-Control-Expose-Headers": "X-Audio-Format, X-Audio-Sample-Rate",
                 }
                 if first.sample_rate is not None:
                     headers["X-Audio-Sample-Rate"] = str(first.sample_rate)

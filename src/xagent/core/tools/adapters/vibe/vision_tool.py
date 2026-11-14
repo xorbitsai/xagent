@@ -599,7 +599,7 @@ def get_default_vision_model() -> Optional[BaseLLM]:
         try:
             from xagent.core.model.chat.basic.gemini import GeminiLLM
 
-            model_name = os.getenv("GEMINI_VISION_MODEL_NAME", "gemini-2.0-flash-exp")
+            model_name = os.getenv("GEMINI_VISION_MODEL_NAME", "gemini-3.8-flash")
             base_url = os.getenv("GEMINI_BASE_URL")
 
             return attach_chat_retry_wrapper(

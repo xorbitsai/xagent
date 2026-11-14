@@ -32,8 +32,12 @@ export interface IdleActivityReporterOptions {
   getRecord: () => IdleSessionRecord | null
   /** Records the report time for every tab of this login before the request is sent. */
   markReported: () => void | Promise<void>
-  /** Sends the activity report; resolves false when it did not reach the server. */
-  report: () => Promise<boolean>
+  /**
+   * Sends the activity report; resolves false when it did not reach the server.
+   * `isStillFresh` tells whether the input is still recent, so a report that
+   * waited (for example for a token refresh) can be dropped before a replay.
+   */
+  report: (isStillFresh: () => boolean) => Promise<boolean>
   isUserEvent?: (event: Event) => boolean
 }
 
@@ -79,9 +83,12 @@ export function startIdleActivityReporter(options: IdleActivityReporterOptions):
       .then(() => {
         // The page may have been suspended while waiting for the auth lock:
         // check again that the input is still recent before reporting it.
-        const record = options.getRecord()
-        if (!record || !inputIsFresh(record, Date.now())) return true
-        return options.report()
+        const isStillFresh = () => {
+          const record = options.getRecord()
+          return record !== null && inputIsFresh(record, Date.now())
+        }
+        if (!isStillFresh()) return true
+        return options.report(isStillFresh)
       })
       .catch(() => false)
       .then(delivered => {

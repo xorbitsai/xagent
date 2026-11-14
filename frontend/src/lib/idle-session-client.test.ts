@@ -40,9 +40,11 @@ describe("idle session client", () => {
   it("reports activity with the current credential and stores the new deadline", async () => {
     login()
     vi.mocked(apiRequest).mockResolvedValue(new Response(idleBody(1800)))
-    await expect(reportIdleActivity("browser-login")).resolves.toBe(true)
+    const isStillFresh = () => true
+    await expect(reportIdleActivity("browser-login", isStillFresh)).resolves.toBe(true)
     expect(apiRequest).toHaveBeenCalledWith(
       expect.stringMatching(/\/api\/auth\/activity$/), { method: "POST" }, readAuthSessionSnapshot(),
+      { beforeReplay: isStillFresh },
     )
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
   })

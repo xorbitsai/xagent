@@ -68,7 +68,7 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
         const current = readAuthSessionSnapshot()
         if (current.sessionId === sessionId) await markIdleActivityReportedIfCurrent(current)
       },
-      report: () => reportIdleActivity(sessionId),
+      report: isStillFresh => reportIdleActivity(sessionId, isStillFresh),
     })
     reporterRef.current = reporter
 

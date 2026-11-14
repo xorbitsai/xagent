@@ -113,6 +113,32 @@ describe("api-wrapper idle expiry", () => {
     expect(readSessionEndNotice(localStorage)).toBe("session_expired")
   })
 
+  it.each([
+    ["after a refresh", "old-access"],
+    ["with another tab's rotated token", "rotated"],
+  ])("skips the replay %s when the caller says the request is no longer wanted", async (_, scenario) => {
+    writeAuthCache("old-access", "old-refresh", "same-login")
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      if (isRefresh(input)) {
+        return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 120, refresh_expires_in: 240 }), { headers: { "Content-Type": "application/json" } })
+      }
+      if (scenario === "rotated") {
+        const cache = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY)!)
+        localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({ ...cache, credentialRevision: 1, token: "rotated-access", refreshToken: "rotated-refresh" }))
+      }
+      return new Response(null, { status: 401, headers: { "Error-Type": "TokenExpired" } })
+    })
+    const beforeReplay = vi.fn(() => false)
+
+    const response = await apiRequest("http://api.local/activity", { method: "POST" }, undefined, { beforeReplay })
+
+    expect(response.status).toBe(401)
+    expect(beforeReplay).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls.filter(([input]) => !isRefresh(input))).toHaveLength(1)
+    // The login itself is kept; only this request is dropped.
+    expect(readAuthCache()).not.toBeNull()
+  })
+
   it("tells the caller that a refresh was refused because the login expired", async () => {
     writeAuthCache("old-access", "old-refresh")
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => idleExpired())

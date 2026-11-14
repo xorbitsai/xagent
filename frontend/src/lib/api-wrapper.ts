@@ -161,11 +161,20 @@ async function finishReplay(replay: Response, sent: AuthSessionSnapshot): Promis
   }
   return replay
 }
+export interface ApiRequestHooks {
+  /**
+   * Runs just before the one allowed replay (after a refresh, or with a token
+   * another tab rotated). Returning false skips the replay and returns the
+   * original response; the login itself is kept.
+   */
+  beforeReplay?: () => boolean
+}
 /** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
 export async function apiRequest(
   url: string,
   options: RequestInit = {},
   capturedSession?: AuthSessionSnapshot,
+  hooks: ApiRequestHooks = {},
 ): Promise<Response> {
   const session = capturedSession ?? readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
@@ -175,6 +184,7 @@ export async function apiRequest(
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {
     const advanced = afterResponse.projection.snapshot
     if (compareCredentialSession(advanced).status === "exact_credentials") {
+      if (hooks.beforeReplay && !hooks.beforeReplay()) return response
       return finishReplay(await fetch(url, withBearer(options, advanced.accessToken!)), advanced)
     }
     return response
@@ -195,6 +205,7 @@ export async function apiRequest(
     case "refreshed":
     case "advanced":
       if (compareCredentialSession(refreshed.session).status === "exact_credentials") {
+        if (hooks.beforeReplay && !hooks.beforeReplay()) return response
         return finishReplay(await fetch(url, withBearer(options, refreshed.accessToken)), refreshed.session)
       }
       return response

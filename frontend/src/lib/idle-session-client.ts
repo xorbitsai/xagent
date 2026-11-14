@@ -7,11 +7,12 @@ import { getApiUrl } from "@/lib/utils"
  * false only when the report should be retried (transport or server error).
  * An idle-expired login is handled by apiRequest and never retried.
  */
-export async function reportIdleActivity(sessionId: string): Promise<boolean> {
+export async function reportIdleActivity(sessionId: string, isStillFresh: () => boolean = () => true): Promise<boolean> {
   const captured = readAuthSessionSnapshot()
   if (captured.sessionId !== sessionId || !captured.accessToken) return true
   try {
-    const response = await apiRequest(`${getApiUrl()}/api/auth/activity`, { method: "POST" }, captured)
+    // A refresh before the replay can take a while; do not replay stale input.
+    const response = await apiRequest(`${getApiUrl()}/api/auth/activity`, { method: "POST" }, captured, { beforeReplay: isStillFresh })
     if (response.ok) {
       await recordIdleSessionIfCurrent(captured, await response.json().catch(() => null))
       return true

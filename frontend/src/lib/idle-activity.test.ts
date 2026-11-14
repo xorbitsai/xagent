@@ -204,6 +204,18 @@ describe("idle activity reporting", () => {
     reporter.stop()
   })
 
+  it("gives the report a freshness check it can run again before a replay", async () => {
+    let isStillFresh: (() => boolean) | undefined
+    const report = vi.fn(async (check?: () => boolean) => { isStillFresh = check; return true })
+    const { fire } = setup(record(), { report })
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
+    expect(isStillFresh?.()).toBe(true)
+    // The page is suspended while the report waits for a token refresh.
+    vi.setSystemTime(Date.now() + 5 * 60_000)
+    expect(isStillFresh?.()).toBe(false)
+  })
+
   it("still sends the report when recording the report time fails", async () => {
     const { reporter, report, fire } = setup(record(), { markReported: () => Promise.reject(new Error("lock unavailable")) })
     fire("keydown")

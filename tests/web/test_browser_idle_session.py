@@ -422,23 +422,106 @@ def test_each_threshold_set_applies_after_a_rolling_change(monkeypatch):
     assert _verify(alive_under_both).status_code == 200
 
 
-@pytest.mark.parametrize("overlap", [True, False])
+@pytest.mark.parametrize(
+    "old_lease_ended_minutes_ago,rejected",
+    [
+        (-0.2, True),  # The 30-minute set is still enforced.
+        (5, True),  # It ended after this login passed its 30-minute deadline.
+        (20, False),  # It ended before; the 60-minute set alone applies.
+    ],
+)
 def test_the_stricter_set_governs_while_a_threshold_change_rolls_out(
-    monkeypatch, overlap
+    monkeypatch, old_lease_ended_minutes_ago, rejected
 ):
-    """This replica runs 60 minutes; another still enforces 30 (or stopped)."""
+    """This replica runs 60 minutes; another enforced 30 until some time."""
     _switch(monkeypatch, True)
     monkeypatch.setenv(ENV_MINUTES, "60")
     _users()
     tokens = _login()
     now = datetime.now(timezone.utc)
-    _lease_until(now + timedelta(seconds=10 if overlap else -10), ordinary_minutes=30)
-    _idle_for(tokens, 40)
+    _lease_until(
+        now - timedelta(minutes=old_lease_ended_minutes_ago), ordinary_minutes=30
+    )
+    _idle_for(tokens, 40)  # 30-minute deadline was 10 minutes ago.
 
-    if overlap:
+    if rejected:
         _assert_idle_rejection(_verify(tokens))
     else:
         assert _verify(tokens).status_code == 200
+
+
+def test_a_threshold_increase_never_revives_an_expired_login(monkeypatch):
+    """Rejected at 30 minutes, then every replica moves to 60."""
+    _switch(monkeypatch, True)
+    _users()
+    tokens = _login()
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session)  # 30-minute replicas.
+        session.commit()
+    _idle_for(tokens, 31)
+    _assert_idle_rejection(_verify(tokens))  # SessionIdleExpired received.
+
+    monkeypatch.setenv(ENV_MINUTES, "60")  # The 30-minute lease has run out.
+    _lease_until(datetime.now(timezone.utc) - timedelta(seconds=30))
+    _assert_idle_rejection(_verify(tokens))
+    _assert_idle_rejection(
+        auth_tests.client.post("/api/auth/activity", headers=_bearer(tokens))
+    )
+    _assert_idle_rejection(_refresh(tokens))
+
+
+def test_writes_cannot_revive_a_login_after_a_threshold_increase(monkeypatch):
+    """The write fence, not only the request check, keeps the old deadline."""
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_MINUTES, "60")
+    _users()
+    tokens = _login()
+    sid = _sid(tokens)
+    # Expired under the 30-minute set before it stopped being enforced.
+    _lease_until(datetime.now(timezone.utc) - timedelta(minutes=5), ordinary_minutes=30)
+    idle_since = _idle_for(tokens, 40)
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).filter_by(username="member").one()
+        assert not browser_idle.fence_browser_session_for_refresh(session, user, sid)
+        session.rollback()
+        with pytest.raises(browser_idle.BrowserSessionRejected):
+            browser_idle.record_activity(session, user, sid)
+    assert _as_utc(_row(sid).last_activity_at) == idle_since
+
+
+def test_the_countdown_uses_the_stricter_of_recorded_and_current_role(enforced):
+    """Demoted but idle since: admission and the countdown use 15 minutes."""
+    _users()
+    admin = _login("administrator")
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session)
+        session.commit()
+    _idle_for(admin, 5)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="administrator").one().is_admin = False
+        session.commit()
+    idle = _verify(admin).json()["idle_session"]
+    assert idle["idle_timeout_seconds"] == 15 * 60
+
+
+def test_a_demotion_while_enforced_never_revives_an_expired_login(enforced):
+    """An admin rejected at 15 minutes, then demoted before any sweep."""
+    _users()
+    admin = _login("administrator")
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session)
+        session.commit()
+    _idle_for(admin, 20)
+    _assert_idle_rejection(_verify(admin))
+
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="administrator").one().is_admin = False
+        session.commit()
+    _assert_idle_rejection(_verify(admin))
+    _assert_idle_rejection(
+        auth_tests.client.post("/api/auth/activity", headers=_bearer(admin))
+    )
+    _assert_idle_rejection(_refresh(admin))
 
 
 def test_an_activity_write_during_a_threshold_rollout_follows_the_stricter_set(

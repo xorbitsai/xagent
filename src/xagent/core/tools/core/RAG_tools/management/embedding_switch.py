@@ -43,6 +43,15 @@ class CollectionEmbeddingSwitch:
     target_dimension: int
 
 
+def resolve_configured_model(target_model_id: str) -> tuple[str, int]:
+    """The configured model a migration may target: canonical id and dimension.
+
+    The one rule for every command that binds or copies into a model: the hub
+    must know the id, nothing may fall back to the environment's default.
+    """
+    return _resolve_configured_model(target_model_id)
+
+
 def _resolve_configured_model(target_model_id: str) -> tuple[str, int]:
     """Return the hub config for ``target_model_id``, never an env fallback.
 
@@ -84,7 +93,7 @@ def switch_collection_embedding_model(
             details={"collection": collection_name, "migration_state": state.state},
         )
 
-    canonical_model_id, dimension = _resolve_configured_model(target_model_id)
+    canonical_model_id, dimension = resolve_configured_model(target_model_id)
 
     stored = get_collection_sync(collection_name)
     observed_model_id = stored.embedding_model_id

@@ -39,6 +39,7 @@ from xagent.migrations.embedding.scope import (
     connection,
     iter_source_chunks,
     iter_source_doc_ids,
+    preflight_source_target,
     resolve_collection_names,
     skip_reason,
     source_eligibility,
@@ -240,6 +241,7 @@ def embed_collection(
         logger.warning("%s: skipped (%s)", name, eligibility.reason)
         return report
     report.source_model_id = eligibility.model_id
+    preflight_source_target(report.source_model_id, model_id)
 
     have = target_chunk_ids(
         name, model_id, conn=conn, dimension=embedding_config.dimension

@@ -559,3 +559,134 @@ def test_reading_is_batched(monkeypatch: pytest.MonkeyPatch) -> None:
     _wire(monkeypatch, conn)
 
     assert mod.scope_collection("kb").chunks == 2500
+
+
+# --- the CLIs run against the real resolver and real imports ---
+
+
+def test_the_public_resolver_is_the_hub_rule() -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import EmbeddingAdapterError
+    from xagent.core.tools.core.RAG_tools.management import embedding_switch
+
+    assert hasattr(embedding_switch, "resolve_configured_model")
+    # A model the hub does not know must fail, not fall back to the environment.
+    with pytest.raises((EmbeddingAdapterError, ValueError)):
+        embedding_switch.resolve_configured_model("no-such-embedding-model-xyz")
+
+
+def test_the_public_resolver_enforces_the_hub_rule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.model.model import EmbeddingModelConfig
+    from xagent.core.tools.core.RAG_tools.management import embedding_switch
+
+    def _config(**overrides: Any) -> EmbeddingModelConfig:
+        fields = {"id": "canonical-model", "model_name": "canonical", "dimension": 2}
+        fields.update(overrides)
+        return EmbeddingModelConfig(**fields)
+
+    monkeypatch.setattr(
+        embedding_switch, "_load_model_from_hub", lambda *a, **k: _config()
+    )
+    # A name the hub resolves to another id is an alias, not a target.
+    with pytest.raises(ValueError, match="resolves to"):
+        embedding_switch.resolve_configured_model("an-alias")
+
+    monkeypatch.setattr(
+        embedding_switch,
+        "_load_model_from_hub",
+        lambda *a, **k: _config(id="an-alias", dimension=None),
+    )
+    # No dimension means no binding, whatever the environment would default to.
+    with pytest.raises(ValueError, match="no dimension"):
+        embedding_switch.resolve_configured_model("an-alias")
+
+    monkeypatch.setattr(
+        embedding_switch, "_load_model_from_hub", lambda *a, **k: _config(id="an-alias")
+    )
+    assert embedding_switch.resolve_configured_model("an-alias") == ("an-alias", 2)
+
+
+def test_scope_reaches_the_real_resolver_without_a_mock(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _wire(monkeypatch, _Conn({}))
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: [])
+
+    assert mod.main(["--model", "no-such-embedding-model-xyz"]) == 2
+
+    assert "ImportError" not in caplog.text
+    assert "no-such-embedding-model-xyz" in caplog.text
+
+
+def test_embed_reaches_the_real_resolver_without_a_mock(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from xagent.migrations.embedding import embed as embed_mod
+
+    monkeypatch.setattr(embed_mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+
+    assert embed_mod.main(["--model", "no-such-embedding-model-xyz"]) == 2
+
+    assert "ImportError" not in caplog.text
+    assert "no-such-embedding-model-xyz" in caplog.text
+
+
+def test_every_module_in_the_migration_package_imports() -> None:
+    # A symbol that only ever existed on an old branch fails here, not in CI.
+    import importlib
+    import pkgutil
+
+    import xagent.migrations.embedding as package
+
+    names = {module.name for module in pkgutil.iter_modules(package.__path__)}
+    assert {"scope", "embed"} <= names
+    for name in sorted(names):
+        importlib.import_module(f"xagent.migrations.embedding.{name}")
+
+
+# --- source and target must not be the same physical table ---
+
+
+def test_a_target_that_writes_the_source_table_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        written_embeddings_table_name,
+    )
+
+    # ``old-model`` and ``old_model`` share one writer spelling.
+    assert written_embeddings_table_name("old-model") == written_embeddings_table_name(
+        "old_model"
+    )
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound("old-model", 2)]),
+            mod.source_table("old-model"): _Table([_row("c1")]),
+        }
+    )
+    _wire(monkeypatch, conn)
+
+    with pytest.raises(mod.MigrationCliError, match="both write"):
+        mod.scope_collection("kb", target=("old_model", 2))
+
+
+def test_the_same_table_refusal_happens_before_anything_is_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound("old-model", 2)]),
+            mod.source_table("old-model"): _Table([_row("c1")]),
+        }
+    )
+    _wire(monkeypatch, conn)
+    monkeypatch.setattr(mod, "resolve_target", lambda model_id: ("old_model", 2))
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+
+    report = mod.scope_report(target_model_id="old_model")
+
+    assert [item.error for item in report] == [report[0].error] and "both write" in (
+        report[0].error or ""
+    )
+    assert report[0].chunks == 0

@@ -339,6 +339,24 @@ def source_eligibility(collection: str, *, conn: Optional[Any] = None) -> Eligib
     return eligible
 
 
+def preflight_source_target(source_model_id: str, target_model_id: str) -> None:
+    """Refuse a migration whose source and target are the same physical table.
+
+    Distinct ids can map to one writer spelling (``old-model`` and
+    ``old_model``): the target's rows would then be the source's, every chunk
+    would count as already held, and a write would overwrite the still-bound
+    source.
+    """
+    source = source_table(source_model_id)
+    target = source_table(target_model_id)
+    if source == target:
+        raise MigrationCliError(
+            f"source model '{source_model_id}' and target model '{target_model_id}' "
+            f"both write '{source}'; a migration from a table into itself "
+            "cannot be told apart from a finished copy."
+        )
+
+
 def iter_source_doc_ids(
     collection: str, model_id: str, *, conn: Optional[Any] = None
 ) -> Tuple[List[str], int]:
@@ -563,11 +581,12 @@ def scope_collection(
         item.skip_reason = eligibility.reason
         return item
     item.source_model_id = eligibility.model_id
-    have = (
-        target_chunk_ids(name, target_model_id, conn=conn, dimension=target_dimension)
-        if target_model_id
-        else set()
-    )
+    have: Set[str] = set()
+    if target_model_id:
+        preflight_source_target(item.source_model_id, target_model_id)
+        have = target_chunk_ids(
+            name, target_model_id, conn=conn, dimension=target_dimension
+        )
     documents: Set[str] = set()
     for chunk in iter_source_chunks(name, item.source_model_id, conn=conn):
         reason = skip_reason(chunk)

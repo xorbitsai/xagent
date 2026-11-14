@@ -553,3 +553,31 @@ def test_the_async_path_encodes_one_text_per_call() -> None:
 
     assert report.failures == []
     assert adapter.calls == ["text c1", "text c2"]
+
+
+def test_a_target_that_writes_the_source_table_is_refused_before_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
+        written_embeddings_table_name,
+    )
+
+    # Distinct ids, one physical table: the copy would overwrite its own source.
+    assert written_embeddings_table_name("old-model") == written_embeddings_table_name(
+        "old_model"
+    )
+    _save_collection(model_id="old-model", dimension=2)
+    _table(scope.source_table("old-model"), [_row("c1")])
+    adapter = _Adapter()
+    same = EmbeddingModelConfig(id="old_model", model_name="old_model", dimension=2)
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+    monkeypatch.setattr(mod, "resolve_target_model", lambda model_id: (same, adapter))
+
+    report = mod.embed_collections(same.id)
+
+    assert "both write" in report.collections[0].failures[0].error
+    assert report.failed
+    assert adapter.calls == []
+    assert {row["chunk_id"] for row in _rows_in(scope.source_table("old-model"))} == {
+        "c1"
+    }

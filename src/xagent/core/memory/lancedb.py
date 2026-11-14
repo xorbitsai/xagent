@@ -595,12 +595,73 @@ class LanceDBMemoryStore(MemoryStore):
             allow_vector_rebuild=False,
         )
 
+    def _storage_record(self, table: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """The row ``add`` and ``update`` write for ``data`` into ``table``.
+
+        The vector goes in only where this store's vectors may enter the table
+        (``_table_accepts_vectors``).
+        """
+        record = {
+            "id": data["id"],
+            "text": data["text"],
+            "metadata": data["metadata"],
+            USER_ID_COLUMN: data[USER_ID_COLUMN],
+            SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
+        }
+        if data["vector"] and self._table_accepts_vectors(table):
+            record["vector"] = data["vector"]
+        elif data["vector"]:
+            logger.warning(
+                "Memory table %r no longer holds this store's vector "
+                "space; storing memory %r without a vector",
+                self._collection_name,
+                data["id"],
+            )
+        return record
+
+    @staticmethod
+    def _fit_record(table: Any, record: dict[str, Any]) -> dict[str, Any]:
+        """``record`` adapted to the (possibly migrated) table schema."""
+        if "vector" in record and "vector" not in set(table.schema.names):
+            return {k: v for k, v in record.items() if k != "vector"}
+        return record
+
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
         """Insert a record, adapting it to the (possibly migrated) table schema."""
-        schema_names = set(table.schema.names)
-        if "vector" in record and "vector" not in schema_names:
-            record = {k: v for k, v in record.items() if k != "vector"}
-        table.add([record])
+        table.add([self._fit_record(table, record)])
+
+    def _update_existing(self, table: Any, record: dict[str, Any]) -> bool:
+        """Overwrite the row whose id is ``record``'s; False when there is none.
+
+        Matched rows are updated and unmatched ones are *not* inserted, so this
+        can never re-create a deleted id. Rebases once onto the latest version
+        when a concurrent ``compact()`` pruned the handle's version, as
+        ``_delete_where`` does.
+        """
+
+        def merge(target: Any) -> bool:
+            result = (
+                target.merge_insert("id").when_matched_update_all().execute([record])
+            )
+            return int(result.num_updated_rows) > 0
+
+        try:
+            return merge(table)
+        except RuntimeError as error:
+            if not _is_pruned_version_error(error):
+                raise
+            logger.warning(
+                "Memory update raced a compaction of %r; retrying on the latest "
+                "version",
+                self._collection_name,
+            )
+            latest = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            try:
+                return merge(latest)
+            finally:
+                _safe_close_table(latest)
 
     def _memory_note_to_dict(self, note: MemoryNote) -> dict[str, Any]:
         """Convert MemoryNote to dictionary for storage."""
@@ -684,26 +745,7 @@ class LanceDBMemoryStore(MemoryStore):
             table = None
             try:
                 table = conn.open_table(self._collection_name)
-
-                # Prepare record for insertion
-                record = {
-                    "id": data["id"],
-                    "text": data["text"],
-                    "metadata": data["metadata"],
-                    USER_ID_COLUMN: data[USER_ID_COLUMN],
-                    SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
-                }
-
-                # Add vector if available
-                if data["vector"] and self._table_accepts_vectors(table):
-                    record["vector"] = data["vector"]
-                elif data["vector"]:
-                    logger.warning(
-                        "Memory table %r no longer holds this store's vector "
-                        "space; storing memory %r without a vector",
-                        self._collection_name,
-                        data["id"],
-                    )
+                record = self._storage_record(table, data)
 
                 # Try to add the record. On a schema mismatch, migrate the
                 # existing table in place (preserving all rows) instead of
@@ -788,22 +830,61 @@ class LanceDBMemoryStore(MemoryStore):
             _safe_close_table(table)
 
     def update(self, note: MemoryNote) -> MemoryResponse:
-        """Update an existing memory note."""
+        """Replace a stored note, only while a row with its id still exists.
+
+        One conditional ``merge_insert`` on ``id`` that updates the matching row
+        and never inserts: a note deleted concurrently -- a forget that commits
+        between a caller's ``get`` and this write -- stays deleted, and the
+        update reports it as not found. LanceDB commits the merge as one table
+        version and, when another commit lands first, retries it against the
+        newer version, so there is no window in which the id is absent and then
+        re-added (a delete followed by an add had one).
+        """
+        if not note.id:
+            return MemoryResponse(
+                success=False, error="Memory not found", memory_id=note.id
+            )
         try:
-            # Check if memory exists
-            get_response = self.get(note.id)
-            if not get_response.success:
+            data = self._memory_note_to_dict(note)
+            conn = self._vector_store.get_raw_connection()
+            table = None
+            try:
+                table = conn.open_table(self._collection_name)
+                record = self._storage_record(table, data)
+                try:
+                    updated = self._update_existing(table, record)
+                except Exception as update_error:
+                    # The same schema-mismatch recovery as ``add``; the update
+                    # stays conditional on the migrated table.
+                    logger.warning(
+                        f"update() failed on possible schema mismatch: {update_error}; "
+                        "attempting safe in-place migration"
+                    )
+                    _safe_close_table(table)
+                    table = None
+                    try:
+                        self._migrate_schema_mismatch(conn, record)
+                    except Exception as migrate_error:
+                        logger.error(
+                            "Safe schema migration failed; table left intact: %s",
+                            migrate_error,
+                        )
+                        return MemoryResponse(
+                            success=False,
+                            error=f"Failed to update memory: {migrate_error}",
+                            memory_id=note.id,
+                        )
+                    table = conn.open_table(self._collection_name)
+                    updated = self._update_existing(
+                        table, self._fit_record(table, record)
+                    )
+            finally:
+                _safe_close_table(table)
+            if not updated:
                 return MemoryResponse(
-                    success=False,
-                    error="Memory not found",
-                    memory_id=note.id,
+                    success=False, error="Memory not found", memory_id=note.id
                 )
-
-            # Delete old record
-            self.delete(note.id)
-
-            # Add updated record
-            return self.add(note)
+            return MemoryResponse(success=True, memory_id=note.id)
 
         except Exception as e:
             logger.error(f"Failed to update memory note {note.id}: {e}")

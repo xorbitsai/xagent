@@ -46,6 +46,7 @@ from ...core.tools.core import pptx_conversion
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
+from .. import browser_idle
 from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..auth_dependencies import (
@@ -1910,6 +1911,9 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
     user = db.query(User).filter(User.username == username, User.id == user_id).first()
     if user is None or not matches_user_session(user, claims):
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+    # A ticket outlives neither its login's idle deadline nor a newer login.
+    if browser_idle.session_rejected(db, user, claims):
+        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
     return user
 
 
@@ -2011,6 +2015,7 @@ async def issue_preview_stream_ticket(
     ticket = create_access_token(
         {
             **user_session_claims(user),
+            **browser_idle.request_session_claims(user),
             "type": FILE_STREAM_TICKET_TYPE,
             "file_id": file_id,
         },

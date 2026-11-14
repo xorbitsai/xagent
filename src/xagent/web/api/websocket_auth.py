@@ -18,7 +18,11 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.websockets import WebSocketState
 
 from ...core.agent.voice_policy import voice_from_preferences
-from ..auth_dependencies import get_user_from_websocket_token
+from ..auth_dependencies import (
+    WebSocketSessionIdleRejected,
+    get_user_from_websocket_token,
+)
+from ..browser_idle import IDLE_WEBSOCKET_CLOSE_CODE
 from ..models.database import get_session_local
 from ..services.db_runtime import (
     cancel_and_drain_async_task,
@@ -54,6 +58,13 @@ class WebSocketPrincipal:
     # later, inside apply_output_voice's own isinstance/lookup guard in
     # api/agents.py), or None if the key is unset.
     voice: str | None = None
+
+
+class _IdleRejected:
+    """The browser idle policy, not a revocation, rejected the token."""
+
+
+_IDLE_REJECTED = _IdleRejected()
 
 
 class _WebSocketAuthenticationTerminated(Exception):
@@ -109,12 +120,15 @@ async def send_websocket_authentication_infrastructure_failure(
 
 def _load_websocket_principal_sync(
     token: str, *, verify_exp: bool = True
-) -> WebSocketPrincipal | None:
+) -> WebSocketPrincipal | _IdleRejected | None:
     """Authenticate one token inside a worker-owned short Session."""
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        user = get_user_from_websocket_token(token, db, verify_exp=verify_exp)
+        try:
+            user = get_user_from_websocket_token(token, db, verify_exp=verify_exp)
+        except WebSocketSessionIdleRejected:
+            return _IDLE_REJECTED
         if user is None or user.id is None:
             return None
         voice = voice_from_preferences(getattr(user, "preferences", None))
@@ -144,6 +158,10 @@ async def get_authenticated_user(
         )
         if revalidate and websocket.application_state is not WebSocketState.CONNECTED:
             return None
+        if isinstance(principal, _IdleRejected):
+            if revalidate:
+                await _close_revoked_session(websocket, idle=True)
+            return None
         if revalidate and principal is None:
             await _close_revoked_session(websocket)
         return principal
@@ -155,8 +173,15 @@ async def get_authenticated_user(
         raise _WebSocketAuthenticationTerminated() from exc
 
 
-async def _close_revoked_session(websocket: WebSocket) -> None:
-    if websocket.application_state is WebSocketState.CONNECTED:
+async def _close_revoked_session(websocket: WebSocket, *, idle: bool = False) -> None:
+    if websocket.application_state is not WebSocketState.CONNECTED:
+        return
+    if idle:
+        # Not 4001: browsers answer 4001 by refreshing and reconnecting.
+        await websocket.close(
+            code=IDLE_WEBSOCKET_CLOSE_CODE, reason="Session idle expired"
+        )
+    else:
         await websocket.close(code=4001, reason="Session expired")
 
 
@@ -223,8 +248,10 @@ def revalidate_websocket_session(endpoint: _Endpoint) -> _Endpoint:
                     )
                     return
                 failures = 0
-                if principal is None:
-                    await _close_revoked_session(websocket)
+                if principal is None or isinstance(principal, _IdleRejected):
+                    await _close_revoked_session(
+                        websocket, idle=isinstance(principal, _IdleRejected)
+                    )
                     return
 
         handler = asyncio.create_task(endpoint(*args, **kwargs))

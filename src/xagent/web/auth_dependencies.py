@@ -7,6 +7,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from . import browser_idle
 from . import jwt_codec as jwt
 from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from .auth_sessions import matches_user_session
@@ -28,6 +29,7 @@ class _AccessTokenRejectionReason(Enum):
     WRONG_TYPE = auto()
     INVALID_CLAIMS = auto()
     USER_NOT_FOUND = auto()
+    IDLE_EXPIRED = auto()
 
 
 class _AccessTokenRejected(Exception):
@@ -91,6 +93,14 @@ def _resolve_access_token_user(
         raise _AccessTokenRejected(_AccessTokenRejectionReason.USER_NOT_FOUND)
     if not matches_user_session(user, payload):
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)
+    # Applies even when verify_exp is off (WebSocket rechecks): a still valid
+    # JWT never outlives its login's idle deadline or revocation. With the
+    # policy off, a revoked login or one that expired while enforced is rejected.
+    if browser_idle.session_rejected(db, user, payload):
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.IDLE_EXPIRED)
+    browser_idle.remember_request_session(
+        user, browser_idle.claimed_session_id(payload)
+    )
     return user
 
 
@@ -127,6 +137,8 @@ def _required_http_rejection(reason: _AccessTokenRejectionReason) -> NoReturn:
                 detail="User not found",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        case _AccessTokenRejectionReason.IDLE_EXPIRED:
+            raise browser_idle.rejection_http_exception()
         case _:
             assert_never(reason)
 
@@ -226,6 +238,10 @@ def is_admin_user(user: User) -> bool:
     return bool(getattr(user, "is_admin", False))
 
 
+class WebSocketSessionIdleRejected(Exception):
+    """The browser idle policy rejected a WebSocket token (not a revocation)."""
+
+
 def get_user_from_websocket_token(
     token: str, db: Session, *, verify_exp: bool = True
 ) -> Optional[User]:
@@ -242,9 +258,13 @@ def get_user_from_websocket_token(
         Optional[User]: User if credentials are valid, None if they are rejected.
 
     Raises:
+        WebSocketSessionIdleRejected: The browser idle policy rejected the
+            token, so an open socket closes with the idle code, not "refresh".
         Exception: Database and unexpected operational failures propagate unchanged.
     """
     try:
         return _resolve_access_token_user(token, db, verify_exp=verify_exp)
-    except _AccessTokenRejected:
+    except _AccessTokenRejected as rejected:
+        if rejected.reason is _AccessTokenRejectionReason.IDLE_EXPIRED:
+            raise WebSocketSessionIdleRejected() from None
         return None

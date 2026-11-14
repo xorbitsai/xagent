@@ -1122,6 +1122,46 @@ def start_retention_purge_task(
     return task
 
 
+def start_browser_session_sweep_task(app_instance: FastAPI) -> asyncio.Task[Any] | None:
+    """Revoke idle-expired browser logins and prune old rows every minute.
+
+    Runs on every replica; each sweep is an idempotent conditional UPDATE.
+    Revocation happens only while the idle policy is enabled; pruning always.
+    """
+    from .browser_idle import run_browser_session_sweep_loop
+    from .models.database import get_session_local
+
+    existing = getattr(app_instance.state, "browser_session_sweep_task", None)
+    if existing is not None and not existing.done():
+        return cast(asyncio.Task[Any], existing)
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return None
+    stop_event = asyncio.Event()
+    app_instance.state.browser_session_sweep_stop = stop_event
+    task = asyncio.create_task(
+        run_browser_session_sweep_loop(get_session_local(), stop_event=stop_event)
+    )
+    app_instance.state.browser_session_sweep_task = task
+    return task
+
+
+async def stop_browser_session_sweep_task(app_instance: FastAPI) -> None:
+    stop_event = getattr(app_instance.state, "browser_session_sweep_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    task = getattr(app_instance.state, "browser_session_sweep_task", None)
+    app_instance.state.browser_session_sweep_stop = None
+    app_instance.state.browser_session_sweep_task = None
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(task, timeout=10)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        task.cancel()
+    except Exception as exc:
+        logger.error("Browser session sweep stopped after failure", exc_info=exc)
+
+
 async def stop_retention_purge_task(app_instance: FastAPI) -> None:
     """Ask the retention purge loop to stop, give it a moment, then cancel it.
 
@@ -1991,6 +2031,7 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
     start_retention_purge_task(app_instance)
+    start_browser_session_sweep_task(app_instance)
     start_task_cleanup_retry_task(app_instance)
 
 
@@ -2596,6 +2637,7 @@ async def _stop_runtime_loops() -> None:
     await stop_composio_reconcile_task(app)
     await stop_composio_missing_account_task(app)
     await stop_retention_purge_task(app)
+    await stop_browser_session_sweep_task(app)
     await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_auto_resume_task(app)

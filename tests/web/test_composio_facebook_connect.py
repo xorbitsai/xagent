@@ -32,10 +32,13 @@ from xagent.web.mcp_apps import ensure_builtin_oauth_server_definition
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import UserMCPServer
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.user_oauth import delete_scoped_user_oauth_accounts
+
+from . import composio_web_start as web_start
 
 OWNER = "toby:workspace-7:member-alice"
 OTHER_OWNER = "toby:workspace-7:member-bob"
@@ -394,6 +397,55 @@ def test_each_app_follows_only_its_own_switch(composio_env, monkeypatch):
 
 
 # --- Start ----------------------------------------------------------------------
+
+
+def test_a_web_facebook_connect_stays_native_with_the_composio_switch_on(
+    db_session, composio_env, composio
+):
+    """The switch moves the actor start only; a web connect keeps our own app."""
+    db, user = db_session
+    meta = _meta_provider()
+    db.add(
+        OAuthProvider(
+            **{
+                name: getattr(meta, name)
+                for name in (
+                    "provider_name",
+                    "client_id",
+                    "client_secret",
+                    "auth_url",
+                    "token_url",
+                    "redirect_uri",
+                    "userinfo_url",
+                    "user_id_path",
+                    "email_path",
+                    "default_scopes",
+                )
+            },
+            name="Meta",
+        )
+    )
+    db.commit()
+    browser = Browser()
+
+    response = auth_api.oauth_login(
+        "meta",
+        token=web_start.access_token(user),
+        app_id="facebook",
+        db=db,
+    )
+
+    assert response.status_code in (302, 307)
+    location = urlsplit(response.headers["location"])
+    assert location.netloc == "www.facebook.com"
+    state = auth_api.verify_token(parse_qs(location.query)["state"][0])
+    assert composio_auth.AUTH_BACKEND_CLAIM not in state
+    assert "actor_flow_nonce" not in state
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert composio.calls == []
+    name = auth_api._ordinary_oauth_cookie_name(state["browser_nonce_hash"])
+    browser.receive(response)
+    assert browser.cookies[name][1] == "/"
 
 
 def test_start_meets_the_xagent_saas_contract(db_session, composio_env, composio):

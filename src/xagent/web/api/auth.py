@@ -3077,6 +3077,7 @@ def generic_oauth_login(
     db_provider: Optional[Any] = None,
     account: Optional[str] = None,
     force_google_consent: bool = False,
+    auth_backend: str | None = None,
 ) -> Any:
     """Start ordinary OAuth with a per-state browser-binding cookie."""
     return _generic_oauth_login(
@@ -3091,6 +3092,7 @@ def generic_oauth_login(
         actor_flow_nonce=None,
         account=account,
         force_google_consent=force_google_consent,
+        auth_backend=auth_backend,
     )
 
 
@@ -4395,11 +4397,12 @@ def _generic_oauth_login(
     force_google_consent: bool = False,
     auth_backend: str | None = None,
 ) -> Any:
-    """Build an ordinary or trusted actor provider authorization redirect.
+    """Build a native, ordinary Composio, or trusted actor OAuth redirect.
 
     ``auth_backend`` is ``None`` for a native start, or Composio's backend for
-    an actor start of an app that goes through Composio. Any other value is a
-    programming error and raises ``ValueError`` before anything is read.
+    a start of an app that goes through Composio, actor or ordinary. Any other
+    value is a programming error and raises ``ValueError`` before anything is
+    read.
     """
     from .. import composio_auth
 
@@ -4408,6 +4411,7 @@ def _generic_oauth_login(
     # Every native-only rule below (our client id, the Google gates, shared
     # grants) keys on this one flag (#3649).
     native_start = auth_backend is None
+    composio_ordinary = not native_start and actor_flow_nonce is None
     if db is None:
         raise RuntimeError("db session is required")
     if native_start:
@@ -4444,8 +4448,7 @@ def _generic_oauth_login(
             status_code=401,
         )
 
-    # Only the actor start passes ``auth_backend``, and only for an app that
-    # goes through Composio, whose start never reaches Google (see above).
+    # A Composio start never reaches Google, so this gate is native-only.
     if native_start and (error_response := _google_gmail_error(provider, app_id)):
         return error_response
 
@@ -4514,6 +4517,12 @@ def _generic_oauth_login(
             browser_state_nonce.encode("ascii")
         ).hexdigest()
         state_payload["browser_nonce_hash"] = browser_nonce_hash
+    if composio_ordinary:
+        # The one-time claim and flow row an actor flow spends, without the
+        # owner claim that would make the callback read it as an actor flow.
+        assert browser_nonce_hash is not None
+        state_payload["actor_flow_nonce"] = browser_nonce_hash
+        state_payload[composio_auth.AUTH_BACKEND_CLAIM] = auth_backend
     if bound_account is not None:
         state_payload["oauth_account"] = bound_account
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
@@ -4693,7 +4702,7 @@ def _generic_oauth_login(
 
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
-    from urllib.parse import urlencode
+    from urllib.parse import urlencode, urlsplit
 
     params = {
         "response_type": "code",
@@ -4762,24 +4771,46 @@ def _generic_oauth_login(
         if optional_scope_str:
             params["optional_scope"] = optional_scope_str
 
-    separator = "&" if "?" in auth_url else "?"
-    full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
-    response = RedirectResponse(full_auth_url)
+    cookie_secure: bool
+    cookie_path: str = "/"
+    if composio_ordinary:
+        assert browser_nonce_hash is not None
+        callback_url = composio_auth.shared_callback_url(
+            db,
+            db_provider
+            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+            else None,
+        )
+        response = RedirectResponse(composio_auth.begin_location(callback_url, state))
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
+        # Committed before the redirect returns: the browser follows it at
+        # once. Begin only checks this row; the verify or denied trip spends it.
+        db.add(
+            ActorOAuthFlowState(
+                nonce=browser_nonce_hash,
+                expires_at=datetime.now(timezone.utc) + _ACTOR_OAUTH_FLOW_TTL,
+            )
+        )
+        db.commit()
+    else:
+        separator = "&" if "?" in auth_url else "?"
+        full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
+        response = RedirectResponse(full_auth_url)
+        cookie_secure = urlsplit(redirect_uri).scheme.lower() == "https"
+        # Match the callback URL's transport, rather than an environment
+        # label. Development can run behind HTTPS and production can be
+        # reached over HTTP during local health checks; the cookie must
+        # follow the browser-visible OAuth origin.
     if browser_state_nonce is not None:
-        from urllib.parse import urlsplit
-
         assert browser_nonce_hash is not None
         response.set_cookie(
             _ordinary_oauth_cookie_name(browser_nonce_hash),
             browser_state_nonce,
             max_age=600,
             httponly=True,
-            # Match the callback URL's transport, rather than an environment
-            # label. Development can run behind HTTPS and production can be
-            # reached over HTTP during local health checks; the cookie must
-            # follow the browser-visible OAuth origin.
-            secure=urlsplit(redirect_uri).scheme.lower() == "https",
+            secure=cookie_secure,
             samesite="lax",
+            path=cookie_path,
         )
     return response
 
@@ -6757,15 +6788,30 @@ def oauth_login(
     db: Session = Depends(get_db),
 ) -> Any:
     """In-process adapter; never expose its token argument as an HTTP query."""
+    from .. import composio_auth
     from ..models.oauth_provider import OAuthProvider
 
+    composio_app = composio_auth.composio_web_app(provider, app_id)
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
-    if not db_provider:
+    if db_provider is None and composio_app is None:
         return HTMLResponse(
             content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
             status_code=400,
+        )
+    if composio_app is not None:
+        if (refusal := composio_auth.start_preflight(composio_app.app_id)) is not None:
+            return refusal
+        return generic_oauth_login(
+            provider,
+            token,
+            app_id,
+            redirect,
+            db,
+            db_provider,
+            account=account,
+            auth_backend=composio_auth.AUTH_BACKEND,
         )
 
     # But now everything can be routed through generic
@@ -6876,13 +6922,21 @@ def redeem_oauth_launch(
             "Invalid or expired authorization ticket",
             headers=_OAUTH_LAUNCH_HEADERS,
         )
+    from .. import composio_auth
     from ..models.oauth_provider import OAuthProvider
 
+    composio_app = composio_auth.composio_web_app(provider, options.app_id)
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
-    if db_provider is None:
+    if db_provider is None and composio_app is None:
         raise HTTPException(400, "Unsupported provider", headers=_OAUTH_LAUNCH_HEADERS)
+    if (
+        composio_app is not None
+        and (refusal := composio_auth.start_preflight(composio_app.app_id)) is not None
+    ):
+        refusal.headers.update(_OAUTH_LAUNCH_HEADERS)
+        return refusal
     response = _generic_oauth_login(
         provider,
         token=None,
@@ -6895,6 +6949,7 @@ def redeem_oauth_launch(
         resource_owner_key=None,
         actor_flow_nonce=None,
         account=options.account,
+        auth_backend=(composio_auth.AUTH_BACKEND if composio_app is not None else None),
     )
     response.headers.update(_OAUTH_LAUNCH_HEADERS)
     return response
@@ -6937,14 +6992,29 @@ def start_oauth_authorization(
         raise HTTPException(
             400, "Invalid authorization options", headers=private_headers
         ) from None
+    from .. import composio_auth
+
+    composio_app = composio_auth.composio_web_app(provider, payload.app_id)
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
-    if db_provider is None:
+    if db_provider is None and composio_app is None:
         raise HTTPException(
             status_code=400, detail="Unsupported provider", headers=private_headers
         )
-    callback = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    if composio_app is not None:
+        if (refusal := composio_auth.start_preflight(composio_app.app_id)) is not None:
+            refusal.headers.update(private_headers)
+            return refusal
+        callback_url = composio_auth.shared_callback_url(
+            db,
+            db_provider
+            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+            else None,
+        )
+    else:
+        callback_url = _resolve_oauth_redirect_uri(provider, db_provider)
+    callback = urlparse(callback_url)
     if (
         callback.scheme not in {"http", "https"}
         or not callback.netloc

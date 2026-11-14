@@ -12,7 +12,6 @@ request leaves the process.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -32,8 +31,10 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 
+from . import composio_web_start as web_start
 from . import test_composio_facebook_connect as facebook_connect
 from .test_composio_facebook_connect import (
+    CALLBACK_PATH,
     CALLBACK_URL,
     COMPOSIO_REDIRECT,
     OTHER_OWNER,
@@ -44,7 +45,13 @@ from .test_composio_facebook_connect import (
     _grants,
     _meta_provider,
     _Response,
+    _store_composio_grant,
     _verify_url,
+)
+from .test_composio_ordinary_flow import (
+    DEDICATED_PATH,
+    DEDICATED_URL,
+    RoutedBrowser,
 )
 
 # Facebook's fixtures, shared: the environment and a database with the
@@ -300,21 +307,141 @@ def test_with_the_switch_off_a_start_without_the_row_is_refused(
     assert composio.calls == []
 
 
-def test_with_the_switch_on_a_web_salesforce_connect_stays_native(salesforce):
-    """Only actor (Toby) connects go through Composio: an ordinary web connect,
-    which has no resource owner key, still uses our own connected app."""
+@pytest.mark.parametrize("entry", web_start.WEB_ENTRIES)
+def test_with_the_switch_on_a_web_salesforce_connect_goes_through_composio(
+    salesforce, monkeypatch, entry
+):
+    """Every web entry starts a Composio flow when the app's switch is on, with
+    no native provider row and no native client configured."""
     db, user, composio = salesforce
-    token = auth_api.create_access_token(
-        data={"sub": user.username, "user_id": user.id, "type": "access"},
-        expires_delta=timedelta(minutes=5),
+    monkeypatch.delenv("SALESFORCE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SALESFORCE_CLIENT_SECRET", raising=False)
+    user.session_epoch = "generation"
+    db.commit()
+    assert (
+        db.query(OAuthProvider)
+        .filter(OAuthProvider.provider_name == "salesforce")
+        .first()
+        is None
+    )
+    _store_composio_grant(db, user, account_id="ca_actor", provider="salesforce")
+    browser = Browser()
+
+    response, callback_origin = web_start.web_begin(
+        db, user, "salesforce", "salesforce", entry
     )
 
-    response = auth_api.generic_oauth_login(
+    location, state = web_start.begin_redirect(response)
+    assert location.startswith(f"{CALLBACK_URL}?state=")
+    assert callback_origin in (None, "https://app.example.com")
+    web_start.assert_ordinary_state(
+        db,
+        state,
         provider="salesforce",
-        token=token,
+        app_id="salesforce",
+        session_epoch="generation",
+    )
+    web_start.assert_proof_cookie(response, browser, state, CALLBACK_PATH)
+
+    assert browser.get(db, location).status_code == 302
+    verify = browser.get(db, _verify_url(composio))
+    assert verify.status_code == 200, verify.body
+
+    db.expire_all()
+    ordinary = [grant for grant in _grants(db) if grant.resource_owner_key is None]
+    assert [
+        (grant.provider, grant.token_type, grant.access_token) for grant in ordinary
+    ] == [("salesforce", "composio", composio.created[-1])]
+    actor = [grant for grant in _grants(db) if grant.resource_owner_key == OWNER]
+    assert [(grant.provider, grant.access_token) for grant in actor] == [
+        ("salesforce", "ca_actor")
+    ]
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert _flow_cookies(browser) == []
+
+    # The same state is one-time: replaying the begin creates no second link.
+    links = composio.paths().count("/connected_accounts/link")
+    assert browser.get(db, location).status_code == 400
+    assert composio.paths().count("/connected_accounts/link") == links
+
+
+def test_a_web_salesforce_composio_state_is_refused_on_the_native_callback(
+    salesforce,
+):
+    db, user, composio = salesforce
+    response, _ = web_start.web_begin(
+        db, user, "salesforce", "salesforce", "oauth_login"
+    )
+    location, _ = web_start.begin_redirect(response)
+    state = parse_qs(urlsplit(location).query)["state"][0]
+
+    callback = auth_api.generic_oauth_callback(
+        "salesforce",
+        SimpleNamespace(query_params={"code": "code", "state": state}, cookies={}),
+        db,
+        None,
+    )
+
+    assert callback.status_code == 400
+    assert composio.calls == []
+    assert _grants(db) == []
+    assert db.query(ActorOAuthFlowState).count() == 1
+
+
+def test_a_web_salesforce_start_scopes_its_proof_cookie_to_the_dedicated_path(
+    salesforce, monkeypatch
+):
+    db, user, composio = salesforce
+    monkeypatch.setenv("XAGENT_COMPOSIO_CALLBACK_URL", DEDICATED_URL)
+    browser = RoutedBrowser()
+
+    response, _ = web_start.web_begin(
+        db, user, "salesforce", "salesforce", "oauth_login"
+    )
+    location, state = web_start.begin_redirect(response)
+    assert urlsplit(location).path == DEDICATED_PATH
+    web_start.assert_proof_cookie(response, browser, state, DEDICATED_PATH)
+
+    assert browser.get(db, location).status_code == 302
+    verify = browser.get(
+        db, f"{DEDICATED_URL}?session_uri={_verify_url(composio).split('=', 1)[1]}"
+    )
+
+    assert verify.status_code == 200, verify.body
+    db.expire_all()
+    ordinary = [grant for grant in _grants(db) if grant.resource_owner_key is None]
+    assert [grant.provider for grant in ordinary] == ["salesforce"]
+
+
+def test_with_the_switch_off_a_web_salesforce_connect_stays_native(
+    db_session, composio_env, composio, monkeypatch
+):
+    monkeypatch.delenv("XAGENT_SALESFORCE_AUTH_BACKEND", raising=False)
+    db, user = db_session
+    provider = _salesforce_provider()
+    db.add(
+        OAuthProvider(
+            provider_name="salesforce",
+            name="Salesforce",
+            client_id=provider.client_id,
+            client_secret=provider.client_secret,
+            auth_url=provider.auth_url,
+            token_url=provider.token_url,
+            redirect_uri=provider.redirect_uri,
+            userinfo_url=provider.userinfo_url,
+            user_id_path=provider.user_id_path,
+            email_path=provider.email_path,
+            default_scopes=provider.default_scopes,
+        )
+    )
+    db.commit()
+    browser = Browser()
+
+    response = auth_api.oauth_login(
+        "salesforce",
+        token=web_start.access_token(user),
         app_id="salesforce",
         db=db,
-        db_provider=_salesforce_provider(),
     )
 
     assert response.status_code in (302, 307)
@@ -326,9 +453,22 @@ def test_with_the_switch_on_a_web_salesforce_connect_stays_native(salesforce):
     query = parse_qs(location.query)
     assert query["client_id"] == ["salesforce-client-id"]
     state = auth_api.verify_token(query["state"][0])
-    assert state.get("resource_owner_key") is None
     assert composio_auth.AUTH_BACKEND_CLAIM not in state
+    assert "actor_flow_nonce" not in state
+    assert state.get("resource_owner_key") is None
+    assert db.query(ActorOAuthFlowState).count() == 0
     assert composio.calls == []
+    # The native proof cookie is untouched: the browser-wide default path.
+    name = auth_api._ordinary_oauth_cookie_name(state["browser_nonce_hash"])
+    browser.receive(response)
+    assert browser.cookies[name][1] == "/"
+    (header,) = [
+        value
+        for value in response.headers.getlist("set-cookie")
+        if value.startswith(f"{name}=")
+    ]
+    assert "Path=/" in header
+    assert "HttpOnly" in header
 
 
 # --- Connect end to end ---------------------------------------------------------

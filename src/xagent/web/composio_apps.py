@@ -84,6 +84,9 @@ class ComposioApp(NamedTuple):
     # change on Composio's page when the account names no usable host. Ends
     # the sentence "Close this window, select Connect again, and ...".
     identity_host_help: str | None = None
+    # Whether ordinary (web) connects also go through Composio; an actor
+    # start follows the app's switch alone.
+    web_start: bool = False
 
 
 # Graph ids, Facebook user ids and Instagram professional account ids alike.
@@ -258,6 +261,7 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_id_pattern=_SALESFORCE_USER_ID_RE,
         connect_guidance=SALESFORCE_CONNECT_GUIDANCE,
         identity_host_help=_SALESFORCE_IDENTITY_HOST_HELP,
+        web_start=True,
     ),
 }
 
@@ -296,6 +300,14 @@ def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
         return None
     app = COMPOSIO_APPS.get(normalize_oauth_grant_key(app_id) or "")
     if app is None or app.provider != provider.lower() or not _uses_composio(app):
+        return None
+    return app
+
+
+def composio_web_app(provider: str, app_id: str | None) -> ComposioApp | None:
+    """The app whose ordinary web connects go through Composio, if this one does."""
+    app = composio_app(provider, app_id)
+    if app is None or not app.web_start:
         return None
     return app
 

@@ -416,6 +416,44 @@ def test_each_threshold_set_applies_after_a_rolling_change(monkeypatch):
     assert _verify(alive_under_both).status_code == 200
 
 
+@pytest.mark.parametrize("overlap", [True, False])
+def test_the_stricter_set_governs_while_a_threshold_change_rolls_out(
+    monkeypatch, overlap
+):
+    """This replica runs 60 minutes; another still enforces 30 (or stopped)."""
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_MINUTES, "60")
+    _users()
+    tokens = _login()
+    now = datetime.now(timezone.utc)
+    _lease_until(now + timedelta(seconds=10 if overlap else -10), ordinary_minutes=30)
+    _idle_for(tokens, 40)
+
+    if overlap:
+        _assert_idle_rejection(_verify(tokens))
+    else:
+        assert _verify(tokens).status_code == 200
+
+
+def test_an_activity_write_during_a_threshold_rollout_follows_the_stricter_set(
+    monkeypatch,
+):
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_MINUTES, "60")
+    _users()
+    tokens = _login()
+    _lease_until(
+        datetime.now(timezone.utc) + timedelta(seconds=10), ordinary_minutes=30
+    )
+    idle_since = _idle_for(tokens, 40)
+    # The read-side check passed; the write itself must apply the 30-minute set.
+    monkeypatch.setattr(browser_idle, "session_rejected", lambda *_a, **_k: False)
+    _assert_idle_rejection(
+        auth_tests.client.post("/api/auth/activity", headers=_bearer(tokens))
+    )
+    assert _as_utc(_row(_sid(tokens)).last_activity_at) == idle_since
+
+
 def test_renewal_keeps_one_row_per_threshold_set(monkeypatch):
     _users()
     now = datetime.now(timezone.utc)

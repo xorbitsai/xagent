@@ -94,8 +94,8 @@ def _resolve_access_token_user(
     if not matches_user_session(user, payload):
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)
     # Applies even when verify_exp is off (WebSocket rechecks): a still valid
-    # JWT never outlives its login's idle deadline or revocation. Only a
-    # revoked login is rejected while the policy is off.
+    # JWT never outlives its login's idle deadline or revocation. With the
+    # policy off, a revoked login or one that expired while enforced is rejected.
     if browser_idle.session_rejected(db, user, payload):
         raise _AccessTokenRejected(_AccessTokenRejectionReason.IDLE_EXPIRED)
     browser_idle.remember_request_session(

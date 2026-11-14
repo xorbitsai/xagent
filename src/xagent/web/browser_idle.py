@@ -131,6 +131,20 @@ def idle_timeout(user: User, policy: BrowserIdlePolicy) -> timedelta:
     return timedelta(seconds=policy.timeout_seconds(bool(user.is_admin)))
 
 
+def _current_timeout(
+    user: User, recorded_admin: bool, policy: BrowserIdlePolicy
+) -> timedelta:
+    """This replica's threshold for the stricter of the recorded and current role.
+
+    A demotion never moves a login onto a longer threshold before its next
+    activity records the new role, whether or not a lease covers its deadline.
+    """
+    return min(
+        timedelta(seconds=policy.timeout_seconds(role))
+        for role in (recorded_admin, bool(user.is_admin))
+    )
+
+
 def _load(db: Session, user: User, sid: str | None) -> BrowserSession | None:
     if sid is None:
         return None
@@ -280,7 +294,7 @@ def expired_while_enforced(
     roles: tuple[bool, ...],
     now: datetime,
 ) -> bool:
-    """Whether a login expired while the policy was enforced (policy now off).
+    """Whether a login expired while a recorded threshold set was enforced.
 
     True if, under any recorded threshold set and the strictest of ``roles``,
     its deadline has passed and fell before that set's lease ended. Needs no
@@ -334,7 +348,14 @@ def _alive_condition(
     conditions = _lease_conditions(enforcement_leases(db), current=current, now=now)
     if policy.enabled:
         conditions.append(
-            BrowserSession.last_activity_at > now - idle_timeout(user, policy)
+            BrowserSession.last_activity_at
+            > case(
+                (
+                    BrowserSession.recorded_admin.is_(True),
+                    now - _current_timeout(user, True, policy),
+                ),
+                else_=now - _current_timeout(user, False, policy),
+            )
         )
     return and_(*conditions) if conditions else None
 
@@ -350,14 +371,15 @@ def _expired(
 ) -> bool:
     """Whether the login has reached an enforced idle deadline.
 
-    Enabled: past this replica's current threshold. In any state: expired
+    Enabled: past this replica's threshold for the stricter of the recorded
+    and current role. In any state: expired
     under a recorded threshold set while that set was still enforced, with the
     stricter of the recorded and current role. The second test keeps a login
     expired after a later threshold increase, a demotion, a rolling change or
     switch-off, without any request-time write. No threshold is below a
     minute, so a login active within the last minute skips the lease read.
     """
-    if policy.enabled and last + idle_timeout(user, policy) <= now:
+    if policy.enabled and last + _current_timeout(user, recorded_admin, policy) <= now:
         return True
     if last > now - _MIN_THRESHOLD:
         return False
@@ -685,11 +707,24 @@ def effective_idle_timeout(
     ``build_idle_session(timeout=...)``.
     """
     policy = policy or get_browser_idle_policy()
-    own = timedelta(seconds=policy.timeout_seconds(is_platform_admin))
     if not policy.enabled:
-        return own
-    leases = _active_leases(db, now or utcnow())
-    return min([own] + [lease.timeout(is_platform_admin) for lease in leases])
+        return timedelta(seconds=policy.timeout_seconds(is_platform_admin))
+    return _effective_timeout(
+        _active_leases(db, now or utcnow()), (is_platform_admin,), policy
+    )
+
+
+def _effective_timeout(
+    leases: list[EnforcementLease], roles: tuple[bool, ...], policy: BrowserIdlePolicy
+) -> timedelta:
+    """The strictest of this replica's and the enforced sets' thresholds."""
+    return min(
+        min(
+            [timedelta(seconds=policy.timeout_seconds(role))]
+            + [lease.timeout(role) for lease in leases]
+        )
+        for role in roles
+    )
 
 
 def idle_session_fields(
@@ -712,14 +747,11 @@ def idle_session_fields(
     now = now or utcnow()
     timeout = None
     if db is not None and policy.enabled:
-        roles = {bool(user.is_admin)}
         row = _load(db, user, sid)
-        if row is not None:
-            roles.add(bool(row.recorded_admin))
-        timeout = min(
-            effective_idle_timeout(db, is_platform_admin=role, now=now, policy=policy)
-            for role in roles
+        roles = (bool(user.is_admin),) + (
+            (bool(row.recorded_admin),) if row is not None else ()
         )
+        timeout = _effective_timeout(_active_leases(db, now), roles, policy)
     return build_idle_session(
         is_platform_admin=bool(user.is_admin),
         sid=sid,

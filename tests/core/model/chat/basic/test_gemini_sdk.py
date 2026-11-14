@@ -921,6 +921,83 @@ class TestGeminiPromptCacheUsage:
         assert inp["cached_tokens"] == 60
 
     @pytest.mark.asyncio
+    async def test_chat_counts_thinking_tokens_as_output(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        mock_part = MagicMock()
+        mock_part.text = "ok"
+        mock_part.function_call = None
+        mock_content = MagicMock()
+        mock_content.parts = [mock_part]
+        mock_candidate = MagicMock()
+        mock_candidate.content = mock_content
+
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_response.usage_metadata = MagicMock()
+        mock_response.usage_metadata.prompt_token_count = 100
+        mock_response.usage_metadata.candidates_token_count = 5
+        mock_response.usage_metadata.thoughts_token_count = 40
+        mock_response.usage_metadata.cached_content_token_count = 0
+
+        mock_sdk_client = MagicMock()
+        mocker.patch("google.genai.Client", return_value=mock_sdk_client)
+
+        async def mock_generate_content(*args, **kwargs):
+            return mock_response
+
+        mock_sdk_client.aio.models.generate_content = mock_generate_content
+
+        with TokenContextManager() as manager:
+            await llm.chat([{"role": "user", "content": "hi"}])
+            usage = manager.get_usage()
+
+        assert usage.output_tokens == 45
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_counts_thinking_tokens_as_output(
+        self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
+    ) -> None:
+        from xagent.core.model.chat.token_context import TokenContextManager
+
+        usage_chunk = MagicMock()
+        usage_chunk.usage_metadata = MagicMock()
+        usage_chunk.usage_metadata.prompt_token_count = 100
+        usage_chunk.usage_metadata.candidates_token_count = 5
+        usage_chunk.usage_metadata.thoughts_token_count = 40
+        usage_chunk.usage_metadata.cached_content_token_count = 0
+        usage_chunk.candidates = None
+
+        end_chunk = MagicMock()
+        end_chunk.candidates = None
+        end_chunk.usage_metadata = None
+
+        async def mock_stream():
+            for chunk in [usage_chunk, end_chunk]:
+                yield chunk
+
+        async def mock_generate_content_stream(*args, **kwargs):
+            return mock_stream()
+
+        mock_client = MagicMock()
+        mock_client.aio.models.generate_content_stream = mock_generate_content_stream
+        mocker.patch.object(llm, "_ensure_client")
+        llm._client = mock_client
+
+        with TokenContextManager() as manager:
+            chunks = [
+                chunk
+                async for chunk in llm.stream_chat([{"role": "user", "content": "hi"}])
+            ]
+            usage = manager.get_usage()
+
+        assert usage.output_tokens == 45
+        usage_chunks = [c for c in chunks if c.usage]
+        assert usage_chunks[0].usage["completion_tokens"] == 45
+
+    @pytest.mark.asyncio
     async def test_stream_chat_usage_chunk_carries_cached_tokens(
         self, llm: GeminiLLM, mocker: pytest_mock.MockerFixture
     ) -> None:

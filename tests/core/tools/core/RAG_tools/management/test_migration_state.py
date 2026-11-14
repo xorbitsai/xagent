@@ -6,6 +6,7 @@ import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,10 +29,14 @@ from xagent.core.tools.core.RAG_tools.management.migration_state import (
     CollectionMigrationState,
     admitted_async,
     admitted_context_async,
+    claim_freeze,
     clear_migration_state,
     ensure_collection_writable,
+    heartbeat_freeze,
     pending_collection,
     read_migration_state,
+    read_raw_state,
+    restore_state,
     run_in_admitted_context,
     write_migration_state,
 )
@@ -678,3 +683,188 @@ async def test_direct_coordinator_rename_checks_the_stripped_target_name() -> No
             await coordinator.rename_collection(
                 "kb", " kb-target ", user_id=1, is_admin=False
             )
+
+
+def _claim(owner: str, *, stale: float = 60.0) -> str:
+    return claim_freeze(
+        "kb",
+        source_model_id="old",
+        target_model_id="new",
+        mode="switch",
+        owner=owner,
+        stale_after_seconds=stale,
+    )
+
+
+def test_claim_freeze_claims_resumes_and_refuses() -> None:
+    assert _claim("a") == "claimed"
+    assert _claim("a") == "resumed"
+    assert _claim("b") == "busy"
+    assert read_migration_state("kb").owner == "a"
+    assert _claim("b", stale=0.0) == "resumed"
+    assert read_migration_state("kb").owner == "b"
+
+
+def test_claim_freeze_over_an_idle_record_keeps_nothing_of_it() -> None:
+    write_migration_state(
+        "kb",
+        CollectionMigrationState(
+            state=IDLE, source_model_id="x", target_model_id="old", mode="switch"
+        ),
+    )
+
+    assert _claim("a") == "claimed"
+    state = read_migration_state("kb")
+    assert (state.state, state.owner, state.target_model_id) == (FROZEN, "a", "new")
+
+
+def test_claim_freeze_loses_when_the_row_changed_after_its_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_migration_state("kb", CollectionMigrationState(state=FROZEN, owner="dead"))
+    stale = state_module._read_row("kb")
+    # Another run took the window between this run's read and its write.
+    write_migration_state("kb", CollectionMigrationState(state=FROZEN, owner="winner"))
+    real = state_module._read_row
+    reads = iter([stale])
+    monkeypatch.setattr(
+        state_module,
+        "_read_row",
+        lambda name, store=None: next(reads, None) or real(name, store),
+    )
+
+    assert _claim("late", stale=0.0) == "busy"
+    assert read_migration_state("kb").owner == "winner"
+
+
+def test_claim_freeze_refuses_an_unreadable_state_value() -> None:
+    write_migration_state("kb", CollectionMigrationState(state=FROZEN, owner="a"))
+    table = get_metadata_store().get_raw_connection().open_table(MIGRATION_TABLE)
+    table.update("name = 'kb'", {"state": "garbled"})
+
+    assert _claim("b", stale=0.0) == "busy"
+
+
+def test_heartbeat_renews_only_the_owners_row() -> None:
+    write_migration_state("kb", CollectionMigrationState(state=FROZEN, owner="a"))
+    before = read_migration_state("kb").updated_at
+
+    assert heartbeat_freeze("kb", "b") is False
+    assert heartbeat_freeze("kb", "a") is True
+    assert read_migration_state("kb").updated_at >= before
+
+    write_migration_state("kb", CollectionMigrationState(state=IDLE, owner="a"))
+    assert heartbeat_freeze("kb", "a") is False
+
+
+def test_restore_state_puts_the_row_back_exactly() -> None:
+    write_migration_state(
+        "kb",
+        CollectionMigrationState(
+            state=IDLE, source_model_id="x", target_model_id="y", mode="switch"
+        ),
+    )
+    before = read_raw_state("kb")
+    _claim("a")
+
+    restore_state("kb", before)
+
+    assert read_raw_state("kb") == before
+    restore_state("kb", None)
+    assert read_raw_state("kb") is None
+
+
+def _old_schema_table(owner_type: Any) -> None:
+    import pyarrow as pa
+
+    fields = [
+        ("name", pa.string()),
+        ("state", pa.string()),
+        ("source_model_id", pa.string()),
+        ("target_model_id", pa.string()),
+        ("updated_at", pa.timestamp("us")),
+    ]
+    if owner_type is not None:
+        fields += [("owner", owner_type), ("mode", owner_type)]
+    row = {"name": "kb", "state": IDLE, "source_model_id": "m", "target_model_id": None}
+    get_metadata_store().get_raw_connection().create_table(
+        MIGRATION_TABLE,
+        data=pa.Table.from_pylist(
+            [
+                {
+                    **row,
+                    "updated_at": None,
+                    **({"owner": None, "mode": None} if owner_type is not None else {}),
+                }
+            ],
+            schema=pa.schema(fields),
+        ),
+    )
+
+
+@pytest.mark.parametrize("owner_type", ["absent", "null-typed"])
+def test_a_table_from_an_older_version_takes_owner_writes(owner_type: str) -> None:
+    import pyarrow as pa
+
+    _old_schema_table(None if owner_type == "absent" else pa.null())
+
+    write_migration_state(
+        "kb2", CollectionMigrationState(state=FROZEN, owner="run-1", mode="switch")
+    )
+
+    assert read_migration_state("kb2").owner == "run-1"
+    assert read_migration_state("kb2").mode == "switch"
+    assert read_migration_state("kb").source_model_id == "m"
+
+
+def test_claim_freeze_on_a_stale_absent_read_does_not_take_a_live_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_migration_state("kb", CollectionMigrationState(state=FROZEN, owner="winner"))
+    real = state_module._read_row
+    calls = {"n": 0}
+
+    def _read_row(name: str, store: Any = None) -> Any:
+        calls["n"] += 1
+        # This run read "no row" just before another run inserted its freeze.
+        return None if calls["n"] == 1 else real(name, store)
+
+    monkeypatch.setattr(state_module, "_read_row", _read_row)
+
+    assert _claim("late") == "busy"
+
+
+@pytest.mark.parametrize("owner_type", ["absent", "null-typed"])
+def test_claim_freeze_upgrades_a_table_from_an_older_version(
+    owner_type: str,
+) -> None:
+    import pyarrow as pa
+
+    _old_schema_table(None if owner_type == "absent" else pa.null())
+
+    assert _claim("run-1") == "claimed"
+    state = read_migration_state("kb")
+    assert (state.state, state.owner, state.target_model_id) == (FROZEN, "run-1", "new")
+
+
+def test_claim_freeze_updates_only_a_row_in_the_state_it_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_migration_state(
+        "kb", CollectionMigrationState(state=IDLE, target_model_id="old")
+    )
+    stale = state_module._read_row("kb")
+    # Another run froze it between this run's read and its write.
+    write_migration_state("kb", CollectionMigrationState(state=FROZEN, owner="winner"))
+    real = state_module._read_row
+    calls = {"n": 0}
+
+    def _read_row(name: str, store: Any = None) -> Any:
+        calls["n"] += 1
+        return stale if calls["n"] == 1 else real(name, store)
+
+    monkeypatch.setattr(state_module, "_read_row", _read_row)
+
+    assert _claim("late") == "busy"
+    state = read_migration_state("kb")
+    assert (state.state, state.owner) == (FROZEN, "winner")

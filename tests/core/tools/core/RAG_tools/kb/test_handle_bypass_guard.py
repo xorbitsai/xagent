@@ -21,6 +21,7 @@ IMPLEMENTATIONS = (
     "xagent/core/tools/core/RAG_tools/storage/",
     "xagent/core/tools/core/RAG_tools/kb/collection_handle.py",
     "xagent/migrations/lancedb/",
+    "xagent/migrations/embedding/",
 )
 
 # VectorIndexStore methods that read or delete chunk/embedding rows.

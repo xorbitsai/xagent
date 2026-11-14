@@ -136,6 +136,21 @@ def test_switch_sets_both_binding_fields_and_records_the_transition(
     assert result.target_dimension == NEW_DIM
 
 
+def test_switch_keeps_the_window_owner_and_mode_on_the_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_sync()
+    write_migration_state(
+        "kb", CollectionMigrationState(state=FROZEN, owner="run-1", mode="switch")
+    )
+    _bind_models(monkeypatch)
+
+    switch_collection_embedding_model("kb", NEW_MODEL)
+
+    state = read_migration_state("kb")
+    assert (state.owner, state.mode) == ("run-1", "switch")
+
+
 def test_switch_writes_only_the_binding_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

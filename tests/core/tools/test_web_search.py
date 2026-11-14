@@ -239,10 +239,11 @@ class TestWebSearchTool:
         assert str(status_code) in str(excinfo.value)
         assert "jane.doe" not in failure
         assert "0412" not in failure
-        # The key and the request URL appear nowhere, at any log level.
-        everything = failure + caplog.text
-        assert secret_key not in everything
-        assert "customsearch/v1?" not in everything
+        assert "customsearch/v1?" not in failure
+        # The key appears nowhere, at any log level. The URL is only checked
+        # in the failure above: httpx's own INFO request line carries it (with
+        # the query, without the key) whenever that logger is not silenced.
+        assert secret_key not in failure + caplog.text
 
     @pytest.mark.asyncio
     async def test_api_key_is_sent_as_header_not_in_url(

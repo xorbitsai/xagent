@@ -1517,7 +1517,7 @@ async def cancel_chat_task(
     response: Response,
     principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
 ) -> CancelTaskResponse:
-    """Stop a task that is still running.
+    """Stop a task that has not ended yet.
 
     Reuses ``GET``'s ownership rule (another agent's task, another user's
     agent, a missing id, or a non-SDK task all answer 404) before anything
@@ -1534,19 +1534,29 @@ async def cancel_chat_task(
     cancelled one; while a later turn is queued after a completed or failed
     run the task reads ``pending`` with a null ``error_code``, as ``GET``
     reads it. 202 means the cancel is recorded but not applied yet, and
-    calling again reaches the same request.
+    calling again reaches the same request, including after it withdrew a
+    queued turn and before it is marked done. A paused task whose
+    automatic resume gives up while the call waits is answered 202 while
+    its cancel is still recorded, since the cancel still applies to it;
+    until it has, calling again answers 409 ``task_not_cancellable``.
 
     A turn still queued to start is cancelled too. For a new task that
     leaves the task cancelled with no ``run_id``. For a turn appended to a
     finished or paused task it only withdraws that turn: the task keeps
     reading as the turn before it, and ``cancelled_run_id`` names the
-    withdrawn run. A queued turn that can no longer start, because the
+    withdrawn run; calling again answers the same while the task has not
+    moved since. A queued turn that can no longer start, because the
     task has moved since it was queued (another run, or a newer version of
-    the same one), is not the target: a running run is cancelled, and any
-    other state is answered as if no turn were queued.
+    the same one), is not the target: the task is cancelled, or answered,
+    as it is now, as if no turn were queued.
 
-    A task that is waiting for an answer or paused, with no turn queued to
-    start, answers 409 ``task_busy`` and is left untouched.
+    A task waiting for an answer is cancelled with its question closed,
+    unlike ``cancel-question``, which leaves the task ``completed``. A
+    paused task is cancelled and no longer resumed automatically; one that
+    reads ``failed`` -- automatic resume gave up, or its appended turn was
+    withdrawn or could not start -- has already ended. While an answer is
+    being applied the call answers 409 ``task_busy``; the resumed run can
+    then be cancelled.
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.

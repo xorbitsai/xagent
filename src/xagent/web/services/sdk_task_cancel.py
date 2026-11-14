@@ -27,9 +27,10 @@ as it stands. A repeat of a cancel that withdrew the newest turn rejoins
 that cancel's command and is answered for that turn
 (``_cancel_of_newest_turn``), since the row no longer shows it.
 
-Besides a queued turn only a RUNNING task is cancelled here. One waiting
-for the caller's answer and a paused one are refused as busy, without a
-write.
+A task waiting for the caller's answer and a paused one have no run
+coroutine to stop: the core writes their terminal row itself, after closing
+the pending question or stopping the automatic resume the paused run was
+waiting for.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import func, or_, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..models.chat_message import TaskChatMessage
@@ -113,6 +114,17 @@ _COMMAND_POLL_SECONDS = 0.05
 _AIMED_RUN_ENDED_MESSAGE = "The run this cancel was aimed at has already ended."
 
 _TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED})
+
+# The statuses of a run a cancel command can end.
+_CANCELLABLE_STATUSES = frozenset(
+    {TaskStatus.RUNNING, TaskStatus.WAITING_FOR_USER, TaskStatus.PAUSED}
+)
+
+# A waiting task no answer has claimed, as the reply path accepts it.
+_UNANSWERED_CONTROL_STATES = (
+    TaskControlState.IDLE.value,
+    TaskControlState.WAITING_FOR_USER.value,
+)
 
 
 def is_sdk_cancelled(status: object, error_message: object) -> bool:
@@ -452,11 +464,34 @@ def _prepare_cancel_sync(
             return _row_result(db, task)
         if _ended_without_cancel(db, task):
             raise SdkTaskNotCancellable
-        if task.status != TaskStatus.RUNNING:
+        if task.status not in _CANCELLABLE_STATUSES:
             raise SdkTaskCancelBusy(
                 f"A task that is {task.status.value} cannot be cancelled yet."
             )
+        if task.status == TaskStatus.WAITING_FOR_USER and _answer_in_flight(db, task):
+            # The answer owns the waiting run until it resumes it; the
+            # resumed run is then cancellable.
+            raise SdkTaskCancelBusy(
+                "An answer is being applied to this task; retry once it runs."
+            )
         return _stage_cancel(db, task, queued_run_id=None)
+
+
+def _answer_in_flight(db: Session, task: Task) -> bool:
+    """Whether a reply already claimed the waiting run or is queued to."""
+
+    if task.control_state not in _UNANSWERED_CONTROL_STATES:
+        return True
+    return (
+        db.query(TaskExecutionCommand.id)
+        .filter(
+            TaskExecutionCommand.task_id == task.id,
+            TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value,
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .first()
+        is not None
+    )
 
 
 def _stage_cancel(
@@ -548,6 +583,7 @@ def _load_result_sync(
     aimed_run_id: str | None,
     aimed_at_queued_turn: bool,
     command_completed: bool,
+    command_in_flight: bool = False,
 ) -> SdkTaskCancelResult:
     """Read the outcome once the command is over or overdue.
 
@@ -569,7 +605,12 @@ def _load_result_sync(
       ``SdkTaskNotCancellable`` with ``_AIMED_RUN_ENDED_MESSAGE``.
     - an aimed run that ended on its own raises ``SdkTaskNotCancellable``
       exactly as the request would have on arrival, whether or not a later
-      turn is queued behind it.
+      turn is queued behind it. The exception is a paused run that reads
+      ``failed`` while the command is still pending or processing
+      (``command_in_flight``, the deadline's read): its automatic resume
+      gave up during the wait, which does not stop the command from
+      cancelling it, so the call answers that the cancel is still being
+      applied.
 
     A START waiting for a later turn reads as ``pending`` with no code, and
     a paused row that has stopped for good reads as ``failed``, as on the
@@ -604,7 +645,9 @@ def _load_result_sync(
                 }:
                     return _result(db, task, cancelled=False, queued=queued)
             raise SdkTaskNotCancellable(_AIMED_RUN_ENDED_MESSAGE)
-        if _ended_without_cancel(db, task):
+        if _ended_without_cancel(db, task) and not (
+            command_in_flight and task.status == TaskStatus.PAUSED
+        ):
             raise SdkTaskNotCancellable
         return _result(
             db,
@@ -637,7 +680,10 @@ async def request_sdk_task_cancel(
     calling again reaches the same command, including after it withdrew a
     queued turn and before it is marked completed. Raises
     ``SdkTaskNotCancellable`` when the aimed run ended without being
-    cancelled, whichever way the wait ends.
+    cancelled, whichever way the wait ends, except a paused run whose
+    automatic resume gave up while the command is still unapplied at the
+    deadline: the command still cancels it, so that answer is
+    ``cancelled=False``.
     """
 
     prepared = await run_db_io_cancellation_safe(
@@ -690,6 +736,7 @@ async def request_sdk_task_cancel(
                     aimed_run_id=aimed_run_id,
                     aimed_at_queued_turn=prepared.aimed_at_queued_turn,
                     command_completed=False,
+                    command_in_flight=True,
                 )
             )
         await asyncio.sleep(_COMMAND_POLL_SECONDS)
@@ -723,17 +770,17 @@ def _is_settled_sdk_cancel_target(
     """Whether this exact target already reached its cancel outcome.
 
     True for the command's own finalize replayed, and for the settlement of
-    the run this command cancelled: both leave the target run FAILED at the
-    command's state version or one past it, carrying the cancellation
-    sentence. A run that failed on its own carries another text and is not
-    this command's to report.
+    the run this command cancelled: both leave the target run FAILED at or
+    past the command's state version (a paused run's stopped automatic
+    resume moves it once more), carrying the cancellation sentence. A run
+    that failed on its own carries another text and is not this command's
+    to report.
     """
 
     return (
         is_sdk_cancelled(task.status, task.error_message)
         and _task_run_id(task) == expected_run_id
-        and int(task.state_version or 0)
-        in {expected_state_version, expected_state_version + 1}
+        and int(task.state_version or 0) >= expected_state_version
     )
 
 
@@ -742,14 +789,22 @@ def _is_exact_cancel_target(
     *,
     expected_run_id: str | None,
     expected_state_version: int,
-    expected_status: TaskStatus,
+    expected_status: TaskStatus | None,
 ) -> bool:
-    """Whether the row is still the target this command was aimed at."""
+    """Whether the row is still the target this command was aimed at.
 
+    ``expected_status`` ``None`` accepts any status a cancel can end: the
+    command was persisted against the run and version alone.
+    """
+
+    if expected_status is None:
+        status_matches = task.status in _CANCELLABLE_STATUSES
+    else:
+        status_matches = task.status == expected_status
     return (
         _task_run_id(task) == expected_run_id
         and int(task.state_version or 0) == expected_state_version
-        and task.status == expected_status
+        and status_matches
     )
 
 
@@ -761,15 +816,17 @@ def _stale(task: Task, expected_run_id: str | None, expected_state_version: int)
     )
 
 
-def _carries_display_events(task: Task, expected_status: TaskStatus) -> bool:
+def _carries_display_events(task: Task, cancelled_from: TaskStatus | None) -> bool:
     """Whether the terminal broadcast should carry the turn's display events.
 
     Only a version-2 task has them, and only a run that ran has the result
-    fact they are read from: a new task cancelled before it started has
-    none, and publishing them without it fails.
+    fact they are read from. A running, waiting or paused run gets one from
+    whichever writer ended it (``None`` is one of those, read before its
+    status was known); a new task cancelled before it started has none, and
+    publishing them without it fails.
     """
 
-    if expected_status != TaskStatus.RUNNING:
+    if cancelled_from == TaskStatus.PENDING:
         return False
     return bool(task.conversation_storage_version == 2)
 
@@ -780,13 +837,16 @@ def _load_cancelable_sdk_task_sync(
     agent_id: int,
     expected_run_id: str | None,
     expected_state_version: int,
-    expected_status: TaskStatus,
+    expected_status: TaskStatus | None,
     terminal_event_state: dict[str, Any],
-) -> bool:
-    """Return whether the exact cancel target is already settled.
+) -> TaskStatus | None:
+    """The status to cancel the exact target from, or ``None`` when it is
+    already settled.
 
-    A settled target fills ``terminal_event_state`` with the control
-    snapshot its terminal broadcast carries.
+    ``expected_status`` is given for a queued turn, whose target was just
+    resolved; otherwise any status a cancel can end is accepted as read. A
+    settled target fills ``terminal_event_state`` with the control snapshot
+    its terminal broadcast carries.
     """
 
     SessionLocal = get_session_local()
@@ -799,7 +859,7 @@ def _load_cancelable_sdk_task_sync(
         ):
             if _carries_display_events(task, expected_status):
                 terminal_event_state.update(task_control_snapshot(task).as_dict())
-            return True
+            return None
         if not _is_exact_cancel_target(
             task,
             expected_run_id=expected_run_id,
@@ -810,10 +870,12 @@ def _load_cancelable_sdk_task_sync(
                 _stale(task, expected_run_id, expected_state_version),
                 reason="stale_run",
             )
-        return False
+        return TaskStatus(task.status)
 
 
-def _close_cancelled_turn_no_commit(db: Session, task: Task) -> str | None:
+def _close_cancelled_turn_no_commit(
+    db: Session, task: Task, *, was_running: bool
+) -> str | None:
     """Stage what a failed run's settlement leaves beside the terminal row.
 
     The assistant line mirrors the settlement's own -- the generic failure
@@ -823,7 +885,10 @@ def _close_cancelled_turn_no_commit(db: Session, task: Task) -> str | None:
     not be offered for a resend.
 
     The running turn is the newest pending user row, which is sound only
-    because a RUNNING task accepts no new turn. Returns that turn's id.
+    because a RUNNING task accepts no new turn. A waiting or paused run has
+    no such guarantee -- a paused task accepts an append -- and its turn's
+    delivery was settled when the run stopped, so only the line is written.
+    Returns the closed turn's id.
     """
 
     from .assistant_history_safety import TASK_FAILURE_MESSAGE_TYPE
@@ -836,17 +901,19 @@ def _close_cancelled_turn_no_commit(db: Session, task: Task) -> str | None:
     from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 
     task_id = int(task.id)
-    row = (
-        db.query(TaskChatMessage.turn_id)
-        .filter(
-            TaskChatMessage.task_id == task_id,
-            TaskChatMessage.role == "user",
-            TaskChatMessage.delivery_status == DELIVERY_PENDING,
+    turn_id: str | None = None
+    if was_running:
+        row = (
+            db.query(TaskChatMessage.turn_id)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.delivery_status == DELIVERY_PENDING,
+            )
+            .order_by(TaskChatMessage.id.desc())
+            .first()
         )
-        .order_by(TaskChatMessage.id.desc())
-        .first()
-    )
-    turn_id = str(row[0]) if row is not None and row[0] is not None else None
+        turn_id = str(row[0]) if row is not None and row[0] is not None else None
     if task.user_id is not None:
         persist_assistant_message_no_commit(
             db,
@@ -863,6 +930,47 @@ def _close_cancelled_turn_no_commit(db: Session, task: Task) -> str | None:
     return turn_id
 
 
+def _queued_answer_exists(task_id: int) -> Any:
+    return (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value,
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .exists()
+    )
+
+
+def _stop_auto_resume_no_commit(db: Session, task: Task) -> int:
+    """Stop the automatic resume a paused run waits for; return the version
+    the task holds afterwards.
+
+    Without this the sweeper could still dispatch the resume it had
+    scheduled. A run with nothing pending -- none was scheduled, or it gave
+    up -- is left as it is. Raises ``StaleTaskRunError`` when the stop lost
+    a race, so the caller reads again.
+    """
+
+    from .task_auto_resume import cancel_pending_auto_resume_no_commit
+
+    # The stop requires the task row locked and read under that lock.
+    locked = (
+        db.query(Task)
+        .filter(Task.id == task.id)
+        .with_for_update()
+        .populate_existing()
+        .one()
+    )
+    stopped = cancel_pending_auto_resume_no_commit(db, locked, at="sdk_cancel")
+    if stopped.raced:
+        db.rollback()
+        raise StaleTaskRunError(
+            f"task {task.id} automatic resume moved while it was being stopped"
+        )
+    return int(locked.state_version or 0)
+
+
 def _finalize_sdk_cancel_sync(
     *,
     task_id: int,
@@ -874,9 +982,12 @@ def _finalize_sdk_cancel_sync(
 ) -> bool:
     """Persist cancellation for one exact target; return whether this wrote it.
 
-    ``expected_status`` is RUNNING, or PENDING for a new task whose START is
-    still queued: that task never ran, so it gets the terminal row alone and
-    its START's own settlement closes the turn.
+    ``expected_status`` is the status the target was read in. PENDING is a
+    new task whose START is still queued: it never ran, so it gets the
+    terminal row alone and its START's own settlement closes the turn. A
+    PAUSED run first has its pending automatic resume stopped, which moves
+    the version this write is then fenced on. A WAITING_FOR_USER run must
+    still be unanswered, and has its question closed with the row.
 
     Raises ``StaleTaskRunError`` before any write, or after a rollback, when
     the target is neither still as read nor already settled. When the
@@ -886,12 +997,16 @@ def _finalize_sdk_cancel_sync(
     commit.
     """
 
+    from .chat_history_service import supersede_legacy_question_rows
     from .task_coordinator_runtime import current_task_coordinator
     from .task_coordinator_service import (
         lock_task_lease_no_commit,
         task_lease_predicate,
     )
     from .task_execution_event_writer import stage_result_fact_no_commit
+    from .task_interaction_close import (
+        terminate_active_interaction_for_question_cancel,
+    )
     from .task_lease_service import task_settlement_ownership_values
     from .task_orchestrator import (
         invalidate_task_cache_best_effort,
@@ -930,19 +1045,22 @@ def _finalize_sdk_cancel_sync(
                 _stale(task, expected_run_id, expected_state_version)
             )
 
+        fence_version = expected_state_version
+        if expected_status == TaskStatus.PAUSED:
+            fence_version = _stop_auto_resume_no_commit(db, task)
         statement = (
             update(Task)
             .where(
                 Task.id == task_id,
                 Task.agent_id == agent_id,
                 Task.source == SDK_TASK_SOURCE,
-                func.coalesce(Task.state_version, 0) == expected_state_version,
+                func.coalesce(Task.state_version, 0) == fence_version,
                 Task.status == expected_status,
             )
             .values(
                 status=TaskStatus.FAILED,
                 control_state=TaskControlState.FAILED.value,
-                state_version=expected_state_version + 1,
+                state_version=fence_version + 1,
                 **task_settlement_ownership_values(task_id),
                 output=None,
                 error_message=SDK_CANCEL_ERROR_MESSAGE,
@@ -955,6 +1073,11 @@ def _finalize_sdk_cancel_sync(
         if coordinator is not None:
             assert coordinator.lease is not None
             statement = statement.where(task_lease_predicate(coordinator.lease))
+        if expected_status == TaskStatus.WAITING_FOR_USER:
+            statement = statement.where(
+                Task.control_state.in_(_UNANSWERED_CONTROL_STATES),
+                ~_queued_answer_exists(task_id),
+            )
 
         # ``task`` is already in the identity map, so RETURNING hands back
         # that same object; populate_existing refreshes its attributes.
@@ -970,10 +1093,19 @@ def _finalize_sdk_cancel_sync(
                 f"task {task_id} changed while finalizing cancel target "
                 f"{expected_run_id}/{expected_state_version}"
             )
+        if expected_status == TaskStatus.WAITING_FOR_USER:
+            # After the task row's write, which is the lock order the
+            # interaction writers require.
+            terminate_active_interaction_for_question_cancel(
+                db, task_id=task_id, run_id=expected_run_id
+            )
+            supersede_legacy_question_rows(db, task_id=task_id)
         sync_workforce_run_status(db, updated, TaskStatus.FAILED)
         sync_trigger_run_status(db, updated, TaskStatus.FAILED)
-        if expected_status == TaskStatus.RUNNING:
-            turn_id = _close_cancelled_turn_no_commit(db, updated)
+        if expected_status != TaskStatus.PENDING:
+            turn_id = _close_cancelled_turn_no_commit(
+                db, updated, was_running=expected_status == TaskStatus.RUNNING
+            )
             stage_result_fact_no_commit(
                 db,
                 updated,
@@ -1119,12 +1251,16 @@ def _resolve_queued_cancel_target_sync(
             if _task_run_id(task) == queued_run_id:
                 # The queued turn started. Fenced on the version read now:
                 # the handoff and the run itself moved it since the request.
+                # It is cancelled the way its current state is, which may
+                # already be waiting for an answer or paused.
                 if is_sdk_cancelled(task.status, task.error_message):
                     return None
-                if task.status != TaskStatus.RUNNING:
+                if task.status not in _CANCELLABLE_STATUSES:
                     raise stale
                 return _CancelTarget(
-                    queued_run_id, int(task.state_version or 0), TaskStatus.RUNNING
+                    queued_run_id,
+                    int(task.state_version or 0),
+                    TaskStatus(task.status),
                 )
             start = _start_of_run(db, task_id, queued_run_id)
             if _start_was_stopped(start):
@@ -1197,7 +1333,7 @@ async def cancel_sdk_task_unserialized(
     so the command ends at once with its reason instead of being retried.
     """
 
-    expected_status = TaskStatus.RUNNING
+    expected_status: TaskStatus | None = None
     if queued_run_id is not None:
         target = await run_db_io_cancellation_safe(
             lambda: _resolve_queued_cancel_target_sync(
@@ -1211,7 +1347,7 @@ async def cancel_sdk_task_unserialized(
         expected_status = target.status
 
     terminal_event_state: dict[str, Any] = {}
-    already_settled = await run_db_io_cancellation_safe(
+    cancel_from = await run_db_io_cancellation_safe(
         lambda: _load_cancelable_sdk_task_sync(
             task_id=task_id,
             agent_id=agent_id,
@@ -1221,7 +1357,7 @@ async def cancel_sdk_task_unserialized(
             terminal_event_state=terminal_event_state,
         )
     )
-    if not already_settled:
+    if cancel_from is not None:
         from .task_execution import background_task_manager
 
         # Returns once the run coroutine has unwound, which normally means
@@ -1236,7 +1372,7 @@ async def cancel_sdk_task_unserialized(
                 agent_id=agent_id,
                 expected_run_id=expected_run_id,
                 expected_state_version=expected_state_version,
-                expected_status=expected_status,
+                expected_status=cancel_from,
                 terminal_event_state=terminal_event_state,
             )
 

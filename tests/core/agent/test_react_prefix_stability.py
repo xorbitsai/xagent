@@ -24,7 +24,10 @@ from tests.core.agent.test_react_deferred_builtin_schemas import (
     BuiltinTool,
 )
 from tests.core.agent.test_react_deferred_connector_schemas import ConnectorTool
-from xagent.core.agent.context.execution import ExecutionContext
+from xagent.core.agent.context.execution import (
+    CLOCK_TIMEZONE_METADATA_KEY,
+    ExecutionContext,
+)
 from xagent.core.agent.deferred_tools import LOAD_TOOLS_NAME
 from xagent.core.agent.pattern.react import ReActPattern
 from xagent.core.tools.adapters.vibe.base import ToolCategory
@@ -103,7 +106,9 @@ async def test_spill_reader_joining_mid_run_leaves_the_system_message_alone(
     assert _names(llm.calls[1])[-1] == SPILL_READ_TOOL_NAME
     _assert_prefix_stable(llm.calls[0], llm.calls[1])
     # The reader is still announced, by a sentence that never changes.
-    assert SPILL_READ_TOOL_NAME in _system(llm.calls[0])
+    turn = llm.calls[0]["messages"][1]["content"]
+    assert SPILL_READ_TOOL_NAME in turn
+    assert turn == llm.calls[1]["messages"][1]["content"]
 
 
 @pytest.mark.asyncio
@@ -139,3 +144,61 @@ async def test_loads_then_a_spill_never_touch_the_system_message(
     # Each load only appends. (The reader is placed ahead of loaded tools, so
     # the spill call is checked on the system message alone.)
     assert _tools(llm.calls[2])[: len(_tools(llm.calls[1]))] == _tools(llm.calls[1])
+
+
+class _FakeSender:
+    """A run of one workspace for one sender: same built-ins, own connectors."""
+
+    def __init__(self, *connectors: tuple[str, str]) -> None:
+        self.tools: list[Any] = [
+            FakeTool(),
+            BuiltinTool("web_search", ToolCategory.WEB_TOOLS),
+            *(ConnectorTool(name, source) for name, source in connectors),
+        ]
+
+
+async def _first_call(
+    sender: _FakeSender, *, zone: str, **pattern_kwargs: Any
+) -> dict[str, Any]:
+    context = ExecutionContext()
+    context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = zone
+    context.add_user_message("What is on my calendar?")
+    llm = FakeLLM(responses=[_final()])
+    await ReActPattern(max_iterations=2, **pattern_kwargs).run(
+        context=context, tools=sender.tools, llm=llm
+    )
+    return llm.calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defer", [True, False])
+async def test_senders_of_a_workspace_share_system_and_a_tool_prefix(
+    defer: bool,
+) -> None:
+    a = _FakeSender(("hubspot_search", "hubspot"), ("notion_search", "notion"))
+    b = _FakeSender(("slack_post", "slack"))
+    call_a = await _first_call(
+        a, zone="Australia/Melbourne", defer_connector_schemas=defer
+    )
+    call_b = await _first_call(
+        b, zone="America/New_York", defer_connector_schemas=defer
+    )
+
+    # Different senders, different zones and connectors: same system bytes.
+    assert _system(call_a) == _system(call_b)
+    names_a = _names(call_a)
+    connector_names = {"hubspot_search", "notion_search", "slack_post"}
+    lead = next(
+        (i for i, n in enumerate(names_a) if n in connector_names), len(names_a)
+    )
+    # Everything before the first sender-specific tool is shared, and holds
+    # the shared tools and the control tools.
+    assert lead >= 3 and "final_answer" in names_a[:lead]
+    assert _tools(call_a)[:lead] == _tools(call_b)[:lead]
+    if not defer:
+        assert names_a[lead] in connector_names
+        assert not connector_names & set(names_a[:lead])
+    # The per-sender facts are still sent, in the turn context.
+    turn_a = call_a["messages"][-1]["content"]
+    assert "Turn-start date (Australia/Melbourne)" in turn_a
+    assert "hubspot_search" in turn_a

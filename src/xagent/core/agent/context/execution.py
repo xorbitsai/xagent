@@ -1231,6 +1231,7 @@ class ExecutionContext:
         max_tokens: int | None = None,
         *,
         form_answer_continuation: bool = False,
+        extra_turn_text: str = "",
     ) -> list[dict[str, Any]]:
         # Computed once per call (not once per candidate message, and not
         # again inside ``_system_context``): the system-context instruction
@@ -1255,6 +1256,7 @@ class ExecutionContext:
                 request_in_latest_user_message=(
                     self._request_is_latest_user_message(visible_messages)
                 ),
+                extra_turn_text=extra_turn_text,
             )
             system_parts.append(static_context)
         turn_anchor = self._turn_context_anchor(visible_messages)
@@ -1528,6 +1530,7 @@ class ExecutionContext:
         *,
         form_answer_continuation_target: Message | None = None,
         request_in_latest_user_message: bool = False,
+        extra_turn_text: str = "",
     ) -> tuple[str, str]:
         """Return ``(static_text, turn_text)``.
 
@@ -1769,6 +1772,10 @@ class ExecutionContext:
                     "and describe in the prompt what a reference would have "
                     "contributed."
                 )
+        if extra_turn_text.strip():
+            # Per-call facts of the pattern (the tool names and connector
+            # inventory), which vary by sender and must not enter the system.
+            turn_parts.append(extra_turn_text)
         turn_parts.append(self._current_time_context())
         static_text = "\n\n".join(part for part in parts if part.strip())
         turn_text = "\n\n".join(part.strip() for part in turn_parts if part.strip())

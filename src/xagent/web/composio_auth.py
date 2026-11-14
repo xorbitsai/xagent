@@ -32,14 +32,25 @@ for, and only accepted under, its app's own provider:
    are dropped, so a browser holds one actor's flows only.
 3. **Verify** (``?session_uri=`` only, sent by Composio's OAuth callback
    identity verification): the session names no flow, so every open flow's
-   checks run first, then ``complete_auth`` is called with that actor's
-   Composio user id, derived from *our* session. The account it activates
+   checks run first, then ``complete_auth`` is called with the Composio user
+   id of the flow's owner. The account it activates
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
    of its app's auth config and toolkit. The app's own identity read through
    the proxy (``identity_url``, fixed or built from that account, with
    ``identity_params``) gives the provider user id, which must match
    ``identity_id_pattern``, and the grant is stored
-   for the app's runtime to execute. A refused completion spends nothing.
+   for the app's runtime to execute. A completion refused after its flow is
+   spent deletes the account it activated.
+
+An ordinary (web) connect has no owner key and no actor link. Its start mints
+the same signed state and single-use flow row, but binds the browser with the
+ordinary OAuth proof cookie and its ``browser_nonce_hash`` claim; it is
+accepted only as an ordinary flow, never as an actor one. Its Composio user id
+is derived with an empty owner key, and its grant replaces the user's ordinary
+row for the app (``resource_owner_key`` NULL) while actor rows are untouched.
+Like the native callback, it also associates the user's catalog server in the
+same transaction and refuses an app hidden from the connector catalog; actor
+flows associate nothing.
 
 A begin needs a state carrying the Composio marker, a verification carries a
 ``session_uri``, and a denied or failed authorization comes back to
@@ -92,6 +103,7 @@ import hashlib
 import hmac
 import logging
 import re
+import secrets
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -107,6 +119,8 @@ from sqlalchemy import event, text
 from ..config import COMPOSIO_CALLBACK_URL as COMPOSIO_CALLBACK_URL_ENV
 from ..config import get_composio_callback_url
 from ..core.utils import public_requests as requests
+from .auth_sessions import lock_current_session_epoch
+from .composio_apps import _CALLBACK_PATHS as _CALLBACK_PATHS
 from .composio_apps import _GOOGLE_SUBJECT_RE as _GOOGLE_SUBJECT_RE
 from .composio_apps import _GRAPH_ID_RE as _GRAPH_ID_RE
 from .composio_apps import _SALESFORCE_HOST_RE as _SALESFORCE_HOST_RE
@@ -122,7 +136,9 @@ from .composio_apps import _WARNED_BACKENDS as _WARNED_BACKENDS
 from .composio_apps import (  # noqa: F401  (re-exported: the switch lookup moved)
     AUTH_BACKEND as AUTH_BACKEND,
 )
+from .composio_apps import COMPOSIO_API_KEY_ENV as COMPOSIO_API_KEY_ENV
 from .composio_apps import COMPOSIO_APPS as COMPOSIO_APPS
+from .composio_apps import COMPOSIO_CALLBACK_PATH as COMPOSIO_CALLBACK_PATH
 from .composio_apps import (
     COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV as COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV,
 )
@@ -138,6 +154,7 @@ from .composio_apps import (
 from .composio_apps import (
     COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV as COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV,
 )
+from .composio_apps import COMPOSIO_USER_ID_SECRET_ENV as COMPOSIO_USER_ID_SECRET_ENV
 from .composio_apps import FACEBOOK_APP_ID as FACEBOOK_APP_ID
 from .composio_apps import FACEBOOK_AUTH_BACKEND_ENV as FACEBOOK_AUTH_BACKEND_ENV
 from .composio_apps import FACEBOOK_TOOLKIT_SLUG as FACEBOOK_TOOLKIT_SLUG
@@ -165,6 +182,7 @@ from .composio_apps import _env as _env
 from .composio_apps import _salesforce_userinfo_url as _salesforce_userinfo_url
 from .composio_apps import _uses_composio as _uses_composio
 from .composio_apps import composio_app as composio_app
+from .composio_apps import composio_web_app as composio_web_app
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Query, Session
@@ -175,20 +193,9 @@ logger = logging.getLogger(__name__)
 # the two lands second switches to the shared constant.
 COMPOSIO_TOKEN_TYPE = "composio"
 
-COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
-COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 
-# Every Composio app's trips (begin, verification, denial) land on one shared
-# callback URL, whatever the app's own provider: Composio's OAuth user
-# verification is a single URL per project, and the flow and actor proof
-# cookies are scoped to the path they come back to. XAGENT_COMPOSIO_CALLBACK_URL
-# sets it (to COMPOSIO_CALLBACK_PATH after the cutover); unset, it is the Meta callback
-# URL, where these trips have always been accepted.
-COMPOSIO_CALLBACK_PATH = "/api/auth/composio/callback"
 DEFAULT_CALLBACK_PROVIDER = META_PROVIDER
-# The two routes that accept the trips; the setting must name one of them.
-_CALLBACK_PATHS = (COMPOSIO_CALLBACK_PATH, "/api/auth/meta/callback")
 # Logged as the provider of a trip whose app is not known yet.
 UNKNOWN_APP_PROVIDER = "composio"
 
@@ -209,6 +216,8 @@ _REQUEST_TIMEOUT_SECONDS = 10
 # Composio ids are short nanoid-style strings. Anything else is refused before
 # it is put in a URL path or stored.
 _ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+# Flow nonces are hex digests, the same shape the actor flows use.
+_FLOW_NONCE_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_SESSION_URI_LENGTH = 4096
 
 Step = Literal["begin", "verify", "denied"]
@@ -233,15 +242,6 @@ class ComposioError(Exception):
         super().__init__(reason)
         self.reason = reason
         self.rejected = rejected
-
-
-def connect_guidance(provider: str, app_id: str | None) -> dict[str, str] | None:
-    """The app's connect guidance while its new connects go through
-    Composio; None otherwise, so a catalog entry can leave the field out."""
-    app = composio_app(provider, app_id)
-    if app is None or app.connect_guidance is None:
-        return None
-    return dict(app.connect_guidance)
 
 
 def load_config(app_id: str) -> ComposioConfig | None:
@@ -277,7 +277,11 @@ def _missing_config_names(app_id: str) -> list[str]:
 
 
 def composio_user_id(config: ComposioConfig, *, user_id: int, owner_key: str) -> str:
-    """One opaque Composio user per actor, never per workspace."""
+    """One opaque Composio user per actor, or per user for an ordinary flow.
+
+    An ordinary flow passes an empty owner key, so its HMAC input is
+    ``"{user_id}:"``. Actor keys are never empty, so the two cannot coincide.
+    """
     digest = hmac.new(
         config.user_id_secret.encode(),
         f"{user_id}:{owner_key}".encode(),
@@ -1205,33 +1209,50 @@ async def run_missing_account_loop(
 # --- Browser trips -------------------------------------------------------------
 
 
+Shape = Literal["actor", "ordinary"]
+
+
 @dataclass(frozen=True)
 class _Flow:
     state: str
     nonce: str
     user_id: int
-    owner_key: str
+    owner_key: str | None
     redirect: str | None
     expires_at: float
     app_id: str
+    shape: Shape
+    session_epoch: str | None
+
+    @property
+    def actor_flow(self) -> bool:
+        return self.shape == "actor"
+
+
+def _flow_actor(flow: _Flow) -> tuple[Shape, int, str | None]:
+    """The fields that must be shared by every flow one browser completes."""
+    return flow.shape, flow.user_id, flow.owner_key
 
 
 class _Rejected(Exception):
-    def __init__(self, reason: str, response: HTMLResponse) -> None:
+    def __init__(
+        self, reason: str, response: HTMLResponse, actor_flow: bool | None = None
+    ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.response = response
+        self.actor_flow = actor_flow
 
 
-def _reject(reason: str) -> _Rejected:
+def _reject(reason: str, actor_flow: bool | None = None) -> _Rejected:
     from .api.auth import (
         _actor_oauth_flow_rejected_response,
         _actor_oauth_flow_used_response,
     )
 
     if reason in {"flow_used_or_expired", "state_expired"}:
-        return _Rejected(reason, _actor_oauth_flow_used_response())
-    return _Rejected(reason, _actor_oauth_flow_rejected_response(reason))
+        return _Rejected(reason, _actor_oauth_flow_used_response(), actor_flow)
+    return _Rejected(reason, _actor_oauth_flow_rejected_response(reason), actor_flow)
 
 
 def _provider_of(app_id: str | None) -> str:
@@ -1240,12 +1261,14 @@ def _provider_of(app_id: str | None) -> str:
     return app.provider if app is not None else UNKNOWN_APP_PROVIDER
 
 
-def _log_rejection(reason: str, app_id: str | None = None) -> None:
+def _log_rejection(
+    reason: str, app_id: str | None = None, *, actor_flow: bool | None = None
+) -> None:
     """``app_id`` is unknown until the signed state has been read."""
     from .api.auth import _log_oauth_callback_rejection
 
     _log_oauth_callback_rejection(
-        _provider_of(app_id), reason, app_id=app_id, actor_flow=True
+        _provider_of(app_id), reason, app_id=app_id, actor_flow=actor_flow
     )
 
 
@@ -1260,6 +1283,33 @@ def _is_expired_composio_state(state: str) -> bool:
             for provider in {app.provider for app in COMPOSIO_APPS.values()}
         )
     )
+
+
+def _verified_ordinary_flow(
+    request: Any, db: Session, payload: Mapping[str, Any], *, nonce: Any, user_id: int
+) -> None:
+    """Check an ordinary flow's signed claims and browser proof cookie."""
+    from .api.auth import _ordinary_oauth_cookie_name
+    from .models.user import User
+
+    if not isinstance(nonce, str) or _FLOW_NONCE_RE.fullmatch(nonce) is None:
+        raise _reject("claims_invalid", False)
+    browser_nonce_hash = payload.get("browser_nonce_hash")
+    if (
+        not isinstance(browser_nonce_hash, str)
+        or _FLOW_NONCE_RE.fullmatch(browser_nonce_hash) is None
+    ):
+        raise _reject("claims_invalid", False)
+    if not secrets.compare_digest(nonce, browser_nonce_hash):
+        raise _reject("claims_invalid", False)
+    cookie_value = request.cookies.get(_ordinary_oauth_cookie_name(browser_nonce_hash))
+    if not isinstance(cookie_value, str) or not cookie_value:
+        raise _reject("cookie_missing", False)
+    digest = hashlib.sha256(cookie_value.encode("ascii", "ignore")).hexdigest()
+    if not secrets.compare_digest(browser_nonce_hash, digest):
+        raise _reject("cookie_mismatch", False)
+    if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
+        raise _reject("user_missing", False)
 
 
 def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
@@ -1293,18 +1343,27 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
         or not isinstance(expires_at, (int, float))
     ):
         raise _reject("claims_invalid")
-    try:
-        owner_key = check_actor_oauth_flow(
-            db,
-            request,
-            provider=COMPOSIO_APPS[app_id].provider,
-            user_id=user_id,
-            app_id=app_id,
-            nonce=nonce,
-            owner_claim=payload.get("resource_owner_key"),
-        )
-    except ActorOAuthFlowRejected as exc:
-        raise _reject(exc.reason) from None
+    owner_claim = payload.get("resource_owner_key")
+    if owner_claim is None:
+        # An ordinary (web) flow: no actor link, proved instead by the same
+        # browser cookie an ordinary OAuth start sets.
+        _verified_ordinary_flow(request, db, payload, nonce=nonce, user_id=user_id)
+        owner_key: str | None = None
+        shape: Shape = "ordinary"
+    else:
+        try:
+            owner_key = check_actor_oauth_flow(
+                db,
+                request,
+                provider=COMPOSIO_APPS[app_id].provider,
+                user_id=user_id,
+                app_id=app_id,
+                nonce=nonce,
+                owner_claim=owner_claim,
+            )
+        except ActorOAuthFlowRejected as exc:
+            raise _reject(exc.reason, True) from None
+        shape = "actor"
     redirect = payload.get("redirect")
     return _Flow(
         state=state,
@@ -1314,6 +1373,8 @@ def _verified_flow(state: str, request: Any, db: Session) -> _Flow:
         redirect=redirect if isinstance(redirect, str) else None,
         expires_at=float(expires_at),
         app_id=app_id,
+        shape=shape,
+        session_epoch=payload.get("session_epoch"),
     )
 
 
@@ -1371,8 +1432,8 @@ class _OpenFlow:
     cookie_name: str
 
     @property
-    def actor(self) -> tuple[int, str]:
-        return self.flow.user_id, self.flow.owner_key
+    def actor(self) -> tuple[Shape, int, str | None]:
+        return _flow_actor(self.flow)
 
 
 @dataclass
@@ -1384,6 +1445,8 @@ class _BrowserFlows:
     dead: list[str]
     # Why each dead flow failed its checks.
     reasons: list[str]
+    # The shape of each dead flow, when its claims named one.
+    shapes: list[bool | None]
 
 
 def _open_flows(request: Any, db: Session) -> _BrowserFlows:
@@ -1391,6 +1454,7 @@ def _open_flows(request: Any, db: Session) -> _BrowserFlows:
     open_flows: list[_OpenFlow] = []
     dead: list[str] = []
     reasons: list[str] = []
+    shapes: list[bool | None] = []
     for name, value in sorted(request.cookies.items()):
         if not name.startswith(FLOW_COOKIE_PREFIX):
             continue
@@ -1398,21 +1462,23 @@ def _open_flows(request: Any, db: Session) -> _BrowserFlows:
         if decoded is None:
             dead.append(name)
             reasons.append("cookie_mismatch")
+            shapes.append(None)
             continue
         state, account_id = decoded
         try:
             flow = _verified_flow(state, request, db)
             if name != _flow_cookie_name(flow.nonce):
-                raise _reject("cookie_mismatch")
+                raise _reject("cookie_mismatch", flow.actor_flow)
             if _flow_row_query(db, flow.nonce).count() != 1:
-                raise _reject("flow_used_or_expired")
+                raise _reject("flow_used_or_expired", flow.actor_flow)
         except _Rejected as rejected:
             dead.append(name)
             reasons.append(rejected.reason)
+            shapes.append(rejected.actor_flow)
             continue
         open_flows.append(_OpenFlow(flow, account_id, name))
     db.rollback()
-    return _BrowserFlows(open_flows, dead, reasons)
+    return _BrowserFlows(open_flows, dead, reasons, shapes)
 
 
 def _clear_flow_cookies(
@@ -1471,10 +1537,10 @@ def _handle_begin(request: Any, db: Session, callback: str) -> Response:
     try:
         flow = _verified_flow(state, request, db)
         if _flow_row_query(db, flow.nonce).count() != 1:
-            raise _reject("flow_used_or_expired")
+            raise _reject("flow_used_or_expired", flow.actor_flow)
     except _Rejected as rejected:
         db.rollback()
-        _log_rejection(rejected.reason)
+        _log_rejection(rejected.reason, actor_flow=rejected.actor_flow)
         return rejected.response
     db.rollback()
 
@@ -1487,28 +1553,29 @@ def _handle_begin(request: Any, db: Session, callback: str) -> Response:
     stale = browser_flows.dead + [
         open_flow.cookie_name
         for open_flow in existing
-        if open_flow.actor != (flow.user_id, flow.owner_key)
-        or open_flow.flow.nonce == flow.nonce
+        if open_flow.actor != _flow_actor(flow) or open_flow.flow.nonce == flow.nonce
     ]
     kept = [open_flow for open_flow in existing if open_flow.cookie_name not in stale]
     if len(kept) >= _MAX_OPEN_FLOWS:
-        _log_rejection("too_many_open_flows", flow.app_id)
+        _log_rejection("too_many_open_flows", flow.app_id, actor_flow=flow.actor_flow)
         return _clear_flow_cookies(_too_many_flows_page(flow.app_id), callback, stale)
 
     config = load_config(flow.app_id)
     if config is None:
-        _log_rejection("composio_not_configured", flow.app_id)
+        _log_rejection(
+            "composio_not_configured", flow.app_id, actor_flow=flow.actor_flow
+        )
         return _unavailable_page(flow.app_id)
     try:
         redirect_url, account_id = create_link(
             config,
             user_id=composio_user_id(
-                config, user_id=flow.user_id, owner_key=flow.owner_key
+                config, user_id=flow.user_id, owner_key=flow.owner_key or ""
             ),
             callback_url=callback,
         )
     except ComposioError as exc:
-        _log_rejection(exc.reason, flow.app_id)
+        _log_rejection(exc.reason, flow.app_id, actor_flow=flow.actor_flow)
         return _unavailable_page(flow.app_id)
     # A reloaded begin replaces this flow's link. The previous link is not
     # deleted here: the original window may be completing it right now. If it
@@ -1552,6 +1619,8 @@ def _handle_denied(request: Any, db: Session, callback: str) -> Response:
     matches = [f for f in browser_flows.open if returned and f.account_id == returned]
     app_ids = sorted({match.flow.app_id for match in matches})
     log_app = app_ids[0] if len(app_ids) == 1 else None
+    matched_shapes = {match.flow.actor_flow for match in matches}
+    actor_flow = matched_shapes.pop() if len(matched_shapes) == 1 else None
     for match in matches:
         dead.append(match.cookie_name)
         _spend(db, match)
@@ -1564,7 +1633,7 @@ def _handle_denied(request: Any, db: Session, callback: str) -> Response:
             "Composio returned a connection without verification; set the "
             "project's OAuth user verification to this callback URL"
         )
-        _log_rejection("verification_not_configured", log_app)
+        _log_rejection("verification_not_configured", log_app, actor_flow=actor_flow)
         return _clear_flow_cookies(_unavailable_page(*app_ids), callback, dead)
     provider = _provider_of(log_app)
     provider_error = _oauth_callback_provider_error(
@@ -1575,7 +1644,7 @@ def _handle_denied(request: Any, db: Session, callback: str) -> Response:
         provider,
         "provider_error",
         app_id=log_app,
-        actor_flow=True,
+        actor_flow=actor_flow,
         provider_error=provider_error,
     )
     return _clear_flow_cookies(
@@ -1615,15 +1684,24 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     browser_flows = _open_flows(request, db)
     open_flows, dead = browser_flows.open, browser_flows.dead
     if not open_flows:
-        reasons = browser_flows.reasons
-        reason = reasons[-1] if reasons else "cookie_missing"
-        _log_rejection(reason)
-        return _clear_flow_cookies(_reject(reason).response, callback, dead)
+        if browser_flows.reasons:
+            # The reason and its shape come from the same cookie.
+            reason = browser_flows.reasons[-1]
+            actor_flow = browser_flows.shapes[-1]
+        else:
+            reason, actor_flow = "cookie_missing", None
+        _log_rejection(reason, actor_flow=actor_flow)
+        return _clear_flow_cookies(_reject(reason, actor_flow).response, callback, dead)
     actors = {open_flow.actor for open_flow in open_flows}
+    shapes = {open_flow.flow.actor_flow for open_flow in open_flows}
     if len(actors) != 1:
-        # begin keeps one actor per browser; anything else is not completed.
-        _log_rejection("claims_invalid")
-        return _clear_flow_cookies(_reject("claims_invalid").response, callback, dead)
+        # begin keeps one actor and one flow shape per browser; anything else
+        # is not completed.
+        actor_flow = shapes.pop() if len(shapes) == 1 else None
+        _log_rejection("claims_invalid", actor_flow=actor_flow)
+        return _clear_flow_cookies(
+            _reject("claims_invalid", actor_flow).response, callback, dead
+        )
 
     # A browser can hold flows of several apps for the same actor at once
     # (Facebook and Instagram, say). They share the project's API key and the
@@ -1633,23 +1711,24 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     # identity checked. One app's missing config never blocks the other's.
     app_ids = sorted({open_flow.flow.app_id for open_flow in open_flows})
     log_app = app_ids[0] if len(app_ids) == 1 else None
+    actor_flow = next(iter(shapes))
     configs = _configured_apps()
     if not configs:
-        _log_rejection("composio_not_configured", log_app)
+        _log_rejection("composio_not_configured", log_app, actor_flow=actor_flow)
         return _clear_flow_cookies(_unavailable_page(*app_ids), callback, dead)
     shared = next(iter(configs.values()))
-    user_id, owner_key = actors.pop()
-    composio_user = composio_user_id(shared, user_id=user_id, owner_key=owner_key)
+    _shape, user_id, owner_key = actors.pop()
+    composio_user = composio_user_id(shared, user_id=user_id, owner_key=owner_key or "")
     try:
         account_id = complete_auth(
             shared, session_uri=session_uri, user_id=composio_user
         )
     except ComposioError as exc:
-        _log_rejection(exc.reason, log_app)
+        _log_rejection(exc.reason, log_app, actor_flow=actor_flow)
         if exc.rejected:
             # Nothing was activated, so every open flow stays usable.
             return _clear_flow_cookies(
-                _reject("composio_rejected").response, callback, dead
+                _reject("composio_rejected", actor_flow).response, callback, dead
             )
         # Composio may have activated an account before the answer was lost;
         # which one cannot be told here. Nothing is spent or deleted: an
@@ -1664,9 +1743,9 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
         # member was signing in). It is not bound here; if it is ours and
         # stays unbound, the reconciler removes it.
         logger.warning("Composio completed a connection no open flow created")
-        _log_rejection("account_invalid", log_app)
+        _log_rejection("account_invalid", log_app, actor_flow=actor_flow)
         return _clear_flow_cookies(
-            _reject("composio_rejected").response, callback, dead
+            _reject("composio_rejected", actor_flow).response, callback, dead
         )
     match = matches[0]
     app_id = match.flow.app_id
@@ -1674,16 +1753,16 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     if not _spend(db, match):
         # Spent by another request (which binds it) or expired meanwhile (the
         # reconciler then removes the unbound account). Never delete here.
-        _log_rejection("flow_used_or_expired", app_id)
+        _log_rejection("flow_used_or_expired", app_id, actor_flow=actor_flow)
         return _clear_flow_cookies(
-            _reject("flow_used_or_expired").response, callback, dead
+            _reject("flow_used_or_expired", actor_flow).response, callback, dead
         )
     # This request spent the flow that created the account, so the account is
     # its own: if it cannot be bound, it is deleted rather than left unbound.
     config = configs.get(app_id)
     if config is None:
         # This app's config went away after its flow began.
-        _log_rejection("composio_not_configured", app_id)
+        _log_rejection("composio_not_configured", app_id, actor_flow=actor_flow)
         delete_account(shared.api_key, account_id)
         return _clear_flow_cookies(_unavailable_page(app_id), callback, dead)
     try:
@@ -1708,17 +1787,23 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
             provider_user_id=provider_user_id,
         )
     except ComposioError as exc:
-        _log_rejection(exc.reason, app_id)
+        _log_rejection(exc.reason, app_id, actor_flow=actor_flow)
         delete_account(config.api_key, account_id)
         if exc.reason == "identity_host_invalid":
             response = _identity_host_invalid_page(app_id)
         elif exc.rejected:
-            response = _reject("composio_rejected").response
+            response = _reject("composio_rejected", actor_flow).response
         else:
             response = _unavailable_page(app_id)
         return _clear_flow_cookies(response, callback, dead)
     except _Rejected as rejected:
-        _log_rejection(rejected.reason, app_id)
+        _log_rejection(
+            rejected.reason,
+            app_id,
+            actor_flow=(
+                actor_flow if rejected.actor_flow is None else rejected.actor_flow
+            ),
+        )
         delete_account(config.api_key, account_id)
         return _clear_flow_cookies(rejected.response, callback, dead)
     except Exception as exc:
@@ -1744,6 +1829,32 @@ def _handle_verify(request: Any, db: Session, callback: str) -> Response:
     return _clear_flow_cookies(stored, callback, dead)
 
 
+def _ordinary_catalog_app(db: Session, app_id: str) -> dict[str, Any] | None:
+    """The catalog app an ordinary grant also associates; a hidden one is refused."""
+    from fastapi import HTTPException
+
+    from .api.mcp import _reject_hidden_catalog_app
+    from .mcp_apps import get_app_by_id
+
+    app_info = get_app_by_id(db, app_id)
+    if app_info is None:
+        return None
+    try:
+        _reject_hidden_catalog_app(app_info)
+    except HTTPException:
+        raise _Rejected(
+            "app_hidden",
+            HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1><p>This app is not currently available.</p>"
+                ),
+                status_code=404,
+            ),
+            False,
+        ) from None
+    return app_info
+
+
 def _store_grant(
     db: Session,
     *,
@@ -1757,20 +1868,31 @@ def _store_grant(
     from .models.user_oauth import UserOAuth
     from .services.user_oauth import delete_scoped_user_oauth_accounts
 
-    try:
-        # Composio I/O can overlap a personal disconnect.
-        _lock_actor_link(
-            db,
-            user_id=flow.user_id,
-            provider=COMPOSIO_APPS[flow.app_id].provider,
-            app_id=flow.app_id,
-        )
-    except ValueError:
-        db.rollback()
-        raise _reject("link_changed_after_exchange") from None
+    app_info = None if flow.actor_flow else _ordinary_catalog_app(db, flow.app_id)
+    if flow.actor_flow:
+        try:
+            # Composio I/O can overlap a personal disconnect.
+            _lock_actor_link(
+                db,
+                user_id=flow.user_id,
+                provider=COMPOSIO_APPS[flow.app_id].provider,
+                app_id=flow.app_id,
+            )
+        except ValueError:
+            db.rollback()
+            raise _reject("link_changed_after_exchange", True) from None
     db.query(User.id).filter(User.id == flow.user_id).with_for_update().one()
-    # Replaces this actor's previous grant for the app; a previous Composio
-    # account is deleted once this commits.
+    if not flow.actor_flow and not lock_current_session_epoch(
+        db, flow.user_id, flow.session_epoch
+    ):
+        db.rollback()
+        raise _reject("session_epoch_changed_after_exchange", False) from None
+    if app_info is not None:
+        from .api.auth import _ensure_user_mcp_server
+
+        _ensure_user_mcp_server(db, flow.user_id, app_info)
+    # Replaces this flow owner's own row for the app, never another owner's;
+    # a replaced Composio account is deleted once this commits.
     delete_scoped_user_oauth_accounts(
         db,
         user_id=flow.user_id,

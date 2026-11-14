@@ -16,7 +16,8 @@ checked this way today (see ``MCP_UNVERIFIABLE``).
 - ``inconclusive``: anything else (a 5xx, a timeout, an answer that does not
   tell the two apart).
 - ``unverifiable``: this provider's token endpoint cannot tell the two apart,
-  or depends on the customer's account; the line says why.
+  depends on the customer's account, or connects through Composio; the line
+  says why.
 
 A builtin provider's request is built by ``build_oauth_refresh_request``, the
 same function a refresh uses, so the command checks exactly what a refresh
@@ -361,6 +362,10 @@ async def verify_builtin_provider(provider: str, row: Any | None) -> Verificatio
     from .oauth_readiness import check_provider
 
     readiness = check_provider(provider, row)
+    if readiness.composio_only:
+        return VerificationResult(
+            "oauth-client", provider, "unverifiable", "connects through Composio"
+        )
     sources = f"client_id={readiness.client_id} client_secret={readiness.client_secret}"
     # Rules are keyed like the refresh's own provider checks: lowercased.
     name = provider.lower()

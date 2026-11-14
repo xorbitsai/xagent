@@ -27,8 +27,15 @@ The registry decides Gmail's and full Google Drive's default visibility from
 running the check, not the deployment's. Leave it unset where the check runs.
 Against a deployment that has the gate open, pass `--include gmail,google-drive`.
 
-**Builtin OAuth providers.** The check launches each provider once, through one
-of its visible catalog apps (a registry app when there is one):
+**Builtin OAuth providers.** The launch is the web connect, so the check
+follows the app's web-connect rule, not its Composio switch alone: the catalog
+entry says `auth_backend: "composio"` only for an app whose web connect goes
+through Composio (today only Salesforce). An app whose switch is on but whose
+web connect stays native (Facebook, Drive, Gmail) keeps only the native checks
+below and adds no `oauth:<provider>:composio` line.
+
+The check launches each provider once per app backend it serves, through one of
+its visible catalog apps (a registry app when there is one):
 
 1. `POST /api/auth/{provider}/login` starts the launch. The returned callback
    origin must equal the environment's origin. An unset `<PROVIDER>_REDIRECT_URI`
@@ -36,6 +43,17 @@ of its visible catalog apps (a registry app when there is one):
 2. `GET` on the returned launch path redeems it, without following the
    redirect. The provider `Location` must carry a non-empty `client_id` and a
    `redirect_uri` of `<origin>/api/auth/{provider}/callback`.
+
+A provider with any native app keeps these two checks through a native app, so
+turning one app over to Composio never drops them (`oauth:<provider>:callback`
+and `oauth:<provider>:authorize`). An operator-created app under a provider
+counts as a native target too. A provider with any app whose catalog entry says
+`auth_backend: "composio"` additionally gets one `oauth:<provider>:composio`
+check: its launch redeem must redirect to the shared Composio callback path
+with a `state`, on the callback origin its own launch start reports, which may
+be another host than the deployment's. A Composio-only provider (every app's web
+connect on Composio) gets only that check. Every start is redeemed before the
+next one, so a launch ticket never expires mid-run.
 
 Remote MCP OAuth apps (Notion, Atlassian, HubSpot, …) are not launched, because
 their connect may register a client with the vendor on every call. L2 covers
@@ -57,7 +75,11 @@ It prints one line per provider saying whether the client ID and secret
 resolve, and from the `oauth_providers` row or the environment, never a value.
 A row encrypted under another key fails as `unreadable`; a process with no
 usable key fails once as `encryption-key`. It proves a value is present, not
-that the vendor accepts it. Its `--exclude` takes OAuth provider names
+that the vendor accepts it. A provider whose every app's web connect goes
+through Composio is reported as `SKIP` (connects through Composio): it needs
+no native client and never fails for a missing row or credential. This is
+decided from the builtin registry's apps only; an operator-created app of the
+same provider is not considered. Its `--exclude` takes OAuth provider names
 (`google`), not the catalog app IDs this script's `--exclude` takes.
 
 Whether the vendor still accepts each client is checked by
@@ -69,7 +91,9 @@ and prints `CLIENT_OK`, `CLIENT_REJECTED`, `INCONCLUSIVE` or `UNVERIFIABLE`
 (with the reason) per credential, plus the vendor's error code and where each
 field resolved from, never a value. It exits 1 when any client is rejected;
 `INCONCLUSIVE` lines do not fail it. A pre-registered remote MCP client is
-listed as `UNVERIFIABLE`. `--exclude` takes the same provider names.
+listed as `UNVERIFIABLE`. A provider whose every app's web connect goes
+through Composio is `UNVERIFIABLE` without a request to the vendor. `--exclude`
+takes the same provider names.
 
 Microsoft checks a refresh token's format before the client, so its secret is
 checked instead with one client-credentials request against the app's home

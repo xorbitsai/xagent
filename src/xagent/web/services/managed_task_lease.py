@@ -222,6 +222,135 @@ def finalize_managed_task_lease_result(
                 message_type=history_message_type,
                 turn_id=history_turn_id,
             )
+        if execution_result is not None:
+            # Native clarification publication, only for a shared channel
+            # leaf: a known waiting result on a version-one task, settled by
+            # the coordinator that owns this lease. Without that coordinator
+            # the release above has cleared the lease identity the
+            # publication checks compare against.
+            #
+            # No lock read precedes this block: release_task_lease_no_commit's
+            # own tasks UPDATE writes only non-key columns and is the first
+            # statement this transaction directs at tasks or
+            # task_interaction_requests on this path, so it already satisfies
+            # the ordering and strength obligation a dedicated lock read
+            # would. Adding a key column to that UPDATE's values would raise
+            # its lock to FOR UPDATE and reopen that reasoning.
+            from .task_coordinator_runtime import current_task_coordinator
+
+            coordinator = current_task_coordinator(lease.task_id)
+            if (
+                status == TaskStatus.WAITING_FOR_USER
+                and task.conversation_storage_version != 2
+                and not execution_result.get("injection_outcome_unknown")
+                and coordinator is not None
+                and coordinator.owns_execution(lease)
+            ):
+                from sqlalchemy import update
+
+                from ..models.task_interaction import (
+                    INTERACTION_PROTOCOL_VERSION,
+                )
+                from .chat_history_service import supersede_legacy_question_rows
+                from .interaction_rollout import (
+                    NativePublicationDecision,
+                    evaluate_native_publication,
+                )
+                from .task_clarification_draft import (
+                    FailClosed,
+                    Publishable,
+                    resolve_publishable_clarification,
+                )
+                from .task_interaction_anchor import resolve_interaction_anchor
+                from .task_interaction_service import (
+                    CreateCreated,
+                    CreateInteractionEnvelope,
+                    InteractionOwnerStateError,
+                    InteractionPrincipal,
+                    InteractionPrincipalKind,
+                    SystemWriteContext,
+                    create,
+                )
+                from .task_lease_service import utc_now
+
+                if (
+                    evaluate_native_publication(db, task)
+                    is NativePublicationDecision.ALLOWED
+                ):
+                    publication_now = utc_now()
+                    anchor = resolve_interaction_anchor(db, task)
+                    resolution = resolve_publishable_clarification(
+                        execution_result,
+                        task=task,
+                        lease=lease,
+                        anchor=anchor,
+                        now=publication_now,
+                    )
+                    if (
+                        isinstance(resolution, FailClosed)
+                        and resolution.discards_settlement
+                    ):
+                        db.rollback()
+                        logger.warning(
+                            "Discarding the result of task %s run %s: "
+                            "clarification ownership check failed (%s)",
+                            lease.task_id,
+                            lease.run_id,
+                            resolution.reason,
+                        )
+                        return False
+                    if isinstance(resolution, Publishable):
+                        assert anchor is not None  # Publishable implies one
+                        try:
+                            outcome = create(
+                                db,
+                                task_id=lease.task_id,
+                                principal=InteractionPrincipal(
+                                    kind=InteractionPrincipalKind.SYSTEM,
+                                    user_id=None,
+                                    is_admin=False,
+                                    auth_mode=None,
+                                ),
+                                envelope=CreateInteractionEnvelope(
+                                    kind="clarification",
+                                    protocol_version=INTERACTION_PROTOCOL_VERSION,
+                                    request_idempotency_key=(
+                                        resolution.request_idempotency_key
+                                    ),
+                                    values=resolution.request_payload,
+                                ),
+                                system_context=SystemWriteContext(
+                                    task=task,
+                                    lease=lease,
+                                    anchor=anchor,
+                                    now=publication_now,
+                                    expires_at=resolution.expires_at,
+                                ),
+                            )
+                        except InteractionOwnerStateError:
+                            logger.exception(
+                                "Task %s run %s: the pending writes of its "
+                                "waiting_for_user settlement failed to flush "
+                                "while publishing its clarification",
+                                lease.task_id,
+                                lease.run_id,
+                            )
+                            raise
+                        if isinstance(outcome, CreateCreated):
+                            # Ordering the marker UPDATE after the lease
+                            # release is a shape rule, not a correctness
+                            # requirement: both statements live in this
+                            # transaction, so either order commits or rolls
+                            # back together. The rule keeps the marker a
+                            # statement of its own and keeps the three
+                            # finalizers one shape.
+                            db.execute(
+                                update(Task)
+                                .where(Task.id == lease.task_id)
+                                .values(interaction_protocol_version=1)
+                                .execution_options(synchronize_session=False)
+                            )
+                            supersede_legacy_question_rows(db, task_id=lease.task_id)
         witness = stage_result_fact_no_commit(
             db,
             task,

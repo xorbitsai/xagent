@@ -196,9 +196,12 @@ mints a fresh ``run_id`` whenever the task's current one reads
 touching either pointer column at all. ``websocket.py``'s own resume
 call site leaves the pointer in place on purpose there, because it is
 the anchor the resume means to read from; what changes underneath it
-is the run id the pointer is now compared against. What can reach this
-branch, then, is not only a hand-edited or mis-migrated row: it is
-also that ordinary resume; the 2026-08 migration's backfill UPDATE
+is the run id the pointer is now compared against. That resume does not
+reach this branch, though: it mints a run id only when the task's
+current one reads ``None``, and a checkpoint written while the task had
+no run id carries no run tag, so its row classifies as absence (step
+4's reclassification), not as another run's checkpoint. What can reach
+this branch is the 2026-08 migration's backfill UPDATE
 (``src/xagent/migrations/versions/20260804_add_task_checkpoint_trace_event_anchor.py``),
 which fills ``last_checkpoint_trace_event_id`` from a task's legacy
 event-id column with no run-partition condition of its own; a pointer
@@ -225,9 +228,11 @@ hold a lock on the task row they pass in, so the run identity read at
 step 4 cannot change out from under the comparison. A caller that does
 not hold that lock could be comparing against a run identity that has
 already moved on, which would make the "self-consistent, wrong run"
-reading above stale rather than sound. This is written as a
-precondition rather than an observed fact because this resolver has no
-production caller yet to check it against.
+reading above stale rather than sound. Its callers, the three finalizers
+that settle a waiting run, call it while their transaction holds that
+row's lock: the two in ``task_execution.py`` through their settlement
+lock read, the managed-lease finalizer through its fenced lease-release
+``UPDATE``.
 
 ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` (``ops_signals.py``) is a
 signal owned by ``interaction_handoff``, not by this function: it is
@@ -243,10 +248,11 @@ signal at an expected frequency of zero in normal operation. A nonzero rate
 means the anchor a caller staged did not come from this function, or the
 run identity changed between resolution and staging.
 
-Zero production callers as of this module's introduction: a static test
-(``tests/web/services/test_task_interaction_anchor.py``) asserts that no
-production module calls ``resolve_interaction_anchor``. See that test's
-own docstring for the removal condition.
+Production callers: the three finalizers that settle a waiting run, in
+``task_execution.py`` and ``managed_task_lease.py``, which reach it only
+when the rollout policy allows native publication. A static test
+(``tests/web/services/test_task_interaction_anchor.py``) asserts that
+exactly those two modules use ``resolve_interaction_anchor``.
 
 Two kinds of pre-existing row are missing the run-partition field and so
 fail the run-partition self-consistency check, though neither one
@@ -280,7 +286,8 @@ the resume path, and the right verdict for it depends on the ordering
 defect tracked in #2023 (a run identity is minted before the checkpoint
 is read, so the read is partitioned by an identity the stored row could
 not have carried). This module's own reclassification does not wait on
-that: it has no production caller yet, so nothing observes its verdict
+that: nothing observes its verdict unless the rollout policy allows the
+finalizers' native publication, which the default rollout mode does not
 today. #2023 tracks converging the two; this module does not.
 """
 
@@ -361,8 +368,9 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
        rather than the generic corrupt one; a row whose run field is
        absent reports absence; every other failed condition, alone or
        combined, still reports the generic corrupt reason. This resolver
-       has no production callers today, so neither divergence has a live
-       impact yet.
+       is reached only from the finalizers' native publication, which the
+       rollout policy keeps off by default, so neither divergence has a
+       live impact while that stays off.
     6. ``row_execution_id and row_execution_id != execution_id`` --
        execution identity mismatch. An empty ``row_execution_id`` (a legacy
        row with no identity field) short-circuits past this condition on

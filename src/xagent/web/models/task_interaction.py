@@ -107,10 +107,11 @@ def normalize_interaction_origin(source: str | None) -> str | None:
 class TaskInteractionRequest(Base):  # type: ignore
     """One blocking interaction request raised by a task and its lifecycle to answer or expiry.
 
-    Zero production consumers as of this table's introduction: the primitive
-    that writes rows here (``stage_interaction_request`` / the
-    ``interaction_handoff`` context manager) and the code that reads them
-    land separately, so this class is model-only until those callers exist.
+    Rows are written through ``interaction_handoff``
+    (``task_interaction_staging.py``), entered only from
+    ``task_interaction_service.create``, which the three finalizers that
+    settle a waiting run call when the rollout policy allows native
+    publication; under the default rollout mode nothing writes here.
 
     Active slot: ``UNIQUE(task_id, active_slot)`` caps a task at one
     ``active`` row at a time. ``active_slot`` is ``1`` on that row and SQL
@@ -164,13 +165,14 @@ class TaskInteractionRequest(Base):  # type: ignore
     reach the column as the JSON text ``null``, which ``NOT NULL`` does not
     reject.
 
-    ``terminal_reason`` vocabulary: each of the three members is spoken for
-    by exactly one intended writer. ``deadline_elapsed`` and
-    ``run_superseded`` are the two reclaim branches the staging primitive's
-    ``_reclaim_stale_slot_stmt`` already writes (``task_interaction_staging.py``)
-    -- that write statement exists, but the staging primitive it belongs to
-    has no production caller yet, so neither value is reachable outside
-    tests; ``answered_via_legacy_resume`` already has both its write
+    ``terminal_reason`` vocabulary. ``deadline_elapsed`` and ``run_superseded``
+    are the reclaim branches of ``_reclaim_stale_slot_stmt``
+    (``task_interaction_staging.py``): an expired row, and a row whose run no
+    longer holds the slot for that question, whether another run took over or the
+    same run asked again. The question cancel also writes ``run_superseded``. The
+    statement is reached only from the finalizers' native publication, which the
+    rollout policy keeps off by default, so with it off the reclaim writes neither;
+    ``answered_via_legacy_resume`` already has both its write
     statement and a production caller, the transitional close in
     ``task_interaction_close.py`` on the legacy answer path. It is not the
     same outcome as ``answered`` -- that path recovers a free-text chat

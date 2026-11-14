@@ -61,11 +61,13 @@ Caller obligations, because none of them happen here:
   already committed in this transaction.
 
 One production caller today: ``task_interaction_service.create`` enters
-``interaction_handoff`` and calls ``stage()``. ``create()`` itself still
-has zero production callers, held there by a live gate
-(``tests/web/services/test_task_interaction_service_create_gate.py``), so
-the chain is not reachable in production yet. The old zero-caller gate on
-this module's two entry points was replaced by three static guards
+``interaction_handoff`` and calls ``stage()``. ``create()`` in turn is
+called only by the three finalizers that settle a waiting run
+(``task_execution.py`` and ``managed_task_lease.py``), pinned by
+``tests/web/services/test_task_interaction_service_create_gate.py``; they
+reach it only when the rollout policy allows native publication. The old
+zero-caller gate on this module's two entry points was replaced by three
+static guards
 (``tests/web/services/test_interaction_handoff_production_surface.py``)
 asserting: the only production use of ``interaction_handoff`` is
 ``task_interaction_service``, validation always runs before it is
@@ -258,6 +260,10 @@ class InteractionSlotTaken(InteractionHandoffError):
     exception is also what a programming error that skipped the
     plain-Python validation block would surface as. See the module
     docstring's misclassification-funnel paragraph.
+
+    Step 4 retires every other active row first, so a real slot conflict takes a
+    concurrent publisher's row that step 4 could not see. The finalizers' task
+    row lock excludes that among themselves.
     """
 
 
@@ -451,9 +457,9 @@ _SWALLOWED: tuple[type[BaseException], ...] = (
 # other five's shared INTERACTION_HANDOFF_DEGRADED, precisely because it is
 # the one override that cannot be validated at this layer -- see
 # interaction_handoff's docstring. Keeping it separately addressable in
-# /health lets the change that wires the first production caller tell "a
-# run-partition anchor went stale" apart from every other reason a handoff
-# degraded, without having to reparse log lines to do it.
+# /health lets an operator tell "a run-partition anchor went stale" apart
+# from every other reason a handoff degraded, without having to reparse
+# log lines to do it.
 _DEGRADATION_SIGNALS: dict[type[BaseException], str] = {
     InteractionSlotTaken: INTERACTION_HANDOFF_DEGRADED,
     InteractionRequestClosed: INTERACTION_HANDOFF_DEGRADED,
@@ -812,20 +818,46 @@ def _identity_lookup_stmt(
     )
 
 
-def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.Update:
+def _reclaim_stale_slot_stmt(
+    *, task_id: int, run_id: str, request_idempotency_key: str, now: datetime
+) -> sa.Update:
     """The reclaim UPDATE (step 4). Stays in the caller's outer transaction,
     not this function's inner savepoint -- it dies with the whole handoff on
     rollback, and the post-conflict re-check must not have undone it.
 
+    Retires the task's active row unless it is this call's own identity
+    (``run_id`` and ``request_idempotency_key``) and still within its deadline.
+    A row under another key on the same run is a question the run has moved
+    past. Only the lease's current execution reaches this statement, and an
+    execution that asks again is no longer blocked on the question before it.
+    The close that should have retired that row may have matched nothing: it
+    binds the id read before its injection, and a row published after that read
+    is out of its reach. Publication therefore cannot depend on that close
+    having run, and must not fail because of the row it left behind.
+
+    The key term keeps this call off its own row. Step 3 replays a row with this
+    identity, so the term only matters when step 3 missed a row committed since;
+    step 6 then has to find that row still active to replay it.
+
+    Within one task coordinator executions share an attempt id, so the attempt
+    fence does not separate an older execution from its successor there. They
+    are ordered instead: a resume waits for the previous execution
+    (``execute_resume_background``'s ``previous_task``) and the resume slot admits
+    one successor at a time, so an older execution's finalizer cannot run after a
+    newer one's and retire its question.
+
+    ``run_superseded`` on the same run means what it means for the question
+    cancel: the asking run no longer holds this slot for that question. It does
+    not claim an answer. Nothing here knows whether one arrived, which is why
+    this is not ``answered_via_legacy_resume``.
+
     Branch order is load-bearing: cross-run supersession takes priority over
-    plain expiry when a row is both (``run_id <> :reclaim_run_id`` is
-    checked before falling through to ``deadline_elapsed``).
+    plain expiry when a row is both, and a same-run row that has expired reads
+    as ``deadline_elapsed`` rather than superseded.
 
     ``terminal_reason`` is built with ``sa.case``, not ``sa.text`` -- Core
     compiles and parameterizes ``run_id`` on both backends without any raw
-    SQL fragment, verified equivalent to the earlier hand-written ``CASE
-    WHEN run_id <> :reclaim_run_id THEN 'run_superseded' ELSE
-    'deadline_elapsed' END``. The only remaining ``sa.text`` usage in this
+    SQL fragment. The only remaining ``sa.text`` usage in this
     module is ``interaction_handoff``'s SQLite-only savepoint guard, which
     needs no parameter because its predicate is a hardcoded constant, not
     caller input.
@@ -850,17 +882,25 @@ def _reclaim_stale_slot_stmt(*, task_id: int, run_id: str, now: datetime) -> sa.
             sa.or_(
                 TaskInteractionRequest.expires_at <= now,
                 TaskInteractionRequest.run_id != run_id,
+                TaskInteractionRequest.request_idempotency_key
+                != request_idempotency_key,
             ),
         )
         .values(
             status="terminated",
             terminal_reason=sa.case(
                 (TaskInteractionRequest.run_id != run_id, "run_superseded"),
-                else_="deadline_elapsed",
+                (TaskInteractionRequest.expires_at <= now, "deadline_elapsed"),
+                else_="run_superseded",
             ),
             active_slot=None,
             terminated_at=now,
             updated_at=now,
+        )
+        .returning(
+            TaskInteractionRequest.id,
+            TaskInteractionRequest.run_id,
+            TaskInteractionRequest.terminal_reason,
         )
     )
 
@@ -981,10 +1021,10 @@ def stage_interaction_request(
        ``answered`` or ``terminated`` raises ``InteractionRequestClosed``:
        identity is scoped by ``run_id``, so a key reclaimed to
        ``terminated`` earlier in *this same run* still raises here on reuse.
-    4. Reclaim: retire this task's stale or run-superseded active row, if
-       any, in the same outer transaction as everything else -- not inside
-       the inner savepoint opened next, so a post-conflict re-check below
-       cannot undo it.
+    4. Reclaim: retire this task's active row, if any, unless step 3 would have
+       replayed it (see ``_reclaim_stale_slot_stmt``), in the same outer
+       transaction as everything else -- not inside the inner savepoint opened
+       next, so a post-conflict re-check below cannot undo it.
     5. Insert the new active row inside a savepoint this function opens and
        owns (``db.begin_nested()``), then flush. A savepoint shared with a
        caller (or with ``interaction_handoff``'s own savepoint) does not
@@ -1098,10 +1138,25 @@ def stage_interaction_request(
     if replay is not None:
         return replay
 
-    db.execute(
-        _reclaim_stale_slot_stmt(task_id=resolved_task_id, run_id=run_id, now=now),
+    reclaimed = db.execute(
+        _reclaim_stale_slot_stmt(
+            task_id=resolved_task_id,
+            run_id=run_id,
+            request_idempotency_key=normalized_key,
+            now=now,
+        ),
         execution_options={"synchronize_session": False},
-    )
+    ).first()
+    if reclaimed is not None:
+        logger.info(
+            "Retiring interaction %s of task %s (run %s) as %s for a new "
+            "question on run %s",
+            reclaimed.id,
+            resolved_task_id,
+            reclaimed.run_id,
+            reclaimed.terminal_reason,
+            run_id,
+        )
 
     row = {
         "task_id": resolved_task_id,
@@ -1416,11 +1471,17 @@ def interaction_handoff(
     has already happened before this is ever called, and the attempt and
     anchor assertions that used to be caller obligations are now checked by
     ``handoff.stage()`` itself, on every call. The one obligation that
-    remains is structural, not sequential: the ``with`` block must be the
-    transaction's last word before the caller commits -- no I/O in between
-    -- because every write inside it, including the reclaim UPDATE, holds
-    SQLite's database-wide writer lock (or, on PostgreSQL, ordinary row
-    locks) for the whole span, not just an instant.
+    remains is structural, not sequential. This context manager's caller is
+    ``create()``, which returns once the ``with`` block exits; the finalizer
+    that called ``create()`` then commits. Between the block and that commit
+    only a bounded number of statements on the same session and connection
+    may run -- the finalizer's protocol-marker UPDATE, the legacy-question
+    relabel, and the rest of its own settlement (lease release, transcript
+    row, result fact, channel result and completion block) -- and never I/O
+    outside that connection, because every write inside the block,
+    including the reclaim UPDATE, holds SQLite's database-wide writer lock
+    (or, on PostgreSQL, ordinary row locks) for the whole span, not just an
+    instant.
 
     This handoff fails closed, on purpose, and does not inherit the
     silent-discard shape a sibling primitive in this package uses.
@@ -1505,12 +1566,16 @@ def interaction_handoff(
     (``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED``, kept separate from the
     other five's shared ``INTERACTION_HANDOFF_DEGRADED`` so it stays
     individually addressable on ``/health``) and a structured log line
-    naming the task, the lease's run, and the anchor's run partition. This
-    override ships with zero production callers and therefore zero
-    real-world reachability data for it: **the change that wires the first
-    production caller -- the one that removes the zero-production-caller
-    AST gate -- must re-adjudicate this policy once a real reachability
-    picture exists**, not carry it forward unexamined.
+    naming the task, the lease's run, and the anchor's run partition. The
+    override stands now that the finalizers call this through ``create()``.
+    In the write direction the mismatch can only mean the anchor a
+    finalizer resolved and the lease's run disagree, and every finalizer
+    resolves the anchor while it holds the task row's lock and stages
+    immediately after, so the two read one run identity. Degrading to "no
+    native row this round; the question stays a transcript message" is
+    safer than failing the whole settlement over it. The expected frequency
+    of the dedicated signal is zero; a nonzero rate is a reason to
+    investigate. This reasoning covers the write direction only.
 
     Every degradation signal this module registers is sticky in a way none
     of ``ops_signals.py``'s other six signals are.

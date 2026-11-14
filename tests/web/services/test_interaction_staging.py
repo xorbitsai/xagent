@@ -41,6 +41,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
+from xagent.web.services import task_interaction_staging as staging
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
     InteractionAnchorCorrupt,
@@ -161,6 +162,19 @@ def _row_state(db: Session, staged_db_id: int):
             TaskInteractionRequest.terminated_at,
         ).where(TaskInteractionRequest.id == staged_db_id)
     ).one()
+
+
+def _force_reclaim_to_match_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for a concurrent publisher whose uncommitted active row the
+    reclaim's snapshot cannot see: the reclaim matches nothing, so the INSERT
+    collides for real. Publishing retires every other active row, so this
+    collision no longer happens without a concurrent writer."""
+    real = staging._reclaim_stale_slot_stmt
+    monkeypatch.setattr(
+        staging,
+        "_reclaim_stale_slot_stmt",
+        lambda **kwargs: real(**kwargs).where(sa.false()),
+    )
 
 
 def _force_next_identity_select_to_miss(
@@ -864,24 +878,22 @@ def test_p5b_identity_is_run_scoped_not_task_scoped(tmp_path: Path) -> None:
 
 
 _T_P_6_CASES = [
-    pytest.param("run-a", "run-a", 1, False, id="same-run-expired"),
-    pytest.param("run-a", "run-a", 15, True, id="same-run-unexpired-control"),
-    pytest.param("run-a", "run-b", 1, False, id="cross-run-expired"),
-    pytest.param("run-a", "run-b", 15, False, id="cross-run-unexpired"),
-    pytest.param("run-b", "run-a", 1, False, id="reverse-cross-run-expired"),
-    pytest.param("run-b", "run-a", 15, False, id="reverse-cross-run-unexpired"),
+    pytest.param("run-a", "run-a", 1, id="same-run-expired"),
+    pytest.param("run-a", "run-a", 15, id="same-run-unexpired-other-key"),
+    pytest.param("run-a", "run-b", 1, id="cross-run-expired"),
+    pytest.param("run-a", "run-b", 15, id="cross-run-unexpired"),
+    pytest.param("run-b", "run-a", 1, id="reverse-cross-run-expired"),
+    pytest.param("run-b", "run-a", 15, id="reverse-cross-run-unexpired"),
 ]
 
 
-@pytest.mark.parametrize(
-    "existing_run, reclaiming_run, ttl_minutes, expect_untouched", _T_P_6_CASES
-)
+@pytest.mark.parametrize("existing_run, reclaiming_run, ttl_minutes", _T_P_6_CASES)
 def test_p6_reclaim_six_cells(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     existing_run: str,
     reclaiming_run: str,
     ttl_minutes: int,
-    expect_untouched: bool,
 ) -> None:
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
@@ -899,46 +911,36 @@ def test_p6_reclaim_six_cells(
     db.commit()
 
     reclaim_now = _now() + timedelta(minutes=5)
-    if expect_untouched:
-        # Same run, unexpired: the reclaim predicate does not match, so the
-        # slot is still held -> the new INSERT collides with it.
-        with pytest.raises(InteractionSlotTaken):
-            stage_interaction_request(
-                db,
-                task_id=task_id,
-                **_stage_kwargs(
-                    _anchor(anchor_id, run_partition=reclaiming_run),
-                    now=reclaim_now,
-                    expires_at=reclaim_now + timedelta(minutes=15),
-                ),
-            )
-        db.rollback()
-        row = _row_state(db, existing.staged_db_id)
-        assert row.status == "active"
-        assert row.active_slot == 1
-        assert row.terminal_reason is None
-        assert row.terminated_at is None
-        db.close()
-        return
-
-    stage_interaction_request(
-        db,
-        task_id=task_id,
-        **_stage_kwargs(
-            _anchor(anchor_id, run_partition=reclaiming_run),
-            now=reclaim_now,
-            expires_at=reclaim_now + timedelta(minutes=15),
-        ),
-    )
+    with caplog.at_level(
+        logging.INFO, logger="xagent.web.services.task_interaction_staging"
+    ):
+        stage_interaction_request(
+            db,
+            task_id=task_id,
+            **_stage_kwargs(
+                _anchor(anchor_id, run_partition=reclaiming_run),
+                now=reclaim_now,
+                expires_at=reclaim_now + timedelta(minutes=15),
+            ),
+        )
     db.commit()
     row = _row_state(db, existing.staged_db_id)
     assert row.status == "terminated"
     assert row.active_slot is None
     assert row.terminated_at is not None
     expected_reason = (
-        "run_superseded" if existing_run != reclaiming_run else "deadline_elapsed"
+        "deadline_elapsed"
+        if existing_run == reclaiming_run and ttl_minutes == 1
+        else "run_superseded"
     )
     assert row.terminal_reason == expected_reason
+    retired = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Retiring interaction")
+    ]
+    assert len(retired) == 1
+    assert f"as {expected_reason} for a new question" in retired[0]
     db.close()
 
 
@@ -1375,7 +1377,9 @@ def test_p9c_post_conflict_recheck_reclassifies_terminal_identity_as_closed(
     assert row_count == 1, "A's own losing INSERT must not leave a second row"
 
 
-def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:
+def test_p10_slot_taken_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine = _engine(tmp_path)
     statements = _count_cursor_executions(engine)
     session_factory = _session_factory(engine)
@@ -1391,6 +1395,7 @@ def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:
     db.commit()
 
     before = len(statements)
+    _force_reclaim_to_match_nothing(monkeypatch)
     with pytest.raises(InteractionSlotTaken):
         stage_interaction_request(
             db,
@@ -1401,6 +1406,49 @@ def test_p10_slot_taken_does_not_retry(tmp_path: Path) -> None:
     issued = statements[before:]
     insert_count = sum(1 for s in issued if s.strip().upper().startswith("INSERT"))
     assert insert_count == 1, issued
+    db.close()
+
+
+def test_a_retired_key_cannot_take_back_the_slot(tmp_path: Path) -> None:
+    """A question retired by the next one on the same run keeps its identity:
+    publishing the first key again is reported as a reused key and leaves the
+    current question active."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    first_key, second_key = _next_key(), _next_key()
+
+    first = stage_interaction_request(
+        db,
+        task_id=task_id,
+        **_stage_kwargs(anchor, request_idempotency_key=first_key),
+    )
+    db.commit()
+    second = stage_interaction_request(
+        db,
+        task_id=task_id,
+        **_stage_kwargs(anchor, request_idempotency_key=second_key),
+    )
+    db.commit()
+    assert _row_state(db, first.staged_db_id).status == "terminated"
+
+    with pytest.raises(InteractionRequestClosed):
+        stage_interaction_request(
+            db,
+            task_id=task_id,
+            **_stage_kwargs(anchor, request_idempotency_key=first_key),
+        )
+    # Read inside the failed call's own transaction: a caller that rolls back
+    # afterwards would hide a reclaim that had already retired the current
+    # question.
+    current = _row_state(db, second.staged_db_id)
+    assert current.status == "active"
+    assert current.active_slot == 1
+    db.rollback()
+    assert _row_state(db, first.staged_db_id).terminal_reason == "run_superseded"
     db.close()
 
 
@@ -1625,7 +1673,10 @@ _DEGRADATION_LOG_EXTRA_KEYS = {
 
 @pytest.mark.parametrize("case", _T_CM_1_CASES)
 def test_cm1_seven_cell_exit_matrix(
-    tmp_path: Path, case: str, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    case: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """T-CM-1, widened to seven cells: the six swallowed types
     (InteractionSlotTaken, InteractionRequestClosed, InteractionAnchorCorrupt,
@@ -1668,6 +1719,7 @@ def test_cm1_seven_cell_exit_matrix(
             **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
         )
         db.commit()
+        _force_reclaim_to_match_nothing(monkeypatch)
         expect_signal = ops_signals.INTERACTION_HANDOFF_DEGRADED
     elif case == "request-closed":
         r = stage_interaction_request(
@@ -2789,7 +2841,9 @@ def test_cm4_with_exit_does_not_commit_outer_transaction(tmp_path: Path) -> None
 # --------------------------------------------------------------------------
 
 
-def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
+def test_sp1_slot_taken_rolls_back_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     engine = _engine(tmp_path)
     session_factory = _session_factory(engine)
     task_id, anchor_id = _seed(session_factory)
@@ -2811,6 +2865,7 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
     ).scalar_one()
     assert before == 1
     _mark_caller_write(db, task_id, "sp1-write")
+    _force_reclaim_to_match_nothing(monkeypatch)
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
         h.stage(

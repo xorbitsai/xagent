@@ -56,6 +56,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
+from xagent.web.services import task_interaction_staging as staging
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
     InteractionSlotTaken,
@@ -185,6 +186,19 @@ def _count_cursor_executions(engine: sa.Engine) -> list[str]:
         statements.append(statement)
 
     return statements
+
+
+def _force_reclaim_to_match_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for a concurrent publisher whose uncommitted active row the
+    reclaim's snapshot cannot see: the reclaim matches nothing, so the INSERT
+    collides for real. Publishing retires every other active row, so this
+    collision no longer happens without a concurrent writer."""
+    real = staging._reclaim_stale_slot_stmt
+    monkeypatch.setattr(
+        staging,
+        "_reclaim_stale_slot_stmt",
+        lambda **kwargs: real(**kwargs).where(sa.false()),
+    )
 
 
 def _force_next_identity_select_to_miss(
@@ -352,7 +366,9 @@ def test_pg2_non_finite_json_payload_rejected_by_backend_as_data_error(
         db.rollback()
 
 
-def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
+def test_sp1_slot_taken_rolls_back_cleanly(
+    db_session, fixtures, monkeypatch: pytest.MonkeyPatch
+) -> None:
     task_id, anchor_id = fixtures
     anchor = _anchor(anchor_id)
     lease = _lease(task_id)
@@ -372,6 +388,7 @@ def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
     assert before == 1
     task = db.get(Task, task_id)
     _mark_caller_write(db, task_id, "pg-sp1-write")
+    _force_reclaim_to_match_nothing(monkeypatch)
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
         h.stage(
@@ -538,7 +555,7 @@ def test_sp3_clean_stage_commits_with_caller(
 
 
 def test_sp4_all_three_cells_preserve_callers_pending_write(
-    session_factory, fixtures
+    session_factory, fixtures, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The caller's pre-with pending write survives all three savepoint
     exit shapes: rollback-on-exception (slot-taken), commit-on-success, and
@@ -550,40 +567,44 @@ def test_sp4_all_three_cells_preserve_callers_pending_write(
     lease = _lease(task_id)
 
     for label in ("slot-taken", "clean", "replay"):
-        db = session_factory()
-        try:
-            key = _next_key()
-            if label == "slot-taken":
-                stage_interaction_request(
-                    db,
-                    task_id=task_id,
-                    **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
-                )
-                db.commit()
-            elif label == "replay":
-                stage_interaction_request(
-                    db,
-                    task_id=task_id,
-                    **_stage_kwargs(anchor, request_idempotency_key=key),
-                )
-                db.commit()
+        with monkeypatch.context() as scoped:
+            db = session_factory()
+            try:
+                key = _next_key()
+                if label == "slot-taken":
+                    stage_interaction_request(
+                        db,
+                        task_id=task_id,
+                        **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
+                    )
+                    db.commit()
+                    _force_reclaim_to_match_nothing(scoped)
+                elif label == "replay":
+                    stage_interaction_request(
+                        db,
+                        task_id=task_id,
+                        **_stage_kwargs(anchor, request_idempotency_key=key),
+                    )
+                    db.commit()
 
-            task = db.get(Task, task_id)
-            _mark_caller_write(db, task_id, f"pg-sp4-{label}")
-            with interaction_handoff(
-                db, lease, task=task, anchor=anchor, now=_now()
-            ) as h:
-                h.stage(
-                    kind="clarification",
-                    protocol_version=1,
-                    request_payload={"prompt": "p"},
-                    request_idempotency_key=key,
-                    expires_at=_now() + timedelta(minutes=15),
-                )
-            db.commit()
-            assert _caller_write_survived(db, task_id, f"pg-sp4-{label}")
-        finally:
-            db.close()
+                task = db.get(Task, task_id)
+                _mark_caller_write(db, task_id, f"pg-sp4-{label}")
+                with interaction_handoff(
+                    db, lease, task=task, anchor=anchor, now=_now()
+                ) as h:
+                    h.stage(
+                        kind="clarification",
+                        protocol_version=1,
+                        request_payload={"prompt": "p"},
+                        request_idempotency_key=key,
+                        expires_at=_now() + timedelta(minutes=15),
+                    )
+                if label == "slot-taken":
+                    assert h.staged is None
+                db.commit()
+                assert _caller_write_survived(db, task_id, f"pg-sp4-{label}")
+            finally:
+                db.close()
         # Clear the active slot between iterations so each label starts clean.
         cleanup = session_factory()
         cleanup.execute(
@@ -604,7 +625,7 @@ def test_sp4_all_three_cells_preserve_callers_pending_write(
 
 
 def test_sp5_integrity_error_poisons_transaction_until_savepoint_rollback(
-    db_session, fixtures
+    db_session, fixtures, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PostgreSQL-only: an uncaught IntegrityError poisons the rest of the
     transaction (InFailedSqlTransaction) until something rolls back to the
@@ -669,6 +690,7 @@ def test_sp5_integrity_error_poisons_transaction_until_savepoint_rollback(
     # holds the active slot) rolls back only to its own inner savepoint,
     # and the session is immediately usable again -- the failure this test
     # exists to contrast with.
+    _force_reclaim_to_match_nothing(monkeypatch)
     with pytest.raises(InteractionSlotTaken):
         stage_interaction_request(
             db,

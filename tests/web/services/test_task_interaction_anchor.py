@@ -894,7 +894,7 @@ def test_ta12_outcome_counter_matrix(tmp_path: Path, outcome: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve_interaction_anchor ships with zero production callers.
+# resolve_interaction_anchor is used only by the finalizer modules.
 # ---------------------------------------------------------------------------
 
 _ANCHOR_GATED_NAME = "resolve_interaction_anchor"
@@ -920,28 +920,23 @@ def _anchor_production_uses(source: str) -> bool:
     return False
 
 
-def test_ta11_resolve_interaction_anchor_has_zero_production_callers() -> None:
-    """This is a fresh assertion, not an extension of an existing
-    ``GATED_NAMES``-style production-caller gate: both
-    ``test_task_interaction_service_create_gate.py`` and
-    ``test_clarification_publication_gate.py`` scan for their own
-    module's names only (``create``/``respond`` on
-    ``task_interaction_service``, and the clarification-draft
-    primitives, respectively), and ``resolve_interaction_anchor`` is not
-    one of them.
-
-    The zero here is scoped to this module's introduction, not a permanent
-    invariant to preserve by construction: the change that wires the first
-    production caller changes this number to 3 (the three finalizers named
-    in ``task_interaction_staging.py``'s own module docstring) and updates
-    this test alongside that wiring, deliberately -- it is not a constant a
-    later change edits in isolation without also reasoning about the wiring
-    itself.
+def test_ta11_resolve_interaction_anchor_is_used_only_by_the_finalizer_modules() -> (
+    None
+):
+    """The three finalizers that settle a waiting run live in two modules,
+    ``task_execution`` and ``managed_task_lease``, and only those two use
+    ``resolve_interaction_anchor``. This is an equality: a red result is
+    fixed by putting the use back, not by widening the set. It judges by
+    module only: the function-level call sites of the publication block are
+    pinned by the call-site guards on ``evaluate_native_publication``
+    (``test_interaction_rollout_guards.py``) and
+    ``resolve_publishable_clarification``
+    (``test_clarification_publication_gate.py``), and are not repeated here.
     """
 
-    offenders: dict[str, bool] = {}
-    for path in _scan_root(_ANCHOR_MODULE_STEM):
-        source = path.read_text(encoding="utf-8")
-        if _anchor_production_uses(source):
-            offenders[str(path)] = True
-    assert offenders == {}
+    users = {
+        path.stem
+        for path in _scan_root(_ANCHOR_MODULE_STEM)
+        if _anchor_production_uses(path.read_text(encoding="utf-8"))
+    }
+    assert users == {"task_execution", "managed_task_lease"}

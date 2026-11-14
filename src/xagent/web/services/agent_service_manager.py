@@ -4049,6 +4049,11 @@ class AgentServiceManager:
         acquisition landing between the check and the removal would have its
         workspace deleted and its manager entries evicted by a cleanup that
         was scheduled for the previous run. Safe to call from a worker thread.
+
+        ``False`` therefore also means "another caller holds the boundary, so
+        nothing was removed here", even without a fence. A caller that owes the
+        removal -- task deletion, which recorded a cleanup obligation -- must
+        treat it as still owed, not as done (see ``finish_task_deletion``).
         """
         if not self._try_enter_runtime_boundary(task_id):
             logger.info(

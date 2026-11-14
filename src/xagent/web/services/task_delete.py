@@ -337,7 +337,17 @@ async def finish_task_deletion(
     *,
     request: Any = None,
 ) -> TaskDeleteOutcome:
-    """Release the runtime/workspace and settle the recorded obligation."""
+    """Release the runtime/workspace and settle the recorded obligation.
+
+    ``remove_agent`` reports ``False`` when it removed nothing. Called without
+    a run fence, as here, the only way that happens is that another caller
+    holds the task's runtime boundary -- typically a files-only deletion or
+    redaction cleanup that started before this deletion committed and is still
+    removing the same workspace. That caller may yet fail, so this attempt
+    cannot count as a release: the obligation is settled as a failed attempt,
+    stays pending with its captured locator, and the retry driver removes the
+    workspace (an already-removed one completes immediately).
+    """
 
     from .agent_service_manager import get_agent_manager
 
@@ -345,12 +355,23 @@ async def finish_task_deletion(
     workspace_error: str | None = None
     try:
         manager = get_agent_manager(request)
-        await asyncio.to_thread(
+        removed = await asyncio.to_thread(
             manager.remove_agent,
             snapshot.task_id,
             snapshot.task_user_id,
             workspace_target=committed.workspace_target,
         )
+        if not removed:
+            workspace_error = (
+                "workspace cleanup deferred: another cleanup holds the task's "
+                "runtime boundary"
+            )
+            logger.warning(
+                "Task %s rows were deleted but another cleanup holds its "
+                "runtime boundary; the retry driver will re-attempt its "
+                "workspace cleanup",
+                snapshot.task_id,
+            )
     except Exception as exc:
         workspace_error = describe_cleanup_failure(exc)
         logger.error(

@@ -56,6 +56,12 @@ from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
 )
+from xagent.web.services.task_cleanup_obligations import (
+    CleanupObligationStatus,
+    CleanupResourceKind,
+    list_cleanup_obligations,
+    run_cleanup_obligation_batch,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_PENDING,
@@ -124,6 +130,22 @@ def mock_start_task() -> Iterator[None]:
         yield
 
 
+def _drop_instance_patches() -> None:
+    """Remove instance attributes that shadow the singleton manager's methods.
+
+    ``monkeypatch.setattr`` on the shared manager restores the original bound
+    method as an *instance* attribute rather than deleting it, which would
+    hide any later class-level patch of the same method.
+    """
+    manager_state = vars(get_agent_manager())
+    for name in (
+        "remove_agent",
+        "_cleanup_workspace_directory",
+        "_get_agent_for_task_unlocked",
+    ):
+        manager_state.pop(name, None)
+
+
 @pytest.fixture(autouse=True)
 def _roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Point uploads and durable storage at ``tmp_path``; yields the uploads root."""
@@ -135,10 +157,12 @@ def _roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     get_unscoped_file_storage.cache_clear()
     register_scope_resolver(None)
     set_execution_scope_snapshot_loader(load_task_execution_scope_snapshot)
+    _drop_instance_patches()
     get_agent_manager()._agents.clear()
 
     yield uploads
 
+    _drop_instance_patches()
     set_execution_scope_snapshot_loader(None)
     get_unscoped_file_storage.cache_clear()
 
@@ -878,17 +902,19 @@ def test_files_only_cleanup_failure_is_reported_and_a_rerun_finishes(
     next_id = _settled_task(full_key, agent_id)
     _seed_content(failing_id, _roots)
     _seed_content(next_id, _roots)
-    manager = get_agent_manager()
-    remove_agent = manager.remove_agent
+    manager_type = type(get_agent_manager())
+    remove_agent = manager_type.remove_agent
 
-    def flaky_remove_agent(task_id: int, *args: Any, **kwargs: Any) -> bool:
+    def flaky_remove_agent(self: Any, task_id: int, *args: Any, **kwargs: Any) -> bool:
         if task_id == failing_id:
             raise OSError("workspace is busy")
-        return remove_agent(task_id, *args, **kwargs)
+        return remove_agent(self, task_id, *args, **kwargs)
 
-    monkeypatch.setattr(manager, "remove_agent", flaky_remove_agent)
-
-    first = _delete_files([failing_id, next_id])
+    # Patched on the class and scoped, so the shared singleton is not left
+    # with a shadowing instance attribute that defeats later class patches.
+    with monkeypatch.context() as patched:
+        patched.setattr(manager_type, "remove_agent", flaky_remove_agent)
+        first = _delete_files([failing_id, next_id])
 
     assert first == TaskFileDeletionReport(
         deleted=(next_id,), cleanup_failed=(failing_id,)
@@ -897,8 +923,6 @@ def test_files_only_cleanup_failure_is_reported_and_a_rerun_finishes(
     assert _file_ids(failing_id) == []
     assert (_roots / f"web_task_{failing_id}").exists()
     assert not (_roots / f"web_task_{next_id}").exists()
-
-    monkeypatch.setattr(manager, "remove_agent", remove_agent)
 
     second = _delete_files([failing_id])
 
@@ -993,16 +1017,18 @@ def _stub_acquisition(
     bookkeeping are what the interleaving tests exercise.
     """
 
-    async def build(task_id: int, *args: Any, **kwargs: Any) -> MagicMock:
+    async def build(self: Any, task_id: int, *args: Any, **kwargs: Any) -> MagicMock:
         if "on_build" in hooks:
             await hooks["on_build"](workspace)
         (workspace / "output").mkdir(parents=True, exist_ok=True)
         (workspace / "output" / "fresh.txt").write_text("fresh")
         agent = _cached_agent_for(workspace)
-        manager._agents[task_id] = agent
+        self._agents[task_id] = agent
         return agent
 
-    monkeypatch.setattr(manager, "_get_agent_for_task_unlocked", build)
+    # Patched on the class: patching the shared singleton's instance would
+    # leave a shadowing attribute behind and defeat later class-level patches.
+    monkeypatch.setattr(type(manager), "_get_agent_for_task_unlocked", build)
 
 
 def test_an_acquisition_arriving_mid_cleanup_waits_and_gets_a_fresh_workspace(
@@ -1019,18 +1045,18 @@ def test_an_acquisition_arriving_mid_cleanup_waits_and_gets_a_fresh_workspace(
     manager = get_agent_manager()
     removing = threading.Event()
     finish_removal = threading.Event()
-    remove_workspace = manager._cleanup_workspace_directory
+    remove_workspace = type(manager)._cleanup_workspace_directory
     built_over_leftover: list[bool] = []
 
-    def slow_removal(*args: Any, **kwargs: Any) -> None:
+    def slow_removal(self: Any, *args: Any, **kwargs: Any) -> None:
         removing.set()
         assert finish_removal.wait(10)
-        remove_workspace(*args, **kwargs)
+        remove_workspace(self, *args, **kwargs)
 
     async def record_workspace(workspace: Path) -> None:
         built_over_leftover.append(workspace.exists())
 
-    monkeypatch.setattr(manager, "_cleanup_workspace_directory", slow_removal)
+    monkeypatch.setattr(type(manager), "_cleanup_workspace_directory", slow_removal)
     _stub_acquisition(manager, monkeypatch, workspace, on_build=record_workspace)
 
     async def acquire_while_removing() -> None:
@@ -1118,3 +1144,71 @@ def test_a_cleanup_arriving_mid_acquisition_skips_and_leaves_the_runtime_alone(
         manager._agents.pop(task_id, None)
         manager._agent_run_generations.pop(task_id, None)
         manager._agent_last_active_at.pop(task_id, None)
+
+
+def test_task_deletion_keeps_its_workspace_obligation_while_a_files_cleanup_holds_the_boundary(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two cleaners on one terminal task: the skipped one must not discharge.
+
+    A files-only cleanup holds the task's runtime boundary while it removes the
+    workspace; the task is then deleted. The deletion's own ``remove_agent``
+    is skipped, which must leave its workspace obligation pending: the first
+    cleaner then fails, and nothing else would ever remove the directory. The
+    retry driver does, from the locator captured at deletion.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _, _, workspace = _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    removing = threading.Event()
+    fail_removal = threading.Event()
+
+    def hold_then_fail(self: Any, *args: Any, **kwargs: Any) -> None:
+        # Only the files-only cleaner gets here: the deletion's remove_agent is
+        # refused at the boundary before it removes anything.
+        removing.set()
+        assert fail_removal.wait(10)
+        raise OSError("input/output error")
+
+    monkeypatch.setattr(type(manager), "_cleanup_workspace_directory", hold_then_fail)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        files_cleanup = pool.submit(_delete_files, [task_id])
+        assert removing.wait(10)
+
+        deletion = client.delete(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        fail_removal.set()
+        files_report = files_cleanup.result(10)
+
+    assert deletion.status_code == 200, deletion.text
+    # The deletion did not remove anything, so it cannot report the workspace
+    # as released.
+    assert deletion.json()["workspace_cleanup_pending"] is True
+    assert files_report == TaskFileDeletionReport(cleanup_failed=(task_id,))
+    assert workspace.exists()
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.id == task_id).count() == 0
+        [owed] = list_cleanup_obligations(db)
+        assert (owed.task_id, owed.kind) == (task_id, CleanupResourceKind.WORKSPACE)
+        assert owed.status is CleanupObligationStatus.PENDING
+        # The captured locator survives, so the retry can find the workspace
+        # although the task row is gone.
+        assert owed.locator["base_dirs"]
+    finally:
+        db.close()
+
+    retry = asyncio.run(
+        run_cleanup_obligation_batch(
+            _direct_db_session, now=datetime.now(UTC) + timedelta(hours=1)
+        )
+    )
+
+    assert (retry.claimed, retry.completed) == (1, 1)
+    assert not workspace.exists()
+    db = _direct_db_session()
+    try:
+        assert list_cleanup_obligations(db) == []
+    finally:
+        db.close()

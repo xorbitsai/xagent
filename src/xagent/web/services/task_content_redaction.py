@@ -67,6 +67,9 @@ task: ``remove_agent`` holds the task's runtime boundary across its run-fence
 check, the workspace removal and the eviction of its entries, so an acquisition
 that arrives meanwhile waits and then builds a fresh runtime and workspace,
 and one already in flight makes the cleanup report ``cleanup_failed`` instead.
+A task deletion that commits while a cleanup holds the boundary gets the same
+skip from ``remove_agent`` and keeps its workspace obligation pending for the
+retry driver, since the cleanup holding the boundary may still fail.
 
 No ``content redacted`` column is added. Readers already treat every removed
 piece as a legitimate empty state (no transcript, no steps, no files, NULL

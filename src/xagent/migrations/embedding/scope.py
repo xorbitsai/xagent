@@ -50,6 +50,9 @@ SKIP_NO_METADATA = "no-metadata"
 SKIP_NO_DOC_ID = "no-doc-id"
 SKIP_NO_OWNER = "no-owner"
 SKIP_NO_TEXT = "no-text"
+# The core chunks table has the document but not this chunk: a copy would be
+# removed again by the reconcile after its write, on every run.
+SKIP_NO_CORE_CHUNK = "no-core-chunk"
 
 # A table without one of these turns rows into skips that acceptance then
 # "confirms" on both sides; that is a broken table, not an empty collection.
@@ -424,12 +427,17 @@ class SourceScan:
 
     ``pending`` counts, per document, the usable chunks the target lacks, and
     ``documents``/``usable_documents`` say which documents to settle at all.
+    ``no_core_chunk`` holds the ``(doc_id, chunk_id)`` skipped as
+    ``SKIP_NO_CORE_CHUNK``; ``unknown_liveness`` the usable documents the core
+    chunks table has no row of.
     """
 
     documents: Set[str] = field(default_factory=set)
     usable_documents: Set[str] = field(default_factory=set)
     pending: Dict[str, int] = field(default_factory=dict)
     skipped: Dict[str, int] = field(default_factory=dict)
+    no_core_chunk: Set[Tuple[str, str]] = field(default_factory=set)
+    unknown_liveness: Set[str] = field(default_factory=set)
 
     @property
     def chunks_pending(self) -> int:
@@ -441,16 +449,19 @@ def scan_source(
     model_id: str,
     *,
     have: Optional[Set[str]] = None,
+    core: Optional[Set[Tuple[str, str]]] = None,
     conn: Optional[Any] = None,
 ) -> SourceScan:
     """Read every source row once to settle what needs a per-document read.
 
     A per-document read is a filtered scan of the whole table, so deciding
     which documents need one from a single pass keeps an all-held rerun at one
-    read. Every excluded row is counted here, once.
+    read. Every excluded row is counted here, once. ``core`` is
+    :func:`core_chunk_pairs`; without it no row is checked against the core table.
     """
     conn = conn if conn is not None else connection()
     scan = SourceScan()
+    core_docs = {doc_id for doc_id, _ in core} if core is not None else set()
     table = source_table(model_id)
     if table not in table_names(conn):
         return scan
@@ -472,9 +483,15 @@ def scan_source(
         if chunk.doc_id:
             scan.documents.add(chunk.doc_id)
         reason = skip_reason(chunk)
+        key = (chunk.doc_id, chunk.chunk_id)
+        if reason is None and chunk.doc_id in core_docs and key not in core:
+            reason = SKIP_NO_CORE_CHUNK
+            scan.no_core_chunk.add(key)
         if reason:
             scan.skipped[reason] = scan.skipped.get(reason, 0) + 1
             continue
+        if core is not None and chunk.doc_id not in core_docs:
+            scan.unknown_liveness.add(chunk.doc_id)
         scan.usable_documents.add(chunk.doc_id)
         if have is not None and chunk.chunk_id not in have:
             scan.pending[chunk.doc_id] = scan.pending.get(chunk.doc_id, 0) + 1
@@ -532,8 +549,8 @@ def core_chunk_ids(
 ) -> Optional[Set[str]]:
     """The document's chunk ids in the core chunks table, or ``None`` without one.
 
-    A document delete and a retirement delete these rows before they sweep
-    embedding tables, so these — not the embeddings ledger a copy sampled
+    A document delete and a retirement sweep the embedding tables again after
+    these rows are gone, so these — not the embeddings ledger a copy sampled
     earlier — say whether a chunk was deleted while it was being encoded. An
     empty set for a document the source still has is no such evidence: the
     document may never have been written here at all (see
@@ -611,7 +628,6 @@ def target_chunk_ids(
     *,
     conn: Optional[Any] = None,
     dimension: Optional[int] = None,
-    rows_out: Optional[List[Dict[str, Any]]] = None,
 ) -> Set[str]:
     """The chunk_ids the target model already holds *with a usable vector*.
 
@@ -619,8 +635,7 @@ def target_chunk_ids(
     read failure: the migration creates the table on its first write. A row
     counts only when its ``model`` column names the target and its vector is
     finite, non-zero and the right dimension; anything else is not held, so a
-    rerun repairs it. ``rows_out`` collects the rows this model wrote, with
-    their table, so a sweep can reuse this scan.
+    rerun repairs it.
     """
     from xagent.migrations.embedding.embed import _validate_vector
 
@@ -628,8 +643,6 @@ def target_chunk_ids(
     names = table_names(conn)
     held: Set[str] = set()
     columns = ["chunk_id", "vector", "model"]
-    if rows_out is not None:
-        columns += ["doc_id", "user_id", "text"]
     for table in readable_tables(model_id):
         if table not in names:
             continue
@@ -637,8 +650,6 @@ def target_chunk_ids(
             chunk_id = str(row.get("chunk_id") or "")
             if not chunk_id or not written_by(row, model_id):
                 continue
-            if rows_out is not None:
-                rows_out.append({**row, "table": table})
             try:
                 _validate_vector(row.get("vector"), dimension)
                 dimension = len(row["vector"])

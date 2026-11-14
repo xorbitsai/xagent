@@ -254,27 +254,24 @@ def embed_collection(
         logger.warning("%s: skipped (%s)", name, SKIP_TARGET_IS_SOURCE)
         return report
 
-    target_rows: List[Dict[str, Any]] = []
     have = target_chunk_ids(
-        name,
-        model_id,
-        conn=conn,
-        dimension=embedding_config.dimension,
-        rows_out=None if dry_run else target_rows,
+        name, model_id, conn=conn, dimension=embedding_config.dimension
     )
-    scan = scan_source(name, report.source_model_id, have=have, conn=conn)
+    scan = scan_source(
+        name,
+        report.source_model_id,
+        have=have,
+        core=core_chunk_pairs(name, conn=conn),
+        conn=conn,
+    )
     report.skipped.update(scan.skipped)
     report.documents_total = len(scan.documents)
     report.chunks_pending = scan.chunks_pending
-    if not dry_run and target_rows:
+    if not dry_run:
         # A run that died partway leaves target rows no core chunk backs, and
         # nothing else ever visits those documents again.
         report.chunks_removed += _sweep_target(
-            name,
-            model_id,
-            report.source_model_id,
-            conn=conn,
-            rows=target_rows,
+            name, model_id, report.source_model_id, conn=conn
         )
     consecutive_failures = 0
     # (doc_id, chunk_id) only: the text is not kept after its write.
@@ -285,6 +282,8 @@ def embed_collection(
         for doc_id in sorted(scan.usable_documents):
             if doc_id not in scan.pending:
                 report.documents_unchanged += 1
+                if not dry_run and doc_id in scan.unknown_liveness:
+                    report.failures.append(_unknown_liveness_failure(doc_id))
                 continue
             if dry_run:
                 report.documents_embedded += 1
@@ -294,7 +293,9 @@ def embed_collection(
                 for chunk in iter_source_chunks(
                     name, report.source_model_id, conn=conn, doc_id=doc_id
                 )
-                if skip_reason(chunk) is None and chunk.chunk_id not in have
+                if skip_reason(chunk) is None
+                and chunk.chunk_id not in have
+                and (chunk.doc_id, chunk.chunk_id) not in scan.no_core_chunk
             ]
             if not items:
                 continue
@@ -330,10 +331,15 @@ def embed_collection(
                     report=report,
                 )
             except Exception as exc:  # noqa: BLE001 - continue with the next document
-                consecutive_failures += 1
                 report.failures.append(
                     DocumentFailure(doc_id, f"{type(exc).__name__}: {exc}")
                 )
+                if isinstance(exc, UnknownLiveness):
+                    # The provider and the write worked; this says nothing
+                    # about the rest of the run.
+                    logger.error("%s/%s: %s", name, doc_id, exc)
+                    continue
+                consecutive_failures += 1
                 logger.error(
                     "%s/%s: embedding failed: %s", name, doc_id, exc, exc_info=True
                 )
@@ -367,8 +373,8 @@ def embed_collection(
         return report
     finally:
         if not dry_run:
-            # Runs on the way out of any failure, Ctrl-C included: no target
-            # row survives the run whose core chunk rows are gone.
+            # Runs on the way out of any failure, Ctrl-C included. Rows of a
+            # document of unknown liveness are kept; every other orphan goes.
             try:
                 report.chunks_removed += _sweep_target(
                     name,
@@ -386,7 +392,20 @@ def embed_collection(
 
 
 class UnknownLiveness(RuntimeError):
-    """The core chunks table never had this document, so a delete cannot be told apart."""
+    """The core chunks table has no row of this document now, the source does.
+
+    A delete that took the core rows and a document never chunked here look the
+    same, so the target rows are neither counted as live nor removed.
+    """
+
+
+def _unknown_liveness_failure(doc_id: str) -> DocumentFailure:
+    exc = UnknownLiveness(_unknown_liveness_message(doc_id))
+    return DocumentFailure(doc_id, f"{type(exc).__name__}: {exc}")
+
+
+def _unknown_liveness_message(doc_id: str) -> str:
+    return f"core chunks hold no row of {doc_id} while the source still has it"
 
 
 def _live_chunk_ids(
@@ -439,9 +458,7 @@ def _reconcile_document(
     if table not in table_names(conn):
         return set()
     if live is None:
-        raise UnknownLiveness(
-            f"core chunks hold no row of {doc_id} while the source still has it"
-        )
+        raise UnknownLiveness(_unknown_liveness_message(doc_id))
     where = f"{collection_filter(name)} AND doc_id = '{escape_lancedb_string(doc_id)}'"
     stale = {
         str(row.get("chunk_id") or "")
@@ -471,47 +488,41 @@ def _sweep_target(
     source_model_id: str,
     *,
     conn: Any,
-    rows: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
     """Delete every target row of this collection no core chunk backs.
 
-    ``rows`` are the target rows a caller already read (``target_chunk_ids``
-    collects them); without it the target's writer table is scanned. A
-    document the core table has no row of is skipped while the source still has
-    it: its liveness is unknown, and removing rows there would make a store
-    that never kept chunk rows lose its vectors.
+    Only the ``(doc_id, chunk_id)`` of rows this model wrote are kept, never the
+    vectors or texts: the scan covers a whole collection. A document the core
+    table has no row of is skipped while the source still has it: its liveness
+    is unknown, and removing rows there would make a store that never kept
+    chunk rows lose its vectors.
     """
     writer = source_table(model_id)
-    if rows is None:
-        if writer not in table_names(conn):
-            return 0
-        rows = [
-            {**row, "table": writer}
-            for row in iter_rows(
-                conn,
-                writer,
-                collection_filter(name),
-                ["doc_id", "chunk_id", "model", "user_id", "text"],
-            )
-        ]
+    if writer not in table_names(conn):
+        return 0
+    # Read before the core rows: a row written after this read is not judged
+    # against a core snapshot older than it.
+    written = [
+        (str(row.get("doc_id") or ""), str(row.get("chunk_id") or ""))
+        for row in iter_rows(
+            conn,
+            writer,
+            collection_filter(name),
+            ["doc_id", "chunk_id", "model", "user_id", "text"],
+        )
+        if row.get("doc_id")
+        and row.get("chunk_id")
+        and written_by(row, model_id)
+        and row.get("user_id") is not None
+        and row.get("text")
+    ]
     pairs = core_chunk_pairs(name, conn=conn)
     if pairs is None:
         return 0
     core_docs = {doc_id for doc_id, _ in pairs}
     source_docs = source_doc_ids(name, source_model_id, conn=conn)
     stale: Dict[str, List[str]] = {}
-    for row in rows:
-        chunk_id = str(row.get("chunk_id") or "")
-        doc_id = str(row.get("doc_id") or "")
-        if (
-            row.get("table") != writer
-            or not doc_id
-            or not chunk_id
-            or not written_by(row, model_id)
-            or row.get("user_id") is None
-            or not row.get("text")
-        ):
-            continue
+    for doc_id, chunk_id in written:
         if (doc_id, chunk_id) in pairs:
             continue
         if doc_id not in core_docs and doc_id in source_docs:
@@ -701,7 +712,7 @@ def _verify_written(
 
     A chunk the core table no longer has is not a dropped one: a delete that
     landed after the copy took it from both sides. A document the core table
-    never had cannot be judged at all, so it is left out.
+    has no row of cannot be judged at all, so it is left out.
     """
     if not written:
         return

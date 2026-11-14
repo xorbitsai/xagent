@@ -1588,25 +1588,72 @@ def test_a_rerun_removes_the_rows_of_a_document_that_is_gone() -> None:
     assert remaining == {"c2"}
 
 
-def test_a_document_the_core_table_never_had_is_reported_not_emptied() -> None:
+def test_a_document_the_core_table_has_no_row_of_is_reported_on_every_run() -> None:
     _save_collection()
     _core([{"collection": "kb", "doc_id": "other", "chunk_id": "x", "user_id": 7}])
-    _source([_row("c1"), _row("c2")])
-    adapter = _Adapter()
+    # One more than the abort limit: these are not provider failures.
+    docs = [f"d{i}" for i in range(mod.MAX_CONSECUTIVE_DOCUMENT_FAILURES + 1)]
+    _source([_row(f"c{i}", doc_id=doc_id) for i, doc_id in enumerate(docs)])
 
-    report = _run(adapter)
+    report = _run()
 
-    assert [failure.doc_id for failure in report.failures] == ["d1"]
-    assert "UnknownLiveness" in report.failures[0].error
+    assert not report.aborted
+    assert [failure.doc_id for failure in report.failures] == docs
+    assert all("UnknownLiveness" in failure.error for failure in report.failures)
     assert report.chunks_embedded == 0
     # Kept: a store that never had the chunk rows must not lose its vectors.
     assert {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))} == {
-        "c1",
-        "c2",
+        f"c{i}" for i in range(len(docs))
     }
 
     rerun = _Adapter()
     second = _run(rerun)
 
     assert rerun.calls == []
-    assert second.failures == []
+    assert [failure.doc_id for failure in second.failures] == docs
+    assert all("UnknownLiveness" in failure.error for failure in second.failures)
+
+
+def test_a_source_row_whose_chunk_the_core_table_lacks_is_never_encoded() -> None:
+    _save_collection()
+    _core([{"collection": "kb", "doc_id": "d1", "chunk_id": "c1", "user_id": 7}])
+    _source([_row("c1"), _row("c2")])
+    adapters = [_Adapter(), _Adapter(), _Adapter()]
+
+    reports = [_run(adapter) for adapter in adapters]
+
+    assert adapters[0].calls == [["text c1"]]
+    assert adapters[1].calls == [] and adapters[2].calls == []
+    assert [report.chunks_pending for report in reports] == [1, 0, 0]
+    for report in reports:
+        assert report.failures == []
+        assert report.skipped == {scope.SKIP_NO_CORE_CHUNK: 1}
+    assert {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))} == {
+        "c1"
+    }
+
+
+def test_the_sweep_scan_reads_no_vectors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _save_collection()
+    _seed_target(["c1"])
+    _core([{"collection": "kb", "doc_id": "d2", "chunk_id": "c2", "user_id": 7}])
+    _source([_row("c2", doc_id="d2")])
+    target = scope.source_table(TARGET.id)
+    real = scope.iter_rows
+    reads: List[List[str]] = []
+
+    def _spy(conn: Any, table: str, where: str, cols: Any, **kwargs: Any) -> Any:
+        if table == target:
+            reads.append(list(cols))
+        return real(conn, table, where, cols, **kwargs)
+
+    monkeypatch.setattr(mod, "iter_rows", _spy)
+    monkeypatch.setattr(scope, "iter_rows", _spy)
+
+    report = _run()
+
+    assert report.chunks_removed == 1
+    sweeps = [cols for cols in reads if "doc_id" in cols and "model" in cols]
+    assert sweeps and all("vector" not in cols for cols in sweeps)
+    # The held-vector check reads vectors, and nothing a sweep would keep.
+    assert all("text" not in cols for cols in reads if "vector" in cols)

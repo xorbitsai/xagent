@@ -136,21 +136,17 @@ export function writeIdleSessionRecord(storage: Storage, sessionId: string, poli
 
 /**
  * Responses for one login can arrive out of order (a verify sent before an
- * activity report may land after it). Ordering uses the server's clock, never
- * the browser's; without a server time the newest arrival wins.
- *
- * Under the same threshold, a response the server produced earlier than the
- * stored one carries nothing newer: the deadline only moves forward, and
- * `idle_expires_in` is truncated to whole seconds, so its reconstructed
- * deadline can even look later. It is ignored. Under a different threshold
- * (a rolling change), an earlier response is ignored only if it implies an
- * earlier deadline.
+ * activity report may land after it). For the same login and switch state, a
+ * response the server produced earlier than the stored one carries nothing
+ * newer and is ignored: the deadline only moves forward, `idle_expires_in` is
+ * truncated to whole seconds (so an older deadline can even look later), and
+ * a stricter threshold from a rolling change always comes with a newer
+ * server time. Ordering uses the server's clock, never the browser's; without
+ * a server time the newest arrival wins.
  */
 function isOutOfOrder(previous: IdleSessionRecord, policy: IdleSessionPolicy): boolean {
   if (previous.sid !== policy.sid || previous.enforced !== policy.enforced) return false
-  if (previous.serverTime === null || policy.serverTime === null || policy.serverTime >= previous.serverTime) return false
-  if (previous.idleTimeoutSeconds === policy.idleTimeoutSeconds) return true
-  return policy.serverTime + policy.idleExpiresIn * 1000 < previous.serverTime + previous.idleExpiresIn * 1000
+  return previous.serverTime !== null && policy.serverTime !== null && policy.serverTime < previous.serverTime
 }
 
 export function markIdleActivityReported(storage: Storage, sessionId: string, now = Date.now()): void {

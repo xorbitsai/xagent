@@ -90,6 +90,20 @@ afterEach(() => {
 })
 
 describe("AuthProvider idle policy from verify", () => {
+  it("checks again after the clock moves backwards, instead of trusting a recent check", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    vi.mocked(apiRequest).mockImplementation(async url =>
+      String(url).endsWith("/api/auth/verify") ? json({ success: true }) : new Response(null, { status: 404 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    fireEvent.click(screen.getByRole("button", { name: "Check" }))
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+    vi.setSystemTime(Date.now() - 10 * 60_000)
+    fireEvent.click(screen.getByRole("button", { name: "Check" }))
+    await waitFor(() => expect(verifyCalls()).toHaveLength(2))
+  })
+
   it("records the idle_session returned by a session check", async () => {
     writeAuthCache()
     vi.mocked(apiRequest).mockImplementation(async url =>

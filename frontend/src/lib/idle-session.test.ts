@@ -159,6 +159,13 @@ describe("idle session state bound to one login", () => {
     expect(readCurrentIdleSession()).toBeNull()
   })
 
+  it("keeps a newer stricter observation when an older, looser response arrives late", async () => {
+    // A rolling change tightened the threshold; a verify produced before it arrives afterwards.
+    const snapshot = await login({ idle_session: idle({ idle_timeout_seconds: 900, idle_expires_in: 890, server_time: "2026-11-13T10:00:10Z" }) })
+    const older = idle({ idle_timeout_seconds: 1800, idle_expires_in: 1795, server_time: "2026-11-13T10:00:05Z" })
+    expect((await recordIdleSessionIfCurrent(snapshot, { idle_session: older }))?.idleTimeoutSeconds).toBe(900)
+  })
+
   it("keeps the newer observation when an older response rounds to the same deadline", async () => {
     // Both describe a 10:02:00 deadline: idle_expires_in is truncated, server_time is not.
     const snapshot = await login({ idle_session: idle({ idle_expires_in: 109, server_time: "2026-11-13T10:00:10.100Z" }) })

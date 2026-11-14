@@ -170,7 +170,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     const key = `${before.snapshot.sessionId}:${before.snapshot.credentialRevision}`
     const now = Date.now()
-    if (lastCheck.key === key && now - lastCheck.at < 15_000) return true
+    // A negative gap means the clock moved backwards; the earlier check no longer counts.
+    if (lastCheck.key === key && now - lastCheck.at >= 0 && now - lastCheck.at < 15_000) return true
     const operation = ++operationRef.current
     try {
       const response = await apiRequest(`${getApiUrl()}/api/auth/verify`, { headers: { "X-Username": before.cache.user.username } })

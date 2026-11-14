@@ -89,6 +89,11 @@ def _system_text(call: dict[str, Any]) -> str:
     )
 
 
+def _prompt_text(call: dict[str, Any]) -> str:
+    # System message plus the turn context, which carries the tool inventory.
+    return "\n".join(str(m.get("content")) for m in call["messages"])
+
+
 def _tools() -> list[Any]:
     return [
         PlainTool("get_current_time"),
@@ -134,8 +139,10 @@ async def test_on_withholds_connector_schemas_and_lists_an_index() -> None:
         "hubspot_create_note",
         "notion_search",
     } & set(names)
-    system = _system_text(llm.calls[0])
+    system = _prompt_text(llm.calls[0])
     assert "are deferred" in system and system.count("notion_search") == 1
+    # The inventory varies per sender, so it is not in the system message.
+    assert "notion_search" not in _system_text(llm.calls[0])
     for name in ("hubspot_search_contacts", "hubspot_create_note", "notion_search"):
         assert name in system
 
@@ -294,7 +301,7 @@ async def test_index_lists_every_connector_tool_including_failing_ones() -> None
     llm = ScriptedLLM([{"content": "hi"}])
     await _pattern().run(context=_ctx(), tools=tools, llm=llm)
 
-    assert "xero_list_invoices" in _system_text(llm.calls[0])
+    assert "xero_list_invoices" in _prompt_text(llm.calls[0])
     assert "xero_list_invoices" not in _names(llm.calls[0])
 
 
@@ -816,7 +823,7 @@ async def test_the_prompt_allows_preloaded_connector_tools() -> None:
     llm = ScriptedLLM([{"content": "hi"}])
     await _pattern().run(context=_ctx("look in HubSpot"), tools=_tools(), llm=llm)
 
-    assert "whether preloaded or loaded" in _system_text(llm.calls[0])
+    assert "whether preloaded or loaded" in _prompt_text(llm.calls[0])
 
 
 @pytest.mark.asyncio

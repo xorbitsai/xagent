@@ -645,7 +645,7 @@ def test_every_module_in_the_migration_package_imports() -> None:
         importlib.import_module(f"xagent.migrations.embedding.{name}")
 
 
-# --- source and target must not be the same physical table ---
+# --- source and target must not share a physical table ---
 
 
 def test_a_target_that_writes_the_source_table_is_refused(
@@ -667,11 +667,16 @@ def test_a_target_that_writes_the_source_table_is_refused(
     )
     _wire(monkeypatch, conn)
 
-    with pytest.raises(mod.MigrationCliError, match="both write"):
-        mod.scope_collection("kb", target=("old_model", 2))
+    assert (
+        mod.source_eligibility("kb", target_model_id="old_model").reason
+        == mod.SKIP_SHARED_TABLE
+    )
+    item = mod.scope_collection("kb", target=("old_model", 2))
+    assert item.skip_reason == mod.SKIP_SHARED_TABLE
+    assert item.chunks == 0
 
 
-def test_the_same_table_refusal_happens_before_anything_is_counted(
+def test_the_refusal_happens_before_anything_is_counted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conn = _Conn(
@@ -686,7 +691,132 @@ def test_the_same_table_refusal_happens_before_anything_is_counted(
 
     report = mod.scope_report(target_model_id="old_model")
 
-    assert [item.error for item in report] == [report[0].error] and "both write" in (
-        report[0].error or ""
-    )
+    assert [item.error for item in report] == [None]
+    assert report[0].skip_reason == mod.SKIP_SHARED_TABLE
     assert report[0].chunks == 0
+
+
+def test_a_target_that_aliases_a_source_fallback_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A distinct, supported id whose writer is exactly the source's
+    # provider-name fallback: the first copy would land in a table the source's
+    # own eligibility then counts as a second one, so every rerun would skip.
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound("old-config", 2)]),
+            mod.source_table("old-config"): _Table([_row("c1")]),
+        }
+    )
+    _wire(monkeypatch, conn)
+    monkeypatch.setattr(
+        mod,
+        "_legacy_spelling",
+        lambda model_id: (
+            "embeddings_text_embedding_3_small" if model_id == "old-config" else None
+        ),
+    )
+    target = "text-embedding-3-small"
+    assert mod.source_table(target) == "embeddings_text_embedding_3_small"
+
+    assert (
+        mod.source_eligibility("kb", target_model_id=target).reason
+        == mod.SKIP_SHARED_TABLE
+    )
+
+
+def test_a_target_whose_other_table_holds_the_collection_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound()]),
+            _writer(): _Table([_row("c1")]),
+            "embeddings_new_legacy": _Table([_row("c9")]),
+        }
+    )
+    _wire(monkeypatch, conn)
+    monkeypatch.setattr(
+        mod,
+        "_legacy_spelling",
+        lambda model_id: ("embeddings_new_legacy" if model_id == "new-model" else None),
+    )
+
+    assert (
+        mod.source_eligibility("kb", target_model_id="new-model").reason
+        == mod.SKIP_TARGET_ROWS_IN_OTHER_TABLE
+    )
+
+
+def test_a_target_whose_other_table_holds_another_collection_is_fine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound()]),
+            _writer(): _Table([_row("c1")]),
+            "embeddings_new_legacy": _Table([_row("c9", collection="other")]),
+        }
+    )
+    _wire(monkeypatch, conn)
+    monkeypatch.setattr(
+        mod,
+        "_legacy_spelling",
+        lambda model_id: ("embeddings_new_legacy" if model_id == "new-model" else None),
+    )
+
+    assert mod.source_eligibility("kb", target_model_id="new-model").reason is None
+
+
+def test_an_empty_collection_switches_even_with_an_absent_source_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn({mod.METADATA_TABLE: _metadata([_bound()])})
+    _wire(monkeypatch, conn)
+
+    eligibility = mod.source_eligibility("kb", target_model_id="new-model")
+
+    assert eligibility.reason is None
+    assert mod.scope_collection("kb", target=("new-model", 2)).missing_chunks == 0
+
+
+# --- one source pass before the per-document reads ---
+
+
+def test_the_scan_settles_pending_per_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn(
+        {
+            mod.METADATA_TABLE: _metadata([_bound()]),
+            _writer(): _Table(
+                [
+                    _row("c1", doc_id="d1"),
+                    _row("c2", doc_id="d2"),
+                    _row("c3", doc_id="d1"),
+                    _row("c4", doc_id=None),
+                    _row("c5", doc_id="d3", user_id=None),
+                ]
+            ),
+        }
+    )
+    _wire(monkeypatch, conn)
+
+    scan = mod.scan_source("kb", "BAAI/old-model", have={"c2"})
+
+    assert scan.documents == {"d1", "d2", "d3"}
+    assert scan.usable_documents == {"d1", "d2"}
+    assert scan.pending == {"d1": 2}
+    assert scan.chunks_pending == 2
+    assert scan.skipped == {mod.SKIP_NO_DOC_ID: 1, mod.SKIP_NO_OWNER: 1}
+
+
+def test_a_missing_source_table_scans_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = _Conn({mod.METADATA_TABLE: _metadata([_bound()])})
+    _wire(monkeypatch, conn)
+
+    scan = mod.scan_source("kb", "BAAI/old-model", have=set())
+
+    assert (scan.documents, scan.chunks_pending) == (set(), 0)

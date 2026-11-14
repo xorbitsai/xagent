@@ -41,6 +41,9 @@ SKIP_BOUND_WITHOUT_DIMENSION = "bound-without-dimension"
 SKIP_ROWS_IN_OTHER_TABLE = "rows-in-another-table"
 SKIP_ROWS_IN_MULTIPLE_TABLES = "rows-in-multiple-tables"
 SKIP_MISSING_COLUMN = "missing-required-column"
+SKIP_SHARED_TABLE = "shared-source-target-table"
+SKIP_TARGET_ROWS_IN_OTHER_TABLE = "target-rows-in-another-table"
+SKIP_TARGET_IS_SOURCE = "target-is-source"
 SKIP_NO_METADATA = "no-metadata"
 # Why a source row is not copied.
 SKIP_NO_DOC_ID = "no-doc-id"
@@ -284,15 +287,24 @@ def require_columns(conn: Any, table: str, collection: str) -> None:
         )
 
 
-def source_eligibility(collection: str, *, conn: Optional[Any] = None) -> Eligibility:
+def source_eligibility(
+    collection: str,
+    *,
+    conn: Optional[Any] = None,
+    target_model_id: Optional[str] = None,
+) -> Eligibility:
     """Whether ``collection`` can be migrated, and the one table it lives in.
 
     The only eligible shape is the one the write path produces: an explicit
     binding with a dimension, and the collection's rows in that binding's
-    writer-spelled table and in none of the other spellings search may read. Anything else is refused with a
-    reason: copying it would either lose rows or write a table search does not
-    read. Read failures raise (see :func:`collection_info`) instead of being
-    reported as skips.
+    writer-spelled table and in none of the other tables search may open for
+    either model. With a target, its writer table must not be one of the
+    source's tables (a distinct id can alias a source fallback), and none of
+    the target's other tables may hold rows of this collection: search would
+    serve those after the flip, and the migration never copied them. Anything
+    else is refused with a reason, because copying it would either lose rows or
+    write a table search does not read. Read failures raise (see
+    :func:`collection_info`) instead of being reported as skips.
     """
     from xagent.core.tools.core.RAG_tools.management.collection_manager import (
         _normalize_model_id,
@@ -315,15 +327,33 @@ def source_eligibility(collection: str, *, conn: Optional[Any] = None) -> Eligib
             model_id=model, engine=engine, reason=SKIP_BOUND_WITHOUT_DIMENSION
         )
     table = source_table(model)
+    spellings = source_spellings(model)
     names = table_names(conn)
-    holders = [
-        name
-        for name in source_spellings(model)
-        if name in names and _holds_rows(conn, name, collection)
-    ]
     eligible = Eligibility(
         model_id=model, dimension=dimension, table=table, engine=engine
     )
+    if target_model_id and target_model_id != model:
+        target_table = source_table(target_model_id)
+        target_spellings = source_spellings(target_model_id)
+        if set(spellings) & set(target_spellings):
+            # Not only identical writer spellings: a target id can be the
+            # source's provider-name fallback, and the copy would land in a
+            # table the source's own eligibility then counts as a second one.
+            return Eligibility(engine=engine, reason=SKIP_SHARED_TABLE)
+        elsewhere = [
+            name
+            for name in target_spellings
+            if name != target_table
+            and name in names
+            and _holds_rows(conn, name, collection)
+        ]
+        if elsewhere:
+            return Eligibility(engine=engine, reason=SKIP_TARGET_ROWS_IN_OTHER_TABLE)
+    holders = [
+        name
+        for name in spellings
+        if name in names and _holds_rows(conn, name, collection)
+    ]
     if table not in holders:
         # No rows yet, or rows search reaches only through another table.
         if holders:
@@ -339,52 +369,67 @@ def source_eligibility(collection: str, *, conn: Optional[Any] = None) -> Eligib
     return eligible
 
 
-def preflight_source_target(source_model_id: str, target_model_id: str) -> None:
-    """Refuse a migration whose source and target are the same physical table.
+@dataclass
+class SourceScan:
+    """One pass over a collection's source rows, before any per-document read.
 
-    Distinct ids can map to one writer spelling (``old-model`` and
-    ``old_model``): the target's rows would then be the source's, every chunk
-    would count as already held, and a write would overwrite the still-bound
-    source.
+    ``pending`` counts, per document, the usable chunks the target lacks, and
+    ``documents``/``usable_documents`` say which documents to settle at all.
     """
-    source = source_table(source_model_id)
-    target = source_table(target_model_id)
-    if source == target:
-        raise MigrationCliError(
-            f"source model '{source_model_id}' and target model '{target_model_id}' "
-            f"both write '{source}'; a migration from a table into itself "
-            "cannot be told apart from a finished copy."
-        )
+
+    documents: Set[str] = field(default_factory=set)
+    usable_documents: Set[str] = field(default_factory=set)
+    pending: Dict[str, int] = field(default_factory=dict)
+    skipped: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def chunks_pending(self) -> int:
+        return sum(self.pending.values())
 
 
-def iter_source_doc_ids(
-    collection: str, model_id: str, *, conn: Optional[Any] = None
-) -> Tuple[List[str], int]:
-    """The collection's document ids and the count of rows without one.
+def scan_source(
+    collection: str,
+    model_id: str,
+    *,
+    have: Optional[Set[str]] = None,
+    conn: Optional[Any] = None,
+) -> SourceScan:
+    """Read every source row once to settle what needs a per-document read.
 
-    Chunk rows are not ordered by document, so a document is only complete
-    when read on its own; this lists what to read.
+    A per-document read is a filtered scan of the whole table, so deciding
+    which documents need one from a single pass keeps an all-held rerun at one
+    read. Every excluded row is counted here, once.
     """
     conn = conn if conn is not None else connection()
+    scan = SourceScan()
     table = source_table(model_id)
     if table not in table_names(conn):
-        return [], 0
-    ids: Set[str] = set()
-    unaddressable = 0
+        return scan
     for row in iter_rows(
         conn,
         table,
         collection_filter(collection),
-        ["doc_id", "chunk_id"],
+        ["doc_id", "chunk_id", "user_id", "text"],
     ):
-        # A chunkless row is counted when its document is read; counting it
-        # here too would count it twice.
-        doc_id = str(row.get("doc_id") or "").strip()
-        if not doc_id:
-            unaddressable += 1
+        chunk = SearchableChunk(
+            doc_id=str(row.get("doc_id") or "").strip(),
+            chunk_id=str(row.get("chunk_id") or "").strip(),
+            parse_hash="",
+            text=str(row.get("text") or ""),
+            chunk_hash="",
+            metadata=None,
+            user_id=_owner(row.get("user_id")),
+        )
+        if chunk.doc_id:
+            scan.documents.add(chunk.doc_id)
+        reason = skip_reason(chunk)
+        if reason:
+            scan.skipped[reason] = scan.skipped.get(reason, 0) + 1
             continue
-        ids.add(doc_id)
-    return sorted(ids), unaddressable
+        scan.usable_documents.add(chunk.doc_id)
+        if have is not None and chunk.chunk_id not in have:
+            scan.pending[chunk.doc_id] = scan.pending.get(chunk.doc_id, 0) + 1
+    return scan
 
 
 def iter_source_chunks(
@@ -575,7 +620,7 @@ def scope_collection(
         target = resolve_target(target_model_id)
     target_model_id, target_dimension = target if target else (None, None)
     conn = conn if conn is not None else connection()
-    eligibility = source_eligibility(name, conn=conn)
+    eligibility = source_eligibility(name, conn=conn, target_model_id=target_model_id)
     item = CollectionScope(name=name, engine=eligibility.engine)
     if eligibility.reason:
         item.skip_reason = eligibility.reason
@@ -583,7 +628,6 @@ def scope_collection(
     item.source_model_id = eligibility.model_id
     have: Set[str] = set()
     if target_model_id:
-        preflight_source_target(item.source_model_id, target_model_id)
         have = target_chunk_ids(
             name, target_model_id, conn=conn, dimension=target_dimension
         )

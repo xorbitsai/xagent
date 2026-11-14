@@ -19,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.model.model import EmbeddingModelConfig
@@ -32,15 +32,16 @@ from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
     write_vectors_to_db,
 )
 from xagent.migrations.embedding.scope import (
-    SKIP_NO_DOC_ID,
+    SKIP_TARGET_IS_SOURCE,
     MigrationCliError,
     SearchableChunk,
     add_scope_args,
+    collection_filter,
     connection,
+    iter_rows,
     iter_source_chunks,
-    iter_source_doc_ids,
-    preflight_source_target,
     resolve_collection_names,
+    scan_source,
     skip_reason,
     source_eligibility,
     source_table,
@@ -116,6 +117,7 @@ class CollectionReport:
     documents_unchanged: int = 0
     chunks_pending: int = 0
     chunks_embedded: int = 0
+    chunks_removed: int = 0
     skipped: Dict[str, int] = field(default_factory=dict)
     failures: List[DocumentFailure] = field(default_factory=list)
     aborted: bool = False
@@ -234,60 +236,63 @@ def embed_collection(
     """Copy one collection's searchable chunks the target model lacks."""
     conn = conn if conn is not None else connection()
     report = CollectionReport(name=name)
-    eligibility = source_eligibility(name, conn=conn)
+    eligibility = source_eligibility(name, conn=conn, target_model_id=model_id)
     report.engine = eligibility.engine
     if eligibility.reason:
         report.collection_skip = eligibility.reason
         logger.warning("%s: skipped (%s)", name, eligibility.reason)
         return report
     report.source_model_id = eligibility.model_id
-    preflight_source_target(report.source_model_id, model_id)
+    if model_id == report.source_model_id:
+        # The copy would be its own source and every chunk would count as held.
+        report.collection_skip = SKIP_TARGET_IS_SOURCE
+        logger.warning("%s: skipped (%s)", name, SKIP_TARGET_IS_SOURCE)
+        return report
 
     have = target_chunk_ids(
         name, model_id, conn=conn, dimension=embedding_config.dimension
     )
-    doc_ids, unaddressable = iter_source_doc_ids(
-        name, report.source_model_id, conn=conn
-    )
-    if unaddressable:
-        report.skipped[SKIP_NO_DOC_ID] = (
-            report.skipped.get(SKIP_NO_DOC_ID, 0) + unaddressable
-        )
+    scan = scan_source(name, report.source_model_id, have=have, conn=conn)
+    report.skipped.update(scan.skipped)
+    report.documents_total = len(scan.documents)
+    report.chunks_pending = scan.chunks_pending
     consecutive_failures = 0
     # (doc_id, chunk_id) only: the text is not kept after its write.
     written: List[Tuple[str, str]] = []
     # One document at a time: its rows are not contiguous in the table, so a
     # window of documents would split its counts and failures across windows.
-    for doc_id in doc_ids:
+    for doc_id in sorted(scan.usable_documents):
+        if doc_id not in scan.pending:
+            report.documents_unchanged += 1
+            continue
+        if dry_run:
+            report.documents_embedded += 1
+            continue
         items = [
             chunk
             for chunk in iter_source_chunks(
                 name, report.source_model_id, conn=conn, doc_id=doc_id
             )
-            if _count_skip(chunk, report.skipped)
+            if skip_reason(chunk) is None and chunk.chunk_id not in have
         ]
-        report.documents_total += 1
         if not items:
-            continue
-        missing = [chunk for chunk in items if chunk.chunk_id not in have]
-        report.chunks_pending += len(missing)
-        if dry_run:
-            if missing:
-                report.documents_embedded += 1
-            else:
-                report.documents_unchanged += 1
-            continue
-        if not missing:
-            report.documents_unchanged += 1
             continue
         try:
             _write_chunks(
                 name,
-                missing,
+                items,
                 model_id=model_id,
                 embedding_config=embedding_config,
                 embedding_adapter=embedding_adapter,
                 cfg=cfg,
+            )
+            removed = _reconcile_document(
+                name,
+                doc_id,
+                source_model_id=report.source_model_id,
+                model_id=model_id,
+                conn=conn,
+                report=report,
             )
         except Exception as exc:  # noqa: BLE001 - continue with the next document
             consecutive_failures += 1
@@ -307,9 +312,13 @@ def embed_collection(
                 return report
             continue
         consecutive_failures = 0
-        written.extend((chunk.doc_id, chunk.chunk_id) for chunk in missing)
+        written.extend(
+            (chunk.doc_id, chunk.chunk_id)
+            for chunk in items
+            if chunk.chunk_id not in removed
+        )
         report.documents_embedded += 1
-        report.chunks_embedded += len(missing)
+        report.chunks_embedded += len(items)
 
     if dry_run:
         return report
@@ -320,26 +329,77 @@ def embed_collection(
         report,
         conn=conn,
         dimension=embedding_config.dimension,
+        source_model_id=report.source_model_id,
     )
     _ensure_indexes(name, model_id, report, conn=conn)
     return report
 
 
-def _count_skip(chunk: SearchableChunk, skipped: Dict[str, int]) -> bool:
-    """Count this row as skipped when it must be, and say whether it is usable."""
-    reason = skip_reason(chunk)
-    if reason:
-        skipped[reason] = skipped.get(reason, 0) + 1
-        return False
-    return True
+def _reconcile_document(
+    name: str,
+    doc_id: str,
+    *,
+    source_model_id: str,
+    model_id: str,
+    conn: Any,
+    report: CollectionReport,
+) -> Set[str]:
+    """Delete the target rows this document no longer has in the source.
+
+    The rows just written were read before provider work, so a delete or a
+    retirement that landed meanwhile must not survive here. The source is read
+    again after the write; a delete that commits after this pass clears every
+    model table itself, the target included. Returns the chunk ids removed, so
+    the caller does not count them as lost.
+    """
+    from xagent.core.tools.core.RAG_tools.utils.string_utils import (
+        escape_lancedb_string,
+    )
+
+    live = {
+        chunk.chunk_id
+        for chunk in iter_source_chunks(name, source_model_id, conn=conn, doc_id=doc_id)
+        if chunk.chunk_id
+    }
+    table = source_table(model_id)
+    if table not in table_names(conn):
+        return set()
+    where = f"{collection_filter(name)} AND doc_id = '{escape_lancedb_string(doc_id)}'"
+    stale = {
+        str(row.get("chunk_id") or "")
+        for row in iter_rows(conn, table, where, ["chunk_id", "user_id", "text"])
+        if row.get("chunk_id")
+        and str(row.get("chunk_id")) not in live
+        # The same rows acceptance excludes: never written by the copy, so
+        # deleting them would lose data no one measured.
+        and row.get("user_id") is not None
+        and row.get("text")
+    }
+    if not stale:
+        return set()
+    deleted = _vector_store().delete_embedding_records(
+        name, doc_id, chunk_ids=sorted(stale), model_tag=model_id, is_admin=True
+    )
+    report.chunks_removed += deleted or len(stale)
+    logger.warning(
+        "%s/%s: removed %d target rows the source no longer has",
+        name,
+        doc_id,
+        len(stale),
+    )
+    return stale
 
 
-def _index_store() -> Any:
+def _vector_store() -> Any:
     from xagent.core.tools.core.RAG_tools.storage.factory import (
         get_vector_index_store,
     )
 
     return get_vector_index_store()
+
+
+def _index_store() -> Any:
+    return _vector_store()
 
 
 def _ensure_indexes(
@@ -489,15 +549,31 @@ def _verify_written(
     *,
     conn: Any,
     dimension: Optional[int],
+    source_model_id: str,
 ) -> None:
-    """A dropped chunk is a failure, not a success: check the target holds it."""
+    """A dropped chunk is a failure, not a success: check the target holds it.
+
+    A chunk the source no longer has is not a dropped one: a delete that landed
+    after the copy took the row from both sides.
+    """
     if not written:
         return
     have = target_chunk_ids(name, model_id, conn=conn, dimension=dimension)
-    shortfall: Dict[str, int] = {}
+    absent: Dict[str, List[str]] = {}
     for doc_id, chunk_id in written:
         if chunk_id not in have:
-            shortfall[doc_id] = shortfall.get(doc_id, 0) + 1
+            absent.setdefault(doc_id, []).append(chunk_id)
+    shortfall: Dict[str, int] = {}
+    for doc_id, chunk_ids in absent.items():
+        live = {
+            chunk.chunk_id
+            for chunk in iter_source_chunks(
+                name, source_model_id, conn=conn, doc_id=doc_id
+            )
+        }
+        lost = [chunk_id for chunk_id in chunk_ids if chunk_id in live]
+        if lost:
+            shortfall[doc_id] = len(lost)
     for doc_id, missing in sorted(shortfall.items()):
         report.failures.append(
             DocumentFailure(doc_id, f"{missing} chunks missing from the target model")
@@ -520,6 +596,8 @@ def _describe(report: CollectionReport, *, dry_run: bool) -> str:
     ]
     if not dry_run:
         parts.append(f"{report.chunks_embedded} chunks")
+        if report.chunks_removed:
+            parts.append(f"{report.chunks_removed} stale rows removed")
     if report.skipped:
         parts.append(
             "skipped "

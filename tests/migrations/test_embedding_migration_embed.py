@@ -527,11 +527,49 @@ def test_every_collection_skipped_is_a_failure_exit(
     assert mod.main(["--model", TARGET.id]) == 1
 
 
-def test_one_limiter_paces_every_collection() -> None:
-    limiter = mod.RateLimiter(rate=0.0)
-    paced = mod.PacedEmbedding(_Adapter(), limiter)
-    assert paced.get_dimension() == 2
-    assert paced.abilities == ["embedding"]
+def test_one_limiter_paces_every_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.slept: List[float] = []
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            self.slept.append(round(seconds, 6))
+            self.now += seconds
+
+    clock = _Clock()
+    monkeypatch.setattr(
+        mod, "time", SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)
+    )
+    _save_collection()
+    _save_collection(name="kb2")
+    _source(
+        [
+            _row("c1"),
+            _row("c2"),
+            _row("c3", collection="kb2"),
+            _row("c4", collection="kb2"),
+        ]
+    )
+    adapter = _Adapter()
+    monkeypatch.setattr(mod, "resolve_target_model", lambda model_id: (TARGET, adapter))
+
+    report = mod.embed_collections(
+        TARGET.id, collections=["kb", "kb2"], rate_limit=2.0, batch_size=2
+    )
+
+    assert [item.chunks_embedded for item in report.collections] == [2, 2]
+    assert [len(call) for call in adapter.calls] == [2, 2]
+    # Two texts per second, one limiter for both collections: the second
+    # collection's batch waits for the budget the first one spent.
+    assert clock.slept == [1.0]
 
 
 def test_the_configured_batch_size_is_used() -> None:
@@ -555,7 +593,7 @@ def test_the_async_path_encodes_one_text_per_call() -> None:
     assert adapter.calls == ["text c1", "text c2"]
 
 
-def test_a_target_that_writes_the_source_table_is_refused_before_writing(
+def test_a_target_that_writes_the_source_table_is_skipped_before_writing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
@@ -575,9 +613,176 @@ def test_a_target_that_writes_the_source_table_is_refused_before_writing(
 
     report = mod.embed_collections(same.id)
 
-    assert "both write" in report.collections[0].failures[0].error
-    assert report.failed
+    assert report.collections[0].collection_skip == scope.SKIP_SHARED_TABLE
     assert adapter.calls == []
     assert {row["chunk_id"] for row in _rows_in(scope.source_table("old-model"))} == {
         "c1"
     }
+
+
+def test_a_target_that_aliases_a_source_fallback_never_writes_or_reruns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The target's writer table is the source's provider-name fallback. A first
+    # copy there would make every later run see rows in two source spellings.
+    _save_collection(model_id="old-config", dimension=2)
+    _table(scope.source_table("old-config"), [_row("c1")])
+    monkeypatch.setattr(
+        scope,
+        "_legacy_spelling",
+        lambda model_id: (
+            "embeddings_text_embedding_3_small" if model_id == "old-config" else None
+        ),
+    )
+    target = EmbeddingModelConfig(
+        id="text-embedding-3-small", model_name="other-provider", dimension=2
+    )
+    adapter = _Adapter()
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+    monkeypatch.setattr(mod, "resolve_target_model", lambda model_id: (target, adapter))
+
+    first = mod.embed_collections(target.id)
+    second = mod.embed_collections(target.id)
+
+    assert [item.collection_skip for item in first.collections] == [
+        scope.SKIP_SHARED_TABLE
+    ]
+    assert [item.collection_skip for item in second.collections] == [
+        scope.SKIP_SHARED_TABLE
+    ]
+    assert adapter.calls == []
+    assert scope.source_table(target.id) not in scope.table_names(scope.connection())
+
+
+def test_a_target_that_is_the_bound_model_copies_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _source([_row("c1")])
+    same = EmbeddingModelConfig(id=SOURCE_MODEL, model_name=SOURCE_MODEL, dimension=2)
+    adapter = _Adapter()
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+    monkeypatch.setattr(mod, "resolve_target_model", lambda model_id: (same, adapter))
+
+    report = mod.embed_collections(SOURCE_MODEL)
+
+    assert report.collections[0].collection_skip == scope.SKIP_TARGET_IS_SOURCE
+    assert adapter.calls == []
+
+
+# --- a delete or retirement landing during the copy ---
+
+
+def _delete_document(doc_id: str, *, everywhere: bool) -> int:
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+
+    model_tag = None if everywhere else TARGET.id
+    return get_vector_index_store().delete_embedding_records(
+        "kb", doc_id, model_tag=model_tag, is_admin=True
+    )
+
+
+def test_a_delete_that_lands_before_the_upsert_does_not_survive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _source([_row("c1"), _row("c2", doc_id="d2")])
+    real = mod.write_vectors_to_db
+    injected = {"done": False}
+
+    def _delete_then_write(**kwargs: Any) -> Any:
+        if not injected["done"]:
+            injected["done"] = True
+            # The document delete commits while this batch is being encoded.
+            _delete_document("d1", everywhere=True)
+        return real(**kwargs)
+
+    monkeypatch.setattr(mod, "write_vectors_to_db", _delete_then_write)
+
+    report = _run()
+
+    assert report.failures == []
+    assert report.chunks_removed == 1
+    remaining = {row["doc_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert remaining == {"d2"}
+
+
+def test_a_delete_that_lands_after_the_upsert_clears_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _source([_row("c1"), _row("c2", doc_id="d2")])
+    real = mod.write_vectors_to_db
+    injected = {"done": False}
+
+    def _write_then_delete(**kwargs: Any) -> Any:
+        result = real(**kwargs)
+        if not injected["done"]:
+            injected["done"] = True
+            # Committed after the copy's revalidation: the delete path clears
+            # every model table itself.
+            _delete_document("d1", everywhere=True)
+        return result
+
+    monkeypatch.setattr(mod, "write_vectors_to_db", _write_then_delete)
+
+    report = _run()
+
+    assert report.failures == []
+    remaining = {row["doc_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert remaining == {"d2"}
+
+
+# --- reads ---
+
+
+def test_an_all_held_rerun_reads_the_source_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _source(
+        [
+            _row("c1"),
+            _row("c2", doc_id="d2"),
+            _row("c3"),
+            _row("c4", doc_id="d2"),
+        ]
+    )
+    _seed_target(["c1", "c2", "c3", "c4"])
+    calls: List[Any] = []
+    real = scope.iter_source_chunks
+
+    def _counted(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs.get("doc_id"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "iter_source_chunks", _counted)
+
+    report = _run()
+
+    assert report.documents_unchanged == 2
+    assert report.chunks_embedded == 0
+    assert calls == []
+
+
+def test_only_documents_with_pending_chunks_are_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _source([_row("c1"), _row("c2", doc_id="d2"), _row("c3", doc_id="d1")])
+    _seed_target(["c1", "c2"])
+    calls: List[Any] = []
+    real = scope.iter_source_chunks
+
+    def _counted(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs.get("doc_id"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "iter_source_chunks", _counted)
+
+    report = _run()
+
+    assert report.chunks_embedded == 1
+    assert calls == ["d1"] * 2  # the copy's read and the reconciler's re-read

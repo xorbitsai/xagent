@@ -7,6 +7,8 @@ import { reportIdleActivity, revalidateIdleSession } from "@/lib/idle-session-cl
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
 
+const alwaysFresh = () => true
+
 const idleBody = (idleExpiresIn: number) => JSON.stringify({
   idle_session: {
     enforced: true, sid: "sid-a", idle_timeout_seconds: 1800, idle_expires_in: idleExpiresIn,
@@ -57,13 +59,13 @@ describe("idle session client", () => {
   ])("%s", async (_, respond, expected) => {
     login()
     vi.mocked(apiRequest).mockImplementation(respond)
-    await expect(reportIdleActivity("browser-login")).resolves.toBe(expected)
+    await expect(reportIdleActivity("browser-login", alwaysFresh)).resolves.toBe(expected)
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1000)
   })
 
   it("sends nothing on behalf of a login that is no longer current", async () => {
     login("newer-login")
-    await expect(reportIdleActivity("browser-login")).resolves.toBe(true)
+    await expect(reportIdleActivity("browser-login", alwaysFresh)).resolves.toBe(true)
     await revalidateIdleSession("browser-login")
     expect(apiRequest).not.toHaveBeenCalled()
   })

@@ -15,6 +15,16 @@ API_KEY = "test-brave-key-0000"
 QUERY = "jane.doe@example.com quarterly forecast"
 
 
+@pytest.fixture(params=["httpx_warning", "httpx_notset"])
+def httpx_log_level(request):
+    """Run leak tests with httpx's own logger both quiet and fully verbose."""
+    lg = logging.getLogger("httpx")
+    saved = lg.level
+    lg.setLevel(logging.WARNING if request.param == "httpx_warning" else logging.NOTSET)
+    yield request.param
+    lg.setLevel(saved)
+
+
 @pytest.fixture
 def transport(monkeypatch):
     """Route the core's httpx.AsyncClient through a MockTransport."""
@@ -230,7 +240,7 @@ async def test_query_limits_raise_without_request(transport, monkeypatch, endpoi
 @pytest.mark.parametrize("status", [400, 429, 500])
 @pytest.mark.parametrize("failure", ["status", "network"])
 async def test_errors_never_leak_key_url_or_query(
-    transport, monkeypatch, caplog, endpoint, status, failure
+    transport, monkeypatch, caplog, httpx_log_level, endpoint, status, failure
 ):
     monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", endpoint)
 
@@ -241,8 +251,7 @@ async def test_errors_never_leak_key_url_or_query(
         return httpx.Response(status, text=f"echo {request.url} {API_KEY}")
 
     transport(handler)
-    # Force httpx's own request log line on: it carries the full request URL.
-    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.INFO, logger="httpx"):
+    with caplog.at_level(logging.DEBUG):
         with pytest.raises(ValueError) as exc_info:
             await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
 
@@ -262,10 +271,12 @@ async def test_errors_never_leak_key_url_or_query(
 
 
 @pytest.mark.asyncio
-async def test_success_does_not_log_query(transport, monkeypatch, caplog):
+async def test_success_does_not_log_query(
+    transport, monkeypatch, caplog, httpx_log_level
+):
     monkeypatch.delenv("XAGENT_BRAVE_SEARCH_ENDPOINT", raising=False)
     transport(lambda r: httpx.Response(200, json=WEB_BODY))
-    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.INFO, logger="httpx"):
+    with caplog.at_level(logging.DEBUG):
         await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
     assert "forecast" not in caplog.text
     assert "jane.doe" not in caplog.text

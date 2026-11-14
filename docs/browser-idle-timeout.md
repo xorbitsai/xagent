@@ -104,7 +104,8 @@ the user.
 
 Once a login is rejected, access-token requests carrying its `sid` and
 refreshes with the user's current refresh token keep returning
-`SessionIdleExpired`. An access token past its own expiry still gets
+`SessionIdleExpired` (under the conditions in "Once expired, always
+expired"). An access token past its own expiry still gets
 `TokenExpired`, and a refresh token already replaced by a newer login gets the
 existing invalid-refresh-token error.
 
@@ -135,8 +136,9 @@ UPDATE.
 - **Role**: each login row records the platform-admin role at its last login,
   activity or refresh, and enforcing replicas mark the live logins of current
   admins with every lease renewal. With the switch on or off, the stricter of
-  the recorded and the current role applies to the recorded threshold sets, so
-  a demotion revives nothing. Exception: a promotion made within the last
+  the recorded and the current role applies to the recorded threshold sets
+  and, with the switch on, to the current thresholds, so a demotion revives
+  nothing. Exception: a promotion made within the last
   renewal interval (5 seconds) before the policy stops being enforced can go
   unrecorded; that interval bounds when a promotion can be missed, not how
   long such a login stays usable after a later demotion. Errors go only toward
@@ -170,8 +172,8 @@ UPDATE.
 that expired under its own thresholds or under any threshold set another
 replica is still enforcing (its lease has not ended), and its activity and
 refresh writes apply the same test; a login that expired under a set while it
-was enforced stays expired afterwards (see "Once expired, always expired"). During a rolling change the stricter set
-therefore governs, until replicas with the old set stop renewing; their lease
+was enforced stays expired afterwards (see "Once expired, always expired").
+During a rolling change the stricter set therefore governs, until replicas with the old set stop renewing; their lease
 ends at most 15 seconds later. With the switch on, a login idle for more than a
 minute adds the same small lease query per decision, and every response that
 carries `idle_session` reads the leases once.
@@ -183,6 +185,16 @@ recorded threshold set while that set was enforced, with the stricter of its
 recorded and current role, and activity and refresh writes repeat the same
 test. A later threshold increase, a rolling change or a demotion therefore
 cannot re-admit it; requests never need to write a revocation for this.
+
+This holds under the same conditions as switch-off: the lease keeps being
+renewed and replica clocks are within 5 seconds. If renewal had stopped before
+a login's deadline (an outage longer than about 10 seconds, or a single replica
+restarted with new thresholds after more than about 15 seconds), only the
+current thresholds judge that login. A demotion of an admin whose role was
+recorded still cannot re-admit it, because the current threshold also uses the
+stricter of the recorded and current role, but a threshold increase made in
+that gap can. A promotion made while renewal had stopped can go unrecorded,
+like one in the last renewal interval before switch-off (see Role).
 
 ## Logout
 
@@ -253,8 +265,8 @@ that issue browser tokens themselves use `xagent.web.browser_idle`:
   `fence_browser_session_for_refresh(db, user, sid)` inside the refresh
   transaction, before updating `users`, and reject when it returns `False`.
   A refresh never moves the deadline.
-- `idle_session_fields(user, sid, last_activity_at=..., absolute_expires_at=...)`
-  builds the response object. Re-signed tickets keep the `sid` claim.
+- `idle_session_fields(user, sid, last_activity_at=..., absolute_expires_at=...,
+  db=db)` builds the response object. Re-signed tickets keep the `sid` claim.
 - Clearing `users.refresh_token` needs no change to `browser_session_id`;
   revoke a login only when the action is meant to end it.
 
@@ -268,8 +280,9 @@ themselves: also reject when `expired_while_enforced(enforcement_leases(db),
 last_activity_at=..., roles=..., now=...)` is true (once expired, always
 expired), and use `effective_idle_timeout(...)` for the reported countdown
 while the switch is on. An adapter may expose its own activity endpoint
-(keeping its CSRF/Origin checks) with the same semantics: check expiry before writing, write
-at most once per login per 60 seconds, return 200 with `idle_session`, no 429.
+(keeping its CSRF/Origin checks) with the same semantics: check expiry before
+writing, write at most once per login per 60 seconds, return 200 with
+`idle_session`, no 429.
 Only a real authentication (password, provider OAuth callback, MFA
 verification) starts a new login; re-signing session credentials keeps the
 same `sid` and is not activity.

@@ -6,6 +6,12 @@ socket and :func:`tts_stream_response` takes over a synthesis request whose
 model configuration is already loaded. Both assume the caller has already
 authenticated the request and chosen who pays: they never check credentials
 themselves, and they bill :attr:`SpeechStreamPlan.user_id`.
+
+A plan's ``audience`` names who is calling. ``member`` (a signed-in user)
+keeps the established responses. ``guest`` (a widget visitor who is not signed
+in, with the usage recorded on the widget owner) adds the daily voice budget
+and answers every failure with a fixed ``{"detail": {"code", "message"}}``
+body that carries no provider text, owner configuration, or usage-gate detail.
 """
 
 from __future__ import annotations
@@ -17,7 +23,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import aclosing, suppress
 from dataclasses import asdict, dataclass
 from types import SimpleNamespace
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -41,6 +47,11 @@ from ..tracking.standalone_usage import (
 )
 from .db_runtime import cancel_and_drain_async_task, drain_async_task_cancellation_safe
 from .release_hold import WritersRetired, release_hold
+from .widget_voice_budget import (
+    VoiceBudgetExhausted,
+    VoiceBudgetUnavailable,
+    reserve_tts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +65,32 @@ _SESSION_SECONDS = 600.0
 _TERMINAL_TIMEOUT = 1.0
 
 _OptionsT = TypeVar("_OptionsT", ASRStreamStart, TTSStreamRequest)
+Audience = Literal["member", "guest"]
+
+# The only text a guest ever receives for a refusal, keyed by its code.
+GUEST_REFUSAL_MESSAGES = {
+    "invalid_request": "Invalid speech request",
+    "voice_disabled": "Voice is not available for this chat",
+    "rate_limited": "Too many requests",
+    "voice_unavailable": "Voice is unavailable",
+    STANDALONE_USAGE_REFUSED: "Usage limit reached",
+    "model_unavailable": "Voice is unavailable",
+    "voice_budget_exhausted": "Voice limit reached, try again later",
+    "speech_synthesis_failed": "Speech synthesis failed",
+}
+
+
+def guest_refusal_detail(code: str) -> dict[str, str]:
+    return {"code": code, "message": GUEST_REFUSAL_MESSAGES[code]}
+
+
+def guest_refusal(status_code: int, code: str) -> HTTPException:
+    """A guest-facing refusal: a fixed code and its fixed message."""
+    return HTTPException(status_code=status_code, detail=guest_refusal_detail(code))
+
+
+class VoiceUnavailable(Exception):
+    """Widget voice cannot run: its models are not configured or not usable."""
 
 
 @dataclass(frozen=True)
@@ -65,12 +102,30 @@ class SpeechStreamPlan(Generic[_OptionsT]):
     instance is built from. ``options`` is the validated client request: the
     ASR start frame, or the TTS request whose text and output options are
     synthesized.
+
+    ``audience`` is ``member`` for a signed-in caller and ``guest`` for a
+    widget visitor. A guest plan must name the widget ``entity_key`` and the
+    ``visitor_key`` its budget is counted under; a member plan names neither.
+    Construction raises ``ValueError`` otherwise.
     """
 
     user_id: int
     config: SimpleNamespace
     options: _OptionsT
     usage_source: UsageSource
+    audience: Audience
+    entity_key: str | None = None
+    visitor_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.audience == "guest":
+            if not self.entity_key or not self.visitor_key:
+                raise ValueError("A guest speech plan needs entity and visitor keys")
+        elif self.audience == "member":
+            if self.entity_key is not None or self.visitor_key is not None:
+                raise ValueError("A member speech plan carries no budget keys")
+        else:
+            raise ValueError(f"Unknown speech audience: {self.audience!r}")
 
 
 class _ASRSessionTimeout(TimeoutError):
@@ -343,6 +398,10 @@ class _TTSAudioResponse(StreamingResponse):
         user_id: int,
         request: TTSStreamRequest,
         usage_source: UsageSource = "speech_synthesize",
+        *,
+        audience: Audience = "member",
+        entity_key: str | None = None,
+        visitor_key: str | None = None,
     ) -> None:
         super().__init__(content=())
         self.model = model
@@ -350,6 +409,17 @@ class _TTSAudioResponse(StreamingResponse):
         # Metered under the same source the gate was asked about.
         self.usage_source: UsageSource = usage_source
         self.options = request.model_dump(exclude={"model_id"}, exclude_none=True)
+        self.audience: Audience = audience
+        self.entity_key = entity_key
+        self.visitor_key = visitor_key
+        self.chars = len(request.text)
+        # The outcome the usage log reports when the response ends.
+        self.result = "incomplete"
+
+    def _failure(self, status: int, detail: Any, code: str) -> JSONResponse:
+        if self.audience == "guest":
+            detail = guest_refusal_detail(code)
+        return JSONResponse({"detail": detail}, status_code=status)
 
     async def _audio(
         self, first: TTSChunk, chunks: AsyncIterator[TTSChunk]
@@ -376,8 +446,9 @@ class _TTSAudioResponse(StreamingResponse):
                         if isinstance(exc, TimeoutError)
                         else 502
                     )
-                    await JSONResponse(
-                        {"detail": "Speech synthesis failed"}, status_code=status
+                    self.result = "provider_failed"
+                    await self._failure(
+                        status, "Speech synthesis failed", "speech_synthesis_failed"
                     )(scope, receive, send)
                     return
                 self.media_type = {
@@ -395,6 +466,7 @@ class _TTSAudioResponse(StreamingResponse):
                 self.init_headers(headers)
                 self.body_iterator = self._audio(first, chunks)
                 await self.stream_response(send)
+                self.result = "ok"
         finally:
             await _close_model(self.model)
 
@@ -412,9 +484,20 @@ class _TTSAudioResponse(StreamingResponse):
         except StandaloneUsageRefused as exc:
             # Only entering the scope raises this: _respond turns every failure
             # into a response of its own. Nothing was sent or opened yet.
+            self.result = "usage_refused"
             await _close_model(self.model)
-            await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(
+            await self._failure(exc.status_code, exc.detail, STANDALONE_USAGE_REFUSED)(
                 scope, receive, send
+            )
+        finally:
+            _log_tts_usage(
+                self.audience,
+                self.user_id,
+                self.entity_key,
+                self.visitor_key,
+                getattr(self.model, "model_id", ""),
+                self.chars,
+                self.result,
             )
 
     async def _respond(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -434,14 +517,39 @@ class _TTSAudioResponse(StreamingResponse):
                 )
         except Exception as exc:
             _log_provider_error(self.model, exc)
+            self.result = "provider_failed"
             if started:
                 # Preserve the truncated-response signal without exposing SDK details
                 # through an ASGI exception traceback.
                 raise RuntimeError("Speech synthesis stream interrupted") from None
-            await JSONResponse(
-                {"detail": "Speech synthesis failed"},
-                status_code=504 if isinstance(exc, TimeoutError) else 502,
+            await self._failure(
+                504 if isinstance(exc, TimeoutError) else 502,
+                "Speech synthesis failed",
+                "speech_synthesis_failed",
             )(scope, receive, send)
+
+
+def _log_tts_usage(
+    audience: Audience,
+    user_id: int,
+    entity_key: str | None,
+    visitor_key: str | None,
+    model_id: str,
+    chars: int,
+    result: str,
+) -> None:
+    """One line per synthesis request, written when it ends; always on."""
+    logger.info(
+        "Speech synthesis usage: audience=%s user_id=%s entity=%s visitor=%s "
+        "model=%s chars=%d result=%s",
+        audience,
+        user_id,
+        entity_key,
+        visitor_key,
+        model_id,
+        chars,
+        result,
+    )
 
 
 async def tts_stream_response(
@@ -451,21 +559,47 @@ async def tts_stream_response(
 
     The caller must have authenticated the request and loaded ``plan.config``.
     In order, this asks the usage gate (``StandaloneUsageRefused``, HTTP 402),
-    builds the provider instance, checks that it streams, and returns a
+    builds the provider instance, checks that it streams, reserves the daily
+    voice budget for a guest plan (429 ``voice_budget_exhausted``, or 503
+    ``voice_unavailable`` when the budget storage fails), and returns a
     response that meters ``plan.user_id`` while it is sent. Failures before
-    the response exists raise ``HTTPException``; the instance is closed on
-    every such path.
+    the response exists raise ``HTTPException``, with a fixed guest body for
+    a guest plan; the instance is closed on every such path, and every
+    request writes one usage log line.
     """
+    guest = plan.audience == "guest"
+    model_id = str(plan.config.model_id)
+
+    def refused(result: str) -> None:
+        _log_tts_usage(
+            plan.audience,
+            plan.user_id,
+            plan.entity_key,
+            plan.visitor_key,
+            model_id,
+            len(plan.options.text),
+            result,
+        )
+
     # The metering scope opens once the response is being sent, too late for a
     # status code; refuse here, before the provider is reached. The scope
     # checks again, for a gate that turns in between.
-    await check_standalone_gate_async(
-        plan.user_id, plan.usage_source, model_ids=(plan.config.model_id,)
-    )
+    try:
+        await check_standalone_gate_async(
+            plan.user_id, plan.usage_source, model_ids=(plan.config.model_id,)
+        )
+    except StandaloneUsageRefused:
+        refused("usage_refused")
+        if guest:
+            raise guest_refusal(402, STANDALONE_USAGE_REFUSED) from None
+        raise
     try:
         model = get_tts_model_instance(plan.config)
     except ValueError as exc:
         _log_provider_error(plan.config, exc)
+        refused("model_unavailable")
+        if guest:
+            raise guest_refusal(400, "model_unavailable") from None
         raise HTTPException(
             status_code=400, detail="Invalid TTS model configuration"
         ) from exc
@@ -475,16 +609,41 @@ async def tts_stream_response(
         await _close_model(model)
         if isinstance(exc, Exception):
             _log_provider_error(model, exc)
+            refused("provider_failed")
+            status = 504 if isinstance(exc, TimeoutError) else 502
+            if guest:
+                raise guest_refusal(status, "speech_synthesis_failed") from None
             raise HTTPException(
-                status_code=504 if isinstance(exc, TimeoutError) else 502,
-                detail="Speech capabilities unavailable",
+                status_code=status, detail="Speech capabilities unavailable"
             ) from None
         raise
     if not capabilities.get("streaming"):
         await _close_model(model)
+        refused("model_unavailable")
+        if guest:
+            raise guest_refusal(400, "model_unavailable")
         raise HTTPException(
             status_code=400, detail="Selected TTS model does not support streaming"
         )
+    if guest:
+        assert plan.entity_key and plan.visitor_key
+        try:
+            await reserve_tts(plan.entity_key, plan.visitor_key, len(plan.options.text))
+        except BaseException as exc:
+            await _close_model(model)
+            if isinstance(exc, VoiceBudgetExhausted):
+                refused("budget_exhausted")
+                raise guest_refusal(429, "voice_budget_exhausted") from None
+            if isinstance(exc, VoiceBudgetUnavailable):
+                refused("budget_unavailable")
+                raise guest_refusal(503, "voice_unavailable") from None
+            raise
     return _TTSAudioResponse(
-        model, plan.user_id, plan.options, usage_source=plan.usage_source
+        model,
+        plan.user_id,
+        plan.options,
+        usage_source=plan.usage_source,
+        audience=plan.audience,
+        entity_key=plan.entity_key,
+        visitor_key=plan.visitor_key,
     )

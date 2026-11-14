@@ -169,6 +169,14 @@ describe("idle activity reporting", () => {
     reporter.stop()
   })
 
+  it("still sends the report when recording the report time fails", async () => {
+    const { reporter, report, fire } = setup(record(), { markReported: () => Promise.reject(new Error("lock unavailable")) })
+    fire("keydown")
+    await vi.advanceTimersByTimeAsync(0)
+    expect(report).toHaveBeenCalledTimes(1)
+    reporter.stop()
+  })
+
   it("treats a report that throws like one that did not reach the server", async () => {
     const report = vi.fn(async () => { throw new Error("offline") })
     const { reporter, fire } = setup(record(), { report })

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -1507,6 +1508,11 @@ async def _load_memory_policy_task_fields_for_agent(
 # Bound invalidation waits for an unlocked but FIFO-queued build lock.
 _INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
 
+# How often an acquisition re-checks a task's runtime boundary while a cleanup
+# holds it. Contention is rare and bounded by one workspace removal, so a short
+# poll is simpler than a cancellation-safe cross-thread wait.
+_RUNTIME_BOUNDARY_POLL_SECONDS = 0.05
+
 # Process-local acquisition identity. This intentionally outlives individual
 # manager instances: a delayed cleanup may resolve the current global manager
 # only after its original manager was replaced. Reusing a token then would
@@ -1542,6 +1548,14 @@ class AgentServiceManager:
         # and leave pause/message control attached to the instance that loses
         # the final cache assignment.
         self._agent_build_locks: Dict[int, asyncio.Lock] = {}
+        # Tasks whose runtime is being acquired (``get_agent_for_task``) or torn
+        # down (``remove_agent``) right now. The build lock above is an
+        # event-loop lock, so a cleanup running in a worker thread cannot hold
+        # it; this set, guarded by a short-held mutex that is never held across
+        # I/O or an await, is the boundary both sides share. See
+        # ``_try_enter_runtime_boundary``.
+        self._runtime_boundary: set[int] = set()
+        self._runtime_boundary_mutex = threading.Lock()
         # Owner (runtime identity) each cached AgentService was built for. A
         # task_id-keyed cache must not silently hand back an instance built
         # under a different user (e.g. once built with the wrong identity).
@@ -2428,23 +2442,34 @@ class AgentServiceManager:
             lock = asyncio.Lock()
             self._agent_build_locks[task_id] = lock
         async with lock:
-            agent = await self._get_agent_for_task_unlocked(
-                task_id,
-                db=db,
-                user=user,
-                task_setup_snapshot=task_setup_snapshot,
-                task_owner_user_id=task_owner_user_id,
-                connector_runtime_turn_id=connector_runtime_turn_id,
-                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
-                mcp_actor_execution_identity=mcp_actor_execution_identity,
-                task_mode=task_mode,
-                resolved_execution_scope=resolved_execution_scope,
-            )
-            if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
-                self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
-            self._agent_run_generations[task_id] = next(_agent_run_generation_counter)
-            self._agent_last_active_at[task_id] = self._monotonic()
-            return agent
+            # Wait out a cleanup that is removing this task's runtime: building
+            # on a workspace it is about to delete would lose the new runtime's
+            # files. Held until the new generation is recorded, so a cleanup
+            # starting meanwhile skips (``remove_agent`` returns ``False``) and
+            # one that starts afterwards sees the new generation and skips.
+            await self._enter_runtime_boundary(task_id)
+            try:
+                agent = await self._get_agent_for_task_unlocked(
+                    task_id,
+                    db=db,
+                    user=user,
+                    task_setup_snapshot=task_setup_snapshot,
+                    task_owner_user_id=task_owner_user_id,
+                    connector_runtime_turn_id=connector_runtime_turn_id,
+                    mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
+                    mcp_actor_execution_identity=mcp_actor_execution_identity,
+                    task_mode=task_mode,
+                    resolved_execution_scope=resolved_execution_scope,
+                )
+                if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
+                    self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
+                self._agent_run_generations[task_id] = next(
+                    _agent_run_generation_counter
+                )
+                self._agent_last_active_at[task_id] = self._monotonic()
+                return agent
+            finally:
+                self._leave_runtime_boundary(task_id)
 
     async def _get_agent_for_task_unlocked(
         self,
@@ -4014,7 +4039,77 @@ class AgentServiceManager:
         Returns ``False`` when the run fence skipped the cleanup -- a later
         acquisition owns the runtime, so neither it nor the workspace was
         touched -- and ``True`` once the runtime was removed.
+
+        The fence check, the workspace removal and the eviction of the
+        manager's entries run as one step with respect to
+        ``get_agent_for_task``: the task's runtime boundary is held across all
+        three. An acquisition that arrives meanwhile waits and then builds a
+        fresh runtime and workspace; one already in flight makes this return
+        ``False`` instead, exactly like a newer generation. Without that, an
+        acquisition landing between the check and the removal would have its
+        workspace deleted and its manager entries evicted by a cleanup that
+        was scheduled for the previous run. Safe to call from a worker thread.
         """
+        if not self._try_enter_runtime_boundary(task_id):
+            logger.info(
+                "Skipping runtime cleanup for task %s: its runtime is being "
+                "acquired or removed by another caller",
+                task_id,
+            )
+            return False
+        try:
+            return self._remove_agent_within_boundary(
+                task_id,
+                user_id,
+                expected_run_id=expected_run_id,
+                expected_run_generation=expected_run_generation,
+                workspace_target=workspace_target,
+            )
+        finally:
+            self._leave_runtime_boundary(task_id)
+
+    def _try_enter_runtime_boundary(self, task_id: int) -> bool:
+        """Claim the task's runtime boundary; ``False`` if someone holds it.
+
+        The boundary serializes the two things that must not interleave for a
+        task: acquiring a runtime and its workspace (``get_agent_for_task``) and
+        tearing them down (``remove_agent``). Non-blocking, so a caller on the
+        event-loop thread can never deadlock against a worker thread; the
+        mutex only protects the set and is never held across I/O or an await.
+        Every successful claim must be paired with
+        :meth:`_leave_runtime_boundary`.
+        """
+        with self._runtime_boundary_mutex:
+            if task_id in self._runtime_boundary:
+                return False
+            self._runtime_boundary.add(task_id)
+            return True
+
+    def _leave_runtime_boundary(self, task_id: int) -> None:
+        """Release a boundary claimed through :meth:`_try_enter_runtime_boundary`."""
+        with self._runtime_boundary_mutex:
+            self._runtime_boundary.discard(task_id)
+
+    async def _enter_runtime_boundary(self, task_id: int) -> None:
+        """Wait, without blocking the loop, until the boundary is claimed.
+
+        Cancellation while waiting leaves nothing claimed. Callers hold the
+        task's build lock, so at most one acquisition polls per task and only
+        a cleanup can hold the boundary meanwhile.
+        """
+        while not self._try_enter_runtime_boundary(task_id):
+            await asyncio.sleep(_RUNTIME_BOUNDARY_POLL_SECONDS)
+
+    def _remove_agent_within_boundary(
+        self,
+        task_id: int,
+        user_id: Optional[int] = None,
+        *,
+        expected_run_id: Optional[str] = None,
+        expected_run_generation: Optional[int] = None,
+        workspace_target: Optional[WorkspaceCleanupTarget] = None,
+    ) -> bool:
+        """The body of :meth:`remove_agent`; the caller holds the runtime boundary."""
         current_run_id = self._agent_run_ids.get(task_id)
         current_generation = self._agent_run_generations.get(task_id)
         build_lock = self._agent_build_locks.get(task_id)

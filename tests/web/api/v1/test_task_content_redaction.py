@@ -10,6 +10,10 @@ a redacted task rather than failing on missing content.
 
 from __future__ import annotations
 
+import asyncio
+import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
@@ -47,7 +51,7 @@ from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.task_runtime_secret import TaskRuntimeSecret
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.uploaded_file_cleanup_fence import UploadedFileCleanupFence
-from xagent.web.services import task_content_redaction, task_deletion
+from xagent.web.services import connector_runtime, task_content_redaction, task_deletion
 from xagent.web.services.agent_service_manager import get_agent_manager
 from xagent.web.services.execution_scope_snapshot import (
     load_task_execution_scope_snapshot,
@@ -831,15 +835,27 @@ def test_files_only_deletion_removes_files_and_workspace_and_keeps_the_conversat
         db.close()
 
 
+def _cached_agent_for(workspace: Path) -> MagicMock:
+    """A cached agent whose ``cleanup_workspace`` really removes ``workspace``.
+
+    The real agent deletes the directory it owns; a bare mock would report
+    success without touching the disk and let a test pass over a leftover.
+    """
+    agent = MagicMock()
+    agent.workspace.workspace_dir = workspace
+    agent.cleanup_workspace.side_effect = lambda: shutil.rmtree(workspace)
+    return agent
+
+
 def test_files_only_deletion_drops_the_cached_agent_and_its_workspace(
     _roots: Path,
 ) -> None:
     """A cached agent owns its workspace: it is evicted and cleans it up."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _settled_task(full_key, agent_id)
-    _seed_content(task_id, _roots)
+    _, _, workspace = _seed_content(task_id, _roots)
     manager = get_agent_manager()
-    cached_agent = MagicMock()
+    cached_agent = _cached_agent_for(workspace)
     manager._agents[task_id] = cached_agent
 
     report = _delete_files([task_id])
@@ -847,6 +863,7 @@ def test_files_only_deletion_drops_the_cached_agent_and_its_workspace(
     assert report == TaskFileDeletionReport(deleted=(task_id,))
     assert task_id not in manager._agents
     cached_agent.cleanup_workspace.assert_called_once()
+    assert not workspace.exists()
     # Only the files go; the transcript stays.
     counts = _content_counts(task_id)
     assert counts[UploadedFile.__tablename__] == 0
@@ -928,3 +945,176 @@ def test_files_only_cleanup_spares_a_runtime_a_later_turn_acquired(
 
     assert _delete_files([task_id]) == TaskFileDeletionReport(deleted=(task_id,))
     assert not workspace.exists()
+
+
+def _retain_connector_values(task_id: int, run_id: str) -> tuple[int, str]:
+    """Retain one ephemeral connector input for ``run_id``; returns its key."""
+    key = (task_id, run_id)
+    connector_runtime._EPHEMERAL_RUN_VALUES[key] = (
+        connector_runtime._EphemeralRunValues(
+            user_id=1,
+            expires_at=float("inf"),
+            values={"secret": "retained"},
+            manifest={},
+        )
+    )
+    return key
+
+
+@pytest.mark.parametrize(
+    ("delete", "keeps_values"),
+    [
+        pytest.param(_delete_files, True, id="files_only"),
+        pytest.param(_redact, False, id="redaction"),
+    ],
+)
+def test_only_the_redaction_drops_retained_connector_values(
+    _roots: Path, delete: Any, keeps_values: bool
+) -> None:
+    """Files are not connector inputs; a turn accepted after the commit may need them."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _seed_content(task_id, _roots)
+    key = _retain_connector_values(task_id, "later-run")
+    try:
+        delete([task_id])
+
+        assert (key in connector_runtime._EPHEMERAL_RUN_VALUES) is keeps_values
+    finally:
+        connector_runtime._EPHEMERAL_RUN_VALUES.pop(key, None)
+
+
+def _stub_acquisition(
+    manager: Any, monkeypatch: pytest.MonkeyPatch, workspace: Path, **hooks: Any
+) -> None:
+    """Replace the runtime build with one that lays down a fresh workspace.
+
+    ``get_agent_for_task`` itself is real, so its boundary and its generation
+    bookkeeping are what the interleaving tests exercise.
+    """
+
+    async def build(task_id: int, *args: Any, **kwargs: Any) -> MagicMock:
+        if "on_build" in hooks:
+            await hooks["on_build"](workspace)
+        (workspace / "output").mkdir(parents=True, exist_ok=True)
+        (workspace / "output" / "fresh.txt").write_text("fresh")
+        agent = _cached_agent_for(workspace)
+        manager._agents[task_id] = agent
+        return agent
+
+    monkeypatch.setattr(manager, "_get_agent_for_task_unlocked", build)
+
+
+def test_an_acquisition_arriving_mid_cleanup_waits_and_gets_a_fresh_workspace(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cleanup holds the runtime boundary across its workspace removal.
+
+    A turn acquiring the runtime while the directory is being removed waits for
+    the removal, then builds into a fresh workspace that nothing deletes.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _, _, workspace = _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    removing = threading.Event()
+    finish_removal = threading.Event()
+    remove_workspace = manager._cleanup_workspace_directory
+    built_over_leftover: list[bool] = []
+
+    def slow_removal(*args: Any, **kwargs: Any) -> None:
+        removing.set()
+        assert finish_removal.wait(10)
+        remove_workspace(*args, **kwargs)
+
+    async def record_workspace(workspace: Path) -> None:
+        built_over_leftover.append(workspace.exists())
+
+    monkeypatch.setattr(manager, "_cleanup_workspace_directory", slow_removal)
+    _stub_acquisition(manager, monkeypatch, workspace, on_build=record_workspace)
+
+    async def acquire_while_removing() -> None:
+        acquiring = asyncio.ensure_future(manager.get_agent_for_task(task_id))
+        # Several polls of the boundary go by without the build starting.
+        await asyncio.sleep(0.3)
+        assert not acquiring.done()
+        assert built_over_leftover == []
+        finish_removal.set()
+        await asyncio.wait_for(acquiring, 10)
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            cleanup = pool.submit(_delete_files, [task_id])
+            assert removing.wait(10)
+            asyncio.run(acquire_while_removing())
+            report = cleanup.result(10)
+
+        assert report == TaskFileDeletionReport(deleted=(task_id,))
+        # The build ran after the removal and its files survived.
+        assert built_over_leftover == [False]
+        assert (workspace / "output" / "fresh.txt").read_text() == "fresh"
+        assert task_id in manager._agents
+    finally:
+        finish_removal.set()
+        manager._agents.pop(task_id, None)
+        manager._agent_run_generations.pop(task_id, None)
+        manager._agent_last_active_at.pop(task_id, None)
+
+
+def test_a_cleanup_arriving_mid_acquisition_skips_and_leaves_the_runtime_alone(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An acquisition in flight owns the boundary until its generation is recorded.
+
+    A cleanup scheduled for the previous run reports ``cleanup_failed`` instead
+    of deleting the workspace the new runtime is building; a re-run after the
+    turn is gone finishes the job.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _, _, workspace = _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    reports: list[TaskFileDeletionReport] = []
+    # Without a run id the cleanup has no run fence and no build-lock check to
+    # fall back on, so only the runtime boundary can stop it.
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update({"run_id": None})
+        db.commit()
+    finally:
+        db.close()
+
+    async def scenario() -> None:
+        in_build = asyncio.Event()
+        finish_build = asyncio.Event()
+
+        async def hold_build(_workspace: Path) -> None:
+            in_build.set()
+            await finish_build.wait()
+
+        _stub_acquisition(manager, monkeypatch, workspace, on_build=hold_build)
+        acquiring = asyncio.ensure_future(manager.get_agent_for_task(task_id))
+        await asyncio.wait_for(in_build.wait(), 10)
+        reports.append(await asyncio.to_thread(_delete_files, [task_id]))
+        # Nothing of the new runtime was touched while it was building.
+        assert workspace.exists()
+        assert task_id not in manager._agents
+        finish_build.set()
+        await asyncio.wait_for(acquiring, 10)
+
+    try:
+        asyncio.run(scenario())
+
+        assert reports == [TaskFileDeletionReport(cleanup_failed=(task_id,))]
+        assert (workspace / "output" / "fresh.txt").read_text() == "fresh"
+        assert task_id in manager._agents
+
+        # The turn is gone: the same call now evicts its runtime and finishes.
+        manager._agents.pop(task_id)
+        manager._agent_run_generations.pop(task_id)
+        assert _delete_files([task_id]) == TaskFileDeletionReport(deleted=(task_id,))
+        assert not workspace.exists()
+    finally:
+        manager._agents.pop(task_id, None)
+        manager._agent_run_generations.pop(task_id, None)
+        manager._agent_last_active_at.pop(task_id, None)

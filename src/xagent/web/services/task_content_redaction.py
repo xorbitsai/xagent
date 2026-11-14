@@ -56,8 +56,17 @@ step is the same one: the workspace directory is removed and the cached agent
 evicted too, because an uploaded file can be copied into the workspace as an
 input, so clearing the rows alone would leave copies on disk. The ordering (DB
 commit first, workspace after), the run fence that spares a runtime a later
-turn acquired, and the ``cleanup_failed`` reporting are identical; only the
-transcript, trace and task columns are left alone.
+turn acquired, and the ``cleanup_failed`` reporting are identical. What it
+leaves alone is the conversation -- transcript, trace, task columns -- and the
+ephemeral connector values the process retains for the task, which only the
+redaction drops.
+
+A turn can acquire the task's runtime while either cleanup runs, because the
+commit has already released the row. The agent manager serializes the two per
+task: ``remove_agent`` holds the task's runtime boundary across its run-fence
+check, the workspace removal and the eviction of its entries, so an acquisition
+that arrives meanwhile waits and then builds a fresh runtime and workspace,
+and one already in flight makes the cleanup report ``cleanup_failed`` instead.
 
 No ``content redacted`` column is added. Readers already treat every removed
 piece as a legitimate empty state (no transcript, no steps, no files, NULL
@@ -205,11 +214,20 @@ def _delete_files(db: Session, task: Task) -> _TaskRuntime:
     return runtime
 
 
-def _release_task_runtime(task_id: int, runtime: _TaskRuntime) -> bool:
+def _release_task_runtime(
+    task_id: int, runtime: _TaskRuntime, *, drop_connector_values: bool
+) -> bool:
     """Drop the in-memory state and the workspace of a task after its commit.
 
     Shared by the redaction and the files-only deletion: both remove the
     workspace, which can hold copies of what they removed.
+
+    ``drop_connector_values`` also drops every ephemeral connector value the
+    process retains for the task, whichever run bound it. Only the redaction
+    asks for that, because the values are part of the conversation it removes.
+    The files-only deletion must not: the drop is task-wide and unfenced, so
+    after the commit it could erase the retained secret of a turn accepted in
+    the meantime, which a later reply without credentials then cannot resolve.
 
     ``remove_agent`` evicts this process's cached agent -- which still holds
     the conversation in memory -- and removes the workspace through it, or
@@ -219,7 +237,10 @@ def _release_task_runtime(task_id: int, runtime: _TaskRuntime) -> bool:
     ``remove_agent`` then leaves both alone rather than pull them out from
     under it. That skip returns ``False``: the workspace still holds the
     files and nothing else removes them, so the caller must re-run once that
-    turn settles.
+    turn settles. The fence check, the removal and the eviction are one step
+    with respect to a turn acquiring the runtime (``remove_agent`` holds the
+    task's runtime boundary across them), so a turn that arrives mid-removal
+    waits for it and then builds a fresh workspace instead of losing its own.
 
     A scope that will not resolve raises rather than degrading to the
     unscoped candidates: a cleanup that cannot find the workspace must not
@@ -232,7 +253,8 @@ def _release_task_runtime(task_id: int, runtime: _TaskRuntime) -> bool:
 
     # In-memory state first: a workspace failure below must not leave the
     # caches serving the content the commit already removed.
-    drop_ephemeral_runtime_values_for_task(task_id)
+    if drop_connector_values:
+        drop_ephemeral_runtime_values_for_task(task_id)
     invalidate_task_cache(task_id)
     manager = get_agent_manager()
 
@@ -260,7 +282,11 @@ def _release_task_runtime(task_id: int, runtime: _TaskRuntime) -> bool:
 
 
 def _try_release_task_runtime(
-    task_id: int, runtime: _TaskRuntime, *, committed: str
+    task_id: int,
+    runtime: _TaskRuntime,
+    *,
+    committed: str,
+    drop_connector_values: bool,
 ) -> bool:
     """Run :func:`_release_task_runtime`, turning a failure into ``False``.
 
@@ -269,7 +295,9 @@ def _try_release_task_runtime(
     so the caller lists the task as ``cleanup_failed`` and the batch goes on.
     """
     try:
-        return _release_task_runtime(task_id, runtime)
+        return _release_task_runtime(
+            task_id, runtime, drop_connector_values=drop_connector_values
+        )
     except Exception:
         logger.exception(
             "Task %s %s but its runtime or workspace cleanup failed; re-run it",
@@ -332,7 +360,10 @@ def redact_task_content(
                 missing.append(task_id)
             case _TaskRuntime() as runtime:
                 if _try_release_task_runtime(
-                    task_id, runtime, committed="content was redacted"
+                    task_id,
+                    runtime,
+                    committed="content was redacted",
+                    drop_connector_values=True,
                 ):
                     redacted.append(task_id)
                 else:
@@ -395,7 +426,11 @@ def delete_task_content_files(
 
     The transcript, trace and task columns are untouched -- the task keeps
     talking about files it no longer has, which is what a files-only deletion
-    asks for. The next turn starts from a fresh runtime and workspace.
+    asks for -- and so are the ephemeral connector values the process retains
+    for the task: they are not files, and a turn accepted after the commit may
+    already depend on them. The next turn starts from a fresh runtime and
+    workspace; one that arrives while the workspace is being removed waits for
+    the removal first.
 
     Eviction of the cached agent is process-local; a host with several agent
     worker processes evicts it on the others itself.
@@ -428,7 +463,10 @@ def delete_task_content_files(
                 missing.append(task_id)
             case _TaskRuntime() as runtime:
                 if _try_release_task_runtime(
-                    task_id, runtime, committed="files were deleted"
+                    task_id,
+                    runtime,
+                    committed="files were deleted",
+                    drop_connector_values=False,
                 ):
                     deleted.append(task_id)
                 else:

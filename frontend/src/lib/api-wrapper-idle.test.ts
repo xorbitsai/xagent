@@ -58,7 +58,7 @@ describe("api-wrapper idle expiry", () => {
 
   it("signs out when the replay after a refresh reports idle expiry", async () => {
     writeAuthCache("old-access", "old-refresh")
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
       if (isRefresh(input)) {
         return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 120, refresh_expires_in: 240 }), { headers: { "Content-Type": "application/json" } })
       }
@@ -70,8 +70,30 @@ describe("api-wrapper idle expiry", () => {
     const response = await apiRequest("http://api.local/protected")
 
     expect(response.status).toBe(401)
+    // One original request and one replay; the replay is not repeated.
+    expect(fetchMock.mock.calls.filter(([input]) => !isRefresh(input))).toHaveLength(2)
     expect(readAuthCache()).toBeNull()
     expect(readSessionEndNotice(localStorage)).toBe("session_expired")
+  })
+
+  it("leaves a login that replaced the replayed one in place", async () => {
+    writeAuthCache("old-access", "old-refresh", "old-login")
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (isRefresh(input)) {
+        return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 120, refresh_expires_in: 240 }), { headers: { "Content-Type": "application/json" } })
+      }
+      if (new Headers(options?.headers).get("Authorization") === "Bearer new-access") {
+        // Another user signs in while the replay is in flight.
+        writeAuthCache("other-access", "other-refresh", "other-login")
+        return idleExpired()
+      }
+      return new Response(null, { status: 401, headers: { "Error-Type": "TokenExpired" } })
+    })
+
+    await apiRequest("http://api.local/protected")
+
+    expect(readAuthCache()?.token).toBe("other-access")
+    expect(readSessionEndNotice(localStorage)).toBeNull()
   })
 
   it("signs out when the replay with another tab's rotated token reports idle expiry", async () => {

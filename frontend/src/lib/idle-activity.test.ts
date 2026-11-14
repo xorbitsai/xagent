@@ -198,6 +198,9 @@ describe("idle activity reporting", () => {
     fire("keydown")
     await vi.advanceTimersByTimeAsync(10_000)
     expect(report).toHaveBeenCalledTimes(1)
+    // The retry still happens once the interval has passed.
+    await vi.advanceTimersByTimeAsync(52_000)
+    expect(report).toHaveBeenCalledTimes(2)
     reporter.stop()
   })
 

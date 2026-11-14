@@ -1,0 +1,179 @@
+"""Widget voice daily budgets and the fail-closed synthesis rate gate."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+from redis.exceptions import RedisError
+
+from xagent.web.services import share_rate_limit, widget_voice_budget
+from xagent.web.services.widget_voice_budget import (
+    TTS_BUCKETS,
+    VoiceBudgetExhausted,
+    VoiceBudgetUnavailable,
+    reserve_tts_sync,
+)
+
+SETTINGS = {
+    "tts-visitor": "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS",
+    "tts-entity": "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS",
+    "tts-site": "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS",
+}
+
+
+@pytest.fixture(autouse=True)
+def memory_budget(monkeypatch):
+    monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
+    monkeypatch.setattr(
+        widget_voice_budget, "_memory_store", widget_voice_budget._MemoryStore()
+    )
+    return widget_voice_budget
+
+
+def _counts() -> dict[str, int]:
+    counts = widget_voice_budget._memory_store._counts
+    return {key.split(":")[3]: value for key, value in counts.items()}
+
+
+def test_tts_buckets_are_the_three_synthesis_layers():
+    assert len(TTS_BUCKETS) == 3
+    assert {bucket.name for bucket in TTS_BUCKETS} == set(SETTINGS)
+
+
+@pytest.mark.parametrize("bucket", [b.name for b in TTS_BUCKETS])
+def test_each_bucket_refuses_at_its_limit(monkeypatch, bucket):
+    monkeypatch.setenv(SETTINGS[bucket], "10")
+    reserve_tts_sync("agent:1", "1.2.3.4", 10)
+    with pytest.raises(VoiceBudgetExhausted):
+        reserve_tts_sync("agent:1", "1.2.3.4", 1)
+    assert _counts()[bucket] == 10
+
+
+@pytest.mark.parametrize(
+    ("over", "rolled_back"),
+    [("tts-site", ["tts-visitor", "tts-entity"]), ("tts-entity", ["tts-visitor"])],
+)
+def test_later_bucket_refusal_rolls_back_earlier_ones(monkeypatch, over, rolled_back):
+    monkeypatch.setenv(SETTINGS[over], "5")
+    reserve_tts_sync("agent:1", "1.2.3.4", 5)
+    before = _counts()
+    with pytest.raises(VoiceBudgetExhausted):
+        reserve_tts_sync("agent:1", "1.2.3.4", 3)
+    after = _counts()
+    for bucket in [*rolled_back, over]:
+        assert after[bucket] == before[bucket]
+
+
+def test_zero_refuses_everything_and_bad_values_fall_back(monkeypatch, caplog):
+    monkeypatch.setenv(SETTINGS["tts-site"], "0")
+    with pytest.raises(VoiceBudgetExhausted):
+        reserve_tts_sync("agent:1", "v", 1)
+    for raw in ("-5", "lots"):
+        monkeypatch.setenv(SETTINGS["tts-site"], raw)
+        assert widget_voice_budget.bucket_limit(TTS_BUCKETS[2]) == 1_000_000
+    monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS", "999999")
+    assert widget_voice_budget.tts_max_text_chars() == 1000
+    assert "Invalid widget voice budget" in caplog.text
+
+
+@pytest.mark.parametrize("next_day", [False, True])
+def test_budget_window_is_the_utc_calendar_day(monkeypatch, next_day):
+    monkeypatch.setenv(SETTINGS["tts-entity"], "10")
+    day = {"value": "20261114"}
+    monkeypatch.setattr(widget_voice_budget, "_utc_day", lambda: day["value"])
+    reserve_tts_sync("agent:1", "v", 8)
+    if next_day:
+        day["value"] = "20261115"
+        reserve_tts_sync("agent:1", "v", 8)
+        assert _counts()["tts-entity"] == 8
+    else:
+        with pytest.raises(VoiceBudgetExhausted):
+            reserve_tts_sync("agent:1", "v", 8)
+
+
+def test_budget_day_is_taken_in_utc(monkeypatch):
+    class _Clock:
+        @staticmethod
+        def now(tz):
+            assert tz is timezone.utc
+            return datetime(2026, 11, 14, 23, 59, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(widget_voice_budget, "datetime", _Clock)
+    assert widget_voice_budget._utc_day() == "20261114"
+
+
+class _FakeRedis:
+    def __init__(self, fail: str | None = None) -> None:
+        self.fail = fail
+        self.values: dict[str, int] = {}
+        self._ops: list[tuple[str, int]] = []
+
+    def pipeline(self):
+        self._ops = []
+        return self
+
+    def incrby(self, key, amount):
+        self._ops.append((key, amount))
+
+    def expire(self, key, seconds):
+        assert seconds == 48 * 3600
+
+    def execute(self):
+        if self.fail == "increment":
+            raise RedisError("down")
+        key, amount = self._ops[0]
+        self.values[key] = self.values.get(key, 0) + amount
+        return [self.values[key], True]
+
+    def decrby(self, key, amount):
+        if self.fail == "rollback":
+            raise RedisError("down")
+        self.values[key] -= amount
+
+
+@pytest.mark.parametrize("failure", ["init", "increment", "rollback", None])
+def test_configured_redis_never_falls_back_to_memory(monkeypatch, failure):
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://budget.invalid:6379/0")
+    fake = _FakeRedis(failure)
+
+    def client(_url):
+        if failure == "init":
+            raise ValueError("bad url")
+        return fake
+
+    monkeypatch.setattr(widget_voice_budget, "_redis_client", client)
+    if failure == "rollback":
+        monkeypatch.setenv(SETTINGS["tts-site"], "0")
+        with pytest.raises(VoiceBudgetExhausted):
+            reserve_tts_sync("agent:1", "v", 4)
+    elif failure is not None:
+        with pytest.raises(VoiceBudgetUnavailable):
+            reserve_tts_sync("agent:1", "v", 4)
+    else:
+        reserve_tts_sync("agent:1", "v", 4)
+        assert sorted(fake.values.values()) == [4, 4, 4]
+    assert widget_voice_budget._memory_store._counts == {}
+
+
+@pytest.mark.parametrize("phase", ["test", "hit"])
+def test_widget_voice_rate_limit_fails_closed(monkeypatch, phase):
+    share_rate_limit.reset_share_rate_limiter()
+    limiter = share_rate_limit.get_share_rate_limiter()
+
+    def broken(*_args):
+        raise RedisError("storage down")
+
+    monkeypatch.setattr(limiter._limiter, phase, broken)
+    assert limiter.allow_widget_voice_tts("agent:1", "1.2.3.4") is False
+    share_rate_limit.reset_share_rate_limiter()
+
+
+def test_widget_voice_rate_limit_pairs_ip_and_entity(monkeypatch):
+    monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT", "1/minute")
+    share_rate_limit.reset_share_rate_limiter()
+    limiter = share_rate_limit.get_share_rate_limiter()
+    assert limiter.allow_widget_voice_tts("agent:1", "1.2.3.4") is True
+    assert limiter.allow_widget_voice_tts("agent:1", "1.2.3.4") is False
+    assert limiter.allow_widget_voice_tts("agent:1", "5.6.7.8") is True
+    share_rate_limit.reset_share_rate_limiter()

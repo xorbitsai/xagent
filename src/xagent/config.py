@@ -298,6 +298,12 @@ WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
 WIDGET_VOICE_ASR_MODEL = "XAGENT_WIDGET_VOICE_ASR_MODEL"
 WIDGET_VOICE_TTS_MODEL = "XAGENT_WIDGET_VOICE_TTS_MODEL"
 WIDGET_VOICE_TTS_VOICE = "XAGENT_WIDGET_VOICE_TTS_VOICE"
+WIDGET_VOICE_TTS_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT"
+WIDGET_VOICE_TTS_IP_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT"
+WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS"
+WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS"
+WIDGET_VOICE_TTS_SITE_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS"
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS = "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -2392,6 +2398,48 @@ def get_widget_voice_tts_model() -> str | None:
 def get_widget_voice_tts_voice() -> str | None:
     """Optional voice for widget voice synthesis; unset uses the model's own."""
     return _get_optional_setting(WIDGET_VOICE_TTS_VOICE)
+
+
+def get_widget_voice_tts_rate_limit() -> str:
+    """Per-widget-entity limit on widget guest speech synthesis requests.
+
+    The loose backstop across all callers of one widget. A reply is
+    synthesized sentence by sentence, so one spoken reply is several requests.
+    """
+    return _get_rate_limit(WIDGET_VOICE_TTS_RATE_LIMIT, "600/minute")
+
+
+def get_widget_voice_tts_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget guest speech synthesis requests.
+
+    The tight bucket: six spoken replies of twenty sentences each in one
+    minute is 120 requests from one caller.
+    """
+    return _get_rate_limit(WIDGET_VOICE_TTS_IP_RATE_LIMIT, "120/minute")
+
+
+def get_widget_voice_tts_visitor_daily_chars() -> str:
+    """Raw daily synthesis character budget for one widget visitor.
+
+    Parsed by the widget voice budget, which falls back to its default with a
+    warning on a negative or unparsable value. 0 refuses every request.
+    """
+    return (os.getenv(WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS) or "").strip()
+
+
+def get_widget_voice_tts_entity_daily_chars() -> str:
+    """Raw daily synthesis character budget for one widget agent or workforce."""
+    return (os.getenv(WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS) or "").strip()
+
+
+def get_widget_voice_tts_site_daily_chars() -> str:
+    """Raw daily synthesis character budget for all widget voice on this site."""
+    return (os.getenv(WIDGET_VOICE_TTS_SITE_DAILY_CHARS) or "").strip()
+
+
+def get_widget_voice_tts_max_text_chars() -> str:
+    """Raw per-request text limit for widget voice synthesis."""
+    return (os.getenv(WIDGET_VOICE_TTS_MAX_TEXT_CHARS) or "").strip()
 
 
 def get_share_run_quota() -> str:

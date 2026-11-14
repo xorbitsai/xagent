@@ -4410,23 +4410,25 @@ def _generic_oauth_login(
     native_start = auth_backend is None
     if db is None:
         raise RuntimeError("db session is required")
-    if not db_provider:
-        return HTMLResponse(
-            content="<h1>Error: Provider not configured</h1>", status_code=500
-        )
-
-    client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
-    # A Composio start keeps only this start's state: Composio's own app
-    # authorizes, so our client id is never sent (composio_auth). The one
-    # later reader, Google shared-grant mode below, never takes a Composio
-    # start (#3649).
-    if not client_id and native_start:
-        return _oauth_provider_config_error(
-            provider, [_oauth_env_name(provider, "CLIENT_ID")]
-        )
-    auth_url = db_provider.auth_url
-
-    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+    if native_start:
+        if not db_provider:
+            return HTMLResponse(
+                content="<h1>Error: Provider not configured</h1>", status_code=500
+            )
+        client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
+        if not client_id:
+            return _oauth_provider_config_error(
+                provider, [_oauth_env_name(provider, "CLIENT_ID")]
+            )
+        auth_url = db_provider.auth_url
+        redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+        default_scopes = db_provider.default_scopes
+    else:
+        # A Composio start keeps only the state; the URL built here is discarded.
+        client_id = ""
+        auth_url = ""
+        redirect_uri = ""
+        default_scopes = None
 
     user_id = trusted_user_id
     session_epoch: str | None = trusted_session_epoch
@@ -4611,9 +4613,7 @@ def _generic_oauth_login(
                 app_scopes = app_info["oauth_scopes"]
             app_optional_scopes = app_info.get("optional_oauth_scopes") or []
 
-    scopes, scope_str = _merged_oauth_scopes(
-        db_provider.default_scopes, app_scopes, provider
-    )
+    scopes, scope_str = _merged_oauth_scopes(default_scopes, app_scopes, provider)
     # Sent via the authorize request's own optional_scope parameter (see
     # get_builtin_execution_fields_and_optional_scopes) rather than merged
     # into `scopes` above: a scope tier-gated on the connected account's

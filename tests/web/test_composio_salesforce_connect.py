@@ -175,6 +175,23 @@ def _salesforce_provider() -> SimpleNamespace:
     )
 
 
+def _install_salesforce(db: Session, user: User) -> None:
+    app = get_builtin_public_mcp_app("salesforce")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    db.commit()
+    server = ensure_builtin_oauth_server_definition(db, app_id="salesforce")
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+
 def _start_salesforce(db: Session, user: User, browser: Browser) -> Any:
     response = auth_api.start_builtin_oauth_for_resource_owner(
         provider="salesforce",
@@ -242,20 +259,7 @@ def test_with_the_switch_off_a_salesforce_start_stays_native(
 ):
     monkeypatch.delenv("XAGENT_SALESFORCE_AUTH_BACKEND", raising=False)
     db, user = db_session
-    app = get_builtin_public_mcp_app("salesforce")
-    assert app is not None
-    db.add(PublicMCPApp(**app))
-    db.commit()
-    server = ensure_builtin_oauth_server_definition(db, app_id="salesforce")
-    db.add(
-        UserMCPServer(
-            user_id=int(user.id),
-            mcpserver_id=int(server.id),
-            is_owner=True,
-            is_active=True,
-        )
-    )
-    db.commit()
+    _install_salesforce(db, user)
 
     response = _start_salesforce(db, user, Browser())
 
@@ -270,6 +274,29 @@ def test_with_the_switch_off_a_salesforce_start_stays_native(
     assert query["scope"] == ["api refresh_token openid"]
     state = auth_api.verify_token(query["state"][0])
     assert composio_auth.AUTH_BACKEND_CLAIM not in state
+    assert composio.calls == []
+
+
+def test_with_the_switch_off_a_start_without_the_row_is_refused(
+    db_session, composio_env, composio, monkeypatch
+):
+    monkeypatch.delenv("XAGENT_SALESFORCE_AUTH_BACKEND", raising=False)
+    monkeypatch.delenv("SALESFORCE_CLIENT_ID", raising=False)
+    db, user = db_session
+    _install_salesforce(db, user)
+
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="salesforce",
+        app_id="salesforce",
+        user=user,
+        resource_owner_key=OWNER,
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=None,
+    )
+
+    assert response.status_code == 500
+    assert "Provider not configured" in response.body.decode()
     assert composio.calls == []
 
 
@@ -344,6 +371,83 @@ def test_a_salesforce_connect_stores_the_orgs_own_user_id(salesforce):
     assert grant.access_token == composio.created[-1]
     assert db.query(ActorOAuthFlowState).count() == 0
     assert _flow_cookies(browser) == []
+
+
+def test_a_salesforce_start_needs_no_provider_row(salesforce, monkeypatch):
+    """The actor start no longer needs the native row; the hosting product and
+    the connector smoke still require it until their own changes land."""
+    db, user, composio = salesforce
+    monkeypatch.delenv("SALESFORCE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SALESFORCE_CLIENT_SECRET", raising=False)
+    assert (
+        db.query(OAuthProvider)
+        .filter(OAuthProvider.provider_name == "salesforce")
+        .first()
+        is None
+    )
+    browser = Browser()
+
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="salesforce",
+        app_id="salesforce",
+        user=user,
+        resource_owner_key=OWNER,
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=None,
+    )
+    db.commit()
+    browser.receive(start)
+
+    assert start.status_code in (302, 307)
+    location = urlsplit(start.headers["location"])
+    assert location.geturl().startswith(f"{CALLBACK_URL}?state=")
+    state = auth_api.verify_token(parse_qs(location.query)["state"][0])
+    assert state[composio_auth.AUTH_BACKEND_CLAIM] == composio_auth.AUTH_BACKEND
+
+    begin = browser.get(db, start.headers["location"])
+    assert begin.status_code == 302, begin.body
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 200, response.body
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.token_type) == ("salesforce", "composio")
+    assert db.query(ActorOAuthFlowState).count() == 0
+
+
+class _RecordingProvider:
+    """A provider row that records every field read; none is expected."""
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.reads.append(name)
+        return None
+
+
+def test_a_salesforce_composio_start_reads_no_provider_field(salesforce, monkeypatch):
+    db, user, composio = salesforce
+    monkeypatch.delenv("SALESFORCE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SALESFORCE_CLIENT_SECRET", raising=False)
+    provider = _RecordingProvider()
+    browser = Browser()
+
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="salesforce",
+        app_id="salesforce",
+        user=user,
+        resource_owner_key=OWNER,
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=provider,
+    )
+    db.commit()
+    browser.receive(start)
+
+    assert start.status_code in (302, 307)
+    assert start.headers["location"].startswith(f"{CALLBACK_URL}?state=")
+    assert provider.reads == []
 
 
 def _native_salesforce_grant(user: User, owner: str | None, token: str) -> UserOAuth:

@@ -45,6 +45,7 @@ from xagent.web.services.user_oauth import delete_scoped_user_oauth_accounts
 
 from . import test_composio_facebook_connect as facebook_connect
 from .test_composio_facebook_connect import (
+    CALLBACK_URL,
     OWNER,
     Browser,
     FakeComposio,
@@ -347,6 +348,42 @@ def test_a_google_flow_uses_the_shared_callback_not_googles(google, monkeypatch)
     )
     assert composio.calls == []
     assert _flow_cookies(browser) == []
+
+
+def test_a_google_composio_start_needs_no_provider_row(google, monkeypatch):
+    db, user, composio = google
+    app_id = "google-drive"
+    _switch_on(monkeypatch, app_id)
+    _install(db, user, app_id)
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    assert (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
+        is None
+    )
+    browser = Browser()
+
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="google",
+        app_id=app_id,
+        user=user,
+        resource_owner_key=OWNER,
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=None,
+    )
+    db.commit()
+    browser.receive(start)
+
+    assert start.status_code in (302, 307)
+    assert start.headers["location"].startswith(f"{CALLBACK_URL}?state=")
+    begin = browser.get(db, start.headers["location"])
+    assert begin.status_code == 302, begin.body
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 200, response.body
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.token_type) == (app_id, "composio")
 
 
 # --- The review gate binds native starts only -------------------------------------

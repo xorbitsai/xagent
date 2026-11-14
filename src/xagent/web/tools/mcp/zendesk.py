@@ -528,6 +528,16 @@ def _request(
                 "granted to this connection do not allow this request; "
                 "reconnecting Zendesk requests the scopes again."
             )
+        elif response.status_code == 409:
+            # A safe_update conflict means Zendesk saved nothing, so the
+            # caller must re-preview before retrying -- same guidance every
+            # in-tool refusal gives. No other tool sends safe_update, and a
+            # 409 never leaves a partial write behind.
+            message = (
+                f"{message}. The ticket changed since this preview and "
+                "nothing was saved; preview again and apply the macro to "
+                "the current ticket."
+            )
         if response.status_code >= 500:
             raise _OutcomeUnknownError(message) from exc
         raise RuntimeError(message) from exc

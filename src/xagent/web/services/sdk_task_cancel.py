@@ -120,12 +120,6 @@ _CANCELLABLE_STATUSES = frozenset(
     {TaskStatus.RUNNING, TaskStatus.WAITING_FOR_USER, TaskStatus.PAUSED}
 )
 
-# A waiting task no answer has claimed, as the reply path accepts it.
-_UNANSWERED_CONTROL_STATES = (
-    TaskControlState.IDLE.value,
-    TaskControlState.WAITING_FOR_USER.value,
-)
-
 
 def is_sdk_cancelled(status: object, error_message: object) -> bool:
     """Whether a task row is the outcome of an SDK cancellation.
@@ -394,7 +388,7 @@ def _unapplied_cancel_of_row(db: Session, task: Task) -> TaskExecutionCommand | 
     if cancel is None:
         return None
     payload: dict[str, Any] = cancel.payload if isinstance(cancel.payload, dict) else {}
-    if payload.get("scope") != SDK_COMMAND_SCOPE or "queued_run_id" in payload:
+    if payload.get("scope") != SDK_COMMAND_SCOPE:
         return None
     return cancel
 
@@ -523,20 +517,15 @@ def _prepare_cancel_sync(
 
 
 def _answer_in_flight(db: Session, task: Task) -> bool:
-    """Whether a reply already claimed the waiting run or is queued to."""
+    """Whether a reply already claimed the waiting run or is queued to, by
+    the reply path's own acceptance rules."""
 
-    if task.control_state not in _UNANSWERED_CONTROL_STATES:
+    from .task_question_cancel import _pending_resume_command_exists
+    from .task_resume import _RESUMABLE_CONTROL_STATES
+
+    if task.control_state not in _RESUMABLE_CONTROL_STATES:
         return True
-    return (
-        db.query(TaskExecutionCommand.id)
-        .filter(
-            TaskExecutionCommand.task_id == task.id,
-            TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value,
-            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
-        )
-        .first()
-        is not None
-    )
+    return bool(db.scalar(select(_pending_resume_command_exists(int(task.id)))))
 
 
 def _stage_cancel(
@@ -1000,26 +989,21 @@ def _close_cancelled_turn_no_commit(
     return turn_id
 
 
-def _queued_answer_exists(task_id: int) -> Any:
-    return (
-        select(TaskExecutionCommand.id)
-        .where(
-            TaskExecutionCommand.task_id == task_id,
-            TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value,
-            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
-        )
-        .exists()
-    )
-
-
-def _stop_auto_resume_no_commit(db: Session, task: Task) -> int:
+def _stop_auto_resume_no_commit(
+    db: Session,
+    task: Task,
+    *,
+    expected_run_id: str | None,
+    expected_state_version: int,
+) -> int:
     """Stop the automatic resume a paused run waits for; return the version
     the task holds afterwards.
 
     Without this the sweeper could still dispatch the resume it had
     scheduled. A run with nothing pending -- none was scheduled, or it gave
-    up -- is left as it is. Raises ``StaleTaskRunError`` when the stop lost
-    a race, so the caller reads again.
+    up -- is left as it is. Raises ``StaleTaskRunError`` when the row read
+    under the lock is no longer the run and version the cancel was aimed
+    at, or when the stop lost a race, so the caller reads again.
     """
 
     from .task_auto_resume import cancel_pending_auto_resume_no_commit
@@ -1032,6 +1016,12 @@ def _stop_auto_resume_no_commit(db: Session, task: Task) -> int:
         .populate_existing()
         .one()
     )
+    if (
+        _task_run_id(locked) != expected_run_id
+        or int(locked.state_version or 0) != expected_state_version
+    ):
+        db.rollback()
+        raise StaleTaskRunError(_stale(locked, expected_run_id, expected_state_version))
     stopped = cancel_pending_auto_resume_no_commit(db, locked, at="sdk_cancel")
     if stopped.raced:
         db.rollback()
@@ -1077,11 +1067,18 @@ def _finalize_sdk_cancel_sync(
     from .task_interaction_close import (
         terminate_active_interaction_for_question_cancel,
     )
+    from .task_interaction_read import get_pending_interaction_question
     from .task_lease_service import task_settlement_ownership_values
     from .task_orchestrator import (
         invalidate_task_cache_best_effort,
         sync_trigger_run_status,
     )
+    from .task_question_cancel import (
+        _latest_question_row,
+        _materialize_question_step,
+        _pending_resume_command_exists,
+    )
+    from .task_resume import _RESUMABLE_CONTROL_STATES
     from .workforce_runtime import sync_workforce_run_status
 
     SessionLocal = get_session_local()
@@ -1117,7 +1114,12 @@ def _finalize_sdk_cancel_sync(
 
         fence_version = expected_state_version
         if expected_status == TaskStatus.PAUSED:
-            fence_version = _stop_auto_resume_no_commit(db, task)
+            fence_version = _stop_auto_resume_no_commit(
+                db,
+                task,
+                expected_run_id=expected_run_id,
+                expected_state_version=expected_state_version,
+            )
         statement = (
             update(Task)
             .where(
@@ -1145,8 +1147,8 @@ def _finalize_sdk_cancel_sync(
             statement = statement.where(task_lease_predicate(coordinator.lease))
         if expected_status == TaskStatus.WAITING_FOR_USER:
             statement = statement.where(
-                Task.control_state.in_(_UNANSWERED_CONTROL_STATES),
-                ~_queued_answer_exists(task_id),
+                Task.control_state.in_(tuple(_RESUMABLE_CONTROL_STATES)),
+                ~_pending_resume_command_exists(task_id),
             )
 
         # ``task`` is already in the identity map, so RETURNING hands back
@@ -1165,11 +1167,23 @@ def _finalize_sdk_cancel_sync(
             )
         if expected_status == TaskStatus.WAITING_FOR_USER:
             # After the task row's write, which is the lock order the
-            # interaction writers require.
+            # interaction writers require, and in the order abandoning the
+            # question uses: the question is read before the rows that carry
+            # it are closed, and a question with no trace row is given one
+            # so the task's steps still show it.
+            question, interactions = get_pending_interaction_question(db, updated)
+            question_row = _latest_question_row(db, task_id)
             terminate_active_interaction_for_question_cancel(
                 db, task_id=task_id, run_id=expected_run_id
             )
             supersede_legacy_question_rows(db, task_id=task_id)
+            _materialize_question_step(
+                db,
+                task=updated,
+                question=question,
+                interactions=interactions,
+                question_row=question_row,
+            )
         sync_workforce_run_status(db, updated, TaskStatus.FAILED)
         sync_trigger_run_status(db, updated, TaskStatus.FAILED)
         if expected_status != TaskStatus.PENDING:
@@ -1430,11 +1444,14 @@ async def cancel_sdk_task_unserialized(
     if cancel_from is not None:
         from .task_execution import background_task_manager
 
-        # Returns once the run coroutine has unwound, which normally means
-        # its own settlement already wrote the cancelled row.
-        await background_task_manager.cancel_task(
-            task_id, timeout_seconds=SDK_CANCEL_WAIT_SECONDS
-        )
+        if cancel_from == TaskStatus.RUNNING:
+            # Returns once the run coroutine has unwound, which normally
+            # means its own settlement already wrote the cancelled row. A
+            # waiting or paused run has no coroutine; this core writes its
+            # row.
+            await background_task_manager.cancel_task(
+                task_id, timeout_seconds=SDK_CANCEL_WAIT_SECONDS
+            )
 
         def finalize() -> bool:
             return _finalize_sdk_cancel_sync(
@@ -1457,8 +1474,8 @@ async def cancel_sdk_task_unserialized(
             wrote = await run_db_io_cancellation_safe(finalize)
         if wrote:
             # No settlement wrote the row, so no coroutine had unwound here.
-            # One that registered since the call above is stopped now; its
-            # settlement finds the row terminal and writes nothing.
+            # One that registered since the target was read is stopped now;
+            # its settlement finds the row terminal and writes nothing.
             await background_task_manager.cancel_task(
                 task_id, timeout_seconds=SDK_CANCEL_WAIT_SECONDS
             )

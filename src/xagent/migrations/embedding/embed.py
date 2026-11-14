@@ -444,8 +444,8 @@ def _reconcile_document(
 
     Liveness is read from the core chunks table after the write, so a delete or
     a retirement that landed during the provider work is seen here. When that
-    table holds no row of the document at all, this raises
-    :class:`UnknownLiveness` and deletes nothing: the rows just written are
+    table holds no row of the document while the source still has it, this
+    raises :class:`UnknownLiveness` and deletes nothing: the rows just written are
     kept and the document is reported instead of being guessed at. Returns the
     chunk ids removed, so the caller does not count them as embedded.
     """
@@ -669,8 +669,6 @@ def _encode(
 
 
 def _validate_vector(vector: Any, dimension: Optional[int]) -> None:
-    import math
-
     if not isinstance(vector, list) or not vector:
         raise ValueError("provider returned a non-list vector")
     if dimension is not None and len(vector) != dimension:

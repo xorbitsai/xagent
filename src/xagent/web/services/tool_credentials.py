@@ -150,6 +150,14 @@ TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
             "label": "API Key",
         }
     },
+    "brave_web_search": {
+        "api_key": {
+            "secret": True,
+            "env": ["BRAVE_SEARCH_API_KEY"],
+            "required": True,
+            "label": "API Key",
+        }
+    },
     "web_search": {
         "api_key": {
             "secret": True,

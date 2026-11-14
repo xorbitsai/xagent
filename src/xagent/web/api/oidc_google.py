@@ -355,7 +355,7 @@ def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
         "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
         "user_id": user.id,
         "idle_session": browser_idle.idle_session_fields(
-            user, sid, last_activity_at=browser_idle.utcnow()
+            user, sid, last_activity_at=browser_idle.utcnow(), db=db
         ),
     }
     commit_refresh_credentials(

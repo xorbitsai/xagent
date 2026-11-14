@@ -7,14 +7,14 @@ refresh, polling, keepalives and other requests never move it.
 
 With the policy enabled, a credential is rejected once its login is past
 ``last activity + threshold``, has no row, or carries no ``sid`` (issued before
-this release). An expired login is revoked on its row; a revoked row is
-rejected whether or not the policy is enabled.
+this release). Requests only reject; the sweep and logout revoke a login's
+row, and a revoked row is rejected whether or not the policy is enabled.
 
 Switching the policy off must not revive a login that expired while it was
 enforced, including one no request saw expire. Replicas with the policy
 enabled keep renewing an enforcement lease (``browser_idle_enforcement``). With
 the policy disabled, a login whose deadline passed before the lease ended is
-still rejected and revoked; a login alive at switch-off is free at once.
+still rejected; a login alive at switch-off is free at once.
 Deployments that never enable the policy have no lease and behave as before.
 
 Rows live in the database, so all workers see the same state and it survives
@@ -167,25 +167,6 @@ def revoke_browser_session(
         synchronize_session=False,
     )
     return changed == 1
-
-
-def _revoke_in_new_transaction(db: Session, sid: str, reason: str) -> None:
-    """Persist a revocation seen by a read-only request.
-
-    Uses its own Session on the same engine so the caller's transaction is
-    neither committed nor rolled back. Best effort: the request is rejected
-    either way, and the sweep revokes the login if this write fails. Two
-    limits: it takes a second pooled connection while the request holds one,
-    and if the caller's Session is bound to a Connection rather than an
-    Engine, the write joins that connection's transaction and is lost if the
-    caller rolls back.
-    """
-    try:
-        with Session(bind=db.get_bind()) as revoking:
-            if revoke_browser_session(revoking, sid, reason=reason):
-                revoking.commit()
-    except Exception:
-        logger.warning("Could not revoke an idle-expired browser login", exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -349,6 +330,40 @@ def _alive_condition(
     return and_(*conditions)
 
 
+def _expired(
+    db: Session,
+    user: User,
+    last: datetime,
+    recorded_admin: bool,
+    *,
+    now: datetime,
+    policy: BrowserIdlePolicy,
+) -> bool:
+    if policy.enabled:
+        if last + idle_timeout(user, policy) <= now:
+            return True
+        if last > now - _MIN_THRESHOLD:
+            return False
+        # During a rolling threshold change the stricter of this replica's
+        # threshold and every set still being enforced governs.
+        current = bool(user.is_admin)
+        return any(
+            last + lease.timeout(current) <= now for lease in _active_leases(db, now)
+        )
+    # Switched off: only a login that expired while the policy was still
+    # enforced stays dead. A login alive at switch-off is free. No threshold is
+    # below a minute, so a login active within the last minute cannot have
+    # expired; skip the lease lookup for it.
+    if last > now - _MIN_THRESHOLD:
+        return False
+    return expired_while_enforced(
+        enforcement_leases(db),
+        last_activity_at=last,
+        roles=(recorded_admin, bool(user.is_admin)),
+        now=now,
+    )
+
+
 def _rejects(
     db: Session,
     user: User,
@@ -358,6 +373,13 @@ def _rejects(
     now: datetime | None,
     policy: BrowserIdlePolicy,
 ) -> bool:
+    """Whether the login is rejected; never writes.
+
+    Expiry is not revoked here: durability comes from the enforcement lease
+    and the sweep, whose conditional UPDATE decides and writes in one
+    statement. A request reads no extra connection, and a stale row cannot
+    revoke a login another request has just kept alive.
+    """
     if row is not None and row.revoked_at is not None:
         return True
     if row is None:
@@ -368,34 +390,29 @@ def _rejects(
         return policy.enabled
     now = now or utcnow()
     last = _as_utc(cast(datetime, row.last_activity_at))
-    if policy.enabled:
-        expired = last + idle_timeout(user, policy) <= now
-        if not expired and last <= now - _MIN_THRESHOLD:
-            # During a rolling threshold change the stricter of this
-            # replica's threshold and every set still being enforced governs.
-            current = bool(user.is_admin)
-            expired = any(
-                last + lease.timeout(current) <= now
-                for lease in _active_leases(db, now)
-            )
-    else:
-        # Switched off: only a login that expired while the policy was still
-        # enforced stays dead. A login alive at switch-off is free. No
-        # threshold is below a minute, so a login active within the last
-        # minute cannot have expired; skip the lease lookup for it.
-        if last > now - _MIN_THRESHOLD:
-            return False
-        expired = expired_while_enforced(
-            enforcement_leases(db),
-            last_activity_at=last,
-            roles=(bool(row.recorded_admin), bool(user.is_admin)),
-            now=now,
-        )
-    if not expired:
+    if not _expired(db, user, last, bool(row.recorded_admin), now=now, policy=policy):
         return False
-    assert sid is not None
-    _revoke_in_new_transaction(db, sid, "idle")
-    return True
+    # Re-read the committed state before rejecting: the loaded row may predate
+    # an activity report that kept the login alive.
+    fresh = db.execute(
+        select(
+            BrowserSession.last_activity_at,
+            BrowserSession.revoked_at,
+            BrowserSession.recorded_admin,
+        ).where(BrowserSession.sid == row.sid)
+    ).one_or_none()
+    if fresh is None:
+        return policy.enabled
+    if fresh.revoked_at is not None:
+        return True
+    return _expired(
+        db,
+        user,
+        _as_utc(fresh.last_activity_at),
+        bool(fresh.recorded_admin),
+        now=now,
+        policy=policy,
+    )
 
 
 def session_rejected(
@@ -561,7 +578,13 @@ def record_activity(
     last = _as_utc(cast(datetime, row.last_activity_at))
     if now - last < ACTIVITY_WRITE_INTERVAL:
         return last
-    conditions = [BrowserSession.sid == sid, BrowserSession.revoked_at.is_(None)]
+    conditions = [
+        BrowserSession.sid == sid,
+        BrowserSession.revoked_at.is_(None),
+        # Coalescing is part of the atomic predicate, so concurrent reports
+        # write at most once per interval and never move the time backward.
+        BrowserSession.last_activity_at <= now - ACTIVITY_WRITE_INTERVAL,
+    ]
     alive = _alive_condition(db, user, now=now, policy=policy)
     if alive is not None:
         conditions.append(alive)
@@ -577,11 +600,16 @@ def record_activity(
             synchronize_session=False,
         )
     )
-    if changed != 1:
-        db.rollback()
+    if changed == 1:
+        db.commit()
+        return now
+    db.rollback()
+    # Nothing written: another report got there first (coalesced), or the
+    # login expired or was revoked. Decide from the committed state.
+    current = _load(db, user, sid)
+    if current is None or _rejects(db, user, sid, current, now=now, policy=policy):
         raise BrowserSessionRejected()
-    db.commit()
-    return now
+    return _as_utc(cast(datetime, current.last_activity_at))
 
 
 def last_activity(db: Session, user: User, sid: str | None) -> datetime | None:
@@ -606,11 +634,17 @@ def build_idle_session(
     now: datetime | None = None,
     absolute_expires_at: datetime | None = None,
     policy: BrowserIdlePolicy | None = None,
+    timeout: timedelta | None = None,
 ) -> dict[str, Any]:
-    """The ``idle_session`` response object; needs no core User."""
+    """The ``idle_session`` response object; needs no core User.
+
+    ``timeout`` overrides the policy threshold, e.g. with the effective one
+    during a rolling threshold change.
+    """
     policy = policy or get_browser_idle_policy()
     now = now or utcnow()
-    timeout = timedelta(seconds=policy.timeout_seconds(is_platform_admin))
+    if timeout is None:
+        timeout = timedelta(seconds=policy.timeout_seconds(is_platform_admin))
     if last_activity_at is None:
         expires_in = 0
     else:
@@ -632,6 +666,27 @@ def build_idle_session(
     }
 
 
+def effective_idle_timeout(
+    db: Session,
+    *,
+    is_platform_admin: bool,
+    now: datetime | None = None,
+    policy: BrowserIdlePolicy | None = None,
+) -> timedelta:
+    """The threshold admission enforces for a role; needs no core User.
+
+    With the policy enabled, the stricter of this replica's threshold and every
+    set still being enforced (a rolling change). Pass it to
+    ``build_idle_session(timeout=...)``.
+    """
+    policy = policy or get_browser_idle_policy()
+    own = timedelta(seconds=policy.timeout_seconds(is_platform_admin))
+    if not policy.enabled:
+        return own
+    leases = _active_leases(db, now or utcnow())
+    return min([own] + [lease.timeout(is_platform_admin) for lease in leases])
+
+
 def idle_session_fields(
     user: User,
     sid: str | None,
@@ -640,8 +695,21 @@ def idle_session_fields(
     now: datetime | None = None,
     absolute_expires_at: datetime | None = None,
     policy: BrowserIdlePolicy | None = None,
+    db: Session | None = None,
 ) -> dict[str, Any]:
-    """``build_idle_session`` for a core User; the role comes from the database."""
+    """``build_idle_session`` for a core User; the role comes from the database.
+
+    With ``db`` and the policy enabled, the reported threshold is the one
+    admission enforces: the stricter of this replica's and every threshold set
+    still being enforced during a rolling change.
+    """
+    policy = policy or get_browser_idle_policy()
+    now = now or utcnow()
+    timeout = None
+    if db is not None:
+        timeout = effective_idle_timeout(
+            db, is_platform_admin=bool(user.is_admin), now=now, policy=policy
+        )
     return build_idle_session(
         is_platform_admin=bool(user.is_admin),
         sid=sid,
@@ -649,6 +717,7 @@ def idle_session_fields(
         now=now,
         absolute_expires_at=absolute_expires_at,
         policy=policy,
+        timeout=timeout,
     )
 
 

@@ -2147,7 +2147,7 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
         "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
         "user_id": user.id,
         "idle_session": browser_idle.idle_session_fields(
-            user, sid, last_activity_at=browser_idle.utcnow()
+            user, sid, last_activity_at=browser_idle.utcnow(), db=object_session(user)
         ),
     }
 
@@ -2974,6 +2974,7 @@ def _prepare_refresh_response(
             user,
             sid,
             last_activity_at=last_activity or browser_idle.utcnow(),
+            db=db,
         ),
     )
 
@@ -3131,6 +3132,7 @@ async def verify_current_token(
             current_user,
             sid,
             last_activity_at=browser_idle.last_activity(db, current_user, sid),
+            db=db,
         ),
     }
 
@@ -3153,7 +3155,7 @@ def report_browser_activity(
     return {
         "success": True,
         "idle_session": browser_idle.idle_session_fields(
-            current_user, sid, last_activity_at=last_activity
+            current_user, sid, last_activity_at=last_activity, db=db
         ),
     }
 

@@ -19,6 +19,7 @@ SCHEMA = pa.schema(
         ("text", pa.string()),
         ("chunk_hash", pa.string()),
         ("metadata", pa.string()),
+        ("model", pa.string()),
         ("vector", pa.list_(pa.float32(), 2)),
     ]
 )
@@ -31,6 +32,7 @@ def _row(
     user_id: Optional[int] = 7,
     text: Optional[str] = "t",
     collection: str = "kb",
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "collection": collection,
@@ -41,6 +43,7 @@ def _row(
         "text": text,
         "chunk_hash": "h",
         "metadata": None,
+        "model": model,
         "vector": [0.5, 0.5],
     }
 
@@ -81,12 +84,23 @@ class _Query:
 def _matches(row: Dict[str, Any], where: str) -> bool:
     if not where or where == "true":
         return True
-    for clause in where.split(" AND "):
-        column, _, literal = clause.partition(" = ")
-        literal = literal.strip("'")
-        if str(row.get(column.strip())) != literal:
-            return False
-    return True
+    return all(_matches_clause(row, part) for part in where.split(" AND "))
+
+
+def _matches_clause(row: Dict[str, Any], clause: str) -> bool:
+    if clause.startswith("(") and clause.endswith(")"):
+        return any(_matches_clause(row, part) for part in clause[1:-1].split(" OR "))
+    if clause.endswith(" IS NULL"):
+        return row.get(clause[: -len(" IS NULL")].strip()) is None
+    for operator in (" != ", " = "):
+        if operator in clause:
+            column, _, literal = clause.partition(operator)
+            value = row.get(column.strip())
+            if operator == " != ":
+                # SQL: NULL is not "different from", it is unknown.
+                return value is not None and str(value) != literal.strip("'")
+            return str(value) == literal.strip("'")
+    raise AssertionError(f"unsupported filter clause: {clause!r}")
 
 
 class _Table:
@@ -325,7 +339,7 @@ def test_the_missing_count_uses_the_target_table(
         {
             mod.METADATA_TABLE: _metadata([_bound()]),
             _writer(): _Table([_row("c1"), _row("c2"), _row("c3")]),
-            mod.source_table("new-model"): _Table([_row("c1")]),
+            mod.source_table("new-model"): _Table([_row("c1", model="new-model")]),
         }
     )
     _wire(monkeypatch, conn)
@@ -337,7 +351,7 @@ def test_the_missing_count_uses_the_target_table(
 def test_a_target_row_with_a_bad_vector_is_still_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    bad = _row("c1")
+    bad = _row("c1", model="new-model")
     bad["vector"] = [0.0, 0.0]
     conn = _Conn(
         {

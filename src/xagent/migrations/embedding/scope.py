@@ -31,6 +31,7 @@ from xagent.core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_s
 logger = logging.getLogger(__name__)
 
 METADATA_TABLE = "collection_metadata"
+CORE_TABLE = "chunks"
 
 # Why a collection is not migrated. Each is reported with its count and the
 # collection is left untouched.
@@ -131,7 +132,7 @@ def table_names(conn: Any) -> Set[str]:
 
 
 def source_table(model_id: str) -> str:
-    """The one table the migration reads and writes for ``model_id``.
+    """The one table the migration writes for ``model_id``.
 
     The name the write path itself creates (``to_model_tag`` applied twice), so
     a row written here is the row search reads back.
@@ -227,6 +228,9 @@ def _legacy_spelling(model_id: str) -> Optional[str]:
     Mirrors ``open_embeddings_table``'s last fallback: the table is named after
     the model's own ``model_name``, which only the hub knows.
     """
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        EmbeddingAdapterError,
+    )
     from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
     from xagent.core.tools.core.RAG_tools.utils.model_resolver import (
         resolve_embedding_adapter,
@@ -236,23 +240,25 @@ def _legacy_spelling(model_id: str) -> Optional[str]:
     try:
         with user_scope_context(None, True):
             config, _ = resolve_embedding_adapter(model_id)
-    except Exception:  # noqa: BLE001 - an unconfigured model has no legacy table
+    except EmbeddingAdapterError:
+        # An unconfigured model has no legacy table. Any other failure is a real
+        # one: reading it as "no fallback" would hide a table search can open.
         return None
     name = getattr(config, "model_name", None)
     return f"embeddings_{to_model_tag(name)}" if name else None
 
 
-def source_spellings(model_id: str) -> List[str]:
-    """Every table name search may serve this binding from, writer's first.
+def readable_tables(model_id: str) -> Tuple[str, ...]:
+    """Every physical table search may serve ``model_id`` from, writer's first.
 
-    The writer's own spelling (``to_model_tag`` applied twice, what every write
-    creates), its once-applied form, and the provider-name table search falls
-    back to when the id and the model's name differ. Another model's table is
-    never here, so a precomputed target does not disqualify its source.
+    ``open_embeddings_table`` tries these in order: the writer's spelling
+    (``to_model_tag`` applied twice, what every write creates), its
+    once-applied form, and the provider-name table the hub resolves. Only the
+    first one that exists is read, so every question about what a model's rows
+    can be read from is this question, and no other spelling is a safe guess.
     """
     from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
         embeddings_table_candidates,
-        written_embeddings_table_name,
     )
 
     names = [written_embeddings_table_name(model_id)]
@@ -260,18 +266,73 @@ def source_spellings(model_id: str) -> List[str]:
     legacy = _legacy_spelling(model_id)
     if legacy:
         names.append(legacy)
-    return list(dict.fromkeys(names))
+    return tuple(dict.fromkeys(names))
+
+
+def written_by(row: Dict[str, Any], model_id: str) -> bool:
+    """Whether this row's ``model`` column names ``model_id``.
+
+    Distinct ids share a writer spelling (``old-model`` and ``old_model``), so a
+    row in the target's table can belong to another model; counting it as the
+    target's would skip the copy that makes it searchable there.
+    """
+    return str(row.get("model") or "").strip() == model_id.strip()
+
+
+def _count_rows(conn: Any, table: str, where: Optional[str] = None) -> int:
+    opened = conn.open_table(table)
+    try:
+        return int(opened.count_rows(where) if where else opened.count_rows())
+    finally:
+        _safe_close_table(opened)
 
 
 def _holds_rows(conn: Any, table: str, collection: str) -> bool:
-    opened = conn.open_table(table)
-    try:
-        if "collection" not in opened.schema.names:
-            # Cannot attribute a row to a collection: any row counts.
-            return int(opened.count_rows()) > 0
-        return int(opened.count_rows(collection_filter(collection))) > 0
-    finally:
-        _safe_close_table(opened)
+    if "collection" not in schema_names(conn, table):
+        # Cannot attribute a row to a collection: any row counts.
+        return _count_rows(conn, table) > 0
+    return _count_rows(conn, table, collection_filter(collection)) > 0
+
+
+def _holds_rows_written_elsewhere(
+    conn: Any, table: str, collection: str, model: str
+) -> bool:
+    """Whether ``table`` holds this collection's rows written by another model.
+
+    A table without the column cannot attribute its rows to ``model``, so it is
+    treated as holding someone else's: search would serve them after the flip
+    and the copy never measured them.
+    """
+    if "collection" not in schema_names(conn, table):
+        return False
+    if "model" not in schema_names(conn, table):
+        return _count_rows(conn, table, collection_filter(collection)) > 0
+    foreign = (
+        f"{collection_filter(collection)} AND "
+        f"(model IS NULL OR model != '{escape_lancedb_string(model)}')"
+    )
+    return _count_rows(conn, table, foreign) > 0
+
+
+def target_tables_hold_foreign_rows(
+    conn: Any, collection: str, model_id: str, names: Set[str]
+) -> bool:
+    """Whether any table search opens for ``model_id`` holds rows that are not its own.
+
+    Either written by another model in its writer table, or in one of its
+    fallback spellings: search serves those after the flip, and the copy only
+    ever writes the writer table.
+    """
+    writer = source_table(model_id)
+    for table in readable_tables(model_id):
+        if table not in names:
+            continue
+        if table != writer:
+            if _holds_rows(conn, table, collection):
+                return True
+        elif _holds_rows_written_elsewhere(conn, table, collection, model_id):
+            return True
+    return False
 
 
 def require_columns(conn: Any, table: str, collection: str) -> None:
@@ -298,13 +359,13 @@ def source_eligibility(
     The only eligible shape is the one the write path produces: an explicit
     binding with a dimension, and the collection's rows in that binding's
     writer-spelled table and in none of the other tables search may open for
-    either model. With a target, its writer table must not be one of the
-    source's tables (a distinct id can alias a source fallback), and none of
-    the target's other tables may hold rows of this collection: search would
-    serve those after the flip, and the migration never copied them. Anything
-    else is refused with a reason, because copying it would either lose rows or
-    write a table search does not read. Read failures raise (see
-    :func:`collection_info`) instead of being reported as skips.
+    it. With a target, its readable tables must be disjoint from the source's
+    (a distinct id can alias a source fallback) and must hold no row of this
+    collection that the target did not write: search serves those after the
+    flip, and the migration never copied them. Anything else is refused with a
+    reason, because copying it would either lose rows or write a table search
+    does not read. Read failures raise (see :func:`collection_info`) instead of
+    being reported as skips.
     """
     from xagent.core.tools.core.RAG_tools.management.collection_manager import (
         _normalize_model_id,
@@ -327,27 +388,15 @@ def source_eligibility(
             model_id=model, engine=engine, reason=SKIP_BOUND_WITHOUT_DIMENSION
         )
     table = source_table(model)
-    spellings = source_spellings(model)
+    spellings = readable_tables(model)
     names = table_names(conn)
     eligible = Eligibility(
         model_id=model, dimension=dimension, table=table, engine=engine
     )
     if target_model_id and target_model_id != model:
-        target_table = source_table(target_model_id)
-        target_spellings = source_spellings(target_model_id)
-        if set(spellings) & set(target_spellings):
-            # Not only identical writer spellings: a target id can be the
-            # source's provider-name fallback, and the copy would land in a
-            # table the source's own eligibility then counts as a second one.
+        if set(spellings) & set(readable_tables(target_model_id)):
             return Eligibility(engine=engine, reason=SKIP_SHARED_TABLE)
-        elsewhere = [
-            name
-            for name in target_spellings
-            if name != target_table
-            and name in names
-            and _holds_rows(conn, name, collection)
-        ]
-        if elsewhere:
+        if target_tables_hold_foreign_rows(conn, collection, target_model_id, names):
             return Eligibility(engine=engine, reason=SKIP_TARGET_ROWS_IN_OTHER_TABLE)
     holders = [
         name
@@ -478,6 +527,28 @@ def iter_source_chunks(
         )
 
 
+def core_chunk_ids(
+    collection: str, doc_id: str, *, conn: Optional[Any] = None
+) -> Optional[Set[str]]:
+    """The document's chunk ids in the core chunks table, or ``None`` without one.
+
+    The delete contract deletes these rows before it sweeps embedding tables, so
+    they — not the embeddings ledger a copy sampled earlier — say whether a
+    chunk was deleted while it was being encoded.
+    """
+    conn = conn if conn is not None else connection()
+    if CORE_TABLE not in table_names(conn):
+        return None
+    where = (
+        f"{collection_filter(collection)} "
+        f"AND doc_id = '{escape_lancedb_string(doc_id)}'"
+    )
+    return {
+        str(row.get("chunk_id") or "")
+        for row in iter_rows(conn, CORE_TABLE, where, ["chunk_id"])
+    }
+
+
 def skip_reason(chunk: SearchableChunk) -> Optional[str]:
     """Why this source row cannot be migrated, or ``None`` when it can."""
     if not chunk.doc_id or not chunk.chunk_id:
@@ -509,28 +580,30 @@ def target_chunk_ids(
 
     A missing table means no rows yet (nothing was ever embedded for it), not a
     read failure: the migration creates the table on its first write. A row
-    whose vector is null, non-finite, all-zero or the wrong dimension is not
-    held: pending must include it so a rerun repairs it.
+    counts only when its ``model`` column names the target and its vector is
+    finite, non-zero and the right dimension; anything else is not held, so a
+    rerun repairs it.
     """
     from xagent.migrations.embedding.embed import _validate_vector
 
     conn = conn if conn is not None else connection()
-    table = source_table(model_id)
-    if table not in table_names(conn):
-        return set()
+    names = table_names(conn)
     held: Set[str] = set()
-    for row in iter_rows(
-        conn, table, collection_filter(collection), ["chunk_id", "vector"]
-    ):
-        chunk_id = str(row.get("chunk_id") or "")
-        if not chunk_id:
+    for table in readable_tables(model_id):
+        if table not in names:
             continue
-        try:
-            _validate_vector(row.get("vector"), dimension)
-            dimension = len(row["vector"])
-        except ValueError:
-            continue
-        held.add(chunk_id)
+        for row in iter_rows(
+            conn, table, collection_filter(collection), ["chunk_id", "vector", "model"]
+        ):
+            chunk_id = str(row.get("chunk_id") or "")
+            if not chunk_id or not written_by(row, model_id):
+                continue
+            try:
+                _validate_vector(row.get("vector"), dimension)
+                dimension = len(row["vector"])
+            except ValueError:
+                continue
+            held.add(chunk_id)
     return held
 
 

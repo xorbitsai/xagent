@@ -101,6 +101,7 @@ def _row(
     text: Optional[str] = None,
     user_id: Optional[int] = 7,
     collection: str = "kb",
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "collection": collection,
@@ -111,7 +112,7 @@ def _row(
         "text": text if text is not None else f"text {chunk_id}",
         "chunk_hash": f"h-{chunk_id}",
         "metadata": None,
-        "model": collection_model(collection),
+        "model": model if model is not None else collection_model(collection),
         "created_at": datetime(2026, 1, 1),
         "vector": [0.5, 0.5],
     }
@@ -786,3 +787,115 @@ def test_only_documents_with_pending_chunks_are_read(
 
     assert report.chunks_embedded == 1
     assert calls == ["d1"] * 2  # the copy's read and the reconciler's re-read
+
+
+# --- one table set per model, whatever the spelling ---
+
+
+@pytest.mark.parametrize(
+    ("source_id", "target_id", "legacy"),
+    [
+        ("old-model", "old_model", None),
+        ("BAAI/old-model", "baai_old_model", None),
+        (
+            "old-config",
+            "text-embedding-3-small",
+            {"old-config": "embeddings_text_embedding_3_small"},
+        ),
+        (
+            "old-config",
+            "text-embedding-3-small",
+            {"text-embedding-3-small": "embeddings_old_config"},
+        ),
+    ],
+    ids=[
+        "hyphen-underscore",
+        "once-twice-applied",
+        "target-is-source-fallback",
+        "source-is-target-fallback",
+    ],
+)
+def test_a_target_that_shares_any_readable_table_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    source_id: str,
+    target_id: str,
+    legacy: Optional[Dict[str, str]],
+) -> None:
+    monkeypatch.setattr(
+        scope, "_legacy_spelling", lambda model_id: (legacy or {}).get(model_id)
+    )
+    _save_collection(model_id=source_id, dimension=2)
+    _table(scope.source_table(source_id), [_row("c1")])
+    target = EmbeddingModelConfig(id=target_id, model_name=target_id, dimension=2)
+    adapter = _Adapter()
+    monkeypatch.setattr(mod, "resolve_collection_names", lambda **kwargs: ["kb"])
+    monkeypatch.setattr(mod, "resolve_target_model", lambda model_id: (target, adapter))
+
+    report = mod.embed_collections(target_id)
+
+    assert report.collections[0].collection_skip == scope.SKIP_SHARED_TABLE
+    assert adapter.calls == []
+    assert {row["chunk_id"] for row in _rows_in(scope.source_table(source_id))} == {
+        "c1"
+    }
+    assert not scope.target_chunk_ids("kb", target_id)
+
+
+def test_a_row_another_model_wrote_in_the_target_table_refuses_the_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``new-model`` and ``new_model`` are distinct bindings with one writer
+    # table: search would serve the other model's rows after the flip.
+    _save_collection()
+    _source([_row("c1")])
+    _table(scope.source_table("new-model"), [_row("c9", model="new_model")])
+    monkeypatch.setattr(
+        mod,
+        "resolve_collection_names",
+        lambda **kwargs: pytest.fail("refused collections are not copied"),
+    )
+
+    eligibility = scope.source_eligibility("kb", target_model_id="new-model")
+
+    assert eligibility.reason == scope.SKIP_TARGET_ROWS_IN_OTHER_TABLE
+
+
+def test_a_target_fallback_table_holding_the_collection_refuses_the_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    _source([_row("c1")])
+    _table("embeddings_new_legacy", [_row("c9")])
+    monkeypatch.setattr(
+        scope,
+        "_legacy_spelling",
+        lambda model_id: ("embeddings_new_legacy" if model_id == "new-model" else None),
+    )
+
+    assert (
+        scope.source_eligibility("kb", target_model_id="new-model").reason
+        == scope.SKIP_TARGET_ROWS_IN_OTHER_TABLE
+    )
+
+
+def test_the_target_holds_only_chunk_ids_its_own_model_wrote() -> None:
+    from xagent.migrations.embedding.scope import target_chunk_ids
+
+    _save_collection()
+    _source([_row("c1")])
+    _table(
+        scope.source_table(TARGET.id),
+        [_row("held", model=TARGET.id), _row("theirs", model="new_model")],
+    )
+
+    assert target_chunk_ids("kb", TARGET.id) == {"held"}
+
+
+def test_a_target_row_without_a_model_value_is_not_held() -> None:
+    from xagent.migrations.embedding.scope import target_chunk_ids
+
+    _save_collection()
+    _source([_row("c1")])
+    _table(scope.source_table(TARGET.id), [_row("c9", model="")])
+
+    assert target_chunk_ids("kb", TARGET.id) == set()

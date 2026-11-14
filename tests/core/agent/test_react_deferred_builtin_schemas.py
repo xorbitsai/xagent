@@ -74,6 +74,11 @@ def _system(call: dict[str, Any]) -> str:
     )
 
 
+def _prompt(call: dict[str, Any]) -> str:
+    # System message plus the turn context, which carries the tool catalog.
+    return "\n".join(str(m.get("content")) for m in call["messages"])
+
+
 def _tools() -> list[Any]:
     return [
         BuiltinTool("read_file", ToolCategory.FILE),
@@ -127,10 +132,12 @@ async def test_deferred_categories_leave_the_schemas_but_stay_in_the_catalog() -
     names = _names(llm.calls[0])
     assert not DEFERRED & set(names)
     assert {"read_file", "web_search", LOAD_TOOLS_NAME} <= set(names)
-    system = _system(llm.calls[0])
+    system = _prompt(llm.calls[0])
     for name in DEFERRED:
         assert name in system
     assert "built-in image" in system
+    # The catalog is per-run, so it is not in the system message.
+    assert "built-in image" not in _system(llm.calls[0])
 
 
 @pytest.mark.asyncio
@@ -245,7 +252,7 @@ async def test_excluded_categories_are_not_in_the_catalog() -> None:
     llm = ScriptedLLM([{"content": "hi"}])
     await _pattern().run(context=_ctx(), tools=tools, llm=llm)
 
-    system = _system(llm.calls[0])
+    system = _prompt(llm.calls[0])
     assert "generate_video" not in system and "built-in video" not in system
     assert "generate_image" in system
 
@@ -273,7 +280,7 @@ async def test_connectors_and_builtins_defer_together() -> None:
     names = set(_names(llm.calls[0]))
     assert not ({"hubspot_search"} | DEFERRED) & names
     assert {"read_file", LOAD_TOOLS_NAME} <= names
-    system = _system(llm.calls[0])
+    system = _prompt(llm.calls[0])
     assert "hubspot_search" in system and "built-in image" in system
 
 

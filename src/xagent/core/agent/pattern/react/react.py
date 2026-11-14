@@ -98,6 +98,7 @@ from ....tools.adapters.vibe.mcp_approval_gate import (
     bind_tool_call_execution_context,
 )
 from ....tools.tool_result_spill import (
+    SPILL_READ_AVAILABLE_NOTE,
     SPILL_READ_TOOL_NAME,
     SPILL_RESERVED_RESULT_KEY,
     normalize_spilled_relative_path,
@@ -176,7 +177,11 @@ from ...runtime import (
     resolve_compact_llm,
     resolved_llm_metadata,
 )
-from ...tool_access import connector_tool_sources, tool_access_context
+from ...tool_access import (
+    TOOL_ACCESS_RULES,
+    connector_tool_sources,
+    tool_access_fact,
+)
 from ...trace import TraceAction, TraceCategory, TraceEventType, TraceScope
 from ..base import (
     AgentPattern,
@@ -821,6 +826,9 @@ class ReActPattern(AgentPattern):
             for c in (defer_builtin_tool_categories or ())
             if isinstance(c, str) and c.strip()
         )
+        # Whether this run has a stored-result reader tool (offered only
+        # after a result is stored). Fixed per run so the system text is too.
+        self._spill_reader_present = False
         self._deferred_tool_names: frozenset[str] = frozenset()
         self._deferred_order: tuple[str, ...] = ()
         # Deferred built-in tools: category -> names in tool order.
@@ -1096,6 +1104,7 @@ class ReActPattern(AgentPattern):
                 None,
             )
         )
+        self._spill_reader_present = spill_read_tool is not None
         spill_read_schema = (
             None
             if spill_read_tool is None
@@ -2000,7 +2009,12 @@ class ReActPattern(AgentPattern):
     ) -> list[dict[str, Any]]:
         messages = list(
             context.get_messages_for_llm(
-                form_answer_continuation=form_answer_continuation
+                form_answer_continuation=form_answer_continuation,
+                extra_turn_text=(
+                    self._tool_turn_facts(context, tool_names or [])
+                    if has_tools and not force_final_answer
+                    else ""
+                ),
             )
         )
         if force_final_answer:
@@ -2092,26 +2106,13 @@ class ReActPattern(AgentPattern):
             )
         elif has_tools:
             active_tool_names = tool_names or []
-            # Names and the connector inventory must not change when a tool is
-            # loaded mid-run, or the system message (and every cached prefix
-            # after it) would change on the call that follows a load. Loaded
-            # deferred tools are therefore left out of the list below and the
-            # inventory is built from the whole deferred index.
-            stable_tool_names = [
-                n for n in active_tool_names if n not in self._deferred_tool_names
-            ]
-            inventory_tool_names = [*stable_tool_names, *self._deferred_order]
-            available_tools = ", ".join(stable_tool_names) or "(none)"
+            # Everything that varies by sender or by call (the date, the tool
+            # names, the connector inventory) is in the turn context, see
+            # ``_tool_turn_facts``: the system message is the same for every
+            # run of a workspace, so a provider caches it across senders.
             can_lookup_output_files = (
                 WORKSPACE_OUTPUT_FILES_TOOL_NAME in active_tool_names
             )
-            clock_zone = context.clock_zone()
-            current_date = (
-                context.created_at.astimezone(clock_zone or timezone.utc)
-                .date()
-                .isoformat()
-            )
-            clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
             missing_information_instruction = (
                 "If a tool needs missing information from the user, including a "
                 "fact-carrying argument value (one that asserts a real-world "
@@ -2190,13 +2191,13 @@ class ReActPattern(AgentPattern):
                 "When writing any final user-facing response, including plain "
                 "assistant text: "
                 f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
-                f"Turn-start date ({clock_zone_label}): {current_date}. "
-                "For recent, latest, current, or time-sensitive requests, use this "
-                "date when forming search queries and judging source relevance. If the "
+                "For recent, latest, current, or time-sensitive requests, use the "
+                "turn-start date in the turn context when forming search queries "
+                "and judging source relevance. If the "
                 "exact current time matters or the turn may have crossed midnight, call "
                 "the get_current_time tool if it is available. "
                 "Only call tools that are present in the current tool schema for this "
-                "LLM call; "
+                "LLM call, whose names the turn context lists; "
                 "tool names mentioned in memory, previous tasks, plans, or error "
                 "messages are unavailable unless they are included in the current "
                 "schema. If a selected skill is already present in the system "
@@ -2204,18 +2205,10 @@ class ReActPattern(AgentPattern):
                 "skill documentation tools only when you need an additional "
                 "referenced file, example, asset, or detail that is not already in "
                 "the provided skill context."
-                f"\n\nAvailable tool names for this LLM call are exactly: {available_tools}. "
-                "Never call a tool name that is not in this list."
-                f"{AVAILABLE_NAMES_SUFFIX if self._deferred_tool_names else ''}"
+                "\n\nNever call a tool name that is not in the list of available "
+                "tool names for this LLM call in the turn context."
             )
-            access_context = tool_access_context(
-                self._connector_tool_sources,
-                inventory_tool_names
-                if self._deferred_tool_names
-                else active_tool_names,
-            )
-            if access_context:
-                instruction = f"{instruction}\n\n{access_context}"
+            instruction = f"{instruction}\n\n{TOOL_ACCESS_RULES}"
             if self._deferred_tool_names:
                 instruction = f"{instruction}\n\n{DEFERRED_RULE}"
                 if self._deferred_builtin_categories:
@@ -4434,6 +4427,49 @@ class ReActPattern(AgentPattern):
             ]
         return schemas
 
+    def _tool_turn_facts(self, context: Any, tool_names: list[str]) -> str:
+        """This call's date, tool names and connector inventory, for the turn
+        context.
+
+        They vary by sender and with what is loaded, and the system message
+        comes before the tool schemas in the request, so any of them in the
+        system message would leave the rest of it and every schema uncached on
+        the first call of each task. Names and inventory must still not change
+        when a tool is loaded mid-run, or the message carrying them (and every
+        cached prefix after it) would change on the call that follows a load:
+        loaded deferred tools and the stored-result reader are therefore left
+        out of the names, and the inventory is built from the whole deferred
+        index.
+        """
+        stable_tool_names = [
+            n
+            for n in tool_names
+            if n not in self._deferred_tool_names and n != SPILL_READ_TOOL_NAME
+        ]
+        inventory_tool_names = (
+            [*stable_tool_names, *self._deferred_order]
+            if self._deferred_tool_names
+            else tool_names
+        )
+        clock_zone = context.clock_zone()
+        current_date = (
+            context.created_at.astimezone(clock_zone or timezone.utc).date().isoformat()
+        )
+        clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
+        names = ", ".join(stable_tool_names) or "(none)"
+        parts = [
+            f"Turn-start date ({clock_zone_label}): {current_date}.",
+            f"Available tool names for this LLM call are exactly: {names}."
+            f"{AVAILABLE_NAMES_SUFFIX if self._deferred_tool_names else ''}"
+            f"{SPILL_READ_AVAILABLE_NOTE if self._spill_reader_present else ''}",
+        ]
+        access_fact = tool_access_fact(
+            self._connector_tool_sources, inventory_tool_names
+        )
+        if access_fact:
+            parts.append(access_fact)
+        return "\n".join(parts)
+
     def _tool_schemas_with_builtin_controls(
         self,
         tools: list[Any],
@@ -4456,11 +4492,27 @@ class ReActPattern(AgentPattern):
             schema.get("function", {}).get("name") == WORKSPACE_OUTPUT_FILES_TOOL_NAME
             for schema in external_tools
         )
+        # Order is what a provider's prefix cache sees: the tools every sender
+        # has and the control tools first, connector tools, which differ by
+        # sender, last. Two senders of a workspace then share the longest
+        # possible tool prefix. Stable within each group.
+        connector_names = set(connector_tool_sources(tools))
+        shared = [
+            schema
+            for schema in external_tools
+            if schema.get("function", {}).get("name") not in connector_names
+        ]
+        connectors = [
+            schema
+            for schema in external_tools
+            if schema.get("function", {}).get("name") in connector_names
+        ]
         return [
-            *external_tools,
+            *shared,
             *self._builtin_tool_schemas(
                 can_lookup_output_files=can_lookup_output_files
             ),
+            *connectors,
         ]
 
     def _spilled_records(self, context: Any) -> Any:

@@ -1390,8 +1390,11 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "latest user message" in system_prompt
-    assert re.search(r"Turn-start date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
-    assert "use this date when forming search queries" in system_prompt
+    # The date is a per-turn fact, so it is in the turn context, not the system.
+    turn_prompt = llm.calls[0]["messages"][-1]["content"]
+    assert re.search(r"Turn-start date \(UTC\): \d{4}-\d{2}-\d{2}", turn_prompt)
+    assert "Turn-start date (" not in system_prompt
+    assert "use the turn-start date in the turn context" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
     assert "quantitative data" in system_prompt
@@ -12591,7 +12594,7 @@ async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) ->
     assert tool.calls == [{}]
 
 
-def _react_clock_prompt(timezone_name: str | None) -> str:
+def _react_clock_messages(timezone_name: str | None) -> tuple[str, str]:
     context = ExecutionContext(
         created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
     )
@@ -12600,43 +12603,41 @@ def _react_clock_prompt(timezone_name: str | None) -> str:
     context.add_user_message("how many shifts do we have on tomorrow?")
 
     messages = ReActPattern()._messages_for_llm(context, has_tools=True)
-    return messages[0]["content"]
+    return messages[0]["content"], messages[-1]["content"]
 
 
-# Covers the whole fallback instruction through the get_current_time pointer, so
-# reverting any part of it fails rather than only a change to the prefix.
-UTC_DATE_INSTRUCTION = (
-    "Turn-start date (UTC): 2026-08-24. "
-    "For recent, latest, current, or time-sensitive requests, use this "
-    "date when forming search queries and judging source relevance. If the "
+# The date is a per-turn fact in the turn context; the rule that tells the
+# model what to do with it is static and stays in the system message.
+DATE_RULE = (
+    "For recent, latest, current, or time-sensitive requests, use the "
+    "turn-start date in the turn context when forming search queries "
+    "and judging source relevance. If the "
     "exact current time matters or the turn may have crossed midnight, call "
     "the get_current_time tool if it is available."
 )
 
 
-def _date_instruction(prompt: str) -> str:
-    start = prompt.index("Turn-start date (")
-    end = prompt.index("if it is available.", start) + len("if it is available.")
-    return prompt[start:end]
-
-
 def test_tool_call_date_line_keeps_utc_wording_without_a_timezone() -> None:
-    assert _date_instruction(_react_clock_prompt(None)) == UTC_DATE_INSTRUCTION
+    system, turn = _react_clock_messages(None)
+
+    assert DATE_RULE in system
+    assert "Turn-start date (UTC): 2026-08-24." in turn
+    assert "Turn-start date (" not in system
 
 
 def test_tool_call_date_line_uses_the_caller_timezone() -> None:
-    prompt = _react_clock_prompt("Australia/Melbourne")
+    system, turn = _react_clock_messages("Australia/Melbourne")
 
-    assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
-        "Turn-start date (UTC): 2026-08-24. ",
-        "Turn-start date (Australia/Melbourne): 2026-08-25. ",
-    )
+    assert "Turn-start date (Australia/Melbourne): 2026-08-25." in turn
     # The UTC date is what produced the wrong "tomorrow" in production.
-    assert "Turn-start date (UTC)" not in prompt
+    assert "Turn-start date (UTC)" not in turn
+    assert "Turn-start date (" not in system
 
 
 def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
-    assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
+    _system, turn = _react_clock_messages("Not/AZone")
+
+    assert "Turn-start date (UTC): 2026-08-24." in turn
 
 
 # ---------------------------------------------------------------------------

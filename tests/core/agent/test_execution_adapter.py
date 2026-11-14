@@ -664,7 +664,7 @@ async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
         f"(Australia/Melbourne, UTC+" in system_prompt
     )
     assert (
-        f"Turn-start date (Australia/Melbourne): {expected_local.date().isoformat()}. "
+        f"Turn-start date (Australia/Melbourne): {expected_local.date().isoformat()}."
         in system_prompt
     )
 

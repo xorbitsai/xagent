@@ -178,6 +178,7 @@ from .composio_apps import _env as _env
 from .composio_apps import _salesforce_userinfo_url as _salesforce_userinfo_url
 from .composio_apps import _uses_composio as _uses_composio
 from .composio_apps import composio_app as composio_app
+from .composio_apps import composio_web_app as composio_web_app
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Query, Session

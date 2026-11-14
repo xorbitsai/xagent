@@ -205,6 +205,7 @@ router = APIRouter()
 def redeem_handoff(
     region: str, request: Request, db: Session = Depends(get_db)
 ) -> Response:
+    from . import composio_auth
     from .api import auth, mcp
     from .models.mcp import MCPServer
     from .models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState
@@ -269,25 +270,34 @@ def redeem_handoff(
         reject()
     kind = claims["purpose"]
     provider = None
+    via_composio = False
     if kind == "builtin":
         provider = resource.get("provider")
         if not isinstance(provider, str):
-            reject()
-        db_provider = (
-            db.query(OAuthProvider)
-            .filter(OAuthProvider.provider_name == provider)
-            .first()
-        )
-        if db_provider is None:
             reject()
         try:
             options = auth.OAuthLaunchRequest.model_validate(resource.get("options"))
         except ValueError:
             reject()
+        # The same web-start decision the entries make, taken in the region
+        # that actually starts the flow.
+        composio_app = composio_auth.composio_web_app(provider, options.app_id)
+        db_provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == provider)
+            .first()
+        )
+        if db_provider is None and composio_app is None:
+            reject()
         if options.redirect != claims["return_origin"]:
             reject()
         validate_builtin_resource(db, provider, options.app_id)
-        target = str(db_provider.name)
+        via_composio = composio_app is not None
+        if db_provider is not None:
+            target = str(db_provider.name)
+        else:
+            assert composio_app is not None
+            target = composio_app.label
     else:
         flow = (
             db.query(MCPOAuthFlowState)
@@ -341,6 +351,12 @@ def redeem_handoff(
     response: Response
     if kind == "builtin":
         assert provider is not None
+        if via_composio:
+            assert composio_app is not None
+            refusal = composio_auth.start_preflight(composio_app.app_id)
+            if refusal is not None:
+                refusal.headers.update(HEADERS)
+                return refusal
         response = auth._generic_oauth_login(
             provider,
             token=None,
@@ -353,6 +369,7 @@ def redeem_handoff(
             resource_owner_key=None,
             actor_flow_nonce=None,
             account=options.account,
+            auth_backend=composio_auth.AUTH_BACKEND if via_composio else None,
         )
         if isinstance(response, RedirectResponse):
             states = parse_qs(urlsplit(response.headers["location"]).query).get(

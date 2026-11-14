@@ -19,12 +19,16 @@ checks read that flag as a protocol-level failure and judge the envelope on
 their own, so the adapter marks the result ``success: False`` instead, which
 ``tool_result_succeeded`` already reads.
 
-The adapter does not apply this to a tool that declares a non-idempotent
-write. Such a tool can return the envelope after its request went out
-(``deputy_create_resource`` does on a timeout after the POST). ReAct reads a
-failed call as one whose write provably did not happen, and its same-turn
-duplicate-write guard suppresses an identical repeat only of a successful
-call, so counting that envelope as a failure would let the repeat write again.
+The adapter applies this only to a tool whose wire annotations declare that a
+repeat adds no effect: ``readOnlyHint: true`` (with ``destructiveHint`` not
+true) or ``idempotentHint: true``. A write can return the envelope after its
+request went out: ``freshdesk_create_ticket``, an unannotated write, does so
+when the read times out after the POST, and ``deputy_create_resource``, a
+declared non-idempotent write, does too. ReAct reads a failed call as one
+whose write provably did not happen. In flash mode a failed result also
+reopens the normal tools, so the model could write again, and the same-turn
+duplicate-write guard covers only declared non-idempotent tools. An
+undeclared tool is treated as a write, so its envelope stays a success.
 """
 
 from __future__ import annotations

@@ -4,7 +4,10 @@ The in-repo FastMCP servers under ``xagent.web.tools.mcp`` catch vendor
 errors and return ``{"status": "error", ...}`` as text with the MCP ``isError``
 flag unset (xorbitsai/xagent#3574). The adapter recognizes that envelope only
 for a connection that launches one of those modules, and marks the result
-``success: False`` so ``tool_result_succeeded`` reports the call as failed.
+``success: False`` so ``tool_result_succeeded`` reports the call as failed,
+but only for a tool whose wire annotations declare that a repeat adds no
+effect (read-only, or idempotent). A write may return the envelope after its
+request went out, so an undeclared or additive write stays a success.
 ``is_error`` keeps mirroring the wire flag.
 """
 
@@ -238,10 +241,15 @@ def test_parser_recursion_error_is_not_the_envelope(monkeypatch):
 # --- Through the adapter, against a real FastMCP server ----------------------
 
 
-def _server_returning(payload: str) -> FastMCP:
+_READ_ONLY = {"readOnlyHint": True}
+
+
+def _server_returning(payload: str, annotations: dict | None = None) -> FastMCP:
     server = FastMCP("envelope-probe")
 
-    @server.tool()
+    @server.tool(
+        annotations=ToolAnnotations(**annotations) if annotations is not None else None
+    )
     def probe_tool() -> str:
         return payload
 
@@ -271,7 +279,12 @@ async def _adapter(monkeypatch, server: FastMCP, connection, **kwargs):
 async def test_in_repo_error_envelope_is_a_failed_tool_call(monkeypatch):
     """The issue's regression: a server returns the envelope with ``isError``
     unset, and the call the model made counts as failed."""
-    adapter = await _adapter(monkeypatch, _server_returning(_ERROR), _in_repo())
+    adapter = await _adapter(
+        monkeypatch,
+        _server_returning(_ERROR, _READ_ONLY),
+        _in_repo(),
+        raw_annotations=_READ_ONLY,
+    )
 
     result = await adapter.run_json_async({})
 
@@ -286,7 +299,12 @@ async def test_in_repo_error_envelope_is_a_failed_tool_call(monkeypatch):
 @pytest.mark.asyncio
 async def test_error_envelope_from_a_server_not_in_repo_stays_successful(monkeypatch):
     remote = {"transport": "streamable_http", "url": "https://mcp.example.com/mcp"}
-    adapter = await _adapter(monkeypatch, _server_returning(_ERROR), remote)
+    adapter = await _adapter(
+        monkeypatch,
+        _server_returning(_ERROR, _READ_ONLY),
+        remote,
+        raw_annotations=_READ_ONLY,
+    )
 
     result = await adapter.run_json_async({})
 
@@ -304,7 +322,12 @@ async def test_error_envelope_from_a_server_not_in_repo_stays_successful(monkeyp
     ],
 )
 async def test_other_in_repo_results_are_unchanged(monkeypatch, payload):
-    adapter = await _adapter(monkeypatch, _server_returning(payload), _in_repo())
+    adapter = await _adapter(
+        monkeypatch,
+        _server_returning(payload, _READ_ONLY),
+        _in_repo(),
+        raw_annotations=_READ_ONLY,
+    )
 
     result = await adapter.run_json_async({})
 
@@ -316,11 +339,13 @@ async def test_other_in_repo_results_are_unchanged(monkeypatch, payload):
 async def test_server_flagged_error_payload_is_unchanged(monkeypatch):
     server = FastMCP("envelope-probe")
 
-    @server.tool()
+    @server.tool(annotations=ToolAnnotations(**_READ_ONLY))
     def probe_tool() -> str:
         raise RuntimeError("boom")
 
-    adapter = await _adapter(monkeypatch, server, _in_repo())
+    adapter = await _adapter(
+        monkeypatch, server, _in_repo(), raw_annotations=_READ_ONLY
+    )
 
     result = await adapter.run_json_async({})
 
@@ -355,16 +380,6 @@ async def test_excel_failure_code_keeps_its_classification(monkeypatch):
     assert result["failure_code"] == "excel_workbook_locked"
 
 
-def _annotated_server(annotations: dict) -> FastMCP:
-    server = FastMCP("envelope-probe")
-
-    @server.tool(annotations=ToolAnnotations(**annotations))
-    def probe_tool() -> str:
-        return _ERROR
-
-    return server
-
-
 @pytest.mark.asyncio
 async def test_non_idempotent_write_envelope_keeps_the_duplicate_write_guard(
     monkeypatch,
@@ -377,7 +392,7 @@ async def test_non_idempotent_write_envelope_keeps_the_duplicate_write_guard(
     annotations = {"destructiveHint": False, "idempotentHint": False}
     adapter = await _adapter(
         monkeypatch,
-        _annotated_server(annotations),
+        _server_returning(_ERROR, annotations),
         _in_repo("deputy"),
         raw_annotations=annotations,
     )
@@ -398,12 +413,12 @@ async def test_non_idempotent_write_envelope_keeps_the_duplicate_write_guard(
         {"destructiveHint": True, "idempotentHint": True},
     ],
 )
-async def test_envelope_of_a_tool_the_guard_does_not_cover_is_a_failure(
+async def test_envelope_of_a_tool_whose_repeat_adds_no_effect_is_a_failure(
     monkeypatch, annotations
 ):
     adapter = await _adapter(
         monkeypatch,
-        _annotated_server(annotations),
+        _server_returning(_ERROR, annotations),
         _in_repo("deputy"),
         raw_annotations=annotations,
     )
@@ -415,10 +430,43 @@ async def test_envelope_of_a_tool_the_guard_does_not_cover_is_a_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        None,
+        {"destructiveHint": False},
+        # Destructive outranks read-only.
+        {"readOnlyHint": True, "destructiveHint": True},
+        # A non-boolean is not a declaration.
+        {"idempotentHint": 1},
+    ],
+)
+async def test_envelope_of_an_undeclared_or_additive_write_stays_successful(
+    monkeypatch, annotations
+):
+    """The Freshdesk create/reply case: ``freshdesk_create_ticket`` is a plain
+    ``@server.tool()`` that returns the envelope after a POST that may have
+    committed. A failed result would reopen normal tools in flash mode, and the
+    duplicate-write guard does not cover an undeclared tool, so the model could
+    write twice. A tool that does not declare a no-effect repeat is a write."""
+    adapter = await _adapter(
+        monkeypatch,
+        _server_returning(_ERROR, annotations),
+        _in_repo("freshdesk"),
+        raw_annotations=annotations,
+    )
+
+    result = await adapter.run_json_async({})
+
+    assert "success" not in result
+    assert tool_result_succeeded(result) is True
+
+
+@pytest.mark.asyncio
 async def test_envelope_among_several_content_items_stays_successful(monkeypatch):
     server = FastMCP("envelope-probe")
 
-    @server.tool()
+    @server.tool(annotations=ToolAnnotations(**_READ_ONLY))
     def probe_tool() -> CallToolResult:
         return CallToolResult(
             content=[
@@ -427,7 +475,9 @@ async def test_envelope_among_several_content_items_stays_successful(monkeypatch
             ]
         )
 
-    adapter = await _adapter(monkeypatch, server, _in_repo())
+    adapter = await _adapter(
+        monkeypatch, server, _in_repo(), raw_annotations=_READ_ONLY
+    )
 
     result = await adapter.run_json_async({})
 
@@ -437,7 +487,7 @@ async def test_envelope_among_several_content_items_stays_successful(monkeypatch
 
 
 def test_envelope_detection_is_decided_from_the_bound_connection():
-    def adapter(connection) -> MCPToolAdapter:
+    def adapter(connection, raw_annotations=None) -> MCPToolAdapter:
         return MCPToolAdapter(
             mcp_tool=SimpleNamespace(
                 name="probe_tool",
@@ -447,13 +497,16 @@ def test_envelope_detection_is_decided_from_the_bound_connection():
             connection=connection,
             name_prefix="mcp_probe_",
             source_server="probe",
+            raw_annotations=raw_annotations,
         )
 
-    assert adapter(_in_repo("gmail"))._detect_error_envelope is True
-    assert adapter(_in_repo("linkedin"))._detect_error_envelope is False
+    assert adapter(_in_repo("gmail"), _READ_ONLY)._detect_error_envelope is True
+    assert adapter(_in_repo("gmail"))._detect_error_envelope is False
+    assert adapter(_in_repo("linkedin"), _READ_ONLY)._detect_error_envelope is False
     assert (
         adapter(
-            {"transport": "streamable_http", "url": "https://x.example"}
+            {"transport": "streamable_http", "url": "https://x.example"},
+            _READ_ONLY,
         )._detect_error_envelope
         is False
     )

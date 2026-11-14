@@ -2388,12 +2388,18 @@ class MCPToolAdapter(AbstractBaseTool):
             str(source_server or "").casefold() == "xero"
         )
         # In-repo servers return a vendor error as a {"status": "error"}
-        # envelope with isError unset; see mcp_error_envelope. A
-        # non-idempotent write is left out: its envelope can follow a request
-        # that went out, and only a successful call keeps the same-turn
-        # duplicate-write guard on it.
-        self._detect_error_envelope = (
-            speaks_error_envelope(connection) and not self.non_idempotent_write
+        # envelope with isError unset; see mcp_error_envelope. Only a tool
+        # whose wire annotations declare that a repeat adds no effect (read-only
+        # or idempotent) is reclassified. A write's envelope can follow a request
+        # that went out; a failed result reopens normal tools in flash mode, and
+        # the duplicate-write guard covers only declared non-idempotent tools.
+        # An undeclared tool is treated as a write, as classify_write_hint says.
+        self._detect_error_envelope = speaks_error_envelope(connection) and (
+            self.write_hint is MCPWriteHint.READ_ONLY
+            or (
+                isinstance(raw_annotations, Mapping)
+                and raw_annotations.get(_IDEMPOTENT_HINT) is True
+            )
         )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,

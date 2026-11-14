@@ -1537,8 +1537,9 @@ async def cancel_chat_task(
     calling again reaches the same request, including after it withdrew a
     queued turn and before it is marked done. A paused task whose
     automatic resume gives up while the call waits is answered 202 while
-    its cancel is still recorded, since the cancel still applies to it;
-    until it has, calling again answers 409 ``task_not_cancellable``.
+    its cancel is still recorded and the task has not moved since, since
+    the cancel still applies to it; calling again reaches that cancel too,
+    and answers 200 once it is applied.
 
     A turn still queued to start is cancelled too. For a new task that
     leaves the task cancelled with no ``run_id``. For a turn appended to a

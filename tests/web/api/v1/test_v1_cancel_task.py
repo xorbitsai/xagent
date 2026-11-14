@@ -558,15 +558,19 @@ def test_a_task_that_reads_failed_after_automatic_resume_gave_up_is_not_cancella
     assert _cancel_commands(task_id) == []
 
 
-@pytest.mark.parametrize("ended", ["automatic_resume_gave_up", "completed"])
+@pytest.mark.parametrize(
+    "ended", ["automatic_resume_gave_up", "gave_up_after_the_row_moved", "completed"]
+)
 def test_a_target_that_ends_while_the_cancel_is_still_unapplied_at_the_deadline(
     monkeypatch: pytest.MonkeyPatch, ended: str
 ):
     """The command is recorded against a paused run and still pending at the
     deadline. A paused run whose automatic resume gave up meanwhile reads
     ``failed`` but stays at the version the command is fenced on, and the
-    command still cancels it, so the answer is 202. A run that completed on
-    its own is over, and the answer is still 409."""
+    command still cancels it, so the answer is 202 and calling again rejoins
+    the same command. Once the row has moved past that version the command
+    no longer applies, and a run that completed on its own is over: both
+    answer 409."""
     task_id, _agent_id, key = _running_task()
     _update(
         task_id,
@@ -584,27 +588,30 @@ def test_a_target_that_ends_while_the_cancel_is_still_unapplied_at_the_deadline(
     )
 
     async def ends_without_applying(_executor: Any, *, command_db_id: int) -> bool:
-        if ended == "automatic_resume_gave_up":
-            gave_up.append(True)
-        else:
+        if gave_up:
+            return False
+        if ended == "completed":
             _update(
                 task_id,
                 status=TaskStatus.COMPLETED,
                 control_state=TaskControlState.COMPLETED.value,
                 output="done",
             )
+            return False
+        gave_up.append(True)
+        if ended == "gave_up_after_the_row_moved":
+            _update(task_id, state_version=before["state_version"] + 1)
         return False
 
-    monkeypatch.setattr(
-        sdk_task_cancel, "dispatch_one_task_command", ends_without_applying
-    )
+    dispatched = AsyncMock(side_effect=ends_without_applying)
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", dispatched)
     monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
 
     response = _cancel(task_id, key)
 
     (command,) = _cancel_commands(task_id)
     assert command.status == "pending"
-    if ended == "completed":
+    if ended != "automatic_resume_gave_up":
         assert response.status_code == 409, response.text
         assert _error(response) == "task_not_cancellable"
         return
@@ -618,6 +625,30 @@ def test_a_target_that_ends_while_the_cancel_is_still_unapplied_at_the_deadline(
         "error_code": None,
     }
     assert _row(task_id) == before
+
+    again = _cancel(task_id, key)
+
+    assert again.status_code == 202, again.text
+    assert again.json() == response.json()
+    assert dispatched.await_args.kwargs["command_db_id"] == command.id
+    assert [c.id for c in _cancel_commands(task_id)] == [command.id]
+    assert _row(task_id) == before
+    # The command is then applied as the core applies it.
+    _update(
+        task_id,
+        status=TaskStatus.FAILED,
+        control_state=TaskControlState.FAILED.value,
+        state_version=before["state_version"] + 1,
+        error_message=SDK_CANCEL_ERROR_MESSAGE,
+    )
+    _settle_cancel_command(command.id, status="completed")
+
+    applied = _cancel(task_id, key)
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["cancelled_run_id"] == before["run_id"]
+    assert applied.json()["error_code"] == "task_cancelled"
+    assert len(_cancel_commands(task_id)) == 1
 
 
 @pytest.mark.parametrize("case", ["other_agent", "other_user", "missing", "non_sdk"])

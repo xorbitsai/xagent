@@ -316,7 +316,9 @@ def _cancel_of_newest_turn(db: Session, task: Task) -> TaskExecutionCommand | No
     example the turn before was resumed and runs again -- is answered from
     the row, as any other call would be. A new task is the exception: its
     cancel wrote the row itself, which then holds no run and reads as
-    cancelled.
+    cancelled. A task paused on request whose appended turn was withdrawn
+    therefore keeps answering that withdrawal, and is not itself cancelled,
+    until the row moves.
     """
 
     newest = (
@@ -362,6 +364,37 @@ def _cancel_of_newest_turn(db: Session, task: Task) -> TaskExecutionCommand | No
         payload.get("scope") != SDK_COMMAND_SCOPE
         or payload.get("queued_run_id") != run_id
     ):
+        return None
+    return cancel
+
+
+def _unapplied_cancel_of_row(db: Session, task: Task) -> TaskExecutionCommand | None:
+    """This endpoint's cancel aimed at the row as it stands, while unapplied.
+
+    Found by the identity ``_enqueue_cancel`` gives a cancel of the run the
+    row holds at its current version (``_cancel_command_id`` with no queued
+    run), and only while it is pending or processing. A repeat that finds
+    it rejoins it instead of judging the row: the row may already read as
+    ended -- a paused run whose automatic resume gave up -- while the
+    command will still cancel it.
+    """
+
+    cancel = (
+        db.query(TaskExecutionCommand)
+        .filter(
+            TaskExecutionCommand.task_id == int(task.id),
+            TaskExecutionCommand.command_id
+            == _cancel_command_id(int(task.id), int(task.state_version or 0), None),
+            TaskExecutionCommand.kind == TaskCommandKind.CANCEL.value,
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .populate_existing()
+        .one_or_none()
+    )
+    if cancel is None:
+        return None
+    payload: dict[str, Any] = cancel.payload if isinstance(cancel.payload, dict) else {}
+    if payload.get("scope") != SDK_COMMAND_SCOPE or "queued_run_id" in payload:
         return None
     return cancel
 
@@ -416,7 +449,9 @@ def _prepare_cancel_sync(
     repeat of a cancel that already withdrew the newest turn finds no such
     START and rejoins that cancel's command (``_cancel_of_newest_turn``):
     the same command to poll while it is still being applied, the same
-    answer once it completed.
+    answer once it completed. A repeat of a cancel of the row that is still
+    unapplied at the row's version rejoins it too
+    (``_unapplied_cancel_of_row``), before the row is judged as ended.
     """
 
     from .task_start import resolve_sdk_task
@@ -462,6 +497,16 @@ def _prepare_cancel_sync(
                 )
         if is_sdk_cancelled(task.status, task.error_message):
             return _row_result(db, task)
+        # A repeat of a cancel still unapplied against the row as it stands
+        # rejoins it, even when the row already reads as ended: that command
+        # decides, as it did for the first call.
+        unapplied = _unapplied_cancel_of_row(db, task)
+        if unapplied is not None:
+            return _CancelCommand(
+                command_db_id=int(unapplied.id),
+                aimed_run_id=_task_run_id(task),
+                aimed_at_queued_turn=False,
+            )
         if _ended_without_cancel(db, task):
             raise SdkTaskNotCancellable
         if task.status not in _CANCELLABLE_STATUSES:
@@ -583,7 +628,7 @@ def _load_result_sync(
     aimed_run_id: str | None,
     aimed_at_queued_turn: bool,
     command_completed: bool,
-    command_in_flight: bool = False,
+    command_db_id: int | None = None,
 ) -> SdkTaskCancelResult:
     """Read the outcome once the command is over or overdue.
 
@@ -606,11 +651,12 @@ def _load_result_sync(
     - an aimed run that ended on its own raises ``SdkTaskNotCancellable``
       exactly as the request would have on arrival, whether or not a later
       turn is queued behind it. The exception is a paused run that reads
-      ``failed`` while the command is still pending or processing
-      (``command_in_flight``, the deadline's read): its automatic resume
-      gave up during the wait, which does not stop the command from
-      cancelling it, so the call answers that the cancel is still being
-      applied.
+      ``failed`` while the command is still pending or processing (the
+      deadline's read, which passes ``command_db_id``) and the row is still
+      at the version the command was recorded against: its automatic resume
+      gave up during the wait, which does not move that version or stop the
+      command from cancelling it, so the call answers that the cancel is
+      still being applied.
 
     A START waiting for a later turn reads as ``pending`` with no code, and
     a paused row that has stopped for good reads as ``failed``, as on the
@@ -645,8 +691,8 @@ def _load_result_sync(
                 }:
                     return _result(db, task, cancelled=False, queued=queued)
             raise SdkTaskNotCancellable(_AIMED_RUN_ENDED_MESSAGE)
-        if _ended_without_cancel(db, task) and not (
-            command_in_flight and task.status == TaskStatus.PAUSED
+        if _ended_without_cancel(db, task) and not _still_cancels_paused_row(
+            db, task, command_db_id
         ):
             raise SdkTaskNotCancellable
         return _result(
@@ -656,6 +702,29 @@ def _load_result_sync(
             cancelled_run_id=aimed_run_id,
             queued=queued,
         )
+
+
+def _still_cancels_paused_row(
+    db: Session, task: Task, command_db_id: int | None
+) -> bool:
+    """Whether the unapplied command ``command_db_id`` still cancels this
+    paused row: it is pending or processing and was recorded against the
+    version the row is still at."""
+
+    if command_db_id is None or task.status != TaskStatus.PAUSED:
+        return False
+    command = (
+        db.query(TaskExecutionCommand)
+        .filter(TaskExecutionCommand.id == command_db_id)
+        .populate_existing()
+        .one_or_none()
+    )
+    return bool(
+        command is not None
+        and command.status in {COMMAND_PENDING, COMMAND_PROCESSING}
+        and command.target_state_version is not None
+        and int(command.target_state_version) == int(task.state_version or 0)
+    )
 
 
 async def request_sdk_task_cancel(
@@ -682,8 +751,9 @@ async def request_sdk_task_cancel(
     ``SdkTaskNotCancellable`` when the aimed run ended without being
     cancelled, whichever way the wait ends, except a paused run whose
     automatic resume gave up while the command is still unapplied at the
-    deadline: the command still cancels it, so that answer is
-    ``cancelled=False``.
+    deadline and the row is still at the command's version: the command
+    still cancels it, so that answer is ``cancelled=False``, and calling
+    again rejoins the same command.
     """
 
     prepared = await run_db_io_cancellation_safe(
@@ -736,7 +806,7 @@ async def request_sdk_task_cancel(
                     aimed_run_id=aimed_run_id,
                     aimed_at_queued_turn=prepared.aimed_at_queued_turn,
                     command_completed=False,
-                    command_in_flight=True,
+                    command_db_id=prepared.command_db_id,
                 )
             )
         await asyncio.sleep(_COMMAND_POLL_SECONDS)

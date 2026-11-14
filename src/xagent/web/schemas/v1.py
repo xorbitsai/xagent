@@ -1257,9 +1257,10 @@ class CancelTaskResponse(BaseModel):
     the task's current one, as ``GET`` reads it, and ``cancelled_run_id``
     is null. Calling again reaches the same request, including after a
     queued turn was withdrawn and before the cancel is marked done. A
-    paused task whose automatic resume gave up while the cancel waited
-    reads ``failed`` here and is still cancelled by it; until it is,
-    calling again answers 409 ``task_not_cancellable``.
+    paused task whose automatic resume gave up while the cancel waited,
+    and has not moved since, reads ``failed`` here and is still cancelled
+    by it; calling again reaches the same cancel and answers 200 once it
+    is applied.
     """
 
     task_id: int = Field(..., description="Existing task primary key.")

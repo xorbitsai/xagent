@@ -1047,6 +1047,31 @@ async def test_a_new_task_cancel_applied_again_before_it_completed_is_done(
 
 
 @pytest.mark.asyncio
+async def test_a_turn_appended_to_a_cancelled_new_task_is_withdrawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new task was cancelled before it ran, so its row holds no run and
+    reads as cancelled; a turn appended to it is queued. Cancelling that
+    turn withdraws its START: the row is not taken for the turn's own
+    cancel already being done."""
+    task_id, agent_id, owner_user_id = _create_task(
+        status=TaskStatus.FAILED,
+        control_state=TaskControlState.FAILED.value,
+        run_id=None,
+        state_version=1,
+        error_message=SDK_CANCEL_ERROR_MESSAGE,
+    )
+    start_id = _stage_start(task_id, owner_user_id)
+    _broadcast_manager(monkeypatch)
+    before = _row(task_id)
+
+    await _cancel_queued(task_id, agent_id)
+
+    assert _row(task_id) == before
+    assert _start(start_id) == ("failed", STOPPED_BEFORE_START)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("storage_version", [1, 2])
 async def test_a_new_task_cancelled_before_it_starts_is_cancelled_as_a_row(
     monkeypatch: pytest.MonkeyPatch, storage_version: int

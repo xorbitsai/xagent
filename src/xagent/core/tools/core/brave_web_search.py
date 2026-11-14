@@ -85,6 +85,20 @@ class BraveWebSearchCore:
         Returns:
             List of search results with title, link, snippet and optionally content
         """
+        return await self._search_redacted(query, max_results, include_content)
+
+    async def _search_redacted(
+        self,
+        query: str,
+        max_results: int = 5,
+        include_content: bool = False,
+    ) -> List[Dict[str, str]]:
+        """Run the search for the query that is actually sent to Brave.
+
+        All request logic lives here so a shared pre-send step (query
+        redaction, audit) can wrap ``search`` with a single call. The length
+        check applies to the text that goes on the wire.
+        """
         self._validate_query(query)
 
         api_key = self._api_key or os.getenv("BRAVE_SEARCH_API_KEY")

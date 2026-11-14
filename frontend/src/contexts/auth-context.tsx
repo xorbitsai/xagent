@@ -4,6 +4,7 @@ import React, { createContext, useCallback, useContext, useEffect, useRef, useSt
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import { toast } from "@/components/ui/sonner"
+import { IdleSessionManager } from "@/components/auth/idle-session-manager"
 import { useI18n } from "@/contexts/i18n-context"
 import { authMutationUnavailableTranslationKey } from "@/lib/auth-pages"
 import {
@@ -11,7 +12,9 @@ import {
   type AuthCacheUser, type AuthSessionProjection, type AuthSessionSnapshot,
   clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
   claimAuthLoginIntent, createAuthSession, inspectAuthSession, migrateLegacyAuthSession,
+  endExpiredAuthSession, readCurrentIdleSession, recordIdleSessionIfCurrent,
 } from "@/lib/auth-cache"
+import { idleRemainingMs } from "@/lib/idle-session"
 
 type TeamRole = "admin" | "member" | null
 interface AuthContextType {
@@ -95,6 +98,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const refreshIfExpiring = () => {
       const current = currentProjection()
       if (!current || current.snapshot.sessionId !== session.sessionId) return
+      // Past the server's idle deadline a refresh would only be refused; the
+      // idle-session manager asks the server instead.
+      const idle = readCurrentIdleSession()
+      if (idle?.enforced && idleRemainingMs(idle) <= 0) return
       const cache = current.cache
       const deadline = Math.min(cache.expiresAt ?? cache.timestamp + AUTH_CACHE_DURATION_MS, cache.refreshExpiresAt ?? Number.POSITIVE_INFINITY)
       if (deadline - Date.now() < 5 * 60 * 1000) void refreshRef.current(current.snapshot)
@@ -163,10 +170,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
     const key = `${before.snapshot.sessionId}:${before.snapshot.credentialRevision}`
     const now = Date.now()
-    if (lastCheck.key === key && now - lastCheck.at < 15_000) return true
+    // A negative gap means the clock moved backwards; the earlier check no longer counts.
+    if (lastCheck.key === key && now - lastCheck.at >= 0 && now - lastCheck.at < 15_000) return true
     const operation = ++operationRef.current
     try {
       const response = await apiRequest(`${getApiUrl()}/api/auth/verify`, { headers: { "X-Username": before.cache.user.username } })
+      if (response.ok) await recordIdleSessionIfCurrent(captured, await response.clone().json().catch(() => null))
       const current = currentProjection()
       if (mountedRef.current && operation === operationRef.current) { setProjection(current); setLastCheck({ key, at: now }) }
       if (!current) return false
@@ -195,7 +204,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       case "advanced":
         return Boolean(current && current.snapshot.sessionId === expected.sessionId && current.snapshot.accessToken === result.accessToken)
       case "rejected":
-        await clearAuthSessionIfCurrent(expected)
+        if (result.reason === "session_expired") await endExpiredAuthSession(expected)
+        else await clearAuthSessionIfCurrent(expected)
         break
       case "unavailable":
         if (mountedRef.current && operation === operationRef.current && isCurrentCredentialLineage(current, expected)) {
@@ -212,7 +222,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return false
   }, [projection, t])
   refreshRef.current = refreshAccessToken
-  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}</AuthContext.Provider>
+  return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}<IdleSessionManager sessionId={session.sessionId} onSignOut={logout} /></AuthContext.Provider>
 }
 /** Provides a stable anonymous projection for public routes without reading browser auth state. */
 export function AnonymousAuthProvider({ children }: { children: ReactNode }) {

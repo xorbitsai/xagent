@@ -10,6 +10,7 @@ import { isCanonicalUuid } from "@/lib/widget-session-upload"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 import { websocketAuthProtocols } from "@/lib/websocket-auth"
+import { AUTH_REVALIDATE_EVENT, IDLE_SESSION_CLOSE_CODE } from "@/lib/idle-session"
 
 interface RecentMessage {
   message: string
@@ -1273,6 +1274,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
 
         if (disposition === "permanent") {
+          // 4010: the server ended the login while connected. 1008: a
+          // handshake rejected by an endpoint without 4001. Ask the auth
+          // layer to confirm with the server; it never reconnects here.
+          if (
+            owner.connection.credentialOwner.kind === "auth-context"
+            && (event.code === IDLE_SESSION_CLOSE_CODE || event.code === 1008)
+          ) {
+            window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT))
+          }
           reportPermanentFailure(
             owner,
             new Error(

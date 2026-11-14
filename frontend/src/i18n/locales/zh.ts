@@ -922,7 +922,14 @@ const zh = {
     },
     back_to_login: "返回登录？",
   },
+  session_idle: {
+    warning_title: "还在使用吗？",
+    warning_description: "为了账号安全，由于长时间未操作，将在 {time} 后退出登录。",
+    continue: "继续使用",
+    sign_out: "退出登录",
+  },
   login: {
+    session_expired: "登录已过期（例如长时间未操作），请重新登录。",
     mobile_title: "欢迎回来",
     title: "登录 {appName}",
     description: "请输入您的账户信息以访问智能体平台",

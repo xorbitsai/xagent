@@ -407,3 +407,58 @@ class TestCleanupCascadeByScope:
             )
         )
         assert sync_result == async_result
+
+    def test_core_rows_are_deleted_before_embedding_tables(
+        self, isolated_store, monkeypatch
+    ):
+        """The sweep reaches embedding tables only after the core rows are gone."""
+        from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+        store = isolated_store
+        collection, doc_id, parse_hash = "cc_order", "cc_order_doc", "orderhash"
+        store.upsert_parses([_make_parse_row(collection, doc_id, parse_hash)])
+        store.upsert_chunks([_make_chunk_row(collection, doc_id, parse_hash, "ck1")])
+        store.upsert_embeddings(
+            "m1",
+            [
+                {
+                    "collection": collection,
+                    "doc_id": doc_id,
+                    "chunk_id": "ck1",
+                    "parse_hash": parse_hash,
+                    "model": "m1",
+                    "vector": [0.1, 0.2],
+                    "vector_dimension": 2,
+                    "text": "ck1",
+                    "chunk_hash": "ch_ck1",
+                    "created_at": datetime.now(timezone.utc),
+                    "metadata": "{}",
+                    "user_id": None,
+                }
+            ],
+        )
+
+        order = []
+        real = lancedb_stores._vis_delete_rows_by_filters
+
+        def _recording(table, filter_exprs):
+            order.append(getattr(table, "name", ""))
+            return real(table, filter_exprs)
+
+        monkeypatch.setattr(lancedb_stores, "_vis_delete_rows_by_filters", _recording)
+
+        result = store.cleanup_cascade_by_scope(
+            collection,
+            doc_id,
+            "parse",
+            old_parse_hash=parse_hash,
+            preview_only=False,
+            confirm=True,
+        )
+
+        assert result["chunks"] == 1
+        assert "chunks" in order
+        embedding_at = next(
+            i for i, name in enumerate(order) if name.startswith("embeddings_")
+        )
+        assert order.index("chunks") < embedding_at

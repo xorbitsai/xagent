@@ -3560,8 +3560,30 @@ def _vis_delete_by_predicates(
 
     _logger = _logging.getLogger(__name__)
     deleted: Dict[str, int] = {}
+    order = [
+        "chunks",
+        "parses",
+        "main_pointers",
+        "ingestion_runs",
+        "documents",
+    ]
     table_names = _vis_get_table_names(conn)
 
+    # Core rows go first and the embedding tables are looked up after: the other
+    # order swept a table set sampled while the core rows were still there.
+    for name in order:
+        if name in table_to_filter and name in table_names:
+            table = None
+            try:
+                table = conn.open_table(name)
+                cnt = _vis_delete_rows_by_filters(table, table_to_filter[name])
+                if cnt > 0:
+                    _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
+                deleted[name] = cnt
+            finally:
+                _safe_close_table(table)
+
+    table_names = _vis_get_table_names(conn)
     for t in table_names:
         if not t.startswith("embeddings_") or t not in table_to_filter:
             continue
@@ -3575,15 +3597,6 @@ def _vis_delete_by_predicates(
             deleted[t] = cnt
         finally:
             _safe_close_table(table)
-
-    order = [
-        "__embeddings__",
-        "chunks",
-        "parses",
-        "main_pointers",
-        "ingestion_runs",
-        "documents",
-    ]
 
     if "__embeddings__" in table_to_filter:
         filter_exprs = table_to_filter["__embeddings__"]
@@ -3601,18 +3614,6 @@ def _vis_delete_by_predicates(
             _logger.info(
                 "Cascade cleanup: deleted %s rows from embeddings tables", total
             )
-
-    for name in order[1:]:
-        if name in table_to_filter and name in table_names:
-            table = None
-            try:
-                table = conn.open_table(name)
-                cnt = _vis_delete_rows_by_filters(table, table_to_filter[name])
-                if cnt > 0:
-                    _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
-                deleted[name] = cnt
-            finally:
-                _safe_close_table(table)
 
     for name, filter_exprs in table_to_filter.items():
         if name in (

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pyarrow as pa
@@ -1015,3 +1016,196 @@ def test_the_documents_cascade_sweeps_a_table_a_writer_created_meantime(
 
     assert created == [late]
     assert _rows_in(late) == []
+
+
+# --- a retirement and the precompute race on one table ---
+
+
+def _handle(collection: str = "kb") -> Any:
+    """A real LanceDB handle over the storage ``scope.connection()`` reads."""
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+    from xagent.core.tools.core.RAG_tools.kb.models import (
+        KBAccessMode,
+        KBBackendCapabilities,
+        KBCollectionContext,
+        KBStorageBackend,
+        KBUserScope,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_ingestion_status_store,
+        get_main_pointer_store,
+        get_metadata_store,
+        get_vector_index_store,
+    )
+
+    context = KBCollectionContext(
+        collection=collection,
+        user_scope=KBUserScope(user_id=None, is_admin=True),
+        access_mode=KBAccessMode.WRITE,
+        allow_create=True,
+        hide_missing=True,
+        metadata_store=get_metadata_store(),
+        vector_index_store=get_vector_index_store(),
+        ingestion_status_store=get_ingestion_status_store(),
+        main_pointer_store=get_main_pointer_store(),
+        backend=KBStorageBackend.LANCEDB,
+        capabilities=KBBackendCapabilities.lancedb(),
+        collection_info=None,
+    )
+    return LanceDBCollectionHandle(context)
+
+
+def _seed_retirable_core() -> None:
+    """A document re-ingested as C2: chunk ``c1`` is stale, ``c2`` is current."""
+    from xagent.core.tools.core.RAG_tools.storage.factory import (
+        get_vector_index_store,
+    )
+    from xagent.core.tools.core.RAG_tools.utils.metadata_utils import (
+        serialize_metadata,
+    )
+
+    store = get_vector_index_store()
+    store.upsert_documents(
+        [
+            {
+                "collection": "kb",
+                "doc_id": "d1",
+                "file_id": None,
+                "source_path": "/x.txt",
+                "file_type": "txt",
+                "content_hash": "C2",
+                "uploaded_at": datetime.now(timezone.utc),
+                "title": None,
+                "language": None,
+                "user_id": None,
+            }
+        ]
+    )
+    store.upsert_parses(
+        [
+            {
+                "collection": "kb",
+                "doc_id": "d1",
+                "parse_hash": "p",
+                "parser": "local:default@v1.0.0",
+                "created_at": datetime.now(timezone.utc),
+                "params_json": json.dumps({"content_hash": "C2"}),
+                "parsed_content": "[]",
+                "user_id": None,
+            }
+        ]
+    )
+    store.upsert_chunks(
+        [
+            {
+                "collection": "kb",
+                "doc_id": "d1",
+                "parse_hash": "p",
+                "chunk_id": chunk_id,
+                "index": 0,
+                "text": chunk_id,
+                "page_number": None,
+                "section": None,
+                "anchor": None,
+                "json_path": None,
+                "chunk_hash": "x",
+                "config_hash": config_hash,
+                "created_at": datetime.now(timezone.utc),
+                "metadata": serialize_metadata({"content_hash": made_from}),
+                "user_id": None,
+            }
+            for chunk_id, config_hash, made_from in (
+                ("c1", "cfg-old", "C1"),
+                ("c2", "cfg-new", "C2"),
+            )
+        ]
+    )
+
+
+def test_a_retirement_that_completes_while_precompute_encodes_leaves_no_target_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+
+    _save_collection()
+    _seed_retirable_core()
+    _source([_row("c1"), _row("c2")])
+    late = {"done": False}
+    real_sweep = LanceDBCollectionHandle.delete_embedding_records
+
+    def _sweep_then_late_copy(handle: Any, doc_id: str, **kwargs: Any) -> int:
+        deleted = real_sweep(handle, doc_id, **kwargs)
+        if not late["done"]:
+            late["done"] = True
+            # The precompute sampled c1 before the retirement committed, so its
+            # write and reconcile land after the sweep.
+            _seed_target(["c1"])
+            mod._reconcile_document(
+                "kb",
+                "d1",
+                source_model_id=SOURCE_MODEL,
+                model_id=TARGET.id,
+                conn=scope.connection(),
+                report=mod.CollectionReport(name="kb", source_model_id=SOURCE_MODEL),
+            )
+        return deleted
+
+    monkeypatch.setattr(
+        LanceDBCollectionHandle, "delete_embedding_records", _sweep_then_late_copy
+    )
+
+    assert _handle().retire_superseded_chunks("d1", "p") == ["c1"]
+
+    target = {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert "c1" not in target
+    assert {row["chunk_id"] for row in _rows_in(scope.source_table(SOURCE_MODEL))} == {
+        "c2"
+    }
+
+    report = _run()
+
+    assert report.failures == []
+    target = {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert "c1" not in target
+
+
+def test_a_retirement_sweeps_a_target_table_a_precompute_created_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
+        LanceDBCollectionHandle,
+    )
+
+    _save_collection()
+    _seed_retirable_core()
+    _source([_row("c1"), _row("c2")])
+    late = {"done": False}
+    real_core = LanceDBCollectionHandle.delete_chunk_records
+
+    def _copy_then_delete_core(handle: Any, doc_id: str, **kwargs: Any) -> int:
+        if not late["done"]:
+            late["done"] = True
+            # The precompute commits its copy of c1 just before core rows go.
+            _seed_target(["c1"])
+        return real_core(handle, doc_id, **kwargs)
+
+    monkeypatch.setattr(
+        LanceDBCollectionHandle, "delete_chunk_records", _copy_then_delete_core
+    )
+
+    assert _handle().retire_superseded_chunks("d1", "p") == ["c1"]
+
+    assert _rows_in(scope.source_table(TARGET.id)) == []
+    assert {row["chunk_id"] for row in _rows_in(scope.source_table(SOURCE_MODEL))} == {
+        "c2"
+    }
+
+    report = _run()
+
+    assert report.failures == []
+    target = {row["chunk_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert "c1" not in target

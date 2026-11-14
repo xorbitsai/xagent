@@ -2620,13 +2620,15 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         for (stale_parse, config_hash), ids in self.stale_chunks(
             doc_id, parse_hash, user_id=user_id
         ).items():
+            # Core rows first; the sweep enumerates embedding tables afterwards,
+            # so a copy landing meanwhile is either found there or sees core gone.
+            self.delete_chunk_records(
+                doc_id, parse_hash=stale_parse, config_hash=config_hash, is_admin=True
+            )
             for start in range(0, len(ids), size):
                 self.delete_embedding_records(
                     doc_id, chunk_ids=ids[start : start + size], is_admin=True
                 )
-            self.delete_chunk_records(
-                doc_id, parse_hash=stale_parse, config_hash=config_hash, is_admin=True
-            )
             deleted += ids
         return deleted
 

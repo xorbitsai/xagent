@@ -361,12 +361,12 @@ def _reconcile_document(
 ) -> Set[str]:
     """Delete the target rows this document no longer has.
 
-    The rows just written were read before provider work, and a delete that
-    lands meanwhile removes the core chunks first, then sweeps embedding tables
-    it enumerated — the target's included only if it already existed. Liveness
-    is read from the core table here, after the write, so either the delete's
-    sweep or this pass removes what it recreated. Returns the chunk ids removed,
-    so the caller does not count them as lost.
+    The rows just written were read before provider work, and a delete or a
+    retirement that lands meanwhile removes the core chunks first, then sweeps
+    the embedding tables it enumerates after that — the target's included only
+    if it already existed. Liveness is read from the core table here, after the
+    write, so either the sweep or this pass removes what the other did not see.
+    Returns the chunk ids removed, so the caller does not count them as lost.
     """
     from xagent.core.tools.core.RAG_tools.utils.string_utils import (
         escape_lancedb_string,

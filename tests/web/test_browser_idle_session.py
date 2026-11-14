@@ -222,6 +222,10 @@ def test_idle_login_is_rejected_before_its_jwt_expires(enforced):
         auth_tests.client.get("/api/auth/me", headers=_bearer(tokens))
     )
     _assert_idle_rejection(_refresh(tokens))
+    # Requests only reject; the sweep's conditional UPDATE revokes.
+    assert _row(_sid(tokens)).revoked_at is None
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.sweep_browser_sessions(session)
     assert _row(_sid(tokens)).revoked_at is not None
 
 
@@ -230,6 +234,9 @@ def test_expired_login_stays_dead_after_the_switch_is_turned_off(monkeypatch):
     _switch(monkeypatch, True)
     _users()
     old = _login()
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session)  # The enabled heartbeat.
+        session.commit()
     _idle_for(old, 31)
     _assert_idle_rejection(_verify(old))  # Seen while the switch is on.
 
@@ -284,7 +291,6 @@ def test_expiry_no_request_saw_stays_dead_after_switch_off(monkeypatch):
     _switch(monkeypatch, False)
     _assert_idle_rejection(_verify(tokens))
     _assert_idle_rejection(_refresh(tokens))
-    assert _row(_sid(tokens)).revoked_at is not None
 
 
 def test_a_login_alive_at_switch_off_is_free_at_once(monkeypatch):
@@ -948,3 +954,127 @@ def test_connected_websocket_closes_with_the_idle_code(monkeypatch, enforced):
             message = socket.portal.call(asyncio.wait_for, socket._send_rx.receive(), 5)
             assert message["type"] == "websocket.close"
             assert message["code"] == 4010
+
+
+# --- Review on #3782: stale reads, bounded pool, coalescing, countdown ------------
+
+
+def test_a_stale_row_cannot_reject_a_login_kept_alive_meanwhile(enforced):
+    """Loaded just before the deadline; activity committed before it."""
+    _users()
+    tokens = _login()
+    sid = _sid(tokens)
+    now = datetime.now(timezone.utc)
+    _set_activity(sid, now - timedelta(minutes=29, seconds=59))  # Deadline now+1s.
+    with (
+        auth_tests.TestingSessionLocal() as stale_session,
+        auth_tests.TestingSessionLocal() as other,
+    ):
+        user = stale_session.query(User).filter_by(username="member").one()
+        # Held, so this session keeps the pre-activity snapshot.
+        stale_row = stale_session.get(BrowserSession, sid)
+        other_user = other.query(User).filter_by(username="member").one()
+        assert browser_idle.record_activity(other, other_user, sid, now=now) == now
+        # Evaluated after the old deadline.
+        assert not browser_idle.session_rejected(
+            stale_session, user, {"sid": sid}, now=now + timedelta(seconds=2)
+        )
+        assert stale_row.revoked_at is None
+    assert _row(sid).revoked_at is None
+    assert _verify(tokens).status_code == 200
+    assert _refresh(tokens).status_code == 200
+
+
+def test_rejecting_an_idle_login_needs_no_second_pooled_connection(
+    tmp_path, monkeypatch
+):
+    """A one-connection pool: resolution must not wait for a second checkout."""
+    import time
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from sqlalchemy.pool import QueuePool
+
+    from xagent.web.auth_dependencies import (
+        WebSocketSessionIdleRejected,
+        get_user_from_token,
+        get_user_from_websocket_token,
+    )
+
+    _switch(monkeypatch, True)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'one.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=2,
+    )
+    for table in (User, BrowserSession, BrowserIdleEnforcement):
+        table.__table__.create(engine)
+    sid = browser_idle.new_browser_session_id()
+    with Session(engine) as session:
+        session.add(User(username="pool", password_hash="unused"))
+        session.commit()
+        user_id = session.query(User.id).scalar()
+        browser_idle.add_browser_session(
+            session,
+            user_id,
+            sid,
+            now=datetime.now(timezone.utc) - timedelta(minutes=31),
+        )
+        session.commit()
+        user = session.get(User, user_id)
+        token = auth.create_access_token(
+            {**user_session_claims(user), **browser_idle.browser_session_claims(sid)}
+        )
+    try:
+        started = time.monotonic()
+        with Session(engine) as session:
+            assert get_user_from_token(token, session) is None
+            with pytest.raises(WebSocketSessionIdleRejected):
+                get_user_from_websocket_token(token, session, verify_exp=False)
+        assert time.monotonic() - started < 1.5
+        with Session(engine) as other:  # The only connection is free again.
+            assert other.query(User).count() == 1
+    finally:
+        engine.dispose()
+
+
+def test_concurrent_activity_reports_write_once_and_never_move_back(enforced):
+    _users()
+    tokens = _login()
+    sid = _sid(tokens)
+    _idle_for(tokens, 5)
+    now = datetime.now(timezone.utc)
+    with (
+        auth_tests.TestingSessionLocal() as first,
+        auth_tests.TestingSessionLocal() as late,
+    ):
+        first_user = first.query(User).filter_by(username="member").one()
+        late_user = late.query(User).filter_by(username="member").one()
+        # Held, so the late session keeps the 5-minute-old snapshot.
+        late_row = late.get(BrowserSession, sid)
+        assert browser_idle.record_activity(first, first_user, sid, now=now) == now
+        # A delayed report with an earlier clock reading arrives second.
+        returned = browser_idle.record_activity(
+            late, late_user, sid, now=now - timedelta(seconds=1)
+        )
+        del late_row
+    assert _as_utc(returned) == now
+    assert _as_utc(_row(sid).last_activity_at) == now
+
+
+def test_the_countdown_reports_the_enforced_threshold_during_a_rollout(monkeypatch):
+    """This replica runs 60 minutes while another still enforces 30."""
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_MINUTES, "60")
+    _users()
+    tokens = _login()
+    _lease_until(
+        datetime.now(timezone.utc) + timedelta(seconds=10), ordinary_minutes=30
+    )
+    _idle_for(tokens, 20)
+
+    idle = _verify(tokens).json()["idle_session"]
+    assert idle["idle_timeout_seconds"] == 30 * 60
+    assert 9 * 60 < idle["idle_expires_in"] <= 10 * 60

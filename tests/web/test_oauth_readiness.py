@@ -143,6 +143,9 @@ def test_format_reports_status_and_source_only():
     ready = oauth_readiness.ProviderReadiness("google", True, "row", "env")
     missing = oauth_readiness.ProviderReadiness("zoom", True, "env", "missing")
     no_row = oauth_readiness.ProviderReadiness("jira", False, "env", "env")
+    composio = oauth_readiness.ProviderReadiness(
+        "salesforce", False, "missing", "missing", composio_only=True
+    )
 
     assert (
         oauth_readiness.format_result(ready)
@@ -154,6 +157,44 @@ def test_format_reports_status_and_source_only():
     )
     assert oauth_readiness.format_result(no_row) == (
         "FAIL oauth-client:jira: no provider row"
+    )
+    assert oauth_readiness.format_result(composio) == (
+        "SKIP oauth-client:salesforce: connects through Composio"
+    )
+
+
+def _set_composio_only(monkeypatch):
+    monkeypatch.setenv("XAGENT_SALESFORCE_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "key")
+    monkeypatch.setenv("COMPOSIO_SALESFORCE_AUTH_CONFIG_ID", "ac_test")
+    monkeypatch.setenv("COMPOSIO_USER_ID_SECRET", "secret")
+
+
+def test_a_composio_only_provider_needs_no_row_or_credentials(monkeypatch):
+    _set_composio_only(monkeypatch)
+
+    result = oauth_readiness.check_provider("salesforce", None)
+
+    assert result.composio_only
+    assert not result.ready
+    assert oauth_readiness.format_result(result) == (
+        "SKIP oauth-client:salesforce: connects through Composio"
+    )
+
+
+def test_a_provider_whose_web_connects_stay_native_is_not_skipped(monkeypatch):
+    monkeypatch.setenv("XAGENT_GMAIL_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_GMAIL_AUTH_CONFIG_ID", "ac_gmail")
+    monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_GOOGLE_DRIVE_AUTH_CONFIG_ID", "ac_drive")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "key")
+    monkeypatch.setenv("COMPOSIO_USER_ID_SECRET", "secret")
+
+    result = oauth_readiness.check_provider("google", None)
+
+    assert not result.composio_only
+    assert oauth_readiness.format_result(result) == (
+        "FAIL oauth-client:google: no provider row"
     )
 
 
@@ -250,6 +291,22 @@ def test_main_passes_when_every_provider_is_ready(database, monkeypatch):
     code, output = _run()
 
     assert code == 0
+    assert output.splitlines()[-1] == f"{len(BUILTIN_PROVIDERS)} checks, 0 failed"
+
+
+def test_main_skips_a_composio_only_provider(database, monkeypatch):
+    for provider in BUILTIN_PROVIDERS:
+        if provider != "salesforce":
+            _add_provider(database, provider, "row-id", "row-secret")
+    database.commit()
+    _set_composio_only(monkeypatch)
+
+    code, output = _run()
+
+    assert code == 0
+    assert "SKIP oauth-client:salesforce: connects through Composio" in (
+        output.splitlines()
+    )
     assert output.splitlines()[-1] == f"{len(BUILTIN_PROVIDERS)} checks, 0 failed"
 
 

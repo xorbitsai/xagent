@@ -23,7 +23,8 @@ from, never a value or part of one.
 It proves that a value is present, not that the vendor accepts it. A row
 encrypted under a different key is reported as ``unreadable``: the runtime
 would send the ciphertext as the value, and the environment variable cannot
-take over because the row is not blank.
+take over because the row is not blank. A provider whose every app's web
+connect goes through Composio is reported as ``SKIP``: it needs no native client.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from ..core.utils.encryption import (
     decrypt_value_strict,
     get_cipher,
 )
+from .composio_apps import provider_is_composio_only
 
 FieldSource = Literal["row", "env", "missing", "unreadable"]
 _READY_SOURCES = frozenset({"row", "env"})
@@ -52,6 +54,7 @@ class ProviderReadiness:
     has_row: bool
     client_id: FieldSource
     client_secret: FieldSource
+    composio_only: bool = False
 
     @property
     def ready(self) -> bool:
@@ -76,8 +79,22 @@ def _field_source(provider: str, stored: str | None, env_suffix: str) -> FieldSo
     return "row" if from_row else "env"
 
 
-def check_provider(provider: str, row: Any | None) -> ProviderReadiness:
+def _builtin_app_ids(provider: str) -> list[str]:
+    from .builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    return [
+        str(row["app_id"])
+        for row in get_builtin_public_mcp_app_rows()
+        if row.get("provider_name") == provider
+    ]
+
+
+def check_provider(
+    provider: str, row: Any | None, *, app_ids: Iterable[str] | None = None
+) -> ProviderReadiness:
     """Resolve one provider's client ID and secret the way a connect does."""
+    if app_ids is None:
+        app_ids = _builtin_app_ids(provider)
     return ProviderReadiness(
         provider=provider,
         has_row=row is not None,
@@ -85,6 +102,7 @@ def check_provider(provider: str, row: Any | None) -> ProviderReadiness:
         client_secret=_field_source(
             provider, getattr(row, "client_secret", None), "CLIENT_SECRET"
         ),
+        composio_only=provider_is_composio_only(provider, app_ids),
     )
 
 
@@ -109,6 +127,8 @@ def check_providers(
 
 
 def format_result(result: ProviderReadiness) -> str:
+    if result.composio_only:
+        return f"SKIP oauth-client:{result.provider}: connects through Composio"
     status = "PASS" if result.ready else "FAIL"
     if not result.has_row:
         detail = "no provider row"
@@ -182,7 +202,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     except ValueError as exc:
         parser.error(str(exc))
 
-    failed = sum(not result.ready for result in results)
+    failed = sum(not result.ready and not result.composio_only for result in results)
     for result in results:
         print(format_result(result), file=out)
     print(f"{len(results)} checks, {failed} failed", file=out)

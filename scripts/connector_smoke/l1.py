@@ -16,12 +16,15 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from xagent.web.composio_apps import _CALLBACK_PATHS as COMPOSIO_CALLBACK_PATHS
+
 # Gmail sits behind the Google restricted-scope gate and can be refused while
 # the provider itself is fine, so it only represents Google as a last resort.
 _AVOID_AS_REPRESENTATIVE = frozenset({"gmail"})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_REASON_DETAIL = 200
+COMPOSIO_BACKEND = "composio"
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class OAuthTarget:
     provider: str
     app_id: str
     needs_account: bool = False
+    auth_backend: str | None = None
 
 
 def format_result(result: CheckResult) -> str:
@@ -110,14 +114,8 @@ def check_catalog(
 def select_oauth_targets(
     apps: Iterable[Mapping[str, Any]], preferred: Iterable[str] = ()
 ) -> list[OAuthTarget]:
-    """One launch per builtin OAuth provider, through a visible catalog app.
-
-    The launch always names an app: providers whose apps need an app-scoped
-    grant refuse a bare provider launch. Apps in ``preferred`` (the expected
-    registry apps) represent their provider before operator-created ones,
-    whose extra scopes could be refused for reasons unrelated to the
-    provider's configuration.
-    """
+    """One launch per builtin OAuth provider and per app backend it serves; each
+    names an app (a bare provider launch is refused), preferring registry apps."""
     preferred = set(preferred)
     by_provider: dict[str, list[Mapping[str, Any]]] = {}
     for app in apps:
@@ -141,15 +139,30 @@ def select_oauth_targets(
                 str(app["id"]),
             ),
         )
-        app = candidates[0]
-        targets.append(
-            OAuthTarget(
-                provider=provider,
-                app_id=str(app["id"]),
-                needs_account=bool(app.get("oauth_account_input")),
+        native = [app for app in candidates if not _is_composio(app)]
+        composio = [app for app in candidates if _is_composio(app)]
+        if native:
+            targets.append(_target(provider, native[0]))
+        if composio:
+            targets.append(
+                _target(provider, composio[0], auth_backend=COMPOSIO_BACKEND)
             )
-        )
     return targets
+
+
+def _is_composio(app: Mapping[str, Any]) -> bool:
+    return app.get("auth_backend") == COMPOSIO_BACKEND
+
+
+def _target(
+    provider: str, app: Mapping[str, Any], *, auth_backend: str | None = None
+) -> OAuthTarget:
+    return OAuthTarget(
+        provider=provider,
+        app_id=str(app["id"]),
+        needs_account=bool(app.get("oauth_account_input")),
+        auth_backend=auth_backend,
+    )
 
 
 def normalize_origin(value: object) -> str | None:
@@ -198,6 +211,56 @@ def check_callback_origin(
         return CheckResult(
             name, False, f"callback origin is {actual}, expected {expected_origin}"
         )
+    return CheckResult(name, True)
+
+
+def start_callback_origin(payload: object) -> str | None:
+    """The callback origin a launch start reports, if it reports one."""
+    if not isinstance(payload, Mapping):
+        return None
+    return normalize_origin(payload.get("callback_origin"))
+
+
+def start_refused_detail(status_code: int, payload: object) -> str:
+    """``HTTP <status>`` plus a value-free body summary, for a refused start."""
+    return f"HTTP {status_code}{_detail_suffix(payload)}"
+
+
+def check_composio_callback(
+    provider: str,
+    *,
+    status_code: int,
+    location: str | None,
+    body: str,
+    expected_origin: str,
+) -> CheckResult:
+    """A Composio app's redeem must begin at the shared Composio callback."""
+    name = f"oauth:{provider}:composio"
+    if status_code not in _REDIRECT_STATUSES or not location:
+        return CheckResult(
+            name,
+            False,
+            f"no Composio begin redirect: HTTP {status_code}{_detail_suffix(body)}",
+        )
+    try:
+        parts = urlsplit(location)
+        query = parse_qs(parts.query)
+    except ValueError:
+        return CheckResult(name, False, "Composio begin redirect is not a valid URL")
+
+    problems = []
+    origin = normalize_origin(location)
+    if origin != normalize_origin(expected_origin):
+        problems.append(
+            f"callback origin is {origin or 'an invalid origin'}, "
+            f"expected {expected_origin}"
+        )
+    if not parts.path.endswith(COMPOSIO_CALLBACK_PATHS):
+        problems.append("redirect is not to a shared Composio callback path")
+    if not "".join(query.get("state", [])).strip():
+        problems.append("state is missing")
+    if problems:
+        return CheckResult(name, False, "; ".join(problems))
     return CheckResult(name, True)
 
 

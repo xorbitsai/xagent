@@ -231,6 +231,44 @@ def test_account_hosted_provider_target_is_marked() -> None:
     ]
 
 
+def test_a_composio_app_target_carries_its_backend() -> None:
+    catalog = [
+        _app(
+            "salesforce",
+            "salesforce",
+            "builtin_oauth",
+            auth_backend="composio",
+        )
+    ]
+
+    assert l1.select_oauth_targets(catalog) == [
+        l1.OAuthTarget(
+            provider="salesforce", app_id="salesforce", auth_backend="composio"
+        )
+    ]
+
+
+def test_a_native_app_target_carries_no_backend() -> None:
+    catalog = [_app("slack", "slack", "builtin_oauth")]
+
+    assert l1.select_oauth_targets(catalog) == [
+        l1.OAuthTarget(provider="slack", app_id="slack")
+    ]
+
+
+def test_a_composio_app_beside_native_apps_adds_a_second_target() -> None:
+    # Facebook sorts first, but the native checks must keep a native app.
+    catalog = [
+        _app("facebook", "meta", "builtin_oauth", auth_backend="composio"),
+        _app("instagram", "meta", "builtin_oauth"),
+    ]
+
+    assert l1.select_oauth_targets(catalog) == [
+        l1.OAuthTarget(provider="meta", app_id="instagram"),
+        l1.OAuthTarget(provider="meta", app_id="facebook", auth_backend="composio"),
+    ]
+
+
 def test_hidden_or_providerless_oauth_apps_are_not_targets() -> None:
     catalog = [
         _app("slack", "slack", "builtin_oauth", is_visible_in_connector=False),
@@ -282,6 +320,105 @@ def test_callback_check_fails_when_the_launch_start_is_refused() -> None:
     assert not result.ok
     assert "HTTP 400" in result.reason
     assert "Unsupported provider" in result.reason
+
+
+# --- Composio begin (from the launch redeem) -----------------------------------
+
+SHARED_COMPOSIO_ORIGIN = "https://global.example.net"
+COMPOSIO_BEGIN = f"{SHARED_COMPOSIO_ORIGIN}/api/auth/meta/callback?state=signed-state"
+
+
+def test_a_composio_begin_on_the_shared_origin_passes() -> None:
+    result = l1.check_composio_callback(
+        "salesforce",
+        status_code=307,
+        location=COMPOSIO_BEGIN,
+        body="",
+        expected_origin=SHARED_COMPOSIO_ORIGIN,
+    )
+
+    assert result.ok
+    assert result.name == "oauth:salesforce:composio"
+
+
+def test_a_composio_begin_behind_a_proxy_prefix_passes() -> None:
+    # XAGENT_COMPOSIO_CALLBACK_URL may put a reverse proxy prefix before a
+    # callback path; so may the fallback Meta URL.
+    result = l1.check_composio_callback(
+        "salesforce",
+        status_code=307,
+        location=(
+            f"{SHARED_COMPOSIO_ORIGIN}/composio/auth/api/auth/meta/callback?state=s"
+        ),
+        body="",
+        expected_origin=SHARED_COMPOSIO_ORIGIN,
+    )
+
+    assert result.ok, result.reason
+
+
+def test_a_composio_begin_on_the_deployment_origin_fails() -> None:
+    result = l1.check_composio_callback(
+        "salesforce",
+        status_code=307,
+        location="https://cloud.example.com/api/auth/meta/callback?state=s",
+        body="",
+        expected_origin=SHARED_COMPOSIO_ORIGIN,
+    )
+
+    assert not result.ok
+    assert "callback origin is https://cloud.example.com" in result.reason
+    assert SHARED_COMPOSIO_ORIGIN in result.reason
+
+
+def test_a_composio_begin_without_a_state_fails() -> None:
+    result = l1.check_composio_callback(
+        "salesforce",
+        status_code=307,
+        location=f"{SHARED_COMPOSIO_ORIGIN}/api/auth/meta/callback",
+        body="",
+        expected_origin=SHARED_COMPOSIO_ORIGIN,
+    )
+
+    assert not result.ok
+    assert "state is missing" in result.reason
+
+
+def test_a_composio_begin_on_another_path_fails() -> None:
+    result = l1.check_composio_callback(
+        "salesforce",
+        status_code=307,
+        location=f"{SHARED_COMPOSIO_ORIGIN}/api/auth/salesforce/callback?state=s",
+        body="",
+        expected_origin=SHARED_COMPOSIO_ORIGIN,
+    )
+
+    assert not result.ok
+    assert "shared Composio callback path" in result.reason
+
+
+def test_a_refused_composio_redeem_fails_with_its_status() -> None:
+    result = l1.check_composio_callback(
+        "salesforce",
+        status_code=500,
+        location=None,
+        body="<h1>Error: OAuth provider not configured</h1>",
+        expected_origin=SHARED_COMPOSIO_ORIGIN,
+    )
+
+    assert not result.ok
+    assert "HTTP 500" in result.reason
+
+
+def test_a_launch_start_callback_origin_is_normalized() -> None:
+    payload = {
+        "authorization_url": "/api/auth/meta/login?ticket=x",
+        "callback_origin": "https://Global.Example.net:443",
+    }
+
+    assert l1.start_callback_origin(payload) == SHARED_COMPOSIO_ORIGIN
+    assert l1.start_callback_origin("not a mapping") is None
+    assert l1.start_callback_origin({}) is None
 
 
 # --- authorization redirect (from the launch redeem) ----------------------------

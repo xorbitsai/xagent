@@ -1034,3 +1034,30 @@ A running task created through `/v1` can now be cancelled. The cancelled task re
 ### Rollback
 
 - A queued turn answers 409 `task_busy` again. Turns already withdrawn stay withdrawn.
+
+## 2026-11-13 — SDK tasks: cancelling a task that is waiting for an answer or paused
+
+`POST /v1/chat/tasks/{task_id}/cancel` now also cancels a task that is waiting for an answer or paused, instead of answering 409 `task_busy`.
+
+### Client-visible changes
+
+- A task waiting for an answer answers 200 and reads `failed` with `error_code` `task_cancelled`. Its question is closed: `pending_interaction` reads `null`, and a reply answers 409 `no_pending_interaction`.
+- A paused task answers 200 and reads `failed` with `error_code` `task_cancelled`; automatic resume no longer picks it up.
+- While an answer is queued or being applied, the call still answers 409 `task_busy`; calling again once the answered run is running cancels it as a running task.
+- A paused task that reads `failed`, because automatic resume gave up or because the turn appended to it was withdrawn or could not be started, still answers 409 `task_not_cancellable`.
+- Calling again after this endpoint withdrew a turn appended to a paused task answers the withdrawal's 200 while the task has not moved since, including while that cancel is still being completed, whether the task reads `paused` or `failed`; it does not cancel the paused task.
+- A paused task whose automatic resume gives up while the call waits answers 202 when the cancel has not been applied by the deadline and the task has not moved since, because the cancel still applies to it. Calling again reaches the same cancel, answering 202 until it is applied and 200 once it has.
+- A queued turn that started and then paused, and whose automatic resume gives up while the call waits, may answer 409 `task_not_cancellable` at the deadline although the cancel can still be applied to it afterwards.
+- When the task has moved since a turn was queued, so that turn can no longer start, a task that is now waiting for an answer or paused is cancelled as such, as a running one is in the previous entry.
+- A cancel that reaches a queued turn after it started cancels it the way it is by then: running, waiting for an answer, or paused.
+- The two earlier entries listed waiting for an answer and paused among the `task_busy` cases; they are no longer.
+
+### Deployment impact
+
+- No migration and no configuration.
+- Mixed versions: a process that predates this change refuses a waiting or paused task with 409 `task_busy` before recording a command. When such a process applies a cancel command recorded by an upgraded one, it rejects it as a changed run without writing anything, and the endpoint answers 409 `task_busy`. A process that predates the cancel endpoint answers 503, as in the first entry. Calling again succeeds once every process that executes tasks has been upgraded.
+- This is the change the first entry named before the Python SDK `tasks.cancel()` ships.
+
+### Rollback
+
+- Waiting and paused tasks answer 409 `task_busy` again. Tasks already cancelled stay `failed`, with their question closed and their automatic resume stopped. A cancel command still recorded but not yet applied is rejected by the older process without a write.

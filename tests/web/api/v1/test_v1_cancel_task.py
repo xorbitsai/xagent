@@ -267,6 +267,7 @@ def test_cancel_running_task_then_repeat_then_append():
     ("values", "expected_code"),
     [
         (
+            # No START is queued for it, so there is no turn to aim at.
             {
                 "status": TaskStatus.COMPLETED,
                 "control_state": TaskControlState.COMPLETED.value,
@@ -288,8 +289,8 @@ def test_cancel_running_task_then_repeat_then_append():
         ),
         (
             {
-                "status": TaskStatus.PAUSED,
-                "control_state": TaskControlState.PAUSED.value,
+                "status": TaskStatus.WAITING_FOR_USER,
+                "control_state": TaskControlState.RESUME_REQUESTED.value,
             },
             "task_busy",
         ),
@@ -297,15 +298,34 @@ def test_cancel_running_task_then_repeat_then_append():
             {
                 "status": TaskStatus.WAITING_FOR_USER,
                 "control_state": TaskControlState.WAITING_FOR_USER.value,
+                "answer_queued": True,
             },
             "task_busy",
         ),
     ],
-    ids=["completed", "failed_itself", "pending", "paused", "waiting"],
+    ids=["completed", "failed_itself", "pending", "answer_in_flight", "answer_queued"],
 )
-def test_states_that_are_not_running_are_refused_without_a_write(values, expected_code):
+def test_states_with_nothing_to_cancel_are_refused_without_a_write(
+    values, expected_code
+):
     task_id, _agent_id, key = _running_task()
+    values = dict(values)
+    answer_queued = values.pop("answer_queued", False)
     _update(task_id, runner_id=None, lease_expires_at=None, **values)
+    if answer_queued:
+        db = _direct_db_session()
+        try:
+            stage_task_command(
+                db,
+                task_id=task_id,
+                actor_user_id=None,
+                command_id="reply-queued",
+                kind=TaskCommandKind.RESUME_INPUT,
+                payload={},
+            )
+            db.commit()
+        finally:
+            db.close()
     before = _row(task_id)
 
     response = _cancel(task_id, key)
@@ -560,6 +580,163 @@ def test_a_task_that_reads_failed_after_automatic_resume_gave_up_is_not_cancella
     assert _error(response) == "task_not_cancellable"
     assert _row(task_id) == before
     assert _cancel_commands(task_id) == []
+
+
+def test_a_paused_cancel_staged_after_its_row_moved_is_not_accepted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An accepted append moves the paused row between the request's read and
+    the command's staging, so the command aims at the old version while its
+    row column records the new one; the append's START then fails and the
+    task reads ``failed``. The executor fences on the aimed version and will
+    reject the command, so the deadline does not answer 202, and a repeat
+    answers the same 409 without staging another command."""
+    task_id, _agent_id, key = _running_task()
+    _update(
+        task_id,
+        status=TaskStatus.PAUSED,
+        control_state=TaskControlState.PAUSED.value,
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    aimed_version = _row(task_id)["state_version"]
+    original_enqueue = sdk_task_cancel._enqueue_cancel
+
+    def staged_after_an_append(
+        db: Any, task: Any, target_state_version: int, *, queued_run_id: Any
+    ) -> Any:
+        _update(task_id, state_version=aimed_version + 1)
+        return original_enqueue(
+            db, task, target_state_version, queued_run_id=queued_run_id
+        )
+
+    monkeypatch.setattr(sdk_task_cancel, "_enqueue_cancel", staged_after_an_append)
+    start_failed: list[bool] = []
+    monkeypatch.setattr(
+        task_auto_resume,
+        "status_only_terminal_view",
+        lambda _db, _task_id: SimpleNamespace(state="manual") if start_failed else None,
+    )
+
+    async def unapplied_while_the_start_fails(*_args: Any, **_kwargs: Any) -> bool:
+        start_failed.append(True)
+        return False
+
+    monkeypatch.setattr(
+        sdk_task_cancel,
+        "dispatch_one_task_command",
+        AsyncMock(side_effect=unapplied_while_the_start_fails),
+    )
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 409, response.text
+    assert _error(response) == "task_not_cancellable"
+    (command,) = _cancel_commands(task_id)
+    assert command.payload["target_state_version"] == aimed_version
+    assert command.target_state_version == aimed_version + 1
+    again = _cancel(task_id, key)
+    assert again.status_code == 409, again.text
+    assert _error(again) == "task_not_cancellable"
+    assert len(_cancel_commands(task_id)) == 1
+    row = _row(task_id)
+    assert (row["status"], row["state_version"]) == (
+        TaskStatus.PAUSED,
+        aimed_version + 1,
+    )
+
+
+@pytest.mark.parametrize(
+    "ended", ["automatic_resume_gave_up", "gave_up_after_the_row_moved", "completed"]
+)
+def test_a_target_that_ends_while_the_cancel_is_still_unapplied_at_the_deadline(
+    monkeypatch: pytest.MonkeyPatch, ended: str
+):
+    """The command is recorded against a paused run and still pending at the
+    deadline. A paused run whose automatic resume gave up meanwhile reads
+    ``failed`` but stays at the version the command is fenced on, and the
+    command still cancels it, so the answer is 202 and calling again rejoins
+    the same command. Once the row has moved past that version the command
+    no longer applies, and a run that completed on its own is over: both
+    answer 409."""
+    task_id, _agent_id, key = _running_task()
+    _update(
+        task_id,
+        status=TaskStatus.PAUSED,
+        control_state=TaskControlState.PAUSED.value,
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    before = _row(task_id)
+    gave_up: list[bool] = []
+    monkeypatch.setattr(
+        task_auto_resume,
+        "status_only_terminal_view",
+        lambda _db, _task_id: SimpleNamespace(state="exhausted") if gave_up else None,
+    )
+
+    async def ends_without_applying(_executor: Any, *, command_db_id: int) -> bool:
+        if gave_up:
+            return False
+        if ended == "completed":
+            _update(
+                task_id,
+                status=TaskStatus.COMPLETED,
+                control_state=TaskControlState.COMPLETED.value,
+                output="done",
+            )
+            return False
+        gave_up.append(True)
+        if ended == "gave_up_after_the_row_moved":
+            _update(task_id, state_version=before["state_version"] + 1)
+        return False
+
+    dispatched = AsyncMock(side_effect=ends_without_applying)
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", dispatched)
+    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+
+    response = _cancel(task_id, key)
+
+    (command,) = _cancel_commands(task_id)
+    assert command.status == "pending"
+    if ended != "automatic_resume_gave_up":
+        assert response.status_code == 409, response.text
+        assert _error(response) == "task_not_cancellable"
+        return
+    assert response.status_code == 202, response.text
+    assert response.json() == {
+        "task_id": task_id,
+        "status": "failed",
+        "run_id": before["run_id"],
+        "state_version": before["state_version"],
+        "cancelled_run_id": None,
+        "error_code": None,
+    }
+    assert _row(task_id) == before
+
+    again = _cancel(task_id, key)
+
+    assert again.status_code == 202, again.text
+    assert again.json() == response.json()
+    assert dispatched.await_args.kwargs["command_db_id"] == command.id
+    assert [c.id for c in _cancel_commands(task_id)] == [command.id]
+    assert _row(task_id) == before
+    # The command is then applied as the core applies it.
+    _update(
+        task_id,
+        status=TaskStatus.FAILED,
+        control_state=TaskControlState.FAILED.value,
+        state_version=before["state_version"] + 1,
+        error_message=SDK_CANCEL_ERROR_MESSAGE,
+    )
+    _settle_cancel_command(command.id, status="completed")
+
+    applied = _cancel(task_id, key)
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["cancelled_run_id"] == before["run_id"]
+    assert applied.json()["error_code"] == "task_cancelled"
+    assert len(_cancel_commands(task_id)) == 1
 
 
 @pytest.mark.parametrize("case", ["other_agent", "other_user", "missing", "non_sdk"])
@@ -1275,6 +1452,33 @@ def test_a_repeat_while_the_withdrawing_cancel_is_still_processing_rejoins_it(
     assert len(_cancel_commands(task_id)) == 1
 
 
+def test_a_repeat_while_the_withdrawal_is_processing_does_not_cancel_the_paused_turn(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The turn before the withdrawn one is paused, and a paused task can be
+    cancelled. The withdrawing cancel has stopped the queued START but is not
+    marked completed yet, so no START is queued and the row is paused: the
+    repeat must still rejoin that command rather than aim a new one at the
+    paused turn, and the paused turn is left as it is."""
+    task_id, key, first, command = _withdrawn_before_completion(
+        monkeypatch, "previous_run_paused"
+    )
+    before = _row(task_id)
+    dispatched = AsyncMock()
+    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", dispatched)
+
+    again = _cancel(task_id, key)
+
+    assert first.status_code == 200, first.text
+    assert again.status_code == 200, again.text
+    assert again.json() == first.json()
+    assert again.json()["status"] == "paused"
+    assert again.json()["cancelled_run_id"] == QUEUED_RUN
+    assert dispatched.await_args.kwargs["command_db_id"] == command.id
+    assert [c.id for c in _cancel_commands(task_id)] == [command.id]
+    assert _row(task_id) == before
+
+
 def test_a_repeat_while_processing_after_the_turn_before_resumed_cancels_that_turn(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1497,9 +1701,9 @@ def test_a_queued_start_that_can_no_longer_hand_off_is_not_the_cancel_target(
     monkeypatch: pytest.MonkeyPatch, moved: str
 ):
     """The row was moved to another run after the START was accepted (an
-    automatic resume won the race), so the START never opens its run. A
-    running row is cancelled as the running run it is; one waiting for an
-    answer is refused as busy, as it would be with no START at all."""
+    automatic resume won the race), so the START never opens its run. The
+    row is cancelled as the run it holds, running or waiting for an answer,
+    as it would be with no START at all."""
     task_id, _agent_id, key = _running_task()
     _update(
         task_id,
@@ -1529,13 +1733,9 @@ def test_a_queued_start_that_can_no_longer_hand_off_is_not_the_cancel_target(
     response = _cancel(task_id, key)
 
     assert _row(task_id) == before
-    if moved == "waiting_on_another_run":
-        assert response.status_code == 409, response.text
-        assert _error(response) == "task_busy"
-        assert _cancel_commands(task_id) == []
-        return
     assert response.status_code == 202, response.text
     assert response.json()["run_id"] == "run-first"
+    assert response.json()["status"] == row_values["status"].value
     (command,) = _cancel_commands(task_id)
     assert "queued_run_id" not in command.payload
     assert command.target_run_id == "run-first"
@@ -1587,3 +1787,148 @@ def test_a_cancel_whose_queued_turn_started_before_the_deadline_is_accepted(
     assert response.json()["status"] == "running"
     assert response.json()["run_id"] == QUEUED_RUN
     assert response.json()["cancelled_run_id"] is None
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {
+            "status": TaskStatus.WAITING_FOR_USER,
+            "control_state": TaskControlState.WAITING_FOR_USER.value,
+        },
+        {"status": TaskStatus.PAUSED, "control_state": TaskControlState.PAUSED.value},
+    ],
+    ids=["waiting", "paused"],
+)
+def test_waiting_and_paused_tasks_are_cancelled(values):
+    task_id, agent_id, key = _running_task()
+    _update(task_id, runner_id=None, lease_expires_at=None, **values)
+    before = _row(task_id)
+
+    response = _cancel(task_id, key)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "task_id": task_id,
+        "status": "failed",
+        "run_id": before["run_id"],
+        "state_version": before["state_version"] + 1,
+        "cancelled_run_id": before["run_id"],
+        "error_code": "task_cancelled",
+    }
+    read = _get(task_id, key)
+    assert (read["status"], read["error_code"]) == ("failed", "task_cancelled")
+    assert read["pending_interaction"] is None
+    # An answer to the cancelled question has nothing to resume.
+    reply = client.post(
+        f"/v1/chat/tasks/{task_id}/reply",
+        headers=_bearer(key),
+        json={
+            "agent_id": agent_id,
+            "command_id": "reply-after-cancel",
+            "message": {"role": "user", "content": "yes"},
+        },
+    )
+    assert reply.status_code == 409, reply.text
+    assert _error(reply) == "no_pending_interaction"
+
+
+_WAITING_OR_PAUSED = {
+    "waiting": {
+        "status": TaskStatus.WAITING_FOR_USER,
+        "control_state": TaskControlState.WAITING_FOR_USER.value,
+    },
+    "paused": {
+        "status": TaskStatus.PAUSED,
+        "control_state": TaskControlState.PAUSED.value,
+    },
+}
+
+
+def _waiting_or_paused_task(state: str) -> tuple[int, int, str]:
+    task_id, agent_id, key = _running_task()
+    _update(task_id, runner_id=None, lease_expires_at=None, **_WAITING_OR_PAUSED[state])
+    return task_id, agent_id, key
+
+
+@pytest.mark.parametrize("state", list(_WAITING_OR_PAUSED))
+@pytest.mark.parametrize(
+    "outcome", ["unapplied", "resumed", "ended_stale_run", "ended_deadline"]
+)
+def test_how_a_cancel_of_a_waiting_or_paused_run_is_answered(
+    monkeypatch: pytest.MonkeyPatch, state: str, outcome: str
+):
+    """The answer follows the aimed waiting or paused run:
+
+    - unapplied: the command was not applied by the deadline, 202.
+    - resumed: an answer or an automatic resume took the run first; the
+      resumed run is still the aimed one and can be cancelled by retrying,
+      so 409 ``task_busy``.
+    - ended_*: the run resumed and completed before the command was
+      applied; it ended without a cancel, whichever way the wait ends, so
+      409 ``task_not_cancellable``.
+    """
+    task_id, _agent_id, key = _waiting_or_paused_task(state)
+    before = _row(task_id)
+    after: list[dict[str, Any]] = []
+
+    def resume_the_run() -> None:
+        _update(
+            task_id,
+            status=TaskStatus.RUNNING,
+            control_state=TaskControlState.RUNNING.value,
+            state_version=before["state_version"] + 1,
+        )
+        after.append(_row(task_id))
+
+    def end_the_run() -> None:
+        _update(task_id, **_ENDED_ROWS["completed"])
+        after.append(_row(task_id))
+
+    if outcome == "unapplied":
+        monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", AsyncMock())
+        monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+    elif outcome == "ended_deadline":
+
+        async def ended_while_the_command_waits(*_args: Any, **_kwargs: Any) -> bool:
+            end_the_run()
+            return False
+
+        monkeypatch.setattr(
+            sdk_task_cancel,
+            "dispatch_one_task_command",
+            AsyncMock(side_effect=ended_while_the_command_waits),
+        )
+        monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 0.1)
+    else:
+        moves = resume_the_run if outcome == "resumed" else end_the_run
+
+        async def moved_before_it_was_applied(**_kwargs: Any) -> None:
+            moves()
+            raise TaskCommandRejected("moved", reason="stale_run")
+
+        _replace_cancel_core(monkeypatch, moved_before_it_was_applied)
+
+    response = _cancel(task_id, key)
+
+    if outcome == "unapplied":
+        assert response.status_code == 202, response.text
+        assert response.json() == {
+            "task_id": task_id,
+            "status": before["status"].value,
+            "run_id": before["run_id"],
+            "state_version": before["state_version"],
+            "cancelled_run_id": None,
+            "error_code": None,
+        }
+        assert _row(task_id) == before
+        assert len(_cancel_commands(task_id)) == 1
+        return
+    assert response.status_code == 409, response.text
+    if outcome == "resumed":
+        assert _error(response) == "task_busy"
+        assert _row(task_id) == after[0]
+        return
+    assert _error(response) == "task_not_cancellable"
+    assert _row(task_id) == after[0]
+    assert len(_cancel_commands(task_id)) == 1

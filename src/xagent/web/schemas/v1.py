@@ -1251,10 +1251,16 @@ class CancelTaskResponse(BaseModel):
     it reads ``pending`` with a null ``error_code``, as
     ``GET /v1/chat/tasks/{task_id}`` does. A turn
     withdrawn before it started leaves the task showing the turn before
-    it, so ``cancelled_run_id`` differs from ``run_id``.
+    it, so ``cancelled_run_id`` differs from ``run_id``; calling again
+    answers the same while the task has not moved since.
     202: the cancel was recorded but not applied yet; ``status`` is still
-    the task's current one and ``cancelled_run_id`` is null. Calling again
-    reaches the same request.
+    the task's current one, as ``GET`` reads it, and ``cancelled_run_id``
+    is null. Calling again reaches the same request, including after a
+    queued turn was withdrawn and before the cancel is marked done. A
+    paused task whose automatic resume gave up while the cancel waited,
+    and has not moved since, reads ``failed`` here and is still cancelled
+    by it; calling again reaches the same cancel and answers 200 once it
+    is applied.
     """
 
     task_id: int = Field(..., description="Existing task primary key.")

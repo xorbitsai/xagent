@@ -21,10 +21,11 @@ from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_execution_event import TaskExecutionEvent
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import a2a_task_cancel as a2a_cancel_service
 from xagent.web.services import sdk_task_cancel
 from xagent.web.services import task_command_execution as command_execution_service
@@ -35,6 +36,7 @@ from xagent.web.services.assistant_history_safety import TASK_FAILURE_MESSAGE_TY
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_PENDING,
+    SUPERSEDED_MESSAGE_TYPE,
 )
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.external_task_cancel import EXTERNAL_TURN_INTERRUPTED_MESSAGE
@@ -460,9 +462,9 @@ async def test_a_run_registered_after_the_first_cancel_is_stopped_after_the_writ
         {"status": TaskStatus.PAUSED, "state_version": 5},
         {"run_id": "run-next"},
         {"state_version": 6},
-        {"status": TaskStatus.WAITING_FOR_USER},
+        {"status": TaskStatus.PENDING},
     ],
-    ids=["failed_itself", "completed", "paused", "new_run", "moved", "waiting"],
+    ids=["failed_itself", "completed", "paused", "new_run", "moved", "pending"],
 )
 async def test_cancel_never_claims_an_outcome_it_did_not_cause(
     monkeypatch: pytest.MonkeyPatch, moved: dict[str, Any]
@@ -1542,3 +1544,339 @@ def test_the_stopped_before_start_wording_has_one_definition() -> None:
         sdk_task_cancel.STOPPED_BEFORE_START_REASON
         == task_execution_admission.STOPPED_BEFORE_START_REASON
     )
+
+
+# ----- a run that is waiting for an answer -----
+
+
+def _add_active_interaction(task_id: int, run_id: str, key: str) -> int:
+    """A native interaction holding the task's one answer slot for ``run_id``."""
+    db = _direct_db_session()
+    try:
+        anchor = TraceEvent(
+            task_id=task_id,
+            event_id=f"anchor-{key}",
+            event_type="agent_execution_checkpoint",
+            timestamp=datetime.now(UTC),
+            data={},
+        )
+        db.add(anchor)
+        db.flush()
+        row = TaskInteractionRequest(
+            task_id=task_id,
+            run_id=run_id,
+            kind="clarification",
+            protocol_version=1,
+            status="active",
+            active_slot=1,
+            origin="sdk",
+            request_payload={
+                "message": "Continue?",
+                "interactions": [
+                    {"type": "text_input", "field": "response", "label": "Answer"}
+                ],
+            },
+            request_idempotency_key=key,
+            resume_trace_event_id=int(anchor.id),
+            resume_event_id=f"resume-event-{key}",
+            resume_execution_id=f"resume-execution-{key}",
+            resume_locator_format="trace_event_pk_v1",
+            resume_checkpoint_type="agent_execution_checkpoint",
+            resume_run_partition=run_id,
+            expires_at=datetime.now(UTC) + timedelta(minutes=15),
+        )
+        db.add(row)
+        db.query(Task).filter(Task.id == task_id).update(
+            {"interaction_protocol_version": 1}
+        )
+        db.commit()
+        return int(row.id)
+    finally:
+        db.close()
+
+
+def _interaction(row_id: int) -> tuple[str, int | None]:
+    db = _direct_db_session()
+    try:
+        row = db.get(TaskInteractionRequest, row_id)
+        return str(row.status), row.active_slot
+    finally:
+        db.close()
+
+
+def _question_traces(task_id: int) -> list[str]:
+    db = _direct_db_session()
+    try:
+        rows = (
+            db.query(TraceEvent)
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.event_type == "agent_message",
+            )
+            .all()
+        )
+        return [str(row.data.get("message")) for row in rows]
+    finally:
+        db.close()
+
+
+def _waiting_task(**overrides: Any) -> tuple[int, int, int]:
+    values = {
+        "status": TaskStatus.WAITING_FOR_USER,
+        "control_state": TaskControlState.WAITING_FOR_USER.value,
+        "output": "stale output",
+    }
+    values.update(overrides)
+    task_id, agent_id, owner_user_id = _create_task(**values)
+    db = _direct_db_session()
+    try:
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=owner_user_id,
+                role="assistant",
+                content="Continue?",
+                message_type="question",
+                turn_id="turn-question",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    _add_active_interaction(task_id, "run-sdk", "question-1")
+    return task_id, agent_id, owner_user_id
+
+
+def _active_interaction_of(task_id: int) -> int:
+    db = _direct_db_session()
+    try:
+        return int(
+            db.query(TaskInteractionRequest.id)
+            .filter(TaskInteractionRequest.task_id == task_id)
+            .one()[0]
+        )
+    finally:
+        db.close()
+
+
+async def _cancel_as_read(task_id: int, agent_id: int) -> None:
+    await cancel_sdk_task_unserialized(
+        task_id=task_id,
+        agent_id=agent_id,
+        expected_run_id="run-sdk",
+        expected_state_version=4,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_run_is_not_waited_on_before_its_cancel_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run waiting for an answer has no coroutine to wait for, so the core
+    writes the row without first stopping one: a resume that started after
+    the target was read must not be cancelled as if it were the aimed run.
+    Only the stop after the write, for a coroutine registered since, runs."""
+    task_id, agent_id, _owner = _waiting_task()
+    _broadcast_manager(monkeypatch)
+    statuses: list[TaskStatus] = []
+
+    async def record_status(_task_id: int, **_kwargs: object) -> SimpleNamespace:
+        statuses.append(_load_task(task_id).status)
+        return SimpleNamespace(requested=False)
+
+    monkeypatch.setattr(
+        task_execution_service.background_task_manager, "cancel_task", record_status
+    )
+
+    await _cancel_as_read(task_id, agent_id)
+
+    assert statuses == [TaskStatus.FAILED]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_version", [1, 2])
+async def test_a_waiting_run_is_cancelled_and_its_question_closed(
+    monkeypatch: pytest.MonkeyPatch, storage_version: int
+) -> None:
+    task_id, agent_id, _owner = _waiting_task(storage_version=storage_version)
+    interaction_id = _active_interaction_of(task_id)
+    _broadcast_manager(monkeypatch)
+
+    await _cancel_as_read(task_id, agent_id)
+
+    task = _load_task(task_id)
+    assert is_sdk_cancelled(task.status, task.error_message)
+    assert (task.run_id, task.state_version, task.output) == ("run-sdk", 5, None)
+    # The question no longer reads as pending; the failure line follows it.
+    assert _assistant_rows(task_id) == [
+        ("Continue?", SUPERSEDED_MESSAGE_TYPE),
+        (CLIENT_SAFE_TASK_FAILURE, TASK_FAILURE_MESSAGE_TYPE),
+    ]
+    # The answer slot is released, so a later run of the task can ask again.
+    assert _interaction(interaction_id) == ("terminated", None)
+    later = _add_active_interaction(task_id, "run-later", "question-2")
+    assert _interaction(later) == ("active", 1)
+    # A version-1 question with no trace row of its own is given one, so the
+    # task's steps still show what was asked.
+    assert _question_traces(task_id) == (["Continue?"] if storage_version == 1 else [])
+    assert [fact["result"] for fact in _result_facts(task_id)] == (
+        [{"status": "cancelled", "error": SDK_CANCEL_ERROR_MESSAGE}]
+        if storage_version == 2
+        else []
+    )
+
+
+@pytest.mark.parametrize("claimed_by", ["control_state", "queued_command"])
+def test_a_waiting_run_an_answer_already_claimed_is_not_cancelled(
+    claimed_by: str,
+) -> None:
+    """The answer owns the waiting run until it resumes it."""
+    task_id, agent_id, owner_user_id = _waiting_task()
+    db = _direct_db_session()
+    try:
+        if claimed_by == "control_state":
+            db.query(Task).filter(Task.id == task_id).update(
+                {"control_state": TaskControlState.RESUME_REQUESTED.value}
+            )
+        else:
+            stage_task_command(
+                db,
+                task_id=task_id,
+                actor_user_id=owner_user_id,
+                command_id="reply-1",
+                kind=TaskCommandKind.RESUME_INPUT,
+                payload={},
+            )
+        db.commit()
+    finally:
+        db.close()
+    before = _row(task_id)
+
+    with pytest.raises(StaleTaskRunError):
+        sdk_task_cancel._finalize_sdk_cancel_sync(
+            task_id=task_id,
+            agent_id=agent_id,
+            expected_run_id="run-sdk",
+            expected_state_version=4,
+            expected_status=TaskStatus.WAITING_FOR_USER,
+            terminal_event_state={},
+        )
+
+    assert _row(task_id) == before
+    assert _assistant_rows(task_id) == [("Continue?", "question")]
+
+
+@pytest.mark.asyncio
+async def test_a_paused_run_is_cancelled_without_touching_a_later_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A paused task accepts an append, so a pending user message may belong
+    to a later turn: the cancelled run's settlement leaves it alone."""
+    task_id, agent_id, owner_user_id = _create_task(
+        status=TaskStatus.PAUSED, control_state=TaskControlState.PAUSED.value
+    )
+    _seed_pending_user_message(task_id, owner_user_id, "turn-appended")
+    _broadcast_manager(monkeypatch)
+
+    await _cancel_as_read(task_id, agent_id)
+
+    task = _load_task(task_id)
+    assert is_sdk_cancelled(task.status, task.error_message)
+    assert task.state_version == 5
+    assert _delivery_status(task_id, "turn-appended") == DELIVERY_PENDING
+    assert _assistant_rows(task_id) == [
+        (CLIENT_SAFE_TASK_FAILURE, TASK_FAILURE_MESSAGE_TYPE)
+    ]
+
+
+@pytest.mark.parametrize("moved", ["run", "state_version"])
+def test_a_paused_run_that_moved_before_its_lock_keeps_its_automatic_resume(
+    monkeypatch: pytest.MonkeyPatch, moved: str
+) -> None:
+    """The row read under the lock is checked against the run and version
+    the cancel was aimed at before the automatic resume is stopped: a row
+    that moved since is stale, and nothing is stopped or written."""
+    from xagent.web.services import task_auto_resume
+
+    task_id, _agent_id, _owner = _create_task(
+        status=TaskStatus.PAUSED, control_state=TaskControlState.PAUSED.value
+    )
+    stop = MagicMock()
+    monkeypatch.setattr(task_auto_resume, "cancel_pending_auto_resume_no_commit", stop)
+    before = _row(task_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        with pytest.raises(StaleTaskRunError):
+            sdk_task_cancel._stop_auto_resume_no_commit(
+                db,
+                task,
+                expected_run_id="run-other" if moved == "run" else "run-sdk",
+                expected_state_version=3 if moved == "state_version" else 4,
+            )
+    finally:
+        db.close()
+
+    stop.assert_not_called()
+    assert _row(task_id) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_version", [1, 2])
+@pytest.mark.parametrize("state", ["waiting", "paused"])
+async def test_the_terminal_frame_of_a_waiting_or_paused_run_carries_its_snapshot(
+    monkeypatch: pytest.MonkeyPatch, state: str, storage_version: int
+) -> None:
+    """The core writes a waiting or paused run's result fact itself, so a
+    version-2 frame carries the turn's display events, on the write and on
+    a replay of the same command alike."""
+    if state == "waiting":
+        task_id, agent_id, _owner = _waiting_task(storage_version=storage_version)
+    else:
+        task_id, agent_id, _owner = _create_task(
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            storage_version=storage_version,
+        )
+    manager = _broadcast_manager(monkeypatch)
+
+    for _replay in range(2):
+        manager.broadcast_to_task.reset_mock()
+        await _cancel_as_read(task_id, agent_id)
+
+        frame = _terminal_frame(manager)
+        if storage_version == 2:
+            assert frame["state_version"] == 5
+            assert frame["task"]["status"] == "failed"
+        else:
+            assert "state_version" not in frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        {
+            "status": TaskStatus.WAITING_FOR_USER,
+            "control_state": TaskControlState.WAITING_FOR_USER.value,
+        },
+        {"status": TaskStatus.PAUSED, "control_state": TaskControlState.PAUSED.value},
+    ],
+    ids=["waiting", "paused"],
+)
+async def test_a_queued_turn_that_started_and_now_waits_is_cancelled_as_it_is(
+    monkeypatch: pytest.MonkeyPatch, state: dict[str, Any]
+) -> None:
+    """The queued run started and is waiting for an answer or paused by the
+    time the command applies: it is cancelled the way its state is."""
+    task_id, agent_id, owner_user_id = _create_task(
+        run_id=QUEUED_RUN, state_version=7, **state
+    )
+    _stage_start(task_id, owner_user_id, status="completed", attempt_count=1)
+    _broadcast_manager(monkeypatch)
+
+    await _cancel_queued(task_id, agent_id)
+
+    task = _load_task(task_id)
+    assert is_sdk_cancelled(task.status, task.error_message)
+    assert (task.run_id, task.state_version) == (QUEUED_RUN, 8)

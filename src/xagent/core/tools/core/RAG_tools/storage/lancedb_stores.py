@@ -3340,6 +3340,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ensure_main_pointers_table,
             ensure_parses_table,
         )
+        from ..utils.lancedb_query_utils import list_table_names
         from ..utils.user_scope import resolve_user_scope
         from .lancedb_cleanup_filters import select_embedding_tables
 
@@ -3357,7 +3358,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_main_pointers_table(conn)
         ensure_ingestion_runs_table(conn)
 
-        table_names = _vis_get_table_names(conn)
+        # A listing that fails must not shrink this delete to the embeddings.
+        table_names = list(list_table_names(conn))
         predicates: Dict[str, list] = {}
 
         core_tables = [
@@ -3619,6 +3621,7 @@ def _vis_delete_by_predicates(
     import logging as _logging
 
     from ..LanceDB.schema_manager import _safe_close_table
+    from ..utils.lancedb_query_utils import list_table_names
 
     _logger = _logging.getLogger(__name__)
     deleted: Dict[str, int] = {}
@@ -3626,7 +3629,8 @@ def _vis_delete_by_predicates(
     # Documents last: its row is what a retried document delete looks up, so
     # every failure before this point can still be retried whole.
     late = ["documents"]
-    table_names = _vis_get_table_names(conn)
+    # A listing that fails must not shrink this delete to the embeddings.
+    table_names = list(list_table_names(conn))
     sweeps_embeddings = embedding_filters is not None or any(
         name == "__embeddings__" or name.startswith("embeddings_")
         for name in table_to_filter
@@ -3915,6 +3919,7 @@ def _vis_cascade_delete_documents(
         ensure_main_pointers_table,
         ensure_parses_table,
     )
+    from ..utils.lancedb_query_utils import list_table_names
     from ..utils.user_scope import resolve_user_scope
     from .lancedb_cleanup_filters import select_embedding_tables
 
@@ -3934,7 +3939,8 @@ def _vis_cascade_delete_documents(
     ensure_main_pointers_table(conn)
     ensure_ingestion_runs_table(conn)
 
-    table_names = _vis_get_table_names(conn)
+    # A listing that fails must not shrink this delete to the embeddings.
+    table_names = list(list_table_names(conn))
     predicates: Dict[str, list] = {}
 
     core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]

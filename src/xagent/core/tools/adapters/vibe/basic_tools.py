@@ -37,7 +37,9 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
         "zhipu_web_search", "api_key", "base_url"
     )
     (tavily_api_key,) = credentials("tavily_web_search", "api_key")
-    google_api_key, google_cse_id = credentials("web_search", "api_key", "cse_id")
+    google_api_key, google_cse_id, google_base_url = credentials(
+        "web_search", "api_key", "cse_id", "base_url"
+    )
     (exa_api_key,) = credentials("exa_web_search", "api_key")
     provider = get_web_search_provider()
 
@@ -56,7 +58,11 @@ async def create_web_tools(config: "BaseToolConfig") -> List[Any]:
     elif provider in ("auto", "google") and google_api_key and google_cse_id:
         from .web_search import WebSearchTool
 
-        tools.append(WebSearchTool(api_key=google_api_key, cse_id=google_cse_id))
+        tools.append(
+            WebSearchTool(
+                api_key=google_api_key, cse_id=google_cse_id, base_url=google_base_url
+            )
+        )
 
     from .fetch_web_content import FetchWebContentTool
 

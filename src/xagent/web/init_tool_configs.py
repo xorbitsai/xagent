@@ -46,6 +46,7 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
                 "provider": "google",
                 "api_key_env": "GOOGLE_API_KEY",
                 "cse_id_env": "GOOGLE_CSE_ID",
+                "base_url_env": "GOOGLE_CSE_BASE_URL",
             },
             "dependencies": ["google_api_key", "google_cse_id"],
         },

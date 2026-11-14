@@ -17,9 +17,15 @@ logger = logging.getLogger(__name__)
 class WebSearchCore:
     """Pure web search tool without framework dependencies"""
 
-    def __init__(self, api_key: str | None = None, cse_id: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        cse_id: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
         self._api_key = api_key
         self._cse_id = cse_id
+        self._base_url = base_url
 
     async def search(
         self,
@@ -53,6 +59,13 @@ class WebSearchCore:
 
         num_results = min(max(1, num_results), 10)
 
+        base_url = (
+            self._base_url
+            or os.getenv("GOOGLE_CSE_BASE_URL")
+            or "https://www.googleapis.com"
+        ).rstrip("/")
+        url = f"{base_url}/customsearch/v1"
+
         # Setup proxy configuration
         proxy_url = self._get_proxy_url()
         if proxy_url:
@@ -75,7 +88,7 @@ class WebSearchCore:
             logger.info("📡 Making request to Google Custom Search API...")
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.get(
-                    "https://www.googleapis.com/customsearch/v1",
+                    url,
                     params=params,
                     timeout=10,
                 )

@@ -18,6 +18,13 @@ the shape alone is never enough.
 checks read that flag as a protocol-level failure and judge the envelope on
 their own, so the adapter marks the result ``success: False`` instead, which
 ``tool_result_succeeded`` already reads.
+
+The adapter does not apply this to a tool that declares a non-idempotent
+write. Such a tool can return the envelope after its request went out
+(``deputy_create_resource`` does on a timeout after the POST). ReAct reads a
+failed call as one whose write provably did not happen, and its same-turn
+duplicate-write guard suppresses an identical repeat only of a successful
+call, so counting that envelope as a failure would let the repeat write again.
 """
 
 from __future__ import annotations
@@ -92,10 +99,13 @@ def speaks_error_envelope(connection: object) -> bool:
 
     The connection must be stdio and run ``-m <IN_REPO_SERVER_PACKAGE>.<module>``
     with ``<module>`` in ``ERROR_ENVELOPE_SERVER_MODULES``. Only the first
-    ``-m`` counts, as it does for Python: what follows it is that module's own
-    argv. Both launch shapes the catalog has used match, ``python -m ...`` and
-    ``uv run python -m ...``; the command is not checked, because the module
-    is what decides the result's shape.
+    ``-m`` is read, since what follows it is that module's own argv. Both
+    launch shapes the catalog has used match, ``python -m ...`` and
+    ``uv run python -m ...``. Neither the command nor the arguments before
+    ``-m`` are interpreted, so a script or ``-c`` placed first would still
+    match. Only a user-configured stdio connection could be shaped that way;
+    such a connection runs in the sandbox, and a match only changes how its
+    own results are counted.
     """
     if not isinstance(connection, Mapping) or connection.get("transport") != "stdio":
         return False
@@ -121,9 +131,11 @@ def is_error_envelope(content: object) -> bool:
 
     It must be a single text item whose text, within
     ``ERROR_ENVELOPE_MAX_CHARS``, parses to a JSON object whose ``status`` is
-    exactly ``"error"``. Other statuses the servers use (``indeterminate``,
-    ``conflict``, ``partial``, ...) are outcomes the model has to read, not
-    failures, and stay successful.
+    exactly ``"error"``, the spelling every in-repo server writes. That is
+    deliberately narrower than ``tool_result_succeeded``, which folds case on
+    a result's own top-level ``status``. Other statuses the servers use
+    (``indeterminate``, ``conflict``, ``partial``, ...) are outcomes the model
+    has to read, not failures, and stay successful.
     """
     if not isinstance(content, list) or len(content) != 1:
         return False

@@ -17,9 +17,12 @@ from types import SimpleNamespace
 import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
-from mcp.types import ImageContent, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 
 import xagent.web.tools.mcp as in_repo_servers
+from xagent.core.agent.pattern.react.duplicate_write_guard import (
+    tool_requires_duplicate_write_guard,
+)
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe import mcp_error_envelope as envelope_module
@@ -27,6 +30,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
 from xagent.core.tools.adapters.vibe.mcp_error_envelope import (
     ERROR_ENVELOPE_MAX_CHARS,
     ERROR_ENVELOPE_SERVER_MODULES,
+    IN_REPO_SERVER_PACKAGE,
     is_error_envelope,
     speaks_error_envelope,
 )
@@ -38,7 +42,7 @@ def _in_repo(module: str = "gmail") -> dict:
     return {
         "transport": "stdio",
         "command": "python",
-        "args": ["-m", f"xagent.web.tools.mcp.{module}"],
+        "args": ["-m", f"{IN_REPO_SERVER_PACKAGE}.{module}"],
     }
 
 
@@ -154,8 +158,8 @@ def test_every_catalog_launched_module_is_classified():
     for row in get_builtin_public_mcp_app_rows():
         args = (row.get("launch_config") or {}).get("args") or []
         for arg in args:
-            if isinstance(arg, str) and arg.startswith("xagent.web.tools.mcp."):
-                launched.add(arg.removeprefix("xagent.web.tools.mcp."))
+            if isinstance(arg, str) and arg.startswith(f"{IN_REPO_SERVER_PACKAGE}."):
+                launched.add(arg.removeprefix(f"{IN_REPO_SERVER_PACKAGE}."))
 
     assert launched
     assert launched <= ERROR_ENVELOPE_SERVER_MODULES | passes_vendor_text_through
@@ -349,6 +353,87 @@ async def test_excel_failure_code_keeps_its_classification(monkeypatch):
     assert result["is_error"] is True
     assert result["success"] is False
     assert result["failure_code"] == "excel_workbook_locked"
+
+
+def _annotated_server(annotations: dict) -> FastMCP:
+    server = FastMCP("envelope-probe")
+
+    @server.tool(annotations=ToolAnnotations(**annotations))
+    def probe_tool() -> str:
+        return _ERROR
+
+    return server
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_write_envelope_keeps_the_duplicate_write_guard(
+    monkeypatch,
+):
+    """An in-repo write can return the envelope after its request went out
+    (``deputy_create_resource`` does on a timeout after the POST). The
+    same-turn duplicate-write guard suppresses an identical repeat only of a
+    ``completed`` call, and a ``failed`` one reads as "provably did not
+    happen", so a non-idempotent write's envelope must stay a success."""
+    annotations = {"destructiveHint": False, "idempotentHint": False}
+    adapter = await _adapter(
+        monkeypatch,
+        _annotated_server(annotations),
+        _in_repo("deputy"),
+        raw_annotations=annotations,
+    )
+    assert tool_requires_duplicate_write_guard(adapter) is True
+
+    result = await adapter.run_json_async({})
+
+    assert "success" not in result
+    assert tool_result_succeeded(result) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {"readOnlyHint": True},
+        {"destructiveHint": False, "idempotentHint": True},
+        {"destructiveHint": True, "idempotentHint": True},
+    ],
+)
+async def test_envelope_of_a_tool_the_guard_does_not_cover_is_a_failure(
+    monkeypatch, annotations
+):
+    adapter = await _adapter(
+        monkeypatch,
+        _annotated_server(annotations),
+        _in_repo("deputy"),
+        raw_annotations=annotations,
+    )
+    assert tool_requires_duplicate_write_guard(adapter) is False
+
+    result = await adapter.run_json_async({})
+
+    assert tool_result_succeeded(result) is False
+
+
+@pytest.mark.asyncio
+async def test_envelope_among_several_content_items_stays_successful(monkeypatch):
+    server = FastMCP("envelope-probe")
+
+    @server.tool()
+    def probe_tool() -> CallToolResult:
+        return CallToolResult(
+            content=[
+                TextContent(type="text", text=_ERROR),
+                TextContent(type="text", text=_ERROR),
+            ]
+        )
+
+    adapter = await _adapter(monkeypatch, server, _in_repo())
+
+    result = await adapter.run_json_async({})
+
+    assert len(result["content"]) == 2
+    assert "success" not in result
+    assert tool_result_succeeded(result) is True
 
 
 def test_envelope_detection_is_decided_from_the_bound_connection():

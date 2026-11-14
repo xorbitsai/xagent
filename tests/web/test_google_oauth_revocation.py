@@ -21,6 +21,7 @@ from sqlalchemy.pool import StaticPool
 from xagent.web.api import auth as auth_api
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
@@ -317,6 +318,69 @@ def test_a_tokenless_or_composio_google_row_without_an_upstream_id_does_not_bloc
     _assert_revoked_with(post, "refresh")
 
 
+@pytest.mark.asyncio
+async def test_the_skip_log_names_an_unidentified_legacy_row_and_the_context(
+    db, post, caplog
+):
+    """Once such a row exists every Google revoke is skipped, so the log must
+    tell it apart from an ordinary sibling reference and say which disconnect
+    path was skipped."""
+    user = _user(db)
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="gmail",
+            provider_user_id=None,
+            access_token="legacy-gmail-access",
+        )
+    )
+    db.commit()
+    revocation = auth_api.BuiltinOAuthRevocation(
+        provider="google",
+        access_token="access",
+        client_id="",
+        client_secret="",
+        provider_user_id="sub-1",
+        refresh_token="refresh",
+    )
+
+    with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
+        await auth_api.revoke_builtin_oauth_grants(
+            db, [revocation], context="deleting server 7"
+        )
+
+    post.assert_not_called()
+    assert "no recorded account id" in caplog.text
+    assert "deleting server 7" in caplog.text
+    assert "another local connection" not in caplog.text
+
+
+def test_the_skip_log_names_a_sibling_row_recording_the_same_account(db, post, caplog):
+    user = _user(db)
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="google-drive",
+            provider_user_id="sub-1",
+            access_token="drive-access",
+        )
+    )
+    db.commit()
+
+    with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
+        auth_api.revoke_builtin_oauth_grant(
+            db,
+            provider="gmail",
+            access_token="access",
+            provider_user_id="sub-1",
+            refresh_token="refresh",
+        )
+
+    post.assert_not_called()
+    assert "another local connection" in caplog.text
+    assert "no recorded account id" not in caplog.text
+
+
 def test_a_rejected_access_token_is_logged_as_not_revoked(monkeypatch, caplog):
     """Google answers an expired access token with invalid_token without
     revoking the grant behind it: that must not read as success."""
@@ -534,4 +598,29 @@ async def test_a_shared_grant_a_sibling_app_still_links_is_not_revoked(db, post)
     await delete_connected_account(account_id=int(legacy.id), db=db, user=user)
 
     assert db.query(UserOAuth).filter(UserOAuth.provider == "google").count() == 1
+    post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_non_google_account_leaves_the_google_fences_alone(db, post):
+    """A Dropbox disconnect cannot detach a shared Google link, so it must not
+    pay for a fence insert, lock and reference query per shared Google row."""
+    from xagent.web.api.cloud_storage import delete_connected_account
+
+    user = _user(db)
+    _shared_grant_with_tombstoned_last_link(db, user)
+    dropbox = UserOAuth(
+        user_id=int(user.id),
+        provider="dropbox",
+        provider_user_id="dropbox-1",
+        access_token="dropbox-access",
+    )
+    db.add(dropbox)
+    db.commit()
+
+    await delete_connected_account(account_id=int(dropbox.id), db=db, user=user)
+
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "dropbox").count() == 0
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "google").count() == 1
+    assert db.query(OAuthRevocationFence).count() == 0
     post.assert_not_called()

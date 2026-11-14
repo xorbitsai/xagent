@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
 from urllib.parse import urlparse
 
@@ -129,11 +130,16 @@ from ..services.auth_email import (
     send_email_changed_notice,
     send_password_reset_email,
 )
-from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.db_runtime import (
+    await_task_settlement,
+    propagate_deferred_cancellation,
+    run_db_io_cancellation_safe,
+)
 from ..services.oauth_revocation_fences import (
     close_oauth_revocation_fence,
     lock_oauth_revocation_fence,
     oauth_revocation_call_allowed,
+    oauth_revocation_fence_is_open,
     oauth_revocation_fence_refuses,
     open_oauth_revocation_fence,
 )
@@ -4030,8 +4036,21 @@ def has_other_builtin_oauth_reference(
     why: a cancelled request's ``db.close()`` can otherwise race a worker
     thread still mid-query on that same Session).
     """
+    return bool(
+        _builtin_oauth_references(
+            db, provider=provider, provider_user_id=provider_user_id
+        )
+    )
+
+
+def _builtin_oauth_references(
+    db: Session, *, provider: str, provider_user_id: str | None
+) -> list[UserOAuth]:
+    """The live rows :func:`has_other_builtin_oauth_reference` counts, so a
+    caller can tell *why* a revoke is blocked: rows recording the same
+    account, and -- for Google only -- rows recording no account at all."""
     if not provider_user_id:
-        return False
+        return []
     same_identity = UserOAuth.provider_user_id == provider_user_id
     if provider == "google":
         same_identity = or_(
@@ -4050,7 +4069,7 @@ def has_other_builtin_oauth_reference(
         )
         .all()
     )
-    return any(candidate.access_token for candidate in candidates)
+    return [candidate for candidate in candidates if candidate.access_token]
 
 
 def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:
@@ -4122,7 +4141,7 @@ class _RevocationClaim(NamedTuple):
 
 
 def _claim_builtin_oauth_revocation(
-    db: Session, revocation: BuiltinOAuthRevocation
+    db: Session, revocation: BuiltinOAuthRevocation, *, context: str
 ) -> _RevocationClaim | None:
     """Reference-check one revocation under its upstream account's fence and,
     when nothing references the account any more, open the fence.
@@ -4131,9 +4150,14 @@ def _claim_builtin_oauth_revocation(
     commits, and an OAuth callback for the same account takes the same lock
     before storing its credentials. So a callback either committed first and
     the reference check sees its row, or it finds the opened fence and is
-    refused instead of storing tokens this revoke may kill. Returns ``None``
-    when the revoke must not go ahead. Commits ``db``; raises on database
-    failure.
+    refused instead of storing tokens this revoke may kill. A revoker that
+    finds the fence already open (another revocation of the account is in
+    flight, or only just ended) skips too: that call revokes the same grant,
+    and a second holder closing the fence early could let a reconnect
+    through. Returns ``None`` when the revoke must not go ahead. Commits
+    ``db``; raises on database failure.
+
+    ``context`` names the disconnect path in the skip log lines.
     """
     if revocation.provider_user_id is None:
         return _RevocationClaim(deadline=None)
@@ -4142,16 +4166,34 @@ def _claim_builtin_oauth_revocation(
         provider=revocation.provider,
         provider_user_id=revocation.provider_user_id,
     )
-    if has_other_builtin_oauth_reference(
+    references = _builtin_oauth_references(
         db,
         provider=revocation.provider,
         provider_user_id=revocation.provider_user_id,
-    ):
+    )
+    if references:
+        # Decided before the commit, which expires the loaded rows.
+        only_unidentified = all(row.provider_user_id is None for row in references)
+        db.commit()
+        # Once an unidentified legacy Google row exists, every Google revoke
+        # is skipped (see has_other_builtin_oauth_reference), so say which
+        # rule fired for operators wondering why grants linger.
+        logger.info(
+            "Skipping %s OAuth grant revocation (%s): %s",
+            revocation.provider,
+            context,
+            "a legacy connection with no recorded account id may share this grant"
+            if only_unidentified
+            else "another local connection still references this account",
+        )
+        return None
+    if oauth_revocation_fence_is_open(fence):
         db.commit()
         logger.info(
-            "Skipping %s OAuth grant revocation: another local connection "
-            "still references this account",
+            "Skipping %s OAuth grant revocation (%s): another revocation of "
+            "this account is in flight",
             revocation.provider,
+            context,
         )
         return None
     deadline = open_oauth_revocation_fence(fence)
@@ -4176,20 +4218,37 @@ def _release_builtin_oauth_revocation(
     db: Session, revocation: BuiltinOAuthRevocation, claim: _RevocationClaim
 ) -> None:
     """Close the fence once the provider call is over, so a reconnect whose
-    exchange starts from now on is accepted. Commits ``db``."""
+    exchange starts from now on (past the close margin) is accepted. Commits
+    ``db``.
+
+    Never raises: it runs in ``finally`` blocks, where an exception would
+    replace a propagating cancellation. A failed release leaves the deadline
+    in place, which only delays reconnects until it lapses.
+    """
     if claim.deadline is None or revocation.provider_user_id is None:
         return
-    close_oauth_revocation_fence(
-        db,
-        provider=revocation.provider,
-        provider_user_id=revocation.provider_user_id,
-        deadline=claim.deadline,
-    )
-    db.commit()
+    try:
+        close_oauth_revocation_fence(
+            db,
+            provider=revocation.provider,
+            provider_user_id=revocation.provider_user_id,
+            deadline=claim.deadline,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "%s OAuth revocation fence release failed (exception_type=%s)",
+            revocation.provider,
+            type(exc).__name__,
+        )
 
 
 def revoke_builtin_oauth_grant_if_unreferenced(
-    db: Session, revocation: BuiltinOAuthRevocation
+    db: Session,
+    revocation: BuiltinOAuthRevocation,
+    *,
+    context: str = "synchronous disconnect",
 ) -> None:
     """Best-effort provider-side revoke of one already-resolved builtin
     OAuth grant, skipped if another local connection (any owner, any user)
@@ -4205,7 +4264,7 @@ def revoke_builtin_oauth_grant_if_unreferenced(
     network-only half -- promises never to raise, so that failure is caught
     here too, rolling the session back first so a caller that keeps using
     ``db`` afterward doesn't inherit a transaction Postgres has already
-    poisoned.
+    poisoned. ``context`` names the disconnect path in the skip log lines.
 
     For a fully synchronous caller only (:func:`revoke_builtin_oauth_grant`
     and this module's own tests): the Session it does real query work on is
@@ -4215,7 +4274,7 @@ def revoke_builtin_oauth_grant_if_unreferenced(
     :func:`revoke_builtin_oauth_grants` for the safe async shape.
     """
     try:
-        claim = _claim_builtin_oauth_revocation(db, revocation)
+        claim = _claim_builtin_oauth_revocation(db, revocation, context=context)
     except Exception as exc:
         db.rollback()
         logger.warning(
@@ -4228,15 +4287,7 @@ def revoke_builtin_oauth_grant_if_unreferenced(
         return
     if _claimed_revocation_may_call(revocation, claim):
         revoke_resolved_builtin_oauth_grant(revocation)
-    try:
-        _release_builtin_oauth_revocation(db, revocation, claim)
-    except Exception as exc:
-        db.rollback()
-        logger.warning(
-            "%s OAuth revocation fence release failed (exception_type=%s)",
-            revocation.provider,
-            type(exc).__name__,
-        )
+    _release_builtin_oauth_revocation(db, revocation, claim)
 
 
 def revoke_builtin_oauth_grant(
@@ -4301,16 +4352,28 @@ async def revoke_builtin_oauth_grants(
     ``context`` is folded into the warning log line so a failure can be
     traced back to which disconnect path it came from. Identical records --
     one row snapshotted by two cleanup steps of the same disconnect -- are
-    revoked once.
+    revoked once. A cancelled request still finishes its in-flight provider
+    call and closes its fence before the cancellation propagates.
     """
     for revocation in dict.fromkeys(revocations):
         try:
-            claim = _claim_builtin_oauth_revocation(db, revocation)
+            claim = _claim_builtin_oauth_revocation(db, revocation, context=context)
             if claim is None:
                 continue
-            if _claimed_revocation_may_call(revocation, claim):
-                await asyncio.to_thread(revoke_resolved_builtin_oauth_grant, revocation)
-            _release_builtin_oauth_revocation(db, revocation, claim)
+            try:
+                if _claimed_revocation_may_call(revocation, claim):
+                    # Drained, not abandoned, when this task is cancelled:
+                    # the fence may only close once the provider call has
+                    # really ended, never while its thread is still in flight.
+                    await run_db_io_cancellation_safe(
+                        partial(revoke_resolved_builtin_oauth_grant, revocation)
+                    )
+            finally:
+                # Also on cancellation (which is no ``Exception``): the call
+                # is over by now, and a fence left open would refuse
+                # reconnects for the rest of its deadline. Synchronous and
+                # non-raising, so cancellation still propagates after it.
+                _release_builtin_oauth_revocation(db, revocation, claim)
         except Exception:
             db.rollback()
             logger.warning("Builtin OAuth grant revocation failed (%s)", context)

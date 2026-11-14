@@ -9,7 +9,9 @@ Bob's callback is inside its token exchange -- with only provider HTTP mocked.
 
 from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
+import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -160,6 +162,14 @@ def test_a_callback_whose_tokens_a_revoke_may_have_killed_is_refused(
     assert bob_db.query(UserOAuth).count() == 0
 
 
+def _fence_deadline(db: Session) -> datetime:
+    """The fence's stored deadline, read fresh and tz-aware."""
+    db.expire_all()
+    fence = db.get(OAuthRevocationFence, ("google", SUBJECT))
+    assert fence is not None and fence.revoking_until is not None
+    return oauth_revocation_fences._utc(fence.revoking_until)
+
+
 def test_a_callback_that_starts_after_the_revoke_finished_is_accepted(
     sessions, monkeypatch
 ):
@@ -167,6 +177,11 @@ def test_a_callback_that_starts_after_the_revoke_finished_is_accepted(
     bob_db, alice_db = sessions
     bob = _bob(bob_db)
     revoked = _provider_http(monkeypatch)
+    # The close margin only absorbs clock skew between hosts; this callback
+    # starts in the same instant on the same clock.
+    monkeypatch.setattr(
+        oauth_revocation_fences, "OAUTH_REVOCATION_CLOSE_MARGIN", timedelta(0)
+    )
     _revoke_alices_grant(alice_db)
 
     response = _connect_google(bob_db, bob)
@@ -222,3 +237,107 @@ def test_a_revoker_delayed_past_its_fence_skips_the_call(sessions, monkeypatch):
     _revoke_alices_grant(alice_db)
 
     assert revoked == []
+
+
+def test_a_closed_fence_keeps_refusing_for_the_clock_skew_margin(sessions, monkeypatch):
+    """A callback host whose clock runs ahead of the revoker's records an
+    exchange start after the close although the exchange began before the
+    call ended; the close margin covers that."""
+    bob_db, alice_db = sessions
+    bob = _bob(bob_db)
+    _provider_http(monkeypatch)
+    _revoke_alices_grant(alice_db)
+
+    margin = oauth_revocation_fences.OAUTH_REVOCATION_CLOSE_MARGIN
+    assert _fence_deadline(alice_db) > datetime.now(timezone.utc)
+    assert _fence_deadline(alice_db) <= datetime.now(timezone.utc) + margin
+    assert _connect_google(bob_db, bob).status_code == 409
+
+
+def test_a_second_revoker_cannot_close_the_fence_under_one_in_flight(
+    sessions, monkeypatch
+):
+    """Two disconnects of the same account pass their reference check. While
+    the first one's provider call is in flight the second runs to the end: it
+    must neither revoke nor close the fence, or a reconnect right after it
+    would be accepted and then killed by the first call."""
+    bob_db, alice_db = sessions
+    carol_db = sessionmaker(bind=alice_db.get_bind(), autoflush=False)()
+    bob = _bob(bob_db)
+    revoked = _provider_http(monkeypatch)
+    provider_post = auth_api.requests.post
+    reconnect_status: list[int] = []
+
+    def post(url, **kwargs):
+        if url == REVOKE_URL and not reconnect_status:
+            reconnect_status.append(0)  # re-entrancy guard
+            auth_api.revoke_builtin_oauth_grant(
+                carol_db,
+                provider="google",
+                access_token="carol-access",
+                provider_user_id=SUBJECT,
+                refresh_token="carol-refresh",
+            )
+            reconnect_status[0] = _connect_google(bob_db, bob).status_code
+        return provider_post(url, **kwargs)
+
+    monkeypatch.setattr(auth_api.requests, "post", post)
+
+    try:
+        _revoke_alices_grant(alice_db)
+    finally:
+        carol_db.close()
+
+    assert revoked == ["alice-refresh"]
+    assert reconnect_status == [409]
+
+
+def _alices_revocation() -> auth_api.BuiltinOAuthRevocation:
+    return auth_api.BuiltinOAuthRevocation(
+        provider="google",
+        access_token="alice-access",
+        client_id="",
+        client_secret="",
+        provider_user_id=SUBJECT,
+        refresh_token="alice-refresh",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_revoke_closes_its_fence_once_the_call_ended(
+    sessions, monkeypatch
+):
+    """Cancelling the request while the provider call is in flight must not
+    leave the fence open until its deadline, nor close it while the call's
+    thread is still running."""
+    bob_db, alice_db = sessions
+    in_call, finish_call = threading.Event(), threading.Event()
+    finished: list[bool] = []
+
+    def blocked_revoke(revocation) -> None:
+        in_call.set()
+        finish_call.wait(timeout=10)
+        finished.append(True)
+
+    monkeypatch.setattr(auth_api, "revoke_resolved_builtin_oauth_grant", blocked_revoke)
+    task = asyncio.create_task(
+        auth_api.revoke_builtin_oauth_grants(
+            alice_db, [_alices_revocation()], context="test"
+        )
+    )
+    assert await asyncio.to_thread(in_call.wait, 10)
+
+    task.cancel()
+    await asyncio.sleep(0.05)
+    # Cancelled, but the call is still running: the fence stays open.
+    assert not task.done()
+    window = oauth_revocation_fences.OAUTH_REVOCATION_FENCE_WINDOW
+    assert _fence_deadline(bob_db) > datetime.now(timezone.utc) + window / 2
+
+    finish_call.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert finished == [True]
+    margin = oauth_revocation_fences.OAUTH_REVOCATION_CLOSE_MARGIN
+    assert _fence_deadline(bob_db) <= datetime.now(timezone.utc) + margin

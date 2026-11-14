@@ -619,6 +619,20 @@ class LanceDBMemoryStore(MemoryStore):
             )
         return record
 
+    def _replacement_record(self, table: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """The row ``update`` writes over a stored one: every column, ``vector``
+        included where the table has one.
+
+        A matched merge keeps a column the source leaves out, so a replacement
+        without an embedding (the provider failed, or the table holds another
+        vector space) must clear the stored vector explicitly; otherwise the new
+        text would be ranked by its former content's embedding.
+        """
+        record = self._fit_record(table, self._storage_record(table, data))
+        if "vector" in table.schema.names:
+            record.setdefault("vector", None)
+        return record
+
     @staticmethod
     def _fit_record(table: Any, record: dict[str, Any]) -> dict[str, Any]:
         """``record`` adapted to the (possibly migrated) table schema."""
@@ -850,7 +864,7 @@ class LanceDBMemoryStore(MemoryStore):
             table = None
             try:
                 table = conn.open_table(self._collection_name)
-                record = self._storage_record(table, data)
+                record = self._replacement_record(table, data)
                 try:
                     updated = self._update_existing(table, record)
                 except Exception as update_error:
@@ -876,7 +890,7 @@ class LanceDBMemoryStore(MemoryStore):
                         )
                     table = conn.open_table(self._collection_name)
                     updated = self._update_existing(
-                        table, self._fit_record(table, record)
+                        table, self._replacement_record(table, data)
                     )
             finally:
                 _safe_close_table(table)

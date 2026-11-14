@@ -8,6 +8,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from .web_search_guard import run_guarded_search
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,6 +52,40 @@ class ExaWebSearchCore:
         Returns:
             List of search results with title, link, snippet and optionally content
         """
+        return await run_guarded_search(
+            "exa",
+            query,
+            lambda redacted: self._search_redacted(
+                redacted,
+                num_results=num_results,
+                search_type=search_type,
+                content_mode=content_mode,
+                category=category,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+                include_text=include_text,
+                exclude_text=exclude_text,
+                start_published_date=start_published_date,
+                end_published_date=end_published_date,
+            ),
+            len,
+        )
+
+    async def _search_redacted(
+        self,
+        query: str,
+        num_results: int,
+        search_type: str,
+        content_mode: str,
+        category: Optional[str],
+        include_domains: Optional[List[str]],
+        exclude_domains: Optional[List[str]],
+        include_text: Optional[List[str]],
+        exclude_text: Optional[List[str]],
+        start_published_date: Optional[str],
+        end_published_date: Optional[str],
+    ) -> List[Dict[str, str]]:
+        """Run the search; ``query`` has already been redacted."""
         logger.info(
             "🔍 Exa web search query='%s' num_results=%s type=%s content=%s",
             query,

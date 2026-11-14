@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .web_content import WebContentFetcher, get_proxy_url
+from .web_search_guard import run_guarded_search
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,9 @@ class WebSearchCore:
         """
         Search the web using Google Custom Search API.
 
+        The query is redacted before it is sent or logged; see
+        ``web_search_guard.run_guarded_search``.
+
         Args:
             query: The search query string
             num_results: Number of results to return (max 10)
@@ -38,9 +42,25 @@ class WebSearchCore:
         Returns:
             List of search results with title, link, snippet, and optional content
         """
+        return await run_guarded_search(
+            "google",
+            query,
+            lambda redacted: self._search_redacted(
+                redacted, num_results, include_content
+            ),
+            len,
+        )
+
+    async def _search_redacted(
+        self,
+        query: str,
+        num_results: int,
+        include_content: bool,
+    ) -> List[Dict[str, str]]:
+        """Run the search; ``query`` has already been redacted."""
         logger.info(
-            f"🔍 Starting web search for query: '{query}' "
-            f"(num_results={num_results}, include_content={include_content})"
+            f"🔍 Starting web search (num_results={num_results}, "
+            f"include_content={include_content}) query='{query}'"
         )
 
         api_key = self._api_key or os.getenv("GOOGLE_API_KEY")

@@ -765,7 +765,15 @@ def test_read_surfaces_answer_for_a_redacted_task(_roots: Path) -> None:
     assert log.json()["log"]["title"] == ""
 
 
-def test_files_only_deletion_removes_files_and_keeps_the_conversation(
+def _delete_files(task_ids: list[int]) -> TaskFileDeletionReport:
+    db = _direct_db_session()
+    try:
+        return delete_task_content_files(db, task_ids)
+    finally:
+        db.close()
+
+
+def test_files_only_deletion_removes_files_and_workspace_and_keeps_the_conversation(
     _roots: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
@@ -773,7 +781,7 @@ def test_files_only_deletion_removes_files_and_keeps_the_conversation(
     busy_id = _settled_task(full_key, agent_id)
     storage_key, local, workspace = _seed_content(task_id, _roots)
     kb_local = _add_file(task_id, _roots, "kb-source")
-    _seed_content(busy_id, _roots)
+    _, _, busy_workspace = _seed_content(busy_id, _roots)
     deleted_id, kb_file_id = _file_ids(task_id)
     monkeypatch.setattr(
         task_deletion,
@@ -807,7 +815,10 @@ def test_files_only_deletion_removes_files_and_keeps_the_conversation(
     assert not local.exists()
     assert not _object_exists(owner_id, storage_key)
     assert kb_local.exists()
-    assert workspace.exists()
+    # The workspace can hold copies of the uploads, so it goes with them; the
+    # busy task is untouched, workspace included.
+    assert not workspace.exists()
+    assert busy_workspace.exists()
     db = _direct_db_session()
     try:
         assert db.get(UploadedFileCleanupFence, deleted_id) is not None
@@ -818,3 +829,102 @@ def test_files_only_deletion_removes_files_and_keeps_the_conversation(
         assert len(_file_ids(busy_id)) == 1
     finally:
         db.close()
+
+
+def test_files_only_deletion_drops_the_cached_agent_and_its_workspace(
+    _roots: Path,
+) -> None:
+    """A cached agent owns its workspace: it is evicted and cleans it up."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    cached_agent = MagicMock()
+    manager._agents[task_id] = cached_agent
+
+    report = _delete_files([task_id])
+
+    assert report == TaskFileDeletionReport(deleted=(task_id,))
+    assert task_id not in manager._agents
+    cached_agent.cleanup_workspace.assert_called_once()
+    # Only the files go; the transcript stays.
+    counts = _content_counts(task_id)
+    assert counts[UploadedFile.__tablename__] == 0
+    assert counts[TaskChatMessage.__tablename__] > 0
+
+
+def test_files_only_cleanup_failure_is_reported_and_a_rerun_finishes(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    failing_id = _settled_task(full_key, agent_id)
+    next_id = _settled_task(full_key, agent_id)
+    _seed_content(failing_id, _roots)
+    _seed_content(next_id, _roots)
+    manager = get_agent_manager()
+    remove_agent = manager.remove_agent
+
+    def flaky_remove_agent(task_id: int, *args: Any, **kwargs: Any) -> bool:
+        if task_id == failing_id:
+            raise OSError("workspace is busy")
+        return remove_agent(task_id, *args, **kwargs)
+
+    monkeypatch.setattr(manager, "remove_agent", flaky_remove_agent)
+
+    first = _delete_files([failing_id, next_id])
+
+    assert first == TaskFileDeletionReport(
+        deleted=(next_id,), cleanup_failed=(failing_id,)
+    )
+    # The files were committed before the cleanup ran; the workspace remains.
+    assert _file_ids(failing_id) == []
+    assert (_roots / f"web_task_{failing_id}").exists()
+    assert not (_roots / f"web_task_{next_id}").exists()
+
+    monkeypatch.setattr(manager, "remove_agent", remove_agent)
+
+    second = _delete_files([failing_id])
+
+    assert second == TaskFileDeletionReport(deleted=(failing_id,))
+    assert not (_roots / f"web_task_{failing_id}").exists()
+
+
+def test_files_only_cleanup_spares_a_runtime_a_later_turn_acquired(
+    _roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The eviction is fenced on the runtime identity read under the lock.
+
+    A turn that acquires the runtime between the commit and the cleanup owns
+    the cached agent and its workspace: they are left alone and the task is
+    reported ``cleanup_failed`` so the host re-runs once that turn settles.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _settled_task(full_key, agent_id)
+    _, _, workspace = _seed_content(task_id, _roots)
+    manager = get_agent_manager()
+    cached_agent = MagicMock()
+    manager._agents[task_id] = cached_agent
+    manager._agent_run_generations[task_id] = 1
+
+    def acquire_after_commit(_task_id: int) -> None:
+        # Runs after the commit, before the eviction: a new acquisition.
+        manager._agent_run_generations[task_id] = 2
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            task_content_redaction, "invalidate_task_cache", acquire_after_commit
+        )
+        report = _delete_files([task_id])
+
+    assert report == TaskFileDeletionReport(cleanup_failed=(task_id,))
+    assert _file_ids(task_id) == []
+    assert manager._agents[task_id] is cached_agent
+    cached_agent.cleanup_workspace.assert_not_called()
+    assert workspace.exists()
+
+    # Once that turn is gone the same call finishes the job.
+    manager._agents.pop(task_id)
+    manager._agent_run_generations.pop(task_id)
+
+    assert _delete_files([task_id]) == TaskFileDeletionReport(deleted=(task_id,))
+    assert not workspace.exists()

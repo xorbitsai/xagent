@@ -45,8 +45,19 @@ by a rollback; it is found from the row, which still exists, so unlike task
 deletion nothing needs capturing up front and no cleanup obligation is
 recorded -- the obligation driver abandons any obligation whose task is live.
 A failed or skipped cleanup is reported per task in ``cleanup_failed``
-instead, and the caller re-runs the redaction for those: every step is
+instead, and the caller re-runs the call for those: every step is
 idempotent, so a re-run finishes what an earlier one left.
+
+Files-only deletion
+-------------------
+:func:`delete_task_content_files` deletes just the uploaded files and keeps
+the conversation, under the same gate and per-task transaction. Its post-commit
+step is the same one: the workspace directory is removed and the cached agent
+evicted too, because an uploaded file can be copied into the workspace as an
+input, so clearing the rows alone would leave copies on disk. The ordering (DB
+commit first, workspace after), the run fence that spares a runtime a later
+turn acquired, and the ``cleanup_failed`` reporting are identical; only the
+transcript, trace and task columns are left alone.
 
 No ``content redacted`` column is added. Readers already treat every removed
 piece as a legitimate empty state (no transcript, no steps, no files, NULL
@@ -107,12 +118,12 @@ class TaskContentRedactionReport:
 
 
 @dataclass(frozen=True)
-class _RedactedRuntime:
+class _TaskRuntime:
     """What the post-commit cleanup needs, read under the row lock.
 
     ``run_id`` and ``run_generation`` identify the runtime that existed when
-    the rows were redacted, so the cleanup can tell it apart from one a later
-    turn acquires after the commit.
+    the rows were changed (redacted, or stripped of their files), so the
+    cleanup can tell it apart from one a later turn acquires after the commit.
     """
 
     owner_id: int
@@ -166,19 +177,39 @@ def _run_on_quiescent_task(
             db.rollback()
 
 
-def _redact_rows(db: Session, task: Task, *, now: datetime) -> _RedactedRuntime:
-    """Redact one locked task's rows; return what its cleanup needs."""
-    runtime = _RedactedRuntime(
+def _snapshot_runtime(task: Task) -> _TaskRuntime:
+    """Identify the runtime the locked ``task`` has right now.
+
+    Read before the rows change and while the row lock is held, so that a turn
+    acquiring the runtime after the commit is told apart from the one the
+    post-commit cleanup was scheduled for.
+    """
+    return _TaskRuntime(
         owner_id=int(task.user_id),
         run_id=cast(str | None, task.run_id),
         run_generation=get_agent_manager().current_run_generation(int(task.id)),
     )
+
+
+def _redact_rows(db: Session, task: Task, *, now: datetime) -> _TaskRuntime:
+    """Redact one locked task's rows; return what its cleanup needs."""
+    runtime = _snapshot_runtime(task)
     redact_task_rows(db, task, now=now)
     return runtime
 
 
-def _release_task_runtime(task_id: int, runtime: _RedactedRuntime) -> bool:
-    """Drop the in-memory state and the workspace of a redacted task.
+def _delete_files(db: Session, task: Task) -> _TaskRuntime:
+    """Delete one locked task's uploaded files; return what its cleanup needs."""
+    runtime = _snapshot_runtime(task)
+    delete_task_files(db, task)
+    return runtime
+
+
+def _release_task_runtime(task_id: int, runtime: _TaskRuntime) -> bool:
+    """Drop the in-memory state and the workspace of a task after its commit.
+
+    Shared by the redaction and the files-only deletion: both remove the
+    workspace, which can hold copies of what they removed.
 
     ``remove_agent`` evicts this process's cached agent -- which still holds
     the conversation in memory -- and removes the workspace through it, or
@@ -186,12 +217,12 @@ def _release_task_runtime(task_id: int, runtime: _RedactedRuntime) -> bool:
     run identity read under the lock: a turn that started after the commit
     (or is building its runtime now) owns the runtime and workspace, and
     ``remove_agent`` then leaves both alone rather than pull them out from
-    under it. That skip returns ``False``: the workspace still holds
-    pre-redaction files and nothing else removes them, so the caller must
-    re-run the redaction once that turn settles.
+    under it. That skip returns ``False``: the workspace still holds the
+    files and nothing else removes them, so the caller must re-run once that
+    turn settles.
 
     A scope that will not resolve raises rather than degrading to the
-    unscoped candidates: a redaction that cannot find the workspace must not
+    unscoped candidates: a cleanup that cannot find the workspace must not
     report success. The cached agent is evicted regardless, since it holds
     the conversation in memory.
 
@@ -226,6 +257,26 @@ def _release_task_runtime(task_id: int, runtime: _RedactedRuntime) -> bool:
         evict(None)
         raise
     return evict(target)
+
+
+def _try_release_task_runtime(
+    task_id: int, runtime: _TaskRuntime, *, committed: str
+) -> bool:
+    """Run :func:`_release_task_runtime`, turning a failure into ``False``.
+
+    ``committed`` says what was already committed for the task (for the log
+    line). A raised cleanup is logged and reported exactly like a skipped one,
+    so the caller lists the task as ``cleanup_failed`` and the batch goes on.
+    """
+    try:
+        return _release_task_runtime(task_id, runtime)
+    except Exception:
+        logger.exception(
+            "Task %s %s but its runtime or workspace cleanup failed; re-run it",
+            task_id,
+            committed,
+        )
+        return False
 
 
 def redact_task_content(
@@ -279,17 +330,10 @@ def redact_task_content(
                 busy.append(task_id)
             case "missing":
                 missing.append(task_id)
-            case _RedactedRuntime() as runtime:
-                try:
-                    released = _release_task_runtime(task_id, runtime)
-                except Exception:
-                    logger.exception(
-                        "Task %s content was redacted but its runtime or "
-                        "workspace cleanup failed; re-run the redaction",
-                        task_id,
-                    )
-                    released = False
-                if released:
+            case _TaskRuntime() as runtime:
+                if _try_release_task_runtime(
+                    task_id, runtime, committed="content was redacted"
+                ):
                     redacted.append(task_id)
                 else:
                     cleanup_failed.append(task_id)
@@ -307,13 +351,19 @@ class TaskFileDeletionReport:
     """Which of the requested tasks ended in which state.
 
     ``deleted`` tasks have no uploaded files left bound to them (including
-    tasks that had none). ``failed`` tasks raised and were rolled back, but
-    the stored files deleted before the failure stay deleted: they are
-    partially cleaned and must be re-run. ``busy`` and ``missing`` mean what
-    they mean for :class:`TaskContentRedactionReport`.
+    tasks that had none) and no workspace directory. ``cleanup_failed`` tasks
+    had their files deleted and committed, but removing the workspace or
+    cached runtime raised, or was skipped because a later turn already owns
+    the runtime; the workspace may still hold copies of the files, so re-run
+    the deletion for them once they settle (any other process's cached agent
+    is never evicted here, see the module docstring). ``failed`` tasks raised
+    and were rolled back, but the stored files deleted before the failure
+    stay deleted: they are partially cleaned and must be re-run. ``busy`` and
+    ``missing`` mean what they mean for :class:`TaskContentRedactionReport`.
     """
 
     deleted: tuple[int, ...] = ()
+    cleanup_failed: tuple[int, ...] = ()
     failed: tuple[int, ...] = ()
     busy: tuple[int, ...] = ()
     missing: tuple[int, ...] = ()
@@ -322,7 +372,7 @@ class TaskFileDeletionReport:
 def delete_task_content_files(
     db: Session, task_ids: Sequence[int]
 ) -> TaskFileDeletionReport:
-    """Delete each task's uploaded files and keep everything else.
+    """Delete each task's uploaded files and workspace and keep the rest.
 
     The files-only sibling of :func:`redact_task_content`, with the same
     contract: one transaction per settled task, the same ``busy`` refusal
@@ -332,10 +382,23 @@ def delete_task_content_files(
     uses is detached rather than deleted, each deleted file is fenced
     against KB reuse, and a file another cleanup owner claimed is left to it.
 
-    The transcript, trace, task columns, cached agent and workspace
-    directory are untouched -- the task keeps talking about files it no
-    longer has, which is what a files-only deletion asks for. Read caches
-    are invalidated after each commit.
+    A deletion that cleared only the rows would leave copies behind: an
+    uploaded file can be copied into the task workspace as an input. So after
+    each commit the read caches are invalidated, the cached agent runtime --
+    which holds the workspace -- is evicted and the workspace directory is
+    removed, with exactly the redaction's ordering, run fence and reporting
+    (see the module docstring and :func:`_release_task_runtime`). A cleanup
+    that raised or was skipped because a later turn owns the runtime is
+    reported ``cleanup_failed``, and the caller re-runs the deletion for it.
+    The workspace also holds the files the task itself produced; they go with
+    it.
+
+    The transcript, trace and task columns are untouched -- the task keeps
+    talking about files it no longer has, which is what a files-only deletion
+    asks for. The next turn starts from a fresh runtime and workspace.
+
+    Eviction of the cached agent is process-local; a host with several agent
+    worker processes evicts it on the others itself.
 
     Blocking (database, object storage and filesystem I/O); async callers
     run it in a worker thread.
@@ -343,13 +406,14 @@ def delete_task_content_files(
 
     now = datetime.now(timezone.utc)
     deleted: list[int] = []
+    cleanup_failed: list[int] = []
     failed: list[int] = []
     busy: list[int] = []
     missing: list[int] = []
     for task_id in dict.fromkeys(task_ids):
         try:
             outcome = _run_on_quiescent_task(
-                db, task_id, lambda task: delete_task_files(db, task), now=now
+                db, task_id, lambda task: _delete_files(db, task), now=now
             )
         except Exception:
             logger.exception(
@@ -362,11 +426,16 @@ def delete_task_content_files(
                 busy.append(task_id)
             case "missing":
                 missing.append(task_id)
-            case None:
-                invalidate_task_cache(task_id)
-                deleted.append(task_id)
+            case _TaskRuntime() as runtime:
+                if _try_release_task_runtime(
+                    task_id, runtime, committed="files were deleted"
+                ):
+                    deleted.append(task_id)
+                else:
+                    cleanup_failed.append(task_id)
     return TaskFileDeletionReport(
         deleted=tuple(deleted),
+        cleanup_failed=tuple(cleanup_failed),
         failed=tuple(failed),
         busy=tuple(busy),
         missing=tuple(missing),

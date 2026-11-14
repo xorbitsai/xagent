@@ -855,7 +855,9 @@ class KBCollectionHandle(ABC):
         """The chunk_ids ``retire_superseded_chunks`` would delete, by chunk key.
 
         Deletes nothing: a caller that must remove other stores' rows first reads
-        the set here and retires last, so a failed attempt can be retried whole.
+        the set here and retires last. Retirement deletes the vectors before its
+        chunk rows, so an attempt that fails before the chunk rows go can be
+        retried whole from this set.
         """
 
     @abstractmethod
@@ -2620,17 +2622,22 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         for (stale_parse, config_hash), ids in self.stale_chunks(
             doc_id, parse_hash, user_id=user_id
         ).items():
-            # Core rows first; the sweep enumerates embedding tables afterwards,
-            # so a copy landing meanwhile is either found there or sees core gone.
+            # Vectors first: a failure here leaves the chunk rows a retry reads.
+            self._delete_stale_vectors(doc_id, ids, size)
             self.delete_chunk_records(
                 doc_id, parse_hash=stale_parse, config_hash=config_hash, is_admin=True
             )
-            for start in range(0, len(ids), size):
-                self.delete_embedding_records(
-                    doc_id, chunk_ids=ids[start : start + size], is_admin=True
-                )
+            # Again after the chunk rows: a copy that enumerated the table set
+            # before this delete committed would otherwise keep the row.
+            self._delete_stale_vectors(doc_id, ids, size)
             deleted += ids
         return deleted
+
+    def _delete_stale_vectors(self, doc_id: str, ids: list[str], size: int) -> None:
+        for start in range(0, len(ids), size):
+            self.delete_embedding_records(
+                doc_id, chunk_ids=ids[start : start + size], is_admin=True
+            )
 
     def discard_uncommitted_embeddings(
         self, doc_id: str, *, user_id: int | None = None

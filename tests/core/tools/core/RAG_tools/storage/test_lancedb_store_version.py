@@ -408,10 +408,10 @@ class TestCleanupCascadeByScope:
         )
         assert sync_result == async_result
 
-    def test_core_rows_are_deleted_before_embedding_tables(
+    def test_embedding_tables_are_swept_before_and_after_the_core_delete(
         self, isolated_store, monkeypatch
     ):
-        """The sweep reaches embedding tables only after the core rows are gone."""
+        """A failure keeps the core rows; the sweep after them catches a late table."""
         from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
 
         store = isolated_store
@@ -457,8 +457,7 @@ class TestCleanupCascadeByScope:
         )
 
         assert result["chunks"] == 1
-        assert "chunks" in order
-        embedding_at = next(
-            i for i, name in enumerate(order) if name.startswith("embeddings_")
-        )
-        assert order.index("chunks") < embedding_at
+        sweeps = [i for i, name in enumerate(order) if name.startswith("embeddings_")]
+        chunks_at = order.index("chunks")
+        assert sweeps[0] < chunks_at
+        assert chunks_at < sweeps[-1]

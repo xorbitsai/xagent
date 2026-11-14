@@ -30,7 +30,7 @@ from . import test_composio_google_connect as google_connect
 from . import test_composio_salesforce_connect as salesforce_connect
 from .test_composio_facebook_connect import (
     API_KEY,
-    CALLBACK_URL,
+    CALLBACK_PATH,
     USER_ID_SECRET,
     Browser,
     _grants,
@@ -39,6 +39,8 @@ from .test_composio_facebook_connect import (
 
 OLD = "https://region.example"
 NEW = "https://public.example"
+# Served by the redeeming region, which sets the host-only proof cookie.
+CALLBACK_URL = f"{OLD}{CALLBACK_PATH}"
 
 # app_id -> (provider, fake Composio, switch env, auth-config env, config id,
 # native provider row factory, native authorize host)
@@ -150,7 +152,9 @@ def _request(app: FastAPI, query: dict[str, str], *, cookie: str | None = None):
     )
 
 
-def _regional_launch(db, user, app, provider, app_id) -> tuple[str, str, str]:
+def _regional_launch(
+    db, user, app, provider, app_id, callback_url: str | None = None
+) -> tuple[str, str, str]:
     """Start at the public entry, then open the target region's confirmation."""
     request = Request(
         {
@@ -174,8 +178,9 @@ def _regional_launch(db, user, app, provider, app_id) -> tuple[str, str, str]:
     )
     assert launch.status_code == 200, launch.body
     body = json.loads(launch.body)
-    callback = urlsplit(CALLBACK_URL)
-    assert body["callback_origin"] == f"{callback.scheme}://{callback.netloc}"
+    if callback_url is not None:
+        callback = urlsplit(callback_url)
+        assert body["callback_origin"] == f"{callback.scheme}://{callback.netloc}"
     ticket = parse_qs(urlsplit(body["authorization_url"]).query)["ticket"][0]
     page = redeem_handoff("au", _request(app, {"ticket": ticket}), db)
     assert page.status_code == 200, page.body
@@ -200,7 +205,9 @@ def test_a_regional_web_launch_starts_a_composio_flow(regional, monkeypatch, app
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
         is None
     )
-    ticket, confirm, cookie = _regional_launch(db, user, app, provider, app_id)
+    ticket, confirm, cookie = _regional_launch(
+        db, user, app, provider, app_id, CALLBACK_URL
+    )
     page = redeem_handoff("au", _request(app, {"ticket": ticket}), db)
     assert f"Connect {composio_auth.COMPOSIO_APPS[app_id].label}?" in page.body.decode()
 
@@ -218,7 +225,8 @@ def test_a_regional_web_launch_starts_a_composio_flow(regional, monkeypatch, app
     cookie_name = auth._ordinary_oauth_cookie_name(state["browser_nonce_hash"])
     browser = Browser()
     browser.receive(response)
-    assert browser.cookies[cookie_name][1] == "/api/auth/meta/callback"
+    assert browser.cookies[cookie_name][1] == CALLBACK_PATH
+    assert urlsplit(location).netloc == urlsplit(OLD).netloc
 
     assert browser.get(db, location).status_code == 302
     verify = browser.get(db, _verify_url(fake))

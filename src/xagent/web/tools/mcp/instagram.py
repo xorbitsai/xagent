@@ -3,9 +3,8 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
-
 from . import meta_graph
+from .composio_metering import ComposioMeteringFastMCP
 from .meta_graph import (
     GraphAPIError,
 )
@@ -23,7 +22,7 @@ logger = logging.getLogger("instagram-mcp")
 
 setup_proxy_env()
 
-mcp = FastMCP("instagram-mcp")
+mcp = ComposioMeteringFastMCP("instagram-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 
 LINKED_ACCOUNT_FIELDS = (

@@ -36,7 +36,9 @@ import logging
 import os
 import re
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass
+from concurrent.futures import Future
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -162,6 +164,64 @@ def serves_composio_grant() -> bool:
     """Whether this connector process serves a Composio-backed grant: it is
     launched with Composio's ids instead of a provider token."""
     return bool(os.environ.get(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
+
+
+@dataclass
+class _RequestCount:
+    """What one metered tool call has counted, and what can still count.
+
+    ``accepted`` is the per-request count: a batch's worker threads reach the
+    same object through a copy of the caller's context. ``pending`` holds the
+    batch futures that were still running when their batch returned, because
+    each of those can still be accepted after the batch's deadline.
+    """
+
+    accepted: list[int] = field(default_factory=list)
+    pending: list[Future[Any]] = field(default_factory=list)
+
+
+# The requests the MCP tool call being handled made to Composio. FastMCP
+# handles calls concurrently in one process, so the count is a context
+# variable; outside a metered call (a host-issued call, a direct client use)
+# nothing is counted.
+_request_count: ContextVar[_RequestCount | None] = ContextVar(
+    "composio_request_count", default=None
+)
+
+
+def begin_request_count() -> Token[_RequestCount | None]:
+    """Start counting the requests Composio accepts for one tool call."""
+    return _request_count.set(_RequestCount())
+
+
+def end_request_count(token: Token[_RequestCount | None]) -> int:
+    """Stop counting and return how many requests were accepted."""
+    count = _request_count.get()
+    _request_count.reset(token)
+    return len(count.accepted) if count is not None else 0
+
+
+def record_accepted_request() -> None:
+    """Count one request Composio accepted; a no-op outside a metered call."""
+    count = _request_count.get()
+    if count is not None:
+        # ``list.append`` is atomic under the GIL, so a batch can count from
+        # its worker threads without a lock.
+        count.accepted.append(1)
+
+
+def register_pending_batch_requests(futures: Iterable[Future[Any]]) -> None:
+    """Have the metered call wait for the batch requests in ``futures`` that
+    outlived their batch's deadline; a no-op outside a metered call."""
+    count = _request_count.get()
+    if count is not None:
+        count.pending.extend(futures)
+
+
+def pending_batch_requests() -> tuple[Future[Any], ...]:
+    """The batch requests a metered call still has to wait for."""
+    count = _request_count.get()
+    return tuple(count.pending) if count is not None else ()
 
 
 def redact(value: Any) -> Any:
@@ -1023,6 +1083,9 @@ def proxy_request(
             "Composio proxy returned a binary answer in an unexpected shape",
             status=status,
         )
+    # Composio accepted this call (the provider's own status, success or not,
+    # is in ``provider_status``), so it is a billed request.
+    record_accepted_request()
     return ProxyResponse(
         status=provider_status,
         data=answer.get("data"),

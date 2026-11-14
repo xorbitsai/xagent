@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, cast
 import httpx
 
 from ...utils.public_http_transport import create_public_async_client
+from .media_usage import record_web_search_usage
 from .web_content import get_trusted_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,9 @@ class ZhipuWebSearchCore:
                     )
 
                 response.raise_for_status()
+                # Zhipu billed this request as soon as it answered 2xx, so
+                # record it before reading the body.
+                record_web_search_usage("zhipu")
                 return cast(Dict[str, Any], response.json())
 
         except httpx.RequestError as e:

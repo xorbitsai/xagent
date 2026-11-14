@@ -5,11 +5,10 @@ import re
 from typing import Any, NoReturn
 from urllib.parse import urlparse, urlsplit
 
-from mcp.server.fastmcp import FastMCP
-
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
 from . import composio_proxy
+from .composio_metering import ComposioMeteringFastMCP
 from .utils import (
     clamp_limit,
     clamp_offset,
@@ -21,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("salesforce-mcp")
 
 
-mcp = FastMCP("salesforce-mcp")
+mcp = ComposioMeteringFastMCP("salesforce-mcp")
 
 # The OIDC userinfo endpoint is documented as this fixed host, not the
 # per-org instance_url used by every other endpoint here -- Salesforce

@@ -19,11 +19,11 @@ from googleapiclient.http import (  # type: ignore[import-not-found]
     MediaIoBaseDownload,
     MediaIoBaseUpload,
 )
-from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from . import composio_proxy, google_api_proxy
+from .composio_metering import ComposioMeteringFastMCP
 from .utils import (
     allowed_dirs_from_env,
     clamp_limit,
@@ -41,7 +41,7 @@ logger = logging.getLogger("google-drive-mcp")
 # Ensure standard proxy environment variables are set to prevent hanging requests
 setup_proxy_env()
 
-mcp = FastMCP("google-drive-mcp")
+mcp = ComposioMeteringFastMCP("google-drive-mcp")
 
 # google_drive_composio -- the Composio write path for the three byte-writing
 # tools below -- is imported inside each Composio branch, not here: that

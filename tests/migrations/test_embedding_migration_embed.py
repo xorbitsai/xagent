@@ -899,3 +899,119 @@ def test_a_target_row_without_a_model_value_is_not_held() -> None:
     _table(scope.source_table(TARGET.id), [_row("c9", model="")])
 
     assert target_chunk_ids("kb", TARGET.id) == set()
+
+
+# --- the delete contract is read from the core tables ---
+
+
+def test_a_delete_that_takes_the_core_rows_leaves_no_target_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _save_collection()
+    core_schema = pa.schema(
+        [
+            ("collection", pa.string()),
+            ("doc_id", pa.string()),
+            ("chunk_id", pa.string()),
+            ("user_id", pa.int64()),
+        ]
+    )
+    _table(
+        "chunks",
+        [
+            {"collection": "kb", "doc_id": "d1", "chunk_id": "c1", "user_id": 7},
+            {"collection": "kb", "doc_id": "d2", "chunk_id": "c2", "user_id": 7},
+        ],
+        schema=core_schema,
+    )
+    _source([_row("c1"), _row("c2", doc_id="d2")])
+    real = mod.write_vectors_to_db
+    injected = {"done": False}
+
+    def _delete_core_rows_then_write(**kwargs: Any) -> Any:
+        if not injected["done"]:
+            injected["done"] = True
+            # The cascade deletes the core rows first and sweeps embedding
+            # tables it can see; this target table does not exist yet.
+            scope.connection().open_table("chunks").delete("doc_id = 'd1'")
+        return real(**kwargs)
+
+    monkeypatch.setattr(mod, "write_vectors_to_db", _delete_core_rows_then_write)
+
+    report = _run()
+
+    assert report.failures == []
+    remaining = {row["doc_id"] for row in _rows_in(scope.source_table(TARGET.id))}
+    assert remaining == {"d2"}
+    # The source row is still there: only the core table says the chunk is gone.
+    assert {row["doc_id"] for row in _rows_in(scope.source_table(SOURCE_MODEL))} == {
+        "d1",
+        "d2",
+    }
+
+
+def test_the_documents_cascade_sweeps_a_table_a_writer_created_meantime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.LanceDB import schema_manager
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    for name in (
+        "ensure_documents_table",
+        "ensure_parses_table",
+        "ensure_chunks_table",
+        "ensure_main_pointers_table",
+        "ensure_ingestion_runs_table",
+    ):
+        monkeypatch.setattr(schema_manager, name, lambda *args, **kwargs: None)
+
+    conn = scope.connection()
+    core = pa.schema(
+        [
+            ("collection", pa.string()),
+            ("doc_id", pa.string()),
+            ("chunk_id", pa.string()),
+            ("user_id", pa.int64()),
+        ]
+    )
+    documents = pa.Table.from_pylist(
+        [{"collection": "kb", "doc_id": "d1", "chunk_id": "", "user_id": 7}],
+        schema=core,
+    )
+    conn.create_table("documents", data=documents)
+    conn.create_table("chunks", data=documents)
+
+    late = scope.source_table(TARGET.id)
+    real_delete = lancedb_stores._vis_delete_rows_by_filters
+    created: List[str] = []
+
+    def _delete_then_writer_commits(table: Any, filters: List[str]) -> int:
+        count = real_delete(table, filters)
+        if count and not created:
+            # A writer that sampled the source while these core rows still
+            # existed commits its target rows while the cascade runs.
+            conn.create_table(
+                late,
+                data=pa.Table.from_pylist(
+                    [_row("c1", model=TARGET.id)], schema=_SCHEMA
+                ),
+            )
+            created.append(late)
+        return count
+
+    monkeypatch.setattr(
+        lancedb_stores, "_vis_delete_rows_by_filters", _delete_then_writer_commits
+    )
+
+    lancedb_stores._vis_cascade_delete_documents(
+        conn,
+        collection="kb",
+        doc_ids=["d1"],
+        user_id=None,
+        is_admin=True,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert created == [late]
+    assert _rows_in(late) == []

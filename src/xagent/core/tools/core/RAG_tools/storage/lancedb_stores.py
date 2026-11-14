@@ -3903,25 +3903,43 @@ def _vis_cascade_delete_documents(
             )
         ]
 
-    for table_name in select_embedding_tables(conn):
-        predicates[table_name] = [
-            _vis_build_documents_filter(
-                conn=conn,
-                table_name=table_name,
-                collection=collection,
-                doc_ids=normalized_doc_ids,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        ]
+    def _embedding_predicates() -> Dict[str, list]:
+        return {
+            table_name: [
+                _vis_build_documents_filter(
+                    conn=conn,
+                    table_name=table_name,
+                    collection=collection,
+                    doc_ids=normalized_doc_ids,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+            ]
+            for table_name in select_embedding_tables(conn)
+        }
 
-    return _vis_execute_or_plan_by_predicates(
-        conn,
-        predicates,
-        preview_only=preview_only,
-        confirm=confirm,
-        model_tag=None,
+    if not (confirm and not preview_only):
+        return _vis_execute_or_plan_by_predicates(
+            conn,
+            {**predicates, **_embedding_predicates()},
+            preview_only=preview_only,
+            confirm=confirm,
+            model_tag=None,
+        )
+    # Core rows go first, and the embeddings tables are enumerated after: the
+    # opposite order missed a table a writer created while the core rows were
+    # still there, and that writer's row outlived the document it belongs to.
+    deleted = _vis_execute_or_plan_by_predicates(
+        conn, predicates, preview_only=False, confirm=True, model_tag=None
     )
+    late = _embedding_predicates()
+    if late:
+        deleted.update(
+            _vis_execute_or_plan_by_predicates(
+                conn, late, preview_only=False, confirm=True, model_tag=None
+            )
+        )
+    return deleted
 
 
 class LanceDBIngestionStatusStore(IngestionStatusStore):

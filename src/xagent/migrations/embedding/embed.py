@@ -38,6 +38,7 @@ from xagent.migrations.embedding.scope import (
     add_scope_args,
     collection_filter,
     connection,
+    core_chunk_ids,
     iter_rows,
     iter_source_chunks,
     resolve_collection_names,
@@ -335,6 +336,20 @@ def embed_collection(
     return report
 
 
+def _live_chunk_ids(
+    name: str, doc_id: str, source_model_id: str, conn: Any
+) -> Set[str]:
+    """The document's chunk ids a delete of it would have taken away."""
+    live = core_chunk_ids(name, doc_id, conn=conn)
+    if live is not None:
+        return live
+    # No core chunks table: fall back to what search itself reads.
+    return {
+        chunk.chunk_id
+        for chunk in iter_source_chunks(name, source_model_id, conn=conn, doc_id=doc_id)
+    }
+
+
 def _reconcile_document(
     name: str,
     doc_id: str,
@@ -344,23 +359,20 @@ def _reconcile_document(
     conn: Any,
     report: CollectionReport,
 ) -> Set[str]:
-    """Delete the target rows this document no longer has in the source.
+    """Delete the target rows this document no longer has.
 
-    The rows just written were read before provider work, so a delete or a
-    retirement that landed meanwhile must not survive here. The source is read
-    again after the write; a delete that commits after this pass clears every
-    model table itself, the target included. Returns the chunk ids removed, so
-    the caller does not count them as lost.
+    The rows just written were read before provider work, and a delete that
+    lands meanwhile removes the core chunks first, then sweeps embedding tables
+    it enumerated — the target's included only if it already existed. Liveness
+    is read from the core table here, after the write, so either the delete's
+    sweep or this pass removes what it recreated. Returns the chunk ids removed,
+    so the caller does not count them as lost.
     """
     from xagent.core.tools.core.RAG_tools.utils.string_utils import (
         escape_lancedb_string,
     )
 
-    live = {
-        chunk.chunk_id
-        for chunk in iter_source_chunks(name, source_model_id, conn=conn, doc_id=doc_id)
-        if chunk.chunk_id
-    }
+    live = _live_chunk_ids(name, doc_id, source_model_id, conn)
     table = source_table(model_id)
     if table not in table_names(conn):
         return set()
@@ -553,8 +565,8 @@ def _verify_written(
 ) -> None:
     """A dropped chunk is a failure, not a success: check the target holds it.
 
-    A chunk the source no longer has is not a dropped one: a delete that landed
-    after the copy took the row from both sides.
+    A chunk the core tables no longer have is not a dropped one: a delete that
+    landed after the copy took it from both sides.
     """
     if not written:
         return
@@ -565,12 +577,7 @@ def _verify_written(
             absent.setdefault(doc_id, []).append(chunk_id)
     shortfall: Dict[str, int] = {}
     for doc_id, chunk_ids in absent.items():
-        live = {
-            chunk.chunk_id
-            for chunk in iter_source_chunks(
-                name, source_model_id, conn=conn, doc_id=doc_id
-            )
-        }
+        live = _live_chunk_ids(name, doc_id, source_model_id, conn)
         lost = [chunk_id for chunk_id in chunk_ids if chunk_id in live]
         if lost:
             shortfall[doc_id] = len(lost)

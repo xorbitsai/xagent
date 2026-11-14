@@ -220,6 +220,7 @@ SANDBOX_WORKSPACE_VOLUME_ROOT = "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
+BRAVE_SEARCH_ENDPOINT = "XAGENT_BRAVE_SEARCH_ENDPOINT"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
 TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
@@ -357,7 +358,11 @@ TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
 INLINE_FILE_DELIVERY_MAX_BYTES = "XAGENT_INLINE_FILE_DELIVERY_MAX_BYTES"
 
-WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
+WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu", "brave"}
+BRAVE_SEARCH_ENDPOINTS = {"web", "llm_context"}
+# Returned by get_web_search_provider() for an unrecognised, non-empty value:
+# no web search tool is registered (fail closed).
+WEB_SEARCH_PROVIDER_INVALID = "invalid"
 
 
 def get_agent_runtime() -> Literal["v1", "v2"]:
@@ -4599,18 +4604,40 @@ def get_web_search_provider() -> str:
         1. XAGENT_WEB_SEARCH_PROVIDER environment variable
         2. "auto"
 
-    Valid values are: auto, google, tavily, exa, zhipu.
+    Valid values are: auto, google, tavily, exa, zhipu, brave.
+
+    An unset or empty value means "auto". An unrecognised value fails closed:
+    ``WEB_SEARCH_PROVIDER_INVALID`` is returned and no search tool is
+    registered, so a deployment that pins a provider (for example for data
+    retention reasons) never silently searches through another one.
     """
-    provider = (os.getenv(WEB_SEARCH_PROVIDER) or "auto").strip().lower()
+    provider = (os.getenv(WEB_SEARCH_PROVIDER) or "").strip().lower()
+    if not provider:
+        return "auto"
     if provider in WEB_SEARCH_PROVIDERS:
         return provider
 
-    logger.warning(
-        "Invalid %s value: %r. Falling back to 'auto'.",
+    logger.error(
+        "Unrecognised %s value; web search is disabled. Valid values: %s.",
         WEB_SEARCH_PROVIDER,
-        provider,
+        ", ".join(sorted(WEB_SEARCH_PROVIDERS)),
     )
-    return "auto"
+    return WEB_SEARCH_PROVIDER_INVALID
+
+
+def get_brave_search_endpoint() -> str:
+    """Get the Brave Search endpoint: "web" (default) or "llm_context"."""
+    endpoint = (os.getenv(BRAVE_SEARCH_ENDPOINT) or "").strip().lower()
+    if not endpoint:
+        return "web"
+    if endpoint in BRAVE_SEARCH_ENDPOINTS:
+        return endpoint
+    logger.warning(
+        "Invalid %s value. Falling back to 'web'. Valid values: %s.",
+        BRAVE_SEARCH_ENDPOINT,
+        ", ".join(sorted(BRAVE_SEARCH_ENDPOINTS)),
+    )
+    return "web"
 
 
 def get_web_crawl_tls_impersonate() -> str | None:

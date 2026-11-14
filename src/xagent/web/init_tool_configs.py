@@ -64,6 +64,20 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "dependencies": ["tavily_api_key"],
         },
         {
+            "tool_name": "brave_web_search",
+            "tool_type": "builtin",
+            "category": "search",
+            "display_name": "Brave 网络搜索",
+            "description": "使用 Brave Search API 进行网络搜索，无需 Google 账号",
+            "enabled": True,
+            "requires_configuration": True,
+            "config": {
+                "provider": "brave",
+                "api_key_env": "BRAVE_SEARCH_API_KEY",
+            },
+            "dependencies": ["brave_api_key"],
+        },
+        {
             "tool_name": "exa_web_search",
             "tool_type": "builtin",
             "category": "search",

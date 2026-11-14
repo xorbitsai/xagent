@@ -193,3 +193,79 @@ async def test_basic_tools_include_web_asset_download_with_workspace(
     names = _tool_names(tools)
     assert "fetch_web_content" in names
     assert "download_web_asset" in names
+
+
+_ALL_SEARCH_CREDENTIALS = {
+    "zhipu_web_search": {"api_key": "zhipu-key"},
+    "tavily_web_search": {"api_key": "tavily-key"},
+    "exa_web_search": {"api_key": "exa-key"},
+    "web_search": {"api_key": "google-key", "cse_id": "google-cse-id"},
+    "brave_web_search": {"api_key": "brave-key"},
+}
+
+
+async def _search_tool_class(credentials, provider=None, monkeypatch=None):
+    if provider is None:
+        monkeypatch.delenv("XAGENT_WEB_SEARCH_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", provider)
+    tools = await create_web_tools(
+        ToolConfig({"workspace": None, "tool_credentials": credentials})
+    )
+    search = [
+        t for t in tools if t.name == "web_search" or t.name.endswith("_web_search")
+    ]
+    assert len(search) <= 1
+    return search[0].__class__.__name__ if search else None
+
+
+@pytest.mark.asyncio
+async def test_explicit_brave_provider_uses_brave(monkeypatch):
+    assert (
+        await _search_tool_class(_ALL_SEARCH_CREDENTIALS, "brave", monkeypatch)
+        == "BraveWebSearchTool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_brave_provider_without_key_adds_no_search_tool(monkeypatch):
+    credentials = {
+        k: v for k, v in _ALL_SEARCH_CREDENTIALS.items() if k != "brave_web_search"
+    }
+    assert await _search_tool_class(credentials, "brave", monkeypatch) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "present,expected",
+    [
+        (["brave_web_search"], "BraveWebSearchTool"),
+        (["web_search", "brave_web_search"], "WebSearchTool"),
+        (["exa_web_search", "web_search", "brave_web_search"], "ExaWebSearchTool"),
+        (
+            ["tavily_web_search", "exa_web_search", "web_search", "brave_web_search"],
+            "TavilyWebSearchTool",
+        ),
+        (list(_ALL_SEARCH_CREDENTIALS), "ZhipuWebSearchTool"),
+    ],
+)
+async def test_auto_order_keeps_brave_last(monkeypatch, present, expected):
+    credentials = {k: _ALL_SEARCH_CREDENTIALS[k] for k in present}
+    assert await _search_tool_class(credentials, None, monkeypatch) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["bing", "braave", "Brave Search"])
+async def test_unknown_provider_registers_no_search_tool(monkeypatch, caplog, value):
+    with caplog.at_level("ERROR"):
+        cls = await _search_tool_class(_ALL_SEARCH_CREDENTIALS, value, monkeypatch)
+    assert cls is None
+    assert "XAGENT_WEB_SEARCH_PROVIDER" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_empty_provider_value_means_auto(monkeypatch):
+    assert (
+        await _search_tool_class(_ALL_SEARCH_CREDENTIALS, "  ", monkeypatch)
+        == "ZhipuWebSearchTool"
+    )

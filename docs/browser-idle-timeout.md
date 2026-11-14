@@ -104,8 +104,7 @@ the user.
 
 Once a login is rejected, access-token requests carrying its `sid` and
 refreshes with the user's current refresh token keep returning
-`SessionIdleExpired`, except that with the switch on a login not yet revoked by
-the sweep is judged again on each request (see "Rolling threshold change"). An access token past its own expiry still gets
+`SessionIdleExpired`. An access token past its own expiry still gets
 `TokenExpired`, and a refresh token already replaced by a newer login gets the
 existing invalid-refresh-token error.
 
@@ -135,14 +134,16 @@ UPDATE.
 
 - **Role**: each login row records the platform-admin role at its last login,
   activity or refresh, and enforcing replicas mark the live logins of current
-  admins with every lease renewal. With the switch off the stricter of the
-  recorded and the current role applies, so a demotion after switch-off revives
-  nothing. Exception: a promotion made within the last renewal interval
-  (5 seconds) before switch-off can go unrecorded; that interval bounds when a
-  promotion can be missed, not how long such a login stays usable after a
-  later demotion. Errors go only toward signing out: a user demoted while the
-  switch was on, or promoted after it, whose login is idle between the two
-  thresholds is signed out once more.
+  admins with every lease renewal. With the switch on or off, the stricter of
+  the recorded and the current role applies to the recorded threshold sets, so
+  a demotion revives nothing. Exception: a promotion made within the last
+  renewal interval (5 seconds) before the policy stops being enforced can go
+  unrecorded; that interval bounds when a promotion can be missed, not how
+  long such a login stays usable after a later demotion. Errors go only toward
+  signing out: a user demoted (or, after switch-off, promoted) whose login has
+  had no activity since is judged by the shorter threshold until the next
+  activity or refresh records the new role; the reported countdown shows that
+  shorter threshold.
 - **Cost with the switch off**: decisions read the lease rows directly, with no
   cache, including in deployments that never enabled the policy (an empty
   table). A login active within the last minute (no threshold is shorter)
@@ -153,8 +154,9 @@ UPDATE.
   keeps enforcing and logs errors, but expirations during an outage longer than
   about 10 seconds are not covered. Replica clocks must be synchronised (NTP)
   to within 5 seconds; the 15-second lease absorbs that.
-- **Window**: logins due to expire within about 10–15 seconds after the last
-  enforcing replica stops still expire on time.
+- **Window**: logins due to expire under a threshold set within about 10–15
+  seconds after the last replica enforcing that set stops (switch-off, or a
+  threshold change) still expire on time.
 - **Legacy credentials**: once any lease exists, a refresh token without a
   known `sid` is rejected rather than migrated. Access tokens without `sid` are
   not checked against the leases (to avoid a per-request read); the rollout
@@ -167,16 +169,20 @@ UPDATE.
 **Rolling threshold change.** While the switch is on, a replica rejects a login
 that expired under its own thresholds or under any threshold set another
 replica is still enforcing (its lease has not ended), and its activity and
-refresh writes apply the same test. During a rolling change the stricter set
+refresh writes apply the same test; a login that expired under a set while it
+was enforced stays expired afterwards (see "Once expired, always expired"). During a rolling change the stricter set
 therefore governs, until replicas with the old set stop renewing; their lease
 ends at most 15 seconds later. With the switch on, a login idle for more than a
 minute adds the same small lease query per decision, and every response that
 carries `idle_session` reads the leases once.
 
-Because requests reject without revoking, a login that expired and was not yet
-revoked by the sweep (it runs every 60 seconds) is judged again on each request:
-loosening a threshold, or demoting a platform admin, within that interval
-re-admits it under the new threshold, whether or not a request saw it expire.
+**Once expired, always expired.** A login that reached an enforced idle
+deadline needs a fresh login, with or without a revocation. Every decision,
+with the switch on or off, also checks whether the login expired under any
+recorded threshold set while that set was enforced, with the stricter of its
+recorded and current role, and activity and refresh writes repeat the same
+test. A later threshold increase, a rolling change or a demotion therefore
+cannot re-admit it; requests never need to write a revocation for this.
 
 ## Logout
 

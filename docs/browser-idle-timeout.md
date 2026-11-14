@@ -263,10 +263,12 @@ Adapters without a core user (for example Toby) use
 `rejection_http_exception()`, and keep their own session state with the same
 guarantees: shared across replicas and restarts, conditional writes that
 cannot revive an expired login, per-login revocation that survives turning the
-switch off. With the switch off they must not implement the lease rule
-themselves: use `expired_while_enforced(enforcement_leases(db),
-last_activity_at=..., roles=..., now=...)`. An adapter may expose its own activity endpoint (keeping its
-CSRF/Origin checks) with the same semantics: check expiry before writing, write
+switch off. With the switch on or off they must not implement the lease rule
+themselves: also reject when `expired_while_enforced(enforcement_leases(db),
+last_activity_at=..., roles=..., now=...)` is true (once expired, always
+expired), and use `effective_idle_timeout(...)` for the reported countdown
+while the switch is on. An adapter may expose its own activity endpoint
+(keeping its CSRF/Origin checks) with the same semantics: check expiry before writing, write
 at most once per login per 60 seconds, return 200 with `idle_session`, no 429.
 Only a real authentication (password, provider OAuth callback, MFA
 verification) starts a new login; re-signing session credentials keeps the

@@ -1430,6 +1430,91 @@ def test_the_generic_cascade_sweeps_a_table_a_writer_created_meanwhile(
 # --- a precompute run that ends early still removes what it left ---
 
 
+@pytest.mark.parametrize("scope_name", ["chunk", "parse"])
+def test_a_version_cleanup_sweeps_a_table_a_writer_created_meanwhile(
+    monkeypatch: pytest.MonkeyPatch, scope_name: str
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    _save_collection()
+    _seed_retirable_core()
+    _source([_row("c1"), _row("c2")])
+    late = scope.source_table(TARGET.id)
+    real = lancedb_stores._vis_delete_rows_by_filters
+    created: List[str] = []
+
+    def _writer_commits_during_the_core_delete(table: Any, filters: List[str]) -> int:
+        if not created and getattr(table, "name", "") == "chunks":
+            scope.connection().create_table(
+                late,
+                data=pa.Table.from_pylist(
+                    [_row("c1", model=TARGET.id)], schema=_SCHEMA
+                ),
+            )
+            created.append(late)
+        return real(table, filters)
+
+    monkeypatch.setattr(
+        lancedb_stores,
+        "_vis_delete_rows_by_filters",
+        _writer_commits_during_the_core_delete,
+    )
+
+    _store().cleanup_cascade_by_scope(
+        "kb",
+        "d1",
+        scope_name,
+        new_parse_hash="p-new",
+        old_parse_hash="p",
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert created == [late]
+    assert _chunk_rows("d1") == 0
+    assert _rows_in(late) == []
+
+
+def test_a_cascade_whose_count_fails_deletes_nothing_and_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.utils import lancedb_query_utils
+
+    _save_collection()
+    _seed_retirable_core()
+    _store().upsert_embeddings("m1", [_emb("d1", "c1"), _emb("d1", "c2")])
+    real = lancedb_query_utils._safe_count_rows
+
+    class _Unreadable:
+        def count_rows(self, *args: Any) -> int:
+            raise OSError("count failed")
+
+    def _embeddings_count_fails(
+        table: Any, filter_expr: Optional[str] = None, **kwargs: Any
+    ) -> int:
+        if str(getattr(table, "name", "")).startswith("embeddings_"):
+            table = _Unreadable()
+        return real(table, filter_expr, **kwargs)
+
+    monkeypatch.setattr(
+        lancedb_query_utils, "_safe_count_rows", _embeddings_count_fails
+    )
+
+    with pytest.raises(OSError):
+        _store().cascade_delete(
+            target="document",
+            collection="kb",
+            doc_id="d1",
+            is_admin=True,
+            preview_only=False,
+            confirm=True,
+        )
+
+    assert _emb_rows("d1") == ["c1", "c2"]
+    assert _chunk_rows("d1") == 2
+    assert _doc_rows("d1") == 1
+
+
 def test_a_write_that_fails_partway_leaves_no_target_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

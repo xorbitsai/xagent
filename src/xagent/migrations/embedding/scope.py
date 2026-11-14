@@ -287,7 +287,7 @@ def _count_rows(conn: Any, table: str, where: Optional[str] = None) -> int:
         _safe_close_table(opened)
 
 
-def _holds_rows(conn: Any, table: str, collection: str) -> bool:
+def holds_rows(conn: Any, table: str, collection: str) -> bool:
     if "collection" not in schema_names(conn, table):
         # Cannot attribute a row to a collection: any row counts.
         return _count_rows(conn, table) > 0
@@ -328,7 +328,7 @@ def target_tables_hold_foreign_rows(
         if table not in names:
             continue
         if table != writer:
-            if _holds_rows(conn, table, collection):
+            if holds_rows(conn, table, collection):
                 return True
         elif _holds_rows_written_elsewhere(conn, table, collection, model_id):
             return True
@@ -401,7 +401,7 @@ def source_eligibility(
     holders = [
         name
         for name in spellings
-        if name in names and _holds_rows(conn, name, collection)
+        if name in names and holds_rows(conn, name, collection)
     ]
     if table not in holders:
         # No rows yet, or rows search reaches only through another table.

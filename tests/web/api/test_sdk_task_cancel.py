@@ -1023,6 +1023,30 @@ async def test_an_appended_turn_stopped_before_it_starts_leaves_the_previous_res
 
 
 @pytest.mark.asyncio
+async def test_a_new_task_cancel_applied_again_before_it_completed_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cancel wrote the new task's row, then its completion never
+    committed and the command is applied again while the START is still
+    pending. The row now holds a later version than the START, which must
+    not read as a turn that ended on its own: the cancel is already done."""
+    task_id, agent_id, owner_user_id = _create_task(
+        status=TaskStatus.PENDING, control_state="idle", run_id=None, state_version=0
+    )
+    start_id = _stage_start(task_id, owner_user_id)
+    _broadcast_manager(monkeypatch)
+
+    await _cancel_queued(task_id, agent_id)
+    after_first = _row(task_id)
+    await _cancel_queued(task_id, agent_id)
+
+    assert _row(task_id) == after_first
+    task = _load_task(task_id)
+    assert is_sdk_cancelled(task.status, task.error_message)
+    assert _start(start_id)[0] == "pending"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("storage_version", [1, 2])
 async def test_a_new_task_cancelled_before_it_starts_is_cancelled_as_a_row(
     monkeypatch: pytest.MonkeyPatch, storage_version: int

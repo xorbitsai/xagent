@@ -635,8 +635,9 @@ async def request_sdk_task_cancel(
     names that turn. Returns ``cancelled=False`` when the command was
     persisted but not applied within ``SDK_CANCEL_REQUEST_WAIT_SECONDS``;
     calling again reaches the same command, including after it withdrew a
-    queued turn and before it is marked completed. Raises ``SdkTaskNotCancellable`` when the aimed run ended
-    without being cancelled, whichever way the wait ends.
+    queued turn and before it is marked completed. Raises
+    ``SdkTaskNotCancellable`` when the aimed run ended without being
+    cancelled, whichever way the wait ends.
     """
 
     prepared = await run_db_io_cancellation_safe(
@@ -1135,6 +1136,13 @@ def _resolve_queued_cancel_target_sync(
                     f"START of run {queued_run_id} is being handed off"
                 )
             if start.status == COMMAND_PENDING:
+                if _new_task_already_cancelled(task, start):
+                    # A new task's cancel wrote the row and the START is
+                    # settled only once that command completes. Applied
+                    # again before then -- its completion never committed --
+                    # the cancel is already done; the row has moved past the
+                    # START, which must not read as the turn having ended.
+                    return None
                 if not start_can_hand_off(start, task):
                     # The row moved on after the START was accepted, so the
                     # START will never open this run and there is nothing
@@ -1153,6 +1161,22 @@ def _resolve_queued_cancel_target_sync(
                     return None
             db.rollback()
         raise stale
+
+
+def _new_task_already_cancelled(task: Task, start: TaskExecutionCommand) -> bool:
+    """Whether ``start`` opens a new task whose row a cancel already wrote."""
+
+    from .task_start_protocol import TaskStartPayload
+
+    if _task_run_id(task) is not None or not is_sdk_cancelled(
+        task.status, task.error_message
+    ):
+        return False
+    try:
+        payload = TaskStartPayload.model_validate(start.payload)
+    except ValueError:
+        return False
+    return bool(payload.kind == "create")
 
 
 async def cancel_sdk_task_unserialized(

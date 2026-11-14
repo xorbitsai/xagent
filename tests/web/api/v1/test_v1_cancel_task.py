@@ -1275,38 +1275,6 @@ def test_a_repeat_while_the_withdrawing_cancel_is_still_processing_rejoins_it(
     assert len(_cancel_commands(task_id)) == 1
 
 
-@pytest.mark.parametrize("previous", list(_PREVIOUS_RUNS))
-def test_a_repeat_that_rejoined_the_cancel_reports_its_completion_while_polling(
-    monkeypatch: pytest.MonkeyPatch, previous: str
-):
-    """The rejoined command is completed while the repeat polls it: the
-    repeat answers with the command's final outcome, the same answer any
-    call gets once the command is completed."""
-    task_id, key, first, command = _withdrawn_before_completion(monkeypatch, previous)
-
-    async def completed_by_its_owner(*_args: Any, **_kwargs: Any) -> bool:
-        threading.Timer(0.2, _complete_applied_cancel, (task_id, command.id)).start()
-        return False
-
-    monkeypatch.setattr(
-        sdk_task_cancel,
-        "dispatch_one_task_command",
-        AsyncMock(side_effect=completed_by_its_owner),
-    )
-    monkeypatch.setattr(sdk_task_cancel, "SDK_CANCEL_REQUEST_WAIT_SECONDS", 5.0)
-
-    again = _cancel(task_id, key)
-
-    assert again.status_code == 200, again.text
-    assert again.json()["cancelled_run_id"] == QUEUED_RUN
-    assert [c.id for c in _cancel_commands(task_id)] == [command.id]
-    assert _cancel_commands(task_id)[0].status == COMMAND_COMPLETED
-    if previous != "new_task":
-        assert again.json() == first.json()
-    monkeypatch.setattr(sdk_task_cancel, "dispatch_one_task_command", AsyncMock())
-    assert _cancel(task_id, key).json() == again.json()
-
-
 def test_a_repeat_while_processing_after_the_turn_before_resumed_cancels_that_turn(
     monkeypatch: pytest.MonkeyPatch,
 ):

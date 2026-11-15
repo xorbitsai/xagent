@@ -160,6 +160,8 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "(an embedding host constructs it); it is not part of any loop "
         "retire_writers stops.",
     ),
+    # Only reads the serving-generation row (is_serving never writes).
+    "web/services/generation.py": (2, READ),
     "web/services/gmail_triggers.py": (
         5,
         "Gmail Pub/Sub webhook collection (collect_gmail_pubsub_events): "

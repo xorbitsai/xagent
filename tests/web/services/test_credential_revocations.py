@@ -880,3 +880,42 @@ async def test_an_endpoint_the_url_policy_refuses_fails_at_once(
     assert endpoint not in record.last_error
     assert rfc7009.calls == []
     _assert_erased(record)
+
+
+@pytest.mark.asyncio
+async def test_a_live_row_with_an_unknown_issuer_blocks_the_revoke(factory, google):
+    """A custom-app row the issuer backfill could not prove stays NULL. Nothing
+    proves it was not issued by Google for the same account, so while it holds
+    a token the Google record is skipped rather than risk cutting it off."""
+    with factory() as db:
+        alice, bob = _user(db, "alice"), _user(db, "bob")
+        _native(db, bob, provider="acme-mail", oauth_provider=None)
+        doomed = _native(db, alice)
+        db.commit()
+        db.delete(doomed)
+        db.commit()
+
+    assert (await _run(factory)).outcomes == {"skipped": 1}
+    assert google.calls == []
+    [record] = _records(factory)
+    assert "another local connection" in record.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_tombstoned_row_with_an_unknown_issuer_fails_without_a_call(
+    factory, google
+):
+    """Its dropped tokens are recorded like any other drop, and the worker
+    refuses to guess where to send them."""
+    with factory() as db:
+        row = _native(db, _user(db), oauth_provider=None)
+        db.commit()
+        row.access_token, row.refresh_token = "", None
+        db.commit()
+
+    assert (await _run(factory)).outcomes == {"failed": 1}
+    [record] = _records(factory)
+    assert record.issuer is None
+    assert "unknown issuer" in record.last_error
+    _assert_erased(record)
+    assert google.calls == []

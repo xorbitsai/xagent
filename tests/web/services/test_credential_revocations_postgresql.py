@@ -295,7 +295,10 @@ def test_replicas_skip_locked_records_and_never_take_two_of_one_grant(factory):
         ({UserOAuth.access_token: "", UserOAuth.refresh_token: None}, True),
         ({UserOAuth.refresh_token: None}, True),
         ({UserOAuth.refresh_token: ""}, True),
-        ({UserOAuth.access_token: "rotated", UserOAuth.refresh_token: "rotated"}, False),
+        (
+            {UserOAuth.access_token: "rotated", UserOAuth.refresh_token: "rotated"},
+            False,
+        ),
         ({UserOAuth.access_token: ""}, False),
     ],
     ids=["tombstone", "refresh-null", "refresh-empty", "rotation", "access-only"],

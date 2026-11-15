@@ -2758,6 +2758,11 @@ def reset_kb_coordinator_for_tests() -> None:
         _coordinator = None
 
 
+def resolve_collection_backend(collection_info: object | None) -> KBStorageBackend:
+    """The engine a collection is bound to, defaulting to the deployment's."""
+    return get_kb_coordinator()._resolve_backend(collection_info)
+
+
 def _run_in_separate_loop(awaitable: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine from sync code, including inside an existing event loop."""
     try:

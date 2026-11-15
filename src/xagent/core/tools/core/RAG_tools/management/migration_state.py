@@ -6,10 +6,11 @@ import asyncio
 import functools
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import Context, ContextVar, copy_context
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import (
     Any,
     AsyncIterator,
@@ -29,7 +30,7 @@ import pyarrow as pa  # type: ignore
 
 from xagent.core.utils.blocking import run_blocking
 
-from ..core.exceptions import CollectionMigratingError
+from ..core.exceptions import CollectionMigratingError, CollectionNotFrozenError
 from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.factory import get_metadata_store
 from ..utils.lancedb_query_utils import list_table_names
@@ -43,6 +44,8 @@ from .write_leases import (
 )
 
 MIGRATION_TABLE = "collection_migration_state"
+# No collection can be named this, and the writers below refuse the name.
+_INSERT_GUARD = "/insert-guard"
 IDLE = "idle"
 FROZEN = "frozen"
 WRITE_MAX_RETRIES = 3
@@ -73,18 +76,24 @@ _SCHEMA = pa.schema(
         ("source_model_id", pa.string()),
         ("target_model_id", pa.string()),
         ("updated_at", pa.timestamp("us")),
+        ("owner", pa.string()),
     ]
 )
 
 
 @dataclass(frozen=True)
 class CollectionMigrationState:
-    """Migration freeze state stored in its own LanceDB table."""
+    """Migration freeze state stored in its own LanceDB table.
+
+    ``owner`` is the run holding the frozen row's window, ``None`` when no run
+    does; only the window functions below write it.
+    """
 
     state: str = IDLE
     source_model_id: Optional[str] = None
     target_model_id: Optional[str] = None
     updated_at: Optional[datetime] = None
+    owner: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         return {
@@ -104,13 +113,42 @@ def _row_state(row: Dict[str, Any]) -> str:
 
 
 def _ensure_table(conn: Any) -> None:
-    if MIGRATION_TABLE in list_table_names(conn):
+    if MIGRATION_TABLE not in list_table_names(conn):
+        try:
+            conn.create_table(MIGRATION_TABLE, schema=_SCHEMA)
+            return
+        except Exception:
+            if MIGRATION_TABLE not in list_table_names(conn):
+                raise
+    if _has_owner_column(conn):
         return
+    table = conn.open_table(MIGRATION_TABLE)
     try:
-        conn.create_table(MIGRATION_TABLE, schema=_SCHEMA)
+        table.add_columns([pa.field("owner", pa.string())])
     except Exception:
-        if MIGRATION_TABLE not in list_table_names(conn):
+        # Of two racing upgrades LanceDB fails one; the column is there for it.
+        if not _has_owner_column(conn):
             raise
+    finally:
+        _safe_close_table(table)
+
+
+def _has_owner_column(conn: Any) -> bool:
+    table = _open_listed_table(conn)
+    try:
+        return "owner" in table.schema.names
+    finally:
+        _safe_close_table(table)
+
+
+def _open_listed_table(conn: Any) -> Any:
+    for attempt in range(WRITE_MAX_RETRIES - 1):
+        try:
+            return conn.open_table(MIGRATION_TABLE)
+        except ValueError:
+            # Listed while another process is still committing its creation.
+            time.sleep(0.1 * (2**attempt))
+    return conn.open_table(MIGRATION_TABLE)
 
 
 def _read_row(
@@ -140,6 +178,7 @@ def read_migration_state(
         source_model_id=row.get("source_model_id"),
         target_model_id=row.get("target_model_id"),
         updated_at=row.get("updated_at"),
+        owner=row.get("owner"),
     )
 
 
@@ -147,56 +186,36 @@ def write_migration_state(
     collection_name: str,
     state: CollectionMigrationState,
 ) -> CollectionMigrationState:
-    """Store ``state`` for one collection; only this module writes the table."""
+    """Store ``state`` for a collection no run holds; only this module writes.
+
+    Raises:
+        CollectionMigratingError: If a run holds the collection's window.
+    """
+    _refuse_guard_name(collection_name)
     if state.state not in (IDLE, FROZEN):
         raise ValueError(f"Unsupported migration state: {state.state!r}")
     stamped = replace(
         state,
         updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        owner=None,
     )
     conn = get_metadata_store().get_raw_connection()
     row = {"name": collection_name, **stamped.to_row()}
     for attempt in range(WRITE_MAX_RETRIES - 1):
         try:
-            _merge_row(conn, row)
-            return stamped
+            written = _merge_row(conn, row)
+            break
         except Exception as exc:
             # Retries any error; the final attempt below re-raises.
             logger.warning(
                 "Retrying migration state write for %s: %s", collection_name, exc
             )
             time.sleep(0.1 * (2**attempt))
-    _merge_row(conn, row)
+    else:
+        written = _merge_row(conn, row)
+    if not written:
+        raise _held_error(collection_name)
     return stamped
-
-
-def update_migration_state_if_frozen(
-    collection_name: str,
-    state: CollectionMigrationState,
-) -> bool:
-    """Write ``state`` only while the stored row is still frozen.
-
-    Returns ``False`` when an unfreeze landed after the caller's read, so a
-    migration step cannot put a frozen row back over it.
-    """
-    if state.state not in (IDLE, FROZEN):
-        raise ValueError(f"Unsupported migration state: {state.state!r}")
-    stamped = replace(
-        state,
-        updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
-    )
-    conn = get_metadata_store().get_raw_connection()
-    _ensure_table(conn)
-    where = f"name = '{escape_lancedb_string(collection_name)}' AND state = '{FROZEN}'"
-    for attempt in range(WRITE_MAX_RETRIES - 1):
-        try:
-            return _update_row(conn, where, stamped.to_row())
-        except Exception as exc:
-            logger.warning(
-                "Retrying migration state update for %s: %s", collection_name, exc
-            )
-            time.sleep(0.1 * (2**attempt))
-    return _update_row(conn, where, stamped.to_row())
 
 
 def _update_row(conn: Any, where: str, values: Dict[str, Any]) -> bool:
@@ -207,27 +226,227 @@ def _update_row(conn: Any, where: str, values: Dict[str, Any]) -> bool:
         _safe_close_table(table)
 
 
-def _merge_row(conn: Any, row: dict[str, Any]) -> None:
+def _merge_row(conn: Any, row: dict[str, Any]) -> bool:
     _ensure_table(conn)
+    if _insert_new_row(conn, row):
+        return True
+    where = f"name = '{escape_lancedb_string(row['name'])}' AND owner IS NULL"
+    return _update_row(conn, where, {k: v for k, v in row.items() if k != "name"})
+
+
+def _insert_new_row(conn: Any, row: Dict[str, Any]) -> bool:
+    """Insert ``row`` only if its collection has no row yet; whether it did.
+
+    The same commit rewrites the guard row, so two racing inserts conflict in
+    LanceDB and the one it re-runs finds the other's row; plain inserts never
+    conflict, so both would land.
+    """
+    guard = {"name": _INSERT_GUARD, "state": IDLE, "updated_at": _next_stamp(None)}
     table = conn.open_table(MIGRATION_TABLE)
     try:
-        table.merge_insert(
-            ["name"]
-        ).when_matched_update_all().when_not_matched_insert_all().execute([row])
+        if not table.search().where(f"name = '{_INSERT_GUARD}'").to_arrow().num_rows:
+            table.add(pa.Table.from_pylist([guard], schema=_SCHEMA))
+        result = (
+            table.merge_insert(["name"])
+            .when_matched_update_all(where=f"target.name = '{_INSERT_GUARD}'")
+            .when_not_matched_insert_all()
+            .execute(pa.Table.from_pylist([guard, row], schema=_SCHEMA))
+        )
     finally:
         _safe_close_table(table)
+    return bool(result.num_inserted_rows)
 
 
 def clear_migration_state(collection_name: str) -> None:
-    """Remove the collection's row; a missing table or row is a no-op."""
+    """Remove the collection's row unless a run holds it.
+
+    A missing table or row is a no-op.
+
+    Raises:
+        CollectionMigratingError: If a run holds the collection's window.
+    """
+    _refuse_guard_name(collection_name)
     conn = get_metadata_store().get_raw_connection()
     if MIGRATION_TABLE not in list_table_names(conn):
         return
+    _ensure_table(conn)
     table = conn.open_table(MIGRATION_TABLE)
     try:
-        table.delete(f"name = '{escape_lancedb_string(collection_name)}'")
+        table.delete(
+            f"name = '{escape_lancedb_string(collection_name)}' AND owner IS NULL"
+        )
     finally:
         _safe_close_table(table)
+    row = _read_row(collection_name)
+    if row is not None and row.get("owner") is not None:
+        raise _held_error(collection_name)
+
+
+@dataclass
+class MigrationWindow:
+    """One run's hold on a frozen collection.
+
+    ``updated_at`` is the row version this run wrote last: each owned write
+    must still find it and advances it in place.
+    """
+
+    collection_name: str
+    owner: str
+    updated_at: datetime
+
+
+def claim_migration_window(collection_name: str, *, holder: str) -> MigrationWindow:
+    """Freeze a collection no run holds, for one run named after ``holder``.
+
+    An absent or idle row is claimed; an idle row keeps its recorded
+    transition, the rollback origin of the last switch.
+
+    Raises:
+        CollectionMigratingError: If the row is frozen, or changed after it was
+            read; the details name its owner and when it was written.
+    """
+    _refuse_guard_name(collection_name)
+    conn = get_metadata_store().get_raw_connection()
+    _ensure_table(conn)
+    owner = f"{holder}:{uuid.uuid4().hex}"
+    row = _read_row(collection_name)
+    stamp = _next_stamp(None if row is None else row.get("updated_at"))
+    claim = {"state": FROZEN, "updated_at": stamp, "owner": owner}
+    if row is None:
+        claimed = _insert_new_row(conn, {"name": collection_name, **claim})
+    elif _row_state(row) == IDLE:
+        where = _version_is(
+            collection_name, IDLE, row.get("owner"), row.get("updated_at")
+        )
+        claimed = _update_row(conn, where, claim)
+    else:
+        claimed = False
+    if claimed:
+        # Decided on the row read back, not on the count of a commit LanceDB re-ran.
+        current = read_migration_state(collection_name)
+        claimed = (current.owner, current.updated_at) == (owner, stamp)
+    if not claimed:
+        raise _held_error(collection_name)
+    return MigrationWindow(collection_name, owner, stamp)
+
+
+def take_over_migration_window(
+    collection_name: str, observed: CollectionMigrationState, *, holder: str
+) -> MigrationWindow:
+    """Give the frozen row ``observed`` was read from to a new run.
+
+    The caller states that the run holding it is gone; nothing here checks
+    that. The row changes only while it is still exactly the one observed, and
+    the collection row is fenced before this returns, so a binding write the
+    previous run prepared can no longer land. If the fence fails, the row is
+    already taken but no window is returned: take it over again.
+
+    Raises:
+        CollectionNotFrozenError: If ``observed`` is not a frozen row.
+        CollectionMigratingError: If the row changed after it was observed.
+    """
+    _refuse_guard_name(collection_name)
+    if observed.state != FROZEN:
+        raise CollectionNotFrozenError(
+            f"Collection '{collection_name}' is not frozen; claim it instead.",
+            details={"collection": collection_name, "migration_state": observed.state},
+        )
+    conn = get_metadata_store().get_raw_connection()
+    _ensure_table(conn)
+    owner = f"{holder}:{uuid.uuid4().hex}"
+    stamp = _next_stamp(observed.updated_at)
+    where = _version_is(collection_name, FROZEN, observed.owner, observed.updated_at)
+    if not _update_row(conn, where, {"updated_at": stamp, "owner": owner}):
+        raise _held_error(collection_name)
+    # collection_manager imports this module.
+    from .collection_manager import fence_collection_binding_sync
+
+    fence_collection_binding_sync(collection_name)
+    return MigrationWindow(collection_name, owner, stamp)
+
+
+def record_migration_transition(
+    window: MigrationWindow,
+    source_model_id: Optional[str],
+    target_model_id: str,
+) -> None:
+    """Record the switch this run is about to apply, while it holds ``window``."""
+    _write_owned(
+        window,
+        {"source_model_id": source_model_id, "target_model_id": target_model_id},
+    )
+
+
+def release_migration_window(window: MigrationWindow) -> None:
+    """Unfreeze the collection; the recorded transition stays as rollback origin."""
+    _write_owned(window, {"state": IDLE, "owner": None})
+
+
+def _write_owned(window: MigrationWindow, values: Dict[str, Any]) -> None:
+    stamp = _next_stamp(window.updated_at)
+    where = _version_is(window.collection_name, FROZEN, window.owner, window.updated_at)
+    conn = get_metadata_store().get_raw_connection()
+    if not _update_row(conn, where, {**values, "updated_at": stamp}):
+        raise CollectionNotFrozenError(
+            f"Collection '{window.collection_name}' is no longer frozen by this "
+            "run; read its migration state before acting on it.",
+            details={
+                "collection": window.collection_name,
+                "owner": window.owner,
+                "migration_state": "not-owned",
+            },
+        )
+    window.updated_at = stamp
+
+
+def _refuse_guard_name(collection_name: str) -> None:
+    if collection_name == _INSERT_GUARD:
+        raise ValueError(f"'{_INSERT_GUARD}' is reserved by the migration table.")
+
+
+def _version_is(
+    collection_name: str,
+    state: str,
+    owner: Optional[str],
+    stamp: Optional[datetime],
+) -> str:
+    owner_sql = (
+        "owner IS NULL"
+        if owner is None
+        else f"owner = '{escape_lancedb_string(owner)}'"
+    )
+    stamp_sql = (
+        "updated_at IS NULL"
+        if stamp is None
+        else f"updated_at = timestamp '{stamp.strftime('%Y-%m-%d %H:%M:%S.%f')}'"
+    )
+    return (
+        f"name = '{escape_lancedb_string(collection_name)}' "
+        f"AND state = '{state}' AND {owner_sql} AND {stamp_sql}"
+    )
+
+
+def _next_stamp(previous: Optional[datetime]) -> datetime:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if previous is None or now > previous:
+        return now
+    # A clock that did not advance must still change the row version.
+    return previous + timedelta(microseconds=1)
+
+
+def _held_error(collection_name: str) -> CollectionMigratingError:
+    current = read_migration_state(collection_name)
+    return CollectionMigratingError(
+        f"Knowledge base '{collection_name}' was not changed: its migration row "
+        f"is {current.state}, owner {current.owner or 'unrecorded'}, written "
+        f"{current.updated_at}.",
+        details={
+            "collection": collection_name,
+            "migration_state": current.state,
+            "owner": current.owner,
+            "updated_at": current.updated_at,
+        },
+    )
 
 
 def verify_active_leases(collection: Optional[str] = None) -> None:

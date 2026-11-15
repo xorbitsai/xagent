@@ -26,8 +26,9 @@ from .collection_manager import (
 from .migration_state import (
     FROZEN,
     CollectionMigrationState,
+    MigrationWindow,
     read_migration_state,
-    update_migration_state_if_frozen,
+    record_migration_transition,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,25 +66,40 @@ def _resolve_configured_model(target_model_id: str) -> tuple[str, int]:
     return canonical, config.dimension
 
 
+def _held_state(window: MigrationWindow) -> CollectionMigrationState:
+    state = read_migration_state(window.collection_name)
+    if state.state != FROZEN or (state.owner, state.updated_at) != (
+        window.owner,
+        window.updated_at,
+    ):
+        raise CollectionNotFrozenError(
+            f"Collection '{window.collection_name}' is not frozen by this run; "
+            "claim it first.",
+            details={
+                "collection": window.collection_name,
+                "migration_state": state.state,
+            },
+        )
+    return state
+
+
 def switch_collection_embedding_model(
-    collection_name: str, target_model_id: str
+    window: MigrationWindow, target_model_id: str
 ) -> CollectionEmbeddingSwitch:
-    """Bind ``collection_name`` to ``target_model_id``.
+    """Bind the collection ``window`` holds to ``target_model_id``.
+
+    The source is the binding read here, after the claim. The transition is
+    recorded only while this run still holds the row version it wrote last, and
+    the binding moves only if the collection row is unchanged since that read.
 
     Raises:
-        CollectionNotFrozenError: If the collection is not frozen for migration.
+        CollectionNotFrozenError: If this run does not hold the window.
         EmbeddingAdapterError: If the model hub is unavailable or has no such model.
         ValueError: If the collection does not exist, the resolved id differs from
-            the requested one, or the stored binding moved while switching.
+            the requested one, or the stored row moved while switching.
     """
-    state = read_migration_state(collection_name)
-    if state.state != FROZEN:
-        raise CollectionNotFrozenError(
-            f"Collection '{collection_name}' is not frozen for an embedding "
-            "switch; freeze it first.",
-            details={"collection": collection_name, "migration_state": state.state},
-        )
-
+    collection_name = window.collection_name
+    state = _held_state(window)
     canonical_model_id, dimension = _resolve_configured_model(target_model_id)
 
     stored = get_collection_sync(collection_name)
@@ -97,38 +113,30 @@ def switch_collection_embedding_model(
 
     # The record goes first: if the binding write fails, retrying the switch is
     # idempotent and still knows the source model to roll back to.
-    if not update_migration_state_if_frozen(
-        collection_name,
-        CollectionMigrationState(
-            state=FROZEN,
-            source_model_id=source_model_id,
-            target_model_id=canonical_model_id,
-        ),
-    ):
-        raise CollectionNotFrozenError(
-            f"Collection '{collection_name}' was unfrozen while switching.",
-            details={"collection": collection_name, "migration_state": "unfrozen"},
-        )
+    record_migration_transition(window, source_model_id, canonical_model_id)
 
     applied = write_collection_binding_sync(
         collection_name,
         canonical_model_id,
         dimension,
-        # Exactly one guard: the store rejects both, and an unbound row is not
-        # matched by an exact-value compare-and-set.
+        # Exactly one binding guard: the store rejects both, and an unbound row
+        # is not matched by an exact-value compare-and-set.
         expected_model_id=observed_model_id if observed is not None else None,
         require_uninitialized=observed is None,
+        expected_updated_at=stored.updated_at,
     )
     if not applied:
-        # A concurrent identical switch may have written the same target.
         current_model_id = _normalize_model_id(
             get_collection_sync(collection_name).embedding_model_id
         )
         if current_model_id != canonical_model_id:
             raise ValueError(
-                f"Collection '{collection_name}' embedding model changed while "
-                "switching; retry the switch."
+                f"Collection '{collection_name}' changed while switching; retry "
+                "the switch."
             )
+        # The target is bound; accept that only while this run holds the window,
+        # or a taken-over run would report the new owner's switch as its own.
+        _held_state(window)
 
     logger.info(
         "Switched collection '%s' embedding model from '%s' to '%s'",

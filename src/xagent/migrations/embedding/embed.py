@@ -155,6 +155,12 @@ def warm_up(
     target_id, dimension, adapter = resolve_hub_target(model_id, dry_run=dry_run)
     conn = connection()
     names = resolve_collection_names(collections=collections, conn=conn)
+    hidden = hidden_by_writer_table(target_id, conn)
+    if hidden:
+        raise MigrationCliError(
+            f"creating {source_table(target_id)} would hide the rows of "
+            f"{', '.join(hidden)}, bound to {target_id}, from search"
+        )
     if adapter is not None and rate_limit <= 0:
         logger.warning("No --rate-limit: the provider's whole quota may be used")
     target = Target(target_id, dimension, adapter, RateLimiter(rate_limit))
@@ -194,6 +200,26 @@ def resolve_hub_target(
     if config.id != canonical:
         raise MigrationCliError(f"'{canonical}' resolves to adapter '{config.id}'")
     return canonical, dimension, adapter
+
+
+def hidden_by_writer_table(model_id: str, conn: Any) -> List[str]:
+    """Collections bound to ``model_id`` with rows in some embeddings table while its
+    writer table does not exist: once created, their search reads only that table."""
+    from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+        _normalize_model_id,
+    )
+
+    names = table_names(conn)
+    if source_table(model_id) in names:
+        return []
+    tables = sorted(name for name in names if name.startswith("embeddings_"))
+    return [
+        name
+        for name in resolve_collection_names(conn=conn)
+        if _normalize_model_id(collection_info(name, conn).embedding_model_id)
+        == model_id
+        and any(holds_rows(conn, table, name) for table in tables)
+    ]
 
 
 def warm_collection(report: CollectionReport, target: Target, conn: Any) -> None:
@@ -505,7 +531,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Exit codes: 0 every collection in scope was processed, skipped or\n"
             "stopped (0 does not mean every collection was warmed up); 1 a\n"
             "collection, a document or an index build failed, or nothing is in\n"
-            "scope; 2 the run never started."
+            "scope; 2 the run never started, including when the target's table\n"
+            "does not exist yet and creating it would hide the rows of a\n"
+            "collection already bound to the target from its search."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

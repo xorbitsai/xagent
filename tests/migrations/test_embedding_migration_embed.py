@@ -23,6 +23,7 @@ LEASES = "collection_write_leases"
 
 SOURCE = "BAAI/old-model"
 TARGET = "new-model"
+VENDOR_TARGET = "Vendor/new-model"
 VECTOR = [0.25, 0.75]
 
 
@@ -512,6 +513,61 @@ def test_a_refused_collection_gets_no_write(adapter: _Adapter, case: str) -> Non
     )
     assert adapter.calls == []
     assert _versions() == before
+
+
+def _bind_kb2_to_vendor_target(hub: _Hub, form: str) -> str:
+    """kb2 bound to VENDOR_TARGET, its rows only in a table search falls back to."""
+    model_name = "provider-model" if form == "provider-name" else VENDOR_TARGET
+    hub.models[VENDOR_TARGET] = _config(VENDOR_TARGET, model_name=model_name)
+    _save_collection("kb2", model_id=VENDOR_TARGET)
+    if form == "provider-name":
+        _write([_src("x1", "e1")], model=model_name, collection="kb2")
+        return scope.source_table(model_name)
+    _write([_src("x1", "e1")], model=VENDOR_TARGET, collection="kb2")
+    conn = scope.connection()
+    writer, once = scope.own_tables(VENDOR_TARGET)
+    conn.create_table(once, data=conn.open_table(writer).to_arrow())
+    conn.drop_table(writer)
+    return once
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("form", ["once-tagged", "provider-name"])
+def test_a_writer_table_that_would_hide_another_collection_refuses_the_run(
+    adapter: _Adapter, hub: _Hub, form: str, dry_run: bool
+) -> None:
+    _save_collection()
+    _seed_core({"d1": ["c1"]})
+    _write([_src("c1")])
+    fallback = _bind_kb2_to_vendor_target(hub, form)
+    assert _store().open_embeddings_table(VENDOR_TARGET)[1] == fallback
+    before = _versions()
+    args = ["--model", VENDOR_TARGET, "--collection", "kb"]
+
+    code = mod.main(args + (["--dry-run"] if dry_run else []))
+
+    assert _store().open_embeddings_table(VENDOR_TARGET)[1] == fallback
+    assert (_versions(), adapter.calls) == (before, [])
+    assert code == 2
+
+
+@pytest.mark.parametrize("case", ["kb2-has-no-rows", "writer-table-exists"])
+def test_a_collection_bound_to_the_target_that_nothing_would_hide_lets_the_run_start(
+    adapter: _Adapter, hub: _Hub, case: str
+) -> None:
+    _save_collection()
+    _seed_core({"d1": ["c1"]})
+    _write([_src("c1")])
+    if case == "kb2-has-no-rows":
+        hub.models[VENDOR_TARGET] = _config(VENDOR_TARGET)
+        _save_collection("kb2", model_id=VENDOR_TARGET)
+    else:
+        _bind_kb2_to_vendor_target(hub, "once-tagged")
+        _write([_src("x2", "e1")], model=VENDOR_TARGET, collection="kb2")
+
+    assert mod.main(["--model", VENDOR_TARGET, "--collection", "kb"]) == 0
+    written = _rows(scope.source_table(VENDOR_TARGET))
+    assert [row["chunk_id"] for row in written if row["collection"] == "kb"] == ["c1"]
 
 
 def test_a_collection_name_the_write_path_would_strip_is_refused(
@@ -1232,6 +1288,7 @@ def test_help_states_what_is_written_and_what_the_exit_codes_mean(
         "Five failed documents in a row in one collection abort the run",
         "0 does not mean every collection was warmed up",
         "2 the run never started",
+        "creating it would hide the rows of a collection already bound",
         "writes nothing to LanceDB",
         "not retried",
     ):

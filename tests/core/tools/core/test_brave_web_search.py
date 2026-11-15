@@ -436,3 +436,112 @@ async def test_brave_redaction_failure_sends_nothing(transport, monkeypatch, aud
         await BraveWebSearchCore(api_key=API_KEY).search(PII_QUERY)
     assert requests == []
     assert audit[-1].failure_kind == "redaction_error"
+
+
+# --- Metering: one usage row per request Brave answered with 2xx ---------------
+
+
+def _usage_rows(manager) -> list[dict[str, Any]]:
+    return list(manager.get_usage().details)
+
+
+@pytest.mark.parametrize("endpoint", ["web", "llm_context"])
+@pytest.mark.asyncio
+async def test_a_brave_answer_records_one_platform_row(
+    transport, monkeypatch, endpoint
+):
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", endpoint)
+    transport(
+        lambda r: httpx.Response(200, json=WEB_BODY if endpoint == "web" else CTX_BODY)
+    )
+    with TokenContextManager() as manager:
+        await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+        rows = _usage_rows(manager)
+
+    assert len(rows) == 1
+    assert rows[0]["call_type"] == "web_search"
+    assert rows[0]["unit"] == "requests"
+    assert rows[0]["quantity"] == 1.0
+    assert rows[0]["model_id"] == "platform/web-search-brave"
+
+
+@pytest.mark.parametrize("endpoint", ["web", "llm_context"])
+@pytest.mark.parametrize("status", [401, 403, 429, 500])
+@pytest.mark.asyncio
+async def test_a_failed_brave_request_records_nothing(
+    transport, monkeypatch, endpoint, status
+):
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", endpoint)
+    transport(lambda r: httpx.Response(status, json={}))
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError):
+            await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+        assert _usage_rows(manager) == []
+
+
+@pytest.mark.asyncio
+async def test_a_brave_network_error_records_nothing(transport):
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down", request=request)
+
+    transport(boom)
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError):
+            await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+        assert _usage_rows(manager) == []
+
+
+@pytest.mark.asyncio
+async def test_refused_before_sending_records_nothing(transport, monkeypatch):
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    requests = transport(lambda r: httpx.Response(200, json=WEB_BODY))
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError):
+            await BraveWebSearchCore(api_key="").search(QUERY)
+        with pytest.raises(ValueError):
+            await BraveWebSearchCore(api_key=API_KEY).search("w " * 80)
+        assert _usage_rows(manager) == []
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_2xx_with_an_unreadable_body_is_still_recorded(transport):
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    transport(lambda r: httpx.Response(200, content=b"not json"))
+    with TokenContextManager() as manager:
+        with pytest.raises(ValueError):
+            await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+        assert len(_usage_rows(manager)) == 1
+
+
+@pytest.mark.asyncio
+async def test_recorded_before_result_pages_are_fetched(transport, monkeypatch):
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    transport(lambda r: httpx.Response(200, json=WEB_BODY))
+
+    class FailingFetcher:
+        def __init__(self, proxy_url=None):
+            pass
+
+        async def fetch_text(self, url: str) -> str:
+            raise RuntimeError("page fetch failed")
+
+    monkeypatch.setattr(mod, "WebContentFetcher", FailingFetcher)
+    with TokenContextManager() as manager:
+        try:
+            await BraveWebSearchCore(api_key=API_KEY).search(
+                QUERY, include_content=True
+            )
+        except Exception:
+            pass
+        assert len(_usage_rows(manager)) == 1

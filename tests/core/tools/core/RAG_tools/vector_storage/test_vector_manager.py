@@ -324,6 +324,7 @@ def _freeze_from_another_connection() -> None:
 
 
 _SWITCH_IN_ANOTHER_PROCESS = """
+import os
 import sys
 
 from xagent.core.tools.core.RAG_tools.management import collection_manager
@@ -337,6 +338,8 @@ if sys.argv[1] == "switch":
         "kb", "m-new", 3, expected_model_id="m-old"
     )
     ms.clear_migration_state("kb")
+# The writes are committed; a crash in interpreter teardown must not fail the test.
+os._exit(0)
 """
 
 
@@ -526,13 +529,15 @@ class TestWriteAfterMigration:
         _bound_collection_with_a_chunk()
         # Warms this process's cached connection before the other process writes.
         assert _write_batch().upsert_count == 1
-        subprocess.run(
-            [sys.executable, "-c", _SWITCH_IN_ANOTHER_PROCESS, change],
+        child = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", _SWITCH_IN_ANOTHER_PROCESS]
+            + [change],
             env=env,
-            check=True,
             capture_output=True,
             timeout=120,
         )
+        # A crash prints its stack through faulthandler; show it instead of the command.
+        assert child.returncode == 0, child.stderr.decode(errors="replace")[-4000:]
 
         with pytest.raises(
             CollectionMigratingError, match="frozen" if change == "freeze" else "m-new"

@@ -126,10 +126,12 @@ def switch_collection_embedding_model(
         expected_updated_at=stored.updated_at,
     )
     if not applied:
-        current_model_id = _normalize_model_id(
-            get_collection_sync(collection_name).embedding_model_id
-        )
-        if current_model_id != canonical_model_id:
+        current = get_collection_sync(collection_name)
+        # Both fields: a row bound to the target without a dimension is not switched.
+        if (
+            _normalize_model_id(current.embedding_model_id) != canonical_model_id
+            or current.embedding_dimension != dimension
+        ):
             raise ValueError(
                 f"Collection '{collection_name}' changed while switching; retry "
                 "the switch."

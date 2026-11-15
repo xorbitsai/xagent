@@ -298,6 +298,38 @@ def test_switch_raises_when_the_binding_moves_under_it(
     assert _binding() == (OLD_MODEL, OLD_DIM)
 
 
+def test_a_touched_partial_binding_is_not_reported_as_switched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        cm.collection_manager.save_collection(
+            CollectionInfo(name="kb", embedding_model_id=NEW_MODEL)
+        )
+    )
+    window = _freeze()
+    _bind_models(monkeypatch)
+    real_get = es.get_collection_sync
+    reads: list[str] = []
+
+    def _touch_after_the_first_read(name: str) -> CollectionInfo:
+        row = real_get(name)
+        if not reads:
+            cm.mark_collection_accessed_sync(name)
+        reads.append(name)
+        return row
+
+    monkeypatch.setattr(es, "get_collection_sync", _touch_after_the_first_read)
+
+    with pytest.raises(ValueError, match="changed while switching"):
+        switch_collection_embedding_model(window, NEW_MODEL)
+    assert _binding() == (NEW_MODEL, None)
+
+    result = switch_collection_embedding_model(window, NEW_MODEL)
+
+    assert result.target_dimension == NEW_DIM
+    assert _binding() == (NEW_MODEL, NEW_DIM)
+
+
 def test_switch_refuses_a_collection_unfrozen_while_switching(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

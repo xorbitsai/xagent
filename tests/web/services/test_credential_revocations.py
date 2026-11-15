@@ -8,6 +8,7 @@ through each outcome, with only provider HTTP faked.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -946,3 +947,151 @@ async def test_a_recreated_server_reusing_local_ids_is_not_mistaken_for_a_succes
 
     assert (await _run(factory)).outcomes == {"revoked": 1}
     assert [call["client_id"] for call in rfc7009.calls] == ["mcp-client"] * 2
+
+
+# --- the guarded executor: a bounded provider call inside its fence ---------
+
+
+def _mcp_fence(factory):
+    from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
+    from xagent.web.services.oauth_revocation_fences import MCP_OAUTH_FENCE_PROVIDER
+
+    with factory() as db:
+        return (
+            db.query(OAuthRevocationFence)
+            .filter_by(provider=MCP_OAUTH_FENCE_PROVIDER)
+            .one()
+        )
+
+
+def _refuses_a_reconnect_starting_now(factory) -> bool:
+    from xagent.web.services.oauth_revocation_fences import (
+        oauth_revocation_fence_refuses,
+    )
+
+    return oauth_revocation_fence_refuses(
+        _mcp_fence(factory), exchange_started_at=datetime.now(timezone.utc)
+    )
+
+
+def _delete_one_mcp_grant(factory) -> None:
+    with factory() as db:
+        _, _, grant = _mcp(db, _user(db))
+        db.delete(grant)
+        db.commit()
+
+
+def _slow_endpoint(monkeypatch, delay: float) -> list[str]:
+    """An endpoint reached only after ``delay`` seconds of DNS resolution and
+    address failover; returns the tokens whose request was actually sent."""
+    sent: list[str] = []
+    real_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(delay)
+        sent.append(httpx.QueryParams(request.content.decode())["token"])
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **_: real_client(transport=httpx.MockTransport(handler)),
+    )
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_a_slow_resolution_never_sends_a_request_after_its_bound(
+    factory, monkeypatch
+):
+    """The whole provider operation -- resolution and failover included -- is
+    bounded well inside the fence, so a slow one is abandoned before it sends
+    anything; its fence is left to refuse reconnects until it lapses, since
+    the abandoned operation's outcome is unknown."""
+    from xagent.web.services import oauth_revocation_fences
+
+    monkeypatch.setattr(
+        oauth_revocation_fences, "OAUTH_REVOCATION_CALL_TIMEOUT", timedelta(seconds=0.2)
+    )
+    sent = _slow_endpoint(monkeypatch, delay=1.0)
+    _delete_one_mcp_grant(factory)
+
+    assert (await _run(factory)).outcomes == {"pending": 1}
+    await asyncio.sleep(1.2)  # long enough for any late request to land
+
+    assert sent == []
+    [record] = _records(factory)
+    assert "did not finish within" in record.last_error
+    assert _refuses_a_reconnect_starting_now(factory)
+
+
+@pytest.mark.asyncio
+async def test_no_request_starts_after_the_fence_deadline(factory, monkeypatch):
+    """The first token's request takes the operation past the fence deadline:
+    the second request is not started, because a revoke reaching the provider
+    after the fence lapsed could end a reconnect the fence no longer refuses."""
+    from xagent.web.services import oauth_revocation_fences
+
+    monkeypatch.setattr(
+        oauth_revocation_fences,
+        "OAUTH_REVOCATION_FENCE_WINDOW",
+        timedelta(seconds=1.5),
+    )
+    monkeypatch.setattr(
+        oauth_revocation_fences, "OAUTH_REVOCATION_CALL_MARGIN", timedelta(0)
+    )
+    sent = _slow_endpoint(monkeypatch, delay=2.0)
+    _delete_one_mcp_grant(factory)
+
+    assert (await _run(factory)).outcomes == {"pending": 1}
+
+    assert sent == ["mcp-access"]
+    [record] = _records(factory)
+    assert "lapsed before the refresh_token request" in record.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_request_keeps_its_fence_until_the_deadline(
+    factory, monkeypatch
+):
+    """Shutdown cancels the worker while the provider may already have
+    accepted the request. The fence must not be shortened then: a reconnect
+    is refused until the outcome is known or the fence's own deadline."""
+    real_client = httpx.AsyncClient
+    in_request, never = asyncio.Event(), asyncio.Event()
+
+    async def accepted_then_hangs(request: httpx.Request) -> httpx.Response:
+        in_request.set()
+        await never.wait()
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **_: real_client(transport=httpx.MockTransport(accepted_then_hangs)),
+    )
+    _delete_one_mcp_grant(factory)
+
+    task = asyncio.create_task(_run(factory))
+    await asyncio.wait_for(in_request.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    fence = _mcp_fence(factory)
+    assert outbox._aware(fence.revoking_until) > datetime.now(timezone.utc) + timedelta(
+        seconds=60
+    )
+    assert _refuses_a_reconnect_starting_now(factory)
+    [record] = _records(factory)
+    assert (record.status, record.attempts) == ("pending", 1)
+
+
+@pytest.mark.asyncio
+async def test_a_settled_request_closes_its_fence(factory, rfc7009):
+    _delete_one_mcp_grant(factory)
+
+    assert (await _run(factory)).outcomes == {"revoked": 1}
+
+    fence = _mcp_fence(factory)
+    assert outbox._aware(fence.revoking_until) <= datetime.now(timezone.utc)

@@ -2003,106 +2003,140 @@ async def _exchange_mcp_oauth_code(
 
 @dataclass(frozen=True)
 class _MCPOAuthIssuedTokenSnapshot:
+    """Tokens a callback was issued, and the authorization they belong to.
+
+    Read before the callback stores anything, so a callback that then fails
+    (a refused or changed connection, an insufficient scope, a failed
+    commit) can still hand them to the credential revocation outbox: they
+    are persisted nowhere else. ``client`` is the detached OAuth client row.
+    """
+
     flow_id: int
-    revocation_endpoint: str | None
-    client_id: str
-    encrypted_client_secret: str | None
-    token_endpoint_auth_method: str
-    access_token: str
-    refresh_token: str | None
+    client: Any
+    mcp_server_id: int
+    user_id: int
+    mcp_oauth_client_id: int
+    resource_owner_key: str
+    issuer: str
+    resource: str
+    scope: str
+    token_data: dict[str, Any]
+
+    @property
+    def access_token(self) -> str:
+        return str(self.token_data["access_token"])
+
+    @property
+    def refresh_token(self) -> str | None:
+        value = self.token_data.get("refresh_token")
+        return str(value) if value else None
+
+
+@dataclass(frozen=True)
+class _MCPOAuthFlowAuthorization:
+    """The authorization a callback's flow connects, read before the flow is
+    claimed: the claim commit expires the flow row, which a concurrent
+    disconnect may then delete."""
+
+    flow_id: int
+    mcp_server_id: int
+    user_id: int
+    mcp_oauth_client_id: int
+    resource_owner_key: str
+    issuer: str
+    resource: str
+    scope: str
+
+    @classmethod
+    def of(cls, flow_state: MCPOAuthFlowState) -> "_MCPOAuthFlowAuthorization":
+        return cls(
+            flow_id=int(flow_state.id),
+            mcp_server_id=int(flow_state.mcp_server_id),
+            user_id=int(flow_state.user_id),
+            mcp_oauth_client_id=int(flow_state.mcp_oauth_client_id),
+            resource_owner_key=str(flow_state.resource_owner_key),
+            issuer=str(flow_state.issuer),
+            resource=str(flow_state.resource),
+            scope=str(flow_state.scope),
+        )
 
 
 def _mcp_oauth_issued_token_snapshot(
     *,
     client: MCPOAuthClient,
-    flow_id: int,
+    flow: _MCPOAuthFlowAuthorization,
     token_data: dict[str, Any],
 ) -> _MCPOAuthIssuedTokenSnapshot:
-    metadata: dict[str, Any] = (
-        client.metadata_json if isinstance(client.metadata_json, dict) else {}
-    )
-    revocation_endpoint = metadata.get("revocation_endpoint")
-    refresh_token = token_data.get("refresh_token")
     return _MCPOAuthIssuedTokenSnapshot(
-        flow_id=flow_id,
-        revocation_endpoint=(
-            revocation_endpoint
-            if isinstance(revocation_endpoint, str) and revocation_endpoint
-            else None
-        ),
-        client_id=str(client.client_id),
-        encrypted_client_secret=(
-            str(client.client_secret) if client.client_secret else None
-        ),
-        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
-        access_token=str(token_data["access_token"]),
-        refresh_token=str(refresh_token) if refresh_token else None,
+        flow_id=flow.flow_id,
+        client=client,
+        mcp_server_id=flow.mcp_server_id,
+        user_id=flow.user_id,
+        mcp_oauth_client_id=flow.mcp_oauth_client_id,
+        resource_owner_key=flow.resource_owner_key,
+        issuer=flow.issuer,
+        resource=flow.resource,
+        scope=_scope_string(str(token_data.get("scope") or flow.scope)),
+        token_data=dict(token_data),
     )
-
-
-async def _revoke_mcp_oauth_issued_token_externally(
-    snapshot: _MCPOAuthIssuedTokenSnapshot,
-) -> None:
-    """Best-effort revoke a token whose final local persistence failed.
-
-    Not a deletion, so the credential revocation outbox never sees these
-    tokens: they were issued by a callback whose own transaction is rolled
-    back before this runs and were never stored. Each token is tried once
-    through the outbox's RFC 7009 call
-    (``services.credential_revocations.revoke_rfc7009_tokens``); a failure is
-    logged, never raised.
-    """
-    from ..services.credential_revocations import (
-        ProviderRevocationError,
-        revoke_rfc7009_tokens,
-    )
-
-    if snapshot.revocation_endpoint is None:
-        return
-    try:
-        client_secret = (
-            decrypt_value(snapshot.encrypted_client_secret)
-            if snapshot.encrypted_client_secret
-            else ""
-        )
-    except Exception:
-        logger.warning(
-            "Skipping issued MCP OAuth token revocation for flow %s because "
-            "client credentials are unavailable",
-            snapshot.flow_id,
-        )
-        return
-    for token, token_type_hint in (
-        (snapshot.access_token, "access_token"),
-        (snapshot.refresh_token, "refresh_token"),
-    ):
-        if token is None:
-            continue
-        try:
-            await revoke_rfc7009_tokens(
-                revocation_endpoint=snapshot.revocation_endpoint,
-                client_id=snapshot.client_id,
-                client_secret=client_secret,
-                token_endpoint_auth_method=snapshot.token_endpoint_auth_method,
-                tokens=[(token, token_type_hint)],
-            )
-        except (ProviderRevocationError, ValueError) as exc:
-            logger.warning(
-                "Issued MCP OAuth token revocation failed for flow %s: %s",
-                snapshot.flow_id,
-                exc,
-            )
-            if isinstance(exc, ValueError):
-                return
 
 
 async def _rollback_and_revoke_mcp_oauth_issued_token(
     db: Session,
     snapshot: _MCPOAuthIssuedTokenSnapshot,
 ) -> None:
-    """Release database locks before any compensating provider request."""
+    """Hand the tokens of a callback that stored nothing to the outbox.
+
+    Rolls the callback's transaction back, then records the issued pair as a
+    credential revocation receipt of its authorization in a transaction of
+    its own. The outbox worker revokes it exactly like a deleted grant:
+    under the authorization's fence, with the successor check, inside the
+    bounded provider call. This keeps the worker as the only code that calls
+    an MCP revocation endpoint, so no compensation can end a reconnect that
+    has meanwhile committed for the same authorization. A failure to record
+    is logged at error level: the tokens then stay valid at the provider.
+    """
     db.rollback()
-    await _revoke_mcp_oauth_issued_token_externally(snapshot)
+    _enqueue_mcp_oauth_issued_token(db, snapshot)
+
+
+def _enqueue_mcp_oauth_issued_token(
+    db: Session, snapshot: _MCPOAuthIssuedTokenSnapshot
+) -> None:
+    """Record the issued pair as an outbox receipt in its own transaction."""
+    from ..services.credential_revocations import enqueue_mcp_oauth_token_revocation
+
+    try:
+        enqueue_mcp_oauth_token_revocation(
+            db,
+            grant_id=snapshot.flow_id,
+            lookup_hash=mcp_oauth_grant_lookup_hash(
+                snapshot.mcp_server_id,
+                snapshot.user_id,
+                snapshot.resource_owner_key,
+                snapshot.mcp_oauth_client_id,
+                snapshot.issuer,
+                snapshot.resource,
+                snapshot.scope,
+            ),
+            user_id=snapshot.user_id,
+            mcp_server_id=snapshot.mcp_server_id,
+            mcp_oauth_client_id=snapshot.mcp_oauth_client_id,
+            resource_owner_key=snapshot.resource_owner_key,
+            issuer=snapshot.issuer,
+            resource=snapshot.resource,
+            client=snapshot.client,
+            token_data=snapshot.token_data,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            "Enqueueing the tokens issued to failed MCP OAuth flow %s failed; "
+            "they stay valid at the provider (exception_type=%s)",
+            snapshot.flow_id,
+            type(exc).__name__,
+        )
 
 
 def _trusted_mcp_oauth_owner_key(resource_owner_key: str, *, user_id: int) -> str:
@@ -6913,6 +6947,7 @@ async def mcp_oauth_callback(
         )
     code_verifier = decrypt_value(str(flow_state.code_verifier))
     resource = str(flow_state.resource)
+    flow_authorization = _MCPOAuthFlowAuthorization.of(flow_state)
     # The claim commit expires ORM instances. Keep the provider-facing client
     # snapshot detached so a concurrent server deletion cannot make token
     # exchange or compensation reload stale ORM state.
@@ -6966,7 +7001,7 @@ async def mcp_oauth_callback(
         failure_stage = "snapshot_issued_token"
         issued_token = _mcp_oauth_issued_token_snapshot(
             client=client,
-            flow_id=flow_identity.id,
+            flow=flow_authorization,
             token_data=token_data,
         )
         if isinstance(flow_identity, _MCPOAuthTeamFlowIdentity):

@@ -43,12 +43,14 @@ the worker reads it:
 * the issuer: ``user_oauth.oauth_provider`` for a native row (NULL when the
   issuer is unknown -- the worker then fails the record rather than guess),
   the grant's issuer URL for an MCP grant;
-* for a native GitHub row, the GitHub OAuth app's ``client_id`` and
-  ``client_secret`` as ``oauth_providers`` stored them at that moment
-  (ciphertext, or empty when they come from the environment): the worker
-  authenticates the grant delete with this snapshot and never with the live
-  provider configuration, which an administrator may replace or delete
-  while the record is pending;
+* for a native row, the client id of the OAuth app that issued its tokens
+  (``user_oauth.oauth_client_id``, recorded by the callback), and for a
+  GitHub row also the GitHub app's ``client_id`` and ``client_secret`` as
+  ``oauth_providers`` stored them at that moment (ciphertext, or empty when
+  they come from the environment). The worker authenticates a GitHub grant
+  delete only with credentials whose client id is the issuing app's: the
+  snapshot, or the current database or environment configuration if that
+  still names the same app, never another app's;
 * for an MCP grant, its OAuth client's ``client_id``, encrypted
   ``client_secret``, client authentication method and RFC 7009 revocation
   endpoint, plus the grant identity the worker's reference check matches on;
@@ -202,6 +204,10 @@ class CredentialRevocation(Base):  # type: ignore[no-any-unimported]
         String(100), nullable=True
     )
     revocation_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Native rows: ``user_oauth.oauth_client_id``, the OAuth app that issued
+    #: the tokens (NULL for rows written before it was recorded). The worker
+    #: authenticates a GitHub grant delete only as this app.
+    issuing_client_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     def __repr__(self) -> str:
         return (
@@ -226,7 +232,7 @@ def _user_oauth_insert(row: str) -> str:
     # redirect the revocation. Google's revoke needs no client.
     return f"""INSERT INTO credential_revocations (
         kind, source_id, user_id, grant_key, issuer, provider_user_id,
-        access_token, refresh_token, client_id, client_secret
+        access_token, refresh_token, client_id, client_secret, issuing_client_id
     )
     SELECT
         '{CredentialRevocationKind.USER_OAUTH.value}', {row}.id, {row}.user_id,
@@ -236,7 +242,7 @@ def _user_oauth_insert(row: str) -> str:
         END,
         {row}.oauth_provider, {row}.provider_user_id,
         {row}.access_token, {row}.refresh_token,
-        provider.client_id, provider.client_secret
+        provider.client_id, provider.client_secret, {row}.oauth_client_id
     FROM (SELECT 1 AS one) AS anchor
     LEFT JOIN oauth_providers AS provider
         ON provider.provider_name = {row}.oauth_provider
@@ -297,7 +303,7 @@ _CLIENTS = MCPOAuthClient.__tablename__
 # changes. Schemas that lack them are partial (test fixtures standing in for
 # xagent's tables) and hold no credential to record.
 _USER_OAUTH_COLUMNS = frozenset(
-    {"id", "user_id", "oauth_provider", "provider_user_id"}
+    {"id", "user_id", "oauth_provider", "oauth_client_id", "provider_user_id"}
     | {"access_token", "refresh_token"}
 )
 _GRANT_COLUMNS = frozenset(

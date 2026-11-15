@@ -14,6 +14,17 @@ deletes the client's grants first: a cascade from the client would
 otherwise run the grant triggers after the client row is gone, and the
 record would lose the client fields its revocation needs.
 
+It adds ``user_oauth.oauth_client_id``, the client id of the OAuth app a
+callback exchanged its code with, which the native trigger copies into the
+receipt so a GitHub revocation authenticates only as the issuing app. There
+is no backfill: nothing recorded which app issued an existing row's tokens,
+so existing rows stay NULL until they are reconnected. The worker revokes a
+NULL row with the GitHub app configuration captured when it was deleted, as
+before this column existed -- if the app was replaced between the token's
+issue and its deletion, GitHub answers 404 and the record settles as gone
+although the original grant may live on. That residual risk is limited to
+rows connected before this revision.
+
 It also seeds a receipt for every grant already marked ``revoked`` that still
 holds a token: before this revision a revoked grant's provider revocation was
 a best-effort call that may have failed, and nothing would retry it after
@@ -43,7 +54,7 @@ TABLE = "credential_revocations"
 
 _USER_OAUTH_INSERT = """INSERT INTO credential_revocations (
         kind, source_id, user_id, grant_key, issuer, provider_user_id,
-        access_token, refresh_token, client_id, client_secret
+        access_token, refresh_token, client_id, client_secret, issuing_client_id
     )
     SELECT
         'user_oauth', {row}.id, {row}.user_id,
@@ -53,7 +64,7 @@ _USER_OAUTH_INSERT = """INSERT INTO credential_revocations (
         END,
         {row}.oauth_provider, {row}.provider_user_id,
         {row}.access_token, {row}.refresh_token,
-        provider.client_id, provider.client_secret
+        provider.client_id, provider.client_secret, {row}.oauth_client_id
     FROM (SELECT 1 AS one) AS anchor
     LEFT JOIN oauth_providers AS provider
         ON provider.provider_name = {row}.oauth_provider
@@ -130,7 +141,7 @@ BEGIN
 # required: a user_oauth that predates it holds no Composio row, so every row
 # is native and the Composio exclusion is left out.
 _USER_OAUTH_COLUMNS = frozenset(
-    {"id", "user_id", "oauth_provider", "provider_user_id"}
+    {"id", "user_id", "oauth_provider", "oauth_client_id", "provider_user_id"}
     | {"access_token", "refresh_token"}
 )
 _GRANT_COLUMNS = frozenset(
@@ -361,6 +372,7 @@ def upgrade() -> None:
             sa.Column("client_secret", sa.Text(), nullable=True),
             sa.Column("token_endpoint_auth_method", sa.String(100), nullable=True),
             sa.Column("revocation_endpoint", sa.Text(), nullable=True),
+            sa.Column("issuing_client_id", sa.String(500), nullable=True),
             sqlite_autoincrement=True,
         )
         op.create_index(
@@ -371,6 +383,13 @@ def upgrade() -> None:
         op.create_index("ix_credential_revocations_grant_key", TABLE, ["grant_key"])
     inspector = sa.inspect(bind)
     present = set(inspector.get_table_names())
+    if _USER_OAUTH in present and "oauth_client_id" not in {
+        column["name"] for column in inspector.get_columns(_USER_OAUTH)
+    }:
+        op.add_column(
+            _USER_OAUTH, sa.Column("oauth_client_id", sa.String(500), nullable=True)
+        )
+        inspector = sa.inspect(bind)
     columns = {
         table: {column["name"] for column in inspector.get_columns(table)}
         for table in {_USER_OAUTH, _GRANTS, _CLIENTS, _PROVIDERS, _OUTBOX} & present
@@ -409,3 +428,9 @@ def downgrade() -> None:
         for function in _FUNCTIONS:
             op.execute(f"DROP FUNCTION IF EXISTS {function}()")
     op.drop_table(TABLE)
+    inspector = sa.inspect(op.get_bind())
+    if inspector.has_table(_USER_OAUTH) and "oauth_client_id" in {
+        column["name"] for column in inspector.get_columns(_USER_OAUTH)
+    }:
+        with op.batch_alter_table(_USER_OAUTH) as batch:
+            batch.drop_column("oauth_client_id")

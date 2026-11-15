@@ -5971,6 +5971,10 @@ def generic_oauth_callback(
             # write, new or revived row alike, so a later revocation never
             # has to infer it from the mutable catalog.
             setattr(oauth_account, "oauth_provider", provider)
+            # And the OAuth app (its client id) the code was exchanged with:
+            # the app a later grant revocation must authenticate as. The
+            # provider's configuration may name another app by then.
+            setattr(oauth_account, "oauth_client_id", client_id)
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))

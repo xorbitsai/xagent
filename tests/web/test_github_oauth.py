@@ -1368,6 +1368,7 @@ def _revoke_deleted(
     oauth_provider: str = "github",
     access_token: str = "tok",
     provider_user_id: str | None = "42",
+    oauth_client_id: str | None = None,
     after_delete=None,
 ) -> CredentialRevocation:
     """Delete one connected row of a user of its own, run ``after_delete``
@@ -1382,6 +1383,7 @@ def _revoke_deleted(
         oauth_provider=oauth_provider,
         provider_user_id=provider_user_id,
         access_token=access_token,
+        oauth_client_id=oauth_client_id,
     )
     db.add(row)
     db.commit()
@@ -1742,3 +1744,120 @@ def test_builtin_oauth_revocation_repr_redacts_the_secrets():
     assert "the-live-client-secret" not in text
     assert "github-client-id" in text  # not itself sensitive; keep it visible
     assert "42" in text
+
+
+def _environment_backed_github_app(db, monkeypatch, client_id: str) -> None:
+    _add_github_provider_row(db)
+    provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+    provider.client_id = ""
+    provider.client_secret = ""
+    db.commit()
+    monkeypatch.setenv("GITHUB_CLIENT_ID", client_id)
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", f"{client_id}-secret")
+
+
+def test_a_receipt_enqueued_under_one_app_never_drains_as_another(
+    db_session, monkeypatch
+):
+    """App A (environment-backed) issued and lost the credential; the worker
+    restarts configured for app B before the record drains. Deleting the
+    grant as B would get a 404 that reads as "already gone" while A's grant
+    lives on, so the record fails instead and GitHub is never called."""
+    db, _user = db_session
+    _environment_backed_github_app(db, monkeypatch, "app-a")
+    delete = Mock(return_value=MockResponse(status_code=404))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    record = _revoke_deleted(
+        db,
+        oauth_client_id="app-a",
+        after_delete=lambda: monkeypatch.setenv("GITHUB_CLIENT_ID", "app-b"),
+    )
+
+    delete.assert_not_called()
+    assert record.status == "failed"
+    assert "not the app that issued" in record.last_error
+
+
+def test_the_issuing_app_is_used_while_it_is_still_configured(db_session, monkeypatch):
+    db, _user = db_session
+    _environment_backed_github_app(db, monkeypatch, "app-a")
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    record = _revoke_deleted(db, oauth_client_id="app-a")
+
+    assert delete.call_args.kwargs["auth"] == ("app-a", "app-a-secret")
+    assert record.status == "revoked"
+
+
+def test_the_current_configuration_is_used_when_it_names_the_issuing_app(
+    db_session, monkeypatch
+):
+    """The app was switched away and back between the token's issue and its
+    deletion: the configuration captured at deletion names another app, but
+    the current one is the issuing app again, so it is used."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+    provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+    provider.client_id = encrypt_value("app-b")
+    provider.client_secret = encrypt_value("app-b-secret")
+    db.commit()
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    def switch_back_to_the_issuing_app() -> None:
+        provider.client_id = encrypt_value("github-client-id")
+        provider.client_secret = encrypt_value("github-client-secret")
+        db.commit()
+
+    record = _revoke_deleted(
+        db,
+        oauth_client_id="github-client-id",
+        after_delete=switch_back_to_the_issuing_app,
+    )
+
+    assert delete.call_args.kwargs["auth"] == (
+        "github-client-id",
+        "github-client-secret",
+    )
+    assert record.status == "revoked"
+
+
+def test_the_callback_records_the_app_that_issued_the_tokens(db_session, monkeypatch):
+    """The native callback stores the client id it exchanged the code with."""
+    db, user = db_session
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "issued", "token_type": "bearer", "scope": "repo"}
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"id": 42, "login": "octocat"})),
+    )
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": int(user.id),
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+
+    response = generic_oauth_callback(
+        "github",
+        SimpleNamespace(query_params={"code": "code", "state": state}),
+        db,
+        _github_provider(),
+    )
+
+    assert response.status_code == 200
+    row = db.query(UserOAuth).filter_by(provider="github").one()
+    assert row.oauth_client_id == "github-client-id"

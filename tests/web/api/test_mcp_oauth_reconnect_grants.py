@@ -84,12 +84,10 @@ def provider(monkeypatch, engine):
     credential revocation outbox record (``records()``, oldest first)."""
     issued: list = []
 
-    async def record_issued(snapshot):
+    def record_issued(_db, snapshot):
         issued.append(snapshot)
 
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_issued
-    )
+    monkeypatch.setattr(mcp_api, "_enqueue_mcp_oauth_issued_token", record_issued)
 
     def records() -> list[CredentialRevocation]:
         with sessionmaker(bind=engine)() as db:
@@ -694,13 +692,13 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     refreshed_tokens: list[str] = []
     authorization = {"alive": True, "revoked": []}
 
-    async def revoke_the_whole_authorization(snapshot):
+    def revoke_the_whole_authorization(_db, snapshot):
         authorization["revoked"].append(snapshot.refresh_token)
         authorization["alive"] = False
 
     monkeypatch.setattr(
         mcp_api,
-        "_revoke_mcp_oauth_issued_token_externally",
+        "_enqueue_mcp_oauth_issued_token",
         revoke_the_whole_authorization,
     )
 

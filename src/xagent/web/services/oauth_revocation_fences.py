@@ -57,6 +57,11 @@ OAUTH_REVOCATION_FENCE_WINDOW = timedelta(minutes=2)
 # The provider call must start at least this long before the fence lapses,
 # covering its own timeouts; a revoker delayed past that skips the call.
 OAUTH_REVOCATION_CALL_MARGIN = timedelta(minutes=1)
+# The bound on a whole provider operation started inside a fence (DNS
+# resolution, address failover and every request). Shorter than the call
+# margin, so an operation that starts while it may has ended before the fence
+# lapses.
+OAUTH_REVOCATION_CALL_TIMEOUT = timedelta(seconds=45)
 # A closed fence keeps refusing callbacks for this long past the end of the
 # provider call: a callback host whose clock runs ahead of the revoker's
 # would otherwise record an exchange start after the close although its

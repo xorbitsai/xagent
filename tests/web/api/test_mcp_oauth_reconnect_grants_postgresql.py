@@ -81,13 +81,11 @@ def provider(monkeypatch):
             "scope": NARROW,
         }
 
-    async def no_revocation(_snapshot):
+    def no_revocation(_db, _snapshot):
         return None
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange_code)
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_issued_token_externally", no_revocation
-    )
+    monkeypatch.setattr(mcp_api, "_enqueue_mcp_oauth_issued_token", no_revocation)
 
 
 def _seed(factory, *, earlier_expired: bool = False) -> dict[str, int]:

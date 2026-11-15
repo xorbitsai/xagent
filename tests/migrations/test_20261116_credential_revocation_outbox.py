@@ -337,6 +337,14 @@ def _assert_legacy_shape(
     with engine.connect() as connection:
         _legacy_schema(connection, user_oauth)
         if path == "create_all":
+            if user_oauth == _LEGACY_USER_OAUTH:
+                # Startup migrates before create_all, so an old table reaches
+                # it with the column this revision adds.
+                connection.execute(
+                    sa.text(
+                        "ALTER TABLE user_oauth ADD COLUMN oauth_client_id VARCHAR(500)"
+                    )
+                )
             CredentialRevocation.__table__.create(connection)
             install_missing_credential_revocation_triggers(connection)
         else:

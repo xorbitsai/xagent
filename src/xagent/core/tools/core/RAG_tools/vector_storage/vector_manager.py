@@ -84,6 +84,8 @@ def write_vectors_to_db(
     embeddings: List[ChunkEmbeddingData],
     create_index: bool = True,
     user_id: Optional[int] = None,
+    *,
+    verify_bound: bool = True,
 ) -> EmbeddingWriteResponse:
     """Write embedding vectors to database with idempotency through the facade.
 
@@ -92,16 +94,65 @@ def write_vectors_to_db(
     (including the create_index build) can raise CommitConflict. The dominant
     cost, embedding computation, already finished before this call, so the lock
     only serializes the cheap write and barely dents throughput.
+
+    With ``verify_bound``, returns only if, after the commit, the migration row is not
+    frozen and the collection either has no metadata row or is bound to the batch model.
     """
     from ..management.collection_manager import _get_collection_thread_lock
 
     with _get_collection_thread_lock(collection):
-        return _get_vector_storage_compatibility_facade().write_vectors_to_db(
+        response = _get_vector_storage_compatibility_facade().write_vectors_to_db(
             collection=collection,
             embeddings=embeddings,
             create_index=create_index,
             user_id=user_id,
         )
+    if verify_bound and embeddings:
+        _refuse_unless_still_bound(collection, embeddings)
+    return response
+
+
+def _refuse_unless_still_bound(
+    collection: str, embeddings: List[ChunkEmbeddingData]
+) -> None:
+    from ..core.exceptions import CollectionMigratingError
+    from ..management.collection_manager import (
+        _normalize_model_id,
+        get_collection_if_present_sync,
+    )
+    from ..management.migration_state import FROZEN, read_migration_state
+
+    written = {_normalize_model_id(item.model) for item in embeddings}
+    error: Optional[Exception] = None
+    read = "migration row"
+    try:
+        # Row before binding: a switch flips the binding before it unfreezes.
+        if read_migration_state(collection).state == FROZEN:
+            reason = "is frozen for an embedding migration"
+        else:
+            read = "binding"
+            info = get_collection_if_present_sync(collection)
+            if info is None:
+                return
+            if {_normalize_model_id(info.embedding_model_id)} == written:
+                return
+            reason = f"is now bound to '{info.embedding_model_id}'"
+    except Exception as exc:  # noqa: BLE001 - unreadable proves nothing either way
+        error = exc
+        reason = f"could not be checked ({read} read: {type(exc).__name__})"
+        logger.warning(
+            "Write guard on collection %s: %s read failed",
+            collection,
+            read,
+            exc_info=True,
+        )
+    raise CollectionMigratingError(
+        f"Collection '{collection}' {reason}; this write is refused, retry it.",
+        details={
+            "collection": collection,
+            "written_models": sorted({item.model for item in embeddings}),
+        },
+    ) from error
 
 
 def commit_vectors_to_db(

@@ -877,6 +877,39 @@ def test_process_document_fails_without_success_when_the_commit_fails(
     ]
 
 
+def test_a_write_that_hits_a_switch_stops_the_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    def _switched_batch(**_kwargs: object) -> None:
+        raise CollectionMigratingError(
+            "Collection 'demo' is frozen for an embedding migration"
+        )
+
+    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _switched_batch)
+    manager = ProgressManager()
+    manager._active_tasks.clear()
+
+    with pytest.raises(CollectionMigratingError):
+        document_ingestion.process_document(
+            collection="demo",
+            source_path="/tmp/doc.pdf",
+            config=IngestionConfig(),
+            progress_manager=manager,
+        )
+
+    # Raised for the job to defer on, and the attempt's status is still final.
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.FAILED.value
+    task = manager.get_task_progress("ingest_demo__tmp_doc_pdf")
+    assert task is not None
+    assert task.status == DocumentProcessingStatus.FAILED
+
+
 def test_process_document_commit_failure_keeps_completed_steps_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

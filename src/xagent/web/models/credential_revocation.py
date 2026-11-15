@@ -86,6 +86,7 @@ installed only once every table its body touches exists.
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -289,18 +290,52 @@ _USER_OAUTH = UserOAuth.__tablename__
 _GRANTS = MCPOAuthGrant.__tablename__
 _CLIENTS = MCPOAuthClient.__tablename__
 
+# The columns each trigger body reads, by table. A trigger is installed only
+# when every one of them exists: PostgreSQL rejects a trigger naming a missing
+# column outright, and SQLite re-validates every trigger on each ALTER TABLE,
+# so one naming a missing table or column would break unrelated schema
+# changes. Schemas that lack them are partial (test fixtures standing in for
+# xagent's tables) and hold no credential to record.
+_USER_OAUTH_COLUMNS = frozenset(
+    {"id", "user_id", "oauth_provider", "provider_user_id"}
+    | {"access_token", "refresh_token"}
+)
+_GRANT_COLUMNS = frozenset(
+    {"id", "user_id", "lookup_hash", "issuer", "status", "resource"}
+    | {"access_token", "refresh_token", "mcp_server_id", "mcp_oauth_client_id"}
+    | {"resource_owner_key"}
+)
+_CLIENT_COLUMNS = frozenset(
+    {"id", "client_id", "client_secret", "token_endpoint_auth_method", "metadata"}
+)
+_NATIVE_REQUIRES = {
+    _USER_OAUTH: _USER_OAUTH_COLUMNS,
+    _OUTBOX: frozenset(),
+    _PROVIDERS: frozenset({"provider_name", "client_id", "client_secret"}),
+}
+_GRANT_REQUIRES = {
+    _GRANTS: _GRANT_COLUMNS,
+    _CLIENTS: _CLIENT_COLUMNS,
+    _OUTBOX: frozenset(),
+}
+
 
 @dataclass(frozen=True)
 class _Trigger:
-    """One trigger: the table it is on, every table its body touches (it is
-    installed only when they all exist: SQLite re-validates every trigger on
-    each ``ALTER TABLE``, so a trigger naming a missing table would break
-    unrelated schema changes), and its creating statements per dialect."""
+    """One trigger: the table it is on, the columns its body reads by table,
+    and its creating statements for a dialect.
+
+    ``ddl(dialect, composio_aware)`` builds the statements. ``composio_aware``
+    says ``user_oauth`` has ``token_type``: only then can it hold a
+    Composio-backed row, which the native triggers must leave out. An older
+    ``user_oauth`` without the column holds native rows only, and a trigger
+    naming the missing column would not even be created.
+    """
 
     name: str
     table: str
-    requires: frozenset[str]
-    ddl: dict[str, tuple[str, ...]]
+    requires: dict[str, frozenset[str]]
+    ddl: Callable[[str, bool], tuple[str, ...]]
 
 
 def _pg_function(name: str, body: str, returns: str = "NULL") -> str:
@@ -312,6 +347,10 @@ END
 $$"""
 
 
+_PG_USER_OAUTH_FUNCTION = _pg_function(
+    "capture_user_oauth_revocation",
+    f"BEGIN\n    {_user_oauth_insert('OLD')};",
+)
 _PG_GRANT_FUNCTION = _pg_function(
     "capture_mcp_oauth_grant_revocation",
     f"""DECLARE
@@ -325,140 +364,159 @@ BEGIN
     {_mcp_grant_insert("grant_row", _PG_REVOCATION_ENDPOINT)};""",
 )
 
+
+def _when(dialect: str, *conditions: str | None) -> str:
+    """A trigger's WHEN clause from its non-empty conditions, or nothing."""
+    present = [f"({condition})" for condition in conditions if condition]
+    if not present:
+        return ""
+    joined = " AND ".join(present)
+    return f"\nWHEN ({joined})" if dialect == "postgresql" else f"\nWHEN {joined}"
+
+
+def _native_row(composio_aware: bool) -> str | None:
+    return _NATIVE_ROW if composio_aware else None
+
+
+def _user_oauth_delete_ddl(dialect: str, composio_aware: bool) -> tuple[str, ...]:
+    head = "CREATE TRIGGER capture_user_oauth_revocation\nAFTER DELETE ON user_oauth"
+    when = _when(dialect, _native_row(composio_aware))
+    if dialect == "postgresql":
+        return (
+            _PG_USER_OAUTH_FUNCTION,
+            f"{head} FOR EACH ROW{when}\n"
+            "EXECUTE FUNCTION capture_user_oauth_revocation()",
+        )
+    return (f"{head} FOR EACH ROW{when}\nBEGIN\n    {_user_oauth_insert('OLD')};\nEND",)
+
+
+def _user_oauth_drop_ddl(dialect: str, composio_aware: bool) -> tuple[str, ...]:
+    # The function above reads only OLD, so it records the dropped
+    # credential for an UPDATE exactly as for a DELETE.
+    head = (
+        "CREATE TRIGGER capture_user_oauth_token_drop\n"
+        "AFTER UPDATE OF access_token, refresh_token ON user_oauth"
+    )
+    when = _when(dialect, _native_row(composio_aware), _TOKEN_DROPPED)
+    if dialect == "postgresql":
+        return (
+            _PG_USER_OAUTH_FUNCTION,
+            f"{head} FOR EACH ROW{when}\n"
+            "EXECUTE FUNCTION capture_user_oauth_revocation()",
+        )
+    return (f"{head} FOR EACH ROW{when}\nBEGIN\n    {_user_oauth_insert('OLD')};\nEND",)
+
+
+def _grant_ddl(
+    name: str, event_clause: str, condition: str, row: str
+) -> Callable[[str, bool], tuple[str, ...]]:
+    def ddl(dialect: str, _composio_aware: bool) -> tuple[str, ...]:
+        head = f"CREATE TRIGGER {name}\n{event_clause} ON mcp_oauth_grants"
+        when = _when(dialect, condition)
+        if dialect == "postgresql":
+            return (
+                _PG_GRANT_FUNCTION,
+                f"{head} FOR EACH ROW{when}\n"
+                "EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()",
+            )
+        insert = _mcp_grant_insert(row, _SQLITE_REVOCATION_ENDPOINT)
+        return (f"{head} FOR EACH ROW{when}\nBEGIN\n    {insert};\nEND",)
+
+    return ddl
+
+
+def _client_ddl(dialect: str, _composio_aware: bool) -> tuple[str, ...]:
+    head = (
+        "CREATE TRIGGER delete_mcp_oauth_client_grants_first\n"
+        "BEFORE DELETE ON mcp_oauth_clients FOR EACH ROW"
+    )
+    if dialect == "postgresql":
+        return (
+            _pg_function(
+                "delete_mcp_oauth_client_grants_first",
+                f"BEGIN\n    {_DELETE_CLIENT_GRANTS_FIRST};",
+                returns="OLD",
+            ),
+            f"{head}\nEXECUTE FUNCTION delete_mcp_oauth_client_grants_first()",
+        )
+    return (f"{head}\nBEGIN\n    {_DELETE_CLIENT_GRANTS_FIRST};\nEND",)
+
+
 CREDENTIAL_REVOCATION_TRIGGERS: tuple[_Trigger, ...] = (
     _Trigger(
-        name="capture_user_oauth_revocation",
-        table=_USER_OAUTH,
-        requires=frozenset({_USER_OAUTH, _OUTBOX, _PROVIDERS}),
-        ddl={
-            "postgresql": (
-                _pg_function(
-                    "capture_user_oauth_revocation",
-                    f"BEGIN\n    {_user_oauth_insert('OLD')};",
-                ),
-                f"""CREATE TRIGGER capture_user_oauth_revocation
-AFTER DELETE ON user_oauth FOR EACH ROW
-WHEN ({_NATIVE_ROW})
-EXECUTE FUNCTION capture_user_oauth_revocation()""",
-            ),
-            "sqlite": (
-                f"""CREATE TRIGGER capture_user_oauth_revocation
-AFTER DELETE ON user_oauth FOR EACH ROW
-WHEN {_NATIVE_ROW}
-BEGIN
-    {_user_oauth_insert("OLD")};
-END""",
-            ),
-        },
+        "capture_user_oauth_revocation",
+        _USER_OAUTH,
+        _NATIVE_REQUIRES,
+        _user_oauth_delete_ddl,
     ),
     _Trigger(
-        name="capture_user_oauth_token_drop",
-        table=_USER_OAUTH,
-        requires=frozenset({_USER_OAUTH, _OUTBOX, _PROVIDERS}),
-        ddl={
-            # The function above reads only OLD, so it records the dropped
-            # credential for an UPDATE exactly as for a DELETE.
-            "postgresql": (
-                _pg_function(
-                    "capture_user_oauth_revocation",
-                    f"BEGIN\n    {_user_oauth_insert('OLD')};",
-                ),
-                f"""CREATE TRIGGER capture_user_oauth_token_drop
-AFTER UPDATE OF access_token, refresh_token ON user_oauth FOR EACH ROW
-WHEN (({_NATIVE_ROW}) AND ({_TOKEN_DROPPED}))
-EXECUTE FUNCTION capture_user_oauth_revocation()""",
-            ),
-            "sqlite": (
-                f"""CREATE TRIGGER capture_user_oauth_token_drop
-AFTER UPDATE OF access_token, refresh_token ON user_oauth FOR EACH ROW
-WHEN ({_NATIVE_ROW}) AND ({_TOKEN_DROPPED})
-BEGIN
-    {_user_oauth_insert("OLD")};
-END""",
-            ),
-        },
+        "capture_user_oauth_token_drop",
+        _USER_OAUTH,
+        _NATIVE_REQUIRES,
+        _user_oauth_drop_ddl,
     ),
     _Trigger(
-        name="capture_mcp_oauth_grant_revocation_on_delete",
-        table=_GRANTS,
-        requires=frozenset({_GRANTS, _CLIENTS, _OUTBOX}),
-        ddl={
-            "postgresql": (
-                _PG_GRANT_FUNCTION,
-                """CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_delete
-AFTER DELETE ON mcp_oauth_grants FOR EACH ROW
-WHEN (OLD.status <> 'revoked')
-EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()""",
-            ),
-            "sqlite": (
-                f"""CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_delete
-AFTER DELETE ON mcp_oauth_grants FOR EACH ROW
-WHEN OLD.status <> 'revoked'
-BEGIN
-    {_mcp_grant_insert("OLD", _SQLITE_REVOCATION_ENDPOINT)};
-END""",
-            ),
-        },
+        "capture_mcp_oauth_grant_revocation_on_delete",
+        _GRANTS,
+        _GRANT_REQUIRES,
+        _grant_ddl(
+            "capture_mcp_oauth_grant_revocation_on_delete",
+            "AFTER DELETE",
+            "OLD.status <> 'revoked'",
+            "OLD",
+        ),
     ),
     _Trigger(
-        name="capture_mcp_oauth_grant_revocation_on_revoke",
-        table=_GRANTS,
-        requires=frozenset({_GRANTS, _CLIENTS, _OUTBOX}),
-        ddl={
-            "postgresql": (
-                _PG_GRANT_FUNCTION,
-                """CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_revoke
-AFTER UPDATE OF status ON mcp_oauth_grants FOR EACH ROW
-WHEN (NEW.status = 'revoked' AND OLD.status <> 'revoked')
-EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()""",
-            ),
-            "sqlite": (
-                f"""CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_revoke
-AFTER UPDATE OF status ON mcp_oauth_grants FOR EACH ROW
-WHEN NEW.status = 'revoked' AND OLD.status <> 'revoked'
-BEGIN
-    {_mcp_grant_insert("NEW", _SQLITE_REVOCATION_ENDPOINT)};
-END""",
-            ),
-        },
+        "capture_mcp_oauth_grant_revocation_on_revoke",
+        _GRANTS,
+        _GRANT_REQUIRES,
+        _grant_ddl(
+            "capture_mcp_oauth_grant_revocation_on_revoke",
+            "AFTER UPDATE OF status",
+            "NEW.status = 'revoked' AND OLD.status <> 'revoked'",
+            "NEW",
+        ),
     ),
     _Trigger(
-        name="delete_mcp_oauth_client_grants_first",
-        table=_CLIENTS,
-        requires=frozenset({_CLIENTS, _GRANTS}),
-        ddl={
-            "postgresql": (
-                _pg_function(
-                    "delete_mcp_oauth_client_grants_first",
-                    f"BEGIN\n    {_DELETE_CLIENT_GRANTS_FIRST};",
-                    returns="OLD",
-                ),
-                """CREATE TRIGGER delete_mcp_oauth_client_grants_first
-BEFORE DELETE ON mcp_oauth_clients FOR EACH ROW
-EXECUTE FUNCTION delete_mcp_oauth_client_grants_first()""",
-            ),
-            "sqlite": (
-                f"""CREATE TRIGGER delete_mcp_oauth_client_grants_first
-BEFORE DELETE ON mcp_oauth_clients FOR EACH ROW
-BEGIN
-    {_DELETE_CLIENT_GRANTS_FIRST};
-END""",
-            ),
-        },
+        "delete_mcp_oauth_client_grants_first",
+        _CLIENTS,
+        {_CLIENTS: frozenset({"id"}), _GRANTS: frozenset({"mcp_oauth_client_id"})},
+        _client_ddl,
     ),
 )
 
 
 def _existing_triggers(connection: Connection) -> set[str]:
+    """Outbox trigger names on tables of the connection's own schema.
+
+    PostgreSQL trigger names are per table, and another schema of the same
+    database (a test run per schema, a second tenant) may hold triggers with
+    the same names on its own tables, so the lookup is scoped to the
+    current schema. SQLite has one namespace per database file.
+    """
     if connection.dialect.name == "postgresql":
-        query = "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal"
+        query = """SELECT trigger.tgname
+            FROM pg_trigger AS trigger
+            JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+            WHERE NOT trigger.tgisinternal
+                AND namespace.nspname = current_schema()"""
     else:
         query = "SELECT name FROM sqlite_master WHERE type = 'trigger'"
     return set(connection.exec_driver_sql(query).scalars())
 
 
+def _table_columns(connection: Connection, tables: set[str]) -> dict[str, set[str]]:
+    inspector = inspect(connection)
+    present = set(inspector.get_table_names())
+    return {
+        table: {column["name"] for column in inspector.get_columns(table)}
+        for table in tables & present
+    }
+
+
 def install_missing_credential_revocation_triggers(connection: Connection) -> None:
-    """Create every outbox trigger that is missing and whose tables exist.
+    """Create every outbox trigger that is missing and whose columns exist.
 
     Runs after each ``create_all`` (see the listener below): that installs
     the triggers on a fresh database, which is created from the models and
@@ -470,12 +528,24 @@ def install_missing_credential_revocation_triggers(connection: Connection) -> No
     dialect = connection.dialect.name
     if dialect not in ("postgresql", "sqlite"):
         return
-    tables = set(inspect(connection).get_table_names())
+    columns = _table_columns(
+        connection,
+        {
+            table
+            for trigger in CREDENTIAL_REVOCATION_TRIGGERS
+            for table in trigger.requires
+        },
+    )
+    composio_aware = "token_type" in columns.get(_USER_OAUTH, set())
     existing = _existing_triggers(connection)
     for trigger in CREDENTIAL_REVOCATION_TRIGGERS:
-        if trigger.name in existing or not trigger.requires <= tables:
+        installable = all(
+            table in columns and needed <= columns[table]
+            for table, needed in trigger.requires.items()
+        )
+        if trigger.name in existing or not installable:
             continue
-        for statement in trigger.ddl[dialect]:
+        for statement in trigger.ddl(dialect, composio_aware):
             connection.exec_driver_sql(statement)
 
 

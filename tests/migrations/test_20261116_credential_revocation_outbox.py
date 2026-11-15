@@ -273,3 +273,163 @@ def test_sqlite_upgrade_retries_a_grant_revoked_before_it(tmp_path, monkeypatch)
 def test_postgresql_upgrade_retries_a_grant_revoked_before_it(monkeypatch):
     with disposable_database_factory("xagent_credential_revocation_cutover") as make:
         _assert_upgrade_retries_a_revoked_grant(make, monkeypatch)
+
+
+# --- legacy and partial user_oauth shapes -------------------------------------
+
+#: A user_oauth older than ``token_type``: it holds token columns but no
+#: Composio row can exist in it.
+_LEGACY_USER_OAUTH = (
+    "CREATE TABLE user_oauth (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, "
+    "provider VARCHAR(50) NOT NULL, oauth_provider VARCHAR(50), "
+    "provider_user_id VARCHAR, access_token VARCHAR NOT NULL, refresh_token VARCHAR)"
+)
+#: The stand-in some downstream suites create: no token column at all.
+_PARTIAL_USER_OAUTH = (
+    "CREATE TABLE user_oauth (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, "
+    "resource_owner_key VARCHAR(512))"
+)
+
+
+def _legacy_schema(connection: sa.Connection, user_oauth: str) -> None:
+    connection.execute(sa.text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+    connection.execute(sa.text(user_oauth))
+    connection.execute(
+        sa.text(
+            "CREATE TABLE oauth_providers (id INTEGER PRIMARY KEY, "
+            "provider_name VARCHAR(50), client_id VARCHAR, client_secret VARCHAR)"
+        )
+    )
+
+
+def _user_oauth_still_alters_and_deletes(connection: sa.Connection) -> list[str]:
+    """Alter the table (SQLite re-validates every trigger), delete a row, and
+    return the kinds of the records that delete wrote."""
+    connection.execute(sa.text("ALTER TABLE user_oauth ADD COLUMN later VARCHAR"))
+    connection.execute(sa.text("INSERT INTO users (id) VALUES (1)"))
+    columns = {c["name"] for c in sa.inspect(connection).get_columns("user_oauth")}
+    if "access_token" in columns:
+        connection.execute(
+            sa.text(
+                "INSERT INTO user_oauth (id, user_id, provider, oauth_provider, "
+                "provider_user_id, access_token) "
+                "VALUES (1, 1, 'gmail', 'google', 'sub', 'ciphertext')"
+            )
+        )
+    else:
+        connection.execute(
+            sa.text("INSERT INTO user_oauth (id, user_id) VALUES (1, 1)")
+        )
+    connection.execute(sa.text("DELETE FROM user_oauth"))
+    return list(
+        connection.execute(sa.text("SELECT kind FROM credential_revocations")).scalars()
+    )
+
+
+def _assert_legacy_shape(
+    engine: sa.Engine, path: str, user_oauth: str, recorded: list[str]
+) -> None:
+    from xagent.web.models.credential_revocation import (
+        CredentialRevocation,
+        install_missing_credential_revocation_triggers,
+    )
+
+    with engine.connect() as connection:
+        _legacy_schema(connection, user_oauth)
+        if path == "create_all":
+            CredentialRevocation.__table__.create(connection)
+            install_missing_credential_revocation_triggers(connection)
+        else:
+            connection.execute(
+                sa.text("CREATE TABLE alembic_version (version_num VARCHAR(255))")
+            )
+            connection.execute(
+                sa.text("INSERT INTO alembic_version VALUES (:revision)"),
+                {"revision": DOWN_REVISION},
+            )
+        connection.commit()
+        if path == "migration":
+            config = create_alembic_config(engine)
+            config.attributes["connection"] = connection
+            command.upgrade(config, REVISION)
+            connection.commit()
+        assert _user_oauth_still_alters_and_deletes(connection) == recorded
+
+
+_LEGACY_CASES = pytest.mark.parametrize(
+    ("user_oauth", "recorded"),
+    [(_LEGACY_USER_OAUTH, ["user_oauth"]), (_PARTIAL_USER_OAUTH, [])],
+    ids=["without-token-type", "without-token-columns"],
+)
+_PATHS = pytest.mark.parametrize("path", ["create_all", "migration"])
+
+
+@_LEGACY_CASES
+@_PATHS
+def test_sqlite_triggers_fit_older_user_oauth_shapes(
+    tmp_path, path, user_oauth, recorded
+) -> None:
+    """A user_oauth without ``token_type`` gets triggers that treat every row
+    as native; one without token columns gets none. Either way later schema
+    changes and deletes keep working."""
+    _assert_legacy_shape(
+        sa.create_engine(f"sqlite:///{tmp_path / 'legacy.db'}"),
+        path,
+        user_oauth,
+        recorded,
+    )
+
+
+@pytest.mark.postgresql
+@_LEGACY_CASES
+@_PATHS
+def test_postgresql_triggers_fit_older_user_oauth_shapes(
+    path, user_oauth, recorded
+) -> None:
+    with disposable_database_factory("xagent_credential_revocation_legacy") as make:
+        _assert_legacy_shape(make("legacy"), path, user_oauth, recorded)
+
+
+@pytest.mark.postgresql
+def test_postgresql_each_schema_gets_its_own_triggers() -> None:
+    """Trigger names are per table in PostgreSQL. A second schema of the same
+    database must not see the first schema's triggers as its own and skip
+    installing them."""
+    from xagent.web.models.credential_revocation import CREDENTIAL_REVOCATION_TRIGGERS
+
+    with disposable_database_factory("xagent_credential_revocation_schemas") as make:
+        admin = make("schemas")
+        with admin.begin() as connection:
+            connection.execute(sa.text("CREATE SCHEMA first"))
+            connection.execute(sa.text("CREATE SCHEMA second"))
+        installed: dict[str, set[str]] = {}
+        for schema in ("first", "second"):
+            engine = sa.create_engine(
+                admin.url,
+                creator=admin.pool._creator,  # same credentials, own search_path
+            )
+
+            @sa.event.listens_for(engine, "connect")
+            def _search_path(dbapi_connection, _record, schema=schema):  # type: ignore[no-untyped-def]
+                with dbapi_connection.cursor() as cursor:
+                    cursor.execute(f"SET search_path TO {schema}")
+
+            Base.metadata.create_all(engine)
+            with engine.connect() as connection:
+                installed[schema] = set(
+                    connection.execute(
+                        sa.text(
+                            "SELECT trigger.tgname FROM pg_trigger AS trigger "
+                            "JOIN pg_class AS relation "
+                            "ON relation.oid = trigger.tgrelid "
+                            "JOIN pg_namespace AS namespace "
+                            "ON namespace.oid = relation.relnamespace "
+                            "WHERE NOT trigger.tgisinternal "
+                            "AND namespace.nspname = :schema"
+                        ),
+                        {"schema": schema},
+                    ).scalars()
+                )
+            engine.dispose()
+    expected = {trigger.name for trigger in CREDENTIAL_REVOCATION_TRIGGERS}
+    assert installed == {"first": expected, "second": expected}

@@ -72,6 +72,7 @@ CTX_BODY = {
 @pytest.mark.asyncio
 async def test_web_endpoint_request_and_mapping(transport, monkeypatch):
     monkeypatch.delenv("XAGENT_BRAVE_SEARCH_ENDPOINT", raising=False)
+    monkeypatch.delenv("XAGENT_BRAVE_SEARCH_COUNTRY", raising=False)
     requests = transport(lambda r: httpx.Response(200, json=WEB_BODY))
 
     results = await BraveWebSearchCore(api_key=API_KEY).search(QUERY, max_results=50)
@@ -117,6 +118,8 @@ async def test_web_endpoint_include_content_fetches_pages(transport, monkeypatch
 @pytest.mark.asyncio
 async def test_llm_context_endpoint_request_and_mapping(transport, monkeypatch):
     monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", "llm_context")
+    # The exact-body assertion below must not depend on the ambient environment.
+    monkeypatch.delenv("XAGENT_BRAVE_SEARCH_COUNTRY", raising=False)
     requests = transport(lambda r: httpx.Response(200, json=CTX_BODY))
 
     results = await BraveWebSearchCore(api_key=API_KEY).search(

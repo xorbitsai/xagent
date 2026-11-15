@@ -922,11 +922,11 @@ async def delete_connected_account(
         raise HTTPException(status_code=404, detail="Account not found")
 
     from ..services.google_oauth_grants import (
+        GOOGLE_OAUTH_ISSUER,
         GOOGLE_SHARED_OAUTH_PROVIDER,
         detach_google_shared_oauth_legacy_account,
     )
     from .auth import (
-        _builtin_oauth_provider_for_key,
         revoke_builtin_oauth_grants,
         snapshot_builtin_oauth_revocations,
     )
@@ -939,9 +939,13 @@ async def delete_connected_account(
     # snapshotted too; one that survives the detach is still there for the
     # post-commit reference check, which then skips its revoke. Any other
     # provider's account has no shared Google link to detach, so it skips
-    # that extra fence and reference work.
+    # that extra fence and reference work. An account whose issuer is unknown
+    # may still be such a Google account, so it takes the cautious branch:
+    # snapshotting a shared credential that survives costs only a skipped
+    # revoke, while missing one that the detach deletes would leave its
+    # grant alive unnoticed.
     snapshotted = [account]
-    if _builtin_oauth_provider_for_key(db, str(account.provider)) == "google":
+    if account.oauth_provider in (GOOGLE_OAUTH_ISSUER, None):
         snapshotted += (
             scoped_user_oauth_query(
                 db, user_id=cast(int, user.id), resource_owner_key=None

@@ -3773,9 +3773,10 @@ class BuiltinOAuthRevocation(NamedTuple):
     :func:`has_other_builtin_oauth_reference`.
 
     ``provider`` is the OAuth provider that issued the grant (``github`` or
-    ``google``), not the ``UserOAuth.provider`` key the row was stored under:
-    a Google grant is stored under its app id (``gmail``, ``google-drive``,
-    ...) or the bare ``google`` key. ``client_id``/``client_secret``
+    ``google``) -- the row's recorded ``UserOAuth.oauth_provider`` -- not the
+    ``UserOAuth.provider`` key the row was stored under: a Google grant is
+    stored under its app id (``gmail``, ``google-drive``, a custom app id) or
+    the bare ``google`` key. ``client_id``/``client_secret``
     authenticate GitHub's grant-delete call; Google's revoke endpoint is
     unauthenticated, so they are empty for Google. ``refresh_token`` is only
     used for Google, where it is the token revoked whenever it is present:
@@ -3804,46 +3805,10 @@ class BuiltinOAuthRevocation(NamedTuple):
         )
 
 
-def _builtin_oauth_provider_for_key(db: Session, key: str) -> str:
-    """The OAuth provider whose client issued a ``UserOAuth.provider`` key's
-    grant.
-
-    A grant is stored under the connecting app's id (``gmail``) or, for a
-    bare provider login, the provider name itself (``google``, ``github``);
-    the catalog row of an app id names its provider. A key with no catalog
-    row is taken to be a provider name.
-    """
-    from ..models.public_mcp import PublicMCPApp
-
-    provider_name = (
-        db.query(PublicMCPApp.provider_name).filter(PublicMCPApp.app_id == key).scalar()
-    )
-    return str(provider_name or key)
-
-
-def _builtin_oauth_provider_keys(db: Session, provider: str) -> list[str]:
-    """Every ``UserOAuth.provider`` key a grant from ``provider``'s OAuth
-    client may be stored under: the bare provider name plus the id of each
-    catalog app that names it. The inverse of
-    :func:`_builtin_oauth_provider_for_key`.
-    """
-    from ..models.public_mcp import PublicMCPApp
-
-    return [
-        provider,
-        *(
-            str(app_id)
-            for (app_id,) in db.query(PublicMCPApp.app_id).filter(
-                PublicMCPApp.provider_name == provider
-            )
-        ),
-    ]
-
-
 def resolve_builtin_oauth_revocation(
     db: Session,
     *,
-    provider: str,
+    oauth_provider: str | None,
     access_token: str,
     provider_user_id: str | None,
     refresh_token: str | None = None,
@@ -3853,10 +3818,22 @@ def resolve_builtin_oauth_revocation(
     record, decrypting the stored client_id/secret the same way
     generic_oauth_login/generic_oauth_callback already do for this row.
 
-    ``provider`` is the row's ``UserOAuth.provider`` key; the OAuth provider
-    behind it is resolved through the catalog (see
-    :func:`_builtin_oauth_provider_for_key`), so a Gmail or Drive row
-    resolves to a Google revocation. Pass the row's ``refresh_token`` and
+    ``oauth_provider`` is the row's recorded issuer
+    (``UserOAuth.oauth_provider``), so a Gmail, Drive or custom-app row whose
+    tokens Google issued resolves to a Google revocation whatever the catalog
+    says about its app today: an admin may since have deleted the app,
+    retargeted its ``provider_name``, or re-created the same id for another
+    provider, none of which changes who issued the stored tokens. The catalog
+    is never consulted for the issuer.
+
+    ``oauth_provider=None`` on a native row means the issuer is unknown (a
+    row the backfill migration could not prove). That outcome is explicit:
+    a warning is logged and ``None`` is returned, so the row is never
+    revoked against a guessed provider -- failing closed leaves a grant
+    alive rather than sending a token to the wrong issuer. A caller that
+    must tell "issuer unknown" apart from "nothing to revoke" reads the
+    row's ``oauth_provider`` itself before calling. Pass the row's
+    ``refresh_token`` and
     ``token_type`` too: Google revokes through the refresh token, and a
     Composio-backed row (``token_type == COMPOSIO_TOKEN_TYPE``) holds a
     Composio connected-account id rather than a provider token -- its grant
@@ -3870,10 +3847,10 @@ def resolve_builtin_oauth_revocation(
     relies on that grant.
 
     Returns ``None`` when there's nothing to revoke -- a Composio-backed row,
-    a provider with no revoke implementation (only GitHub and Google have
-    one), a Google row without an upstream identity, an empty token, no
-    configured provider row, or a missing secret -- so callers can skip
-    revocation outright. Only reads the
+    an unknown issuer, a provider with no revoke implementation (only GitHub
+    and Google have one), a Google row without an upstream identity, an
+    empty token, no configured provider row, or a missing secret -- so
+    callers can skip revocation outright. Only reads the
     database and makes no network call, so it is safe to call while still
     holding a disconnect transaction's locks; do the actual provider call
     (:func:`revoke_builtin_oauth_grant_if_unreferenced`) only after that
@@ -3881,7 +3858,12 @@ def resolve_builtin_oauth_revocation(
     """
     if token_type == COMPOSIO_TOKEN_TYPE:
         return None
-    oauth_provider = _builtin_oauth_provider_for_key(db, provider)
+    if oauth_provider is None:
+        logger.warning(
+            "Skipping OAuth grant revocation: the connection recorded no "
+            "issuing provider, so it cannot be revoked without guessing"
+        )
+        return None
     if oauth_provider == "google":
         if not (refresh_token or access_token):
             return None
@@ -3961,7 +3943,7 @@ def snapshot_builtin_oauth_revocations(
             continue
         snapshot = resolve_builtin_oauth_revocation(
             db,
-            provider=str(account.provider),
+            oauth_provider=cast(str | None, account.oauth_provider),
             access_token=str(account.access_token),
             # is not None, not a truthy check: an empty-string
             # provider_user_id is still a real (if unlikely) identity value,
@@ -3985,12 +3967,16 @@ def has_other_builtin_oauth_reference(
     db: Session, *, provider: str, provider_user_id: str | None
 ) -> bool:
     """True if any current ``UserOAuth`` row -- any local user, any owner
-    namespace, any key ``provider``'s grants are stored under -- still
-    points at the same upstream (provider, provider_user_id) identity.
+    namespace, any app key -- still points at the same upstream
+    (provider, provider_user_id) identity.
 
     ``provider`` is the OAuth provider (``BuiltinOAuthRevocation.provider``),
-    and every key its grants may be stored under counts
-    (:func:`_builtin_oauth_provider_keys`). GitHub's grant-delete revokes
+    matched against each row's recorded issuer (``UserOAuth.oauth_provider``),
+    never against the catalog: a row stays a reference after an admin
+    deletes or retargets the app it was connected through. A native row
+    whose issuer is unknown (NULL) counts as well, because nothing can prove
+    it was not issued by ``provider``; that keeps a revoke from cutting off a
+    connection the backfill could not classify. GitHub's grant-delete revokes
     every token issued to that GitHub account for this OAuth App, and
     Google's revoke revokes the account's whole grant for this OAuth client,
     not just the one token this disconnect deleted -- a different XAgent
@@ -4050,7 +4036,9 @@ def _builtin_oauth_references(
 ) -> list[UserOAuth]:
     """The live rows :func:`has_other_builtin_oauth_reference` counts, so a
     caller can tell *why* a revoke is blocked: rows recording the same
-    account, and -- for Google only -- rows recording no account at all."""
+    account, and -- for Google only -- rows recording no account at all.
+    Either kind must have been issued by ``provider`` or have an unknown
+    issuer."""
     if not provider_user_id:
         return []
     same_identity = UserOAuth.provider_user_id == provider_user_id
@@ -4062,7 +4050,10 @@ def _builtin_oauth_references(
     candidates = (
         db.query(UserOAuth)
         .filter(
-            UserOAuth.provider.in_(_builtin_oauth_provider_keys(db, provider)),
+            or_(
+                UserOAuth.oauth_provider == provider,
+                UserOAuth.oauth_provider.is_(None),
+            ),
             same_identity,
             or_(
                 UserOAuth.token_type.is_(None),
@@ -4295,7 +4286,7 @@ def revoke_builtin_oauth_grant_if_unreferenced(
 def revoke_builtin_oauth_grant(
     db: Session,
     *,
-    provider: str,
+    oauth_provider: str | None,
     access_token: str,
     provider_user_id: str | None,
     refresh_token: str | None = None,
@@ -4319,7 +4310,7 @@ def revoke_builtin_oauth_grant(
     """
     resolved = resolve_builtin_oauth_revocation(
         db,
-        provider=provider,
+        oauth_provider=oauth_provider,
         access_token=access_token,
         provider_user_id=provider_user_id,
         refresh_token=refresh_token,
@@ -6436,6 +6427,12 @@ def generic_oauth_callback(
                 "provider_user_id",
                 str(provider_user_id) if provider_user_id else None,
             )
+            # The issuer of the tokens written below is the provider whose
+            # route served this callback (an ``OAuthProvider.provider_name``),
+            # whatever app key the row is stored under. Recorded on every
+            # write, new or revived row alike, so a later revocation never
+            # has to infer it from the mutable catalog.
+            setattr(oauth_account, "oauth_provider", provider)
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))

@@ -276,10 +276,10 @@ def _bound_collection_with_a_chunk(model: str | None = "m-old") -> None:
 
 
 def _write_batch(
-    create_index: bool = False, *, verify_bound: bool = True
+    create_index: bool = False, *, verify_bound: bool = True, collection: str = "kb"
 ) -> EmbeddingWriteResponse:
     return write_vectors_to_db(
-        collection="kb",
+        collection=collection,
         embeddings=[
             ChunkEmbeddingData(
                 doc_id="d1",
@@ -470,6 +470,36 @@ class TestWriteAfterMigration:
             for record in caplog.records
             if record.exc_info
         )
+        assert _vectorless_chunks() == 0
+
+    @pytest.mark.parametrize("change", ["freeze", "switch"])
+    def test_a_padded_name_is_checked_as_the_canonical_collection(
+        self, change: str
+    ) -> None:
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            CollectionMigratingError,
+        )
+        from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+            write_collection_binding_sync,
+        )
+        from xagent.core.tools.core.RAG_tools.management.migration_state import (
+            clear_migration_state,
+        )
+
+        _bound_collection_with_a_chunk()
+        _freeze_from_another_connection()
+        if change == "switch":
+            assert write_collection_binding_sync(
+                "kb", "m-new", 3, expected_model_id="m-old"
+            )
+            clear_migration_state("kb")
+
+        with pytest.raises(
+            CollectionMigratingError, match="frozen" if change == "freeze" else "m-new"
+        ) as raised:
+            _write_batch(collection="  kb  ")
+        assert raised.value.details["collection"] == "kb"
+        # The padded write landed in the canonical collection's table.
         assert _vectorless_chunks() == 0
 
     def test_an_unverified_write_ignores_a_frozen_collection(self) -> None:

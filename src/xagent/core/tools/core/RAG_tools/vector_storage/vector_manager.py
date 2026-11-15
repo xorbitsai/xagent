@@ -98,8 +98,11 @@ def write_vectors_to_db(
     With ``verify_bound``, returns only if, after the commit, the migration row is not
     frozen and the collection has no metadata row, no binding, or the batch model bound.
     """
+    from ..kb.coordinator import KBCoordinator
     from ..management.collection_manager import _get_collection_thread_lock
 
+    # The handle writes under this name; the guard must read the same rows.
+    collection = KBCoordinator._normalize_collection(collection)
     with _get_collection_thread_lock(collection):
         response = _get_vector_storage_compatibility_facade().write_vectors_to_db(
             collection=collection,

@@ -595,9 +595,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Report the scope of an embedding migration.\n\n"
-            "Read-only: lists the collections in scope, the model each is bound\n"
-            "to, the chunks searchable under it, and with --model how many of\n"
-            "them the target model still lacks."
+            "Read-only. For each collection in scope it logs the model it is\n"
+            "bound to, its usable documents and its chunks; with --model, also\n"
+            "how many usable chunks the target model does not hold yet.\n\n"
+            "'chunks' counts every source row of the collection, including the\n"
+            "rows listed after 'skipped', which are never counted as missing.\n"
+            "A collection that cannot be counted is logged as skipped with a\n"
+            "reason and does not change the exit code.\n\n"
+            "Exit codes: 0 every collection in scope was read (not: every\n"
+            "collection can be migrated); 1 a collection failed to read, or\n"
+            "nothing is in scope; 2 the run could not start.\n\n"
+            "Not a readiness check: the --model id is not checked against the\n"
+            "configured models or their dimension, and the store is read live\n"
+            "without a lock, so the counts are not a consistent snapshot."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

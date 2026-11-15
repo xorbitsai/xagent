@@ -210,7 +210,7 @@ async def test_country_absent_when_unset(transport, monkeypatch, endpoint, value
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", ["web", "llm_context"])
-@pytest.mark.parametrize("value", ["AUS", "7", "1x", "é9", "au-AU"])
+@pytest.mark.parametrize("value", ["AUS", "7", "1x", "éé", "au-AU"])
 async def test_invalid_country_ignored_with_one_warning(
     transport, monkeypatch, caplog, endpoint, value
 ):

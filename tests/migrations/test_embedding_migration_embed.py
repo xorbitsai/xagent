@@ -1035,6 +1035,23 @@ def test_an_unusable_provider_answer_fails_the_document(
     assert (report.written, _target_ids()) == (0, [])
 
 
+def test_a_bad_metadata_row_in_a_later_batch_fails_before_any_provider_call(
+    adapter: _Adapter,
+) -> None:
+    _save_collection()
+    chunk_ids = [f"c{index:02d}" for index in range(12)]
+    _seed_core({"d1": chunk_ids})
+    _write([_src(chunk_id) for chunk_id in chunk_ids])
+    scope.connection().open_table(scope.source_table(SOURCE)).update(
+        where="chunk_id = 'c11'", values={"metadata": "[1]"}
+    )
+
+    report = _run()
+
+    assert list(report.failures) == ["d1"]
+    assert (adapter.calls, report.written, _target()) == ([], 0, [])
+
+
 def test_metadata_that_is_not_an_object_fails_only_its_document(
     adapter: _Adapter,
 ) -> None:

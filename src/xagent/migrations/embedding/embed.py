@@ -361,6 +361,8 @@ def write_rows(
     assert target.adapter is not None
     by_owner: Dict[int, List[Dict[str, Any]]] = {}
     for row in rows:
+        # Every row is checked before the first provider call, not batch by batch.
+        source_metadata(row["metadata"])
         by_owner.setdefault(int(row["user_id"]), []).append(row)
     for owner, items in by_owner.items():
         for start in range(0, len(items), DEFAULT_EMBEDDING_BATCH_SIZE):

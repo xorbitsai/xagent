@@ -2842,11 +2842,13 @@ async def _start_late_tasks() -> None:
     start_composio_missing_account_task(app)
 
 
-async def _stop_runtime_loops() -> None:
+async def _stop_runtime_loops(*, keep_command_dispatcher: bool = False) -> None:
     """Stop the background loops and dispatchers startup (or activation) started.
 
     Shared by shutdown and by a failed standby activation, which must not leave
-    the claim paths it already started running.
+    the claim paths it already started running. Finish-only mode keeps the
+    command dispatcher (``keep_command_dispatcher``): it applies the commands of
+    tasks this process still owns.
     """
     global \
         _file_storage_startup_sync_task, \
@@ -2862,11 +2864,11 @@ async def _stop_runtime_loops() -> None:
     if temp_file_cleanup_stop is not None:
         temp_file_cleanup_stop.set()
 
-    if _task_command_dispatcher_task is not None:
+    if _task_command_dispatcher_task is not None and not keep_command_dispatcher:
         from .services.task_command_transport import stop_task_command_dispatcher
 
         await stop_task_command_dispatcher()
-    _task_command_dispatcher_task = None
+        _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)
     await stop_composio_reconcile_task(app)
@@ -3260,6 +3262,41 @@ async def retire_writers(
             raise RuntimeError("socket writes did not settle")
         _writers_retired = True
         return True
+
+
+_begin_finishing_lock: asyncio.Lock | None = None
+
+
+async def begin_finishing() -> None:
+    """Let this process only finish the runs it owns; one-way and idempotent.
+
+    Used while two backend generations overlap during a release: the serving
+    generation takes all new work, this one finishes what it started.
+
+    **Stopped:** every claim path for new work -- trigger dispatcher, auto-resume
+    sweeper, lease recovery, chat channels, the maintenance loops and the other
+    loops ``_stop_runtime_loops`` stops -- and every new execution (the release
+    hold is closed for good; ``release_hold.begin_finishing``).
+
+    **Kept:** running executions and their lease heartbeats, the event bridge,
+    socket writes, and the command dispatcher, which claims only commands of
+    tasks whose lease this process holds (controls included, see
+    ``_command_routing_predicate``). A lease is released normally once its run
+    ends, so the next command of that task is claimed by the serving generation.
+
+    ``finishing_status()`` reports when this process is idle. Unlike
+    ``retire_writers`` nothing waits for runs to end. Safe next to it and to
+    shutdown: every step is idempotent. A step that raises leaves the process
+    finishing (the claim restriction is already up); calling again continues.
+    """
+    global _begin_finishing_lock
+    if _begin_finishing_lock is None:
+        _begin_finishing_lock = asyncio.Lock()
+    async with _begin_finishing_lock:
+        # Fence first: from here on no claim takes a task this process does not own.
+        release_hold.begin_finishing()
+        await _stop_runtime_loops(keep_command_dispatcher=True)
+        await _stop_chat_channels(raise_errors=True)
 
 
 def writers_retired() -> bool:

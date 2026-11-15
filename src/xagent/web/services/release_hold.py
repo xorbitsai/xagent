@@ -159,6 +159,10 @@ class ReleaseHold:
         # Refusals since the hold last closed, by entry kind; diagnostics only.
         self._refused: Counter[str] = Counter()
         self._sealed = False
+        # One-way for the life of the process: this generation only finishes
+        # what it owns (``begin_finishing``). The hold is closed with it, and
+        # ``reopen`` refuses to lift it.
+        self._finishing = False
         # One-way for the life of the lifespan: set once the host started to
         # retire this process's writers (``app.retire_writers``). Entries that
         # would write while the old process only waits to be replaced refuse
@@ -181,6 +185,11 @@ class ReleaseHold:
     @property
     def sealed(self) -> bool:
         return self._sealed
+
+    @property
+    def finishing(self) -> bool:
+        """Whether this process only finishes the runs it owns (one-way)."""
+        return self._finishing
 
     @property
     def socket_writes_fenced(self) -> bool:
@@ -269,12 +278,31 @@ class ReleaseHold:
             logger.info("Command attempts sealed (%s)", reason)
         self._sealed = True
 
+    def begin_finishing(self, reason: str = "finishing") -> None:
+        """Close the hold for good and restrict claims to owned tasks; idempotent.
+
+        Unlike :meth:`seal` this keeps command attempts flowing: the dispatcher
+        still applies commands of tasks whose lease this process holds (the
+        claim predicate, ``_command_routing_predicate``, reads ``finishing``).
+        The closed hold keeps new execution out (a held lease is released once
+        its run ends, so the next command of the task goes to the serving
+        generation). One-way: :meth:`reopen` does not lift it.
+        """
+        self.close(reason)
+        if not self._finishing:
+            logger.info("Finish-only mode begins (%s)", reason)
+        self._finishing = True
+
     def reopen(self) -> None:
         """Admit new execution again on this same process; idempotent.
 
         Lifts a seal too. ``unsettled_total`` is deliberately kept: reopening
-        proves nothing about work that was left to recovery.
+        proves nothing about work that was left to recovery. A process in
+        finish-only mode stays closed.
         """
+        if self._finishing:
+            logger.warning("Reopen ignored: this process only finishes its runs")
+            return
         if self._closed:
             logger.info(
                 "Execution admission reopened (%s); refused while held: %s",
@@ -377,6 +405,7 @@ class ReleaseHold:
         return {
             "closed": self._closed,
             "sealed": self._sealed,
+            "finishing": self._finishing,
             "reason": self._reason,
             "refused": dict(self._refused),
             "responsibilities": [
@@ -397,6 +426,95 @@ release_hold = ReleaseHold()
 # yet, so nothing can be admitted in between. Activation reopens it.
 if get_standby_enabled():
     release_hold.seal("standby")
+
+
+_finishing_counters: dict[str, Callable[[], int]] = {}
+
+
+def register_finishing_counter(name: str, count: Callable[[], int]) -> None:
+    """Add a host-owned count of unfinished work to ``finishing_status()``.
+
+    The count appears under ``name`` in the ``finishing`` object and keeps
+    ``idle`` false while it is non-zero; an exception from ``count`` reads as
+    busy. Registering the same name again replaces the earlier counter. The
+    SaaS layer uses this for its channel turns and schedule runs.
+    """
+    _finishing_counters[name] = count
+
+
+def _pending_reply_count() -> int:
+    """START commands whose reply is bound to this process's event bridge.
+
+    Replies to START commands travel to the ingress process named by
+    ``reply_host_id``; while one is unsettled this process still owes an answer
+    through its bridge, so it cannot stop. Zero without a running bridge, and not counted outside finish-only mode.
+    """
+    from .task_event_bridge import _bridge
+
+    if _bridge is None or not release_hold.finishing:
+        return 0
+    from ..models.database import get_session_local
+    from ..models.task_command import (
+        CLAIMABLE_COMMAND_STATUSES,
+        TaskExecutionCommand,
+    )
+
+    with get_session_local()() as db:
+        return int(
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.reply_host_id == _bridge.host_id,
+                TaskExecutionCommand.status.in_(CLAIMABLE_COMMAND_STATUSES),
+            )
+            .count()
+        )
+
+
+def finishing_status() -> dict[str, Any]:
+    """``{active, owned_runs, pending_replies, idle, ...host counters}``.
+
+    ``idle`` is true only when finish-only mode is active and this process holds
+    no task lease, runs nothing and has no reply route pending, plus every
+    registered host counter is zero. A count that cannot be read makes ``idle``
+    false (and is reported as ``None``): idle is evidence the host stops this
+    process on, so an unknown is never idle. Event-loop thread only.
+    """
+    from .task_coordinator_runtime import live_coordinator_count
+    from .task_execution import background_task_manager
+
+    owned_runs = sum(background_task_manager.release_counts().values()) + (
+        live_coordinator_count()
+    )
+    readable = True
+    try:
+        pending_replies: int | None = _pending_reply_count()
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not count pending replies", exc_info=True)
+        pending_replies = None
+        readable = False
+    status: dict[str, Any] = {
+        "active": release_hold.finishing,
+        "owned_runs": owned_runs,
+        "pending_replies": pending_replies,
+    }
+    extra = 0
+    for name, count in list(_finishing_counters.items()):
+        try:
+            value: int | None = int(count())
+        except Exception:  # noqa: BLE001
+            logger.warning("Finishing counter %s failed", name, exc_info=True)
+            value = None
+            readable = False
+        status[name] = value
+        extra += value or 0
+    status["idle"] = bool(
+        release_hold.finishing
+        and readable
+        and owned_runs == 0
+        and not pending_replies
+        and extra == 0
+    )
+    return status
 
 
 def execution_status() -> dict[str, Any]:
@@ -432,6 +550,7 @@ def execution_status() -> dict[str, Any]:
         "socket_writes_fenced": release_hold.socket_writes_fenced,
         "socket_writes": release_hold.socket_write_count,
         "hold": ledger,
+        "finishing": finishing_status(),
         "sealed": ledger["sealed"],
         "unsettled_total": ledger["unsettled_total"],
         "unsettled": ledger["unsettled"],

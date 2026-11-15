@@ -75,8 +75,13 @@ async def run_tracked_to_completion(
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        if not task.done():
-            await asyncio.wait({task})
+        # Join the worker however many more times this await is cancelled: the
+        # only exit is the task being done, so no cancel can return early.
+        while not task.done():
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError:
+                continue
         if not task.cancelled():
             task.exception()  # consumed: the caller is already being cancelled
         raise

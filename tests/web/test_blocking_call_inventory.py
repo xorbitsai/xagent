@@ -81,11 +81,16 @@ ALLOWED: dict[str, tuple[int, str]] = {
     "web/api/workforces.py": (2, HTTP),
     # -- web: lifecycle and telemetry -------------------------------------------
     "web/app.py": (
-        2,
-        "Two calls: the startup check of the auth-attempt storage, which is "
-        "awaited before the lifespan starts any writer, and the temp-file "
+        4,
+        "Four calls: the startup check of the auth-attempt storage, which is "
+        "awaited before the lifespan starts any writer; the temp-file "
         "walk, which deletes temp files only and is stopped through its own "
-        "event (documented in retire_writers).",
+        "event (documented in retire_writers); the dedicated "
+        "'startup-file-sync' pool, whose only writing job (the startup file "
+        "storage sync) is submitted through run_tracked_in and so is counted "
+        "until its thread returns; and the standby preflight, a read-only "
+        "classification that writes nothing and is stopped through its "
+        "StartupSyncControl cancel event.",
     ),
     "web/worker.py": (
         4,

@@ -708,9 +708,10 @@ def test_resume_cursor_never_moves_past_a_failed_file(tmp_path, monkeypatch):
         row.checksum = None
         row.storage_backend = None
         db.commit()
-    first_user_key = (
-        f"users/{row.user_id}/uploads/{row.file_id}/{Path(row.storage_path).name}"
-    )
+        # Read the identity while the session is open: the row detaches on exit.
+        first_user_key = (
+            f"users/{row.user_id}/uploads/{row.file_id}/{Path(row.storage_path).name}"
+        )
     storage = _SlowListStorage(keys - {first_user_key}, delay=0)
 
     def failing_put(*args, **kwargs):

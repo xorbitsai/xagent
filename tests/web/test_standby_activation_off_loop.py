@@ -102,22 +102,63 @@ async def test_cancelled_activation_waits_for_database_init_to_finish(
 
 
 @pytest.mark.asyncio
-async def test_sync_admission_runs_in_a_thread_in_registration_order() -> None:
+async def test_default_path_invokes_every_callback_on_the_event_loop() -> None:
     app = FastAPI()
     events: list[tuple[str, bool]] = []
     main = threading.get_ident()
 
-    def sync_check() -> None:
-        events.append(("sync", threading.get_ident() != main))
+    def factory():
+        # A decorator/factory style callable: it needs the running loop while
+        # building the awaitable it returns.
+        asyncio.get_running_loop()
+
+        async def run() -> None:
+            events.append(("factory result", threading.get_ident() == main))
+
+        return run()
+
+    def plain() -> None:
+        events.append(("plain", threading.get_ident() == main))
 
     async def async_check() -> None:
         events.append(("async", threading.get_ident() == main))
 
-    register_host_startup_admission(app, sync_check)
+    register_host_startup_admission(app, factory)
+    register_host_startup_admission(app, plain)
     register_host_startup_admission(app, async_check)
     register_host_startup_admission(app, Mock())
     await run_host_startup_admissions(app)
-    assert events == [("sync", True), ("async", True)]
+    assert events == [("factory result", True), ("plain", True), ("async", True)]
+
+
+@pytest.mark.asyncio
+async def test_opt_in_callback_runs_off_the_loop_in_registration_order() -> None:
+    app = FastAPI()
+    events: list[tuple[str, bool]] = []
+    main = threading.get_ident()
+
+    def threaded() -> None:
+        events.append(("threaded", threading.get_ident() != main))
+
+    async def async_check() -> None:
+        events.append(("async", threading.get_ident() == main))
+
+    register_host_startup_admission(app, async_check)
+    register_host_startup_admission(app, threaded, run_in_thread=True)
+    register_host_startup_admission(app, async_check)
+    await run_host_startup_admissions(app)
+    assert events == [("async", True), ("threaded", True), ("async", True)]
+
+
+@pytest.mark.asyncio
+async def test_opt_in_callback_returning_an_awaitable_is_rejected_clearly() -> None:
+    app = FastAPI()
+
+    async def coroutine_function() -> None: ...
+
+    register_host_startup_admission(app, coroutine_function, run_in_thread=True)
+    with pytest.raises(TypeError, match="run_in_thread=True"):
+        await run_host_startup_admissions(app)
 
 
 @pytest.mark.asyncio
@@ -127,7 +168,7 @@ async def test_sync_admission_rejection_propagates_unchanged() -> None:
     def reject() -> None:
         raise RuntimeError("catalog refused")
 
-    register_host_startup_admission(app, reject)
+    register_host_startup_admission(app, reject, run_in_thread=True)
     with pytest.raises(RuntimeError, match="catalog refused"):
         await run_host_startup_admissions(app)
 

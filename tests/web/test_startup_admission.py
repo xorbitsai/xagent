@@ -47,7 +47,7 @@ def _patch_runtime_starts(
         monkeypatch.setattr(
             app_module,
             name,
-            lambda _app, event=event: events.append(event),
+            lambda _app, event=event, **_kw: events.append(event),
         )
 
 

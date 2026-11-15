@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from .media_usage import record_web_search_usage
 from .web_content import WebContentFetcher, get_proxy_url
 from .web_search_guard import run_guarded_search
 
@@ -108,6 +109,9 @@ class WebSearchCore:
                     self._handle_403_error(response)
 
                 response.raise_for_status()
+                # Google billed this request as soon as it answered 2xx, so
+                # record it before reading the body or fetching any result page.
+                record_web_search_usage("google")
                 data = response.json()
 
                 logger.info("✅ Google API request successful")

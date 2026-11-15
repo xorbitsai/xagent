@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from .media_usage import record_web_search_usage
 from .web_search_guard import run_guarded_search
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,9 @@ class ExaWebSearchCore:
             raise ValueError(f"Error during Exa search: {str(e)}") from e
 
         logger.info("✅ Exa API request successful")
+        # The SDK returned, so Exa billed this request; record it before the
+        # response is read into results.
+        record_web_search_usage("exa")
         return self._normalize_results(response, content_mode)
 
     @staticmethod

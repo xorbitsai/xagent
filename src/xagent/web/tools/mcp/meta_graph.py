@@ -373,12 +373,22 @@ def _composio_proxy_request(
             "Composio proxy returned a response that is not a JSON object",
             sensitive_values=sensitive_values,
         )
+    upstream_status = body.get("status")
+    # Same rule as ``composio_proxy.proxy_request``: exactly an int, so a bool
+    # or a numeric string is not read as Graph's status.
+    if type(upstream_status) is not int:
+        raise ComposioProxyError(
+            "Composio proxy returned an answer without the provider's status",
+            sensitive_values=sensitive_values,
+        )
+    # Composio accepted this call; a Graph error in the body is the provider's
+    # answer, not a refusal, so the request is billed either way.
+    composio_proxy.record_accepted_request()
 
     upstream_data = body.get("data")
     _remember_proxy_response_secrets(upstream_data)
     _strip_tokens_from_paging_links(upstream_data)
-    upstream_status = body.get("status")
-    if isinstance(upstream_status, int) and upstream_status >= 400:
+    if upstream_status >= 400:
         message = f"Graph API returned HTTP {upstream_status} through Composio"
         if upstream_data is not None:
             message = f"{message} - {json.dumps(upstream_data)}"

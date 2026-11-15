@@ -80,5 +80,4 @@ class WebSearchTool(AbstractBaseTool):
             num_results=search_args.num_results,
             include_content=search_args.include_content,
         )
-
         return WebSearchResult(results=results).model_dump()

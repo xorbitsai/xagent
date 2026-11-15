@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import time
 from collections.abc import Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -43,6 +45,8 @@ from .composio_proxy import (
     ProxyResponse,
     check_json_body_size,
     proxy_request,
+    register_pending_batch_requests,
+    send_within_deadline,
 )
 
 # How many batch requests may be in flight at once. A Gmail message search
@@ -59,6 +63,14 @@ DEFAULT_BATCH_DEADLINE_SECONDS = float(DEFAULT_TIMEOUT_SECONDS)
 # made. 100 is Google's own per-batch request limit, so the fallback stays on
 # the same scale as the native batch it replaces.
 MAX_BATCH_REQUESTS = 100
+
+# Whether the request being sent right now is one a batch sent. Only those get
+# an end-to-end deadline: a metered Composio tool call waits, after its batch
+# returned, for a request still running, so that request's answer must not keep
+# arriving for longer than one ``timeout``. ``execute_batch`` sets this inside
+# the context it copies for the worker that sends one request, so it cannot
+# reach a request sent outside a batch (a Drive read, a single Gmail call).
+_batch_request: ContextVar[bool] = ContextVar("google_api_batch_request", default=False)
 
 # The only request headers forwarded to the API. Both change what Google
 # returns or how it reads the body. Content-Length and User-Agent describe
@@ -111,7 +123,7 @@ def _declared_size(value: Any) -> int | None:
 
 
 def _binary_content(
-    binary_data: Mapping[str, Any], *, timeout: float
+    binary_data: Mapping[str, Any], *, timeout: float, deadline: float | None
 ) -> tuple[bytes, str]:
     """The bytes behind a binary answer's signed URL, and their content type.
 
@@ -119,7 +131,10 @@ def _binary_content(
     that signed URL in ``binary_data``; the URL expires, so it must not be
     kept, and it must not appear in an error either (it is a bearer-like
     credential for the file). ``public_requests`` keeps the download off a
-    non-public destination.
+    non-public destination. When the request was one a batch sent, the download
+    runs under the same end-to-end deadline as the proxy call it belongs to:
+    the count was settled when that call returned, so a download that never
+    ends must not hold the caller of the request either.
 
     The bytes must be the whole body: a 206, or a body shorter or longer than
     the size Composio declared (or, unless the answer is compressed, the
@@ -138,8 +153,11 @@ def _binary_content(
         # it the client would ask for gzip/deflate, decode the body, and
         # compare the decoded length with the encoded one -- refusing a
         # perfectly good download as truncated.
-        response = requests.get(
-            url, timeout=timeout, headers={"Accept-Encoding": "identity"}
+        response = send_within_deadline(
+            deadline,
+            lambda: requests.get(
+                url, timeout=timeout, headers={"Accept-Encoding": "identity"}
+            ),
         )
     except Exception:
         # Type only: the exception's text can name the signed URL.
@@ -178,7 +196,9 @@ def _binary_content(
     return content, content_type
 
 
-def _body_and_type(answer: ProxyResponse, *, timeout: float) -> tuple[bytes, str]:
+def _body_and_type(
+    answer: ProxyResponse, *, timeout: float, deadline: float | None
+) -> tuple[bytes, str]:
     """The body and content type of one provider answer.
 
     Gmail answers an empty success with 204, so a 2xx other than 204 that
@@ -187,9 +207,13 @@ def _body_and_type(answer: ProxyResponse, *, timeout: float) -> tuple[bytes, str
     to a caller that reads it as a JSON document. The shared client leaves
     that judgment to each API: Salesforce, for one, reads an empty answer as
     an empty object.
+
+    ``deadline`` is the end-to-end deadline of the proxied request this answer
+    belongs to, when it is one a batch sent, so a binary body is downloaded
+    inside it.
     """
     if answer.binary_data is not None:
-        return _binary_content(answer.binary_data, timeout=timeout)
+        return _binary_content(answer.binary_data, timeout=timeout, deadline=deadline)
     if answer.ok and answer.status != 204 and answer.data is None:
         raise ComposioProxyError(
             "Composio proxy returned an answer without the provider's data"
@@ -318,7 +342,14 @@ class GoogleApiProxyHttp:
         httplib2's callers pass them; neither applies here. This transport
         does not follow a redirect: the status and the provider's headers
         (including ``location``) are returned, so the caller can follow it.
+
+        A request a batch sent gets an end-to-end deadline, because a metered
+        tool call waits for it after the batch returned: the whole call, a
+        binary answer's download included, runs inside one ``timeout`` from
+        here. A request sent outside a batch has no such deadline and keeps
+        only the ``timeout`` given to ``requests``.
         """
+        deadline = time.monotonic() + self._timeout if _batch_request.get() else None
         prepared = self._prepare(uri, method, body, headers)
         answer = proxy_request(
             prepared.method,
@@ -329,10 +360,13 @@ class GoogleApiProxyHttp:
             body=prepared.body,
             timeout=self._timeout,
             max_body_bytes=self._max_body_bytes,
+            deadline=deadline,
         )
         if answer.ok and answer.binary_data is None and _is_media_request(prepared):
             _refuse_relayed_media_object(answer.data)
-        content, content_type = _body_and_type(answer, timeout=self._timeout)
+        content, content_type = _body_and_type(
+            answer, timeout=self._timeout, deadline=deadline
+        )
         response_headers = {
             str(name).lower(): str(value)
             for name, value in (answer.headers or {}).items()
@@ -434,7 +468,13 @@ def execute_batch(
 
     A request still unanswered at ``deadline`` reaches its callback as a
     ``TimeoutError``; the batch's own threads are abandoned rather than
-    awaited, so the caller returns inside its budget.
+    awaited, so the caller returns inside its budget. A request that was
+    already sent keeps running, but only until the end-to-end deadline of the
+    transport that sent it (``GoogleApiProxyHttp`` gives it ``timeout`` from
+    its start, the answer's body and a binary download included), so it
+    settles inside one such deadline. It can still be accepted before then,
+    and a metered Composio tool call registers it and waits for that, so the
+    count it reports includes every request Composio accepted.
     """
     # BatchHttpRequest keeps its requests, their order and its callbacks in
     # these attributes and googleapiclient has no public accessor for them. A
@@ -466,6 +506,9 @@ def execute_batch(
         http = request.http
         if http is None:
             return ValueError("Missing a valid http object.")
+        # This runs in a context copied for this one request, so the mark
+        # reaches this request's transport and no other.
+        _batch_request.set(True)
         try:
             answer: tuple[Any, bytes] = http.request(
                 request.uri,
@@ -486,10 +529,25 @@ def execute_batch(
         thread_name_prefix="google-api-proxy",
     )
     try:
-        futures = {request_id: executor.submit(run, request_id) for request_id in order}
+        # Each worker runs under the caller's context, so a Composio request
+        # count started for this tool call also sees the batch's requests.
+        futures = {
+            request_id: executor.submit(copy_context().run, run, request_id)
+            for request_id in order
+        }
         _, pending = wait(futures.values(), timeout=deadline)
         for future in pending:
             future.cancel()
+        # A request that is neither cancelled nor finished has started and is
+        # still running past the deadline, so it can still be accepted: a
+        # metered tool call waits for it before it reports its count. A
+        # cancelled request was never sent and can never be accepted, so it is
+        # not registered.
+        register_pending_batch_requests(
+            future
+            for future in futures.values()
+            if not future.cancelled() and not future.done()
+        )
         for request_id, future in futures.items():
             # ``pending`` is a snapshot taken when ``wait`` returned: a
             # request can finish between that snapshot and this loop, and

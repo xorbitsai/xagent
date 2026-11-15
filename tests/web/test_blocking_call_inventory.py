@@ -108,6 +108,7 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "running execution (load); writes nothing.",
     ),
     "web/tools/config.py": (1, NETWORK),
+    "web/tools/mcp/composio_proxy.py": (1, NETWORK),
     "web/tools/mcp/google_api_proxy.py": (1, NETWORK),
     "web/tools/mcp/google_slides.py": (3, NETWORK),
     "web/tracking/standalone_usage.py": (

@@ -138,11 +138,14 @@ def test_other_connections_do_not_speak_the_envelope(connection):
 
 
 def _fastmcp_server_modules() -> set[str]:
+    # A module is a server when it constructs ``FastMCP`` or a subclass of it
+    # (``ComposioMeteringFastMCP``). The line that defines such a subclass
+    # constructs nothing, so it does not count.
     package_dir = Path(in_repo_servers.__file__).parent
     return {
         path.stem
         for path in package_dir.glob("*.py")
-        if re.search(r"\bFastMCP\(", path.read_text(encoding="utf-8"))
+        if re.search(r"(?<!class )\b\w*FastMCP\(", path.read_text(encoding="utf-8"))
     }
 
 

@@ -161,7 +161,9 @@ async def test_generations_off_sync_reads_and_logs_nothing_new(
     with caplog.at_level("DEBUG", logger=generation.logger.name):
         await manager._sync_bots_async()
     assert started == [kind]
-    assert caplog.records == []
+    # Other loggers (the managers' own sync line) keep logging as before; the
+    # fence itself must add nothing.
+    assert [r for r in caplog.records if r.name == generation.logger.name] == []
 
 
 @pytest.mark.asyncio

@@ -922,39 +922,13 @@ async def delete_connected_account(
         raise HTTPException(status_code=404, detail="Account not found")
 
     from ..services.google_oauth_grants import (
-        GOOGLE_OAUTH_ISSUER,
-        GOOGLE_SHARED_OAUTH_PROVIDER,
         detach_google_shared_oauth_legacy_account,
     )
-    from .auth import (
-        revoke_builtin_oauth_grants,
-        snapshot_builtin_oauth_revocations,
-    )
 
-    # Snapshot before the delete, while the row (and its tokens) still
-    # exists -- the same "read the token before it's gone" constraint as in
-    # mcp.py's disconnect endpoints. Detaching a Google legacy account's last
-    # shared link also deletes the shared ``google`` credential, which this
-    # request never selected, so the user's shared credentials are
-    # snapshotted too; one that survives the detach is still there for the
-    # post-commit reference check, which then skips its revoke. Any other
-    # provider's account has no shared Google link to detach, so it skips
-    # that extra fence and reference work. An account whose issuer is unknown
-    # may still be such a Google account, so it takes the cautious branch:
-    # snapshotting a shared credential that survives costs only a skipped
-    # revoke, while missing one that the detach deletes would leave its
-    # grant alive unnoticed.
-    snapshotted = [account]
-    if account.oauth_provider in (GOOGLE_OAUTH_ISSUER, None):
-        snapshotted += (
-            scoped_user_oauth_query(
-                db, user_id=cast(int, user.id), resource_owner_key=None
-            )
-            .filter(UserOAuth.provider == GOOGLE_SHARED_OAUTH_PROVIDER)
-            .all()
-        )
-    revocations = snapshot_builtin_oauth_revocations(db, snapshotted)
-
+    # Detaching a Google legacy account's last shared link also deletes the
+    # shared ``google`` credential. Every credential deleted here enqueues
+    # its own provider revocation in the credential revocation outbox (a
+    # database trigger), revoked by the outbox worker after this commits.
     detach_google_shared_oauth_legacy_account(
         db,
         user_id=cast(int, user.id),
@@ -962,10 +936,6 @@ async def delete_connected_account(
     )
     db.delete(account)
     db.commit()
-
-    await revoke_builtin_oauth_grants(
-        db, revocations, context=f"deleting connected account {account_id}"
-    )
 
     return {"success": True, "message": "Account deleted successfully"}
 

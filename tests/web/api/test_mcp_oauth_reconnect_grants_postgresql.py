@@ -84,9 +84,6 @@ def provider(monkeypatch):
     monkeypatch.setattr(
         mcp_api, "_revoke_mcp_oauth_issued_token_externally", no_revocation
     )
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", no_revocation
-    )
 
 
 def _seed(factory, *, earlier_expired: bool = False) -> dict[str, int]:

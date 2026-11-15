@@ -13,6 +13,7 @@ from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.exc import OperationalError
 
+from tests.shared.credential_revocations import drain_credential_revocations
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.api.v1.deps import _bearer, get_user_from_personal_key
@@ -21,6 +22,7 @@ from xagent.web.models.database import get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.services import connector_team_scope, mcp_server_management
+from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.connector_team_scope import ConnectorDeleteDecision
 
 from ..conftest import _direct_db_session, app_for_tests, client
@@ -471,7 +473,7 @@ def test_a_real_delete_removes_the_holders_grants_and_flow_states_and_revokes_th
         return httpx.Response(200)
 
     monkeypatch.setattr(
-        mcp_api,
+        mcp_oauth_service,
         "create_mcp_oauth_http_client",
         lambda **_kw: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
@@ -482,6 +484,13 @@ def test_a_real_delete_removes_the_holders_grants_and_flow_states_and_revokes_th
     assert _definition_exists(server_id)
     assert _grant_count(server_id) == 0
     assert _flow_state_count(server_id) == 0
+    # The delete enqueued the revocation; the outbox worker sends it.
+    assert revoked == []
+    db = _direct_db_session()
+    try:
+        asyncio.run(drain_credential_revocations(db))
+    finally:
+        db.close()
     assert [url for url, _ in revoked] == ["https://auth.example.test/revoke"] * 2
     assert [
         ("token=AT-plain" in body, "token=RT-plain" in body) for _, body in revoked

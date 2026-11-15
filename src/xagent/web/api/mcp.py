@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import (
-    TYPE_CHECKING,
     Annotated,
     Any,
     Callable,
@@ -90,7 +89,6 @@ from ..models.mcp_oauth import (
 )
 from ..models.public_mcp import PublicMCPApp
 from ..models.user import User
-from ..models.user_oauth import UserOAuth
 from ..services.connector_name_policy import (
     catalog_app_name_detail,
     folded_name_conflict_detail,
@@ -130,15 +128,7 @@ from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
-    scoped_user_oauth_query,
 )
-
-if TYPE_CHECKING:
-    # Type-checking only: a real module-level import here would be a
-    # circular import (auth.py itself defers its own imports of this module
-    # into function bodies for exactly this reason) -- every runtime use
-    # imports from .auth locally at the call site instead.
-    from .auth import BuiltinOAuthRevocation
 
 logger = logging.getLogger(__name__)
 
@@ -2050,7 +2040,20 @@ def _mcp_oauth_issued_token_snapshot(
 async def _revoke_mcp_oauth_issued_token_externally(
     snapshot: _MCPOAuthIssuedTokenSnapshot,
 ) -> None:
-    """Best-effort revoke a token whose final local persistence failed."""
+    """Best-effort revoke a token whose final local persistence failed.
+
+    Not a deletion, so the credential revocation outbox never sees these
+    tokens: they were issued by a callback whose own transaction is rolled
+    back before this runs and were never stored. Each token is tried once
+    through the outbox's RFC 7009 call
+    (``services.credential_revocations.revoke_rfc7009_tokens``); a failure is
+    logged, never raised.
+    """
+    from ..services.credential_revocations import (
+        ProviderRevocationError,
+        revoke_rfc7009_tokens,
+    )
+
     if snapshot.revocation_endpoint is None:
         return
     try:
@@ -2066,68 +2069,28 @@ async def _revoke_mcp_oauth_issued_token_externally(
             snapshot.flow_id,
         )
         return
-
-    auth: httpx.Auth | None = None
-    data_base: dict[str, str] = {"client_id": snapshot.client_id}
-    if snapshot.token_endpoint_auth_method == "client_secret_post" and client_secret:
-        data_base["client_secret"] = client_secret
-    elif snapshot.token_endpoint_auth_method == "client_secret_basic" and client_secret:
-        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
-    elif snapshot.token_endpoint_auth_method not in {
-        "none",
-        "client_secret_post",
-        "client_secret_basic",
-    }:
-        logger.warning(
-            "Skipping issued MCP OAuth token revocation for flow %s because "
-            "the client authentication method is unsupported",
-            snapshot.flow_id,
-        )
-        return
-
-    try:
-        async with create_mcp_oauth_http_client(
-            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
-        ) as http_client:
-            for token, token_type_hint in (
-                (snapshot.access_token, "access_token"),
-                (snapshot.refresh_token, "refresh_token"),
-            ):
-                if token is None:
-                    continue
-                request_kwargs: dict[str, Any] = {
-                    "data": {
-                        **data_base,
-                        "token": token,
-                        "token_type_hint": token_type_hint,
-                    },
-                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                }
-                if auth is not None:
-                    request_kwargs["auth"] = auth
-                try:
-                    response = await oauth_post(
-                        snapshot.revocation_endpoint,
-                        client=http_client,
-                        **request_kwargs,
-                    )
-                    if response.status_code >= 400:
-                        logger.warning(
-                            "Issued MCP OAuth token revocation returned HTTP %s "
-                            "for flow %s",
-                            response.status_code,
-                            snapshot.flow_id,
-                        )
-                except Exception:
-                    logger.warning(
-                        "Issued MCP OAuth token revocation failed for flow %s",
-                        snapshot.flow_id,
-                    )
-    except Exception:
-        logger.warning(
-            "Issued MCP OAuth token revocation could not start for flow %s",
-            snapshot.flow_id,
-        )
+    for token, token_type_hint in (
+        (snapshot.access_token, "access_token"),
+        (snapshot.refresh_token, "refresh_token"),
+    ):
+        if token is None:
+            continue
+        try:
+            await revoke_rfc7009_tokens(
+                revocation_endpoint=snapshot.revocation_endpoint,
+                client_id=snapshot.client_id,
+                client_secret=client_secret,
+                token_endpoint_auth_method=snapshot.token_endpoint_auth_method,
+                tokens=[(token, token_type_hint)],
+            )
+        except (ProviderRevocationError, ValueError) as exc:
+            logger.warning(
+                "Issued MCP OAuth token revocation failed for flow %s: %s",
+                snapshot.flow_id,
+                exc,
+            )
+            if isinstance(exc, ValueError):
+                return
 
 
 async def _rollback_and_revoke_mcp_oauth_issued_token(
@@ -2137,164 +2100,6 @@ async def _rollback_and_revoke_mcp_oauth_issued_token(
     """Release database locks before any compensating provider request."""
     db.rollback()
     await _revoke_mcp_oauth_issued_token_externally(snapshot)
-
-
-@dataclass(frozen=True)
-class _MCPOAuthGrantRevocationSnapshot:
-    grant_id: int
-    revocation_endpoint: str | None
-    client_id: str
-    encrypted_client_secret: str | None
-    token_endpoint_auth_method: str
-    encrypted_access_token: str | None
-    encrypted_refresh_token: str | None
-
-
-def _mcp_oauth_grant_revocation_snapshot(
-    *, client: MCPOAuthClient, grant: MCPOAuthGrant
-) -> _MCPOAuthGrantRevocationSnapshot:
-    metadata: dict[str, Any] = (
-        client.metadata_json if isinstance(client.metadata_json, dict) else {}
-    )
-    revocation_endpoint = metadata.get("revocation_endpoint")
-    return _MCPOAuthGrantRevocationSnapshot(
-        grant_id=int(grant.id),
-        revocation_endpoint=(
-            revocation_endpoint
-            if isinstance(revocation_endpoint, str) and revocation_endpoint
-            else None
-        ),
-        client_id=str(client.client_id),
-        encrypted_client_secret=(
-            str(client.client_secret) if client.client_secret else None
-        ),
-        token_endpoint_auth_method=str(client.token_endpoint_auth_method or "none"),
-        encrypted_access_token=(
-            str(grant.access_token) if grant.access_token else None
-        ),
-        encrypted_refresh_token=(
-            str(grant.refresh_token) if grant.refresh_token else None
-        ),
-    )
-
-
-async def _revoke_mcp_oauth_grant_snapshot_externally(
-    snapshot: _MCPOAuthGrantRevocationSnapshot,
-) -> None:
-    """Best-effort revoke a detached grant snapshot without ORM access."""
-    if snapshot.revocation_endpoint is None:
-        return
-
-    try:
-        client_secret = (
-            decrypt_value(snapshot.encrypted_client_secret)
-            if snapshot.encrypted_client_secret
-            else ""
-        )
-    except Exception as exc:
-        logger.warning(
-            "Skipping MCP OAuth token revocation for grant %s "
-            "(stage=decrypt_client_secret, exception_type=%s)",
-            snapshot.grant_id,
-            type(exc).__name__,
-        )
-        return
-    auth_method = snapshot.token_endpoint_auth_method
-    auth: httpx.Auth | None = None
-    base_data: dict[str, str] = {"client_id": snapshot.client_id}
-    if auth_method == "client_secret_post" and client_secret:
-        base_data["client_secret"] = client_secret
-    elif auth_method == "client_secret_basic" and client_secret:
-        auth = httpx.BasicAuth(snapshot.client_id, client_secret)
-    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
-        logger.warning(
-            "Skipping MCP OAuth token revocation for grant %s "
-            "(stage=validate_auth_method)",
-            snapshot.grant_id,
-        )
-        return
-
-    try:
-        async with create_mcp_oauth_http_client(
-            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
-        ) as http_client:
-            for encrypted_token, token_type_hint in (
-                (snapshot.encrypted_access_token, "access_token"),
-                (snapshot.encrypted_refresh_token, "refresh_token"),
-            ):
-                if not encrypted_token:
-                    continue
-                try:
-                    decrypted_token = decrypt_value(encrypted_token)
-                except Exception as exc:
-                    logger.warning(
-                        "Skipping MCP OAuth token revocation for grant %s "
-                        "(stage=decrypt_%s, exception_type=%s)",
-                        snapshot.grant_id,
-                        token_type_hint,
-                        type(exc).__name__,
-                    )
-                    continue
-                request_kwargs: dict[str, Any] = {
-                    "data": {
-                        **base_data,
-                        "token": decrypted_token,
-                        "token_type_hint": token_type_hint,
-                    },
-                    "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                }
-                if auth is not None:
-                    request_kwargs["auth"] = auth
-                try:
-                    response = await oauth_post(
-                        snapshot.revocation_endpoint,
-                        client=http_client,
-                        **request_kwargs,
-                    )
-                    if response.status_code >= 400:
-                        logger.warning(
-                            "MCP OAuth token revocation returned HTTP %s for grant %s",
-                            response.status_code,
-                            snapshot.grant_id,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "MCP OAuth token revocation failed for grant %s "
-                        "(stage=revoke_%s, exception_type=%s)",
-                        snapshot.grant_id,
-                        token_type_hint,
-                        type(exc).__name__,
-                    )
-    except Exception as exc:
-        logger.warning(
-            "MCP OAuth token revocation could not start for grant %s "
-            "(stage=create_client, exception_type=%s)",
-            snapshot.grant_id,
-            type(exc).__name__,
-        )
-
-
-async def _revoke_mcp_oauth_grant_externally(
-    *,
-    client: MCPOAuthClient,
-    grant: MCPOAuthGrant,
-) -> None:
-    await _revoke_mcp_oauth_grant_snapshot_externally(
-        _mcp_oauth_grant_revocation_snapshot(client=client, grant=grant)
-    )
-
-
-@dataclass(frozen=True)
-class MCPOAuthOwnerRevocation:
-    """Provider work staged by an exact-owner local transaction."""
-
-    grant_count: int
-    _snapshots: tuple[_MCPOAuthGrantRevocationSnapshot, ...]
-
-    async def revoke_tokens(self) -> None:
-        """Revoke provider tokens only after the caller commits local state."""
-        for snapshot in self._snapshots:
-            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
 
 
 def _trusted_mcp_oauth_owner_key(resource_owner_key: str, *, user_id: int) -> str:
@@ -5896,57 +5701,20 @@ def _locked_catalog_app_for_server(
     return expected_app if owners == {app_id} else None
 
 
-def _snapshot_builtin_oauth_revocations(
-    db: Session, *, user_id: int, providers: Sequence[str]
-) -> "list[BuiltinOAuthRevocation]":
-    """Resolve provider-side revocation records for the builtin
-    ``UserOAuth`` rows ``delete_scoped_user_oauth_accounts`` is about to
-    delete for ``providers``.
-
-    Must run before that call -- it's a bulk SQL DELETE that never loads
-    rows into Python, so this is the only chance to read each row's
-    access_token and provider_user_id. Only reads the database (see
-    ``auth.resolve_builtin_oauth_revocation``), so it's safe to call while
-    still holding the disconnect transaction's locks; the caller revokes the
-    resolved credentials only after its own commit, and only once
-    ``auth.has_other_builtin_oauth_reference`` (checked at that later point,
-    not here) confirms no other local connection still needs the grant.
-    """
-    from .auth import snapshot_builtin_oauth_revocations
-
-    if not providers:
-        return []
-    return snapshot_builtin_oauth_revocations(
-        db,
-        scoped_user_oauth_query(db, user_id=user_id, resource_owner_key=None)
-        .filter(UserOAuth.provider.in_(providers))
-        .all(),
-    )
-
-
 def _detach_shared_google_grant_for_disconnect(
     db: Session, *, user_id: int, provider: object, app_id: object
-) -> "list[BuiltinOAuthRevocation]":
+) -> None:
     """Detach one ordinary Google app from any explicit shared grant.
 
     Detaching the last app linked to a shared grant deletes the shared
-    ``google`` credential with it, so the user's shared credentials are
-    snapshotted for revocation first. One that survives the detach (another
-    app still links it) is still there for the post-commit reference check,
-    which then skips its revoke.
+    ``google`` credential with it; that deletion enqueues its provider
+    revocation in the credential revocation outbox like any other.
     """
     if normalize_catalog_key(provider) != "google" or not isinstance(app_id, str):
-        return []
-    from ..services.google_oauth_grants import (
-        GOOGLE_SHARED_OAUTH_PROVIDER,
-        detach_google_shared_oauth_app,
-    )
+        return
+    from ..services.google_oauth_grants import detach_google_shared_oauth_app
 
-    revocations = _snapshot_builtin_oauth_revocations(
-        db, user_id=user_id, providers=[GOOGLE_SHARED_OAUTH_PROVIDER]
-    )
     detach_google_shared_oauth_app(db, user_id=user_id, app_id=app_id)
-    return revocations
 
 
 def _legacy_disconnect_provider_keys(
@@ -5967,13 +5735,14 @@ def _teardown_mcp_app_server_locally(
     expected_association_generation: UUID,
     current_user: User,
     db: Session,
-) -> "tuple[int, list[_MCPOAuthGrantRevocationSnapshot], list[BuiltinOAuthRevocation]]":
-    """Own the local teardown transaction and report what still needs revoking.
+) -> int:
+    """Own the local teardown transaction; return the acting user id.
 
     The caller pins both generations during preflight. This function owns the
     local transaction, revalidates every destructive identity while locked, and
-    commits local cleanup once. Provider revocation stays with the caller,
-    because it may only run once this commit has released every lock.
+    commits local cleanup once. Every credential it deletes enqueues its own
+    provider revocation in the credential revocation outbox (a database
+    trigger), so the commit hands provider revocation to the outbox worker.
 
     Kept a plain ``def`` and run off the event loop by its caller: this half
     calls the connector team seam, and an installed team hook answers from the
@@ -5982,13 +5751,11 @@ def _teardown_mcp_app_server_locally(
     every other request the process is serving instead of occupying one
     worker.
 
-    Returns the acting user id alongside the revocation snapshots because this
-    function is the half of a split teardown that has ``current_user`` in
-    scope: the caller, ``teardown_mcp_app_server``, logs the completed
-    teardown after this function returns and needs the id to do it.
+    Returns the acting user id because this function is the half of a split
+    teardown that has ``current_user`` in scope: the caller,
+    ``teardown_mcp_app_server``, logs the completed teardown after this
+    function returns and needs the id to do it.
     """
-    revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
-    builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
     try:
         with db.no_autoflush:
             user_id = int(current_user.id)
@@ -6104,10 +5871,8 @@ def _teardown_mcp_app_server_locally(
 
         if str(server.transport or "").lower() == "oauth":
             provider = expected_app.provider_name
-            builtin_oauth_revocations.extend(
-                _detach_shared_google_grant_for_disconnect(
-                    db, user_id=user_id, provider=provider, app_id=app_id
-                )
+            _detach_shared_google_grant_for_disconnect(
+                db, user_id=user_id, provider=provider, app_id=app_id
             )
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
                 expected_app, [provider, app_id]
@@ -6120,11 +5885,6 @@ def _teardown_mcp_app_server_locally(
                 provider, providers_to_delete
             )
             if providers_to_delete:
-                builtin_oauth_revocations.extend(
-                    _snapshot_builtin_oauth_revocations(
-                        db, user_id=user_id, providers=providers_to_delete
-                    )
-                )
                 delete_scoped_user_oauth_accounts(
                     db,
                     user_id=user_id,
@@ -6149,11 +5909,6 @@ def _teardown_mcp_app_server_locally(
                     for other_server in other_servers
                 )
                 if not sibling_still_connected:
-                    builtin_oauth_revocations.extend(
-                        _snapshot_builtin_oauth_revocations(
-                            db, user_id=user_id, providers=[provider]
-                        )
-                    )
                     delete_scoped_user_oauth_accounts(
                         db,
                         user_id=user_id,
@@ -6170,14 +5925,6 @@ def _teardown_mcp_app_server_locally(
             .with_for_update()
             .all()
         ):
-            if str(grant.status) == "active" and isinstance(
-                grant.oauth_client, MCPOAuthClient
-            ):
-                revocations.append(
-                    _mcp_oauth_grant_revocation_snapshot(
-                        client=grant.oauth_client, grant=grant
-                    )
-                )
             db.delete(grant)
 
         db.query(MCPOAuthFlowState).filter(
@@ -6235,7 +5982,7 @@ def _teardown_mcp_app_server_locally(
             detail="Failed to delete MCP server",
         ) from None
 
-    return user_id, revocations, builtin_oauth_revocations
+    return user_id
 
 
 async def teardown_mcp_app_server(
@@ -6273,11 +6020,11 @@ async def teardown_mcp_app_server(
     ``run_db_io_cancellation_safe`` instead and have the worker function open
     and close its own session.
 
-    What remains here is the best-effort provider revocation, the one step that
-    genuinely needs to await. It needs no ORM access and holds no database
-    lock, and runs only after the commit above has released every lock.
+    Nothing here calls a provider: every credential the teardown deletes is
+    revoked by the credential revocation outbox worker once the local commit
+    lands (see ``services.credential_revocations``).
     """
-    user_id, revocations, builtin_oauth_revocations = await asyncio.to_thread(
+    user_id = await asyncio.to_thread(
         _teardown_mcp_app_server_locally,
         server_id,
         app_id=app_id,
@@ -6287,24 +6034,6 @@ async def teardown_mcp_app_server(
         current_user=current_user,
         db=db,
     )
-
-    # No provider call may run until the local commit releases every lock.
-    for revocation in revocations:
-        try:
-            await _revoke_mcp_oauth_grant_snapshot_externally(revocation)
-        except Exception:
-            logger.warning(
-                "MCP OAuth token revocation failed after teardown for grant %s",
-                revocation.grant_id,
-            )
-    if builtin_oauth_revocations:
-        from .auth import revoke_builtin_oauth_grants
-
-        await revoke_builtin_oauth_grants(
-            db,
-            builtin_oauth_revocations,
-            context=f"teardown for app {app_id!r}, server {server_id}",
-        )
     logger.info(
         "Completed app-scoped MCP teardown for app %r, server %s, user %s",
         app_id,
@@ -6404,8 +6133,10 @@ async def delete_mcp_server(
                 detail="Only a team admin can delete a team MCP server",
             )
 
-        # If it's an OAuth server, also delete the corresponding OAuth tokens
-        builtin_oauth_revocations: "list[BuiltinOAuthRevocation]" = []
+        # If it's an OAuth server, also delete the corresponding OAuth tokens.
+        # Each deleted credential enqueues its own provider revocation in the
+        # credential revocation outbox (a database trigger), so nothing here
+        # calls a provider.
         if server.transport == "oauth":
             # Resolve by stable identity rather than by ``server.name``.
             # ``PublicMCPApp.name`` is mutable and carries no uniqueness
@@ -6424,13 +6155,11 @@ async def delete_mcp_server(
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
-                builtin_oauth_revocations.extend(
-                    _detach_shared_google_grant_for_disconnect(
-                        db,
-                        user_id=int(user_id),
-                        provider=provider,
-                        app_id=app_id,
-                    )
+                _detach_shared_google_grant_for_disconnect(
+                    db,
+                    user_id=int(user_id),
+                    provider=provider,
+                    app_id=app_id,
                 )
 
                 # Delete tokens for this specific app. For apps in
@@ -6448,11 +6177,6 @@ async def delete_mcp_server(
                     provider, providers_to_delete
                 )
                 if providers_to_delete:
-                    builtin_oauth_revocations.extend(
-                        _snapshot_builtin_oauth_revocations(
-                            db, user_id=int(user_id), providers=providers_to_delete
-                        )
-                    )
                     delete_scoped_user_oauth_accounts(
                         db,
                         user_id=int(user_id),
@@ -6487,11 +6211,6 @@ async def delete_mcp_server(
                         for other_server in other_servers
                     )
                     if not sibling_still_connected:
-                        builtin_oauth_revocations.extend(
-                            _snapshot_builtin_oauth_revocations(
-                                db, user_id=int(user_id), providers=[provider]
-                            )
-                        )
                         delete_scoped_user_oauth_accounts(
                             db,
                             user_id=int(user_id),
@@ -6499,16 +6218,15 @@ async def delete_mcp_server(
                             providers=[provider],
                         )
 
-        # Snapshot and purge this user's MCP OAuth grants for the server. On a
-        # shared (multi-user) row the server outlives this disconnect, so
-        # without this the grant's refresh token would stay usable — and its
-        # row would stay stored — until the LAST user disconnects and the
-        # cascade finally removes it. The provider-facing revocation happens
-        # only after the local commit releases lifecycle locks. Use a hard
-        # delete rather than a "revoked" status flip: a revoked grant
+        # Purge this user's MCP OAuth grants for the server. On a shared
+        # (multi-user) row the server outlives this disconnect, so without
+        # this the grant's refresh token would stay usable — and its row would
+        # stay stored — until the LAST user disconnects and the cascade
+        # finally removes it. The delete enqueues each grant's provider
+        # revocation (outbox trigger), revoked by the worker after commit. Use
+        # a hard delete rather than a "revoked" status flip: a revoked grant
         # row is otherwise never swept, accumulating indefinitely as an
         # inert but secret-bearing row (F10).
-        grant_revocations: list[_MCPOAuthGrantRevocationSnapshot] = []
         for grant in (
             db.query(MCPOAuthGrant)
             .filter(
@@ -6518,12 +6236,6 @@ async def delete_mcp_server(
             )
             .all()
         ):
-            if isinstance(grant.oauth_client, MCPOAuthClient):
-                grant_revocations.append(
-                    _mcp_oauth_grant_revocation_snapshot(
-                        client=grant.oauth_client, grant=grant
-                    )
-                )
             db.delete(grant)
 
         # This user's own flow-state rows (code_verifier etc.) are per-user,
@@ -6561,18 +6273,6 @@ async def delete_mcp_server(
                 server_deleted = True
 
         db.commit()
-
-        for snapshot in grant_revocations:
-            await _revoke_mcp_oauth_grant_snapshot_externally(snapshot)
-
-        if builtin_oauth_revocations:
-            from .auth import revoke_builtin_oauth_grants
-
-            await revoke_builtin_oauth_grants(
-                db,
-                builtin_oauth_revocations,
-                context=f"deleting MCP server {server_id}",
-            )
 
         if retained_team_server:
             logger.info(f"Kept shared MCP server '{server_name}' after team disconnect")
@@ -7790,8 +7490,15 @@ async def revoke_mcp_oauth_grants_for_owner(
     db: Session,
     *,
     resource_owner_key: str,
-) -> MCPOAuthOwnerRevocation:
-    """Stage exact-owner revocation in the caller-owned transaction."""
+) -> int:
+    """Revoke one exact owner's grants in the caller-owned transaction.
+
+    Marks each active grant ``revoked`` and returns how many there were. The
+    status change itself enqueues each grant's provider revocation in the
+    credential revocation outbox (a database trigger, see
+    ``models.credential_revocation``), so it commits or rolls back with the
+    caller's transaction and the outbox worker revokes once it commits.
+    """
 
     user_id = cast(int, current_user.id)
     owner_key = _trusted_mcp_oauth_owner_key(resource_owner_key, user_id=user_id)
@@ -7816,20 +7523,12 @@ async def revoke_mcp_oauth_grants_for_owner(
         )
         .all()
     )
-    snapshots = tuple(
-        _mcp_oauth_grant_revocation_snapshot(client=grant.oauth_client, grant=grant)
-        for grant in grants
-        if isinstance(grant.oauth_client, MCPOAuthClient)
-    )
     now = _utc_now()
     for grant in grants:
         setattr(grant, "status", "revoked")
         setattr(grant, "revoked_at", now)
     db.flush()
-    return MCPOAuthOwnerRevocation(
-        grant_count=len(grants),
-        _snapshots=snapshots,
-    )
+    return len(grants)
 
 
 @mcp_router.delete(
@@ -7842,7 +7541,12 @@ async def delete_mcp_oauth_grant(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> None:
-    """Revoke an MCP OAuth grant owned by the current user."""
+    """Revoke an MCP OAuth grant owned by the current user.
+
+    Marking it ``revoked`` enqueues its provider revocation in the credential
+    revocation outbox (a database trigger); the outbox worker calls the
+    provider after this commits.
+    """
     user_id = cast(int, current_user.id)
     _get_user_mcp_server_or_404(
         db, user_id=user_id, server_id=server_id, require_active=True
@@ -7861,15 +7565,11 @@ async def delete_mcp_oauth_grant(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP OAuth grant not found"
         )
-    if isinstance(grant.oauth_client, MCPOAuthClient):
-        await _revoke_mcp_oauth_grant_externally(
-            client=grant.oauth_client,
-            grant=grant,
-        )
     setattr(grant, "status", "revoked")
     setattr(grant, "revoked_at", _utc_now())
     try:
         db.commit()
     except StaleDataError:
-        # A runtime refresh deleted the row while the provider revoke ran.
+        # A runtime refresh deleted the row since it was read; its deletion
+        # already enqueued the revocation.
         db.rollback()

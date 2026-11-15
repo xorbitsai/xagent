@@ -20,6 +20,10 @@ from sqlalchemy.orm import Query, sessionmaker
 from starlette.requests import Request
 
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+from tests.shared.credential_revocations import (
+    credential_revocation_statuses,
+    drain_credential_revocations,
+)
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
@@ -46,6 +50,7 @@ from xagent.web.api.mcp import (
 )
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
+from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import mcp_oauth_client_registration_lookup_hash
@@ -1314,7 +1319,7 @@ async def test_last_user_disconnect_deletes_server_before_post_commit_reconnect(
     def record_main_commit(session):
         main_commits.append(None)
 
-    async def reconnect_after_local_commit(snapshot):
+    def reconnect_after_local_commit():
         assert not db.in_transaction()
         with SessionLocal() as reconnect_db:
             reconnect_db.add(
@@ -1333,14 +1338,10 @@ async def test_last_user_disconnect_deletes_server_before_post_commit_reconnect(
             else:  # pragma: no cover - the assertion below reports the regression
                 replacement_committed.append(True)
 
-    monkeypatch.setattr(
-        mcp_api,
-        "_revoke_mcp_oauth_grant_snapshot_externally",
-        reconnect_after_local_commit,
-    )
     _allow_standalone_connector_delete(monkeypatch)
 
     await delete_mcp_server(server_id, current_user=user, db=db)
+    reconnect_after_local_commit()
 
     assert replacement_committed == [False]
     assert len(main_commits) == 1
@@ -3747,7 +3748,9 @@ async def test_issued_token_compensation_revokes_access_and_refresh(monkeypatch)
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+    monkeypatch.setattr(
+        mcp_oauth_service, "create_mcp_oauth_http_client", async_client_factory
+    )
     await mcp_api._revoke_mcp_oauth_issued_token_externally(
         mcp_api._MCPOAuthIssuedTokenSnapshot(
             flow_id=7,
@@ -4692,14 +4695,14 @@ async def test_trusted_revoke_removes_only_exact_resource_owner(db_session):
     association.is_active = False
     db.commit()
 
-    revocation = await mcp_api.revoke_mcp_oauth_grants_for_owner(
+    revoked = await mcp_api.revoke_mcp_oauth_grants_for_owner(
         server.id,
         user,
         db,
         resource_owner_key="  toby:slack:workspace:alice  ",
     )
 
-    assert revocation.grant_count == 1
+    assert revoked == 1
     db.expire_all()
     assert [grant.status for grant in grants] == ["active", "revoked", "active"]
     assert [row.resource_owner_key for row in db.query(MCPOAuthFlowState).all()] == [
@@ -4717,7 +4720,7 @@ async def test_trusted_revoke_removes_only_exact_resource_owner(db_session):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["commit", "rollback"])
-async def test_trusted_revoke_defers_provider_work(db_session, monkeypatch, outcome):
+async def test_trusted_revoke_defers_provider_work(db_session, outcome):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(
@@ -4739,32 +4742,24 @@ async def test_trusted_revoke_defers_provider_work(db_session, monkeypatch, outc
     db.add(grant)
     db.commit()
     db.refresh(grant)
-    revoked_grants: list[int] = []
 
-    async def record_revoke(snapshot):
-        revoked_grants.append(snapshot.grant_id)
-
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", record_revoke
-    )
-
-    revocation = await mcp_api.revoke_mcp_oauth_grants_for_owner(
+    revoked = await mcp_api.revoke_mcp_oauth_grants_for_owner(
         server.id,
         user,
         db,
         resource_owner_key="toby:slack:workspace:alice",
     )
 
-    assert revocation.grant_count == 1
-    assert revoked_grants == []
+    # The status change enqueued the provider revocation inside the caller's
+    # transaction: it lands with the commit and vanishes with a rollback.
+    assert revoked == 1
     if outcome == "commit":
         db.commit()
-        await revocation.revoke_tokens()
-        assert revoked_grants == [grant.id]
+        assert credential_revocation_statuses(db) == ["pending"]
         return
 
     db.rollback()
-    assert revoked_grants == []
+    assert credential_revocation_statuses(db) == []
     assert db.get(MCPOAuthGrant, grant.id).status == "active"
 
 
@@ -4836,9 +4831,13 @@ async def test_delete_grant_revokes_external_tokens_when_endpoint_is_advertised(
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+    monkeypatch.setattr(
+        mcp_oauth_service, "create_mcp_oauth_http_client", async_client_factory
+    )
 
     await delete_mcp_oauth_grant(server.id, grant.id, user, db)
+    assert requests == []
+    await drain_credential_revocations(db)
 
     assert [request["token"] for request in requests] == [
         ["access-token"],
@@ -4855,7 +4854,7 @@ async def test_delete_grant_revokes_external_tokens_when_endpoint_is_advertised(
 
 
 @pytest.mark.asyncio
-async def test_delete_grant_treats_a_runtime_delete_during_revoke_as_done(
+async def test_delete_grant_treats_a_concurrent_runtime_delete_as_done(
     db_session, monkeypatch
 ):
     db, user, _ = db_session
@@ -4883,20 +4882,24 @@ async def test_delete_grant_treats_a_runtime_delete_during_revoke_as_done(
     db.refresh(grant)
     grant_id = grant.id
     SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    utc_now = mcp_api._utc_now
 
-    async def revoke_and_delete(*args, **kwargs):
+    def delete_then_now():
+        # A runtime refresh deletes the row after the endpoint read it.
         with SessionLocal() as other_db:
             other_db.delete(other_db.get(MCPOAuthGrant, grant_id))
             other_db.commit()
+        return utc_now()
 
-    monkeypatch.setattr(
-        mcp_api, "_revoke_mcp_oauth_grant_externally", revoke_and_delete
-    )
+    monkeypatch.setattr(mcp_api, "_utc_now", delete_then_now)
 
     await delete_mcp_oauth_grant(server.id, grant_id, user, db)
 
     db.expire_all()
     assert db.get(MCPOAuthGrant, grant_id) is None
+    # Its deletion enqueued the revocation; the endpoint's own status change
+    # was rolled back with nothing left to update.
+    assert credential_revocation_statuses(db) == ["pending"]
 
 
 def test_upsert_mcp_oauth_grant_locks_and_reinserts_a_deleted_row(
@@ -4976,8 +4979,8 @@ async def test_delete_mcp_server_revokes_external_tokens_when_endpoint_is_advert
     db_session, monkeypatch
 ):
     """M3's remaining half: disconnecting a server must actually reach the
-    provider's revocation_endpoint, not just flip local status (which was
-    already fixed in an earlier round but never called the external API)."""
+    provider's revocation_endpoint, not just flip local status. The
+    disconnect enqueues; the outbox worker calls the endpoint."""
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(
@@ -5013,9 +5016,13 @@ async def test_delete_mcp_server_revokes_external_tokens_when_endpoint_is_advert
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+    monkeypatch.setattr(
+        mcp_oauth_service, "create_mcp_oauth_http_client", async_client_factory
+    )
 
     await delete_mcp_server(server.id, current_user=user, db=db)
+    assert requests == []
+    await drain_credential_revocations(db)
 
     assert [request["token"] for request in requests] == [
         ["access-token"],
@@ -5108,9 +5115,14 @@ async def test_delete_mcp_server_preserves_inactive_association_semantics(db_ses
 
 
 @pytest.mark.asyncio
-async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
-    db_session, monkeypatch, caplog
+async def test_delete_grant_revokes_locally_when_a_token_cannot_be_decrypted(
+    db_session, monkeypatch
 ):
+    """A token under a lost key cannot be sent anywhere: the local revoke
+    still happens, and the outbox fails the record without a provider call
+    or the token in its error."""
+    from cryptography.fernet import Fernet
+
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(
@@ -5119,6 +5131,7 @@ async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
         token_endpoint_auth_method="none",
         metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
     )
+    unreadable = Fernet(Fernet.generate_key()).encrypt(b"raw-token").decode()
     grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=user.id,
@@ -5127,18 +5140,12 @@ async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
         scope="records.read",
-        access_token="not-encrypted-token",
+        access_token=unreadable,
     )
     db.add(grant)
     db.commit()
     db.refresh(grant)
     real_async_client = httpx.AsyncClient
-    real_decrypt_value = mcp_api.decrypt_value
-
-    def fail_target_token_decrypt(value: str) -> str:
-        if value == "not-encrypted-token":
-            raise ValueError("cannot decrypt raw-sensitive-provider-detail")
-        return real_decrypt_value(value)
 
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail("External revocation should be skipped when token decrypt fails")
@@ -5146,17 +5153,20 @@ async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
-    monkeypatch.setattr(mcp_api, "decrypt_value", fail_target_token_decrypt)
-    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+    monkeypatch.setattr(
+        mcp_oauth_service, "create_mcp_oauth_http_client", async_client_factory
+    )
 
     await delete_mcp_oauth_grant(server.id, grant.id, user, db)
+    await drain_credential_revocations(db)
 
     db.refresh(grant)
     assert grant.status == "revoked"
     assert grant.revoked_at is not None
-    assert "raw-sensitive-provider-detail" not in caplog.text
-    assert "stage=decrypt_access_token" in caplog.text
-    assert "exception_type=ValueError" in caplog.text
+    [record] = db.query(CredentialRevocation).all()
+    assert record.status == "failed"
+    assert "cannot be decrypted" in record.last_error
+    assert record.access_token is None
 
 
 @pytest.mark.asyncio
@@ -5296,8 +5306,8 @@ async def test_app_teardown_builtin_uses_exact_catalog_credential(db_session):
 
 
 @pytest.mark.asyncio
-async def test_app_teardown_rolls_back_then_commits_once_before_safe_revoke(
-    db_session, monkeypatch, caplog
+async def test_app_teardown_rolls_back_then_commits_once_and_enqueues(
+    db_session, caplog
 ):
     db, user, _ = db_session
     db.connection().exec_driver_sql("PRAGMA foreign_keys=ON")
@@ -5347,7 +5357,6 @@ async def test_app_teardown_rolls_back_then_commits_once_before_safe_revoke(
     ids = int(server.id), int(client.id)
     fail = {"once": True}
     commits: list[None] = []
-    revoked_grants: list[int] = []
 
     @event.listens_for(MCPServer, "before_delete")
     def fail_first_delete(_mapper, _connection, target):
@@ -5374,15 +5383,9 @@ async def test_app_teardown_rolls_back_then_commits_once_before_safe_revoke(
         assert db.get(MCPOAuthClient, ids[1]) is not None
         assert db.query(MCPOAuthGrant).count() == 3
         assert db.query(MCPOAuthFlowState).count() == 1
+        # The rolled-back attempt enqueued nothing either.
+        assert credential_revocation_statuses(db) == []
 
-        async def fail_revoke(snapshot):
-            assert not db.in_transaction()
-            revoked_grants.append(snapshot.grant_id)
-            raise RuntimeError("remote-secret-detail")
-
-        monkeypatch.setattr(
-            mcp_api, "_revoke_mcp_oauth_grant_snapshot_externally", fail_revoke
-        )
         await mcp_api.teardown_mcp_app_server(ids[0], **kwargs)
     finally:
         event.remove(MCPServer, "before_delete", fail_first_delete)
@@ -5393,9 +5396,10 @@ async def test_app_teardown_rolls_back_then_commits_once_before_safe_revoke(
     assert db.get(MCPOAuthClient, ids[1]) is None
     assert db.query(MCPOAuthGrant).count() == 0
     assert db.query(MCPOAuthFlowState).count() == 0
-    assert len(revoked_grants) == 1
+    # Every grant that was not already revoked is owed a provider revocation
+    # (the revoked one was enqueued when it became revoked).
+    assert credential_revocation_statuses(db) == ["pending", "pending"]
     assert "local-secret-detail" not in caplog.text
-    assert "remote-secret-detail" not in caplog.text
 
 
 @pytest.mark.parametrize(

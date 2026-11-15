@@ -6,6 +6,7 @@ from .api_idempotency_key import ApiIdempotencyKey
 from .auto_model import AutoModelCandidate, AutoModelConfig
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
 from .chat_message import TaskChatMessage
+from .credential_revocation import CredentialRevocation
 from .custom_api import CustomApi, UserCustomApi
 from .database import Base, get_db, get_engine, get_session_local
 from .deployment import Deployment, DeploymentOwnerType
@@ -133,6 +134,7 @@ __all__ = [
     "UserSkillFile",
     "OAuthProvider",
     "OAuthRevocationFence",
+    "CredentialRevocation",
     "OidcConsumedToken",
     "PublicMCPApp",
     "PublicMCPAppAudit",

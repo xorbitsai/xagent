@@ -1,8 +1,9 @@
 """Fence builtin OAuth grant revocations against concurrent callbacks.
 
 GitHub and Google revoke a whole grant per upstream account and OAuth client.
-A disconnect revokes only once no local row references that account any more
-(``has_other_builtin_oauth_reference``), but a concurrent callback for the
+The credential revocation outbox worker (``services.credential_revocations``)
+revokes a deleted credential only once no local row references that account
+any more (``has_other_builtin_oauth_reference``), but a concurrent callback for the
 same account may already have exchanged its code -- its tokens belong to the
 very grant about to be revoked -- without having committed its row yet. The
 revoke would then succeed and the callback would store dead credentials and

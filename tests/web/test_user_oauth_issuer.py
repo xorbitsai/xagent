@@ -9,6 +9,7 @@ re-creates the app, and refuses to guess when the issuer is unknown.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 from types import SimpleNamespace
@@ -19,12 +20,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from tests.shared.credential_revocations import drain_credential_revocations
 from tests.shared.oauth_browser_fixture import (
     create_access_token,
     generic_oauth_callback,
 )
-from xagent.core.utils.encryption import encrypt_value
+from xagent.core.utils.encryption import decrypt_value_strict, encrypt_value
 from xagent.web.api import auth as auth_api
+from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
@@ -192,11 +195,15 @@ def test_revocation_targets_the_recorded_issuer_after_a_catalog_change(
     row = _google_row(db, user)
     admin_change(db)
 
-    (revocation,) = auth_api.snapshot_builtin_oauth_revocations(db, [row])
+    db.delete(row)
+    db.commit()
 
-    assert revocation.provider == "google"
-    assert revocation.refresh_token == "google-refresh"
-    assert revocation.provider_user_id == "google-sub"
+    # The deletion's outbox record carries the recorded issuer, whatever the
+    # catalog says now; the worker revokes against it.
+    [record] = db.query(CredentialRevocation).all()
+    assert record.issuer == "google"
+    assert decrypt_value_strict(record.refresh_token) == "google-refresh"
+    assert record.provider_user_id == "google-sub"
 
 
 @pytest.mark.parametrize(
@@ -236,7 +243,7 @@ def test_an_unknown_issuer_resolves_to_no_revocation(db, caplog):
     assert "recorded no issuing provider" in caplog.text
 
 
-def test_an_unknown_issuer_row_is_never_snapshotted(db, user):
+def test_an_unknown_issuer_row_is_recorded_and_failed_without_a_guess(db, user):
     _custom_app(db, "google")
     row = UserOAuth(
         user_id=int(user.id),
@@ -248,8 +255,13 @@ def test_an_unknown_issuer_row_is_never_snapshotted(db, user):
     )
     db.add(row)
     db.commit()
+    db.delete(row)
+    asyncio.run(drain_credential_revocations(db))
 
-    assert auth_api.snapshot_builtin_oauth_revocations(db, [row]) == []
+    [record] = db.query(CredentialRevocation).all()
+    assert record.issuer is None
+    assert record.status == "failed"
+    assert "unknown issuer" in record.last_error
 
 
 def test_an_unknown_issuer_row_blocks_every_providers_revoke(db, user):
@@ -283,7 +295,9 @@ def test_composio_rows_have_no_issuer_and_are_never_revoked(db, user):
     db.commit()
 
     assert row.oauth_provider is None
-    assert auth_api.snapshot_builtin_oauth_revocations(db, [row]) == []
     assert not auth_api.has_other_builtin_oauth_reference(
         db, provider="google", provider_user_id="google-sub"
     )
+    db.delete(row)
+    db.commit()
+    assert db.query(CredentialRevocation).count() == 0

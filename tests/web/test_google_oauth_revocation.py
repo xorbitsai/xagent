@@ -6,12 +6,14 @@ Google grants are stored under the connecting app's id (``gmail``,
 issued to the same Google OAuth client -- so the revoke resolves the
 provider from the row's recorded issuer (``UserOAuth.oauth_provider``),
 revokes through the refresh token, and skips while any sibling row for the
-same Google account is still connected.
+same Google account is still connected. Deleting a row enqueues its
+revocation in the credential revocation outbox; these tests drain the outbox
+to see the provider call.
 """
 
 from __future__ import annotations
 
-import logging
+import asyncio
 from unittest.mock import Mock
 
 import pytest
@@ -19,13 +21,19 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
+from tests.shared.credential_revocations import (
+    credential_revocation_statuses,
+    drain_credential_revocations,
+)
 from xagent.web.api import auth as auth_api
+from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import COMPOSIO_TOKEN_TYPE, UserOAuth
+from xagent.web.services.credential_revocations import ProviderRevocationError
 from xagent.web.services.google_oauth_grants import (
     create_google_oauth_grant_association,
 )
@@ -74,6 +82,31 @@ def _user(db: Session, username: str = "alice") -> User:
     db.commit()
     db.refresh(user)
     return user
+
+
+def _revoke_deleted(
+    db: Session,
+    *,
+    provider_user_id: str | None = "sub-1",
+    refresh_token: str | None = None,
+) -> CredentialRevocation:
+    """Delete one Gmail row of a user of its own, drain the outbox, and
+    return the row's record."""
+    user = _user(db, "deleting-user")
+    row = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        oauth_provider="google",
+        provider_user_id=provider_user_id,
+        access_token="access",
+        refresh_token=refresh_token,
+    )
+    db.add(row)
+    db.commit()
+    db.delete(row)
+    asyncio.run(drain_credential_revocations(db))
+    db.expire_all()
+    return db.query(CredentialRevocation).one()
 
 
 def _assert_revoked_with(post: Mock, token: str) -> None:
@@ -135,24 +168,13 @@ def test_revocation_repr_redacts_the_refresh_token():
 def test_revoke_prefers_the_refresh_token(db, post):
     """An access token may have expired, and Google answers an expired one
     with invalid_token without revoking the grant behind it."""
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token="refresh")
 
     _assert_revoked_with(post, "refresh")
 
 
 def test_revoke_falls_back_to_the_access_token(db, post):
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token=None)
 
     _assert_revoked_with(post, "access")
 
@@ -172,13 +194,7 @@ def test_revoke_skips_while_a_sibling_google_app_is_connected(db, post):
     )
     db.commit()
 
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token="refresh")
 
     post.assert_not_called()
 
@@ -196,13 +212,7 @@ def test_a_composio_sibling_does_not_block_the_revoke(db, post):
     )
     db.commit()
 
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token="refresh")
 
     _assert_revoked_with(post, "refresh")
 
@@ -222,13 +232,7 @@ def test_a_google_row_without_an_upstream_id_is_never_revoked(db, post):
     )
     db.commit()
 
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id=None,
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id=None, refresh_token="refresh")
 
     post.assert_not_called()
 
@@ -248,13 +252,7 @@ def test_a_same_user_google_row_without_an_upstream_id_blocks_the_revoke(db, pos
     )
     db.commit()
 
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token="refresh")
 
     post.assert_not_called()
 
@@ -276,13 +274,7 @@ def test_another_users_google_row_without_an_upstream_id_blocks_the_revoke(db, p
     )
     db.commit()
 
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token="refresh")
 
     post.assert_not_called()
 
@@ -313,24 +305,14 @@ def test_a_tokenless_or_composio_google_row_without_an_upstream_id_does_not_bloc
     )
     db.commit()
 
-    auth_api.revoke_builtin_oauth_grant(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
+    _revoke_deleted(db, provider_user_id="sub-1", refresh_token="refresh")
 
     _assert_revoked_with(post, "refresh")
 
 
-@pytest.mark.asyncio
-async def test_the_skip_log_names_an_unidentified_legacy_row_and_the_context(
-    db, post, caplog
-):
-    """Once such a row exists every Google revoke is skipped, so the log must
-    tell it apart from an ordinary sibling reference and say which disconnect
-    path was skipped."""
+def test_the_skip_names_an_unidentified_legacy_row(db, post):
+    """Once such a row exists every Google revoke is skipped, so the record
+    must tell it apart from an ordinary sibling reference."""
     user = _user(db)
     db.add(
         UserOAuth(
@@ -342,27 +324,16 @@ async def test_the_skip_log_names_an_unidentified_legacy_row_and_the_context(
         )
     )
     db.commit()
-    revocation = auth_api.BuiltinOAuthRevocation(
-        provider="google",
-        access_token="access",
-        client_id="",
-        client_secret="",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
 
-    with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
-        await auth_api.revoke_builtin_oauth_grants(
-            db, [revocation], context="deleting server 7"
-        )
+    record = _revoke_deleted(db, refresh_token="refresh")
 
     post.assert_not_called()
-    assert "no recorded account id" in caplog.text
-    assert "deleting server 7" in caplog.text
-    assert "another local connection" not in caplog.text
+    assert record.status == "skipped"
+    assert "no recorded account id" in record.last_error
+    assert "another local connection" not in record.last_error
 
 
-def test_the_skip_log_names_a_sibling_row_recording_the_same_account(db, post, caplog):
+def test_the_skip_names_a_sibling_row_recording_the_same_account(db, post):
     user = _user(db)
     db.add(
         UserOAuth(
@@ -375,42 +346,36 @@ def test_the_skip_log_names_a_sibling_row_recording_the_same_account(db, post, c
     )
     db.commit()
 
-    with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
-        auth_api.revoke_builtin_oauth_grant(
-            db,
-            oauth_provider="google",
-            access_token="access",
-            provider_user_id="sub-1",
-            refresh_token="refresh",
-        )
+    record = _revoke_deleted(db, refresh_token="refresh")
 
     post.assert_not_called()
-    assert "another local connection" in caplog.text
-    assert "no recorded account id" not in caplog.text
+    assert record.status == "skipped"
+    assert "another local connection" in record.last_error
+    assert "no recorded account id" not in record.last_error
 
 
-def test_a_rejected_access_token_is_logged_as_not_revoked(monkeypatch, caplog):
+def test_a_rejected_access_token_is_reported_as_not_revoked(monkeypatch):
     """Google answers an expired access token with invalid_token without
-    revoking the grant behind it: that must not read as success."""
+    revoking the grant behind it: that must not read as a revocation, and
+    retrying would not help either."""
     monkeypatch.setattr(
         auth_api.requests,
         "post",
         Mock(return_value=MockResponse(400, '{"error": "invalid_token"}')),
     )
 
-    with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
-        auth_api._revoke_google_oauth_token("access", kind="access_token")
+    detail = auth_api._revoke_google_oauth_token("access", kind="access_token")
 
-    assert "not revoked" in caplog.text
+    assert "cannot be revoked" in detail
 
 
-def test_an_unknown_provider_record_is_skipped_not_sent_to_github(monkeypatch, caplog):
+def test_an_unknown_provider_record_is_refused_not_sent_to_github(monkeypatch):
     delete = Mock()
     post = Mock()
     monkeypatch.setattr(auth_api.requests, "delete", delete)
     monkeypatch.setattr(auth_api.requests, "post", post)
 
-    with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
+    with pytest.raises(ValueError, match="no revoke implementation"):
         auth_api.revoke_resolved_builtin_oauth_grant(
             auth_api.BuiltinOAuthRevocation(
                 provider="slack",
@@ -423,51 +388,51 @@ def test_an_unknown_provider_record_is_skipped_not_sent_to_github(monkeypatch, c
 
     delete.assert_not_called()
     post.assert_not_called()
-    assert "no revoke implementation" in caplog.text
 
 
 @pytest.mark.parametrize(
-    ("response", "warned"),
+    ("response", "settled"),
     [
-        (MockResponse(200), False),
-        # Already revoked or expired: also a successful outcome.
-        (MockResponse(400, '{"error": "invalid_token"}'), False),
-        (MockResponse(400, '{"error": "unsupported_token_type"}'), True),
-        (MockResponse(503), True),
+        (MockResponse(200), True),
+        # Already revoked or expired: also a settled outcome.
+        (MockResponse(400, '{"error": "invalid_token"}'), True),
+        (MockResponse(400, '{"error": "unsupported_token_type"}'), False),
+        (MockResponse(503), False),
     ],
 )
-def test_revoke_google_token_logs_only_genuine_failures(
-    monkeypatch, caplog, response, warned
+def test_revoke_google_token_raises_only_on_genuine_failures(
+    monkeypatch, response, settled
 ):
     monkeypatch.setattr(auth_api.requests, "post", Mock(return_value=response))
 
-    with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
+    if settled:
         auth_api._revoke_google_oauth_token("tok", kind="refresh_token")
+    else:
+        with pytest.raises(ProviderRevocationError, match=str(response.status_code)):
+            auth_api._revoke_google_oauth_token("tok", kind="refresh_token")
 
-    assert bool(caplog.records) is warned
 
-
-def test_revoke_google_token_swallows_a_failure_without_leaking_it(monkeypatch, caplog):
+def test_revoke_google_token_failure_does_not_leak_the_token(monkeypatch):
     monkeypatch.setattr(
         auth_api.requests,
         "post",
         Mock(side_effect=RuntimeError("boom secret-refresh-token")),
     )
 
-    with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
-        # Must not raise.
+    with pytest.raises(ProviderRevocationError) as raised:
         auth_api._revoke_google_oauth_token(
             "secret-refresh-token", kind="refresh_token"
         )
 
-    assert "RuntimeError" in caplog.text
-    assert "secret-refresh-token" not in caplog.text
+    assert "RuntimeError" in str(raised.value)
+    assert "secret-refresh-token" not in str(raised.value)
+    assert raised.value.__cause__ is None
 
 
 @pytest.mark.asyncio
 async def test_delete_mcp_server_revokes_the_google_grant(db, post):
-    """The disconnect endpoints snapshot the refresh token before the bulk
-    delete and revoke it after the commit."""
+    """The disconnect's bulk delete enqueues the row as stored, and the
+    outbox revokes through its refresh token."""
     from xagent.web.api.mcp import delete_mcp_server
 
     user = _user(db)
@@ -494,6 +459,8 @@ async def test_delete_mcp_server_revokes_the_google_grant(db, post):
     db.commit()
 
     await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
+    post.assert_not_called()
+    await drain_credential_revocations(db)
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     _assert_revoked_with(post, "refresh")
@@ -559,6 +526,8 @@ async def test_mcp_disconnect_revokes_the_shared_grant_its_last_link_deletes(db,
     db.commit()
 
     await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
+    post.assert_not_called()
+    await drain_credential_revocations(db)
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     _assert_revoked_with(post, "shared-refresh")
@@ -574,6 +543,7 @@ async def test_cloud_account_delete_revokes_the_shared_grant_its_last_link_delet
     legacy = _shared_grant_with_tombstoned_last_link(db, user)
 
     await delete_connected_account(account_id=int(legacy.id), db=db, user=user)
+    await drain_credential_revocations(db)
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     _assert_revoked_with(post, "shared-refresh")
@@ -581,8 +551,8 @@ async def test_cloud_account_delete_revokes_the_shared_grant_its_last_link_delet
 
 @pytest.mark.asyncio
 async def test_a_shared_grant_a_sibling_app_still_links_is_not_revoked(db, post):
-    """The shared credential is snapshotted before every detach, but one that
-    survives it is still there for the reference check."""
+    """The shared credential survives the detach, so it is still there for
+    the reference check of the deleted legacy row's record."""
     from xagent.web.api.cloud_storage import delete_connected_account
 
     user = _user(db)
@@ -608,6 +578,7 @@ async def test_a_shared_grant_a_sibling_app_still_links_is_not_revoked(db, post)
     db.commit()
 
     await delete_connected_account(account_id=int(legacy.id), db=db, user=user)
+    await drain_credential_revocations(db)
 
     assert db.query(UserOAuth).filter(UserOAuth.provider == "google").count() == 1
     post.assert_not_called()
@@ -615,8 +586,9 @@ async def test_a_shared_grant_a_sibling_app_still_links_is_not_revoked(db, post)
 
 @pytest.mark.asyncio
 async def test_deleting_a_non_google_account_leaves_the_google_fences_alone(db, post):
-    """A Dropbox disconnect cannot detach a shared Google link, so it must not
-    pay for a fence insert, lock and reference query per shared Google row."""
+    """A Dropbox disconnect cannot detach a shared Google link, and Dropbox
+    has no provider-side revocation, so its record is skipped without a
+    fence insert, lock or reference query."""
     from xagent.web.api.cloud_storage import delete_connected_account
 
     user = _user(db)
@@ -632,7 +604,9 @@ async def test_deleting_a_non_google_account_leaves_the_google_fences_alone(db, 
     db.commit()
 
     await delete_connected_account(account_id=int(dropbox.id), db=db, user=user)
+    await drain_credential_revocations(db)
 
+    assert credential_revocation_statuses(db) == ["skipped"]
     assert db.query(UserOAuth).filter(UserOAuth.provider == "dropbox").count() == 0
     assert db.query(UserOAuth).filter(UserOAuth.provider == "google").count() == 1
     assert db.query(OAuthRevocationFence).count() == 0

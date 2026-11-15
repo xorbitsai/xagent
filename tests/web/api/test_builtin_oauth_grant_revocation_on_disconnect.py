@@ -1,15 +1,14 @@
 """Revoking a builtin OAuth grant when a GitHub-backed connection is
 disconnected through any of the generic connector endpoints.
 
-Disconnecting only deletes the local ``UserOAuth`` row; GitHub's own grant
-stays alive unless something also calls its revoke API, which is exactly
-what lets a reconnect silently skip GitHub's consent screen (see
-auth.py's ``resolve_builtin_oauth_revocation`` /
-``revoke_builtin_oauth_grants``). This pins that *every* generic disconnect
-endpoint calls it -- ``delete_mcp_server`` and the app-scoped
-``teardown_mcp_app_server`` in mcp.py, and cloud_storage.py's
-``delete_connected_account`` -- not just Toby's own personal-connector
-disconnect path (covered separately in ``xagent-saas``'s own test suite).
+Disconnecting deletes the local ``UserOAuth`` row; GitHub's own grant stays
+alive unless something also calls its revoke API, which is exactly what lets
+a reconnect silently skip GitHub's consent screen. The deletion enqueues a
+credential revocation outbox record (a database trigger) and the outbox
+worker calls GitHub. This pins that *every* generic disconnect endpoint --
+``delete_mcp_server`` and the app-scoped ``teardown_mcp_app_server`` in
+mcp.py, and cloud_storage.py's ``delete_connected_account`` -- ends in that
+call once the outbox is drained, and never calls GitHub itself.
 """
 
 from __future__ import annotations
@@ -21,6 +20,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from tests.shared.credential_revocations import (
+    credential_revocation_statuses,
+    drain_credential_revocations,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.models.database import Base
@@ -137,6 +140,8 @@ async def test_delete_mcp_server_revokes_the_github_grant(db, monkeypatch):
     await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    delete.assert_not_called()
+    await drain_credential_revocations(db)
     _assert_github_grant_was_revoked(delete)
 
 
@@ -144,7 +149,7 @@ async def test_delete_mcp_server_skips_revocation_with_a_live_sibling(db, monkey
     """The end-to-end regression for the sibling-reference finding: a
     second XAgent user connected to the same upstream GitHub account keeps
     working after the first user disconnects. Exercised through the real
-    disconnect endpoint and the real _snapshot_builtin_oauth_revocations ->
+    disconnect endpoint, the outbox trigger and the worker's
     has_other_builtin_oauth_reference path, not a hand-built
     BuiltinOAuthRevocation -- a wiring bug that drops or miswires
     provider_user_id anywhere along that path would go undetected by a
@@ -170,17 +175,19 @@ async def test_delete_mcp_server_skips_revocation_with_a_live_sibling(db, monkey
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
+    await drain_credential_revocations(db)
 
     # The disconnecting user's own row is gone -- disconnect still worked --
     # but GitHub was never called, so bob's still-live token survives.
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
     delete.assert_not_called()
+    assert credential_revocation_statuses(db) == ["skipped"]
 
 
 async def test_delete_mcp_server_disconnect_survives_a_revoke_failure(db, monkeypatch):
     """A dead network to GitHub must not turn an otherwise-successful
-    disconnect into a failed request."""
+    disconnect into a failed request: the revocation stays owed."""
     from xagent.web.api.mcp import delete_mcp_server
 
     user, server, _user_mcp = _connected_github_server(db)
@@ -193,6 +200,8 @@ async def test_delete_mcp_server_disconnect_survives_a_revoke_failure(db, monkey
     await delete_mcp_server(server_id=int(server.id), current_user=user, db=db)
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    await drain_credential_revocations(db)
+    assert credential_revocation_statuses(db) == ["pending"]
 
 
 @pytest.fixture()
@@ -234,6 +243,8 @@ async def test_teardown_mcp_app_server_revokes_the_github_grant(
     )
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    delete.assert_not_called()
+    await drain_credential_revocations(db)
     _assert_github_grant_was_revoked(delete)
 
 
@@ -271,10 +282,12 @@ async def test_teardown_mcp_app_server_skips_revocation_with_a_live_sibling(
         current_user=user,
         db=db,
     )
+    await drain_credential_revocations(db)
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
     assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
     delete.assert_not_called()
+    assert credential_revocation_statuses(db) == ["skipped"]
 
 
 async def test_teardown_mcp_app_server_disconnect_survives_a_revoke_failure(
@@ -306,15 +319,15 @@ async def test_teardown_mcp_app_server_disconnect_survives_a_revoke_failure(
     )
 
     assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).count() == 0
+    await drain_credential_revocations(db)
+    assert credential_revocation_statuses(db) == ["pending"]
 
 
-async def test_snapshot_builtin_oauth_revocations_captures_every_matching_row(db):
-    """The core claim the whole feature rests on: the snapshot must read
-    *every* matching row before the bulk delete removes them, not just the
-    first one -- delete_scoped_user_oauth_accounts is a single SQL
-    statement with no per-row callback, so a snapshot that only captured
-    one row would silently lose the others' tokens with no error."""
-    from xagent.web.api.mcp import _snapshot_builtin_oauth_revocations
+async def test_a_bulk_disconnect_enqueues_every_matching_row(db, monkeypatch):
+    """The disconnect deletes with one bulk SQL statement that never loads
+    the rows; each row still gets its own outbox record with its own token,
+    and the drain revokes both grants."""
+    from xagent.web.services.user_oauth import delete_scoped_user_oauth_accounts
 
     user = User(username="multi-github", password_hash="h", is_admin=False)
     db.add(user)
@@ -326,35 +339,30 @@ async def test_snapshot_builtin_oauth_revocations_captures_every_matching_row(db
     # unusual, but nothing in the schema prevents it (the ordinary-row
     # uniqueness index is on (user_id, provider, provider_user_id), so two
     # different provider_user_id values are two legal rows).
-    db.add(
-        UserOAuth(
-            user_id=int(user.id),
-            provider="github",
-            oauth_provider="github",
-            provider_user_id="42",
-            access_token="first-account-token",
+    for subject, token in (("42", "first-account-token"), ("43", "second-account-token")):
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="github",
+                oauth_provider="github",
+                provider_user_id=subject,
+                access_token=token,
+            )
         )
-    )
-    db.add(
-        UserOAuth(
-            user_id=int(user.id),
-            provider="github",
-            oauth_provider="github",
-            provider_user_id="43",
-            access_token="second-account-token",
-        )
-    )
     db.commit()
+    delete = Mock(return_value=MockResponse())
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
 
-    resolved = _snapshot_builtin_oauth_revocations(
-        db, user_id=int(user.id), providers=["github"]
+    delete_scoped_user_oauth_accounts(
+        db, user_id=int(user.id), resource_owner_key=None, providers=["github"]
     )
+    await drain_credential_revocations(db)
 
-    assert {r.access_token for r in resolved} == {
+    assert {call.kwargs["json"]["access_token"] for call in delete.call_args_list} == {
         "first-account-token",
         "second-account-token",
     }
-    assert {r.provider_user_id for r in resolved} == {"42", "43"}
+    assert credential_revocation_statuses(db) == ["revoked", "revoked"]
 
 
 def _seed_bare_github_account(db: Session) -> tuple[User, UserOAuth]:
@@ -407,6 +415,8 @@ async def test_delete_connected_account_revokes_the_github_grant(db, monkeypatch
     await delete_connected_account(int(account.id), db=db, user=user)
 
     assert db.get(UserOAuth, int(account.id)) is None
+    delete.assert_not_called()
+    await drain_credential_revocations(db)
     _assert_github_grant_was_revoked(delete)
 
 
@@ -434,6 +444,7 @@ async def test_delete_connected_account_skips_revocation_with_a_live_sibling(
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     await delete_connected_account(int(account.id), db=db, user=user)
+    await drain_credential_revocations(db)
 
     assert db.get(UserOAuth, int(account.id)) is None
     assert db.query(UserOAuth).filter(UserOAuth.user_id == other_user.id).count() == 1
@@ -464,6 +475,7 @@ async def test_delete_connected_account_ignores_token_cleared_sibling_reference(
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     await delete_connected_account(int(account.id), db=db, user=user)
+    await drain_credential_revocations(db)
 
     assert db.get(UserOAuth, int(tombstone.id)) is not None
     _assert_github_grant_was_revoked(delete)
@@ -482,3 +494,5 @@ async def test_delete_connected_account_survives_a_revoke_failure(db, monkeypatc
     await delete_connected_account(int(account.id), db=db, user=user)
 
     assert db.get(UserOAuth, int(account.id)) is None
+    await drain_credential_revocations(db)
+    assert credential_revocation_statuses(db) == ["pending"]

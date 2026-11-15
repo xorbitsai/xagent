@@ -1217,6 +1217,24 @@ def test_metadata_that_is_not_an_object_fails_only_its_document(
     assert adapter.calls == [["text c2"]]
 
 
+@pytest.mark.parametrize("field", ["chunk_hash", "parse_hash"])
+def test_a_source_row_without_a_hash_fails_its_document_before_any_provider_call(
+    adapter: _Adapter, field: str
+) -> None:
+    _save_collection()
+    _seed_core({"d1": ["c1", "c2"], "d2": ["c3"]})
+    _write([_src("c1"), _src("c2"), _src("c3", "d2")])
+    scope.connection().open_table(scope.source_table(SOURCE)).update(
+        where="chunk_id = 'c2'", values_sql={field: "NULL"}
+    )
+
+    report = _run()
+
+    assert list(report.failures) == ["d1"]
+    assert (report.written, _target_ids()) == (1, ["c3"])
+    assert adapter.calls == [["text c3"]]
+
+
 def test_consecutive_document_failures_abort_the_run(adapter: _Adapter) -> None:
     docs = {f"d{index}": [f"c{index}"] for index in range(6)}
     _save_collection()

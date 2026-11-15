@@ -320,6 +320,18 @@ def _xero_paged_pin(
 # The Tier 2 read checks (issue #3573): the tool, its arguments, and every
 # assertion, so dropping an item key or a whole assertion fails here.
 _TIER_2_READS: Mapping[str, tuple[str, dict[str, Any], tuple[Assertion, ...]]] = {
+    "mixpanel.query_engage": (
+        "mixpanel_query_engage",
+        {},
+        (
+            StatusSuccess(),
+            HasKeys((), ("engage", "truncated")),
+            HasKeys(("engage",), ("page", "page_size", "results", "total")),
+            IsType(("engage", "results"), "array"),
+            IsType(("engage", "total"), "number"),
+            IsType(("truncated",), "boolean"),
+        ),
+    ),
     "google-ads.list_accessible_customers": (
         "google_ads_list_accessible_customers",
         {},

@@ -45,7 +45,6 @@ _PINNED_LEGACY = frozenset(
         "linkedin",
         "magento",
         "meta-ads",
-        "mixpanel",
         "myob",
         "posthog",
         "rocketlane",

@@ -60,6 +60,28 @@ async def run_tracked(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
                 _active -= 1
 
 
+async def run_tracked_to_completion(
+    fn: Callable[..., T], /, *args: Any, **kwargs: Any
+) -> T:
+    """:func:`run_tracked` that a cancel cannot cut short once it was started.
+
+    A cancelled await still waits for the worker thread (and for a thread that
+    had not started yet, which is then started and finished) before the
+    cancellation propagates. For blocking startup work whose half-done state
+    must never be left behind: a migration, a schema seed. The result of a
+    cancelled call is discarded.
+    """
+    task = asyncio.ensure_future(run_tracked(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            await asyncio.wait({task})
+        if not task.cancelled():
+            task.exception()  # consumed: the caller is already being cancelled
+        raise
+
+
 def start_tracked_thread(
     target: Callable[..., Any],
     *,

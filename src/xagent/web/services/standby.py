@@ -42,6 +42,49 @@ DeferredStep = Callable[[], Awaitable[None]]
 FailureHook = Callable[[], Awaitable[None]]
 
 
+_LAG_PROBE_INTERVAL_SECONDS = 0.05
+
+
+class _LoopLagProbe:
+    """Track how late the event loop wakes a short sleep: its worst stall.
+
+    A step that blocks the loop (synchronous database work, a slow admission)
+    makes every request wait, including the host's lifecycle polls. The
+    activation log names the step and its stall so the next one is obvious.
+    """
+
+    def __init__(self) -> None:
+        self.max_lag = 0.0
+        self._expected: float | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    def worst_lag(self) -> float:
+        """Max lag so far, counting a tick that is overdue and not yet seen.
+
+        A stall that ends exactly as a step returns has not woken the probe
+        yet; its overdue tick is the stall.
+        """
+        if self._expected is None:
+            return self.max_lag
+        return max(self.max_lag, asyncio.get_running_loop().time() - self._expected)
+
+    def start(self) -> None:
+        self._task = asyncio.ensure_future(self._run())
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            self._expected = loop.time() + _LAG_PROBE_INTERVAL_SECONDS
+            await asyncio.sleep(_LAG_PROBE_INTERVAL_SECONDS)
+            self.max_lag = max(self.max_lag, loop.time() - self._expected)
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 class StandbyController:
     """Ordered ledger of the startup steps a standby process postponed."""
 
@@ -122,6 +165,9 @@ class StandbyController:
             self._activated_at = time.time()
             steps = list(self._steps)
             hooks = self._failure_hooks
+            probe = _LoopLagProbe()
+            probe.start()
+            overall_started = time.monotonic()
             try:
                 for name, step in steps:
                     if self._phase is not StandbyPhase.ACTIVATING:
@@ -130,7 +176,18 @@ class StandbyController:
                         logger.info("Standby activation stopped before %s", name)
                         return
                     logger.info("Standby activation: %s", name)
-                    await step()
+                    step_started = time.monotonic()
+                    probe.max_lag = 0.0
+                    try:
+                        await step()
+                    finally:
+                        logger.info(
+                            "Standby activation step %s took %.2fs "
+                            "(max event loop lag %.3fs)",
+                            name,
+                            time.monotonic() - step_started,
+                            probe.worst_lag(),
+                        )
             except BaseException:
                 if self._phase is StandbyPhase.ACTIVATING:
                     self._activated_at = None
@@ -142,11 +199,16 @@ class StandbyController:
                     except Exception:
                         logger.exception("Standby failure hook failed")
                 raise
+            finally:
+                await probe.stop()
             # A shutdown that reset the ledger mid-activation owns the phase.
             if self._phase is StandbyPhase.ACTIVATING:
                 self._steps.clear()
                 self._phase = StandbyPhase.ACTIVE
-                logger.info("Standby activation complete")
+                logger.info(
+                    "Standby activation complete in %.2fs",
+                    time.monotonic() - overall_started,
+                )
 
     def snapshot(self) -> dict[str, object]:
         return {

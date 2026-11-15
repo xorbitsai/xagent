@@ -151,7 +151,11 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
-from .services.writer_workers import drain_workers, run_tracked
+from .services.writer_workers import (
+    drain_workers,
+    run_tracked,
+    run_tracked_to_completion,
+)
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
@@ -1951,11 +1955,11 @@ async def _admit_database_and_host(app_instance: FastAPI, *, bound: bool) -> Non
     ``bound`` is a standby that already bound its engine and passed the
     read-only checks: it completes the deferred half instead of ``init_db``.
     """
+    # Blocking (migrations, key validation, schema seed): off the event loop so
+    # lifecycle requests keep being answered, and never cut short by a cancel
+    # that would leave the schema half-initialized.
     with _startup_phase("database init"):
-        if bound:
-            complete_standby_db_init()
-        else:
-            init_db()
+        await run_tracked_to_completion(complete_standby_db_init if bound else init_db)
 
     # Host checks may rely on the fully migrated database. Nothing below this
     # boundary may admit tasks or launch a writer/dispatcher until every check

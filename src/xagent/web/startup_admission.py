@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+from collections.abc import Awaitable
 from typing import Protocol
 
 from fastapi import FastAPI
@@ -10,9 +13,15 @@ _CALLBACKS_STATE_KEY = "_host_startup_admission_callbacks"
 
 
 class HostStartupAdmissionCallback(Protocol):
-    """Async host check that returns on admission and raises on rejection."""
+    """Host check that returns on admission and raises on rejection.
 
-    async def __call__(self) -> None: ...
+    Either ``async def`` (runs on the event loop: it must only await) or a
+    plain ``def`` (runs in a worker thread, so blocking database or file work
+    never stalls the loop that answers lifecycle requests during a standby
+    activation).
+    """
+
+    def __call__(self) -> Awaitable[None] | None: ...
 
 
 def register_host_startup_admission(
@@ -36,7 +45,20 @@ def register_host_startup_admission(
 async def run_host_startup_admissions(app: FastAPI) -> None:
     """Run a stable snapshot of this app's registered admission callbacks."""
     for callback in _get_callbacks(app):
-        await callback()
+        if _is_async_callback(callback):
+            await callback()
+            continue
+        from .services.writer_workers import run_tracked_to_completion
+
+        result = await run_tracked_to_completion(callback)
+        if inspect.isawaitable(result):
+            await result
+
+
+def _is_async_callback(callback: HostStartupAdmissionCallback) -> bool:
+    return asyncio.iscoroutinefunction(callback) or asyncio.iscoroutinefunction(
+        getattr(callback, "__call__", None)
+    )
 
 
 def _get_callbacks(app: FastAPI) -> tuple[HostStartupAdmissionCallback, ...]:

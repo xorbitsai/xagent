@@ -260,6 +260,7 @@ WEB_SEARCH_MODEL_IDS: dict[str, str] = {
     "tavily": "platform/web-search-tavily",
     "exa": "platform/web-search-exa",
     "google": "platform/web-search-google",
+    "brave": "platform/web-search-brave",
 }
 
 

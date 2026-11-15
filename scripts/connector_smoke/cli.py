@@ -62,10 +62,64 @@ def run_l1(
 
     results = l1.check_catalog(apps, expected)
     for target in l1.select_oauth_targets(apps, preferred=expected):
-        results.extend(
-            _check_oauth_target(client, target, expected_origin, oauth_accounts)
-        )
+        if target.auth_backend == l1.COMPOSIO_BACKEND:
+            results.extend(_check_composio_target(client, target, oauth_accounts))
+        else:
+            results.extend(
+                _check_oauth_target(client, target, expected_origin, oauth_accounts)
+            )
     return results
+
+
+def _check_composio_target(
+    client: SmokeClient,
+    target: l1.OAuthTarget,
+    oauth_accounts: Mapping[str, str],
+) -> list[l1.CheckResult]:
+    provider = target.provider
+    name = f"oauth:{provider}:composio"
+    account = oauth_accounts.get(provider)
+    if target.needs_account and account is None:
+        return [
+            l1.CheckResult(
+                name,
+                False,
+                f"needs an account label: pass --oauth-account {provider}=<label>",
+            )
+        ]
+    try:
+        start = client.start_launch(provider, target.app_id, account)
+    except SmokeError as exc:
+        return [l1.CheckResult(name, False, str(exc))]
+    if start.status_code != 200:
+        return [
+            l1.CheckResult(
+                name,
+                False,
+                "launch start refused: "
+                + l1.start_refused_detail(start.status_code, start.payload),
+            )
+        ]
+    origin = l1.start_callback_origin(start.payload)
+    if origin is None:
+        return [
+            l1.CheckResult(
+                name, False, "launch start returned no usable callback origin"
+            )
+        ]
+    try:
+        redeem = client.redeem_launch(provider, start.payload.get("authorization_url"))
+    except SmokeError as exc:
+        return [l1.CheckResult(name, False, str(exc))]
+    return [
+        l1.check_composio_callback(
+            provider,
+            status_code=redeem.status_code,
+            location=redeem.location,
+            body=redeem.body,
+            expected_origin=origin,
+        )
+    ]
 
 
 def _check_oauth_target(
@@ -84,7 +138,6 @@ def _check_oauth_target(
                 f"needs an account label: pass --oauth-account {provider}=<label>",
             )
         ]
-
     try:
         start = client.start_launch(provider, target.app_id, account)
     except SmokeError as exc:

@@ -120,6 +120,7 @@ from ..config import COMPOSIO_CALLBACK_URL as COMPOSIO_CALLBACK_URL_ENV
 from ..config import get_composio_callback_url
 from ..core.utils import public_requests as requests
 from .auth_sessions import lock_current_session_epoch
+from .composio_apps import _CALLBACK_PATHS as _CALLBACK_PATHS
 from .composio_apps import _GOOGLE_SUBJECT_RE as _GOOGLE_SUBJECT_RE
 from .composio_apps import _GRAPH_ID_RE as _GRAPH_ID_RE
 from .composio_apps import _SALESFORCE_HOST_RE as _SALESFORCE_HOST_RE
@@ -135,7 +136,9 @@ from .composio_apps import _WARNED_BACKENDS as _WARNED_BACKENDS
 from .composio_apps import (  # noqa: F401  (re-exported: the switch lookup moved)
     AUTH_BACKEND as AUTH_BACKEND,
 )
+from .composio_apps import COMPOSIO_API_KEY_ENV as COMPOSIO_API_KEY_ENV
 from .composio_apps import COMPOSIO_APPS as COMPOSIO_APPS
+from .composio_apps import COMPOSIO_CALLBACK_PATH as COMPOSIO_CALLBACK_PATH
 from .composio_apps import (
     COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV as COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV,
 )
@@ -151,6 +154,7 @@ from .composio_apps import (
 from .composio_apps import (
     COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV as COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV,
 )
+from .composio_apps import COMPOSIO_USER_ID_SECRET_ENV as COMPOSIO_USER_ID_SECRET_ENV
 from .composio_apps import FACEBOOK_APP_ID as FACEBOOK_APP_ID
 from .composio_apps import FACEBOOK_AUTH_BACKEND_ENV as FACEBOOK_AUTH_BACKEND_ENV
 from .composio_apps import FACEBOOK_TOOLKIT_SLUG as FACEBOOK_TOOLKIT_SLUG
@@ -189,20 +193,9 @@ logger = logging.getLogger(__name__)
 # the two lands second switches to the shared constant.
 COMPOSIO_TOKEN_TYPE = "composio"
 
-COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
-COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
 COMPOSIO_API_BASE_URL = "https://backend.composio.dev/api/v3.1"
 
-# Every Composio app's trips (begin, verification, denial) land on one shared
-# callback URL, whatever the app's own provider: Composio's OAuth user
-# verification is a single URL per project, and the flow and actor proof
-# cookies are scoped to the path they come back to. XAGENT_COMPOSIO_CALLBACK_URL
-# sets it (to COMPOSIO_CALLBACK_PATH after the cutover); unset, it is the Meta callback
-# URL, where these trips have always been accepted.
-COMPOSIO_CALLBACK_PATH = "/api/auth/composio/callback"
 DEFAULT_CALLBACK_PROVIDER = META_PROVIDER
-# The two routes that accept the trips; the setting must name one of them.
-_CALLBACK_PATHS = (COMPOSIO_CALLBACK_PATH, "/api/auth/meta/callback")
 # Logged as the provider of a trip whose app is not known yet.
 UNKNOWN_APP_PROVIDER = "composio"
 
@@ -249,15 +242,6 @@ class ComposioError(Exception):
         super().__init__(reason)
         self.reason = reason
         self.rejected = rejected
-
-
-def connect_guidance(provider: str, app_id: str | None) -> dict[str, str] | None:
-    """The app's connect guidance while its new connects go through
-    Composio; None otherwise, so a catalog entry can leave the field out."""
-    app = composio_app(provider, app_id)
-    if app is None or app.connect_guidance is None:
-        return None
-    return dict(app.connect_guidance)
 
 
 def load_config(app_id: str) -> ComposioConfig | None:

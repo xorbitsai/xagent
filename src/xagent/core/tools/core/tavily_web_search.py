@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .media_usage import record_web_search_usage
+from .web_search_guard import run_guarded_search
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,23 @@ class TavilyWebSearchCore:
         Returns:
             List of search results with title, link, snippet and optionally content
         """
+        return await run_guarded_search(
+            "tavily",
+            query,
+            lambda redacted: self._search_redacted(
+                redacted, max_results, include_content, search_depth
+            ),
+            len,
+        )
+
+    async def _search_redacted(
+        self,
+        query: str,
+        max_results: int,
+        include_content: bool,
+        search_depth: str,
+    ) -> List[Dict[str, str]]:
+        """Run the search; ``query`` has already been redacted."""
         logger.info(
             "🔍 Tavily web search query='%s' max_results=%s depth=%s",
             query,

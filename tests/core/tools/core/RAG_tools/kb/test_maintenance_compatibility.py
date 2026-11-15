@@ -30,6 +30,10 @@ def test_kb_maintenance_compatibility_methods_match_public_helper_signatures() -
     pairs = [
         (facade.get_collection_sync, collection_manager.get_collection_sync),
         (
+            facade.get_collection_if_present_sync,
+            collection_manager.get_collection_if_present_sync,
+        ),
+        (
             facade.initialize_collection_embedding_sync,
             collection_manager.initialize_collection_embedding_sync,
         ),

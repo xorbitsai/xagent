@@ -246,6 +246,66 @@ def test_an_unverifiable_provider_sends_nothing(monkeypatch, provider):
     assert sent == []
 
 
+def test_a_composio_only_provider_is_unverifiable_without_a_request(monkeypatch):
+    monkeypatch.setenv("XAGENT_SALESFORCE_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "key")
+    monkeypatch.setenv("COMPOSIO_SALESFORCE_AUTH_CONFIG_ID", "ac_test")
+    monkeypatch.setenv("COMPOSIO_USER_ID_SECRET", "secret")
+    sent = _vendor(monkeypatch, 400, {"error": "invalid_client_id"})
+
+    result = asyncio.run(
+        verification.verify_builtin_provider("salesforce", _row("salesforce"))
+    )
+
+    assert result.verdict == "unverifiable"
+    assert result.detail == "connects through Composio"
+    assert sent == []
+
+
+def test_a_provider_whose_web_connects_stay_native_is_still_verified(monkeypatch):
+    monkeypatch.setenv("XAGENT_FACEBOOK_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_FACEBOOK_AUTH_CONFIG_ID", "ac_facebook")
+    monkeypatch.setenv("XAGENT_INSTAGRAM_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_INSTAGRAM_AUTH_CONFIG_ID", "ac_instagram")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "key")
+    monkeypatch.setenv("COMPOSIO_USER_ID_SECRET", "secret")
+    sent = _vendor(monkeypatch, *DOCUMENTED_OK["meta"])
+
+    result = asyncio.run(verification.verify_builtin_provider("meta", _row("meta")))
+
+    assert result.verdict == "client_ok"
+    assert len(sent) == 1
+
+
+def test_excluding_a_composio_only_provider_is_valid(monkeypatch):
+    monkeypatch.setenv("XAGENT_SALESFORCE_AUTH_BACKEND", "composio")
+    monkeypatch.setenv("COMPOSIO_API_KEY", "key")
+    monkeypatch.setenv("COMPOSIO_SALESFORCE_AUTH_CONFIG_ID", "ac_test")
+    monkeypatch.setenv("COMPOSIO_USER_ID_SECRET", "secret")
+
+    excluded = asyncio.run(
+        verification.verify_all(
+            [],
+            builtin_providers=["salesforce"],
+            mcp_apps=[],
+            exclude={"salesforce"},
+        )
+    )
+    kept = asyncio.run(
+        verification.verify_all(
+            [],
+            builtin_providers=["salesforce"],
+            mcp_apps=[],
+            exclude=set(),
+        )
+    )
+
+    assert excluded == []
+    assert [(result.name, result.verdict, result.detail) for result in kept] == [
+        ("salesforce", "unverifiable", "connects through Composio")
+    ]
+
+
 def test_a_missing_credential_is_left_to_oauth_readiness(monkeypatch):
     sent = _vendor(monkeypatch, 400, {"error": "invalid_client"})
     row = _row("xero")

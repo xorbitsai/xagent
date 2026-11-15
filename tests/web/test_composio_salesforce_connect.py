@@ -874,3 +874,28 @@ def test_other_apps_on_composio_carry_no_connect_guidance(salesforce):
     assert [
         app_id for app_id, entry in entries.items() if "connect_guidance" in entry
     ] == ["salesforce"]
+
+
+# --- Catalog auth backend -------------------------------------------------------
+
+
+def test_the_catalog_marks_only_an_app_whose_web_connect_is_on_composio(salesforce):
+    db, _user, _composio = salesforce
+    from xagent.web.mcp_apps import get_all_mcp_apps
+
+    entries = {entry["id"]: entry for entry in get_all_mcp_apps(db)}
+
+    assert entries["salesforce"]["auth_backend"] == "composio"
+    # Facebook's switch is on too; its web connect stays native.
+    assert "auth_backend" not in entries["facebook"]
+
+
+@pytest.mark.parametrize("backend", [None, "native", "other"])
+def test_a_native_app_has_no_auth_backend(salesforce, monkeypatch, backend):
+    db, _user, _composio = salesforce
+    if backend is None:
+        monkeypatch.delenv("XAGENT_SALESFORCE_AUTH_BACKEND")
+    else:
+        monkeypatch.setenv("XAGENT_SALESFORCE_AUTH_BACKEND", backend)
+
+    assert "auth_backend" not in _catalog_entry(db, "salesforce")

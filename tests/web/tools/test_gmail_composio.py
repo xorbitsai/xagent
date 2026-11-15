@@ -346,7 +346,9 @@ def test_read_threads_sends_one_request_per_thread(proxy, monkeypatch):
         ],
         "errors": None,
     }
-    assert [call["endpoint"] for call in proxy.calls] == [
+    # The two requests are sent concurrently, so the order in which they reach
+    # the proxy is not fixed; only the order of the results is.
+    assert sorted(call["endpoint"] for call in proxy.calls) == [
         "https://gmail.googleapis.com/gmail/v1/users/me/threads/t1",
         "https://gmail.googleapis.com/gmail/v1/users/me/threads/t2",
     ]

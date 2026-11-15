@@ -3,6 +3,7 @@
 import inspect
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
@@ -131,6 +132,12 @@ _TRUNCATABLE_CONTENT_FIELDS = frozenset(
 )
 
 
+# Opens every truncation marker the reducers below write
+# (``...[truncated N chars]``, ``...[truncated N middle items]``). The console
+# sink keys on it to recognise text that was cut upstream.
+_TRUNCATION_MARKER = "...[truncated "
+
+
 def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
     """Recursive per-leaf truncation of a trace value.
 
@@ -196,7 +203,7 @@ def _truncate_string(value: str, budget: int) -> str:
     slack = min(30, max(8, budget // 4))
     head_budget = max(1, budget - slack)
     head = encoded[:head_budget].decode("utf-8", errors="ignore")
-    return f"{head}...[truncated {len(value) - len(head)} chars]"
+    return f"{head}{_TRUNCATION_MARKER}{len(value) - len(head)} chars]"
 
 
 def _placeholder(message: str) -> Dict[str, str]:
@@ -229,7 +236,7 @@ def _reduce_text_list(value: Any, budget: int) -> Any:
             [_reduce_text(v, per_item) for v in value[-keep_tail:]] if keep_tail else []
         )
         omitted = len(value) - keep_head - keep_tail
-        marker = f"...[truncated {omitted} middle items]"
+        marker = f"{_TRUNCATION_MARKER}{omitted} middle items]"
         candidate: List[Any] = head + [marker] + tail
         if _serialized_size(candidate) <= budget:
             return candidate
@@ -627,7 +634,7 @@ def _trim_subtree(value: Any, max_bytes: int, _depth: int = 0) -> Any:
         # U+FFFD replacement chars — otherwise len(head) inflates and the
         # reported truncation count becomes inaccurate (can even go negative).
         head = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        return f"{head}...[truncated {len(value) - len(head)} chars]"
+        return f"{head}{_TRUNCATION_MARKER}{len(value) - len(head)} chars]"
 
     if isinstance(value, list):
         per_item = max(1, max_bytes // max(1, len(value)))
@@ -1015,7 +1022,7 @@ def _shrink_string_leaf(
     marked = ""
     for _ in range(_LOG_TRUNCATE_FIT_PASSES):
         head = encoded[:cut].decode("utf-8", errors="ignore")
-        marked = f"{head}...[truncated {len(value) - len(head)} chars]"
+        marked = f"{head}{_TRUNCATION_MARKER}{len(value) - len(head)} chars]"
         marked_width = _leaf_width(marked, depth)
         if marked_width <= spendable or cut == 0:
             break
@@ -1057,7 +1064,9 @@ def _shrink_node(
         return too_deep
 
     if isinstance(value, str):
-        return _shrink_string_leaf(value, remaining, depth, slack)
+        return _shrink_string_leaf(
+            _withhold_truncated_query_text(value), remaining, depth, slack
+        )
 
     if isinstance(value, dict):
         node_id = id(value)
@@ -1067,7 +1076,10 @@ def _shrink_node(
         seen.add(node_id)
         shrunk: Dict[Any, Any] = {}
         remaining[0] -= 2  # rendered braces
-        for key, item in value.items():
+        # Redact a search call's query *before* its leaves are measured or cut,
+        # so the byte budget can never leave a fragment of the original query.
+        projected = _project_search_call(value)
+        for key, item in projected.items():
             key_cost = _rendered_width(f"{key!r}: , ")
             # A key is charged in full and can't be truncated, so decide
             # before spending: stopping here instead of after keeps the copy
@@ -1112,6 +1124,178 @@ def _shrink_node(
     return value
 
 
+# Tool names whose ``query`` argument is sent to an external search provider.
+# The single definition: a new search tool (e.g. Brave) is added here, and
+# ``tests/core/tools/test_web_search_redaction_providers.py`` fails if a
+# registered search tool name is missing from the set.
+SEARCH_TOOL_NAMES = frozenset(
+    {"web_search", "tavily_web_search", "zhipu_web_search", "exa_web_search"}
+)
+
+# Keys under which a tool call carries its arguments, across the shapes the
+# trace sees: ``tool_params`` (tool events), ``args`` (normalised calls and the
+# checkpoint ledger), ``arguments`` (OpenAI ``function``), ``input`` / ``params``
+# / ``parameters`` (other adapters).
+_SEARCH_ARG_KEYS = ("tool_params", "args", "arguments", "input", "params", "parameters")
+
+
+def _search_call_name(node: Dict[Any, Any]) -> Optional[str]:
+    for key in ("tool_name", "name"):
+        name = node.get(key)
+        if isinstance(name, str):
+            return name
+    return None
+
+
+# Fixed replacements. Neither contains any of the text it stands for.
+_SEARCH_ARGS_WITHHELD = "[search arguments withheld]"
+_QUERY_TEXT_WITHHELD = "[truncated text containing a query withheld]"
+
+# The bare word ``query`` followed, after any run of quotes and backslashes (so
+# at any JSON/repr escaping depth: ``"query":``, ``'query':``, ``\\"query\\":``),
+# by a colon: how a ``query`` key looks inside serialised arguments.
+_QUERY_KEY_RE = re.compile(r"query[\\\"']*\s*:")
+# A search tool name right after a quote or backslash (how a name looks inside
+# serialised JSON or a repr).
+_SEARCH_NAME_RE = re.compile(
+    r"[\\\"'](?:" + "|".join(sorted(SEARCH_TOOL_NAMES)) + r")\b"
+)
+
+
+def _withhold_truncated_query_text(text: str) -> str:
+    """Make a string leaf that holds serialised search arguments safe to log.
+
+    ``_shrink_message`` dumps a dict or list message value (a legacy
+    ``function_call``, Anthropic content blocks) to a string, and may then cut
+    it, so the structural projection never sees the call. A string that holds a
+    ``query:`` key, or names a search tool in quotes (so also the
+    ``{"input": <raw text>}`` fallback), is handled in two ways:
+
+    * cut (carries a truncation marker): replaced wholesale, because a cut
+      value leaves a fragment no recogniser can match (``jane.doe@exa``). A
+      query value can only follow its key, so a cut before the key carries
+      none of it;
+    * complete: when it names a search tool, every entity in it is redacted.
+
+    The wholesale rule over-masks truncated text that merely mentions
+    ``query:`` or quotes a search tool name (prose, other tools' ``query``
+    arguments); it affects only the console line.
+    """
+    has_key = _QUERY_KEY_RE.search(text) is not None
+    names_tool = _SEARCH_NAME_RE.search(text) is not None
+    if not (has_key or names_tool):
+        return text
+    if _TRUNCATION_MARKER in text:
+        return _QUERY_TEXT_WITHHELD
+    if names_tool:
+        from ..tools.core.search_query_redaction import redact_search_query
+
+        return redact_search_query(text).text
+    return text
+
+
+def _redact_search_value(value: Any, key: Any = None) -> Any:
+    """Redact every string leaf of a search call's arguments (copy on change)."""
+    from ..tools.core.search_query_redaction import redact_search_query
+
+    if isinstance(value, str):
+        if _TRUNCATION_MARKER in value:
+            return _SEARCH_ARGS_WITHHELD
+        text = redact_search_query(value).text
+        return value if text == value else text
+    if isinstance(value, dict):
+        out = {k: _redact_search_value(v, k) for k, v in value.items()}
+        return out if any(out[k] is not value[k] for k in value) else value
+    if isinstance(value, list):
+        items = [_redact_search_value(v) for v in value]
+        return items if any(a is not b for a, b in zip(items, value)) else value
+    if key == "query" and value is not None and not isinstance(value, bool):
+        return redact_search_query(str(value)).text
+    return value
+
+
+def _redact_search_args(args: Any) -> Any:
+    """Return a search call's arguments with every string leaf redacted.
+
+    Console projection only; the provider-bound contract stays "the ``query``
+    argument". Every string is redacted, not just ``query``, because arguments
+    that failed to parse reach the tool as ``{"input": <raw text>}``. A string
+    that is not a JSON object/array (malformed, or cut upstream) is replaced
+    wholesale by a fixed marker.
+    """
+    if isinstance(args, str):
+        if not args.strip():
+            return args
+        try:
+            parsed = json.loads(args)
+        except ValueError:
+            return _SEARCH_ARGS_WITHHELD
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(_redact_search_value(parsed), ensure_ascii=False)
+        return _SEARCH_ARGS_WITHHELD
+    return _redact_search_value(args)
+
+
+def _project_search_call(node: Dict[Any, Any]) -> Dict[Any, Any]:
+    """Return ``node`` with a search call's query redacted, one level only.
+
+    ``node`` is a search call when its ``tool_name`` / ``name`` is a search
+    tool; an OpenAI ``{"function": {"name": ..., "arguments": ...}}`` wrapper
+    is handled when the caller reaches its ``function`` child. The caller walks
+    the children itself, so this never recurses. Returns ``node`` itself when
+    nothing needs to change.
+    """
+    result = node
+    name = _search_call_name(node)
+    if name in SEARCH_TOOL_NAMES:
+        for key in _SEARCH_ARG_KEYS:
+            if key in node:
+                redacted = _redact_search_args(node[key])
+                if redacted is not node[key]:
+                    if result is node:
+                        result = dict(node)
+                    result[key] = redacted
+    return result
+
+
+def _project_search_calls(
+    value: Any, depth: int = 0, seen: Optional[Set[int]] = None
+) -> Any:
+    """Copy-on-write walk redacting every search call in ``value``.
+
+    Used only where the byte-budgeted shrink walk does not run
+    (``max_bytes <= 0``); depth is capped and cycles are cut.
+    """
+    if seen is None:
+        seen = set()
+    if depth >= _MAX_TRACE_DEPTH:
+        return value
+    if isinstance(value, str):
+        return _withhold_truncated_query_text(value)
+    if isinstance(value, dict):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        projected = _project_search_call(value)
+        out = projected
+        for key, item in projected.items():
+            new = _project_search_calls(item, depth + 1, seen)
+            if new is not item:
+                if out is value:
+                    out = dict(projected)
+                out[key] = new
+        seen.discard(id(value))
+        return out
+    if isinstance(value, list):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        items = [_project_search_calls(item, depth + 1, seen) for item in value]
+        seen.discard(id(value))
+        return items if any(a is not b for a, b in zip(items, value)) else value
+    return value
+
+
 def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> str:
     """Render ``event.data`` into a size-bounded string for console logging.
 
@@ -1143,7 +1327,7 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
         max_bytes = get_max_trace_payload_bytes()
 
     if max_bytes <= 0:
-        return f"{data}"
+        return f"{_project_search_calls(data)}"
 
     rendered = f"{_shrink_within_budget(data, max_bytes)}"
     encoded = rendered.encode("utf-8", errors="replace")
@@ -1152,7 +1336,7 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
     # Slice on a byte boundary and drop an incomplete trailing multi-byte
     # char, matching the string-leaf truncation above.
     head = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    return f"{head}...[truncated {len(rendered) - len(head)} chars]"
+    return f"{head}{_TRUNCATION_MARKER}{len(rendered) - len(head)} chars]"
 
 
 class ConsoleTraceHandler(BaseTraceHandler):

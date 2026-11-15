@@ -17,19 +17,23 @@ depends_on = None
 
 
 def upgrade() -> None:
-    if not sa.inspect(op.get_bind()).has_table("serving_generation"):
-        op.create_table(
-            "serving_generation",
-            sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
-            sa.Column("generation", sa.String(length=255), nullable=False),
-            sa.Column(
-                "updated_at",
-                sa.DateTime(timezone=True),
-                server_default=sa.func.now(),
-                nullable=False,
-            ),
-            sa.CheckConstraint("id = 1", name="ck_serving_generation_single_row"),
-        )
+    # Offline SQL generation cannot inspect: it emits the CREATE TABLE.
+    if not op.get_context().as_sql and sa.inspect(op.get_bind()).has_table(
+        "serving_generation"
+    ):
+        return
+    op.create_table(
+        "serving_generation",
+        sa.Column("id", sa.Integer(), primary_key=True, nullable=False),
+        sa.Column("generation", sa.String(length=255), nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.CheckConstraint("id = 1", name="ck_serving_generation_single_row"),
+    )
 
 
 def downgrade() -> None:

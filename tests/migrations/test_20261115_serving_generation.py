@@ -57,3 +57,18 @@ def test_revision_chains_onto_the_previous_head(tmp_path) -> None:
     revision = script.get_revision("20261115_serving_generation")
     assert revision.down_revision == "20261114_oauth_revocation_fences"
     assert len(script.get_heads()) == 1
+
+
+def test_offline_sql_generation_emits_the_create_table() -> None:
+    from io import StringIO
+
+    buffer = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql", opts={"as_sql": True, "output_buffer": buffer}
+    )
+    with Operations.context(context):
+        MIGRATION.upgrade()
+    sql = buffer.getvalue()
+    assert "CREATE TABLE serving_generation" in sql
+    assert "ck_serving_generation_single_row" in sql
+    assert "ALTER" not in sql and "INSERT" not in sql

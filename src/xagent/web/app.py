@@ -2523,7 +2523,11 @@ async def _start_commands_and_channels() -> None:
     logger.info("Task command dispatch configured")
 
     # Chat intake claims new conversations: only the serving generation takes
-    # it. A restarted old generation must not start receiving again.
+    # it. A restarted old generation must not start receiving again. This is
+    # the cheap early refusal; when the record cannot be read it lets the start
+    # through, and the channel managers' own sync (which every start path,
+    # including channel CRUD, goes through) keeps the channels dormant until
+    # this generation is confirmed as the serving one.
     if not start_allowed("chat-channels"):
         return
 

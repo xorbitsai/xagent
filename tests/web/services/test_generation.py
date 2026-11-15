@@ -96,7 +96,14 @@ async def _run_briefly(coro) -> None:
     task = asyncio.create_task(coro)
     await asyncio.sleep(0.15)
     task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    (outcome,) = await asyncio.gather(task, return_exceptions=True)
+    # Cancellation is how the helper stops the loop; the sentinel is how the
+    # fake tick stops it. Anything else is a real failure and must surface.
+    if isinstance(outcome, BaseException) and not isinstance(
+        outcome, asyncio.CancelledError
+    ):
+        if str(outcome) != "stop after the first tick":
+            raise outcome
 
 
 @pytest.mark.asyncio
@@ -130,7 +137,9 @@ async def test_lease_recovery_and_auto_resume_loops_honor_the_record(
     await _run_briefly(
         task_auto_resume.run_task_auto_resume_loop(poll_interval_seconds=0)
     )
-    assert bool(calls) is serving
+    # Each loop is guarded on its own, so each must be seen on its own.
+    assert ("recover" in calls) is serving
+    assert ("resume" in calls) is serving
 
 
 @pytest.mark.asyncio

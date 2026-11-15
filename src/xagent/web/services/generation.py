@@ -138,6 +138,21 @@ async def tick_allowed(component: str) -> bool:
     return allowed
 
 
+async def other_generation_serves(component: str) -> bool:
+    """``True`` only when the record is readable and names another generation.
+
+    For callers that must close something already running: an unreadable record
+    is not enough to tear down a live intake, so it answers ``False`` there
+    (and the caller simply opens nothing new, via ``tick_allowed``).
+    """
+    if current_generation() is None:
+        return False
+    other = await asyncio.to_thread(_definitely_not_serving)
+    if other:
+        logger.info("component=%s: another generation is serving", component)
+    return other
+
+
 def start_allowed(component: str) -> bool:
     """Start-time guard: ``False`` only when another generation definitely serves."""
     if _definitely_not_serving():

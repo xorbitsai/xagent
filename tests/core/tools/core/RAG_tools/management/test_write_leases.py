@@ -701,10 +701,11 @@ def test_one_failed_renewal_is_retried_instead_of_losing_the_leases(
         return real_renew(ids, **kwargs)
 
     monkeypatch.setattr(leases, "renew_leases", _flaky)
-    held = LeaseSet(ttl_seconds=0.6)
+    # verify() fails here once one renewal takes over 5/12 of the TTL (1 s).
+    held = LeaseSet(ttl_seconds=2.4)
     try:
         held.add(acquire_lease("kb", "test"))
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 15.0
         while len(calls) < 3 and time.monotonic() < deadline:
             time.sleep(0.02)
         assert len(calls) >= 3

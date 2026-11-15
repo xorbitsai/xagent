@@ -80,6 +80,7 @@ from ...services.generation import (
 )
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
+from ...services.release_hold import release_hold
 from ...services.shared_channel_execution import (
     SharedChannelTurn,
 )
@@ -1523,6 +1524,10 @@ class SlackChannelManager:
 
     async def _sync_bots_async(self) -> None:
         if not get_channel_ingress_enabled():
+            return
+        # Finish-only mode ends chat intake for good (begin_finishing stopped
+        # the channels); a later channel create/update sync must not reopen it.
+        if release_hold.finishing:
             return
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable

@@ -1163,9 +1163,13 @@ async def run_reconcile_loop(
     """
     import asyncio
 
+    from .services.generation import tick_allowed
     from .services.writer_workers import run_tracked
 
     while not stop_event.is_set():
+        if not await tick_allowed("composio-reconcile"):
+            await asyncio.sleep(interval_seconds)
+            continue
         try:
             await run_tracked(reconcile_orphan_accounts_isolated, stop_event=stop_event)
         except asyncio.CancelledError:
@@ -1189,9 +1193,13 @@ async def run_missing_account_loop(
     """
     import asyncio
 
+    from .services.generation import tick_allowed
     from .services.writer_workers import run_tracked
 
     while not stop_event.is_set():
+        if not await tick_allowed("composio-missing-account"):
+            await asyncio.sleep(interval_seconds)
+            continue
         try:
             await run_tracked(
                 tombstone_missing_composio_accounts_isolated, stop_event=stop_event

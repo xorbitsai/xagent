@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus, task_status_predicate
+from .generation import tick_allowed
 from .chat_history_service import DELIVERY_DISPATCHED, DELIVERY_PENDING
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .ops_signals import (
@@ -747,6 +748,12 @@ async def run_task_lease_recovery_loop(
 
     secret_cursor: int | None = None
     while True:
+        # Recovery takes over other processes' tasks; only the serving
+        # generation may. The delivery reconciliation below is skipped too:
+        # the serving generation does it.
+        if not await tick_allowed("task-lease-recovery"):
+            await asyncio.sleep(poll_interval_seconds)
+            continue
         try:
             recovered = await recover_expired_task_leases_until_cutoff(
                 cutoff=datetime.now(timezone.utc),

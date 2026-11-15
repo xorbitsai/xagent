@@ -119,6 +119,7 @@ from .services.connector_team_scope import (
     ConnectorHookSessionBoundaryError,
     connector_hook_session_boundary_error_handler,
 )
+from .services.generation import start_allowed, tick_allowed
 from .services.conversation_storage_rollout import (
     report_unobserved_execution_events,
     validate_conversation_storage_rollout_at_startup,
@@ -453,6 +454,9 @@ async def _run_trigger_dispatcher(
     next_preview_run_reap_at = 0.0
     tick_paused = False
     while True:
+        if not await tick_allowed("trigger-dispatcher"):
+            await asyncio.sleep(poll_interval_seconds)
+            continue
         # Trigger production pauses at the tick boundary while a planned
         # restart holds new execution: a tick already past this point runs to
         # its end (and is counted until then), a later one neither scans due
@@ -552,6 +556,8 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
     if os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Skipping trigger dispatcher (test environment)")
         return None
+    if not start_allowed("trigger-dispatcher"):
+        return None
 
     poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
     batch_size = get_trigger_dispatcher_batch_size()
@@ -583,6 +589,8 @@ def start_task_lease_recovery_task(
     from .services.task_execution_host import consumes_task_commands
 
     if not consumes_task_commands():
+        return None
+    if not start_allowed("task-lease-recovery"):
         return None
 
     existing_task = cast(
@@ -657,6 +665,8 @@ def start_task_auto_resume_task(
     from .services.task_execution_host import consumes_task_commands
 
     if not consumes_task_commands():
+        return None
+    if not start_allowed("task-auto-resume"):
         return None
 
     existing_task = cast(
@@ -2511,6 +2521,11 @@ async def _start_commands_and_channels() -> None:
         )
         app.state.task_command_dispatcher_task = _task_command_dispatcher_task
     logger.info("Task command dispatch configured")
+
+    # Chat intake claims new conversations: only the serving generation takes
+    # it. A restarted old generation must not start receiving again.
+    if not start_allowed("chat-channels"):
+        return
 
     # Start configured chat channels.
     try:

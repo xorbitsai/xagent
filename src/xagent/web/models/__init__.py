@@ -22,6 +22,7 @@ from .oauth_revocation_fence import OAuthRevocationFence
 from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp, PublicMCPAppAudit
 from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
+from .serving_generation import ServingGeneration
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
@@ -88,6 +89,7 @@ __all__ = [
     "TaskAdmissionPacing",
     "TaskAdmissionBucket",
     "TaskAdmissionTicket",
+    "ServingGeneration",
     "TaskExecutionCommand",
     "TaskInputReceipt",
     "ApiIdempotencyKey",

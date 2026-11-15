@@ -125,6 +125,7 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
+from .generation import tick_allowed
 from .expired_tasks import record_task_expiry_no_commit
 from .task_cleanup_obligations import (
     CleanupObligation,
@@ -859,6 +860,12 @@ async def run_retention_purge_loop(
         return
     while not stop.is_set():
         pause = get_retention_sweep_interval_seconds()
+        if not await tick_allowed("retention-purge"):
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=pause)
+            except TimeoutError:
+                pass
+            continue
         try:
             limit = get_retention_batch_size()
             report = await run_tracked(

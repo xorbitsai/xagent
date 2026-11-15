@@ -12,6 +12,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from ..models.uploaded_file import UploadedFile
+from .generation import tick_allowed
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
 from .uploaded_file_cleanup import run_uploaded_file_cleanup
 from .uploaded_file_store import (
@@ -195,6 +196,9 @@ async def run_uploaded_file_compensation_recovery_loop(
 
     cursor: UploadedFileCompensationRecoveryCursor | None = None
     while True:
+        if not await tick_allowed("uploaded-file-recovery"):
+            await asyncio.sleep(poll_interval_seconds)
+            continue
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
             result = await run_db_io_cancellation_safe(

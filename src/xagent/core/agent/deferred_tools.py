@@ -108,7 +108,7 @@ def _normalize(text: str) -> str:
 
 
 DEFERRED_RULE = (
-    "Connector tools in the inventory above are deferred: their schemas are "
+    "Connector tools in the inventory in the turn context are deferred: their schemas are "
     f"not sent with every call. To use one, first call {LOAD_TOOLS_NAME} "
     "with the names you need, copied exactly as listed (capitalization "
     "included); they can be called from the next step. "

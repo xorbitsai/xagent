@@ -408,10 +408,10 @@ class TestCleanupCascadeByScope:
         )
         assert sync_result == async_result
 
-    def test_embedding_tables_are_swept_before_and_after_the_core_delete(
+    def test_embedding_tables_are_swept_before_and_after_the_chunk_delete(
         self, isolated_store, monkeypatch
     ):
-        """A failure keeps the core rows; the sweep after them catches a late table."""
+        """A failure keeps the chunk rows; the sweep after them catches a late table."""
         from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
 
         store = isolated_store

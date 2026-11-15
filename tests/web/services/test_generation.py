@@ -146,3 +146,28 @@ async def test_singleton_starters_refuse_when_another_generation_serves(
     assert app_module.start_trigger_dispatcher_task(app_module.app) is None
     assert app_module.start_task_lease_recovery_task(app_module.app) is None
     assert app_module.start_task_auto_resume_task(app_module.app) is None
+
+
+def test_generations_off_never_reads_the_database(monkeypatch) -> None:
+    """Every host today: no query, no failure mode, no log on any tick."""
+    monkeypatch.delenv(generation.GENERATION_ENV, raising=False)
+
+    def forbidden() -> str | None:
+        raise AssertionError("the record must not be read while generations are off")
+
+    monkeypatch.setattr(generation, "serving_generation", forbidden)
+    assert is_serving()
+    assert start_allowed("x")
+    assert asyncio.run(tick_allowed("x"))
+
+
+def test_generations_off_logs_nothing(monkeypatch, caplog) -> None:
+    monkeypatch.delenv(generation.GENERATION_ENV, raising=False)
+    monkeypatch.setattr(
+        generation, "serving_generation", lambda: (_ for _ in ()).throw(RuntimeError())
+    )
+    with caplog.at_level("DEBUG", logger=generation.logger.name):
+        is_serving()
+        start_allowed("x")
+        asyncio.run(tick_allowed("x"))
+    assert caplog.records == []

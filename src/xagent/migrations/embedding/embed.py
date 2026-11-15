@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from xagent.core.model.embedding.base import BaseEmbedding
+from xagent.core.model.model import EmbeddingModelConfig
 from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DEFAULT_EMBEDDING_BATCH_SIZE,
@@ -25,6 +26,7 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 )
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_candidates,
+    model_tag_candidates,
     to_model_tag,
 )
 from xagent.core.tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
@@ -37,7 +39,14 @@ from xagent.core.tools.core.RAG_tools.storage.factory import get_vector_index_st
 from xagent.core.tools.core.RAG_tools.utils.embedding_utils import (
     normalize_raw_embedding_to_vectors,
 )
+from xagent.core.tools.core.RAG_tools.utils.migration_utils import (
+    _model_tag_to_model_id,
+)
+from xagent.core.tools.core.RAG_tools.utils.model_resolver import (
+    _list_model_hub_configs,
+)
 from xagent.core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_string
+from xagent.core.tools.core.RAG_tools.utils.tag_mapping import register_tag_mapping
 from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
     write_vectors_to_db,
 )
@@ -57,6 +66,7 @@ from xagent.migrations.embedding.scope import (
     core_chunk_pairs,
     holds_rows,
     iter_rows,
+    own_tables,
     precompute_eligibility,
     resolve_collection_names,
     skip_reason,
@@ -158,8 +168,8 @@ def warm_up(
     hidden = hidden_by_writer_table(target_id, conn)
     if hidden:
         raise MigrationCliError(
-            f"creating {source_table(target_id)} would hide the rows of "
-            f"{', '.join(hidden)}, bound to {target_id}, from search"
+            f"creating {source_table(target_id)} would take over the search route "
+            f"of {', '.join(hidden)}"
         )
     if adapter is not None and rate_limit <= 0:
         logger.warning("No --rate-limit: the provider's whole quota may be used")
@@ -203,23 +213,48 @@ def resolve_hub_target(
 
 
 def hidden_by_writer_table(model_id: str, conn: Any) -> List[str]:
-    """Collections bound to ``model_id`` with rows in some embeddings table while its
-    writer table does not exist: once created, their search reads only that table."""
+    """Collections with rows whose search would read the new writer table first."""
+    from xagent.core.tools.core.RAG_tools.kb.coordinator import KBCoordinator
     from xagent.core.tools.core.RAG_tools.management.collection_manager import (
         _normalize_model_id,
     )
 
     names = table_names(conn)
-    if source_table(model_id) in names:
+    writer = source_table(model_id)
+    if writer in names:
         return []
+
+    def takes_over(model: Optional[str]) -> bool:
+        tables = own_tables(model) if model and _normalize_model_id(model) else []
+        return next((t for t in tables if t in names or t == writer), None) == writer
+
     tables = sorted(name for name in names if name.startswith("embeddings_"))
-    return [
-        name
-        for name in resolve_collection_names(conn=conn)
-        if _normalize_model_id(collection_info(name, conn).embedding_model_id)
-        == model_id
-        and any(holds_rows(conn, table, name) for table in tables)
-    ]
+    # Mirrors how embedding inference maps a table to a hub id, ids before names.
+    hub_configs = _list_model_hub_configs().values()
+    configs = [c for c in hub_configs if isinstance(c, EmbeddingModelConfig)]
+    ids: Dict[str, str] = {}
+    for attribute in ("id", "model_name"):
+        for cfg in configs:
+            for tag in model_tag_candidates(getattr(cfg, attribute)):
+                register_tag_mapping(ids, tag, cfg.id, get_identity=str, logger=logger)
+    inferred = []
+    for table in tables:
+        tag = table.replace("embeddings_", "")
+        if takes_over(ids.get(tag) or _model_tag_to_model_id(tag)):
+            inferred.append(table)
+    hidden = []
+    for name in resolve_collection_names(conn=conn):
+        info = collection_info(name, conn)
+        stored_as = KBCoordinator._normalize_collection(name)
+        bound, config = info.embedding_model_id, info.ingestion_config
+        if info.is_initialized and _normalize_model_id(bound):
+            suspects = tables if takes_over(bound) else []
+        else:
+            indexed = config and config.embedding_model_id
+            suspects = tables if takes_over(bound) or takes_over(indexed) else inferred
+        if any(holds_rows(conn, table, stored_as) for table in suspects):
+            hidden.append(name)
+    return hidden
 
 
 def warm_collection(report: CollectionReport, target: Target, conn: Any) -> None:
@@ -534,8 +569,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "stopped (0 does not mean every collection was warmed up); 1 a\n"
             "collection, a document or an index build failed, or nothing is in\n"
             "scope; 2 the run never started, including when the target's table\n"
-            "does not exist yet and creating it would hide the rows of a\n"
-            "collection already bound to the target from its search."
+            "does not exist yet and creating it would take over the search route\n"
+            "of a collection that has rows."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import pytest
 
@@ -132,11 +132,17 @@ def adapter(monkeypatch: pytest.MonkeyPatch) -> _Adapter:
 
 
 def _save_collection(
-    name: str = "kb", model_id: Optional[str] = SOURCE, dimension: Optional[int] = 2
+    name: str = "kb",
+    model_id: Optional[str] = SOURCE,
+    dimension: Optional[int] = 2,
+    indexed: Optional[str] = None,
 ) -> None:
     import asyncio
 
-    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.core.schemas import (
+        CollectionInfo,
+        IngestionConfig,
+    )
     from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
 
     asyncio.run(
@@ -146,6 +152,9 @@ def _save_collection(
                 embedding_model_id=model_id,
                 embedding_dimension=dimension,
                 embeddings=4,
+                ingestion_config=IngestionConfig(embedding_model_id=indexed)
+                if indexed
+                else None,
             )
         )
     )
@@ -491,9 +500,15 @@ def test_a_dry_run_reads_only(adapter: _Adapter) -> None:
     assert _versions() == before
 
 
-@pytest.mark.parametrize("case", ["unbound", "target-is-source", "foreign-target-row"])
+@pytest.mark.parametrize(
+    "case", ["unbound", "target-is-source", "foreign-target-row", "shares-target-table"]
+)
 def test_a_refused_collection_gets_no_write(adapter: _Adapter, case: str) -> None:
-    bound = {"unbound": None, "target-is-source": TARGET}.get(case, SOURCE)
+    bound = {
+        "unbound": None,
+        "target-is-source": TARGET,
+        "shares-target-table": "new_model",
+    }.get(case, SOURCE)
     _save_collection(model_id=bound, dimension=2 if bound else None)
     _seed_core({"d1": ["c1"]})
     _write([_src("c1")], model=bound or SOURCE)
@@ -509,65 +524,216 @@ def test_a_refused_collection_gets_no_write(adapter: _Adapter, case: str) -> Non
             "unbound": scope.SKIP_UNBOUND,
             "target-is-source": scope.SKIP_TARGET_IS_SOURCE,
             "foreign-target-row": scope.SKIP_TARGET_ROWS_IN_OTHER_TABLE,
+            "shares-target-table": scope.SKIP_SHARED_TABLE,
         }[case]
     )
     assert adapter.calls == []
     assert _versions() == before
 
 
-def _bind_kb2_to_vendor_target(hub: _Hub, form: str) -> str:
-    """kb2 bound to VENDOR_TARGET, its rows only in a table search falls back to."""
-    model_name = "provider-model" if form == "provider-name" else VENDOR_TARGET
-    hub.models[VENDOR_TARGET] = _config(VENDOR_TARGET, model_name=model_name)
-    _save_collection("kb2", model_id=VENDOR_TARGET)
-    if form == "provider-name":
-        _write([_src("x1", "e1")], model=model_name, collection="kb2")
-        return scope.source_table(model_name)
-    _write([_src("x1", "e1")], model=VENDOR_TARGET, collection="kb2")
-    conn = scope.connection()
-    writer, once = scope.own_tables(VENDOR_TARGET)
-    conn.create_table(once, data=conn.open_table(writer).to_arrow())
-    conn.drop_table(writer)
-    return once
+def _served(model_id: str) -> Tuple[Optional[str], List[str]]:
+    """The table search opens for ``model_id`` and the kb2 rows it serves there."""
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        DatabaseOperationError,
+    )
+
+    try:
+        table, name = _store().open_embeddings_table(model_id)
+    except DatabaseOperationError:
+        return None, []
+    rows = table.search().where(scope.collection_filter("kb2")).to_arrow().to_pylist()
+    return name, sorted(row["chunk_id"] for row in rows)
 
 
-@pytest.mark.parametrize("dry_run", [False, True])
-@pytest.mark.parametrize("form", ["once-tagged", "provider-name"])
-def test_a_writer_table_that_would_hide_another_collection_refuses_the_run(
-    adapter: _Adapter, hub: _Hub, form: str, dry_run: bool
+def _seed_kb2(
+    stored: Optional[str], dimension: Optional[int], indexed: Optional[str], model: str
 ) -> None:
+    """kb2's rows written by ``model``, moved to its once-tagged table if it has one."""
+    _save_collection("kb2", model_id=stored, dimension=dimension, indexed=indexed)
+    _write([_src("x1", "e1")], model=model, collection="kb2")
+    if "/" in model:
+        conn = scope.connection()
+        writer, once = scope.own_tables(model)
+        conn.create_table(once, data=conn.open_table(writer).to_arrow())
+        conn.drop_table(writer)
+
+
+def _resolved(name: str = "kb2") -> str:
+    """What search resolves for ``name``, with the resolver's own writes dropped."""
+    from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
+
+    async def _dropped(*_args: Any, **_kwargs: Any) -> bool:
+        return True
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cm.collection_manager, "update_collection_fields", _dropped)
+        patch.setattr(cm.collection_manager, "mark_collection_accessed", _dropped)
+        return cm.resolve_effective_embedding_model_sync(name)
+
+
+def _seed_two(
+    hub: _Hub,
+    stored: Optional[str],
+    dimension: Optional[int],
+    indexed: Optional[str],
+    model: str,
+) -> None:
+    """kb to warm and kb2 as :func:`_seed_kb2`; a hub id claims the provider table."""
+    hub.models["provider-model"] = _config("provider-model")
+    hub.models["new_model"] = _config("new_model", model_name="provider-model")
+    hub.models[VENDOR_TARGET] = _config(VENDOR_TARGET)
     _save_collection()
     _seed_core({"d1": ["c1"]})
     _write([_src("c1")])
-    fallback = _bind_kb2_to_vendor_target(hub, form)
-    assert _store().open_embeddings_table(VENDOR_TARGET)[1] == fallback
-    before = _versions()
-    args = ["--model", VENDOR_TARGET, "--collection", "kb"]
-
-    code = mod.main(args + (["--dry-run"] if dry_run else []))
-
-    assert _store().open_embeddings_table(VENDOR_TARGET)[1] == fallback
-    assert (_versions(), adapter.calls) == (before, [])
-    assert code == 2
+    _seed_kb2(stored, dimension, indexed, model)
 
 
-@pytest.mark.parametrize("case", ["kb2-has-no-rows", "writer-table-exists"])
-def test_a_collection_bound_to_the_target_that_nothing_would_hide_lets_the_run_start(
+# stored id, dimension, ingestion-config id, model of kb2's rows, target
+MOVED = {
+    "bound-provider-name": ("new_model", 2, None, "provider-model", TARGET),
+    "bound-once-tagged": (
+        "Vendor/new_model",
+        2,
+        None,
+        "Vendor/new_model",
+        VENDOR_TARGET,
+    ),
+    "ingestion-config": (None, None, "new_model", "provider-model", TARGET),
+    "inferred": (None, None, None, VENDOR_TARGET, VENDOR_TARGET),
+    "no-dimension-inferred": ("other-model", None, None, VENDOR_TARGET, VENDOR_TARGET),
+}
+CONSERVATIVE = {
+    "bound-no-dimension": ("new_model", None, None, "provider-model", TARGET),
+    "inferred-off-hub": (None, None, None, "ACME/new-model", TARGET),
+}
+
+
+@pytest.mark.parametrize("case", list(MOVED))
+def test_a_writer_table_that_would_take_over_another_search_refuses_the_run(
+    adapter: _Adapter, hub: _Hub, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    *seed, target = MOVED[case]
+    _seed_two(hub, *seed)
+    writer = scope.source_table(target)
+    search_id = _resolved()
+    before = _served(search_id)
+    assert before[1] == ["x1"]
+    versions = _versions()
+    args = ["--model", target, "--collection", "kb"]
+
+    assert [mod.main(args), mod.main(args + ["--dry-run"])] == [2, 2]
+
+    assert writer not in scope.table_names(scope.connection())
+    assert (_served(search_id), _versions(), adapter.calls) == (before, versions, [])
+    monkeypatch.setattr(mod, "hidden_by_writer_table", lambda *_: [])
+    assert mod.main(args) == 0
+    assert (_resolved(), _served(search_id)) == (search_id, (writer, []))
+
+
+@pytest.mark.parametrize("case", list(CONSERVATIVE))
+def test_an_id_counted_beyond_what_search_resolves_also_refuses_the_run(
+    adapter: _Adapter, hub: _Hub, case: str
+) -> None:
+    *seed, target = CONSERVATIVE[case]
+    _seed_two(hub, *seed)
+    resolved = _resolved()
+    versions = _versions()
+    args = ["--model", target, "--collection", "kb"]
+
+    assert [mod.main(args), mod.main(args + ["--dry-run"])] == [2, 2]
+
+    assert scope.source_table(target) not in scope.table_names(scope.connection())
+    assert (_resolved(), _versions(), adapter.calls) == (resolved, versions, [])
+
+
+def test_rows_under_the_stripped_name_count_for_an_unstripped_record(
+    adapter: _Adapter, hub: _Hub
+) -> None:
+    from xagent.core.tools.core.RAG_tools.kb.coordinator import get_kb_coordinator
+
+    _seed_two(hub, "new_model", 2, None, "provider-model")
+    scope.connection().open_table(scope.METADATA_TABLE).update(
+        where="name = 'kb2'", values={"name": " kb2"}
+    )
+
+    def _search() -> Any:
+        search_id = _resolved(" kb2")
+        response = get_kb_coordinator().search_dense_sync(
+            " kb2", search_id, [0.5, 0.5], top_k=5, is_admin=True
+        )
+        hits = sorted(result.chunk_id for result in response.results)
+        return _served(search_id), response.status, hits
+
+    before = _search()
+    assert before == (("embeddings_provider_model", ["x1"]), "success", ["x1"])
+
+    assert mod.main(["--model", TARGET, "--collection", "kb"]) == 2
+
+    assert _search() == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "bound-no-rows",
+        "other-id",
+        "other-id-target-provider-name",
+        "inferred-tag-claimed-by-an-id",
+        "writer-table-exists",
+    ],
+)
+def test_a_writer_table_that_takes_over_no_search_of_rows_lets_the_run_start(
     adapter: _Adapter, hub: _Hub, case: str
 ) -> None:
     _save_collection()
     _seed_core({"d1": ["c1"]})
     _write([_src("c1")])
-    if case == "kb2-has-no-rows":
-        hub.models[VENDOR_TARGET] = _config(VENDOR_TARGET)
-        _save_collection("kb2", model_id=VENDOR_TARGET)
+    if case == "bound-no-rows":
+        _save_collection("kb2", model_id="new_model")
+    elif case.startswith("other-id"):
+        if case == "other-id-target-provider-name":
+            hub.models[TARGET] = _config(TARGET, model_name="provider-model")
+        hub.models["other-model"] = _config("other-model", model_name="provider-model")
+        _seed_kb2("other-model", 2, None, "provider-model")
+    elif case == "inferred-tag-claimed-by-an-id":
+        hub.models["new_model"] = _config("new_model", model_name="provider-model")
+        hub.models["provider-model"] = _config("provider-model")
+        _seed_kb2(None, None, None, "provider-model")
     else:
-        _bind_kb2_to_vendor_target(hub, "once-tagged")
-        _write([_src("x2", "e1")], model=VENDOR_TARGET, collection="kb2")
+        hub.models["new_model"] = _config("new_model", model_name="provider-model")
+        _seed_kb2("new_model", 2, None, "provider-model")
+        _write([_src("x2", "e1")], model="new_model", collection="kb2")
+    before = _served(_resolved())
 
-    assert mod.main(["--model", VENDOR_TARGET, "--collection", "kb"]) == 0
-    written = _rows(scope.source_table(VENDOR_TARGET))
+    assert mod.main(["--model", TARGET, "--collection", "kb"]) == 0
+
+    written = _rows(scope.source_table(TARGET))
     assert [row["chunk_id"] for row in written if row["collection"] == "kb"] == ["c1"]
+    after = _served(_resolved())
+    assert after[1] == before[1]
+    assert after == before or case == "bound-no-rows"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"extra_metadata": "{"}, {"name": " "}],
+    ids=["undecodable", "blank-name"],
+)
+def test_an_unreadable_collection_record_refuses_the_run(
+    adapter: _Adapter, change: Dict[str, str]
+) -> None:
+    _save_collection()
+    _seed_core({"d1": ["c1"]})
+    _write([_src("c1")])
+    _save_collection("kb2", model_id="other-model")
+    scope.connection().open_table(scope.METADATA_TABLE).update(
+        where="name = 'kb2'", values=change
+    )
+    before = _versions()
+
+    assert mod.main(["--model", TARGET, "--collection", "kb"]) == 2
+
+    assert (_versions(), adapter.calls) == (before, [])
 
 
 def test_a_collection_name_the_write_path_would_strip_is_refused(
@@ -1305,7 +1471,7 @@ def test_help_states_what_is_written_and_what_the_exit_codes_mean(
         "Five failed documents in a row in one collection abort the run",
         "0 does not mean every collection was warmed up",
         "2 the run never started",
-        "creating it would hide the rows of a collection already bound",
+        "creating it would take over the search route of a collection that has rows",
         "writes nothing to LanceDB",
         "not retried",
     ):

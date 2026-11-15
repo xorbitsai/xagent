@@ -330,6 +330,53 @@ def test_a_refused_proxy_call_accepts_nothing(monkeypatch, composio_env):
 
 
 @pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"data": {"id": "fb-user-1"}},
+        {"data": {"id": "fb-user-1"}, "status": None},
+        {"data": {"id": "fb-user-1"}, "status": "200"},
+        {"data": {"id": "fb-user-1"}, "status": 200.0},
+        {"data": {"id": "fb-user-1"}, "status": True},
+    ],
+)
+def test_a_proxy_answer_without_an_integer_status_is_refused_and_not_counted(
+    monkeypatch, composio_env, body
+):
+    """An outer 2xx whose envelope has no readable Graph status is not an
+    answer the caller can use, so it adds no accepted request (#3779)."""
+    _capture_proxy(monkeypatch, MockResponse(body, text=json.dumps(body)))
+
+    token = composio_proxy.begin_request_count()
+    try:
+        with pytest.raises(meta_graph.ComposioProxyError) as caught:
+            meta_graph.graph_request("GET", "/me")
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert accepted == 0
+    assert "provider's status" in str(caught.value)
+    assert "fb-user-1" not in str(caught.value)
+
+
+def test_a_graph_error_through_the_proxy_is_still_one_accepted_request(
+    monkeypatch, composio_env
+):
+    graph_body = {"error": {"message": "(#100) bad field", "code": 100}}
+    _capture_proxy(monkeypatch, _proxy_response(graph_body, status=400))
+
+    token = composio_proxy.begin_request_count()
+    try:
+        with pytest.raises(meta_graph.GraphAPIError) as caught:
+            meta_graph.graph_request("GET", "/me")
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert accepted == 1
+    assert not isinstance(caught.value, meta_graph.ComposioProxyError)
+
+
+@pytest.mark.parametrize(
     "kwargs, path",
     [
         ({"data": {"message": "hi"}}, "/page-1/feed"),

@@ -785,7 +785,7 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
         lambda: runtime_start_order.append("admission"),
     )
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(
         web_app_module,
@@ -914,7 +914,7 @@ async def test_startup_event_triggers_background_auto_migration(
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -1048,7 +1048,7 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -1386,7 +1386,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
     monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro;/foo:/guest2:ro")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -1570,7 +1570,7 @@ async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -1673,7 +1673,7 @@ async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
     monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro;/foo:/guest2:ro")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
@@ -1748,7 +1748,7 @@ async def test_startup_event_skips_sandbox_readiness_when_manager_is_none(
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
     monkeypatch.setattr(
-        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app, **_kw: None
     )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(

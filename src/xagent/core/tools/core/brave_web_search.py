@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ....config import get_brave_search_country, get_brave_search_endpoint
+from .media_usage import record_web_search_usage
 from .web_content import WebContentFetcher
 from .web_search_guard import run_guarded_search
 
@@ -178,6 +179,9 @@ class BraveWebSearchCore:
             ) from None
 
         self._raise_for_status(response.status_code)
+        # Brave billed this request as soon as it answered 2xx, so record it
+        # before the body is read or any result page is fetched.
+        record_web_search_usage("brave")
 
         try:
             data = response.json()

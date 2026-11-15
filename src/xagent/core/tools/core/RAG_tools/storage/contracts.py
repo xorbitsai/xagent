@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import (
     Any,
@@ -338,6 +338,7 @@ class MetadataStore(ABC):
         *,
         require_uninitialized: bool = False,
         expected_model_id: Optional[str] = None,
+        expected_updated_at: Optional[datetime] = None,
     ) -> bool:
         """Update only ``field_names`` of an existing collection row.
 
@@ -347,9 +348,11 @@ class MetadataStore(ABC):
         The binding columns are written only while the guard holds:
         ``require_uninitialized`` means the row is not fully bound yet,
         ``expected_model_id`` means it still stores exactly that value (used by
-        the alias-to-canonical rewrite). A guarded update that matches no row
-        returns ``False`` instead of overwriting; an unguarded update raises
-        ``ValueError`` when the row is missing.
+        the alias-to-canonical rewrite), ``expected_updated_at`` means the row
+        was not written since it was read with that ``updated_at`` (a stored
+        NULL, never written since creation, also matches). A guarded update that
+        matches no row returns ``False`` instead of overwriting; an unguarded
+        update raises ``ValueError`` when the row is missing.
         """
 
     @abstractmethod

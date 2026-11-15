@@ -359,6 +359,7 @@ class LanceDBMetadataStore(MetadataStore):
         *,
         require_uninitialized: bool = False,
         expected_model_id: Optional[str] = None,
+        expected_updated_at: Optional[datetime] = None,
     ) -> bool:
         from ..LanceDB.schema_manager import _safe_close_table
 
@@ -389,6 +390,11 @@ class LanceDBMetadataStore(MetadataStore):
                 " AND embedding_model_id = "
                 f"'{escape_lancedb_string(expected_model_id)}'"
             )
+        if expected_updated_at is not None:
+            stamp = expected_updated_at.strftime("%Y-%m-%d %H:%M:%S.%f")
+            # Every write sets updated_at, so NULL means no write since creation
+            # (a read reports it as the read time; see migrate_collection_metadata).
+            where += f" AND (updated_at = timestamp '{stamp}' OR updated_at IS NULL)"
         table = conn.open_table("collection_metadata")
         try:
             updated = table.update(where, payload)
@@ -396,7 +402,11 @@ class LanceDBMetadataStore(MetadataStore):
             _safe_close_table(table)
         if updated.rows_updated:
             return True
-        if require_uninitialized or expected_model_id is not None:
+        if (
+            require_uninitialized
+            or expected_model_id is not None
+            or expected_updated_at is not None
+        ):
             return False
         raise ValueError(f"Collection '{collection.name}' not found")
 

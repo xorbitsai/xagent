@@ -61,9 +61,6 @@ _SUPERSEDED_STAGED_INGEST_MESSAGE = "KB ingest job superseded by a newer upload"
 # created_at also covers queue wait and stale requeues, so it cannot anchor
 # the wait budget; a deferred job carries its first refusal here instead.
 _MIGRATION_DEFERRED_AT_KEY = "_migration_deferred_at"
-# In-run refusals keep their own anchor: every admitted attempt clears the one
-# above, which would restart this budget each time.
-_MIGRATION_ADMITTED_DEFERRED_AT_KEY = "_migration_admitted_deferred_at"
 _MIGRATION_GIVE_UP_MESSAGE = (
     "Gave up waiting for the knowledge base upgrade; please re-submit."
 )
@@ -83,23 +80,14 @@ def _payload_collection(db: Session, job: BackgroundJob) -> str | None:
 
 
 def _defer_collection_migration(
-    db: Session,
-    job: BackgroundJob,
-    exc: CollectionMigratingError,
-    *,
-    after_admission: bool = False,
+    db: Session, job: BackgroundJob, exc: CollectionMigratingError
 ) -> BackgroundJobDeferred | None:
     now = datetime.now(timezone.utc)
     payload = dict(job.payload or {})
-    key = (
-        _MIGRATION_ADMITTED_DEFERRED_AT_KEY
-        if after_admission
-        else _MIGRATION_DEFERRED_AT_KEY
-    )
-    first_deferral = payload.get(key)
+    first_deferral = payload.get(_MIGRATION_DEFERRED_AT_KEY)
     if first_deferral is None:
         first_at = now
-        payload[key] = first_at.isoformat()
+        payload[_MIGRATION_DEFERRED_AT_KEY] = first_at.isoformat()
         setattr(job, "payload", payload)
         db.add(job)
         db.commit()
@@ -362,27 +350,6 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             context="background staged document superseded exception",
         )
         return _superseded_staged_document_result(payload)
-    except CollectionMigratingError as exc:
-        # Not compensated: the retry re-registers the same doc_id and reuses
-        # this attempt's parse, chunk and embedding rows.
-        deferred = _defer_collection_migration(db, job, exc, after_admission=True)
-        if deferred is not None:
-            raise deferred from exc
-        # Giving up is this job's last attempt: the same compensation as below.
-        try:
-            _rollback_raised_staged_document_ingestion(db, payload, exc)
-        except CollectionMigratingError:
-            # Only a failure before the rollback runner lands here; the runner's
-            # own verdict propagates.
-            logger.exception("Job %s gave up without compensating", job.id)
-        _cleanup_failed_staged_job_collection_metadata_if_current(
-            db,
-            payload,
-            context="background staged document migration give-up",
-        )
-        raise BackgroundJobHandlerError(
-            _MIGRATION_GIVE_UP_MESSAGE, retryable=False
-        ) from exc
     except Exception as exc:
         # A refused job is not retried: the gate would refuse the retry too.
         refused = isinstance(exc, StandaloneUsageRefused)

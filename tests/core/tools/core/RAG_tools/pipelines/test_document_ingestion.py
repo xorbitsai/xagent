@@ -877,7 +877,7 @@ def test_process_document_fails_without_success_when_the_commit_fails(
     ]
 
 
-def test_a_write_that_hits_a_switch_stops_the_ingestion(
+def test_a_write_refused_by_the_migration_check_fails_the_ingestion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.core.tools.core.RAG_tools.core.exceptions import (
@@ -885,29 +885,27 @@ def test_a_write_that_hits_a_switch_stops_the_ingestion(
     )
 
     _patch_pipeline_dependencies(monkeypatch)
+    refusal = (
+        "Collection 'demo' is frozen for an embedding migration; "
+        "this write is refused, retry it."
+    )
 
-    def _switched_batch(**_kwargs: object) -> None:
-        raise CollectionMigratingError(
-            "Collection 'demo' is frozen for an embedding migration"
-        )
+    def _refused(**_kwargs: object) -> None:
+        raise CollectionMigratingError(refusal)
 
-    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _switched_batch)
-    manager = ProgressManager()
-    manager._active_tasks.clear()
+    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _refused)
 
-    with pytest.raises(CollectionMigratingError):
-        document_ingestion.process_document(
-            collection="demo",
-            source_path="/tmp/doc.pdf",
-            config=IngestionConfig(),
-            progress_manager=manager,
-        )
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
 
-    # Raised for the job to defer on, and the attempt's status is still final.
+    assert result.status == "partial"
+    assert result.failed_step == "write_vectors_to_db"
+    assert result.message == refusal
+    assert result.vector_count == 0
     assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.FAILED.value
-    task = manager.get_task_progress("ingest_demo__tmp_doc_pdf")
-    assert task is not None
-    assert task.status == DocumentProcessingStatus.FAILED
 
 
 def test_process_document_commit_failure_keeps_completed_steps_in_order(

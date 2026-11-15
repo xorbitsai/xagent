@@ -1742,19 +1742,6 @@ def _process_document_impl(
             warnings=warnings,
         )
 
-    except CollectionMigratingError as exc:
-        # Raised, not folded into a result: the document job defers on it and
-        # ``POST /ingest`` answers 409.
-        progress_manager.complete_task(task_id, success=False)
-        _record_ingestion_status(
-            collection,
-            doc_id,
-            status=DocumentProcessingStatus.FAILED,
-            message=str(exc),
-            parse_hash=parse_hash,
-            user_id=user_id,
-        )
-        raise
     except (RagCoreException, Exception) as exc:
         progress_manager.complete_task(task_id, success=False)
         return _handle_ingestion_error(

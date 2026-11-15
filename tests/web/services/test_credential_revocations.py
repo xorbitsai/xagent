@@ -316,6 +316,107 @@ def test_the_record_holds_the_tokens_of_the_last_committed_refresh(factory):
     }
 
 
+# --- tokens dropped in place --------------------------------------------------
+
+
+def _drop(factory, **updates) -> list[CredentialRevocation]:
+    """Update one stored Google row in place and return the records."""
+    with factory() as db:
+        row = _native(db, _user(db))
+        db.commit()
+        for field, value in updates.items():
+            setattr(row, field, value)
+        db.commit()
+    return _records(factory)
+
+
+def test_a_reconnect_tombstone_records_the_dropped_tokens(factory):
+    """What a permanently failed refresh leaves (tools.config, Gmail
+    provisioning): the row stays, its tokens go."""
+    [record] = _drop(factory, access_token="", refresh_token=None)
+
+    assert record.kind == "user_oauth"
+    assert decrypt_value_strict(record.access_token) == "native-access"
+    assert decrypt_value_strict(record.refresh_token) == "native-refresh"
+    assert record.grant_key == "user_oauth:google:google-subject"
+
+
+def test_dropping_only_the_refresh_token_records_it(factory):
+    [record] = _drop(factory, refresh_token=None)
+    assert decrypt_value_strict(record.refresh_token) == "native-refresh"
+
+
+def test_dropping_the_access_token_of_a_row_without_a_refresh_token_records_it(
+    factory,
+):
+    [record] = _drop(factory, refresh_token=None)
+    with factory() as db:
+        row = db.query(UserOAuth).one()
+        row.access_token = ""
+        db.commit()
+    assert len(_records(factory)) == 2
+    assert decrypt_value_strict(_records(factory)[1].access_token) == "native-access"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        # A refresh that rotates both tokens.
+        {"access_token": "rotated-access", "refresh_token": "rotated-refresh"},
+        # An access token cleared while the refresh token stays: the row can
+        # still mint access tokens, so nothing was dropped.
+        {"access_token": ""},
+        # A refresh that only replaces the access token.
+        {"access_token": "new-access"},
+    ],
+    ids=["rotation", "access-cleared-refresh-kept", "access-rotated"],
+)
+def test_rotations_and_partial_clears_record_nothing(factory, updates):
+    assert _drop(factory, **updates) == []
+
+
+def test_a_callback_that_blanks_then_refills_in_one_flush_records_nothing(factory):
+    """The OAuth callback sets ``refresh_token`` to None and then to the new
+    value before anything is flushed: one UPDATE with the final value."""
+    with factory() as db:
+        row = _native(db, _user(db))
+        db.commit()
+        row.refresh_token = None
+        row.refresh_token = "reconnected-refresh"
+        row.access_token = "reconnected-access"
+        db.commit()
+    assert _records(factory) == []
+
+
+def test_a_composio_tombstone_records_nothing(factory):
+    with factory() as db:
+        row = _native(
+            db,
+            _user(db),
+            token_type=COMPOSIO_TOKEN_TYPE,
+            oauth_provider=None,
+            refresh_token=None,
+        )
+        db.commit()
+        row.access_token = ""
+        db.commit()
+    assert _records(factory) == []
+
+
+def test_a_bulk_clear_records_each_row(factory):
+    with factory() as db:
+        user = _user(db)
+        _native(db, user, provider="gmail")
+        _native(db, user, provider="google-drive", subject="other")
+        db.commit()
+        db.query(UserOAuth).update(
+            {UserOAuth.access_token: "", UserOAuth.refresh_token: None},
+            synchronize_session=False,
+        )
+        db.commit()
+    assert len(_records(factory)) == 2
+
+
 # --- the worker ---------------------------------------------------------------
 
 
@@ -728,3 +829,54 @@ async def test_refresh_compensation_enqueues_the_issued_pair(factory, rfc7009):
         "new-access",
         "new-rt",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_tombstoned_grant_is_revoked_once_nothing_references_it(
+    factory, google
+):
+    """The reconnect tombstone left nothing usable on the row, so the worker
+    revokes the dropped refresh token (Google answers ``invalid_token`` if
+    the grant is already dead, which also settles the record)."""
+    _drop(factory, access_token="", refresh_token=None)
+
+    assert (await _run(factory)).outcomes == {"revoked": 1}
+    assert google.calls == [{"token": "native-refresh"}]
+
+
+@pytest.mark.asyncio
+async def test_a_drop_from_a_row_that_kept_a_live_token_is_skipped(factory, google):
+    """A row whose refresh token went but whose access token stayed (a
+    reconnect without a new refresh token, a mirror re-copied from a shared
+    credential without one) still holds the account's grant: revoking the
+    dropped token would kill it."""
+    _drop(factory, refresh_token=None)
+
+    assert (await _run(factory)).outcomes == {"skipped": 1}
+    assert google.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://127.0.0.1/revoke", "ftp://auth.example.com/revoke"],
+    ids=["local-address", "not-http"],
+)
+async def test_an_endpoint_the_url_policy_refuses_fails_at_once(
+    factory, rfc7009, endpoint
+):
+    with factory() as db:
+        _, client, grant = _mcp(db, _user(db))
+        client.metadata_json = {"revocation_endpoint": endpoint}
+        db.flush()
+        db.delete(grant)
+        db.commit()
+
+    assert (await _run(factory)).outcomes == {"failed": 1}
+
+    [record] = _records(factory)
+    assert record.attempts == 1
+    assert "refused by the OAuth URL policy" in record.last_error
+    assert endpoint not in record.last_error
+    assert rfc7009.calls == []
+    _assert_erased(record)

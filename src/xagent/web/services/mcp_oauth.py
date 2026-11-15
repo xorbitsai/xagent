@@ -74,6 +74,15 @@ class MCPOAuthDiscoveryError(RuntimeError):
         self.message = message
 
 
+class MCPOAuthURLPolicyError(MCPOAuthDiscoveryError):
+    """The OAuth URL policy refuses a URL outright: not an absolute HTTP(S)
+    URL, userinfo in it, or a host that is or resolves to a local address.
+
+    Unlike a failed DNS lookup this does not change on retry, so a caller
+    that retries (the credential revocation outbox) gives up at once.
+    """
+
+
 class MCPOAuthRuntimeError(RuntimeError):
     """Raised when runtime cannot prepare an MCP OAuth bearer token."""
 
@@ -2131,12 +2140,12 @@ async def _validate_and_resolve_oauth_http_url(
 ) -> list[str]:
     parts = urlsplit(value)
     if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
-        raise MCPOAuthDiscoveryError(
+        raise MCPOAuthURLPolicyError(
             "invalid_resource",
             "OAuth metadata URL must be an absolute HTTP(S) URL",
         )
     if parts.username or parts.password:
-        raise MCPOAuthDiscoveryError(
+        raise MCPOAuthURLPolicyError(
             "invalid_resource",
             "OAuth metadata URL must not include userinfo",
         )
@@ -2280,7 +2289,7 @@ def _reject_blocked_host(hostname: str) -> None:
     try:
         reject_private_network_host(hostname)
     except PrivateNetworkHostError as exc:
-        raise MCPOAuthDiscoveryError(
+        raise MCPOAuthURLPolicyError(
             "invalid_resource",
             "OAuth metadata host must not resolve to local addresses",
         ) from exc

@@ -287,3 +287,72 @@ def test_replicas_skip_locked_records_and_never_take_two_of_one_grant(factory):
         r.id for r in outbox._claim_due_sync(factory, now=now, limit=10, max_attempts=5)
     ] == [first.id]
     assert outbox._claim_due_sync(factory, now=now, limit=10, max_attempts=5) == []
+
+
+@pytest.mark.parametrize(
+    ("updates", "recorded"),
+    [
+        ({UserOAuth.access_token: "", UserOAuth.refresh_token: None}, True),
+        ({UserOAuth.refresh_token: None}, True),
+        ({UserOAuth.refresh_token: ""}, True),
+        ({UserOAuth.access_token: "rotated", UserOAuth.refresh_token: "rotated"}, False),
+        ({UserOAuth.access_token: ""}, False),
+    ],
+    ids=["tombstone", "refresh-null", "refresh-empty", "rotation", "access-only"],
+)
+def test_a_token_dropped_in_place_is_recorded(factory, updates, recorded):
+    """A reconnect tombstone keeps the row but drops its credential: the
+    UPDATE records what it held. A rotation, or clearing only the access
+    token of a row that keeps its refresh token, drops nothing."""
+    _seed(factory)
+    with factory() as db:
+        db.query(UserOAuth).update(updates, synchronize_session=False)
+        db.commit()
+
+    records = [r for r in _records(factory) if r.kind == "user_oauth"]
+    if not recorded:
+        assert records == []
+        return
+    [record] = records
+    assert decrypt_value_strict(record.access_token) == "native-access"
+    assert decrypt_value_strict(record.refresh_token) == "native-refresh"
+    assert record.grant_key == "user_oauth:google:google-subject"
+
+
+def test_a_drop_racing_a_refresh_records_the_rotated_tokens(factory):
+    """The tombstone waits for the refresh's row lock, then drops what the
+    refresh committed."""
+    _seed(factory)
+    refresh: Session = factory()
+    row = refresh.query(UserOAuth).with_for_update().one()
+    row.access_token = "rotated-native-access"
+    row.refresh_token = "rotated-native-refresh"
+    refresh.flush()
+
+    done = threading.Event()
+    failure: list[BaseException] = []
+
+    def tombstone() -> None:
+        try:
+            with factory() as db:
+                db.query(UserOAuth).update(
+                    {UserOAuth.access_token: "", UserOAuth.refresh_token: None},
+                    synchronize_session=False,
+                )
+                db.commit()
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            failure.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=tombstone)
+    worker.start()
+    assert not done.wait(1.0)
+    refresh.commit()
+    refresh.close()
+    worker.join(30)
+    assert done.is_set() and not failure
+
+    [record] = [r for r in _records(factory) if r.kind == "user_oauth"]
+    assert decrypt_value_strict(record.access_token) == "rotated-native-access"
+    assert decrypt_value_strict(record.refresh_token) == "rotated-native-refresh"

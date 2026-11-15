@@ -8,11 +8,22 @@ stored at that moment, written in the same transaction:
 
 * a native ``user_oauth`` row (every row except a Composio-backed one, whose
   grant belongs to Composio's own OAuth app and is removed through Composio)
-  when it is deleted;
+  when it is deleted, or when an UPDATE drops its credential in place -- its
+  refresh token, or for a row without one its access token, goes from a value
+  to NULL or empty (the reconnect tombstones a permanently failed refresh or
+  a superseded app-local row leave behind). A rotation to a new value is not
+  a drop;
 * an ``mcp_oauth_grants`` row when it is deleted, or when its ``status``
   becomes ``revoked`` -- a revoked grant is never used again, so that is the
   moment it is given up. Deleting an already revoked grant records nothing
   more: its tokens cannot change while it is revoked, and its record exists.
+
+A drop record of a row that keeps a token is skipped by the worker's reference
+check while the row itself still holds a live credential for the same
+account (a reconnect that got no new refresh token, a mirror re-copied from
+the shared Google credential), so it never kills the credential that
+replaced it. No code path clears an MCP grant's tokens in place: its access
+token is NOT NULL and a refresh only ever overwrites the refresh token.
 
 Database triggers write the records, not application code, so the invariant
 holds for every way a row can go: an ORM delete, a bulk ``Query.delete``, a
@@ -235,6 +246,18 @@ _DELETE_CLIENT_GRANTS_FIRST = (
     "DELETE FROM mcp_oauth_grants WHERE mcp_oauth_client_id = OLD.id"
 )
 _NATIVE_ROW = f"OLD.token_type IS NULL OR OLD.token_type <> '{COMPOSIO_TOKEN_TYPE}'"
+# An UPDATE that drops the row's credential: its refresh token, or -- for a
+# row that never had one -- its access token goes from a value to NULL or
+# empty. A rotation writes a new value and is not a drop; neither is clearing
+# only the access token of a row that keeps its refresh token, which can
+# still mint access tokens.
+_TOKEN_DROPPED = """(
+    COALESCE(OLD.refresh_token, '') <> '' AND COALESCE(NEW.refresh_token, '') = ''
+) OR (
+    COALESCE(OLD.refresh_token, '') = ''
+    AND COALESCE(OLD.access_token, '') <> ''
+    AND COALESCE(NEW.access_token, '') = ''
+)"""
 _PG_REVOCATION_ENDPOINT = "client.metadata ->> 'revocation_endpoint'"
 # ``json_extract`` raises on malformed JSON, which would make the delete fail.
 _SQLITE_REVOCATION_ENDPOINT = (
@@ -302,6 +325,33 @@ EXECUTE FUNCTION capture_user_oauth_revocation()""",
                 f"""CREATE TRIGGER capture_user_oauth_revocation
 AFTER DELETE ON user_oauth FOR EACH ROW
 WHEN {_NATIVE_ROW}
+BEGIN
+    {_user_oauth_insert("OLD")};
+END""",
+            ),
+        },
+    ),
+    _Trigger(
+        name="capture_user_oauth_token_drop",
+        table=_USER_OAUTH,
+        requires=frozenset({_USER_OAUTH, _OUTBOX}),
+        ddl={
+            # The function above reads only OLD, so it records the dropped
+            # credential for an UPDATE exactly as for a DELETE.
+            "postgresql": (
+                _pg_function(
+                    "capture_user_oauth_revocation",
+                    f"BEGIN\n    {_user_oauth_insert('OLD')};",
+                ),
+                f"""CREATE TRIGGER capture_user_oauth_token_drop
+AFTER UPDATE OF access_token, refresh_token ON user_oauth FOR EACH ROW
+WHEN (({_NATIVE_ROW}) AND ({_TOKEN_DROPPED}))
+EXECUTE FUNCTION capture_user_oauth_revocation()""",
+            ),
+            "sqlite": (
+                f"""CREATE TRIGGER capture_user_oauth_token_drop
+AFTER UPDATE OF access_token, refresh_token ON user_oauth FOR EACH ROW
+WHEN ({_NATIVE_ROW}) AND ({_TOKEN_DROPPED})
 BEGIN
     {_user_oauth_insert("OLD")};
 END""",

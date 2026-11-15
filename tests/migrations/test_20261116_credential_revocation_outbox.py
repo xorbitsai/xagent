@@ -24,6 +24,7 @@ REVISION = "20261116_credential_revocation_outbox"
 DOWN_REVISION = "20261115_user_oauth_issuer"
 TRIGGERS = {
     "capture_user_oauth_revocation",
+    "capture_user_oauth_token_drop",
     "capture_mcp_oauth_grant_revocation_on_delete",
     "capture_mcp_oauth_grant_revocation_on_revoke",
     "delete_mcp_oauth_client_grants_first",
@@ -74,6 +75,7 @@ def _strip_outbox(connection: sa.Connection) -> None:
     """Turn a create_all database back into the state before this revision."""
     for trigger, table in (
         ("capture_user_oauth_revocation", "user_oauth"),
+        ("capture_user_oauth_token_drop", "user_oauth"),
         ("capture_mcp_oauth_grant_revocation_on_delete", "mcp_oauth_grants"),
         ("capture_mcp_oauth_grant_revocation_on_revoke", "mcp_oauth_grants"),
         ("delete_mcp_oauth_client_grants_first", "mcp_oauth_clients"),

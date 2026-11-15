@@ -274,16 +274,26 @@ async def revoke_rfc7009_tokens(
     ``invalid_token`` / ``unsupported_token_type``); raises
     :class:`ProviderRevocationError` otherwise, so the caller retries --
     revoking the same tokens again is harmless. ``ValueError`` for a client
-    authentication method this cannot speak, which no retry fixes.
+    authentication method this cannot speak, or for an endpoint the OAuth URL
+    policy refuses (``MCPOAuthURLPolicyError``: not an absolute HTTP(S) URL,
+    or a host that is or resolves to a local address), which no retry fixes
+    either. The literal URL is checked before any request; a host that only
+    resolves to a local address is refused when the request resolves it.
     """
     from .mcp_oauth import (
         MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+        MCPOAuthURLPolicyError,
         create_mcp_oauth_http_client,
         oauth_post,
+        validate_oauth_http_url,
     )
 
     if token_endpoint_auth_method not in _RFC7009_AUTH_METHODS:
         raise ValueError("unsupported client authentication method")
+    try:
+        await validate_oauth_http_url(revocation_endpoint, resolve_dns=False)
+    except MCPOAuthURLPolicyError as exc:
+        raise _endpoint_rejected(exc) from None
     auth: httpx.Auth | None = None
     base_data = {"client_id": client_id}
     if token_endpoint_auth_method == "client_secret_post" and client_secret:
@@ -316,11 +326,19 @@ async def revoke_rfc7009_tokens(
                 )
     except ProviderRevocationError:
         raise
+    except MCPOAuthURLPolicyError as exc:
+        raise _endpoint_rejected(exc) from None
     except Exception as exc:
         # Only the type: an httpx error's text can carry the endpoint URL.
         raise ProviderRevocationError(
             f"revocation request failed ({type(exc).__name__})"
         ) from None
+
+
+def _endpoint_rejected(exc: Exception) -> ValueError:
+    """The terminal error for an endpoint the OAuth URL policy refuses. The
+    policy's message names the rule, never the URL."""
+    return ValueError(f"revocation endpoint refused by the OAuth URL policy: {exc}")
 
 
 def _rfc7009_settled(response: httpx.Response) -> bool:

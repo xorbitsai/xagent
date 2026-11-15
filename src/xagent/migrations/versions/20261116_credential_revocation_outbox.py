@@ -4,8 +4,10 @@ Creates ``credential_revocations`` and the triggers that write it, so that a
 native ``user_oauth`` row (not Composio-backed) and an ``mcp_oauth_grants``
 row cannot leave the database without a record of their tokens as stored at
 that moment -- whether an ORM delete, a bulk delete, a foreign-key cascade
-or raw SQL removes them. An MCP grant also gets its record when its status
-becomes ``revoked``. A worker (``services.credential_revocations``) revokes
+or raw SQL removes them. A native row also gets its record when an UPDATE
+drops its credential in place (its refresh token, or without one its access
+token, goes to NULL or empty), and an MCP grant when its status becomes
+``revoked``. A worker (``services.credential_revocations``) revokes
 each record with its provider. See ``models.credential_revocation`` for the
 design, including why a ``BEFORE DELETE`` trigger on ``mcp_oauth_clients``
 deletes the client's grants first: a cascade from the client would
@@ -66,6 +68,13 @@ _DELETE_CLIENT_GRANTS_FIRST = (
     "DELETE FROM mcp_oauth_grants WHERE mcp_oauth_client_id = OLD.id"
 )
 _NATIVE_ROW = "OLD.token_type IS NULL OR OLD.token_type <> 'composio'"
+_TOKEN_DROPPED = """(
+    COALESCE(OLD.refresh_token, '') <> '' AND COALESCE(NEW.refresh_token, '') = ''
+) OR (
+    COALESCE(OLD.refresh_token, '') = ''
+    AND COALESCE(OLD.access_token, '') <> ''
+    AND COALESCE(NEW.access_token, '') = ''
+)"""
 _PG_REVOCATION_ENDPOINT = "client.metadata ->> 'revocation_endpoint'"
 _SQLITE_REVOCATION_ENDPOINT = (
     "CASE WHEN json_valid(client.metadata) "
@@ -122,6 +131,31 @@ EXECUTE FUNCTION capture_user_oauth_revocation()""",
                 f"""CREATE TRIGGER capture_user_oauth_revocation
 AFTER DELETE ON user_oauth FOR EACH ROW
 WHEN {_NATIVE_ROW}
+BEGIN
+    {_USER_OAUTH_INSERT.format(row="OLD")};
+END""",
+            ),
+        },
+    ),
+    (
+        "capture_user_oauth_token_drop",
+        _USER_OAUTH,
+        frozenset({_USER_OAUTH, _OUTBOX}),
+        {
+            "postgresql": (
+                _pg_function(
+                    "capture_user_oauth_revocation",
+                    f"BEGIN\n    {_USER_OAUTH_INSERT.format(row='OLD')};",
+                ),
+                f"""CREATE TRIGGER capture_user_oauth_token_drop
+AFTER UPDATE OF access_token, refresh_token ON user_oauth FOR EACH ROW
+WHEN (({_NATIVE_ROW}) AND ({_TOKEN_DROPPED}))
+EXECUTE FUNCTION capture_user_oauth_revocation()""",
+            ),
+            "sqlite": (
+                f"""CREATE TRIGGER capture_user_oauth_token_drop
+AFTER UPDATE OF access_token, refresh_token ON user_oauth FOR EACH ROW
+WHEN ({_NATIVE_ROW}) AND ({_TOKEN_DROPPED})
 BEGIN
     {_USER_OAUTH_INSERT.format(row="OLD")};
 END""",

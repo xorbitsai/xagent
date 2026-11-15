@@ -30,8 +30,8 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from ..models.uploaded_file import UploadedFile
-from .generation import tick_allowed
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .generation import tick_allowed
 from .kb_reference_protection import guard_cleanup_claim
 from .uploaded_file_cleanup import run_uploaded_file_cleanup
 from .uploaded_file_cleanup_resources import build_cleanup_manifest

@@ -125,8 +125,8 @@ from ..models.task import (
     TraceMessageBlob,
 )
 from ..models.task_interaction import TaskInteractionRequest
-from .generation import tick_allowed
 from .expired_tasks import record_task_expiry_no_commit
+from .generation import tick_allowed
 from .task_cleanup_obligations import (
     CleanupObligation,
     captured_workspace_obligation,

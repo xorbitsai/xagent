@@ -79,8 +79,8 @@ from ..models.task_auto_recovery import (
 )
 from ..models.task_command import TaskExecutionCommand
 from ..utils.db_timezone import format_datetime_for_api
-from .generation import tick_allowed
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .generation import tick_allowed
 from .ops_signals import (
     TASK_AUTO_RESUME_UNAVAILABLE,
     clear_degradation,

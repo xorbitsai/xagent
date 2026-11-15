@@ -13,9 +13,9 @@ from sqlalchemy.orm import Session
 
 from ..models.chat_message import TaskChatMessage
 from ..models.task import Task, TaskStatus, task_status_predicate
-from .generation import tick_allowed
 from .chat_history_service import DELIVERY_DISPATCHED, DELIVERY_PENDING
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .generation import tick_allowed
 from .ops_signals import (
     CHECKPOINT_LEGACY_POINTER_AMBIGUOUS,
     CHECKPOINT_RECOVERY_UNAVAILABLE,

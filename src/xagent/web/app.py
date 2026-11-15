@@ -119,11 +119,11 @@ from .services.connector_team_scope import (
     ConnectorHookSessionBoundaryError,
     connector_hook_session_boundary_error_handler,
 )
-from .services.generation import start_allowed, tick_allowed
 from .services.conversation_storage_rollout import (
     report_unobserved_execution_events,
     validate_conversation_storage_rollout_at_startup,
 )
+from .services.generation import start_allowed, tick_allowed
 from .services.interaction_rollout import (
     get_interaction_rollout_policy,
     is_native_schema_ready,

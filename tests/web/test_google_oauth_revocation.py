@@ -469,8 +469,9 @@ async def test_delete_mcp_server_revokes_the_google_grant(db, post):
 def _shared_grant_with_tombstoned_last_link(db: Session, user: User) -> UserOAuth:
     """A shared ``google`` credential whose only app link points at a legacy
     Drive row that holds no token any more (a disconnected tombstone).
-    Detaching that link deletes the shared credential as an orphan, and the
-    tombstone itself has nothing to revoke with."""
+    Detaching that link deletes the shared credential as an orphan. The
+    tombstone's dropped copy of the shared tokens is recorded too, and it is
+    the same Google grant."""
     shared = UserOAuth(
         user_id=int(user.id),
         provider="google",
@@ -593,6 +594,12 @@ async def test_deleting_a_non_google_account_leaves_the_google_fences_alone(db, 
 
     user = _user(db)
     _shared_grant_with_tombstoned_last_link(db, user)
+    # Tombstoning the legacy row dropped its copy of the shared tokens; that
+    # record is skipped while the shared credential is live. Settle it first
+    # so only the Dropbox disconnect is measured.
+    await drain_credential_revocations(db)
+    assert credential_revocation_statuses(db) == ["skipped"]
+    fences = db.query(OAuthRevocationFence).count()
     dropbox = UserOAuth(
         user_id=int(user.id),
         provider="dropbox",
@@ -606,8 +613,8 @@ async def test_deleting_a_non_google_account_leaves_the_google_fences_alone(db, 
     await delete_connected_account(account_id=int(dropbox.id), db=db, user=user)
     await drain_credential_revocations(db)
 
-    assert credential_revocation_statuses(db) == ["skipped"]
+    assert credential_revocation_statuses(db) == ["skipped", "skipped"]
     assert db.query(UserOAuth).filter(UserOAuth.provider == "dropbox").count() == 0
     assert db.query(UserOAuth).filter(UserOAuth.provider == "google").count() == 1
-    assert db.query(OAuthRevocationFence).count() == 0
+    assert db.query(OAuthRevocationFence).count() == fences
     post.assert_not_called()

@@ -57,13 +57,27 @@ def _lancedb(tmp_path, embedding: _Embedding) -> LanceDBMemoryStore:
     )
 
 
-@pytest.fixture(params=["lancedb", "lancedb_without_vectors", "in_memory"])
+def _column_names(store: LanceDBMemoryStore) -> set[str]:
+    table = store._vector_store.get_raw_connection().open_table("memories")
+    try:
+        return set(table.schema.names)
+    finally:
+        _safe_close_table(table)
+
+
+@pytest.fixture(params=["lancedb", "lancedb_text_only", "in_memory"])
 def store(request, tmp_path) -> MemoryStore:
     if request.param == "in_memory":
         return InMemoryMemoryStore()
-    embedding = _Embedding()
-    embedding.fail = request.param == "lancedb_without_vectors"
-    return _lancedb(tmp_path, embedding)
+    if request.param == "lancedb_text_only":
+        # No embedding adapter at all: the supported text-only schema, which has
+        # no ``vector`` column (a failing adapter would still get one).
+        text_only = LanceDBMemoryStore(
+            db_dir=str(tmp_path), collection_name="memories", embedding_model=None
+        )
+        assert "vector" not in _column_names(text_only)
+        return text_only
+    return _lancedb(tmp_path, _Embedding())
 
 
 def _ids(store: MemoryStore) -> list[str]:

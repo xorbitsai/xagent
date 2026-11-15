@@ -10,12 +10,16 @@ re-creates the app, and refuses to guess when the issuer is unknown.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 from datetime import timedelta
-from types import SimpleNamespace
-from unittest.mock import Mock
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -301,3 +305,75 @@ def test_composio_rows_have_no_issuer_and_are_never_revoked(db, user):
     db.delete(row)
     db.commit()
     assert db.query(CredentialRevocation).count() == 0
+
+
+def _issuer_migration() -> ModuleType:
+    import xagent.migrations as migrations_pkg
+
+    path = (
+        Path(next(iter(migrations_pkg.__path__)))
+        / "versions"
+        / "20261115_user_oauth_issuer.py"
+    )
+    spec = importlib.util.spec_from_file_location("user_oauth_issuer", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_pre_audit_retarget_cannot_expose_a_live_google_row_to_revocation(
+    db, user, monkeypatch
+):
+    """``acme-mail`` issued a live Google credential, then was retargeted to
+    GitHub before catalog auditing existed, so the upgrade sees only
+    ``github``. The backfill must leave the row unknown rather than label it
+    ``github``: once the app is restored to Google, another user's
+    disconnect of the same Google account must still find it and skip the
+    project-wide revoke."""
+    _custom_app(db, "github")
+    survivor = UserOAuth(
+        user_id=int(user.id),
+        provider=CUSTOM_APP,
+        provider_user_id="google-sub",
+        access_token="alice-live-google-access",
+        refresh_token="alice-live-google-refresh",
+    )
+    db.add(survivor)
+    db.commit()
+
+    migration = _issuer_migration()
+    with patch.object(
+        migration, "op", Operations(MigrationContext.configure(db.connection()))
+    ):
+        migration.upgrade()
+    db.commit()
+    db.refresh(survivor)
+    assert survivor.oauth_provider is None
+
+    db.query(PublicMCPApp).filter_by(app_id=CUSTOM_APP).one().provider_name = "google"
+    bob = User(username="bob", password_hash="h", is_admin=False)
+    db.add(bob)
+    db.flush()
+    disconnected = UserOAuth(
+        user_id=int(bob.id),
+        provider="gmail",
+        oauth_provider="google",
+        provider_user_id="google-sub",
+        access_token="bob-access",
+        refresh_token="bob-refresh",
+    )
+    db.add(disconnected)
+    db.commit()
+
+    post = Mock()
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    db.delete(disconnected)
+    asyncio.run(drain_credential_revocations(db))
+
+    post.assert_not_called()
+    [record] = db.query(CredentialRevocation).all()
+    assert record.status == "skipped"
+    assert db.get(UserOAuth, int(survivor.id)).access_token == (
+        "alice-live-google-access"
+    )

@@ -72,7 +72,16 @@ import enum
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import Connection, DateTime, Index, Integer, String, Text, event, inspect
+from sqlalchemy import (
+    Connection,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    event,
+    inspect,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 

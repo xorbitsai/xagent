@@ -15,14 +15,14 @@ from sqlalchemy.exc import OperationalError
 
 from tests.shared.credential_revocations import drain_credential_revocations
 from xagent.core.utils.encryption import encrypt_value
-from xagent.web.api import mcp as mcp_api
 from xagent.web.api.v1.deps import _bearer, get_user_from_personal_key
 from xagent.web.api.v1.errors import _DEFAULT_MESSAGES, V1ErrorCode
 from xagent.web.models.database import get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
-from xagent.web.services import connector_team_scope, mcp_server_management
+from xagent.web.services import connector_team_scope
 from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.services import mcp_server_management
 from xagent.web.services.connector_team_scope import ConnectorDeleteDecision
 
 from ..conftest import _direct_db_session, app_for_tests, client

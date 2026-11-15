@@ -58,8 +58,8 @@ import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from functools import partial
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Any
 
 import httpx
@@ -502,8 +502,7 @@ async def _revoke_user_oauth(
                 "GitHub OAuth client credentials are not configured"
             )
         return RevocationOutcome.skipped(
-            "no Google account id was recorded, so nothing proves the grant "
-            "is unshared"
+            "no Google account id was recorded, so nothing proves the grant is unshared"
         )
     claim = await run_tracked(_claim_native_fence_sync, session_factory, revocation)
     if isinstance(claim, _FenceRefusal):
@@ -622,7 +621,13 @@ async def _attempt(
 
 def _retry_backoff(attempts: int) -> timedelta:
     """1, 2, 4, ... minutes after attempt 1, 2, 3, ..., capped."""
-    return min(BASE_RETRY_BACKOFF * (2 ** max(attempts - 1, 0)), MAX_RETRY_BACKOFF)
+    backoff: timedelta = BASE_RETRY_BACKOFF * 2 ** max(attempts - 1, 0)
+    return min(backoff, MAX_RETRY_BACKOFF)
+
+
+def _rowcount(result: object) -> int:
+    """Rows an UPDATE matched: the compare-and-set's outcome."""
+    return int(getattr(result, "rowcount", 0))
 
 
 def _truncate(text: str | None) -> str | None:
@@ -684,15 +689,17 @@ def _claim_due_sync(
             )
             # Compare-and-set on top of the row lock: SQLite takes no lock
             # on the select, and two processes may share one file.
-            won = db.execute(
-                update(record)
-                .where(
-                    record.id == snapshot.id,
-                    record.attempts == snapshot.attempts,
-                    record.status == pending,
+            won = _rowcount(
+                db.execute(
+                    update(record)
+                    .where(
+                        record.id == snapshot.id,
+                        record.attempts == snapshot.attempts,
+                        record.status == pending,
+                    )
+                    .values(updated_at=now, **values)
                 )
-                .values(updated_at=now, **values)
-            ).rowcount
+            )
             if won != 1:
                 continue
             if exhausted:
@@ -719,7 +726,10 @@ def _settle_sync(
 ) -> CredentialRevocationStatus | None:
     """Write one attempt's outcome; ``None`` if the lease was lost meanwhile."""
     status = outcome.status
-    values: dict[str, Any] = {"last_error": _truncate(outcome.detail), "updated_at": now}
+    values: dict[str, Any] = {
+        "last_error": _truncate(outcome.detail),
+        "updated_at": now,
+    }
     if outcome.defer_until is not None:
         # Not attempted: hand the counted attempt back.
         values |= {
@@ -735,15 +745,18 @@ def _settle_sync(
     else:
         values |= {"status": status.value, **_TERMINAL_ERASURE}
     with session_factory() as db:
-        won = db.execute(
-            update(CredentialRevocation)
-            .where(
-                CredentialRevocation.id == record.id,
-                CredentialRevocation.attempts == record.attempts,
-                CredentialRevocation.status == CredentialRevocationStatus.PENDING.value,
+        won = _rowcount(
+            db.execute(
+                update(CredentialRevocation)
+                .where(
+                    CredentialRevocation.id == record.id,
+                    CredentialRevocation.attempts == record.attempts,
+                    CredentialRevocation.status
+                    == CredentialRevocationStatus.PENDING.value,
+                )
+                .values(**values)
             )
-            .values(**values)
-        ).rowcount
+        )
         db.commit()
     if won != 1:
         return None
@@ -756,7 +769,9 @@ def _log_outcome(
     status: CredentialRevocationStatus,
     detail: str | None,
 ) -> None:
-    label = f"Credential revocation {record.id} ({record.kind.value} {record.source_id})"
+    label = (
+        f"Credential revocation {record.id} ({record.kind.value} {record.source_id})"
+    )
     match status:
         case CredentialRevocationStatus.REVOKED:
             logger.info("%s revoked%s", label, f": {detail}" if detail else "")

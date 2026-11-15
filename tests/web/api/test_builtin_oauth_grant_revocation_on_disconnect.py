@@ -339,7 +339,10 @@ async def test_a_bulk_disconnect_enqueues_every_matching_row(db, monkeypatch):
     # unusual, but nothing in the schema prevents it (the ordinary-row
     # uniqueness index is on (user_id, provider, provider_user_id), so two
     # different provider_user_id values are two legal rows).
-    for subject, token in (("42", "first-account-token"), ("43", "second-account-token")):
+    for subject, token in (
+        ("42", "first-account-token"),
+        ("43", "second-account-token"),
+    ):
         db.add(
             UserOAuth(
                 user_id=int(user.id),

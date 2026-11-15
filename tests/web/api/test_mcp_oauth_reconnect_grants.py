@@ -30,11 +30,11 @@ from xagent.web.api import mcp as mcp_api
 from xagent.web.api.mcp import mcp_oauth_callback
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.credential_revocation import CredentialRevocation
-from xagent.web.services.credential_revocations import run_credential_revocation_batch
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.services.credential_revocations import run_credential_revocation_batch
 from xagent.web.services.mcp_oauth import (
     resolve_mcp_oauth_runtime_auth,
     select_mcp_oauth_grants,
@@ -93,7 +93,9 @@ def provider(monkeypatch, engine):
 
     def records() -> list[CredentialRevocation]:
         with sessionmaker(bind=engine)() as db:
-            rows = db.query(CredentialRevocation).order_by(CredentialRevocation.id).all()
+            rows = (
+                db.query(CredentialRevocation).order_by(CredentialRevocation.id).all()
+            )
             db.expunge_all()
             return rows
 

@@ -21,7 +21,6 @@ from xagent.core.utils.encryption import decrypt_value_strict, encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.models.credential_revocation import (
     CredentialRevocation,
-    CredentialRevocationStatus,
 )
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer
@@ -181,7 +180,9 @@ def test_bulk_and_raw_sql_deletes_record_too(factory):
 
 def test_composio_rows_are_not_recorded(factory):
     with factory() as db:
-        row = _native(db, _user(db), token_type=COMPOSIO_TOKEN_TYPE, oauth_provider=None)
+        row = _native(
+            db, _user(db), token_type=COMPOSIO_TOKEN_TYPE, oauth_provider=None
+        )
         db.delete(row)
         db.commit()
     assert _records(factory) == []
@@ -206,7 +207,10 @@ def test_user_cascade_records_native_rows_and_grants(factory):
         db.commit()
         db.execute(text("DELETE FROM users WHERE id = :id"), {"id": user.id})
         db.commit()
-    assert sorted(r.kind for r in _records(factory)) == ["mcp_oauth_grant", "user_oauth"]
+    assert sorted(r.kind for r in _records(factory)) == [
+        "mcp_oauth_grant",
+        "user_oauth",
+    ]
 
 
 def test_mcp_grant_delete_records_tokens_client_and_identity(factory):
@@ -305,9 +309,7 @@ def test_the_record_holds_the_tokens_of_the_last_committed_refresh(factory):
         db.delete(grant)
         db.delete(row)
         db.commit()
-    tokens = {
-        r.kind: decrypt_value_strict(r.access_token) for r in _records(factory)
-    }
+    tokens = {r.kind: decrypt_value_strict(r.access_token) for r in _records(factory)}
     assert tokens == {
         "mcp_oauth_grant": "rotated-access",
         "user_oauth": "rotated-native-access",
@@ -315,6 +317,7 @@ def test_the_record_holds_the_tokens_of_the_last_committed_refresh(factory):
 
 
 # --- the worker ---------------------------------------------------------------
+
 
 @pytest.fixture()
 def now() -> datetime:
@@ -331,7 +334,9 @@ def _no_fence_close_margin(monkeypatch):
     margin; the tests retry sooner than that in real time."""
     from xagent.web.services import oauth_revocation_fences
 
-    monkeypatch.setattr(oauth_revocation_fences, "OAUTH_REVOCATION_CLOSE_MARGIN", timedelta(0))
+    monkeypatch.setattr(
+        oauth_revocation_fences, "OAUTH_REVOCATION_CLOSE_MARGIN", timedelta(0)
+    )
 
 
 class _Response:
@@ -399,9 +404,7 @@ def _assert_erased(record: CredentialRevocation) -> None:
 
 
 @pytest.mark.asyncio
-async def test_worker_revokes_a_google_grant_through_its_refresh_token(
-    factory, google
-):
+async def test_worker_revokes_a_google_grant_through_its_refresh_token(factory, google):
     _delete_native(factory)
 
     report = await _run(factory)
@@ -431,9 +434,7 @@ async def test_already_revoked_counts_as_done(factory, google, monkeypatch):
         )
         db.commit()
     _delete_native(factory, provider="github", oauth_provider="github", subject="42")
-    monkeypatch.setattr(
-        auth_api.requests, "delete", lambda *a, **k: _Response(404)
-    )
+    monkeypatch.setattr(auth_api.requests, "delete", lambda *a, **k: _Response(404))
 
     report = await _run(factory)
 
@@ -548,7 +549,9 @@ async def test_an_open_fence_defers_without_spending_an_attempt(factory, google)
 
 
 @pytest.mark.asyncio
-async def test_records_of_one_grant_run_one_at_a_time_oldest_first(factory, now, google):
+async def test_records_of_one_grant_run_one_at_a_time_oldest_first(
+    factory, now, google
+):
     google.answers.append(_Response(503))
     with factory() as db:
         user = _user(db)
@@ -624,7 +627,9 @@ async def test_an_mcp_grant_is_revoked_per_rfc7009(factory, rfc7009):
 
 
 @pytest.mark.asyncio
-async def test_an_mcp_invalid_token_answer_is_done_and_a_5xx_retries(factory, now, rfc7009):
+async def test_an_mcp_invalid_token_answer_is_done_and_a_5xx_retries(
+    factory, now, rfc7009
+):
     rfc7009.answers.extend(
         [
             httpx.Response(400, json={"error": "invalid_token"}),
@@ -662,9 +667,7 @@ async def test_an_mcp_grant_with_an_active_successor_is_skipped(factory, rfc7009
 
 
 @pytest.mark.asyncio
-async def test_an_mcp_server_without_a_revocation_endpoint_is_skipped(
-    factory, rfc7009
-):
+async def test_an_mcp_server_without_a_revocation_endpoint_is_skipped(factory, rfc7009):
     with factory() as db:
         _, client, grant = _mcp(db, _user(db))
         client.metadata_json = {}

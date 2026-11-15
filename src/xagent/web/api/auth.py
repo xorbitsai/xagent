@@ -4028,7 +4028,6 @@ def revoke_resolved_builtin_oauth_grant(
             )
 
 
-
 def _generic_oauth_login(
     provider: str,
     *,

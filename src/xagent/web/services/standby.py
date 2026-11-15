@@ -78,11 +78,17 @@ class _LoopLagProbe:
             await asyncio.sleep(_LAG_PROBE_INTERVAL_SECONDS)
             self.max_lag = max(self.max_lag, loop.time() - self._expected)
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
+        """Cancel the probe without awaiting it.
+
+        Deliberately not a coroutine: an await here would be a cancellation
+        point outside activation's failure boundary, where a cancel would skip
+        the FAILED transition and the failure hooks. The cancelled task ends
+        on its own on the next loop iteration.
+        """
         task, self._task = self._task, None
         if task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
 
 class StandbyController:
@@ -188,6 +194,11 @@ class StandbyController:
                             time.monotonic() - step_started,
                             probe.worst_lag(),
                         )
+                # A cancel requested during a step that never suspended is
+                # delivered here, inside the failure boundary, so it takes the
+                # fail-closed path (FAILED, hooks) instead of an ACTIVE process
+                # whose caller was told it was cancelled.
+                await asyncio.sleep(0)
             except BaseException:
                 if self._phase is StandbyPhase.ACTIVATING:
                     self._activated_at = None
@@ -200,7 +211,7 @@ class StandbyController:
                         logger.exception("Standby failure hook failed")
                 raise
             finally:
-                await probe.stop()
+                probe.stop()
             # A shutdown that reset the ledger mid-activation owns the phase.
             if self._phase is StandbyPhase.ACTIVATING:
                 self._steps.clear()

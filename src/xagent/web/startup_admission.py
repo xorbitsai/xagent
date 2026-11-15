@@ -46,11 +46,11 @@ async def run_host_startup_admissions(app: FastAPI) -> None:
     """Run a stable snapshot of this app's registered admission callbacks."""
     for callback in _get_callbacks(app):
         if _is_async_callback(callback):
-            await callback()
-            continue
-        from .services.writer_workers import run_tracked_to_completion
+            result = callback()
+        else:
+            from .services.writer_workers import run_tracked_to_completion
 
-        result = await run_tracked_to_completion(callback)
+            result = await run_tracked_to_completion(callback)
         if inspect.isawaitable(result):
             await result
 

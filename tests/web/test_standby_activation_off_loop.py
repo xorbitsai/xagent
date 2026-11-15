@@ -12,7 +12,7 @@ import pytest
 from fastapi import FastAPI
 
 from xagent.web import app as app_module
-from xagent.web.services.standby import StandbyController
+from xagent.web.services.standby import StandbyController, StandbyPhase
 from xagent.web.startup_admission import (
     register_host_startup_admission,
     run_host_startup_admissions,
@@ -153,3 +153,34 @@ async def test_activation_logs_step_duration_and_loop_lag(
     lag = float(line.rsplit("lag ", 1)[1].rstrip("s)"))
     assert lag >= 0.2, line
     assert any("activation complete in" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_cancel_at_the_end_of_the_last_step_still_closes_activation() -> None:
+    """A cancel landing after the final step must not strand the phase.
+
+    The last step has no suspension of its own, so a cancel requested inside it
+    is delivered at the first suspension after it: whatever activation does
+    next. That point must stay inside the failure boundary, or the phase stays
+    ``ACTIVATING`` and the failure hooks (which reseal admission and stop the
+    started paths) never run.
+    """
+    controller = StandbyController()
+    hooks: list[str] = []
+    holder: dict[str, asyncio.Task[None]] = {}
+
+    async def last_step_requests_cancel() -> None:
+        holder["task"].cancel()  # delivered at the next suspension point
+
+    async def hook() -> None:
+        hooks.append("failure hook")
+
+    controller.begin()
+    controller.on_failure(hook)
+    controller.defer("last step", last_step_requests_cancel)
+    holder["task"] = asyncio.ensure_future(controller.activate())
+    with pytest.raises(asyncio.CancelledError):
+        await holder["task"]
+
+    assert controller.phase is StandbyPhase.FAILED
+    assert hooks == ["failure hook"]

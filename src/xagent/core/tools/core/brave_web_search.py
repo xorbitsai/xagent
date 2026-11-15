@@ -21,6 +21,7 @@ import httpx
 
 from ....config import get_brave_search_country, get_brave_search_endpoint
 from .web_content import WebContentFetcher
+from .web_search_guard import run_guarded_search
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,14 @@ class BraveWebSearchCore:
         Returns:
             List of search results with title, link, snippet and optionally content
         """
-        return await self._search_redacted(query, max_results, include_content)
+        return await run_guarded_search(
+            "brave",
+            query,
+            lambda redacted: self._search_redacted(
+                redacted, max_results, include_content
+            ),
+            len,
+        )
 
     async def _search_redacted(
         self,

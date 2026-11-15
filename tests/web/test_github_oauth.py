@@ -1368,8 +1368,10 @@ def _revoke_deleted(
     oauth_provider: str = "github",
     access_token: str = "tok",
     provider_user_id: str | None = "42",
+    after_delete=None,
 ) -> CredentialRevocation:
-    """Delete one connected row of a user of its own, drain the credential
+    """Delete one connected row of a user of its own, run ``after_delete``
+    (a change made while the record is pending), drain the credential
     revocation outbox once, and return the row's record."""
     owner = User(username="deleting-user", password_hash="x", is_admin=False)
     db.add(owner)
@@ -1384,6 +1386,9 @@ def _revoke_deleted(
     db.add(row)
     db.commit()
     db.delete(row)
+    db.commit()
+    if after_delete is not None:
+        after_delete()
     asyncio.run(drain_credential_revocations(db))
     db.expire_all()
     return db.query(CredentialRevocation).one()
@@ -1483,11 +1488,86 @@ def test_github_422_is_a_real_failure(db_session, monkeypatch):
     assert "HTTP 422" in record.last_error
 
 
-def test_a_missing_github_provider_row_is_retried(db_session, monkeypatch):
-    """No configured GitHub OAuthProvider row -- nothing to authenticate the
-    revoke call with. An operator can fix that, so the record stays owed."""
+def test_no_github_app_configured_when_the_credential_left_fails(
+    db_session, monkeypatch
+):
+    """With no GitHub OAuth app configured when the row was deleted, nothing
+    says which app issued it; configuring one later must not be guessed to
+    be it."""
     db, _user = db_session
 
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    record = _revoke_deleted(db, after_delete=lambda: _add_github_provider_row(db))
+
+    delete.assert_not_called()
+    assert record.status == "failed"
+    assert "app that issued it is unknown" in record.last_error
+
+
+@pytest.mark.parametrize("change", ["replaced", "deleted"])
+def test_the_grant_delete_uses_the_app_recorded_when_the_credential_left(
+    db_session, monkeypatch, change
+):
+    """An administrator replaces or deletes the GitHub app configuration while
+    the record is pending: the delete still authenticates as the app that
+    issued the token, never as whatever is configured now."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    def change_the_app() -> None:
+        provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+        if change == "replaced":
+            provider.client_id = encrypt_value("app-b-client-id")
+            provider.client_secret = encrypt_value("app-b-client-secret")
+        else:
+            db.delete(provider)
+        db.commit()
+
+    record = _revoke_deleted(db, after_delete=change_the_app)
+
+    args, kwargs = delete.call_args
+    assert args[0] == "https://api.github.com/applications/github-client-id/grant"
+    assert kwargs["auth"] == ("github-client-id", "github-client-secret")
+    assert record.status == "revoked"
+    assert record.client_secret is None
+
+
+def test_an_environment_backed_app_resolves_from_the_environment(
+    db_session, monkeypatch
+):
+    """A provider row with blank credentials uses ``GITHUB_CLIENT_ID`` and
+    ``GITHUB_CLIENT_SECRET``, which a provider update cannot change; the
+    snapshot records the blanks and the environment answers."""
+    db, _user = db_session
+    _add_github_provider_row(db)
+    provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+    provider.client_id = ""
+    provider.client_secret = ""
+    db.commit()
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "env-client-id")
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", "env-client-secret")
+    delete = Mock(return_value=MockResponse(status_code=204))
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    record = _revoke_deleted(db)
+
+    assert delete.call_args.kwargs["auth"] == ("env-client-id", "env-client-secret")
+    assert record.status == "revoked"
+
+
+def test_an_environment_backed_app_without_its_environment_is_retried(
+    db_session, monkeypatch
+):
+    db, _user = db_session
+    _add_github_provider_row(db)
+    provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+    provider.client_secret = ""
+    db.commit()
+    monkeypatch.delenv("GITHUB_CLIENT_SECRET", raising=False)
     delete = Mock()
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
@@ -1495,7 +1575,25 @@ def test_a_missing_github_provider_row_is_retried(db_session, monkeypatch):
 
     delete.assert_not_called()
     assert record.status == "pending"
-    assert "not configured" in record.last_error
+    assert "environment" in record.last_error
+
+
+def test_an_app_secret_under_a_lost_key_fails_without_a_call(db_session, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    db, _user = db_session
+    _add_github_provider_row(db)
+    provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+    provider.client_secret = Fernet(Fernet.generate_key()).encrypt(b"x").decode()
+    db.commit()
+    delete = Mock()
+    monkeypatch.setattr(auth_api.requests, "delete", delete)
+
+    record = _revoke_deleted(db)
+
+    delete.assert_not_called()
+    assert record.status == "failed"
+    assert "cannot be decrypted" in record.last_error
 
 
 def test_a_github_account_another_user_shares_is_not_revoked(db_session, monkeypatch):
@@ -1527,106 +1625,6 @@ def test_a_github_account_another_user_shares_is_not_revoked(db_session, monkeyp
 
     delete.assert_not_called()
     assert record.status == "skipped"
-
-
-def test_resolve_builtin_oauth_revocation_decrypts_credentials(db_session):
-    """The outbox worker resolves a record before ever touching the network
-    -- it must come back decrypted and ready to use, carrying
-    provider_user_id through unchanged for the reference check."""
-    db, _user = db_session
-    _add_github_provider_row(db)
-
-    resolved = auth_api.resolve_builtin_oauth_revocation(
-        db,
-        oauth_provider="github",
-        access_token="live-access-token",
-        provider_user_id="42",
-    )
-
-    assert resolved == auth_api.BuiltinOAuthRevocation(
-        provider="github",
-        access_token="live-access-token",
-        client_id="github-client-id",
-        client_secret="github-client-secret",
-        provider_user_id="42",
-    )
-
-
-def test_resolve_builtin_oauth_revocation_is_none_when_nothing_to_revoke(db_session):
-    """Every reason to skip revocation must come back as a plain ``None`` --
-    the async caller decides what to do with that, not this function."""
-    db, _user = db_session
-
-    assert (
-        auth_api.resolve_builtin_oauth_revocation(
-            db, oauth_provider="slack", access_token="tok", provider_user_id="42"
-        )
-        is None
-    )
-    assert (
-        auth_api.resolve_builtin_oauth_revocation(
-            db, oauth_provider="github", access_token="", provider_user_id="42"
-        )
-        is None
-    )
-    assert (
-        auth_api.resolve_builtin_oauth_revocation(
-            db, oauth_provider="github", access_token="tok", provider_user_id="42"
-        )
-        is None
-    )  # no OAuthProvider row seeded yet
-
-
-def test_resolve_builtin_oauth_revocation_warns_on_missing_provider_row(
-    db_session, monkeypatch
-):
-    """Every other skip reason logs (a network failure, an unexpected
-    status, a still-referenced sibling); silence here would hide a real
-    misconfiguration (the connector was never set up) behind an
-    indistinguishable "disconnect worked cleanly" outcome."""
-    db, _user = db_session
-    warning = Mock()
-    monkeypatch.setattr(auth_api.logger, "warning", warning)
-
-    auth_api.resolve_builtin_oauth_revocation(
-        db, oauth_provider="github", access_token="tok", provider_user_id="42"
-    )
-
-    warning.assert_called_once()
-
-
-def test_resolve_builtin_oauth_revocation_warns_on_unresolvable_secret(
-    db_session, monkeypatch
-):
-    """Same reasoning as the missing-provider-row case, for a
-    partially-configured provider row (e.g. only one of
-    GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set)."""
-    db, _user = db_session
-    db.add(
-        OAuthProvider(
-            provider_name="github",
-            name="GitHub",
-            client_id="",
-            client_secret="",
-            auth_url="https://github.com/login/oauth/authorize",
-            token_url="https://github.com/login/oauth/access_token",
-            redirect_uri="https://app.example.com/api/auth/github/callback",
-            userinfo_url="https://api.github.com/user",
-            user_id_path="id",
-            email_path="login",
-            default_scopes=["read:user"],
-        )
-    )
-    db.commit()
-    warning = Mock()
-    monkeypatch.setattr(auth_api.logger, "warning", warning)
-
-    result = auth_api.resolve_builtin_oauth_revocation(
-        db, oauth_provider="github", access_token="tok", provider_user_id="42"
-    )
-
-    assert result is None
-    warning.assert_called_once()
 
 
 def test_has_other_builtin_oauth_reference_true_for_a_live_sibling_row(db_session):

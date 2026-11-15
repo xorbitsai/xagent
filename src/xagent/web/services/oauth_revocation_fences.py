@@ -1,6 +1,7 @@
-"""Fence builtin OAuth grant revocations against concurrent callbacks.
+"""Fence OAuth grant revocations against concurrent callbacks.
 
-GitHub and Google revoke a whole grant per upstream account and OAuth client.
+GitHub and Google revoke a whole grant per upstream account and OAuth client;
+an MCP authorization server may end a whole authorization the same way.
 The credential revocation outbox worker (``services.credential_revocations``)
 revokes a deleted credential only once no local row references that account
 any more (``has_other_builtin_oauth_reference``), but a concurrent callback for the
@@ -43,6 +44,13 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from ..models.oauth_revocation_fence import OAuthRevocationFence
+
+# The fence ``provider`` of an MCP authorization; its ``provider_user_id`` is
+# ``models.mcp_oauth.mcp_oauth_authorization_key``. An MCP authorization server
+# may end a whole authorization when one of its tokens is revoked, so a
+# revocation and a reconnect of the same authorization share a fence exactly
+# like a GitHub or Google account does.
+MCP_OAUTH_FENCE_PROVIDER = "mcp_oauth"
 
 # How long an opened fence refuses callbacks if its revoker never closes it.
 OAUTH_REVOCATION_FENCE_WINDOW = timedelta(minutes=2)

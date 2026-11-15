@@ -3736,8 +3736,9 @@ def _revoke_google_oauth_token(
 
 class BuiltinOAuthRevocation(NamedTuple):
     """Everything needed to revoke one builtin OAuth grant after its local
-    ``UserOAuth`` row is gone (resolved from its revocation outbox record by
-    ``services.credential_revocations``), plus the
+    ``UserOAuth`` row is gone (built from its revocation outbox receipt by
+    ``services.credential_revocations``, never from the live provider
+    configuration), plus the
     upstream identity (``provider_user_id``) needed to check whether another
     local connection still needs that same grant alive -- see
     :func:`has_other_builtin_oauth_reference`.
@@ -3773,125 +3774,6 @@ class BuiltinOAuthRevocation(NamedTuple):
             f"provider_user_id={self.provider_user_id!r}, "
             f"refresh_token=<redacted>)"
         )
-
-
-def resolve_builtin_oauth_revocation(
-    db: Session,
-    *,
-    oauth_provider: str | None,
-    access_token: str,
-    provider_user_id: str | None,
-    refresh_token: str | None = None,
-    token_type: str | None = None,
-) -> BuiltinOAuthRevocation | None:
-    """Resolve one deleted ``UserOAuth`` row into a network-free revocation
-    record, decrypting the stored client_id/secret the same way
-    generic_oauth_login/generic_oauth_callback already do for this row.
-
-    ``oauth_provider`` is the row's recorded issuer
-    (``UserOAuth.oauth_provider``), so a Gmail, Drive or custom-app row whose
-    tokens Google issued resolves to a Google revocation whatever the catalog
-    says about its app today: an admin may since have deleted the app,
-    retargeted its ``provider_name``, or re-created the same id for another
-    provider, none of which changes who issued the stored tokens. The catalog
-    is never consulted for the issuer.
-
-    ``oauth_provider=None`` on a native row means the issuer is unknown (a
-    row the backfill migration could not prove). That outcome is explicit:
-    a warning is logged and ``None`` is returned, so the row is never
-    revoked against a guessed provider -- failing closed leaves a grant
-    alive rather than sending a token to the wrong issuer. A caller that
-    must tell "issuer unknown" apart from "nothing to revoke" reads the
-    row's ``oauth_provider`` itself before calling. Pass the row's
-    ``refresh_token`` and
-    ``token_type`` too: Google revokes through the refresh token, and a
-    Composio-backed row (``token_type == COMPOSIO_TOKEN_TYPE``) holds a
-    Composio connected-account id rather than a provider token -- its grant
-    belongs to Composio's own OAuth app and is removed by deleting that
-    account (``delete_scoped_user_oauth_accounts``), never here.
-
-    A Google row with no recorded ``provider_user_id`` (legacy rows) is never
-    revoked: Google revokes the account's whole grant for this client, and
-    without the upstream identity nothing can prove that no other
-    connection -- the same user's Drive, another user's Gmail -- still
-    relies on that grant.
-
-    Returns ``None`` when there's nothing to revoke -- a Composio-backed row,
-    an unknown issuer, a provider with no revoke implementation (only GitHub
-    and Google have one), a Google row without an upstream identity, an
-    empty token, no configured provider row, or a missing secret -- so
-    callers can skip revocation outright. Only reads the database and makes
-    no network call; the provider call is
-    :func:`revoke_resolved_builtin_oauth_grant`.
-    """
-    if token_type == COMPOSIO_TOKEN_TYPE:
-        return None
-    if oauth_provider is None:
-        logger.warning(
-            "Skipping OAuth grant revocation: the connection recorded no "
-            "issuing provider, so it cannot be revoked without guessing"
-        )
-        return None
-    if oauth_provider == "google":
-        if not (refresh_token or access_token):
-            return None
-        if provider_user_id is None:
-            logger.info(
-                "Skipping Google OAuth grant revocation: the connection "
-                "recorded no Google account id"
-            )
-            return None
-        return BuiltinOAuthRevocation(
-            provider="google",
-            access_token=access_token,
-            client_id="",
-            client_secret="",
-            provider_user_id=provider_user_id,
-            refresh_token=refresh_token or None,
-        )
-    if oauth_provider != "github" or not access_token:
-        return None
-    from ..models.oauth_provider import OAuthProvider
-
-    db_provider = (
-        db.query(OAuthProvider)
-        .filter(OAuthProvider.provider_name == "github")
-        .one_or_none()
-    )
-    if not db_provider:
-        logger.warning(
-            "Skipping GitHub OAuth grant revocation: no github OAuthProvider "
-            "row is configured"
-        )
-        return None
-    # oauth_providers.client_id/client_secret are stored encrypted (or left
-    # blank to fall back to the GITHUB_CLIENT_ID/SECRET env vars) -- same
-    # resolution generic_oauth_login/generic_oauth_callback already use for
-    # this row, never the raw column value.
-    client_id = _resolve_oauth_secret(
-        "github", cast(Any, db_provider.client_id), "CLIENT_ID"
-    )
-    client_secret = _resolve_oauth_secret(
-        "github", cast(Any, db_provider.client_secret), "CLIENT_SECRET"
-    )
-    if not client_id or not client_secret:
-        # Every other skip reason here logs (missing provider row above,
-        # unreachable/failing GitHub in _revoke_github_oauth_grant) -- silence
-        # here would hide a real misconfiguration (e.g. only one of
-        # GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET set) behind an
-        # indistinguishable "disconnect worked" outcome.
-        logger.warning(
-            "Skipping GitHub OAuth grant revocation: client_id/client_secret "
-            "could not be resolved"
-        )
-        return None
-    return BuiltinOAuthRevocation(
-        provider="github",
-        access_token=access_token,
-        client_id=client_id,
-        client_secret=client_secret,
-        provider_user_id=provider_user_id,
-    )
 
 
 def has_other_builtin_oauth_reference(

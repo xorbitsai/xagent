@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import logging
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -230,24 +229,8 @@ def test_a_sibling_still_references_google_after_a_catalog_change(
     )
 
 
-def test_an_unknown_issuer_resolves_to_no_revocation(db, caplog):
-    """Never a guess from the catalog, even when it names a provider."""
-    _custom_app(db, "google")
-
-    with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
-        resolved = auth_api.resolve_builtin_oauth_revocation(
-            db,
-            oauth_provider=None,
-            access_token="access",
-            provider_user_id="google-sub",
-            refresh_token="refresh",
-        )
-
-    assert resolved is None
-    assert "recorded no issuing provider" in caplog.text
-
-
 def test_an_unknown_issuer_row_is_recorded_and_failed_without_a_guess(db, user):
+    """Never a guess from the catalog, even when it names a provider."""
     _custom_app(db, "google")
     row = UserOAuth(
         user_id=int(user.id),

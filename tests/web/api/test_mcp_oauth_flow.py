@@ -977,6 +977,7 @@ def test_callback_producer_first_blocks_real_disconnect_until_grant_commit(
     mcp_api._upsert_mcp_oauth_grant(
         db,
         flow_state=lifecycle[2],
+        exchange_started_at=mcp_api._utc_now(),
         token_data={
             "access_token": "sqlite-issued-token",
             "token_type": "Bearer",
@@ -4917,7 +4918,10 @@ def test_upsert_mcp_oauth_grant_locks_and_reinserts_a_deleted_row(
         "scope": "records.read",
     }
     grant = mcp_api._upsert_mcp_oauth_grant(
-        db, flow_state=flow_state, token_data=token_data
+        db,
+        flow_state=flow_state,
+        token_data=token_data,
+        exchange_started_at=mcp_api._utc_now(),
     )
     db.commit()
     grant_id = grant.id
@@ -4938,7 +4942,12 @@ def test_upsert_mcp_oauth_grant_locks_and_reinserts_a_deleted_row(
 
     monkeypatch.setattr(Query, "with_for_update", record_with_for_update)
 
-    mcp_api._upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
+    mcp_api._upsert_mcp_oauth_grant(
+        db,
+        flow_state=flow_state,
+        token_data=token_data,
+        exchange_started_at=mcp_api._utc_now(),
+    )
     db.commit()
 
     assert lock_queries
@@ -4959,6 +4968,7 @@ def test_upsert_mcp_oauth_grant_drops_marker_keys_from_a_token_payload(db_sessio
     grant = mcp_api._upsert_mcp_oauth_grant(
         db,
         flow_state=flow_state,
+        exchange_started_at=mcp_api._utc_now(),
         token_data={
             "access_token": "access-token",
             "token_type": "Bearer",

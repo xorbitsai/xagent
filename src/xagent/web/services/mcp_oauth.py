@@ -948,6 +948,7 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                     user_id=user_id,
                     resource_owner_key=resource_owner_key,
                     client_id=grant_client_id,
+                    remote_client_id=oauth_client_snapshot.client_id,
                     issuer=grant_issuer,
                     resource=refresh_resource,
                 ):
@@ -1074,10 +1075,15 @@ def _replaced_by_an_active_grant(  # noqa: PLR0913
     user_id: int,
     resource_owner_key: str,
     client_id: int,
+    remote_client_id: str,
     issuer: str,
     resource: str,
 ) -> bool:
     """Whether the owner holds another active grant in place of ``grant_id``.
+
+    ``remote_client_id`` is the grant's OAuth client's own ``client_id``: on
+    SQLite a deleted client row's local id can be handed to a recreated
+    server's different client, which is not a successor of this grant.
 
     A reconnect that grants a different scope deletes the earlier grant as
     superseded and stores its successor in one callback transaction
@@ -1098,16 +1104,18 @@ def _replaced_by_an_active_grant(  # noqa: PLR0913
     coordination between reconnect and revocation that this deliberately
     does not add.
     """
-    from ..models.mcp_oauth import MCPOAuthGrant
+    from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 
     return (
         db.query(MCPOAuthGrant.id)
+        .join(MCPOAuthClient, MCPOAuthClient.id == MCPOAuthGrant.mcp_oauth_client_id)
         .filter(
             MCPOAuthGrant.id != grant_id,
             MCPOAuthGrant.mcp_server_id == server_id,
             MCPOAuthGrant.user_id == user_id,
             MCPOAuthGrant.resource_owner_key == resource_owner_key,
             MCPOAuthGrant.mcp_oauth_client_id == client_id,
+            MCPOAuthClient.client_id == remote_client_id,
             MCPOAuthGrant.issuer == issuer,
             MCPOAuthGrant.resource == resource,
             MCPOAuthGrant.status == "active",

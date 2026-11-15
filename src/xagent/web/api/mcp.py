@@ -84,6 +84,7 @@ from ..models.mcp_oauth import (
     MCPOAuthFlowState,
     MCPOAuthGrant,
     mcp_oauth_client_lookup_hash,
+    mcp_oauth_authorization_key,
     mcp_oauth_client_registration_lookup_hash,
     mcp_oauth_grant_lookup_hash,
 )
@@ -1484,6 +1485,7 @@ def _store_team_member_mcp_oauth_grant(
     flow_identity: _MCPOAuthTeamFlowIdentity,
     resource: str,
     token_data: dict[str, Any],
+    exchange_started_at: datetime,
 ) -> bool:
     """Lock, write the grant and commit; False when access no longer holds.
 
@@ -1506,6 +1508,7 @@ def _store_team_member_mcp_oauth_grant(
             db,
             flow_state=flow_state,
             token_data=token_data,
+            exchange_started_at=exchange_started_at,
             required_scope=_explicit_mcp_oauth_required_scope(server),
             selected_scope=_mcp_oauth_selected_scope(server),
         )
@@ -2183,15 +2186,79 @@ def _delete_superseded_mcp_oauth_grants(
         )
 
 
+def _refuse_mcp_oauth_grant_revoked_during_exchange(
+    db: Session, *, flow_state: MCPOAuthFlowState, exchange_started_at: datetime
+) -> None:
+    """Refuse tokens a concurrent revocation of the same authorization may kill.
+
+    The credential revocation outbox revokes a deleted or revoked grant after
+    its local commit, and an authorization server may end the whole
+    authorization when one token is revoked -- including the tokens this
+    callback was just issued for the same owner, server, client and resource.
+    Both sides lock the authorization's revocation fence
+    (``services.oauth_revocation_fences``), and this lock is held until the
+    callback commits. So either this grant commits first and the worker's
+    reference check sees it (the revocation is skipped), or the worker has
+    opened the fence and a code exchange that started before its provider
+    call ended is refused here with ``grant_revoked_during_exchange``; the
+    caller then compensates the issued tokens and asks for a reconnect.
+    """
+    from ..services.oauth_revocation_fences import (
+        MCP_OAUTH_FENCE_PROVIDER,
+        lock_oauth_revocation_fence,
+        oauth_revocation_fence_refuses,
+    )
+
+    remote_client_id = (
+        db.query(MCPOAuthClient.client_id)
+        .filter(MCPOAuthClient.id == flow_state.mcp_oauth_client_id)
+        .scalar()
+    )
+    fence = lock_oauth_revocation_fence(
+        db,
+        provider=MCP_OAUTH_FENCE_PROVIDER,
+        provider_user_id=mcp_oauth_authorization_key(
+            mcp_server_id=flow_state.mcp_server_id,
+            user_id=flow_state.user_id,
+            resource_owner_key=flow_state.resource_owner_key,
+            client_id=remote_client_id,
+            issuer=flow_state.issuer,
+            resource=flow_state.resource,
+        ),
+    )
+    if oauth_revocation_fence_refuses(fence, exchange_started_at=exchange_started_at):
+        logger.warning(
+            "MCP OAuth callback did not connect: server_id=%s "
+            "reason=grant_revoked_during_exchange",
+            flow_state.mcp_server_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "grant_revoked_during_exchange",
+                "message": (
+                    "This connection was being disconnected while you "
+                    "authorized it. Please connect again."
+                ),
+            },
+        )
+
+
 def _upsert_mcp_oauth_grant(
     db: Session,
     *,
     flow_state: MCPOAuthFlowState,
     token_data: dict[str, Any],
+    exchange_started_at: datetime,
     required_scope: str = "",
     selected_scope: str = "",
 ) -> MCPOAuthGrant:
     """Store the granted scope as the provider returned it.
+
+    ``exchange_started_at`` is when the code exchange that issued
+    ``token_data`` began; a revocation of the same authorization that may
+    have reached the provider after it refuses the grant
+    (``_refuse_mcp_oauth_grant_revoked_during_exchange``).
 
     A token response without ``scope`` was granted the requested scope (RFC
     6749 section 5.1). When ``required_scope`` is given and the granted scope
@@ -2204,6 +2271,9 @@ def _upsert_mcp_oauth_grant(
     or an access token that does not expire
     (``_delete_superseded_mcp_oauth_grants``).
     """
+    _refuse_mcp_oauth_grant_revoked_during_exchange(
+        db, flow_state=flow_state, exchange_started_at=exchange_started_at
+    )
     scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
     missing_scopes = set(required_scope.split()) - set(scope.split())
     if missing_scopes:
@@ -6883,6 +6953,9 @@ async def mcp_oauth_callback(
         )
     issued_token: _MCPOAuthIssuedTokenSnapshot | None = None
     failure_stage = "token_exchange"
+    # Before the exchange: a revocation of this authorization whose provider
+    # call overlaps the exchange may kill what it issues.
+    exchange_started_at = _utc_now()
     try:
         token_data = await _exchange_mcp_oauth_code(
             client=client,
@@ -6905,6 +6978,7 @@ async def mcp_oauth_callback(
                 flow_identity=flow_identity,
                 resource=resource,
                 token_data=token_data,
+                exchange_started_at=exchange_started_at,
             )
         else:
             failure_stage = "lock_lifecycle"
@@ -6929,6 +7003,7 @@ async def mcp_oauth_callback(
                     db,
                     flow_state=locked_flow_state,
                     token_data=token_data,
+                    exchange_started_at=exchange_started_at,
                     required_scope=_explicit_mcp_oauth_required_scope(lifecycle[0]),
                     selected_scope=_mcp_oauth_selected_scope(lifecycle[0]),
                 )

@@ -360,6 +360,7 @@ def test_producer_first_holds_lifecycle_locks_until_grant_commit(
         mcp_api._upsert_mcp_oauth_grant(
             producer_db,
             flow_state=locked_flow,
+            exchange_started_at=mcp_api._utc_now(),
             token_data={
                 "access_token": "postgres-issued-token",
                 "token_type": "Bearer",

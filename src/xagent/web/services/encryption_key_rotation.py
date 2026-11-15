@@ -43,9 +43,16 @@ ENCRYPTED_COLUMNS = {
     "agent_triggers": ("secret_encrypted",),
     "trigger_runs": ("payload_snapshot",),
     "global_memory_embedding_authority": ("api_key_encrypted",),
-    # Ciphertext copied verbatim from the three columns above by the
-    # revocation outbox triggers (models.credential_revocation).
-    "credential_revocations": ("access_token", "refresh_token", "client_secret"),
+    # Ciphertext copied verbatim from the columns above by the revocation
+    # outbox triggers (models.credential_revocation). Its client_id holds an
+    # MCP client's plain id or a GitHub app's encrypted one; only
+    # Fernet-shaped values are rotated, so both are handled.
+    "credential_revocations": (
+        "access_token",
+        "refresh_token",
+        "client_id",
+        "client_secret",
+    ),
 }
 _REQUIRED_CIPHERTEXT = {
     ("models", "_api_key_encrypted"),

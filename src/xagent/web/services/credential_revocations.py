@@ -56,7 +56,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Sequence
+import os
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -358,33 +359,36 @@ def _decrypt(value: str | None) -> str | None:
     return decrypt_value_strict(value) if value else None
 
 
-def _resolve_native_sync(
-    session_factory: Callable[[], Session],
-    record: ClaimedRevocation,
-    access_token: str,
-    refresh_token: str | None,
-) -> Any:
-    from ..api.auth import resolve_builtin_oauth_revocation
+# --- the revocation fence -----------------------------------------------------
+#
+# A provider may revoke more than the tokens it is handed: GitHub deletes and
+# Google revokes a whole grant per account and OAuth client, and an MCP
+# authorization server may end a whole authorization. A reconnect of the same
+# account or authorization that commits between the worker's reference check
+# and its provider call would then be killed after reporting success. Both
+# sides therefore share one ``OAuthRevocationFence`` row per account or
+# authorization (``services.oauth_revocation_fences``): the worker locks it,
+# runs the reference check and opens it in one short transaction, calls the
+# provider with no database lock held, and closes it afterwards; a callback
+# locks it before storing its credential and is refused when its code
+# exchange started before the fence's deadline.
 
-    with session_factory() as db:
-        return resolve_builtin_oauth_revocation(
-            db,
-            oauth_provider=record.issuer,
-            access_token=access_token,
-            provider_user_id=record.provider_user_id,
-            refresh_token=refresh_token,
-        )
+
+@dataclass(frozen=True)
+class _Fence:
+    """The fence row one record's provider call is serialised on."""
+
+    provider: str
+    key: str
 
 
 @dataclass(frozen=True)
 class _FenceClaim:
-    """A native revocation cleared to call its provider.
+    """A revocation cleared to call its provider before ``deadline``; no
+    fence and no deadline for a native row with no recorded upstream account,
+    which nothing can reference."""
 
-    ``deadline`` is the fence deadline its call must start well before;
-    ``None`` for a row with no recorded upstream account, which has neither a
-    reference check nor a fence.
-    """
-
+    fence: _Fence | None
     deadline: datetime | None
 
 
@@ -393,80 +397,65 @@ class _FenceRefusal:
     outcome: RevocationOutcome
 
 
-def _claim_native_fence_sync(
-    session_factory: Callable[[], Session], revocation: Any
+def _claim_fence_sync(
+    session_factory: Callable[[], Session],
+    fence: _Fence,
+    referenced: Callable[[Session], str | None],
 ) -> _FenceClaim | _FenceRefusal:
-    """Reference-check one native revocation under its account's fence.
+    """Reference-check one record under its fence and open the fence.
 
-    The fence row stays locked from before the reference check until the
-    fence is opened and committed, and an OAuth callback for the same
-    account takes the same lock before storing its credentials. So a
-    callback either committed first and the check sees its row, or it finds
-    the opened fence and is refused instead of storing tokens this revoke
-    may kill. A fence another revoker still holds defers the record to its
-    deadline: only one call per account may be in flight, or a second
-    holder closing the fence early could let a reconnect through.
+    ``referenced`` answers why a live credential still holds the same grant
+    (the record is then skipped), or ``None``. The fence row stays locked
+    from before that check until the fence is opened and committed, so a
+    callback either committed first and the check sees its credential, or
+    finds the opened fence and is refused. A fence another revoker still
+    holds defers the record to its deadline: only one call per fence may be
+    in flight, or a second holder closing it early could let a reconnect
+    through that the first call then kills.
     """
-    from ..api.auth import builtin_oauth_references
     from .oauth_revocation_fences import (
         lock_oauth_revocation_fence,
         oauth_revocation_fence_is_open,
         open_oauth_revocation_fence,
     )
 
-    if revocation.provider_user_id is None:
-        return _FenceClaim(deadline=None)
     with session_factory() as db:
-        fence = lock_oauth_revocation_fence(
-            db,
-            provider=revocation.provider,
-            provider_user_id=revocation.provider_user_id,
+        lock = lock_oauth_revocation_fence(
+            db, provider=fence.provider, provider_user_id=fence.key
         )
-        references = builtin_oauth_references(
-            db,
-            provider=revocation.provider,
-            provider_user_id=revocation.provider_user_id,
-        )
-        if references:
-            only_unidentified = all(row.provider_user_id is None for row in references)
+        reason = referenced(db)
+        if reason is not None:
             db.commit()
-            return _FenceRefusal(
-                RevocationOutcome.skipped(
-                    "a legacy connection with no recorded account id may share "
-                    "this grant"
-                    if only_unidentified
-                    else "another local connection still references this account"
-                )
-            )
-        if oauth_revocation_fence_is_open(fence):
-            until = fence.revoking_until
+            return _FenceRefusal(RevocationOutcome.skipped(reason))
+        if oauth_revocation_fence_is_open(lock):
+            until = lock.revoking_until
             db.commit()
             return _FenceRefusal(
                 RevocationOutcome.deferred(
                     _aware(until) if until is not None else _utcnow(),
-                    "another revocation of this account is in flight",
+                    "another revocation of this grant is in flight",
                 )
             )
-        deadline = open_oauth_revocation_fence(fence)
+        deadline = open_oauth_revocation_fence(lock)
         db.commit()
-        return _FenceClaim(deadline=deadline)
+        return _FenceClaim(fence=fence, deadline=deadline)
 
 
-def _release_native_fence_sync(
-    session_factory: Callable[[], Session], revocation: Any, claim: _FenceClaim
+def _release_fence_sync(
+    session_factory: Callable[[], Session], claim: _FenceClaim
 ) -> None:
     """Close the fence once the provider call is over. Never raises: a
     failed release only delays reconnects until the deadline lapses."""
     from .oauth_revocation_fences import close_oauth_revocation_fence
 
-    if claim.deadline is None or revocation.provider_user_id is None:
+    if claim.fence is None or claim.deadline is None:
         return
     try:
         with session_factory() as db:
             close_oauth_revocation_fence(
                 db,
-                provider=revocation.provider,
-                provider_user_id=revocation.provider_user_id,
+                provider=claim.fence.provider,
+                provider_user_id=claim.fence.key,
                 deadline=claim.deadline,
             )
             db.commit()
@@ -477,9 +466,112 @@ def _release_native_fence_sync(
         )
 
 
+async def _call_inside_fence(
+    session_factory: Callable[[], Session],
+    claim: _FenceClaim,
+    call: Callable[[], Awaitable[RevocationOutcome]],
+) -> RevocationOutcome:
+    """Run the provider call under an opened fence and close it afterwards."""
+    from .oauth_revocation_fences import oauth_revocation_call_allowed
+
+    try:
+        if claim.deadline is not None and not oauth_revocation_call_allowed(
+            claim.deadline
+        ):
+            return RevocationOutcome.retry("delayed past its revocation fence")
+        return await call()
+    finally:
+        await run_tracked(_release_fence_sync, session_factory, claim)
+
+
 def _aware(value: datetime) -> datetime:
     """SQLite returns timezone-aware columns naive; they were stored as UTC."""
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+# --- native credentials -------------------------------------------------------
+
+
+def _github_client_secret(snapshot: str | None, env_suffix: str) -> str:
+    """One GitHub OAuth app credential from the receipt's snapshot.
+
+    The snapshot is the ``oauth_providers`` column as it was when the
+    credential left (ciphertext, or empty when the app's credentials come
+    from ``GITHUB_CLIENT_ID``/``GITHUB_CLIENT_SECRET``, which an
+    administrator's provider update cannot change). The current provider row
+    is never read: replacing or deleting it after the credential left must
+    not redirect the revocation to another app.
+    """
+    from ..api.auth import _oauth_env_name
+
+    if snapshot:
+        return decrypt_value_strict(snapshot)
+    return os.environ.get(_oauth_env_name("github", env_suffix), "")
+
+
+def _native_revocation(
+    record: ClaimedRevocation, access_token: str | None, refresh_token: str | None
+) -> Any:
+    """The provider call one native record needs, or why it gets none.
+
+    Returns a ``BuiltinOAuthRevocation`` or a terminal/retry
+    ``RevocationOutcome``. Google's revoke endpoint needs no client; GitHub's
+    grant delete authenticates as the app that issued the token, taken from
+    the receipt (see :func:`_github_client_secret`).
+    """
+    from ..api.auth import BuiltinOAuthRevocation
+
+    match record.issuer:
+        case "google":
+            if record.provider_user_id is None:
+                # Google revokes the account's whole grant for the client;
+                # without the account id nothing proves no other connection
+                # shares it.
+                return RevocationOutcome.skipped(
+                    "no Google account id was recorded, so nothing proves the "
+                    "grant is unshared"
+                )
+            return BuiltinOAuthRevocation(
+                provider="google",
+                access_token=access_token or "",
+                client_id="",
+                client_secret="",
+                provider_user_id=record.provider_user_id,
+                refresh_token=refresh_token,
+            )
+        case "github":
+            if not access_token:
+                return RevocationOutcome.skipped("the credential held no access token")
+            if record.client_id is None:
+                return RevocationOutcome.failed(
+                    "no GitHub OAuth app was configured when the credential was "
+                    "deleted, so the app that issued it is unknown"
+                )
+            try:
+                client_id = _github_client_secret(record.client_id, "CLIENT_ID")
+                client_secret = _github_client_secret(
+                    record.client_secret, "CLIENT_SECRET"
+                )
+            except EncryptionDecodeError:
+                return RevocationOutcome.failed(
+                    "the GitHub OAuth app's credentials cannot be decrypted with "
+                    "the configured key"
+                )
+            if not client_id or not client_secret:
+                # Environment-backed and the environment lacks them now: an
+                # operator can restore them, so keep retrying.
+                return RevocationOutcome.retry(
+                    "the GitHub OAuth app's credentials come from the environment, "
+                    "which does not provide them"
+                )
+            return BuiltinOAuthRevocation(
+                provider="github",
+                access_token=access_token,
+                client_id=client_id,
+                client_secret=client_secret,
+                provider_user_id=record.provider_user_id,
+            )
+    raise AssertionError(f"no native revocation for issuer {record.issuer!r}")
 
 
 async def _revoke_user_oauth(
@@ -487,9 +579,9 @@ async def _revoke_user_oauth(
 ) -> RevocationOutcome:
     from ..api.auth import (
         BUILTIN_OAUTH_REVOCATION_PROVIDERS,
+        builtin_oauth_references,
         revoke_resolved_builtin_oauth_grant,
     )
-    from .oauth_revocation_fences import oauth_revocation_call_allowed
 
     if record.issuer is None:
         return RevocationOutcome.failed(
@@ -509,27 +601,11 @@ async def _revoke_user_oauth(
         )
     if not (access_token or refresh_token):
         return RevocationOutcome.skipped("the credential held no token")
-    revocation = await run_tracked(
-        _resolve_native_sync, session_factory, record, access_token or "", refresh_token
-    )
-    if revocation is None:
-        if record.issuer == "github":
-            # The provider row or its client credentials are missing: an
-            # operator can fix that, so keep retrying until the budget ends.
-            return RevocationOutcome.retry(
-                "GitHub OAuth client credentials are not configured"
-            )
-        return RevocationOutcome.skipped(
-            "no Google account id was recorded, so nothing proves the grant is unshared"
-        )
-    claim = await run_tracked(_claim_native_fence_sync, session_factory, revocation)
-    if isinstance(claim, _FenceRefusal):
-        return claim.outcome
-    try:
-        if claim.deadline is not None and not oauth_revocation_call_allowed(
-            claim.deadline
-        ):
-            return RevocationOutcome.retry("delayed past its revocation fence")
+    revocation = _native_revocation(record, access_token, refresh_token)
+    if isinstance(revocation, RevocationOutcome):
+        return revocation
+
+    async def call() -> RevocationOutcome:
         try:
             # Drained, not abandoned, when this task is cancelled: the fence
             # may close only once the provider call has really ended, never
@@ -540,45 +616,76 @@ async def _revoke_user_oauth(
         except ProviderRevocationError as exc:
             return RevocationOutcome.retry(str(exc))
         return RevocationOutcome.revoked(detail)
-    finally:
-        await run_tracked(
-            _release_native_fence_sync, session_factory, revocation, claim
+
+    if revocation.provider_user_id is None:
+        return await _call_inside_fence(
+            session_factory, _FenceClaim(fence=None, deadline=None), call
         )
 
+    def referenced(db: Session) -> str | None:
+        references = builtin_oauth_references(
+            db,
+            provider=revocation.provider,
+            provider_user_id=revocation.provider_user_id,
+        )
+        if not references:
+            return None
+        if all(row.provider_user_id is None for row in references):
+            return "a legacy connection with no recorded account id may share this grant"
+        return "another local connection still references this account"
 
-def _mcp_grant_still_referenced_sync(
-    session_factory: Callable[[], Session], record: ClaimedRevocation
-) -> bool:
+    claim = await run_tracked(
+        _claim_fence_sync,
+        session_factory,
+        _Fence(provider=revocation.provider, key=revocation.provider_user_id),
+        referenced,
+    )
+    if isinstance(claim, _FenceRefusal):
+        return claim.outcome
+    return await _call_inside_fence(session_factory, claim, call)
+
+
+# --- MCP grants ---------------------------------------------------------------
+
+
+def _mcp_grant_still_referenced(db: Session, record: ClaimedRevocation) -> bool:
     """Whether an active grant holds the same authorization as ``record``.
 
     The identity a reconnect keeps (``_replaced_by_an_active_grant`` and
     ``_delete_superseded_mcp_oauth_grants`` match on it): same server, user,
-    owner, client, issuer and resource. A provider may end the whole
-    authorization when one of its tokens is revoked, which would take that
-    live grant down too.
+    owner, issuer and resource, and the same *remote* OAuth client. Matching
+    the local client row id alone is not enough: SQLite hands a deleted row's
+    id to the next insert, so a recreated server's different client would
+    otherwise pass for the old authorization and get it skipped. A provider
+    may end the whole authorization when one of its tokens is revoked, which
+    would take a live grant of it down too.
     """
-    from ..models.mcp_oauth import MCPOAuthGrant
+    from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 
-    with session_factory() as db:
-        return (
-            db.query(MCPOAuthGrant.id)
-            .filter(
-                MCPOAuthGrant.mcp_server_id == record.mcp_server_id,
-                MCPOAuthGrant.user_id == record.user_id,
-                MCPOAuthGrant.resource_owner_key == record.resource_owner_key,
-                MCPOAuthGrant.mcp_oauth_client_id == record.mcp_oauth_client_id,
-                MCPOAuthGrant.issuer == record.issuer,
-                MCPOAuthGrant.resource == record.resource,
-                MCPOAuthGrant.status == "active",
-            )
-            .first()
-            is not None
+    return (
+        db.query(MCPOAuthGrant.id)
+        .join(MCPOAuthClient, MCPOAuthClient.id == MCPOAuthGrant.mcp_oauth_client_id)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == record.mcp_server_id,
+            MCPOAuthGrant.user_id == record.user_id,
+            MCPOAuthGrant.resource_owner_key == record.resource_owner_key,
+            MCPOAuthGrant.mcp_oauth_client_id == record.mcp_oauth_client_id,
+            MCPOAuthClient.client_id == record.client_id,
+            MCPOAuthGrant.issuer == record.issuer,
+            MCPOAuthGrant.resource == record.resource,
+            MCPOAuthGrant.status == "active",
         )
+        .first()
+        is not None
+    )
 
 
 async def _revoke_mcp_oauth_grant(
     record: ClaimedRevocation, session_factory: Callable[[], Session]
 ) -> RevocationOutcome:
+    from ..models.mcp_oauth import mcp_oauth_authorization_key
+    from .oauth_revocation_fences import MCP_OAUTH_FENCE_PROVIDER
+
     if record.client_id is None:
         return RevocationOutcome.failed(
             "the grant's OAuth client registration was gone when it was recorded"
@@ -587,10 +694,6 @@ async def _revoke_mcp_oauth_grant(
     if not endpoint:
         return RevocationOutcome.skipped(
             "the authorization server advertises no revocation endpoint"
-        )
-    if await run_tracked(_mcp_grant_still_referenced_sync, session_factory, record):
-        return RevocationOutcome.skipped(
-            "an active grant still holds the same authorization"
         )
     try:
         client_secret = _decrypt(record.client_secret) or ""
@@ -609,19 +712,48 @@ async def _revoke_mcp_oauth_grant(
         )
     if not tokens:
         return RevocationOutcome.skipped("the grant held no token")
-    try:
-        await revoke_rfc7009_tokens(
-            revocation_endpoint=endpoint,
-            client_id=record.client_id,
-            client_secret=client_secret,
-            token_endpoint_auth_method=record.token_endpoint_auth_method or "none",
-            tokens=tokens,
-        )
-    except ValueError as exc:
-        return RevocationOutcome.failed(str(exc))
-    except ProviderRevocationError as exc:
-        return RevocationOutcome.retry(str(exc))
-    return RevocationOutcome.revoked()
+    client_id = record.client_id
+
+    def referenced(db: Session) -> str | None:
+        if _mcp_grant_still_referenced(db, record):
+            return "an active grant still holds the same authorization"
+        return None
+
+    claim = await run_tracked(
+        _claim_fence_sync,
+        session_factory,
+        _Fence(
+            provider=MCP_OAUTH_FENCE_PROVIDER,
+            key=mcp_oauth_authorization_key(
+                mcp_server_id=record.mcp_server_id,
+                user_id=record.user_id,
+                resource_owner_key=record.resource_owner_key,
+                client_id=client_id,
+                issuer=record.issuer,
+                resource=record.resource,
+            ),
+        ),
+        referenced,
+    )
+    if isinstance(claim, _FenceRefusal):
+        return claim.outcome
+
+    async def call() -> RevocationOutcome:
+        try:
+            await revoke_rfc7009_tokens(
+                revocation_endpoint=endpoint,
+                client_id=client_id,
+                client_secret=client_secret,
+                token_endpoint_auth_method=record.token_endpoint_auth_method or "none",
+                tokens=tokens,
+            )
+        except ValueError as exc:
+            return RevocationOutcome.failed(str(exc))
+        except ProviderRevocationError as exc:
+            return RevocationOutcome.retry(str(exc))
+        return RevocationOutcome.revoked()
+
+    return await _call_inside_fence(session_factory, claim, call)
 
 
 async def _attempt(

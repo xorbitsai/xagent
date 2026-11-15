@@ -14,6 +14,11 @@ deletes the client's grants first: a cascade from the client would
 otherwise run the grant triggers after the client row is gone, and the
 record would lose the client fields its revocation needs.
 
+It also seeds a receipt for every grant already marked ``revoked`` that still
+holds a token: before this revision a revoked grant's provider revocation was
+a best-effort call that may have failed, and nothing would retry it after
+the cutover.
+
 PostgreSQL gets PL/pgSQL trigger functions, SQLite inline trigger bodies;
 the statements they run are the same. The SQL is a frozen copy of what
 ``models.credential_revocation`` installs on a database created from the
@@ -38,16 +43,21 @@ TABLE = "credential_revocations"
 
 _USER_OAUTH_INSERT = """INSERT INTO credential_revocations (
         kind, source_id, user_id, grant_key, issuer, provider_user_id,
-        access_token, refresh_token
-    ) VALUES (
+        access_token, refresh_token, client_id, client_secret
+    )
+    SELECT
         'user_oauth', {row}.id, {row}.user_id,
         CASE WHEN {row}.oauth_provider IS NULL OR {row}.provider_user_id IS NULL
             THEN 'user_oauth#' || CAST({row}.id AS VARCHAR)
             ELSE 'user_oauth:' || {row}.oauth_provider || ':' || {row}.provider_user_id
         END,
         {row}.oauth_provider, {row}.provider_user_id,
-        {row}.access_token, {row}.refresh_token
-    )"""
+        {row}.access_token, {row}.refresh_token,
+        provider.client_id, provider.client_secret
+    FROM (SELECT 1 AS one) AS anchor
+    LEFT JOIN oauth_providers AS provider
+        ON provider.provider_name = {row}.oauth_provider
+        AND {row}.oauth_provider = 'github'"""
 _MCP_GRANT_INSERT = """INSERT INTO credential_revocations (
         kind, source_id, user_id, grant_key, issuer, access_token, refresh_token,
         mcp_server_id, mcp_oauth_client_id, resource_owner_key, resource,
@@ -81,7 +91,7 @@ _SQLITE_REVOCATION_ENDPOINT = (
     "THEN json_extract(client.metadata, '$.revocation_endpoint') END"
 )
 
-_OUTBOX, _USER_OAUTH = TABLE, "user_oauth"
+_OUTBOX, _USER_OAUTH, _PROVIDERS = TABLE, "user_oauth", "oauth_providers"
 _GRANTS, _CLIENTS = "mcp_oauth_grants", "mcp_oauth_clients"
 
 
@@ -115,7 +125,7 @@ _TRIGGERS: tuple[tuple[str, str, frozenset[str], dict[str, tuple[str, ...]]], ..
     (
         "capture_user_oauth_revocation",
         _USER_OAUTH,
-        frozenset({_USER_OAUTH, _OUTBOX}),
+        frozenset({_USER_OAUTH, _OUTBOX, _PROVIDERS}),
         {
             "postgresql": (
                 _pg_function(
@@ -140,7 +150,7 @@ END""",
     (
         "capture_user_oauth_token_drop",
         _USER_OAUTH,
-        frozenset({_USER_OAUTH, _OUTBOX}),
+        frozenset({_USER_OAUTH, _OUTBOX, _PROVIDERS}),
         {
             "postgresql": (
                 _pg_function(
@@ -231,6 +241,31 @@ END""",
         },
     ),
 )
+# Grants marked revoked before this revision. Their provider revocation was
+# a best-effort call at disconnect time that may have failed, leaving the
+# tokens live, and the triggers never capture an already revoked grant (its
+# status change predates them, and its later deletion is skipped as already
+# recorded). So each one still holding a token gets its receipt here; a
+# grant whose revocation did succeed is revoked again, which RFC 7009 makes
+# a no-op.
+_SEED_REVOKED_GRANTS = """INSERT INTO credential_revocations (
+        kind, source_id, user_id, grant_key, issuer, access_token, refresh_token,
+        mcp_server_id, mcp_oauth_client_id, resource_owner_key, resource,
+        client_id, client_secret, token_endpoint_auth_method, revocation_endpoint
+    )
+    SELECT
+        'mcp_oauth_grant', g.id, g.user_id,
+        'mcp_oauth_grant:' || g.lookup_hash, g.issuer,
+        g.access_token, g.refresh_token,
+        g.mcp_server_id, g.mcp_oauth_client_id,
+        g.resource_owner_key, g.resource,
+        client.client_id, client.client_secret,
+        client.token_endpoint_auth_method, {revocation_endpoint}
+    FROM mcp_oauth_grants AS g
+    LEFT JOIN mcp_oauth_clients AS client ON client.id = g.mcp_oauth_client_id
+    WHERE g.status = 'revoked' AND COALESCE(g.access_token, '') <> ''
+    ORDER BY g.id"""
+
 _FUNCTIONS = (
     "capture_user_oauth_revocation",
     "capture_mcp_oauth_grant_revocation",
@@ -302,6 +337,14 @@ def upgrade() -> None:
         )
         op.create_index("ix_credential_revocations_grant_key", TABLE, ["grant_key"])
     tables = set(sa.inspect(bind).get_table_names())
+    if {_GRANTS, _CLIENTS} <= tables:
+        op.execute(
+            _SEED_REVOKED_GRANTS.format(
+                revocation_endpoint=_PG_REVOCATION_ENDPOINT
+                if dialect == "postgresql"
+                else _SQLITE_REVOCATION_ENDPOINT
+            )
+        )
     for trigger, table, requires, ddl in _TRIGGERS:
         if not requires <= tables:
             continue

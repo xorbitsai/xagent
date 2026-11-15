@@ -117,40 +117,6 @@ def _assert_revoked_with(post: Mock, token: str) -> None:
     assert kwargs["data"] == {"token": token}
 
 
-def test_resolve_maps_a_google_issuer_to_a_google_revocation(db):
-    resolved = auth_api.resolve_builtin_oauth_revocation(
-        db,
-        oauth_provider="google",
-        access_token="access",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
-
-    assert resolved == auth_api.BuiltinOAuthRevocation(
-        provider="google",
-        access_token="access",
-        client_id="",
-        client_secret="",
-        provider_user_id="sub-1",
-        refresh_token="refresh",
-    )
-
-
-def test_resolve_skips_a_composio_backed_row(db):
-    """Its access_token is a Composio connected-account id, and its grant
-    belongs to Composio's OAuth app; Composio account deletion handles it."""
-    assert (
-        auth_api.resolve_builtin_oauth_revocation(
-            db,
-            oauth_provider=None,
-            access_token="ca_composio-account",
-            provider_user_id="sub-1",
-            token_type=COMPOSIO_TOKEN_TYPE,
-        )
-        is None
-    )
-
-
 def test_revocation_repr_redacts_the_refresh_token():
     revocation = auth_api.BuiltinOAuthRevocation(
         provider="google",

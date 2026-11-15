@@ -43,6 +43,12 @@ the worker reads it:
 * the issuer: ``user_oauth.oauth_provider`` for a native row (NULL when the
   issuer is unknown -- the worker then fails the record rather than guess),
   the grant's issuer URL for an MCP grant;
+* for a native GitHub row, the GitHub OAuth app's ``client_id`` and
+  ``client_secret`` as ``oauth_providers`` stored them at that moment
+  (ciphertext, or empty when they come from the environment): the worker
+  authenticates the grant delete with this snapshot and never with the live
+  provider configuration, which an administrator may replace or delete
+  while the record is pending;
 * for an MCP grant, its OAuth client's ``client_id``, encrypted
   ``client_secret``, client authentication method and RFC 7009 revocation
   endpoint, plus the grant identity the worker's reference check matches on;
@@ -184,9 +190,12 @@ class CredentialRevocation(Base):  # type: ignore[no-any-unimported]
     mcp_oauth_client_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     resource_owner_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     resource: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    # MCP grants only: the OAuth client as it was when the grant left.
+    # The OAuth client as it was when the credential left: the MCP grant's
+    # client (``client_id`` in plain text), or a native GitHub row's app from
+    # ``oauth_providers`` (both columns as stored there, so ``client_id`` may
+    # be ciphertext). NULL ``client_id`` on a GitHub row: no app configured.
     client_id: Mapped[str | None] = mapped_column(String(1000), nullable=True)
-    #: Ciphertext as stored in ``mcp_oauth_clients``; erased at a terminal status.
+    #: Ciphertext as stored at the source; erased at a terminal status.
     client_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_endpoint_auth_method: Mapped[str | None] = mapped_column(
         String(100), nullable=True
@@ -209,18 +218,28 @@ class CredentialRevocation(Base):  # type: ignore[no-any-unimported]
 
 
 def _user_oauth_insert(row: str) -> str:
+    # GitHub's grant delete authenticates as the app that issued the token, so
+    # the receipt snapshots that app's credentials as stored when the
+    # credential leaves (ciphertext, or empty for environment-backed ones):
+    # replacing or deleting the provider configuration afterwards cannot
+    # redirect the revocation. Google's revoke needs no client.
     return f"""INSERT INTO credential_revocations (
         kind, source_id, user_id, grant_key, issuer, provider_user_id,
-        access_token, refresh_token
-    ) VALUES (
+        access_token, refresh_token, client_id, client_secret
+    )
+    SELECT
         '{CredentialRevocationKind.USER_OAUTH.value}', {row}.id, {row}.user_id,
         CASE WHEN {row}.oauth_provider IS NULL OR {row}.provider_user_id IS NULL
             THEN 'user_oauth#' || CAST({row}.id AS VARCHAR)
             ELSE 'user_oauth:' || {row}.oauth_provider || ':' || {row}.provider_user_id
         END,
         {row}.oauth_provider, {row}.provider_user_id,
-        {row}.access_token, {row}.refresh_token
-    )"""
+        {row}.access_token, {row}.refresh_token,
+        provider.client_id, provider.client_secret
+    FROM (SELECT 1 AS one) AS anchor
+    LEFT JOIN oauth_providers AS provider
+        ON provider.provider_name = {row}.oauth_provider
+        AND {row}.oauth_provider = 'github'"""
 
 
 def _mcp_grant_insert(row: str, revocation_endpoint: str) -> str:
@@ -265,6 +284,7 @@ _SQLITE_REVOCATION_ENDPOINT = (
     "THEN json_extract(client.metadata, '$.revocation_endpoint') END"
 )
 _OUTBOX = "credential_revocations"
+_PROVIDERS = "oauth_providers"
 _USER_OAUTH = UserOAuth.__tablename__
 _GRANTS = MCPOAuthGrant.__tablename__
 _CLIENTS = MCPOAuthClient.__tablename__
@@ -309,7 +329,7 @@ CREDENTIAL_REVOCATION_TRIGGERS: tuple[_Trigger, ...] = (
     _Trigger(
         name="capture_user_oauth_revocation",
         table=_USER_OAUTH,
-        requires=frozenset({_USER_OAUTH, _OUTBOX}),
+        requires=frozenset({_USER_OAUTH, _OUTBOX, _PROVIDERS}),
         ddl={
             "postgresql": (
                 _pg_function(
@@ -334,7 +354,7 @@ END""",
     _Trigger(
         name="capture_user_oauth_token_drop",
         table=_USER_OAUTH,
-        requires=frozenset({_USER_OAUTH, _OUTBOX}),
+        requires=frozenset({_USER_OAUTH, _OUTBOX, _PROVIDERS}),
         ddl={
             # The function above reads only OLD, so it records the dropped
             # credential for an UPDATE exactly as for a DELETE.

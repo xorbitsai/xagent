@@ -311,38 +311,27 @@ def test_no_function_that_reaches_the_connector_seam_is_a_coroutine():
         if name == "xagent.web.api.mcp.delete_mcp_server":
             # The one function that reaches the seam and is still a
             # coroutine. It could be converted with the same split this PR
-            # applies to ``teardown_mcp_app_server`` -- its own await,
-            # asserted below, is a real external OAuth revocation at the end
-            # of the function, in the same shape this PR already handles. It
-            # is exempted instead because it is an existing production route
-            # and this PR deliberately leaves that route unchanged;
-            # converting it is tracked separately.
+            # applies to ``teardown_mcp_app_server``. It is exempted instead
+            # because it is an existing production route whose callers await
+            # it; converting it is tracked separately. (Its last await, the
+            # provider revocation after the commit, moved to the credential
+            # revocation outbox worker.)
             #
-            # An exemption is only legitimate for a function that carries an
-            # await that is NOT the seam call itself. A function whose only
-            # await IS the seam call is a coroutine of the seam's own
-            # making -- convertible by making that call synchronous -- and
-            # "contains some await" would still wave it through. The check
-            # below only proves that some other await exists, not that the
-            # function resists conversion -- it could be satisfied by an
-            # await that does nothing (``await asyncio.sleep(0)``) and still
-            # pass. Tightening it to verify the hook call itself is off the
-            # event loop thread is not done here.
+            # The exemption must not cover a coroutine of the seam's own
+            # making: no await in it may be a seam call, which would be
+            # convertible by making that call synchronous.
             seam_names = _seam_names_imported_by(node)
-            non_seam_awaits = [
+            seam_awaits = [
                 child
                 for child in ast.walk(node)
                 if isinstance(child, ast.Await)
-                and not (
-                    isinstance(child.value, ast.Call)
-                    and isinstance(child.value.func, ast.Name)
-                    and child.value.func.id in seam_names
-                )
+                and isinstance(child.value, ast.Call)
+                and isinstance(child.value.func, ast.Name)
+                and child.value.func.id in seam_names
             ]
-            assert non_seam_awaits, (
-                f"{name} is exempted from this invariant, but every await it "
-                "has is a seam call -- the coroutine is the seam's own doing, "
-                "so make that call synchronous instead of exempting the route"
+            assert not seam_awaits, (
+                f"{name} is exempted from this invariant, but it awaits a seam "
+                "call -- make that call synchronous instead"
             )
             continue
         offenders.append(name)

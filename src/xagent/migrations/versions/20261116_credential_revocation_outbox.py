@@ -72,22 +72,22 @@ _SQLITE_REVOCATION_ENDPOINT = (
     "THEN json_extract(client.metadata, '$.revocation_endpoint') END"
 )
 
-_POSTGRESQL_DDL = [
-    f"""CREATE OR REPLACE FUNCTION capture_user_oauth_revocation()
+_OUTBOX, _USER_OAUTH = TABLE, "user_oauth"
+_GRANTS, _CLIENTS = "mcp_oauth_grants", "mcp_oauth_clients"
+
+
+def _pg_function(name: str, body: str, returns: str = "NULL") -> str:
+    return f"""CREATE OR REPLACE FUNCTION {name}()
 RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    {_USER_OAUTH_INSERT.format(row="OLD")};
-    RETURN NULL;
+{body}
+    RETURN {returns};
 END
-$$""",
-    "DROP TRIGGER IF EXISTS capture_user_oauth_revocation ON user_oauth",
-    f"""CREATE TRIGGER capture_user_oauth_revocation
-AFTER DELETE ON user_oauth FOR EACH ROW
-WHEN ({_NATIVE_ROW})
-EXECUTE FUNCTION capture_user_oauth_revocation()""",
-    f"""CREATE OR REPLACE FUNCTION capture_mcp_oauth_grant_revocation()
-RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE
+$$"""
+
+
+_PG_GRANT_FUNCTION = _pg_function(
+    "capture_mcp_oauth_grant_revocation",
+    f"""DECLARE
     grant_row record;
 BEGIN
     IF TG_OP = 'DELETE' THEN
@@ -95,78 +95,127 @@ BEGIN
     ELSE
         grant_row := NEW;
     END IF;
-    {_MCP_GRANT_INSERT.format(row="grant_row", revocation_endpoint=_PG_REVOCATION_ENDPOINT)};
-    RETURN NULL;
-END
-$$""",
-    "DROP TRIGGER IF EXISTS capture_mcp_oauth_grant_revocation_on_delete "
-    "ON mcp_oauth_grants",
-    """CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_delete
-AFTER DELETE ON mcp_oauth_grants FOR EACH ROW
-WHEN (OLD.status <> 'revoked')
-EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()""",
-    "DROP TRIGGER IF EXISTS capture_mcp_oauth_grant_revocation_on_revoke "
-    "ON mcp_oauth_grants",
-    """CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_revoke
-AFTER UPDATE OF status ON mcp_oauth_grants FOR EACH ROW
-WHEN (NEW.status = 'revoked' AND OLD.status <> 'revoked')
-EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()""",
-    f"""CREATE OR REPLACE FUNCTION delete_mcp_oauth_client_grants_first()
-RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    {_DELETE_CLIENT_GRANTS_FIRST};
-    RETURN OLD;
-END
-$$""",
-    "DROP TRIGGER IF EXISTS delete_mcp_oauth_client_grants_first "
-    "ON mcp_oauth_clients",
-    """CREATE TRIGGER delete_mcp_oauth_client_grants_first
-BEFORE DELETE ON mcp_oauth_clients FOR EACH ROW
-EXECUTE FUNCTION delete_mcp_oauth_client_grants_first()""",
-]
+    {_MCP_GRANT_INSERT.format(row="grant_row", revocation_endpoint=_PG_REVOCATION_ENDPOINT)};""",
+)
 
-_SQLITE_DDL = [
-    "DROP TRIGGER IF EXISTS capture_user_oauth_revocation",
-    f"""CREATE TRIGGER capture_user_oauth_revocation
+# (trigger, table, tables its body touches, {dialect: creating statements}).
+# A trigger is installed only when all of those tables exist: SQLite
+# re-validates every trigger on each ALTER TABLE, so one naming a missing
+# table would break unrelated schema changes.
+_TRIGGERS: tuple[tuple[str, str, frozenset[str], dict[str, tuple[str, ...]]], ...] = (
+    (
+        "capture_user_oauth_revocation",
+        _USER_OAUTH,
+        frozenset({_USER_OAUTH, _OUTBOX}),
+        {
+            "postgresql": (
+                _pg_function(
+                    "capture_user_oauth_revocation",
+                    f"BEGIN\n    {_USER_OAUTH_INSERT.format(row='OLD')};",
+                ),
+                f"""CREATE TRIGGER capture_user_oauth_revocation
+AFTER DELETE ON user_oauth FOR EACH ROW
+WHEN ({_NATIVE_ROW})
+EXECUTE FUNCTION capture_user_oauth_revocation()""",
+            ),
+            "sqlite": (
+                f"""CREATE TRIGGER capture_user_oauth_revocation
 AFTER DELETE ON user_oauth FOR EACH ROW
 WHEN {_NATIVE_ROW}
 BEGIN
     {_USER_OAUTH_INSERT.format(row="OLD")};
 END""",
-    "DROP TRIGGER IF EXISTS capture_mcp_oauth_grant_revocation_on_delete",
-    f"""CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_delete
+            ),
+        },
+    ),
+    (
+        "capture_mcp_oauth_grant_revocation_on_delete",
+        _GRANTS,
+        frozenset({_GRANTS, _CLIENTS, _OUTBOX}),
+        {
+            "postgresql": (
+                _PG_GRANT_FUNCTION,
+                """CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_delete
+AFTER DELETE ON mcp_oauth_grants FOR EACH ROW
+WHEN (OLD.status <> 'revoked')
+EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()""",
+            ),
+            "sqlite": (
+                f"""CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_delete
 AFTER DELETE ON mcp_oauth_grants FOR EACH ROW
 WHEN OLD.status <> 'revoked'
 BEGIN
     {_MCP_GRANT_INSERT.format(row="OLD", revocation_endpoint=_SQLITE_REVOCATION_ENDPOINT)};
 END""",
-    "DROP TRIGGER IF EXISTS capture_mcp_oauth_grant_revocation_on_revoke",
-    f"""CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_revoke
+            ),
+        },
+    ),
+    (
+        "capture_mcp_oauth_grant_revocation_on_revoke",
+        _GRANTS,
+        frozenset({_GRANTS, _CLIENTS, _OUTBOX}),
+        {
+            "postgresql": (
+                _PG_GRANT_FUNCTION,
+                """CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_revoke
+AFTER UPDATE OF status ON mcp_oauth_grants FOR EACH ROW
+WHEN (NEW.status = 'revoked' AND OLD.status <> 'revoked')
+EXECUTE FUNCTION capture_mcp_oauth_grant_revocation()""",
+            ),
+            "sqlite": (
+                f"""CREATE TRIGGER capture_mcp_oauth_grant_revocation_on_revoke
 AFTER UPDATE OF status ON mcp_oauth_grants FOR EACH ROW
 WHEN NEW.status = 'revoked' AND OLD.status <> 'revoked'
 BEGIN
     {_MCP_GRANT_INSERT.format(row="NEW", revocation_endpoint=_SQLITE_REVOCATION_ENDPOINT)};
 END""",
-    "DROP TRIGGER IF EXISTS delete_mcp_oauth_client_grants_first",
-    f"""CREATE TRIGGER delete_mcp_oauth_client_grants_first
+            ),
+        },
+    ),
+    (
+        "delete_mcp_oauth_client_grants_first",
+        _CLIENTS,
+        frozenset({_CLIENTS, _GRANTS}),
+        {
+            "postgresql": (
+                _pg_function(
+                    "delete_mcp_oauth_client_grants_first",
+                    f"BEGIN\n    {_DELETE_CLIENT_GRANTS_FIRST};",
+                    returns="OLD",
+                ),
+                """CREATE TRIGGER delete_mcp_oauth_client_grants_first
+BEFORE DELETE ON mcp_oauth_clients FOR EACH ROW
+EXECUTE FUNCTION delete_mcp_oauth_client_grants_first()""",
+            ),
+            "sqlite": (
+                f"""CREATE TRIGGER delete_mcp_oauth_client_grants_first
 BEFORE DELETE ON mcp_oauth_clients FOR EACH ROW
 BEGIN
     {_DELETE_CLIENT_GRANTS_FIRST};
 END""",
-]
+            ),
+        },
+    ),
+)
+_FUNCTIONS = (
+    "capture_user_oauth_revocation",
+    "capture_mcp_oauth_grant_revocation",
+    "delete_mcp_oauth_client_grants_first",
+)
 
 
-def _ddl(dialect: str) -> list[str]:
-    if dialect == "postgresql":
-        return _POSTGRESQL_DDL
-    if dialect == "sqlite":
-        return _SQLITE_DDL
-    raise RuntimeError("The credential revocation outbox requires PostgreSQL or SQLite")
+def _drop_trigger(dialect: str, trigger: str, table: str) -> None:
+    on = f" ON {table}" if dialect == "postgresql" else ""
+    op.execute(f"DROP TRIGGER IF EXISTS {trigger}{on}")
 
 
 def upgrade() -> None:
     bind = op.get_bind()
-    statements = _ddl(bind.dialect.name)
+    dialect = bind.dialect.name
+    if dialect not in ("postgresql", "sqlite"):
+        raise RuntimeError(
+            "The credential revocation outbox requires PostgreSQL or SQLite"
+        )
     if not sa.inspect(bind).has_table(TABLE):
         op.create_table(
             TABLE,
@@ -218,32 +267,22 @@ def upgrade() -> None:
             ["status", "next_attempt_at"],
         )
         op.create_index("ix_credential_revocations_grant_key", TABLE, ["grant_key"])
-    for statement in statements:
-        op.execute(statement)
+    tables = set(sa.inspect(bind).get_table_names())
+    for trigger, table, requires, ddl in _TRIGGERS:
+        if not requires <= tables:
+            continue
+        _drop_trigger(dialect, trigger, table)
+        for statement in ddl[dialect]:
+            op.execute(statement)
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    if bind.dialect.name == "postgresql":
-        for trigger, table in (
-            ("capture_user_oauth_revocation", "user_oauth"),
-            ("capture_mcp_oauth_grant_revocation_on_delete", "mcp_oauth_grants"),
-            ("capture_mcp_oauth_grant_revocation_on_revoke", "mcp_oauth_grants"),
-            ("delete_mcp_oauth_client_grants_first", "mcp_oauth_clients"),
-        ):
-            op.execute(f"DROP TRIGGER IF EXISTS {trigger} ON {table}")
-        for function in (
-            "capture_user_oauth_revocation",
-            "capture_mcp_oauth_grant_revocation",
-            "delete_mcp_oauth_client_grants_first",
-        ):
+    dialect = op.get_bind().dialect.name
+    tables = set(sa.inspect(op.get_bind()).get_table_names())
+    for trigger, table, _requires, _ddl in _TRIGGERS:
+        if table in tables:
+            _drop_trigger(dialect, trigger, table)
+    if dialect == "postgresql":
+        for function in _FUNCTIONS:
             op.execute(f"DROP FUNCTION IF EXISTS {function}()")
-    else:
-        for trigger in (
-            "capture_user_oauth_revocation",
-            "capture_mcp_oauth_grant_revocation_on_delete",
-            "capture_mcp_oauth_grant_revocation_on_revoke",
-            "delete_mcp_oauth_client_grants_first",
-        ):
-            op.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     op.drop_table(TABLE)

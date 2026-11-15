@@ -387,6 +387,27 @@ def test_a_composio_start_without_a_valid_callback_origin_fails(
     assert ("GET", "salesforce", None) not in _launch_events(fake)
 
 
+def test_a_refused_composio_start_fails_without_a_redeem() -> None:
+    fake = _composio_deployment()
+    original_start = fake._start
+
+    def start(provider: str, request: httpx.Request) -> httpx.Response:
+        if provider != "salesforce":
+            return original_start(provider, request)
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    fake._start = start  # type: ignore[method-assign]
+
+    code, lines = _run(fake, registry_rows=COMPOSIO_REGISTRY_ROWS)
+
+    assert code == 1
+    (failure,) = _failures(lines)
+    assert failure.startswith(
+        "FAIL oauth:salesforce:composio: launch start refused: HTTP 503"
+    )
+    assert ("GET", "salesforce", None) not in _launch_events(fake)
+
+
 def _real_catalog_app(app_id: str) -> dict[str, Any]:
     """The entry the server's own catalog code builds for a builtin app."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app

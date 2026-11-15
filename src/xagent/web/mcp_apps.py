@@ -391,7 +391,7 @@ def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
     if account_host is not None and app_dict["auth_type"] == "builtin_oauth":
         app_dict["oauth_account_input"] = account_host.input_metadata()
     # The switch alone does not set ``auth_backend``: only a web connect that
-    # also goes through Composio does (an org admin must install its app first).
+    # also goes through Composio does.
     if app_dict["auth_type"] == "builtin_oauth":
         from .composio_auth import AUTH_BACKEND, composio_app
 

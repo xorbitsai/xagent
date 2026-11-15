@@ -61,12 +61,18 @@ def test_every_app_on_makes_the_provider_composio_only(monkeypatch):
 def test_one_app_off_keeps_the_native_client(monkeypatch):
     _on(
         monkeypatch,
-        composio_apps.FACEBOOK_AUTH_BACKEND_ENV,
-        composio_apps.COMPOSIO_FACEBOOK_AUTH_CONFIG_ID_ENV,
+        composio_apps.SALESFORCE_AUTH_BACKEND_ENV,
+        composio_apps.COMPOSIO_SALESFORCE_AUTH_CONFIG_ID_ENV,
     )
+    extra = composio_apps.COMPOSIO_APPS["salesforce"]._replace(
+        app_id="salesforce-extra", backend_env="XAGENT_SALESFORCE_EXTRA_AUTH_BACKEND"
+    )
+    monkeypatch.setitem(composio_apps.COMPOSIO_APPS, "salesforce-extra", extra)
+    monkeypatch.delenv(extra.backend_env, raising=False)
+    assert composio_apps.provider_is_composio_only("salesforce", ["salesforce"])
 
     assert not composio_apps.provider_is_composio_only(
-        "meta", ["facebook", "instagram"]
+        "salesforce", ["salesforce", "salesforce-extra"]
     )
 
 

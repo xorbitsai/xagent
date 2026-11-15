@@ -52,8 +52,9 @@ counts as a native target too. A provider with any app whose catalog entry says
 check: its launch redeem must redirect to the shared Composio callback path
 with a `state`, on the callback origin its own launch start reports, which may
 be another host than the deployment's. A Composio-only provider (every app's web
-connect on Composio) gets only that check. Every start is redeemed before the
-next one, so a launch ticket never expires mid-run.
+connect on Composio, with the Composio settings present) gets only that check.
+Every start is redeemed before the next one, so a launch ticket never expires
+mid-run.
 
 Remote MCP OAuth apps (Notion, Atlassian, HubSpot, …) are not launched, because
 their connect may register a client with the vendor on every call. L2 covers
@@ -76,8 +77,10 @@ resolve, and from the `oauth_providers` row or the environment, never a value.
 A row encrypted under another key fails as `unreadable`; a process with no
 usable key fails once as `encryption-key`. It proves a value is present, not
 that the vendor accepts it. A provider whose every app's web connect goes
-through Composio is reported as `SKIP` (connects through Composio): it needs
-no native client and never fails for a missing row or credential. This is
+through Composio, with the Composio settings present, is reported as `SKIP`
+(connects through Composio): it needs no native client and never fails for a
+missing row or credential. With a Composio setting missing it is checked as a
+native provider, so it still fails. This is
 decided from the builtin registry's apps only; an operator-created app of the
 same provider is not considered. Its `--exclude` takes OAuth provider names
 (`google`), not the catalog app IDs this script's `--exclude` takes.
@@ -92,7 +95,8 @@ and prints `CLIENT_OK`, `CLIENT_REJECTED`, `INCONCLUSIVE` or `UNVERIFIABLE`
 field resolved from, never a value. It exits 1 when any client is rejected;
 `INCONCLUSIVE` lines do not fail it. A pre-registered remote MCP client is
 listed as `UNVERIFIABLE`. A provider whose every app's web connect goes
-through Composio is `UNVERIFIABLE` without a request to the vendor. `--exclude`
+through Composio, with the Composio settings present, is `UNVERIFIABLE` without
+a request to the vendor. `--exclude`
 takes the same provider names.
 
 Microsoft checks a refresh token's format before the client, so its secret is

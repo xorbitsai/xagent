@@ -24,7 +24,8 @@ It proves that a value is present, not that the vendor accepts it. A row
 encrypted under a different key is reported as ``unreadable``: the runtime
 would send the ciphertext as the value, and the environment variable cannot
 take over because the row is not blank. A provider whose every app's web
-connect goes through Composio is reported as ``SKIP``: it needs no native client.
+connect goes through a fully configured Composio is reported as ``SKIP``: it
+needs no native client.
 """
 
 from __future__ import annotations

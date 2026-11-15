@@ -31,7 +31,7 @@ import json
 import time
 from collections.abc import Collection, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -63,6 +63,14 @@ DEFAULT_BATCH_DEADLINE_SECONDS = float(DEFAULT_TIMEOUT_SECONDS)
 # made. 100 is Google's own per-batch request limit, so the fallback stays on
 # the same scale as the native batch it replaces.
 MAX_BATCH_REQUESTS = 100
+
+# Whether the request being sent right now is one a batch sent. Only those get
+# an end-to-end deadline: a metered Composio tool call waits, after its batch
+# returned, for a request still running, so that request's answer must not keep
+# arriving for longer than one ``timeout``. ``execute_batch`` sets this inside
+# the context it copies for the worker that sends one request, so it cannot
+# reach a request sent outside a batch (a Drive read, a single Gmail call).
+_batch_request: ContextVar[bool] = ContextVar("google_api_batch_request", default=False)
 
 # The only request headers forwarded to the API. Both change what Google
 # returns or how it reads the body. Content-Length and User-Agent describe
@@ -115,7 +123,7 @@ def _declared_size(value: Any) -> int | None:
 
 
 def _binary_content(
-    binary_data: Mapping[str, Any], *, timeout: float, deadline: float
+    binary_data: Mapping[str, Any], *, timeout: float, deadline: float | None
 ) -> tuple[bytes, str]:
     """The bytes behind a binary answer's signed URL, and their content type.
 
@@ -123,10 +131,10 @@ def _binary_content(
     that signed URL in ``binary_data``; the URL expires, so it must not be
     kept, and it must not appear in an error either (it is a bearer-like
     credential for the file). ``public_requests`` keeps the download off a
-    non-public destination. The download runs under the same end-to-end
-    deadline as the proxy call it belongs to: the count was settled when that
-    call returned, so a download that never ends must not hold the caller of
-    the request either.
+    non-public destination. When the request was one a batch sent, the download
+    runs under the same end-to-end deadline as the proxy call it belongs to:
+    the count was settled when that call returned, so a download that never
+    ends must not hold the caller of the request either.
 
     The bytes must be the whole body: a 206, or a body shorter or longer than
     the size Composio declared (or, unless the answer is compressed, the
@@ -189,7 +197,7 @@ def _binary_content(
 
 
 def _body_and_type(
-    answer: ProxyResponse, *, timeout: float, deadline: float
+    answer: ProxyResponse, *, timeout: float, deadline: float | None
 ) -> tuple[bytes, str]:
     """The body and content type of one provider answer.
 
@@ -201,7 +209,8 @@ def _body_and_type(
     an empty object.
 
     ``deadline`` is the end-to-end deadline of the proxied request this answer
-    belongs to, so a binary body is downloaded inside it.
+    belongs to, when it is one a batch sent, so a binary body is downloaded
+    inside it.
     """
     if answer.binary_data is not None:
         return _binary_content(answer.binary_data, timeout=timeout, deadline=deadline)
@@ -334,13 +343,13 @@ class GoogleApiProxyHttp:
         does not follow a redirect: the status and the provider's headers
         (including ``location``) are returned, so the caller can follow it.
 
-        The whole call, a binary answer's download included, runs inside one
-        ``timeout`` from here: the proxy call and the download share the
-        deadline, so no delivery of the answer's body can hold the caller past
-        it, and a batch's late request still settles before a metered tool
-        call takes its count.
+        A request a batch sent gets an end-to-end deadline, because a metered
+        tool call waits for it after the batch returned: the whole call, a
+        binary answer's download included, runs inside one ``timeout`` from
+        here. A request sent outside a batch has no such deadline and keeps
+        only the ``timeout`` given to ``requests``.
         """
-        deadline = time.monotonic() + self._timeout
+        deadline = time.monotonic() + self._timeout if _batch_request.get() else None
         prepared = self._prepare(uri, method, body, headers)
         answer = proxy_request(
             prepared.method,
@@ -497,6 +506,9 @@ def execute_batch(
         http = request.http
         if http is None:
             return ValueError("Missing a valid http object.")
+        # This runs in a context copied for this one request, so the mark
+        # reaches this request's transport and no other.
+        _batch_request.set(True)
         try:
             answer: tuple[Any, bytes] = http.request(
                 request.uri,

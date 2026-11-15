@@ -18,10 +18,13 @@ and sends absolute URLs.
 Two kinds of failure stay apart:
 
 - Composio itself refusing or failing (bad key, unknown account, rate limit,
-  an answer that is not a proxy result) raises ``ComposioProxyError``. A call
-  that outlives its end-to-end deadline raises it too: ``requests``' ``timeout``
-  bounds one connect attempt and each socket read, not the whole exchange, so a
-  body that keeps arriving inside the read timeout would never end.
+  an answer that is not a proxy result) raises ``ComposioProxyError``. So does
+  a request a batch sent that outlives its end-to-end deadline: ``requests``'
+  ``timeout`` bounds one connect attempt and each socket read, not the whole
+  exchange, so a body that keeps arriving inside the read timeout would never
+  end. Only a batch's request has that deadline, because a metered tool call
+  waits for it after the batch returned; a request sent outside a batch keeps
+  just the ``timeout``.
 - The provider's own answer, error or not, is returned as a ``ProxyResponse``
   with the provider's status, so each connector maps its own API's errors.
 
@@ -61,10 +64,11 @@ _LAUNCH_SECRET_ENVS = (
     COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
     COMPOSIO_USER_ID_ENV,
 )
-# The end-to-end budget of one proxied request, from the send to the last byte
-# of the answer (a binary answer's download included); it is also the
-# per-socket timeout given to ``requests``, which bounds one connect attempt and
-# each read, not the whole exchange.
+# The per-socket timeout given to ``requests``, which bounds one connect attempt
+# and each read, not the whole exchange. A proxied request a batch sent also has
+# it as an end-to-end budget, from the send to the last byte of the answer (a
+# binary answer's download included), because a metered tool call waits for such
+# a request after its batch returned.
 DEFAULT_TIMEOUT_SECONDS = 30
 # The largest JSON body one Proxy Execute call may carry. Composio's API is
 # served by Vercel functions (its answers can carry ``x-vercel-id``), whose
@@ -1017,19 +1021,22 @@ class _DeadlinePassed(Exception):
     """One proxied send did not finish by the deadline it was given."""
 
 
-def send_within_deadline(deadline: float, send: Callable[[], Any]) -> Any:
+def send_within_deadline(deadline: float | None, send: Callable[[], Any]) -> Any:
     """``send()``, given up on at ``deadline`` (a ``time.monotonic()`` value).
 
     ``send`` performs one ``requests`` call, whose own ``timeout`` bounds one
     connect attempt and each socket read, not the whole exchange: a body that
-    keeps arriving inside the read timeout never trips it. The call therefore
-    runs on a thread of its own and the caller waits only until ``deadline``,
+    keeps arriving inside the read timeout never trips it. Given a deadline,
+    the call runs on a thread of its own and the caller waits only until then,
     so one deadline can cover several steps of one proxied request (the proxy
-    call and the download of a binary answer). A call that outlives the
-    deadline is abandoned and raises; nothing this client counts or returns
-    comes from the abandoned call, because the caller counts and reads the
-    answer itself, after this returns.
+    call and the download of a binary answer); a call that outlives it is
+    abandoned and raises, and nothing this client counts or returns comes from
+    the abandoned call, because the caller counts and reads the answer itself,
+    after this returns. Without a deadline, ``send()`` runs on this thread, as
+    one sent outside a batch does.
     """
+    if deadline is None:
+        return send()
     sent: Future[Any] = Future()
 
     def run() -> None:
@@ -1065,21 +1072,21 @@ def proxy_request(
     ``allowed_hosts`` are the hostnames an absolute ``endpoint`` may name.
     ``query`` is a mapping or a sequence of pairs, and each name may appear
     only once; ``body`` is sent as JSON. Raises ``ComposioProxyError`` when
-    Composio does not relay the call or does not finish it inside ``timeout``,
-    and ``ValueError`` before sending anything when the endpoint, a launch
-    variable or a parameter is unusable, when a query name appears more than
-    once, or when the JSON body would exceed ``MAX_JSON_BODY_BYTES``.
-    ``max_body_bytes`` overrides that shared default, for a connector whose
-    real limit differs.
+    Composio does not relay the call, or does not finish a call that has a
+    ``deadline`` inside it, and ``ValueError`` before sending anything when the
+    endpoint, a launch variable or a parameter is unusable, when a query name
+    appears more than once, or when the JSON body would exceed
+    ``MAX_JSON_BODY_BYTES``. ``max_body_bytes`` overrides that shared default,
+    for a connector whose real limit differs.
 
-    ``timeout`` is the call's end-to-end budget, whichever way the answer's
-    body is delivered, and it is also the per-socket timeout given to
-    ``requests``. ``deadline`` is that cutoff as a ``time.monotonic()`` value,
-    for a caller that runs further steps of the same request under it (reading
-    a binary answer); without it the cutoff is one ``timeout`` from now.
+    ``timeout`` is the per-socket timeout given to ``requests``. ``deadline``
+    is an end-to-end cutoff for the call, as a ``time.monotonic()`` value, for
+    a caller that runs further steps of the same request under it (reading a
+    binary answer): ``GoogleApiProxyHttp`` gives one to each request a batch
+    sends, because a metered tool call waits for those. A call that outlives it
+    is abandoned and raises. Without a deadline the call has no end-to-end
+    cutoff and is bounded only by ``timeout``.
     """
-    if deadline is None:
-        deadline = time.monotonic() + timeout
     if isinstance(allowed_hosts, str):
         raise TypeError("allowed_hosts must be a collection of hostnames, not a str")
     endpoint = _checked_endpoint(endpoint, allowed_hosts)

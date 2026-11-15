@@ -4,9 +4,9 @@ Composio bills each Proxy Execute request, and one tool call can make several.
 The connector subprocess reports how many were accepted so the agent process
 can record that many rows; these tests pin what the server puts on the result,
 including what a call that raises cannot report, that a batch request accepted
-after the batch's deadline still reaches the count, and that a request whose
-answer never stops arriving is cut off by its own deadline instead of holding
-the call open.
+after the batch's deadline still reaches the count, and that a request a batch
+sent whose answer never stops arriving is cut off by its own deadline instead
+of holding the call open, a binary download included.
 """
 
 from __future__ import annotations
@@ -108,18 +108,44 @@ async def test_a_call_that_raises_loses_its_count() -> None:
     assert result.meta is None
 
 
+_FILE_BYTES = b"%PDF-1.4 real bytes"
+# Composio's answer for a binary body: the file is not relayed in ``data`` but
+# stored, and its signed URL comes back in ``binary_data``.
+_FILE_ANSWER = {
+    "status": 200,
+    "data": None,
+    "binary_data": {
+        "url": "https://files.composio.dev/signed",
+        "content_type": "application/pdf",
+        "size": len(_FILE_BYTES),
+    },
+}
+
+
+class _DownloadedFile:
+    """The ``public_requests`` response shape a binary download returns."""
+
+    def __init__(self, status_code: int, content: bytes) -> None:
+        self.status_code = status_code
+        self.content = content
+        self.headers: dict[str, str] = {}
+
+
 class _TimedProxy:
     """The proxy answering each message read after its own delay.
 
     A message that trickles keeps its answer's body arriving in small pieces
     for that long: ``requests`` reads the whole body before it returns, and a
-    read timeout does not trip while the pieces keep coming.
+    read timeout does not trip while the pieces keep coming. A message that
+    answers with a file gets Composio's binary envelope instead of data, so the
+    transport downloads it from the signed URL.
     """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self._delays: dict[str, float] = {}
         self._trickles: dict[str, float] = {}
+        self._files: set[str] = set()
         self._refusals: set[str] = set()
         self._lock = threading.Lock()
 
@@ -128,6 +154,9 @@ class _TimedProxy:
 
     def trickles_for(self, message_id: str, seconds: float) -> None:
         self._trickles[message_id] = seconds
+
+    def answers_a_file(self, message_id: str) -> None:
+        self._files.add(message_id)
 
     def refuses_after(self, message_id: str, delay: float) -> None:
         self._delays[message_id] = delay
@@ -143,6 +172,8 @@ class _TimedProxy:
             time.sleep(0.02)
         if message_id in self._refusals:
             return _Response(500, {"error": {"message": "refused"}})
+        if message_id in self._files:
+            return _Response(200, _FILE_ANSWER)
         return _Response(200, {"status": 200, "data": {"id": message_id}})
 
 
@@ -290,3 +321,39 @@ async def test_a_slow_request_inside_its_deadline_still_counts(timed_proxy):
     assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 1}
     assert seen[0][1] is not None
     assert seen[0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_a_binary_download_inside_a_batch_runs_under_its_deadline(
+    timed_proxy, monkeypatch
+):
+    """A Gmail batch has no binary answer of its own, so this drives the
+    transport with one: a batch request's deadline covers a binary answer's
+    download too, so a download that keeps arriving cannot hold the metered
+    call past it. Composio accepted the call before the download, so it is
+    counted."""
+    timed_proxy.answers_a_file("m1")
+
+    def trickling(url: str, timeout: float, **kwargs: Any) -> _DownloadedFile:
+        trickling_until = time.monotonic() + 1.5
+        while time.monotonic() < trickling_until:
+            time.sleep(0.02)
+        return _DownloadedFile(200, _FILE_BYTES)
+
+    monkeypatch.setattr(google_api_proxy.requests, "get", trickling)
+    mcp, seen = _batch_server(deadline=0.2, timeout=0.3)
+
+    started = time.monotonic()
+    async with create_connected_server_and_client_session(mcp._mcp_server) as session:
+        result = await session.call_tool("read_messages", {"messages": ["m1"]})
+    elapsed = time.monotonic() - started
+
+    assert result.isError is False
+    assert result.meta == {COMPOSIO_REQUESTS_META_KEY: 1}
+    # The tool's own answer is unchanged: the request was still downloading
+    # when its batch hit the batch deadline, so it is reported as a timeout.
+    assert seen[0][1] is None
+    assert isinstance(seen[0][2], TimeoutError)
+    assert elapsed < 2 * (0.2 + 0.3), (
+        "the wait must end one proxy deadline after the batch's"
+    )

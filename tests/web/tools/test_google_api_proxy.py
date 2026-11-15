@@ -1170,16 +1170,16 @@ def test_the_transport_can_override_the_shared_body_limit(proxy):
     assert proxy.calls == []
 
 
-def test_a_binary_download_runs_under_the_requests_deadline(proxy, monkeypatch):
-    """The count is settled when the proxy call returns, before the binary body
-    is fetched, and the download shares the request's end-to-end deadline: a
-    download that keeps arriving cannot hold the caller past it."""
+def test_a_single_binary_download_is_not_cut_off_at_its_timeout(proxy, monkeypatch):
+    """A download outside a batch keeps only the ``timeout`` given to
+    ``requests``: nothing waits for that request afterwards, so it is given no
+    end-to-end deadline, and a body that keeps arriving is not cut off."""
 
     def trickling(url: str, timeout: float, **kwargs: Any) -> _Download:
-        trickling_until = time.monotonic() + 1.5
+        trickling_until = time.monotonic() + 0.5
         while time.monotonic() < trickling_until:
             time.sleep(0.02)
-        return _Download(200, b"late bytes")
+        return _Download(200, b"%PDF-1.4 real bytes")
 
     monkeypatch.setattr(google_api_proxy.requests, "get", trickling)
     proxy.answer_with(
@@ -1190,7 +1190,7 @@ def test_a_binary_download_runs_under_the_requests_deadline(proxy, monkeypatch):
             "binary_data": {
                 "url": "https://files.composio.dev/signed",
                 "content_type": "application/pdf",
-                "size": 10,
+                "size": 19,
             },
         },
     )
@@ -1198,15 +1198,16 @@ def test_a_binary_download_runs_under_the_requests_deadline(proxy, monkeypatch):
     token = composio_proxy.begin_request_count()
     started = time.monotonic()
     try:
-        with pytest.raises(composio_proxy.ComposioProxyError):
-            google_api_proxy.GoogleApiProxyHttp(
-                allowed_hosts=GMAIL_HOSTS, timeout=0.3
-            ).request(
-                "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
-            )
+        response, content = google_api_proxy.GoogleApiProxyHttp(
+            allowed_hosts=GMAIL_HOSTS, timeout=0.3
+        ).request(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/m1/attachments/a"
+        )
     finally:
         accepted = composio_proxy.end_request_count(token)
     elapsed = time.monotonic() - started
 
-    assert accepted == 1, "Composio accepted the proxy call before the download"
-    assert elapsed < 2 * 0.3, "the download must not outlive the request's deadline"
+    assert response.status == 200
+    assert content == b"%PDF-1.4 real bytes"
+    assert accepted == 1
+    assert elapsed >= 0.5, "the download must not be cut off at its timeout"

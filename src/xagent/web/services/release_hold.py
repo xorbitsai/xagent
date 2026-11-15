@@ -405,7 +405,6 @@ class ReleaseHold:
         return {
             "closed": self._closed,
             "sealed": self._sealed,
-            "finishing": self._finishing,
             "reason": self._reason,
             "refused": dict(self._refused),
             "responsibilities": [
@@ -479,6 +478,9 @@ def finishing_status() -> dict[str, Any]:
     false (and is reported as ``None``): idle is evidence the host stops this
     process on, so an unknown is never idle. Event-loop thread only.
     """
+    if not release_hold.finishing:
+        # Outside finish-only mode nothing is read: no query, no counting.
+        return {"active": False, "owned_runs": 0, "pending_replies": 0, "idle": False}
     from .task_coordinator_runtime import live_coordinator_count
     from .task_execution import background_task_manager
 

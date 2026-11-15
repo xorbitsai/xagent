@@ -302,3 +302,61 @@ async def test_finishing_closes_the_dispatch_cap_so_idle_leases_are_released():
     cap = build_dispatch_cap_snapshot()
     assert cap.held and cap.closed
     assert not cap.admits(123456, interactive=True)
+
+
+def _compiled(expression) -> str:
+    from sqlalchemy.dialects import postgresql
+
+    return str(
+        expression.compile(
+            dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_routing_predicate_is_unchanged_without_finishing(monkeypatch, shared):
+    """The normal claim path: exactly the pre-existing predicate."""
+    from sqlalchemy import or_
+
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(transport, "get_shared_task_execution_enabled", lambda: shared)
+    assert release_hold.finishing is False
+    legacy = [
+        Task.runner_id == "r",
+        Task.runner_id.is_(None),
+        Task.lease_expires_at.is_(None),
+        Task.lease_expires_at < now,
+    ]
+    if not shared:
+        legacy = [
+            TaskExecutionCommand.target_runner_id.is_(None),
+            TaskExecutionCommand.target_runner_id == "r",
+            *legacy,
+        ]
+    assert _compiled(transport._command_routing_predicate("r", now)) == _compiled(
+        or_(*legacy)
+    )
+
+
+def test_nothing_changes_until_begin_finishing_is_called():
+    assert release_hold.finishing is False
+    assert release_hold.closed is False
+    status = finishing_status()
+    assert status == {
+        "active": False,
+        "owned_runs": 0,
+        "pending_replies": 0,
+        "idle": False,
+    }
+    assert "finishing" not in release_hold.snapshot()
+    assert release_hold_module.execution_status()["finishing"]["active"] is False
+
+
+def test_status_outside_finishing_reads_nothing(monkeypatch):
+    def forbidden():
+        raise AssertionError("must not read the database outside finish-only mode")
+
+    monkeypatch.setattr(release_hold_module, "_pending_reply_count", forbidden)
+    register_finishing_counter("x", forbidden)
+    assert finishing_status()["active"] is False

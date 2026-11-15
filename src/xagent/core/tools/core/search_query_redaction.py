@@ -23,9 +23,17 @@ Recognised and not recognised
 -----------------------------
 Email: the local part and each domain label may contain any Unicode letter or
 digit (RFC 6531), the domain may use an ASCII or ideographic dot, and a quoted
-local part is accepted. The domain must contain at least one dot, so
-``user@localhost`` and ``user@[IP]`` are not recognised, nor is an address with
-spaces around the ``@``.
+local part is accepted. A local part or label is either a run of non-CJK
+characters or a run of CJK characters (Han, kana, hangul), never a mix, so an
+address inside CJK text does not absorb the words beside it; a local part or
+label made only of CJK characters still absorbs adjacent CJK text. The last
+domain label must be letters only (at least two) or ``xn--`` punycode, so a
+version specifier such as ``lodash@4.17.21`` is not an address, but one whose
+last dotted part is alphabetic (``react@18.2.0-rc.alpha``) is replaced. The
+domain must contain at least one dot, so ``user@localhost`` and ``user@[IP]``
+are not recognised, nor is an address with spaces around the ``@``. Not
+replaced: ``git@host`` (the ssh user of git hosts) and an address followed by
+``:`` and a path (scp-style remotes such as ``deploy@host:/srv``).
 
 Phone: an international number starting with ``+`` (or the full-width ``＋``),
 checked against the structure of its country code (+61: 9 national digits,
@@ -155,17 +163,40 @@ def valid_medicare(value: str) -> bool:
 _NUM_START = r"(?<![\w\-./$€£,])"
 _NUM_END = r"(?![\w\-]|[.,]\d)"
 
-# Local part: a quoted string or dot-atom text; ``\w`` is Unicode-aware, so
-# internationalised mailboxes (RFC 6531) match. Domain: Unicode letters/digits
-# and hyphens per label, labels joined by an ASCII or ideographic dot.
-_DOMAIN_LABEL = r"(?:[^\W_]|-){1,63}"
-_EMAIL_RE = re.compile(
-    r"(?:\"[^\"\\\r\n@]{1,64}\"|[\w.%+\-]{1,64})@"
-    + _DOMAIN_LABEL
-    + r"(?:[.\u3002\uff0e\uff61]"
-    + _DOMAIN_LABEL
-    + r"){1,8}"
+# Email. ``\w`` is Unicode-aware, so internationalised mailboxes (RFC 6531)
+# match. Scripts written without spaces (Han, kana, hangul) must not swallow the
+# text beside the address, so the local part and each domain label are a run of
+# either non-CJK word characters or CJK characters, never a mix. The last
+# domain label is the TLD: letters only (at least two), or ``xn--`` punycode, so
+# version specifiers such as ``lodash@4.17.21`` are not addresses.
+_CJK = (
+    "\u1100-\u11ff\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af"
+    "\uf900-\ufaff\uff66-\uff9f"
 )
+_NOT_CJK = f"(?![{_CJK}])"
+_NON_CJK_WORD_END = f"(?!{_NOT_CJK}[\\w\\-])"
+_LOCAL = (
+    r'(?:"[^"\\\r\n@]{1,64}"'
+    + f"|(?:{_NOT_CJK}[\\w.%+\\-]){{1,64}}"
+    + f"|[{_CJK}]{{1,64}})"
+)
+_LABEL = f"(?:(?:{_NOT_CJK}[^\\W_]|-){{1,63}}|[{_CJK}]{{1,63}})"
+_TLD = (
+    r"(?:xn--[A-Za-z0-9\-]{2,59}(?![\w\-])"
+    + f"|(?:{_NOT_CJK}[^\\W\\d_]){{2,63}}{_NON_CJK_WORD_END}"
+    + f"|[{_CJK}]{{2,63}}(?![{_CJK}]))"
+)
+_EMAIL_RE = re.compile(_LOCAL + "@(?:" + _LABEL + r"[.\u3002\uff0e\uff61]){1,8}" + _TLD)
+# scp-style remote ``user@host:path``: the address is followed by ``:`` and a
+# path, not by prose.
+_SCP_PATH_RE = re.compile(r":(?:[/~]|[\w.\-]+/)")
+
+
+def _email_ok(m: Match[str]) -> bool:
+    if m.group(0).partition("@")[0] == "git":
+        return False  # ssh user of every git host, never a person's mailbox
+    return _SCP_PATH_RE.match(m.string, m.end()) is None
+
 
 _ABN_RE = re.compile(_NUM_START + r"\d{2}[ -]?\d{3}[ -]?\d{3}[ -]?\d{3}" + _NUM_END)
 _TFN_RE = re.compile(_NUM_START + r"\d{3}[ -]?\d{3}[ -]?\d{3}" + _NUM_END)
@@ -303,7 +334,7 @@ def redact_search_query(query: str) -> RedactionResult:
             return RedactionResult(query if isinstance(query, str) else "", ())
         found: List[str] = []
         text = query
-        text = _sub(text, _EMAIL_RE, EMAIL, found)
+        text = _sub(text, _EMAIL_RE, EMAIL, found, _email_ok)
         text = _sub(text, _ADDRESS_CAP_RE, ADDRESS, found)
         text = _sub(text, _ADDRESS_CTX_RE, ADDRESS, found)
         text = _sub(text, _PO_BOX_RE, ADDRESS, found)

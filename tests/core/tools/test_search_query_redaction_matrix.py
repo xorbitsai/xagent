@@ -27,6 +27,19 @@ FIXED = [
     ("mailto:jane@example.com?subject=hi", "mailto:[EMAIL]?subject=hi"),
     ("JANE@EXAMPLE.COM", "[EMAIL]"),
     ("jane@example.com,bob@example.org", "[EMAIL],[EMAIL]"),
+    # email inside text written without spaces: neighbours are not absorbed
+    ("张三的邮箱zhangsan@example.com是否有效", "张三的邮箱[EMAIL]是否有效"),
+    ("请联系alice@example.com查询订单", "请联系[EMAIL]查询订单"),
+    ("用户@example.com的资料", "[EMAIL]的资料"),
+    ("ありがとうtaro@example.jpです", "ありがとう[EMAIL]です"),
+    ("한글bob@example.com입니다", "한글[EMAIL]입니다"),
+    ("see alice@例子.公司 for details", "see [EMAIL] for details"),
+    # a CJK-only local part or label still absorbs adjacent CJK text
+    ("联系用户@例子.公司查询", "[EMAIL]"),
+    # documented false positive: alphabetic last part looks like a TLD
+    ("react@18.2.0-rc.alpha", "[EMAIL]"),
+    ("mygit@example.com", "[EMAIL]"),
+    ("jane@example.com:note", "[EMAIL]:note"),
     # phone: international, trunk forms, separators
     ("call +61 (0) 412 345 678", "call [PHONE]"),
     ("call +61 (0)412 345 678", "call [PHONE]"),
@@ -87,6 +100,15 @@ OUT_OF_SCOPE = [
     "jane@localhost",
     "jane@[192.168.0.1]",
     "jane @ example.com",
+    # email: version and package specifiers (numeric last label)
+    "node package lodash@4.17.21 changelog",
+    "price list v1.2.3@2024.10 release notes",
+    # email: a domain label that mixes CJK and non-CJK characters
+    "a@b例子.com",
+    # email: scp-style remotes and the ssh user of git hosts
+    "git ssh git@github.com:org/repo.git clone error",
+    "git@github.com: Permission denied (publickey)",
+    "deploy@example.com:/var/www",
     # phone: business numbers
     "call 1300 123 456",
     "call 13 12 34",

@@ -1155,6 +1155,11 @@ _QUERY_TEXT_WITHHELD = "[truncated text containing a query withheld]"
 # at any JSON/repr escaping depth: ``"query":``, ``'query':``, ``\\"query\\":``),
 # by a colon: how a ``query`` key looks inside serialised arguments.
 _QUERY_KEY_RE = re.compile(r"query[\\\"']*\s*:")
+# A search tool name right after a quote or backslash (how a name looks inside
+# serialised JSON or a repr).
+_SEARCH_NAME_RE = re.compile(
+    r"[\\\"'](?:" + "|".join(sorted(SEARCH_TOOL_NAMES)) + r")\b"
+)
 
 
 def _withhold_truncated_query_text(text: str) -> str:
@@ -1162,23 +1167,27 @@ def _withhold_truncated_query_text(text: str) -> str:
 
     ``_shrink_message`` dumps a dict or list message value (a legacy
     ``function_call``, Anthropic content blocks) to a string, and may then cut
-    it, so the structural projection never sees the call. Two cases:
+    it, so the structural projection never sees the call. A string that holds a
+    ``query:`` key, or names a search tool in quotes (so also the
+    ``{"input": <raw text>}`` fallback), is handled in two ways:
 
-    * cut (carries a truncation marker) and holding a ``query:`` key: replaced
-      wholesale, because a query value can only follow its key, and a cut
-      value leaves a fragment no recogniser can match (``jane.doe@exa``);
-    * complete and naming a search tool next to a ``query:`` key: every entity
-      in it is redacted.
+    * cut (carries a truncation marker): replaced wholesale, because a cut
+      value leaves a fragment no recogniser can match (``jane.doe@exa``). A
+      query value can only follow its key, so a cut before the key carries
+      none of it;
+    * complete: when it names a search tool, every entity in it is redacted.
 
-    The wholesale rule over-masks any truncated text that merely mentions
-    ``query:`` (prose, other tools' ``query`` arguments); it affects only the
-    console line.
+    The wholesale rule over-masks truncated text that merely mentions
+    ``query:`` or quotes a search tool name (prose, other tools' ``query``
+    arguments); it affects only the console line.
     """
-    if not _QUERY_KEY_RE.search(text):
+    has_key = _QUERY_KEY_RE.search(text) is not None
+    names_tool = _SEARCH_NAME_RE.search(text) is not None
+    if not (has_key or names_tool):
         return text
     if _TRUNCATION_MARKER in text:
         return _QUERY_TEXT_WITHHELD
-    if any(name in text for name in SEARCH_TOOL_NAMES):
+    if names_tool:
         from ..tools.core.search_query_redaction import redact_search_query
 
         return redact_search_query(text).text

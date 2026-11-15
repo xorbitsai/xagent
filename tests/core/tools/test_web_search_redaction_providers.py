@@ -582,6 +582,24 @@ def test_cut_query_text_is_withheld_when_nothing_is_truncated_by_the_sink():
     assert "[truncated text containing a query withheld]" in rendered
 
 
+def test_stringified_block_naming_a_search_tool_without_a_query_key():
+    # the {"input": <raw text>} fallback inside a stringified content block
+    complete = json.dumps(
+        [{"type": "tool_use", "name": "web_search", "input": {"input": EMAIL}}]
+    )
+    rendered = _render_event_data_for_log({"content": complete})
+    assert EMAIL not in rendered and "[EMAIL]" in rendered
+    cut = complete[:-12] + "...[truncated 12 chars]"
+    rendered = _render_event_data_for_log({"content": cut})
+    assert "jane" not in rendered
+    assert "[truncated text containing a query withheld]" in rendered
+
+
+def test_unquoted_search_tool_name_in_prose_is_kept():
+    text = "I will use web_search for this...[truncated 40 chars]"
+    assert text in _render_event_data_for_log({"content": text})
+
+
 def test_truncated_text_without_a_query_key_is_kept():
     text = "an ordinary long answer...[truncated 99 chars]"
     assert text in _render_event_data_for_log({"content": text})

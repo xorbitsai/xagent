@@ -18,6 +18,7 @@ from .mcp import MCPServer, UserMCPServer
 from .mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from .model import Model
 from .oauth_provider import OAuthProvider
+from .oauth_revocation_fence import OAuthRevocationFence
 from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp, PublicMCPAppAudit
 from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
@@ -131,6 +132,7 @@ __all__ = [
     "UserSkill",
     "UserSkillFile",
     "OAuthProvider",
+    "OAuthRevocationFence",
     "OidcConsumedToken",
     "PublicMCPApp",
     "PublicMCPAppAudit",

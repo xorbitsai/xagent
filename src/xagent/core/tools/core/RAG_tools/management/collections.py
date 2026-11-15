@@ -50,7 +50,11 @@ from ..utils.lancedb_query_utils import _safe_count_rows, list_table_names
 from ..utils.string_utils import build_lancedb_filter_expression, escape_lancedb_string
 from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
-from .migration_state import ensure_collection_writable
+from .migration_state import (
+    ensure_collection_writable,
+    leased_collections,
+    verify_active_leases,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1264,111 +1268,117 @@ def _delete_document_impl(
     Returns:
         DocumentOperationResult: Operation result with deletion counts.
     """
-    ensure_collection_writable(collection)
+    with leased_collections(collection, operation="document-delete"):
+        ensure_collection_writable(collection)
 
-    vector_store = get_vector_index_store()
+        vector_store = get_vector_index_store()
 
-    authorized_via_legacy_source_path = False
+        authorized_via_legacy_source_path = False
 
-    try:
-        document_count = vector_store.count_rows(
-            table_name="documents",
-            filters={"collection": collection, "doc_id": doc_id},
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "Failed to authorize document deletion %s/%s: %s",
-            collection,
-            doc_id,
-            exc,
-        )
-        return DocumentOperationResult(
-            status="error",
-            collection=collection,
-            doc_id=doc_id,
-            new_status=DocumentProcessingStatus.FAILED,
-            message=f"Failed to delete document: {exc}",
-            warnings=[],
-            details={},
-        )
-
-    if document_count == 0:
-        owner_context = _load_document_owner_context(collection, doc_id)
-        if owner_context is None:
+        try:
+            document_count = vector_store.count_rows(
+                table_name="documents",
+                filters={"collection": collection, "doc_id": doc_id},
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to authorize document deletion %s/%s: %s",
+                collection,
+                doc_id,
+                exc,
+            )
             return DocumentOperationResult(
                 status="error",
                 collection=collection,
                 doc_id=doc_id,
                 new_status=DocumentProcessingStatus.FAILED,
-                message="Document not found or not accessible.",
+                message=f"Failed to delete document: {exc}",
                 warnings=[],
                 details={},
             )
 
-        owner_user_id = owner_context.get("owner_user_id")
-        if owner_user_id is None:
-            owner_user_id = _extract_user_id_from_source_path(
-                owner_context.get("source_path")
+        if document_count == 0:
+            owner_context = _load_document_owner_context(collection, doc_id)
+            if owner_context is None:
+                return DocumentOperationResult(
+                    status="error",
+                    collection=collection,
+                    doc_id=doc_id,
+                    new_status=DocumentProcessingStatus.FAILED,
+                    message="Document not found or not accessible.",
+                    warnings=[],
+                    details={},
+                )
+
+            owner_user_id = owner_context.get("owner_user_id")
+            if owner_user_id is None:
+                owner_user_id = _extract_user_id_from_source_path(
+                    owner_context.get("source_path")
+                )
+
+            if not is_admin and owner_user_id != user_id:
+                return DocumentOperationResult(
+                    status="error",
+                    collection=collection,
+                    doc_id=doc_id,
+                    new_status=DocumentProcessingStatus.FAILED,
+                    message="Document not found or not accessible.",
+                    warnings=[],
+                    details={},
+                )
+
+            authorized_via_legacy_source_path = (
+                owner_context.get("owner_user_id") is None
             )
 
-        if not is_admin and owner_user_id != user_id:
+        # Immediately before the write: a lease lost while resolving the
+        # document above would otherwise go unnoticed here.
+        verify_active_leases(collection)
+        try:
+            counts = coordinator.delete_documents_data_sync(
+                collection, [doc_id], user_id=user_id, is_admin=is_admin
+            )
+            _clear_ingestion_status_impl(
+                collection,
+                doc_id,
+                user_id=None if authorized_via_legacy_source_path else user_id,
+                is_admin=is_admin or authorized_via_legacy_source_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The store wraps delete failures; report the root cause as before.
+            cause = (
+                exc.__cause__
+                if isinstance(exc, DatabaseOperationError) and exc.__cause__ is not None
+                else exc
+            )
+            logger.error(
+                "Failed to delete document %s/%s: %s",
+                collection,
+                doc_id,
+                cause,
+                exc_info=True,
+            )
             return DocumentOperationResult(
                 status="error",
                 collection=collection,
                 doc_id=doc_id,
                 new_status=DocumentProcessingStatus.FAILED,
-                message="Document not found or not accessible.",
+                message=f"Failed to delete document: {cause}",
                 warnings=[],
                 details={},
             )
 
-        authorized_via_legacy_source_path = owner_context.get("owner_user_id") is None
-
-    try:
-        counts = coordinator.delete_documents_data_sync(
-            collection, [doc_id], user_id=user_id, is_admin=is_admin
-        )
-        _clear_ingestion_status_impl(
-            collection,
-            doc_id,
-            user_id=None if authorized_via_legacy_source_path else user_id,
-            is_admin=is_admin or authorized_via_legacy_source_path,
-        )
-    except Exception as exc:  # noqa: BLE001
-        # The store wraps delete failures; report the root cause as before.
-        cause = (
-            exc.__cause__
-            if isinstance(exc, DatabaseOperationError) and exc.__cause__ is not None
-            else exc
-        )
-        logger.error(
-            "Failed to delete document %s/%s: %s",
-            collection,
-            doc_id,
-            cause,
-            exc_info=True,
-        )
         return DocumentOperationResult(
-            status="error",
+            status="success",
             collection=collection,
             doc_id=doc_id,
             new_status=DocumentProcessingStatus.FAILED,
-            message=f"Failed to delete document: {cause}",
+            message="Document deleted successfully.",
             warnings=[],
-            details={},
+            details=counts,
         )
-
-    return DocumentOperationResult(
-        status="success",
-        collection=collection,
-        doc_id=doc_id,
-        new_status=DocumentProcessingStatus.FAILED,
-        message="Document deleted successfully.",
-        warnings=[],
-        details=counts,
-    )
 
 
 def retry_document(

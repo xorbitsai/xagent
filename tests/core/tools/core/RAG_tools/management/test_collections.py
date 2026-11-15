@@ -1418,3 +1418,27 @@ def test_delete_collection_removes_metadata_table_entry(temp_lancedb_dir: str) -
     after_table = conn.open_table("collection_metadata")
     after = after_table.search().where(f"name = '{collection}'").to_list()
     assert after == []
+
+
+def test_a_lost_lease_stops_the_document_delete_before_the_write() -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+
+    vector_store = MagicMock()
+    vector_store.count_rows.return_value = 1
+
+    def _lost(collection: str) -> None:
+        raise CollectionMigratingError("lease lost")
+
+    with (
+        patch.object(
+            collections_module, "get_vector_index_store", return_value=vector_store
+        ),
+        patch.object(collections_module, "verify_active_leases", _lost),
+        patch.object(KBCoordinator, "delete_documents_data_sync") as mock_delete_data,
+    ):
+        with pytest.raises(CollectionMigratingError):
+            delete_document("demo", "doc-1", user_id=7, is_admin=False)
+
+    mock_delete_data.assert_not_called()

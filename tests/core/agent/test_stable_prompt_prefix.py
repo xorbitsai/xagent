@@ -355,11 +355,14 @@ async def test_a_host_without_turn_notes_gets_only_the_clock() -> None:
     await adapter.execute(task="Say hi", task_id="prefix-plain", context={})
 
     user = _non_system(llm.calls[0])
-    request, header, clock, end = user.split("\n\n")
+    request, header, facts, clock, end = user.split("\n\n")
     assert request == "Say hi"
-    # Exactly the header, the clock paragraph and the end marker: no host,
-    # evidence or memory text leaks in when the host passes none.
+    # Exactly the header, the engine's own per-call facts (date and tool
+    # names), the clock paragraph and the end marker: no host, evidence or
+    # memory text leaks in when the host passes none.
     assert header == TURN_CONTEXT_HEADER
+    assert facts.startswith("Turn-start date (UTC): ")
+    assert "Available tool names for this LLM call are exactly:" in facts
     assert clock.startswith("Turn started at: ")
     assert clock.endswith("instead of computing from this value.")
     assert end == TURN_CONTEXT_END

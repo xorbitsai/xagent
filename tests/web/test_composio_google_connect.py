@@ -43,8 +43,10 @@ from xagent.web.services.google_oauth_grants import (
 )
 from xagent.web.services.user_oauth import delete_scoped_user_oauth_accounts
 
+from . import composio_web_start as web_start
 from . import test_composio_facebook_connect as facebook_connect
 from .test_composio_facebook_connect import (
+    CALLBACK_URL,
     OWNER,
     Browser,
     FakeComposio,
@@ -349,6 +351,42 @@ def test_a_google_flow_uses_the_shared_callback_not_googles(google, monkeypatch)
     assert _flow_cookies(browser) == []
 
 
+def test_a_google_composio_start_needs_no_provider_row(google, monkeypatch):
+    db, user, composio = google
+    app_id = "google-drive"
+    _switch_on(monkeypatch, app_id)
+    _install(db, user, app_id)
+    monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
+    assert (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == "google").first()
+        is None
+    )
+    browser = Browser()
+
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="google",
+        app_id=app_id,
+        user=user,
+        resource_owner_key=OWNER,
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=None,
+    )
+    db.commit()
+    browser.receive(start)
+
+    assert start.status_code in (302, 307)
+    assert start.headers["location"].startswith(f"{CALLBACK_URL}?state=")
+    begin = browser.get(db, start.headers["location"])
+    assert begin.status_code == 302, begin.body
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 200, response.body
+    (grant,) = _grants(db)
+    assert (grant.provider, grant.token_type) == (app_id, "composio")
+
+
 # --- The review gate binds native starts only -------------------------------------
 
 
@@ -482,6 +520,59 @@ def test_a_native_gmail_callback_is_refused_while_the_composio_switch_is_on(
     assert _grants(db) == []
 
 
+def _add_google_provider(db: Session) -> None:
+    provider = _google_provider()
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=provider.client_id,
+            client_secret=provider.client_secret,
+            auth_url=provider.auth_url,
+            token_url=provider.token_url,
+            redirect_uri=provider.redirect_uri,
+            userinfo_url=provider.userinfo_url,
+            user_id_path=provider.user_id_path,
+            email_path=provider.email_path,
+            default_scopes=provider.default_scopes,
+        )
+    )
+    db.commit()
+
+
+@pytest.mark.parametrize("entry", web_start.WEB_ENTRIES)
+def test_each_web_drive_entry_stays_native_while_the_composio_switch_is_on(
+    google, monkeypatch, entry
+):
+    """The switch moves the actor connect only: every web entry keeps the native
+    drive.file connect."""
+    db, user, composio = google
+    _switch_on(monkeypatch, "google-drive")
+    _install(db, user, "google-drive")
+    _add_google_provider(db)
+    browser = Browser()
+
+    response, callback_origin = web_start.web_begin(
+        db, user, "google", "google-drive", entry
+    )
+
+    assert response.status_code in (302, 307), response.body
+    location = urlsplit(response.headers["location"])
+    assert location.netloc == "accounts.google.com"
+    scopes = parse_qs(location.query)["scope"][0].split()
+    assert "https://www.googleapis.com/auth/drive.file" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
+    assert callback_origin in (None, "https://app.example.com")
+    state = auth_api.verify_token(parse_qs(location.query)["state"][0])
+    assert composio_auth.AUTH_BACKEND_CLAIM not in state
+    assert "actor_flow_nonce" not in state
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert composio.calls == []
+    name = auth_api._ordinary_oauth_cookie_name(state["browser_nonce_hash"])
+    browser.receive(response)
+    assert browser.cookies[name][1] == "/"
+
+
 def test_a_web_drive_connect_stays_native_while_the_composio_switch_is_on(
     google, monkeypatch
 ):
@@ -500,6 +591,37 @@ def test_a_web_drive_connect_stays_native_while_the_composio_switch_is_on(
     assert "https://www.googleapis.com/auth/drive.file" in scopes
     assert "https://www.googleapis.com/auth/drive" not in scopes
     assert composio.calls == []
+
+
+def test_a_web_drive_connect_stays_native_while_the_composio_switch_is_off(
+    google, monkeypatch
+):
+    db, user, composio = google
+    _install(db, user, "google-drive")
+    _add_google_provider(db)
+    browser = Browser()
+
+    response = auth_api.oauth_login(
+        "google",
+        token=web_start.access_token(user),
+        app_id="google-drive",
+        db=db,
+    )
+
+    assert response.status_code in (302, 307)
+    location = urlsplit(response.headers["location"])
+    assert location.netloc == "accounts.google.com"
+    scopes = parse_qs(location.query)["scope"][0].split()
+    assert "https://www.googleapis.com/auth/drive.file" in scopes
+    assert "https://www.googleapis.com/auth/drive" not in scopes
+    state = auth_api.verify_token(parse_qs(location.query)["state"][0])
+    assert composio_auth.AUTH_BACKEND_CLAIM not in state
+    assert "actor_flow_nonce" not in state
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert composio.calls == []
+    name = auth_api._ordinary_oauth_cookie_name(state["browser_nonce_hash"])
+    browser.receive(response)
+    assert browser.cookies[name][1] == "/"
 
 
 # --- The catalog -------------------------------------------------------------------

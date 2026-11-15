@@ -11,6 +11,7 @@ from typing import Any
 
 from ...core.execution_scope import ExecutionScope
 from ...core.memory.access_scope import MemoryAccessScope
+from ...core.memory.provenance import MemoryProvenance, validate_memory_provenance
 from ...core.memory.scope_columns import strict_user_id
 
 logger = logging.getLogger(__name__)
@@ -35,12 +36,37 @@ class MemoryPolicyRequest:
 
 @dataclass(frozen=True)
 class MemoryPolicyDecision:
-    """Explicit memory eligibility and availability decision."""
+    """Explicit memory eligibility and availability decision.
+
+    ``memory_provenance`` optionally describes where memories stored during
+    this task are learned (e.g. ``{"channel_kind": "dm", "channel_id": "D1"}``).
+    The ``store_memory`` tool copies it into each new note's metadata under
+    ``"provenance"``; see ``core.memory.provenance``. It is validated and
+    frozen on construction: a value outside the ASCII identifier grammar fails
+    the resolver (and therefore memory) closed. That grammar is defense in
+    depth, not proof a value is not content; hosts must pass identifiers
+    only. It is descriptive only and never affects which memories the task
+    may read.
+
+    Like ``memory_access_scope``, it requires enabled, available memory:
+    hosts must leave ``memory_provenance`` unset (``None``) whenever they
+    return ``enabled=False`` or ``available=False``, otherwise the decision
+    is rejected and memory fails closed for the task.
+    """
 
     enabled: bool
     available: bool
     reason: str | None = None
     memory_access_scope: MemoryAccessScope | None = None
+    memory_provenance: MemoryProvenance | None = None
+
+    def __post_init__(self) -> None:
+        if self.memory_provenance is not None:
+            object.__setattr__(
+                self,
+                "memory_provenance",
+                validate_memory_provenance(self.memory_provenance),
+            )
 
 
 MemoryPolicyResolver = Callable[[MemoryPolicyRequest], MemoryPolicyDecision]
@@ -72,8 +98,15 @@ def resolve_trusted_memory_policy(
         decision = resolver(request)
         _validate_decision(decision)
         return decision
-    except Exception:
-        logger.warning("Trusted memory policy resolver failed")
+    except Exception as exc:
+        # Name the failure so a rejected decision (e.g. an invalid provenance
+        # value) is diagnosable. Validation messages name the offending key
+        # and grammar, never the rejected value, which may be content.
+        logger.warning(
+            "Trusted memory policy resolver failed (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
         return MemoryPolicyDecision(
             enabled=False,
             available=False,
@@ -102,6 +135,10 @@ def _validate_decision(decision: object) -> None:
         decision.enabled and decision.available
     ):
         raise ValueError("memory access scope requires enabled, available memory")
+    if decision.memory_provenance is not None and not (
+        decision.enabled and decision.available
+    ):
+        raise ValueError("memory provenance requires enabled, available memory")
 
 
 def memory_retrieval_scope_fingerprint(

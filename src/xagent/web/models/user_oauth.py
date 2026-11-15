@@ -108,6 +108,21 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     provider = Column(String(50), nullable=False)  # e.g. "google-drive"
+    # The OAuth provider that issued this row's tokens, by its
+    # ``OAuthProvider.provider_name`` (``google``, ``github``, ...). It is
+    # distinct from ``provider`` above, which is the connecting app's key: a
+    # custom app ``acme-mail`` backed by Google stores ``provider="acme-mail"``
+    # and ``oauth_provider="google"``. The issuer is a fact known only when
+    # the tokens are written (the callback's provider route), so it is
+    # recorded then and never re-derived from the mutable catalog, whose
+    # ``provider_name`` an admin may change or delete afterwards.
+    #
+    # NULL means the issuer is unknown: a Composio-backed row (its grant
+    # belongs to Composio's own OAuth app, never this deployment's client),
+    # or a pre-existing native row whose issuer the backfill migration
+    # (20261115_user_oauth_issuer) could not prove. Provider-side revocation
+    # treats NULL as "do not revoke" and never guesses.
+    oauth_provider = Column(String(50), nullable=True)
     resource_owner_key = Column(
         String(USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH), nullable=True
     )

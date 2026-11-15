@@ -31,6 +31,7 @@ from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Union
 
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
 from ..utils.lancedb_sql import sql_and
+from .base import comparable_timestamp
 from .core import MemoryNote
 from .scope_columns import build_scope_where
 from .storage_admission import AdmittedLanceDBMemoryStore, DormantLanceDBMemoryHandle
@@ -258,7 +259,8 @@ def stream_list_all(
             batch_size=batch_size,
         )
     )
-    notes.sort(key=lambda note: note.timestamp, reverse=True)
+    # Naive legacy and aware current timestamps cannot be compared directly.
+    notes.sort(key=lambda note: comparable_timestamp(note.timestamp), reverse=True)
     return notes
 
 

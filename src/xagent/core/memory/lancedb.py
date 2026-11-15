@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable, List, Optional, Union
+from datetime import timedelta
+from typing import Any, Callable, List, Mapping, Optional, Union
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore
@@ -16,8 +17,8 @@ from ..model.embedding import BaseEmbedding, DashScopeEmbedding
 from ..model.embedding.adapter import create_embedding_adapter
 from ..model.model import EmbeddingModelConfig
 from ..tools.core.RAG_tools.LanceDB.schema_manager import _safe_close_table
-from ..utils.lancedb_sql import sql_string_literal
-from .base import MemoryStore
+from ..utils.lancedb_sql import sql_and, sql_string_in, sql_string_literal
+from .base import MemoryStore, comparable_timestamp, validate_scope_delete
 from .core import MemoryNote, MemoryResponse
 from .retrieval_compatibility import DEFAULT_STREAM_BATCH_SIZE, stream_lexical_top_k
 from .schema_migration import (
@@ -43,6 +44,32 @@ from .vector_compatibility import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Age past which ``compact()`` prunes superseded table versions. Long enough
+# that no in-flight memory operation (each opens the table fresh) can still be
+# reading or committing against a pruned version; shorter retentions can
+# silently lose a concurrent delete, see ``compact()``.
+COMPACT_VERSION_RETENTION = timedelta(minutes=10)
+
+
+def _is_pruned_version_error(error: Exception) -> bool:
+    """Whether a LanceDB write failed because its table version was pruned.
+
+    A handle keeps reading the version it opened. When a concurrent
+    ``compact()`` rewrites the table and prunes that version, the handle's
+    data files are gone and the write fails with a "not found" error on one
+    of them (``LanceError(IO): ... not found`` or ``Not found: <file>``,
+    depending on where Lance notices). The binding surfaces either only as a
+    ``RuntimeError`` message, so the message is the one thing to match on.
+    Matching any Lance "not found" is deliberately broad: a false positive
+    costs one retry that fails the same way and then propagates.
+    """
+    message = str(error)
+    return (
+        isinstance(error, RuntimeError)
+        and "lance error" in message
+        and "not found" in message.lower()
+    )
 
 
 class LanceDBMemoryStore(MemoryStore):
@@ -568,12 +595,87 @@ class LanceDBMemoryStore(MemoryStore):
             allow_vector_rebuild=False,
         )
 
+    def _storage_record(self, table: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """The row ``add`` and ``update`` write for ``data`` into ``table``.
+
+        The vector goes in only where this store's vectors may enter the table
+        (``_table_accepts_vectors``).
+        """
+        record = {
+            "id": data["id"],
+            "text": data["text"],
+            "metadata": data["metadata"],
+            USER_ID_COLUMN: data[USER_ID_COLUMN],
+            SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
+        }
+        if data["vector"] and self._table_accepts_vectors(table):
+            record["vector"] = data["vector"]
+        elif data["vector"]:
+            logger.warning(
+                "Memory table %r no longer holds this store's vector "
+                "space; storing memory %r without a vector",
+                self._collection_name,
+                data["id"],
+            )
+        return record
+
+    def _replacement_record(self, table: Any, data: dict[str, Any]) -> dict[str, Any]:
+        """The row ``update`` writes over a stored one: every column, ``vector``
+        included where the table has one.
+
+        A matched merge keeps a column the source leaves out, so a replacement
+        without an embedding (the provider failed, or the table holds another
+        vector space) must clear the stored vector explicitly; otherwise the new
+        text would be ranked by its former content's embedding.
+        """
+        record = self._fit_record(table, self._storage_record(table, data))
+        if "vector" in table.schema.names:
+            record.setdefault("vector", None)
+        return record
+
+    @staticmethod
+    def _fit_record(table: Any, record: dict[str, Any]) -> dict[str, Any]:
+        """``record`` adapted to the (possibly migrated) table schema."""
+        if "vector" in record and "vector" not in set(table.schema.names):
+            return {k: v for k, v in record.items() if k != "vector"}
+        return record
+
     def _insert_record(self, table: Any, record: dict[str, Any]) -> None:
         """Insert a record, adapting it to the (possibly migrated) table schema."""
-        schema_names = set(table.schema.names)
-        if "vector" in record and "vector" not in schema_names:
-            record = {k: v for k, v in record.items() if k != "vector"}
-        table.add([record])
+        table.add([self._fit_record(table, record)])
+
+    def _update_existing(self, table: Any, record: dict[str, Any]) -> bool:
+        """Overwrite the row whose id is ``record``'s; False when there is none.
+
+        Matched rows are updated and unmatched ones are *not* inserted, so this
+        can never re-create a deleted id. Rebases once onto the latest version
+        when a concurrent ``compact()`` pruned the handle's version, as
+        ``_delete_where`` does.
+        """
+
+        def merge(target: Any) -> bool:
+            result = (
+                target.merge_insert("id").when_matched_update_all().execute([record])
+            )
+            return int(result.num_updated_rows) > 0
+
+        try:
+            return merge(table)
+        except RuntimeError as error:
+            if not _is_pruned_version_error(error):
+                raise
+            logger.warning(
+                "Memory update raced a compaction of %r; retrying on the latest "
+                "version",
+                self._collection_name,
+            )
+            latest = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            try:
+                return merge(latest)
+            finally:
+                _safe_close_table(latest)
 
     def _memory_note_to_dict(self, note: MemoryNote) -> dict[str, Any]:
         """Convert MemoryNote to dictionary for storage."""
@@ -657,26 +759,7 @@ class LanceDBMemoryStore(MemoryStore):
             table = None
             try:
                 table = conn.open_table(self._collection_name)
-
-                # Prepare record for insertion
-                record = {
-                    "id": data["id"],
-                    "text": data["text"],
-                    "metadata": data["metadata"],
-                    USER_ID_COLUMN: data[USER_ID_COLUMN],
-                    SCOPE_DIMS_COLUMN: data[SCOPE_DIMS_COLUMN],
-                }
-
-                # Add vector if available
-                if data["vector"] and self._table_accepts_vectors(table):
-                    record["vector"] = data["vector"]
-                elif data["vector"]:
-                    logger.warning(
-                        "Memory table %r no longer holds this store's vector "
-                        "space; storing memory %r without a vector",
-                        self._collection_name,
-                        data["id"],
-                    )
+                record = self._storage_record(table, data)
 
                 # Try to add the record. On a schema mismatch, migrate the
                 # existing table in place (preserving all rows) instead of
@@ -761,22 +844,61 @@ class LanceDBMemoryStore(MemoryStore):
             _safe_close_table(table)
 
     def update(self, note: MemoryNote) -> MemoryResponse:
-        """Update an existing memory note."""
+        """Replace a stored note, only while a row with its id still exists.
+
+        One conditional ``merge_insert`` on ``id`` that updates the matching row
+        and never inserts: a note deleted concurrently -- a forget that commits
+        between a caller's ``get`` and this write -- stays deleted, and the
+        update reports it as not found. LanceDB commits the merge as one table
+        version and, when another commit lands first, retries it against the
+        newer version, so there is no window in which the id is absent and then
+        re-added (a delete followed by an add had one).
+        """
+        if not note.id:
+            return MemoryResponse(
+                success=False, error="Memory not found", memory_id=note.id
+            )
         try:
-            # Check if memory exists
-            get_response = self.get(note.id)
-            if not get_response.success:
+            data = self._memory_note_to_dict(note)
+            conn = self._vector_store.get_raw_connection()
+            table = None
+            try:
+                table = conn.open_table(self._collection_name)
+                record = self._replacement_record(table, data)
+                try:
+                    updated = self._update_existing(table, record)
+                except Exception as update_error:
+                    # The same schema-mismatch recovery as ``add``; the update
+                    # stays conditional on the migrated table.
+                    logger.warning(
+                        f"update() failed on possible schema mismatch: {update_error}; "
+                        "attempting safe in-place migration"
+                    )
+                    _safe_close_table(table)
+                    table = None
+                    try:
+                        self._migrate_schema_mismatch(conn, record)
+                    except Exception as migrate_error:
+                        logger.error(
+                            "Safe schema migration failed; table left intact: %s",
+                            migrate_error,
+                        )
+                        return MemoryResponse(
+                            success=False,
+                            error=f"Failed to update memory: {migrate_error}",
+                            memory_id=note.id,
+                        )
+                    table = conn.open_table(self._collection_name)
+                    updated = self._update_existing(
+                        table, self._replacement_record(table, data)
+                    )
+            finally:
+                _safe_close_table(table)
+            if not updated:
                 return MemoryResponse(
-                    success=False,
-                    error="Memory not found",
-                    memory_id=note.id,
+                    success=False, error="Memory not found", memory_id=note.id
                 )
-
-            # Delete old record
-            self.delete(note.id)
-
-            # Add updated record
-            return self.add(note)
+            return MemoryResponse(success=True, memory_id=note.id)
 
         except Exception as e:
             logger.error(f"Failed to update memory note {note.id}: {e}")
@@ -788,17 +910,15 @@ class LanceDBMemoryStore(MemoryStore):
 
     def delete(self, note_id: str) -> MemoryResponse:
         """Delete a memory note by its ID."""
+        table = None
         try:
-            success = self._vector_store.delete_vectors([note_id])
-
-            if success:
-                return MemoryResponse(success=True, memory_id=note_id)
-            else:
-                return MemoryResponse(
-                    success=False,
-                    error="Failed to delete memory",
-                    memory_id=note_id,
-                )
+            table = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            # Every id is a quoted literal, so a crafted id cannot widen the
+            # predicate beyond exact-match rows.
+            self._delete_where(table, sql_string_in("id", [note_id]))
+            return MemoryResponse(success=True, memory_id=note_id)
 
         except Exception as e:
             logger.error(f"Failed to delete memory note {note_id}: {e}")
@@ -807,6 +927,39 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to delete memory: {str(e)}",
                 memory_id=note_id,
             )
+        finally:
+            _safe_close_table(table)
+
+    def _delete_where(self, table: Any, where: str) -> None:
+        """Delete ``where`` through ``table``, rebasing once onto the latest version.
+
+        ``compact()`` prunes versions older than ``COMPACT_VERSION_RETENTION``,
+        and that cutoff ages the *version*, not the writer's snapshot: on an
+        idle table the latest version can already be older than the
+        retention, so a concurrent ``compact()`` may rewrite the table and
+        prune it between this handle opening it and the delete committing.
+        The delete then fails on the missing data files with the row still
+        live. Retrying once on a freshly opened handle re-applies the same
+        idempotent predicate to the version that replaced it. Anything else,
+        including a second failure, propagates.
+        """
+        try:
+            table.delete(where)
+        except RuntimeError as error:
+            if not _is_pruned_version_error(error):
+                raise
+            logger.warning(
+                "Memory delete raced a compaction of %r; retrying on the latest "
+                "version",
+                self._collection_name,
+            )
+            latest = self._vector_store.get_raw_connection().open_table(
+                self._collection_name
+            )
+            try:
+                latest.delete(where)
+            finally:
+                _safe_close_table(latest)
 
     def delete_by_scope_dimension(self, dim_key: str, value: Any) -> MemoryResponse:
         """Bulk-delete every note stamped with dimension ``dim_key=value``.
@@ -831,7 +984,7 @@ class LanceDBMemoryStore(MemoryStore):
             )
             count = table.count_rows(where)
             if count:
-                table.delete(where)
+                self._delete_where(table, where)
             return MemoryResponse(success=True, metadata={"deleted_count": count})
         except Exception as e:
             logger.error(f"Failed to delete memories by scope dimension {dim_key}: {e}")
@@ -840,6 +993,115 @@ class LanceDBMemoryStore(MemoryStore):
                 error=f"Failed to delete memories by scope dimension: {str(e)}",
                 metadata={"deleted_count": 0},
             )
+        finally:
+            _safe_close_table(table)
+
+    def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
+        """Bulk-delete the owner's notes carrying every dimension in ``dims``.
+
+        One predicate delete: ``user_id = owner`` AND one
+        ``array_contains(scope_dims, 'key=value')`` term per dimension, the
+        same column predicates a scoped search pushes into its prefilter, so
+        the deleted set is exactly the set that scope can read. See the base
+        class for the contract.
+
+        The returned count comes from a ``count_rows`` on the same predicate
+        just before the delete (LanceDB's ``delete()`` reports only the new
+        table version), so it is best-effort under concurrent writers. Unlike
+        ``delete_by_scope_dimension`` a backend failure raises: an erasure
+        request must never be reported as done when it was not.
+
+        Deleted rows stay readable in older table versions until
+        ``compact()`` prunes them.
+        """
+        # Validate before any SQL is built: the owner is interpolated as a
+        # bare integer, which is only safe once it is known to be an ``int``.
+        validated = validate_scope_delete(owner_user_id, dims)
+        where = sql_and(
+            [
+                f"{USER_ID_COLUMN} = {owner_user_id}",
+                *(scope_dim_where_term(key, value) for key, value in validated.items()),
+            ]
+        )
+        # Narrows the type only: the owner term is always present.
+        assert where is not None
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            count = int(table.count_rows(where))
+            if count:
+                self._delete_where(table, where)
+            return count
+        finally:
+            _safe_close_table(table)
+
+    def compact(self) -> None:
+        """Physically remove deleted rows from the memories table's files.
+
+        A LanceDB delete only masks rows: their text, metadata and vectors stay
+        in the data files of the current version (behind a deletion file) and of
+        every older version, which remain readable by version checkout.
+        ``optimize()`` alone does not fix this: it only rewrites a fragment once
+        more than 10% of its rows are deleted or it can merge it with a
+        neighbouring small fragment, so a few deletes in one large compacted
+        fragment survive any number of plain optimizations. This therefore runs
+        two steps:
+
+        1. If the current version carries any deletion file, rewrite every
+           live row (a no-op ``update`` over the whole table), so no live
+           fragment still holds a soft-deleted row. Cost is O(table): it
+           rewrites all live data, vectors included. Skipped when nothing was
+           deleted since the last rewrite.
+        2. ``optimize()``: merge fragments and prune every version older than
+           ``COMPACT_VERSION_RETENTION`` together with the data files only
+           those versions reference.
+
+        Physical removal guarantee: a row deleted before one ``compact()``
+        starts is gone from disk after a later ``compact()`` started more than
+        ``COMPACT_VERSION_RETENTION`` after the first one returned (the first
+        call removes it from the current version, the later one prunes the
+        older versions still holding it). A host running this periodically
+        with an interval longer than the retention erases a deleted row within
+        two intervals.
+
+        Concurrency: explicit host call only, never on a request path, and
+        from at most one scheduler at a time (two concurrent compactions
+        conflict and one raises). Ordinary writers on any worker may run
+        concurrently. The retention is fixed rather than configurable because
+        pruning versions that a concurrent writer may still be committing
+        against is unsafe: with a short retention a concurrent delete can be
+        silently lost (it reports success but the row survives the rewrite)
+        or fail outright. The retention ages versions, not writers'
+        snapshots: when the table has been idle for longer than the retention,
+        the version a delete just opened may itself be pruned under it. The
+        store's delete paths (``delete``, ``delete_for_scope``,
+        ``delete_by_scope_dimension``) detect that failure and retry once on
+        the latest version (see ``_delete_where``); a delete that loses that
+        race twice in a row, or any other writer path, raises instead of
+        reporting success, so the row is never silently kept. Under heavy
+        write contention the rewrite can exhaust LanceDB's commit retries and
+        raise; nothing is lost, so the caller simply retries later.
+        """
+        self._compact(COMPACT_VERSION_RETENTION)
+
+    def _compact(self, cleanup_older_than: timedelta) -> None:
+        """``compact()`` with an explicit retention.
+
+        Private test hook: a retention below ``COMPACT_VERSION_RETENTION`` is
+        only safe with no concurrent writer, which production never has (see
+        ``compact()``).
+        """
+        table = self._vector_store.get_raw_connection().open_table(
+            self._collection_name
+        )
+        try:
+            # Each version's manifest summary counts the rows masked by
+            # deletion files; zero means there is nothing to materialize.
+            latest = max(table.list_versions(), key=lambda entry: entry["version"])
+            if int(latest["metadata"]["total_deletion_file_rows"]):
+                table.update(values_sql={"id": "id"})
+            table.optimize(cleanup_older_than=cleanup_older_than)
         finally:
             _safe_close_table(table)
 
@@ -1130,8 +1392,8 @@ class LanceDBMemoryStore(MemoryStore):
         newest-first to match InMemoryStore.list_all.
         """
         notes = self.search(query="", k=10000, filters=filters or None)
-        # Mirror InMemoryStore: newest first.
-        notes.sort(key=lambda n: n.timestamp, reverse=True)
+        # Mirror InMemoryStore: newest first, over naive legacy and aware rows.
+        notes.sort(key=lambda n: comparable_timestamp(n.timestamp), reverse=True)
         return notes
 
     def get_stats(self) -> dict[str, Any]:

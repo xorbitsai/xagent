@@ -4,6 +4,10 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+# The ratings a run's final answer can carry, kept on the result by the
+# execution adapter and stored in ``tasks.completion_outcome``.
+COMPLETION_OUTCOMES = frozenset({"completed", "partial", "blocked"})
+
 EXCEL_FAILURE_CODES = frozenset(
     {
         "excel_workbook_access_denied",

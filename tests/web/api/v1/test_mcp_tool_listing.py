@@ -25,7 +25,8 @@ from xagent.web.services.mcp_connector_session import (
     ConnectorToolsResult,
 )
 
-from ..conftest import client
+from ..conftest import _login, client
+from .test_management import _bearer
 from .test_mcp_servers import (
     CONNECTOR_URL,
     Holder,
@@ -527,6 +528,8 @@ def test_a_session_listing_that_finds_no_connector_is_not_found(bob, monkeypatch
 
 def test_a_session_listing_that_raises_is_a_plain_500(bob, monkeypatch, caplog):
     server_id = _seed("records", owner=bob)
+    holders = _recording_holders(monkeypatch)
+    gates = _recording_gates(monkeypatch)
 
     async def raising(db, **kwargs):
         raise RuntimeError(SECRET)
@@ -537,6 +540,8 @@ def test_a_session_listing_that_raises_is_a_plain_500(bob, monkeypatch, caplog):
         resp = _tools(bob, server_id)
 
     _error(resp, 500, "internal_error")
+    assert holders == [{}]
+    assert [g._value for g in gates] == [4]
     assert SECRET not in resp.text
     assert "RuntimeError" in caplog.text
     assert SECRET not in caplog.text
@@ -581,6 +586,18 @@ def _use_timeout(monkeypatch, seconds: float) -> None:
     monkeypatch.setattr(routes, "get_mcp_tool_init_timeout_seconds", lambda: seconds)
 
 
+def _recording_holders(monkeypatch) -> list[dict[int, int]]:
+    real = routes._v1_tool_listing_holders
+    seen: list[dict[int, int]] = []
+
+    def holders():
+        seen.append(real())
+        return seen[-1]
+
+    monkeypatch.setattr(routes, "_v1_tool_listing_holders", holders)
+    return seen
+
+
 def _recording_gates(monkeypatch) -> list[asyncio.Semaphore]:
     real = routes._v1_tool_listing_gate
     seen: list[asyncio.Semaphore] = []
@@ -607,7 +624,9 @@ def _gate_cell_web_gate_full(bob, monkeypatch):
 
 def _gate_cell_own_gate_full(bob, monkeypatch):
     monkeypatch.setattr(routes, "_v1_tool_listing_gate", lambda: asyncio.Semaphore(0))
+    monkeypatch.setattr(routes, "_TOOL_LISTING_SLOT_WAIT_SECONDS", 0.05)
     _use_timeout(monkeypatch, 1.2)
+    holders = _recording_holders(monkeypatch)
     calls = _stub_loader(monkeypatch, _loaded(_tool()))
     server_id = _seed("records", owner=bob)
 
@@ -615,19 +634,31 @@ def _gate_cell_own_gate_full(bob, monkeypatch):
 
     error = _error(resp, 429, "rate_limited")
     assert error["message"] == BUSY
-    assert resp.headers["Retry-After"] == "2"
+    assert resp.headers["Retry-After"] == "1"
+    assert holders == [{}]
     assert calls == []
 
 
-def _gate_cell_normal_call(bob, monkeypatch):
+def _normal_call(bob, monkeypatch, timeout: float) -> None:
+    _use_timeout(monkeypatch, timeout)
     gates = _recording_gates(monkeypatch)
+    holders = _recording_holders(monkeypatch)
     _stub_loader(monkeypatch, _loaded(_tool()))
     server_id = _seed("records", owner=bob)
 
     assert _tools(bob, server_id).status_code == 200
 
     assert [g._value for g in gates] == [4]
+    assert holders == [{}]
     assert routes._v1_tool_listing_loads == set()
+
+
+def _gate_cell_normal_call_with_a_deadline(bob, monkeypatch):
+    _normal_call(bob, monkeypatch, 60)
+
+
+def _gate_cell_normal_call_without_a_deadline(bob, monkeypatch):
+    _normal_call(bob, monkeypatch, 0)
 
 
 def _gate_cell_session_listing_not_found(bob, monkeypatch):
@@ -662,19 +693,23 @@ async def _cancel_a_listing(monkeypatch, timeout: float) -> dict[str, Any]:
     request = asyncio.create_task(routes._run_tool_listing(1, 1))
     await asyncio.wait_for(entered.wait(), 5)
     gate = routes._v1_tool_listing_gate()
+    holders = routes._v1_tool_listing_holders()
     state["value_while_running"] = gate._value
+    state["holders_while_running"] = dict(holders)
     request.cancel()
     with pytest.raises(asyncio.CancelledError):
         await request
     await asyncio.sleep(0)
     state["gate"] = gate
     state["value_after_cancel"] = gate._value
+    state["holders_after_cancel"] = dict(holders)
     state["loads_after_cancel"] = set(routes._v1_tool_listing_loads)
     release.set()
     if state["loads_after_cancel"]:
         await asyncio.wait_for(asyncio.wait(state["loads_after_cancel"]), 5)
     await asyncio.sleep(0)
     state["value_at_end"] = gate._value
+    state["holders_at_end"] = dict(holders)
     state["loads_at_end"] = set(routes._v1_tool_listing_loads)
     return state
 
@@ -683,9 +718,11 @@ def _gate_cell_cancelled_with_a_deadline(bob, monkeypatch):
     state = asyncio.run(_cancel_a_listing(monkeypatch, 5))
 
     assert state["value_after_cancel"] == 3
+    assert state["holders_after_cancel"] == {1: 1}
     assert state["load_cancelled"] is False
     assert len(state["loads_after_cancel"]) == 1
     assert state["value_at_end"] == 4
+    assert state["holders_at_end"] == {}
     assert state["loads_at_end"] == set()
 
 
@@ -693,8 +730,10 @@ def _gate_cell_cancelled_without_a_deadline(bob, monkeypatch):
     state = asyncio.run(_cancel_a_listing(monkeypatch, 0))
 
     assert state["value_while_running"] == 3
+    assert state["holders_while_running"] == {1: 1}
     assert state["load_cancelled"] is True
     assert state["value_after_cancel"] == 4
+    assert state["holders_after_cancel"] == {}
     assert state["loads_at_end"] == set()
 
 
@@ -716,6 +755,7 @@ async def _abandon_a_failing_listing(monkeypatch) -> dict[str, Any]:
     request = asyncio.create_task(routes._run_tool_listing(1, 1))
     await asyncio.wait_for(entered.wait(), 5)
     gate = routes._v1_tool_listing_gate()
+    holders = routes._v1_tool_listing_holders()
     request.cancel()
     with pytest.raises(asyncio.CancelledError):
         await request
@@ -726,7 +766,11 @@ async def _abandon_a_failing_listing(monkeypatch) -> dict[str, Any]:
     del loads, request
     gc.collect()
     await asyncio.sleep(0)
-    return {"unretrieved": unretrieved, "gate_value": gate._value}
+    return {
+        "unretrieved": unretrieved,
+        "gate_value": gate._value,
+        "holders": dict(holders),
+    }
 
 
 def test_an_abandoned_listing_that_fails_has_its_error_retrieved(monkeypatch):
@@ -734,6 +778,7 @@ def test_an_abandoned_listing_that_fails_has_its_error_retrieved(monkeypatch):
 
     assert state["unretrieved"] == []
     assert state["gate_value"] == 4
+    assert state["holders"] == {}
     assert routes._v1_tool_listing_loads == set()
 
 
@@ -746,6 +791,216 @@ def _gate_cell_one_gate_per_loop(bob, monkeypatch):
     assert first is not asyncio.run(gates())[0]
 
 
+def _gate_cell_one_holder_map_per_loop(bob, monkeypatch):
+    async def maps():
+        return routes._v1_tool_listing_holders(), routes._v1_tool_listing_holders()
+
+    first, again = asyncio.run(maps())
+    assert first is again
+    assert first is not asyncio.run(maps())[0]
+
+
+async def _until(condition) -> None:
+    for _ in range(1000):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the condition never became true")
+
+
+async def _hang_listings(monkeypatch) -> asyncio.Event:
+    """Make every listing wait for the returned event; timeout above 0."""
+    _use_timeout(monkeypatch, 5)
+    release = asyncio.Event()
+
+    async def hanging(server_id, user_id):
+        await release.wait()
+        return _ok_listing()
+
+    monkeypatch.setattr(routes, "_list_saved_connector_tools", hanging)
+    return release
+
+
+def _assert_busy(error: BaseException, message: str) -> None:
+    assert isinstance(error, routes.V1ApiError)
+    assert (error.code, error.http_status) == (routes.V1ErrorCode.RATE_LIMITED, 429)
+    assert error.message == message
+    assert error.headers == {"Retry-After": "5"}
+
+
+def _gate_cell_no_slot_in_time_suggests_the_real_wait(bob, monkeypatch):
+    class NoSlot:
+        async def acquire(self):
+            # What waiting for a slot raises once the wait has run out.
+            raise TimeoutError
+
+    monkeypatch.setattr(routes, "_v1_tool_listing_gate", NoSlot)
+
+    async def run():
+        holders = routes._v1_tool_listing_holders()
+        with pytest.raises(routes.V1ApiError) as raised:
+            await routes._run_tool_listing(1, 7)
+        _assert_busy(raised.value, BUSY)
+        assert holders == {}
+
+    asyncio.run(run())
+
+
+def _gate_cell_holder_full(bob, monkeypatch):
+    monkeypatch.setattr(routes, "_v1_tool_listing_holders", lambda: {bob.user_id: 2})
+    calls = _stub_loader(monkeypatch, _loaded(_tool()))
+    server_id = _seed("records", owner=bob)
+
+    resp = _tools(bob, server_id)
+
+    error = _error(resp, 429, "rate_limited")
+    assert error["message"] == (
+        "You already have 2 connector tool listings in progress, including "
+        "any whose request ended early; retry shortly."
+    )
+    assert "details" not in error
+    assert resp.headers["Retry-After"] == "5"
+    assert calls == []
+
+
+def _gate_cell_two_listings_per_holder_whatever_the_connector(bob, monkeypatch):
+    async def run():
+        release = await _hang_listings(monkeypatch)
+        holders = routes._v1_tool_listing_holders()
+        # All three start before any of them yields, so a yield between the
+        # holder check and the count would let the third one in too.
+        requests = [
+            asyncio.create_task(routes._run_tool_listing(i, 7)) for i in (1, 2, 3)
+        ]
+        await _until(requests[2].done)
+        with pytest.raises(routes.V1ApiError) as raised:
+            requests[2].result()
+        _assert_busy(
+            raised.value,
+            "You already have 2 connector tool listings in progress, including "
+            "any whose request ended early; retry shortly.",
+        )
+        assert holders == {7: 2}
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*requests[:2]), 5)
+        await asyncio.sleep(0)
+        assert holders == {}
+
+    asyncio.run(run())
+
+
+def _gate_cell_another_holder_is_not_affected(bob, monkeypatch):
+    async def run():
+        release = await _hang_listings(monkeypatch)
+        holders = routes._v1_tool_listing_holders()
+        gate = routes._v1_tool_listing_gate()
+        mine = [asyncio.create_task(routes._run_tool_listing(i, 7)) for i in (1, 2)]
+        await _until(lambda: holders == {7: 2})
+        other = asyncio.create_task(routes._run_tool_listing(1, 8))
+        await _until(lambda: holders == {7: 2, 8: 1})
+        assert gate._value == 1
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*mine, other), 5)
+        await asyncio.sleep(0)
+        assert holders == {}
+
+    asyncio.run(run())
+
+
+def _gate_cell_a_cancelled_request_keeps_its_holder_count(bob, monkeypatch):
+    async def run():
+        release = await _hang_listings(monkeypatch)
+        holders = routes._v1_tool_listing_holders()
+        requests = [asyncio.create_task(routes._run_tool_listing(i, 7)) for i in (1, 2)]
+        await _until(lambda: holders == {7: 2})
+        for request in requests:
+            request.cancel()
+        for request in requests:
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        await asyncio.sleep(0)
+        assert holders == {7: 2}
+        with pytest.raises(routes.V1ApiError) as raised:
+            await asyncio.wait_for(routes._run_tool_listing(3, 7), 1)
+        assert raised.value.http_status == 429
+        loads = set(routes._v1_tool_listing_loads)
+        release.set()
+        await asyncio.wait_for(asyncio.wait(loads), 5)
+        await asyncio.sleep(0)
+        assert holders == {}
+        assert (await routes._run_tool_listing(3, 7)) is not None
+
+    asyncio.run(run())
+
+
+def _gate_cell_a_request_cancelled_while_waiting_gives_back_its_count(bob, monkeypatch):
+    async def run():
+        _use_timeout(monkeypatch, 5)
+        full = asyncio.Semaphore(0)
+        monkeypatch.setattr(routes, "_v1_tool_listing_gate", lambda: full)
+        holders = routes._v1_tool_listing_holders()
+        request = asyncio.create_task(routes._run_tool_listing(1, 7))
+        await _until(lambda: holders == {7: 1} and bool(full._waiters))
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert holders == {}
+        assert full._value == 0
+
+    asyncio.run(run())
+
+
+def _gate_cell_a_timeout_of_zero_still_waits_a_bounded_time(bob, monkeypatch):
+    async def run():
+        _use_timeout(monkeypatch, 0)
+        monkeypatch.setattr(routes, "_TOOL_LISTING_SLOT_WAIT_SECONDS", 0.05)
+        full = asyncio.Semaphore(0)
+        monkeypatch.setattr(routes, "_v1_tool_listing_gate", lambda: full)
+        holders = routes._v1_tool_listing_holders()
+        with pytest.raises(routes.V1ApiError) as raised:
+            await asyncio.wait_for(routes._run_tool_listing(1, 7), 5)
+        assert raised.value.http_status == 429
+        assert raised.value.message == BUSY
+        assert holders == {}
+
+    asyncio.run(run())
+
+
+def _gate_cell_a_full_holder_does_not_queue_for_a_slot(bob, monkeypatch):
+    async def run():
+        _use_timeout(monkeypatch, 5)
+        monkeypatch.setattr(routes, "_TOOL_LISTING_SLOT_WAIT_SECONDS", 2)
+        full = asyncio.Semaphore(0)
+        monkeypatch.setattr(routes, "_v1_tool_listing_gate", lambda: full)
+        holders = {7: 2}
+        monkeypatch.setattr(routes, "_v1_tool_listing_holders", lambda: holders)
+        with pytest.raises(routes.V1ApiError) as raised:
+            await asyncio.wait_for(routes._run_tool_listing(1, 7), 0.5)
+        assert "already have" in raised.value.message
+        assert not full._waiters
+        assert holders == {7: 2}
+
+    asyncio.run(run())
+
+
+def _gate_cell_the_cap_counts_the_account_not_the_key(bob, monkeypatch):
+    second = client.post("/api/me/personal-keys", headers=_login("bob", "bobpass1"))
+    assert second.status_code == 200, second.text
+    other_key = _bearer(second.json()["full_key"])
+    assert other_key != bob.headers
+    holders = {bob.user_id: 2}
+    monkeypatch.setattr(routes, "_v1_tool_listing_holders", lambda: holders)
+    calls = _stub_loader(monkeypatch, _loaded(_tool()))
+    server_id = _seed("records", owner=bob)
+
+    resp = client.get(f"/v1/mcp-servers/{server_id}/tools", headers=other_key)
+
+    error = _error(resp, 429, "rate_limited")
+    assert "already have" in error["message"]
+    assert calls == []
+    assert holders == {bob.user_id: 2}
+
+
 _GATE_CELLS = {
     name.removeprefix("_gate_cell_"): fn
     for name, fn in sorted(globals().items())
@@ -755,7 +1010,7 @@ _GATE_CELLS = {
 
 @pytest.mark.parametrize("cell", list(_GATE_CELLS))
 def test_tool_listing_has_its_own_gate(bob, monkeypatch, cell):
-    assert len(_GATE_CELLS) == 7
+    assert len(_GATE_CELLS) == 18
     _GATE_CELLS[cell](bob, monkeypatch)
 
 

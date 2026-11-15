@@ -582,14 +582,24 @@ async def set_mcp_server_enabled(
 # ===== listing a connector's tools =====
 
 _V1_TOOL_LISTING_MAX_INFLIGHT = 4
+_V1_TOOL_LISTING_MAX_PER_HOLDER = 2
+_TOOL_LISTING_SLOT_WAIT_SECONDS = 5
 _TOOL_LISTING_BUSY_MESSAGE = (
     "Too many connector tool listings are running; retry shortly."
+)
+_TOOL_LISTING_HOLDER_BUSY_MESSAGE = (
+    f"You already have {_V1_TOOL_LISTING_MAX_PER_HOLDER} connector tool listings "
+    "in progress, including any whose request ended early; retry shortly."
 )
 
 # Keyed by loop, weakly, like the web connection-test gate: a semaphore binds
 # to the loop it first waits on, and a finished loop must not pin it. This gate
 # is independent of the web one, so the two never queue behind each other.
 _v1_tool_listing_gates: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+# Listings each key holder has in progress (waiting for a slot or running),
+# per loop like the gate, so the two never disagree about which loop they count.
+_v1_tool_listing_holder_counts: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, int]]" = weakref.WeakKeyDictionary()
 
 # Listings that hold a slot. The done-callback gives the slot back; this set
 # keeps the task referenced until then.
@@ -603,6 +613,29 @@ def _v1_tool_listing_gate() -> asyncio.Semaphore:
         gate = asyncio.Semaphore(_V1_TOOL_LISTING_MAX_INFLIGHT)
         _v1_tool_listing_gates[loop] = gate
     return gate
+
+
+def _v1_tool_listing_holders() -> dict[int, int]:
+    return _v1_tool_listing_holder_counts.setdefault(asyncio.get_running_loop(), {})
+
+
+def _release_holder(holders: dict[int, int], user_id: int) -> None:
+    left = holders.get(user_id, 0) - 1
+    if left > 0:
+        holders[user_id] = left
+    else:
+        holders.pop(user_id, None)
+
+
+def _busy(message: str) -> V1ApiError:
+    return V1ApiError(
+        V1ErrorCode.RATE_LIMITED,
+        429,
+        message,
+        headers={
+            "Retry-After": str(max(1, math.ceil(_TOOL_LISTING_SLOT_WAIT_SECONDS)))
+        },
+    )
 
 
 async def _list_saved_connector_tools(
@@ -639,44 +672,63 @@ def _consume_abandoned_listing(task: "asyncio.Task[Any]") -> None:
 
 
 async def _run_tool_listing(server_id: int, user_id: int) -> ConnectorToolsResult:
-    """List a saved connector's tools under this module's own concurrency cap.
+    """List a saved connector's tools under this module's own concurrency caps.
 
     * At most ``_V1_TOOL_LISTING_MAX_INFLIGHT`` listings run per event loop,
       shared by every key holder in the process.
-    * Waiting for a slot is bounded by the MCP initialization timeout; a
-      listing that cannot get one answers 429 ``rate_limited`` with a
-      ``Retry-After`` of that timeout in whole seconds.
-    * With a timeout above 0 a slot is given back when the listing returns,
-      never earlier: a cancelled request leaves the listing running. Starting
-      the connector is bounded by the initialization timeout; reading its
+    * A key holder has at most ``_V1_TOOL_LISTING_MAX_PER_HOLDER`` listings in
+      progress per event loop, counting those waiting for a slot and those
+      whose request was cancelled while the listing still runs. A request
+      beyond that answers 429 ``rate_limited`` at once.
+    * Waiting for a slot takes at most ``_TOOL_LISTING_SLOT_WAIT_SECONDS``,
+      whatever the initialization timeout; a request that gets none answers
+      429 ``rate_limited``. Both 429s carry a ``Retry-After`` of that wait in
+      whole seconds, at least 1.
+    * Once a slot is taken, both counts are given back when the listing ends,
+      never earlier. With a timeout above 0 the listing runs in the
+      background, so a cancelled request leaves it running; starting the
+      connector is bounded by the initialization timeout, and reading its
       settings before that, which can refresh an OAuth token, is not.
-    * A timeout of 0 means no deadline: wait for a slot as long as it takes
-      and await the listing directly. A client disconnect does not cancel the
-      request, so a listing that never returns keeps its slot until the
+    * With a timeout of 0 the listing runs in the request and has no deadline;
+      cancellation reaches it. A client disconnect does not cancel the
+      request, so a listing that never returns keeps both counts until the
       process stops.
     """
-    gate = _v1_tool_listing_gate()
+    # Read before anything is counted, so that once a slot is taken nothing
+    # can raise before the finally or the done-callback below gives it back.
     timeout = get_mcp_tool_init_timeout_seconds()
-    if timeout <= 0:
-        async with gate:
-            return await _list_saved_connector_tools(server_id, user_id)
+    gate = _v1_tool_listing_gate()
+    holders = _v1_tool_listing_holders()
+    # Check and count with no await in between, so two requests on this loop
+    # cannot both pass the check.
+    if holders.get(user_id, 0) >= _V1_TOOL_LISTING_MAX_PER_HOLDER:
+        raise _busy(_TOOL_LISTING_HOLDER_BUSY_MESSAGE)
+    holders[user_id] = holders.get(user_id, 0) + 1
     try:
-        await asyncio.wait_for(gate.acquire(), timeout)
-    except TimeoutError:
-        raise V1ApiError(
-            V1ErrorCode.RATE_LIMITED,
-            429,
-            _TOOL_LISTING_BUSY_MESSAGE,
-            headers={"Retry-After": str(max(1, math.ceil(timeout)))},
-        )
+        await asyncio.wait_for(gate.acquire(), _TOOL_LISTING_SLOT_WAIT_SECONDS)
+    except BaseException as exc:
+        _release_holder(holders, user_id)
+        if isinstance(exc, TimeoutError):
+            raise _busy(_TOOL_LISTING_BUSY_MESSAGE) from None
+        raise
+
+    def _give_back() -> None:
+        gate.release()
+        _release_holder(holders, user_id)
+
+    if timeout <= 0:
+        try:
+            return await _list_saved_connector_tools(server_id, user_id)
+        finally:
+            _give_back()
     load = asyncio.ensure_future(_list_saved_connector_tools(server_id, user_id))
     _v1_tool_listing_loads.add(load)
 
-    def _give_back(task: "asyncio.Task[Any]") -> None:
+    def _done(task: "asyncio.Task[Any]") -> None:
         _v1_tool_listing_loads.discard(task)
-        gate.release()
+        _give_back()
 
-    load.add_done_callback(_give_back)
+    load.add_done_callback(_done)
     try:
         await asyncio.wait({load})
     except asyncio.CancelledError:
@@ -776,15 +828,18 @@ async def list_mcp_server_tools(
 ) -> V1McpServerTools:
     """Start one of the holder's remote connectors and list its tools.
 
-    The connector is started exactly as a task would start it. The request
-    first waits for a free slot (at most one MCP initialization timeout) and
-    then lists the tools. Starting the connector takes at most one more
-    initialization timeout, plus the time to read its settings. A connector
-    the holder has switched off, one shared by the team, or one whose
-    transport is not ``streamable_http`` or ``sse`` (catalog connectors
-    included) is refused before anything starts. Authorization is done in
-    the web app: an unauthorized OAuth connector answers 409
-    ``mcp_oauth_authorization_failed``.
+    The connector is started exactly as a task would start it. Each server
+    process lets an account have at most two listings in progress at once,
+    across all of its keys and connectors and including ones whose request
+    ended early; another request answers 429 ``rate_limited`` at once.
+    Otherwise the request waits up to five seconds for a free slot, then
+    answers 429 ``rate_limited``; both carry ``Retry-After``. Starting the
+    connector takes at most one initialization timeout, plus the time to
+    read its settings. A connector the holder has switched off, one shared
+    by the team, or one whose transport is not ``streamable_http`` or
+    ``sse`` (catalog connectors included) is refused before anything
+    starts. Authorization is done in the web app: an unauthorized OAuth
+    connector answers 409 ``mcp_oauth_authorization_failed``.
     """
     user, _key = authed
     user_id = int(user.id)

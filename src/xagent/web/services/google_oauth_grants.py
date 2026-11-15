@@ -28,6 +28,11 @@ from .user_oauth import (
 )
 
 GOOGLE_SHARED_OAUTH_PROVIDER = "google"
+# ``UserOAuth.oauth_provider`` of every row holding Google-issued tokens: the
+# Google ``OAuthProvider.provider_name``. Same value as the shared row's key
+# above, but a different fact -- the issuer, not the app key a row is stored
+# under -- so legacy app rows (``gmail``, a custom ``acme-mail``) record it too.
+GOOGLE_OAUTH_ISSUER = "google"
 
 
 class GoogleOAuthGrantConflict(ValueError):
@@ -248,6 +253,14 @@ def _connected_google_apps_covered_by_bare_account(
 def _copy_shared_google_credentials(
     source: UserOAuth, target: UserOAuth, *, preserve_missing_refresh: bool
 ) -> None:
+    """Mirror a shared Google credential's token material onto ``target``.
+
+    ``source`` is always a shared Google credential, so whatever ``target``
+    held before, the tokens it holds afterwards were issued by Google: the
+    issuer is stamped as a fact rather than copied, which also repairs a
+    mirror whose issuer the backfill left unknown.
+    """
+    setattr(target, "oauth_provider", GOOGLE_OAUTH_ISSUER)
     for field in (
         "access_token",
         "refresh_token",
@@ -680,6 +693,7 @@ def write_google_shared_oauth_callback(
             candidate = UserOAuth(
                 user_id=int(user_id),
                 provider=GOOGLE_SHARED_OAUTH_PROVIDER,
+                oauth_provider=GOOGLE_OAUTH_ISSUER,
                 resource_owner_key=owner_key,
                 provider_user_id=subject,
                 access_token=access_token,
@@ -747,6 +761,9 @@ def write_google_shared_oauth_callback(
     scope_value = " ".join(sorted(scopes))
 
     for account in (shared_account, legacy_oauth_account):
+        # Both rows now hold the tokens Google issued to this callback; an
+        # adopted pre-rollout bare row may still carry a NULL issuer.
+        setattr(account, "oauth_provider", GOOGLE_OAUTH_ISSUER)
         setattr(account, "provider_user_id", subject)
         setattr(account, "access_token", access_token)
         setattr(account, "refresh_token", resolved_refresh_token)
@@ -801,6 +818,7 @@ def write_google_shared_oauth_callback(
             sibling_legacy = UserOAuth(
                 user_id=int(user_id),
                 provider=sibling_app_id,
+                oauth_provider=GOOGLE_OAUTH_ISSUER,
                 resource_owner_key=owner_key,
                 provider_user_id=subject,
                 access_token=access_token,

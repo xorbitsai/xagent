@@ -2721,6 +2721,37 @@ class TestComposioReconcileConfig:
             assert get_composio_reconcile_interval_seconds() is None
 
 
+class TestComposioMissingAccountConfig:
+    """How often grants whose Composio account is gone are cleared."""
+
+    def test_on_by_default(self, monkeypatch):
+        from xagent.config import get_composio_missing_account_interval_seconds
+
+        monkeypatch.delenv(
+            "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", raising=False
+        )
+        assert get_composio_missing_account_interval_seconds() == 3600
+        monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", " ")
+        assert get_composio_missing_account_interval_seconds() == 3600
+
+    def test_zero_turns_it_off(self, monkeypatch):
+        from xagent.config import get_composio_missing_account_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", "0")
+        assert get_composio_missing_account_interval_seconds() == 0
+
+    def test_a_set_interval_has_a_floor(self, monkeypatch):
+        from xagent.config import get_composio_missing_account_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", "900")
+        assert get_composio_missing_account_interval_seconds() == 900
+        for invalid in ("5", "hourly", "-1"):
+            monkeypatch.setenv(
+                "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", invalid
+            )
+            assert get_composio_missing_account_interval_seconds() == 3600
+
+
 class TestTaskCleanupRetryConfig:
     """Config for retrying the external cleanup a task deletion owes (#2587)."""
 

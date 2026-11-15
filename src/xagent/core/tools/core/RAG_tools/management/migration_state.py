@@ -19,6 +19,7 @@ from typing import (
     Iterable,
     Iterator,
     Optional,
+    Set,
     TypeVar,
     Union,
     cast,
@@ -26,11 +27,20 @@ from typing import (
 
 import pyarrow as pa  # type: ignore
 
+from xagent.core.utils.blocking import run_blocking
+
 from ..core.exceptions import CollectionMigratingError
 from ..LanceDB.schema_manager import _safe_close_table
 from ..storage.factory import get_metadata_store
 from ..utils.lancedb_query_utils import list_table_names
 from ..utils.string_utils import escape_lancedb_string
+from .write_leases import (
+    LeaseLostError,
+    LeaseSet,
+    acquire_lease,
+    acquire_lease_async,
+    release_leases_async,
+)
 
 MIGRATION_TABLE = "collection_migration_state"
 IDLE = "idle"
@@ -47,6 +57,14 @@ _ADMITTED: ContextVar[frozenset[str]] = ContextVar(
 _PENDING: ContextVar[frozenset[str]] = ContextVar(
     "kb_pending_collections", default=frozenset()
 )
+# (collection, lease_id) pairs this operation already holds, and the set that
+# renews and releases them when the operation ends.
+_LEASES: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
+    "kb_write_leases", default=()
+)
+# Every enclosing lease scope, innermost last: a nested scope must not hide a
+# lease the outer one lost.
+_LEASE_SETS: ContextVar[tuple[LeaseSet, ...]] = ContextVar("kb_lease_sets", default=())
 
 _SCHEMA = pa.schema(
     [
@@ -212,6 +230,165 @@ def clear_migration_state(collection_name: str) -> None:
         _safe_close_table(table)
 
 
+def verify_active_leases(collection: Optional[str] = None) -> None:
+    """Raise when any lease set in this operation is broken.
+
+    Long writers call this at their commit points: a lease the migration has
+    already seen expire means the migration may have started its window, so the
+    operation must stop instead of writing behind it. Every enclosing set is
+    checked, so a nested scope cannot hide a lease the outer one lost.
+    """
+    sets = _LEASE_SETS.get()
+    if not sets:
+        return
+    if collection is not None and not holds_lease(collection):
+        raise CollectionMigratingError(
+            "No write lease is held for this collection; the operation must stop",
+            details={"collection": collection},
+        )
+    try:
+        for item in sets:
+            item.verify()
+    except LeaseLostError as exc:
+        raise CollectionMigratingError(
+            "Knowledge base write lease was lost; the operation must stop",
+            details={"collection": collection, "error": str(exc)},
+        ) from exc
+
+
+def holds_lease(collection: str) -> bool:
+    """Whether this scope already holds ``collection``'s lease."""
+    return any(name == collection for name, _ in _LEASES.get())
+
+
+def _push_scope(lease_set: LeaseSet) -> Any:
+    return _LEASE_SETS.set(_LEASE_SETS.get() + (lease_set,))
+
+
+def _current_set() -> Optional[LeaseSet]:
+    sets = _LEASE_SETS.get()
+    return sets[-1] if sets else None
+
+
+def _verify_enclosing() -> None:
+    """Refuse to start a nested scope inside an already-broken one."""
+    for item in _LEASE_SETS.get():
+        try:
+            item.verify()
+        except LeaseLostError as exc:
+            raise CollectionMigratingError(
+                "Knowledge base write lease was lost before this step",
+                details={"error": str(exc)},
+            ) from exc
+
+
+@contextmanager
+def _lease_scope(*, store: Optional[Any] = None) -> Iterator[LeaseSet]:
+    """The one place a scope is opened: push the set, reset it, release it."""
+    _verify_enclosing()
+    lease_set = LeaseSet(store=store)
+    sets_token = _push_scope(lease_set)
+    leases_token = _LEASES.set(_LEASES.get())
+    try:
+        yield lease_set
+    finally:
+        _LEASE_SETS.reset(sets_token)
+        _LEASES.reset(leases_token)
+        lease_set.release()
+
+
+@asynccontextmanager
+async def _lease_scope_async(*, store: Optional[Any] = None) -> AsyncIterator[LeaseSet]:
+    """``_lease_scope`` for event-loop callers: neither join nor I/O on the loop."""
+    _verify_enclosing()
+    lease_set = LeaseSet(store=store)
+    sets_token = _push_scope(lease_set)
+    leases_token = _LEASES.set(_LEASES.get())
+    try:
+        yield lease_set
+    finally:
+        _LEASE_SETS.reset(sets_token)
+        _LEASES.reset(leases_token)
+        # Stopping the heartbeat must not wait on an await: a second cancel
+        # would leave it renewing a row nobody releases.
+        lease_set.begin_stop()
+        ids = lease_set.lease_ids
+        try:
+            await asyncio.shield(run_blocking(lease_set.stop))
+        finally:
+            await asyncio.shield(_release_tracked(ids, store))
+
+
+def _take_lease(name: str, operation: str, store: Optional[Any]) -> None:
+    """Take ``name``'s lease unless an enclosing scope already holds it."""
+    if holds_lease(name):
+        # A second lease would be a second heartbeat whose loss the outer scope
+        # never sees; reuse what the outer scope already keeps alive.
+        return
+    _record_lease(name, acquire_lease(name, operation, store=store))
+
+
+async def _take_lease_async(name: str, operation: str, store: Optional[Any]) -> None:
+    if holds_lease(name):
+        return
+    task = asyncio.ensure_future(acquire_lease_async(name, operation, store=store))
+    try:
+        lease_id = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The insert may land after the cancel; release whatever it produced so
+        # the row cannot delay a migration for a full TTL.
+        task.add_done_callback(functools.partial(_release_after_cancel, store=store))
+        raise
+    _record_lease(name, lease_id)
+
+
+# Releases still in flight: the loop keeps only a weak reference to a task.
+_RELEASE_TASKS: Set["asyncio.Future[Any]"] = set()
+
+
+def _release_tracked(ids: Iterable[str], store: Optional[Any]) -> "asyncio.Future[Any]":
+    task = asyncio.ensure_future(release_leases_async(list(ids), store=store))
+    _RELEASE_TASKS.add(task)
+    task.add_done_callback(_RELEASE_TASKS.discard)
+    return task
+
+
+def _release_after_cancel(
+    task: "asyncio.Future[str]", store: Optional[Any] = None
+) -> None:
+    if task.cancelled() or task.exception() is not None:
+        return
+    try:
+        _release_tracked([task.result()], store)
+    except RuntimeError:  # pragma: no cover - loop gone with the request
+        logger.warning("No loop to release lease %s after cancellation", task.result())
+
+
+@asynccontextmanager
+async def holding_leases(
+    *names: str, operation: str, store: Optional[Any] = None
+) -> AsyncIterator[LeaseSet]:
+    """Lease collections for a long operation that starts outside a request scope.
+
+    The coordinator's delete and rename paths do their work after a guard that
+    returned immediately, so they hold nothing the freeze can see. They wrap
+    their whole body in this instead, and the leases then cover every write.
+    """
+    async with _lease_scope_async(store=store) as lease_set:
+        for name in dict.fromkeys(names):
+            await _take_lease_async(name, operation, store)
+        yield lease_set
+
+
+@contextmanager
+def leased_collections(*names: str, operation: str) -> Iterator[LeaseSet]:
+    """Sync counterpart of :func:`holding_leases`."""
+    with _lease_scope() as lease_set:
+        for name in dict.fromkeys(names):
+            _take_lease(name, operation, store=None)
+        yield lease_set
+
+
 def _admit(collection: str) -> None:
     _ADMITTED.set(_ADMITTED.get() | {collection})
 
@@ -220,30 +397,75 @@ def _is_admitted(collection: str) -> bool:
     return collection in _ADMITTED.get()
 
 
+def _record_lease(collection: str, lease_id: str) -> None:
+    _LEASES.set(_LEASES.get() + ((collection, lease_id),))
+    lease_set = _current_set()
+    if lease_set is not None:
+        lease_set.add(lease_id)
+
+
+def _lease_for_guard(collection: str, *, store: Optional[Any] = None) -> None:
+    """Take the operation's lease before the freeze read, when one is due."""
+    if collection not in _PENDING.get() or holds_lease(collection):
+        return
+    _record_lease(collection, acquire_lease(collection, "write-guard", store=store))
+
+
+async def _lease_for_guard_async(
+    collection: str, *, store: Optional[Any] = None
+) -> None:
+    if collection not in _PENDING.get() or holds_lease(collection):
+        return
+    await _take_lease_async(collection, "write-guard", store)
+
+
 @contextmanager
 def pending_collection(*collections: str) -> Iterator[None]:
     """Open a scope whose first guard call per collection decides its admission."""
     token = _PENDING.set(_PENDING.get() | set(collections))
     admitted_token = _ADMITTED.set(_ADMITTED.get())
-    try:
-        yield
-    finally:
-        _ADMITTED.reset(admitted_token)
-        _PENDING.reset(token)
+    with _lease_scope():
+        try:
+            yield
+        finally:
+            _ADMITTED.reset(admitted_token)
+            _PENDING.reset(token)
+
+
+@asynccontextmanager
+async def pending_collection_async(*collections: str) -> AsyncIterator[None]:
+    """``pending_collection`` for event-loop callers, releasing off the loop."""
+    token = _PENDING.set(_PENDING.get() | set(collections))
+    admitted_token = _ADMITTED.set(_ADMITTED.get())
+    async with _lease_scope_async():
+        try:
+            yield
+        finally:
+            _ADMITTED.reset(admitted_token)
+            _PENDING.reset(token)
 
 
 @asynccontextmanager
 async def admitted_async(collection: str) -> AsyncIterator[None]:
-    """Check the freeze and mark the collection admitted for this scope."""
+    """Check the freeze and mark the collection admitted for this scope.
+
+    The lease goes in first: an operation that finds the collection frozen has
+    already been visible to the migration, which is what closes the gap between
+    checking and freezing.
+    """
     if _is_admitted(collection):
         yield
         return
-    await ensure_collection_writable_async(collection)
-    token = _ADMITTED.set(_ADMITTED.get() | {collection})
-    try:
-        yield
-    finally:
-        _ADMITTED.reset(token)
+    async with _lease_scope_async():
+        await _take_lease_async(collection, "admitted_async", None)
+        await ensure_collection_writable_async(collection)
+        # Taken after the guard: resetting restores the post-guard state, so an
+        # admission the guard granted to the enclosing pending scope survives.
+        admitted_token = _ADMITTED.set(_ADMITTED.get() | {collection})
+        try:
+            yield
+        finally:
+            _ADMITTED.reset(admitted_token)
 
 
 async def admitted_context_async(collection: str) -> Context:
@@ -279,7 +501,7 @@ def admits_collection(
             names = _as_names(get_name(*args, **kwargs))
             if not names:
                 return await func(*args, **kwargs)
-            with pending_collection(*names):
+            async with pending_collection_async(*names):
                 return await func(*args, **kwargs)
 
         return cast(F, wrapper)
@@ -332,6 +554,7 @@ def ensure_collection_writable(
     """Raise before a write when the collection is frozen for migration."""
     if _is_admitted(collection_name):
         return
+    _lease_for_guard(collection_name, store=store)
     _raise_if_frozen(collection_name, read_migration_state(collection_name, store))
     if collection_name in _PENDING.get():
         _ADMITTED.set(_ADMITTED.get() | {collection_name})
@@ -343,6 +566,7 @@ async def ensure_collection_writable_async(
     """Async guard: runs the blocking state read off the event loop."""
     if _is_admitted(collection_name):
         return
+    await _lease_for_guard_async(collection_name, store=store)
     state = await asyncio.to_thread(read_migration_state, collection_name, store)
     _raise_if_frozen(collection_name, state)
     if collection_name in _PENDING.get():

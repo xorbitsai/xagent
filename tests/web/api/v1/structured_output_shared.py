@@ -7,14 +7,17 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import event
 
+from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import get_engine
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.services.task_auto_resume import TerminalView
 
 from ..conftest import _admin_headers, _direct_db_session, client
 
@@ -56,6 +59,7 @@ def insert_task(
     error: str | None = None,
     title: str = "structured output task",
     moment: datetime | None = None,
+    completion_outcome: str | None = None,
 ) -> int:
     """One SDK task row, with its structured output record and agent_config."""
     db = _direct_db_session()
@@ -74,6 +78,7 @@ def insert_task(
             run_id=run_id,
             agent_config=agent_config,
             error_message=error,
+            completion_outcome=completion_outcome,
         )
         if moment is not None:
             task.created_at = moment
@@ -115,6 +120,22 @@ def task_selects(statements: list[str]) -> list[str]:
 
 
 FORMAT_CONFIG = {"response_format": {"type": "json_schema", "name": "answer"}}
+
+
+def stored_format_config(**switch: bool) -> dict[str, Any]:
+    """The agent_config of a task whose stored format is complete, with the
+    accept_partial switch stored as given (not stored when not given)."""
+    return {
+        "response_format": {
+            "type": "json_schema",
+            "name": "answer",
+            "schema": {"type": "object", "properties": {}},
+            "description": None,
+            **switch,
+        }
+    }
+
+
 MOMENT = datetime(2026, 11, 1, 8, 30, tzinfo=timezone.utc)
 RECORD = {
     "run_id": "run-1",
@@ -140,3 +161,55 @@ BASELINE_TASKS: list[dict[str, Any]] = [
     {"status": TaskStatus.COMPLETED, "output": "\u00e9 \u4e2d\u6587 \U0001f600"},
 ]
 NEW_KEYS = ("structured_output", "structured_output_status", "structured_output_reason")
+
+# The keys of a GET task response and of a task.completed frame for a task
+# without accept_partial, in order.
+TODAY_TASK_INFO_KEYS = (
+    "task_id",
+    "agent_id",
+    "workforce_id",
+    "status",
+    "run_id",
+    "state_version",
+    "control_state",
+    "input",
+    "output",
+    "error",
+    "error_code",
+    "created_at",
+    "completed_at",
+    "pending_interaction",
+    *NEW_KEYS,
+)
+TODAY_COMPLETED_FRAME_KEYS = ("status", "output", "error", "error_code", *NEW_KEYS)
+
+SWITCH_OFF_CONFIGS = {
+    "no-format": None,
+    "no-switch": stored_format_config(),
+    "switch-false": stored_format_config(accept_partial=False),
+}
+SWITCH_ON_CONFIG = stored_format_config(accept_partial=True)
+TERMINAL_VIEW = TerminalView(
+    state="stopped", error="stopped", stopped_at=MOMENT, reason="x"
+)
+
+# (id, rating stored on the row, snapshot changes that make the effective state)
+EFFECTIVE_STATES = [
+    ("completed-completed", "completed", {}),
+    ("completed-partial", "partial", {}),
+    ("completed-blocked", "blocked", {}),
+    ("completed-unrated", None, {}),
+    ("pending", "partial", {"start_queued": True}),
+    ("failed-view", "partial", {"view": TERMINAL_VIEW}),
+]
+
+
+def with_snapshot(monkeypatch, **changes) -> None:
+    """Make the v1 task snapshot reader return the row's snapshot with
+    ``changes`` applied."""
+    real = v1_tasks._load_task_info_snapshot
+    monkeypatch.setattr(
+        v1_tasks,
+        "_load_task_info_snapshot",
+        lambda task_id, principal: replace(real(task_id, principal), **changes),
+    )

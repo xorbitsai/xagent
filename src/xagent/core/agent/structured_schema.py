@@ -1221,7 +1221,11 @@ class Incomplete:
     """A value with gaps. ``missing_fields`` lists the positions with nothing
     written and ``unexpressible_fields`` those marked as not writable, each at
     most ``MAX_LISTED_FIELDS`` long and in document order, with the true totals
-    in the counts. No output is kept."""
+    in the counts. With ``keep_output``, ``output`` holds the value with null
+    at every gap, unless the root is a gap or the value is over a size limit
+    (``output_dropped``); otherwise it is None. ``output_bytes`` is the
+    canonical JSON size of that value (also set when it was dropped for size),
+    0 when ``keep_output`` is off or the root is a gap."""
 
     missing_fields: list[str]
     unexpressible_fields: list[str]
@@ -1230,6 +1234,9 @@ class Incomplete:
     blank_as_null_count: int
     r1_steps: int
     expansion_nodes: int
+    output: Any = None
+    output_bytes: int = 0
+    output_dropped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1433,7 +1440,11 @@ def _copy_template(compiled: CompiledSchema, index: int) -> dict[str, Any]:
 
 
 def _decide(
-    compiled: CompiledSchema, reduced: Any, steps: int, blanks: int
+    compiled: CompiledSchema,
+    reduced: Any,
+    steps: int,
+    blanks: int,
+    keep_output: bool = False,
 ) -> Ready | Incomplete | TooComplex:
     """Turn a reduced tree into the output and the lists of gaps, then decide
     the status. An empty position is null when its node is nullable, an object
@@ -1441,11 +1452,14 @@ def _decide(
     one, and a gap otherwise; a marker is a position that cannot be written.
     The canonical JSON size of the output is added up position by position, a
     template counting for its precomputed size, so the output is never
-    serialized."""
+    serialized. With ``keep_output`` an :class:`Incomplete` also carries the
+    output, whose gaps are null, when it fits the size limits of a
+    :class:`Ready` (each gap position adds the 4 bytes of its null)."""
     nodes = compiled.nodes
     missing: list[str] = []
     unexpressible: list[str] = []
     missing_count = unexpressible_count = expansion_nodes = output_bytes = 0
+    gap_positions = 0
     holder: list[Any] = [None]
     slots: list[tuple[Any, Any, int]] = []
     work: list[tuple[int, Any, Any, Any, Any]] = [
@@ -1460,6 +1474,7 @@ def _decide(
                 continue
             if node.kind == "object":
                 if node.missing_total:
+                    gap_positions += 1
                     missing_count += node.missing_total
                     if len(missing) < MAX_LISTED_FIELDS:
                         prefix = _pointer_of(link)
@@ -1475,10 +1490,12 @@ def _decide(
                 parent[key] = node.single
                 output_bytes += node.single_bytes
             else:
+                gap_positions += 1
                 missing_count += 1
                 if len(missing) < MAX_LISTED_FIELDS:
                     missing.append(_pointer_of(link))
         elif item is _UNEXPRESSIBLE:
+            gap_positions += 1
             unexpressible_count += 1
             if len(unexpressible) < MAX_LISTED_FIELDS:
                 unexpressible.append(_pointer_of(link))
@@ -1513,6 +1530,21 @@ def _decide(
             parent[key] = value
             output_bytes += _scalar_bytes(value)
     if missing_count or unexpressible_count:
+        kept: Any = None
+        kept_bytes = 0
+        dropped = False
+        # A root that is a gap leaves no value to keep, so nothing is dropped.
+        if keep_output and holder[0] is not None:
+            kept_bytes = output_bytes + 4 * gap_positions
+            if (
+                steps + expansion_nodes > MAX_JUDGED_STEPS
+                or kept_bytes > MAX_RESULT_BYTES
+            ):
+                dropped = True
+            else:
+                for target, key, index in slots:
+                    target[key] = _copy_template(compiled, index)
+                kept = holder[0]
         return Incomplete(
             missing_fields=missing,
             unexpressible_fields=unexpressible,
@@ -1521,6 +1553,9 @@ def _decide(
             blank_as_null_count=blanks,
             r1_steps=steps,
             expansion_nodes=expansion_nodes,
+            output=kept,
+            output_bytes=kept_bytes,
+            output_dropped=dropped,
         )
     if steps + expansion_nodes > MAX_JUDGED_STEPS or output_bytes > MAX_RESULT_BYTES:
         return TooComplex("r4", steps, expansion_nodes, output_bytes)
@@ -1538,7 +1573,7 @@ def _decide(
 
 
 def judge_instance(
-    compiled: CompiledSchema, instance: Any
+    compiled: CompiledSchema, instance: Any, *, keep_output: bool = False
 ) -> Ready | Incomplete | Err | TooComplex:
     """Judge the value a model wrote against the caller's schema.
 
@@ -1548,12 +1583,14 @@ def judge_instance(
     holds its only allowed value, and a list is empty when it has items and all
     are empty. What each empty position stands for, and whether the result is
     :class:`Ready`, :class:`Incomplete` or :class:`TooComplex`, follows from
-    the compiled nodes. A NaN, an infinity, or a string holding U+0000 or a
-    surrogate code point is an :class:`Err` with rule ``type`` as a value
-    anywhere in the instance, since none of them can be stored as JSON (unless
-    the string also holds the marker, which is reported as ``marker``); in an
-    object key such a character makes the key an extra property, reported as
-    ``extra_property``. The instance must hold
+    the compiled nodes. ``keep_output`` only makes an :class:`Incomplete` carry
+    the value with null at each gap; it changes no other result. A NaN, an
+    infinity, or a string holding U+0000 or a surrogate code point is an
+    :class:`Err` with rule ``type`` as a value anywhere in the instance, since
+    none of them can be stored as JSON (unless the string also holds the
+    marker, which is reported as ``marker``); in an object key such a character
+    makes the key an extra property, reported as ``extra_property``. The
+    instance must hold
     no integer too long for the interpreter to turn into text (``str`` raises
     ``ValueError`` past the interpreter's digit limit, 4300 by default). An
     integer decoded from JSON text under that limit never is, because the
@@ -1564,7 +1601,7 @@ def judge_instance(
         reduced, steps, blanks = _reduce(compiled.nodes, compiled.root, instance)
     except _Stop as stop:
         return stop.verdict
-    return _decide(compiled, reduced, steps, blanks)
+    return _decide(compiled, reduced, steps, blanks, keep_output)
 
 
 def judge_empty_answer(compiled: CompiledSchema) -> Ready | Incomplete | TooComplex:

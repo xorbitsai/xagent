@@ -109,6 +109,12 @@ class V1ErrorCode(str, Enum):
     # Template id is unknown or unavailable to the caller.
     TEMPLATE_NOT_FOUND = "template_not_found"
 
+    # The agent is manageable by the caller but has no runtime key with the
+    # requested id. 404 -- distinct from agent_not_found so SDK clients can
+    # tell "bad key id" from "bad agent id". A key bound to another agent or
+    # to a workforce is reported the same way as an id that does not exist.
+    API_KEY_NOT_FOUND = "api_key_not_found"
+
     # No skill the key holder can see has this name (GET), or the name does
     # not address a personal skill the holder owns (PUT / DELETE). 404.
     SKILL_NOT_FOUND = "skill_not_found"
@@ -128,7 +134,8 @@ class V1ErrorCode(str, Enum):
     INVALID_INPUT = "invalid_input"
 
     # Emitted when a caller exceeds the v1 SSE stream concurrency caps
-    # (per-task or per-principal), or when no MCP tool-listing slot frees up.
+    # (per-task or per-principal), or the MCP tool-listing caps (per key holder,
+    # or no shared slot frees up in time).
     RATE_LIMITED = "rate_limited"
 
     # Monthly execution quota exhausted. 402 Payment Required. Two distinct
@@ -146,6 +153,15 @@ class V1ErrorCode(str, Enum):
     AUTO_MODEL_UNAVAILABLE = "auto_model_unavailable"
 
     CONNECTOR_NOT_FOUND = "connector_not_found"
+
+    # A team agent would select connectors its team cannot use. 400.
+    # ``details.connectors`` lists each one as ``{"name", "reason"}`` with
+    # ``reason`` one of ``not_shared``, ``disabled`` or ``unresolved``.
+    CONNECTOR_NOT_SHARED = "connector_not_shared"
+
+    # The agent has never had its tools chosen and uses the default tool
+    # set, so there is no selection to read connectors from or replace. 409.
+    AGENT_TOOLS_UNCONFIGURED = "agent_tools_unconfigured"
 
     # The connector's transport is not one the API can create, change or list
     # tools for (only ``streamable_http`` and ``sse``). 400.
@@ -216,6 +232,14 @@ class V1ErrorCode(str, Enum):
     # current run (pending / paused / completed normally / failed). 409.
     TASK_NOT_WAITING = "task_not_waiting"
 
+    # ``POST /v1/chat/tasks/{id}/cancel`` was called on a task that already
+    # ended without being cancelled (completed, or failed on its own), or
+    # whose run the cancel was aimed at ended while the cancel was being
+    # applied and another turn took its place. 409,
+    # not retryable -- a task that can be cancelled later answers
+    # ``task_busy`` instead.
+    TASK_NOT_CANCELLABLE = "task_not_cancellable"
+
     # A reply's saved progress could not be read due to a transient
     # infrastructure failure. 503, retryable -- distinct from
     # ``interaction_not_resumable`` (which means resuming can never
@@ -266,6 +290,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
         "This task's conversation was removed under the retention policy."
     ),
     V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
+    V1ErrorCode.API_KEY_NOT_FOUND: "API key not found for this agent.",
     V1ErrorCode.SKILL_NOT_FOUND: "Skill not found.",
     V1ErrorCode.SKILL_ALREADY_EXISTS: "A skill with this name already exists.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
@@ -278,6 +303,12 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
     V1ErrorCode.AUTO_MODEL_UNAVAILABLE: CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE,
     V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.CONNECTOR_NOT_SHARED: (
+        "The agent would select connectors its team cannot use."
+    ),
+    V1ErrorCode.AGENT_TOOLS_UNCONFIGURED: (
+        "This agent uses the default tool set; choose its tools in the web app first."
+    ),
     V1ErrorCode.TRANSPORT_NOT_SUPPORTED: (
         "Only the streamable_http and sse transports are supported through the API."
     ),
@@ -320,6 +351,9 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     ),
     V1ErrorCode.TASK_NOT_WAITING: (
         "This task is not waiting for an answer to a question."
+    ),
+    V1ErrorCode.TASK_NOT_CANCELLABLE: (
+        "This task has already ended and cannot be cancelled."
     ),
     V1ErrorCode.REPLY_OUTCOME_UNKNOWN: (
         "Reply was accepted but its outcome is not yet known. "

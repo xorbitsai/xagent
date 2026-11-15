@@ -11,7 +11,9 @@ import re
 import secrets
 import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
 from urllib.parse import urlparse
 
@@ -128,7 +130,19 @@ from ..services.auth_email import (
     send_email_changed_notice,
     send_password_reset_email,
 )
-from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.db_runtime import (
+    await_task_settlement,
+    propagate_deferred_cancellation,
+    run_db_io_cancellation_safe,
+)
+from ..services.oauth_revocation_fences import (
+    close_oauth_revocation_fence,
+    lock_oauth_revocation_fence,
+    oauth_revocation_call_allowed,
+    oauth_revocation_fence_is_open,
+    oauth_revocation_fence_refuses,
+    open_oauth_revocation_fence,
+)
 from ..services.oauth_state_claims import claim_oauth_state
 from ..services.trigger_rate_limit import remote_ip_from_request
 from ..services.user_oauth import (
@@ -3063,6 +3077,7 @@ def generic_oauth_login(
     db_provider: Optional[Any] = None,
     account: Optional[str] = None,
     force_google_consent: bool = False,
+    auth_backend: str | None = None,
 ) -> Any:
     """Start ordinary OAuth with a per-state browser-binding cookie."""
     return _generic_oauth_login(
@@ -3077,6 +3092,7 @@ def generic_oauth_login(
         actor_flow_nonce=None,
         account=account,
         force_google_consent=force_google_consent,
+        auth_backend=auth_backend,
     )
 
 
@@ -3682,12 +3698,90 @@ def _revoke_github_oauth_grant(
         )
 
 
+_GOOGLE_OAUTH_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+# OAuth providers whose grants a disconnect revokes provider-side (see
+# revoke_resolved_builtin_oauth_grant); their callbacks honor the revocation
+# fence.
+BUILTIN_OAUTH_REVOCATION_PROVIDERS = frozenset({"github", "google"})
+
+
+def _revoke_google_oauth_token(
+    token: str, *, kind: Literal["refresh_token", "access_token"]
+) -> None:
+    """Best-effort revoke of one Google OAuth grant through one of its tokens.
+
+    Google's revoke endpoint takes either token of a grant and revokes the
+    whole grant: revoking a refresh token invalidates every access token
+    issued from it, and revoking an access token also revokes its refresh
+    token. The grant is per Google account and OAuth client, not per token,
+    so this also cuts off every other token this deployment holds for the
+    same Google account -- which is why callers must clear
+    :func:`has_other_builtin_oauth_reference` first. Afterwards the next
+    authorize request shows Google's consent screen again, and the old
+    tokens are rejected by Google immediately. ``kind`` names which of the
+    grant's tokens ``token`` is, only to tell the outcomes apart in the log.
+
+    The token goes in the form body, never the query string, so it can't
+    end up in a proxy's or Google's request log. The endpoint needs no
+    client authentication.
+
+    Never raises, for the same reason and with the same exception-logging
+    shape as :func:`_revoke_github_oauth_grant`: this runs after the local
+    disconnect has already committed. Deployments that restrict outbound
+    traffic must allow oauth2.googleapis.com, which token refresh already
+    needs.
+    """
+    try:
+        response = requests.post(
+            _GOOGLE_OAUTH_REVOKE_URL,
+            data={"token": token},
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Google OAuth token revocation request failed (exception_type=%s)",
+            type(exc).__name__,
+        )
+        return
+    # 200: revoked. 400 ``invalid_token`` on a refresh token: Google already
+    # considers the grant gone (revoked, or never valid) -- also a successful
+    # outcome. The same answer on an access token only says that token
+    # expired: the grant behind it may still be alive, and nothing here can
+    # revoke it, so that is logged rather than treated as done. Every other
+    # answer, including any other 400, is a genuine (still non-raising)
+    # failure.
+    if response.status_code == 200:
+        logger.info("Google OAuth grant revoked")
+    elif response.status_code == 400 and "invalid_token" in response.text:
+        if kind == "access_token":
+            logger.info(
+                "Google OAuth grant not revoked: its access token was rejected "
+                "as invalid or expired and no refresh token was stored"
+            )
+    else:
+        logger.warning(
+            "Google OAuth token revocation returned unexpected status %s",
+            response.status_code,
+        )
+
+
 class BuiltinOAuthRevocation(NamedTuple):
     """Everything needed to revoke one builtin OAuth grant after its local
     ``UserOAuth`` row has already been deleted and committed, plus the
     upstream identity (``provider_user_id``) needed to check whether another
     local connection still needs that same grant alive -- see
     :func:`has_other_builtin_oauth_reference`.
+
+    ``provider`` is the OAuth provider that issued the grant (``github`` or
+    ``google``) -- the row's recorded ``UserOAuth.oauth_provider`` -- not the
+    ``UserOAuth.provider`` key the row was stored under: a Google grant is
+    stored under its app id (``gmail``, ``google-drive``, a custom app id) or
+    the bare ``google`` key. ``client_id``/``client_secret``
+    authenticate GitHub's grant-delete call; Google's revoke endpoint is
+    unauthenticated, so they are empty for Google. ``refresh_token`` is only
+    used for Google, where it is the token revoked whenever it is present:
+    an access token may already have expired, and Google rejects an expired
+    access token without revoking the grant behind it.
     """
 
     provider: str
@@ -3695,40 +3789,99 @@ class BuiltinOAuthRevocation(NamedTuple):
     client_id: str
     client_secret: str
     provider_user_id: str | None
+    refresh_token: str | None = None
 
     def __repr__(self) -> str:
-        # The default NamedTuple repr would print access_token/client_secret
+        # The default NamedTuple repr would print the tokens/client_secret
         # in plain text -- a stray logger.debug(revocation) or an
         # uncaught-exception traceback that includes this value as a local
-        # variable must not leak either one.
+        # variable must not leak any of them.
         return (
             f"BuiltinOAuthRevocation(provider={self.provider!r}, "
             f"access_token=<redacted>, client_id={self.client_id!r}, "
             f"client_secret=<redacted>, "
-            f"provider_user_id={self.provider_user_id!r})"
+            f"provider_user_id={self.provider_user_id!r}, "
+            f"refresh_token=<redacted>)"
         )
 
 
 def resolve_builtin_oauth_revocation(
     db: Session,
     *,
-    provider: str,
+    oauth_provider: str | None,
     access_token: str,
     provider_user_id: str | None,
+    refresh_token: str | None = None,
+    token_type: str | None = None,
 ) -> BuiltinOAuthRevocation | None:
     """Resolve one deleted ``UserOAuth`` row into a network-free revocation
     record, decrypting the stored client_id/secret the same way
     generic_oauth_login/generic_oauth_callback already do for this row.
 
-    Returns ``None`` when there's nothing to revoke -- an unsupported
-    provider, an empty token, no configured provider row, or a missing
-    secret -- so callers can skip revocation outright. Only reads the
+    ``oauth_provider`` is the row's recorded issuer
+    (``UserOAuth.oauth_provider``), so a Gmail, Drive or custom-app row whose
+    tokens Google issued resolves to a Google revocation whatever the catalog
+    says about its app today: an admin may since have deleted the app,
+    retargeted its ``provider_name``, or re-created the same id for another
+    provider, none of which changes who issued the stored tokens. The catalog
+    is never consulted for the issuer.
+
+    ``oauth_provider=None`` on a native row means the issuer is unknown (a
+    row the backfill migration could not prove). That outcome is explicit:
+    a warning is logged and ``None`` is returned, so the row is never
+    revoked against a guessed provider -- failing closed leaves a grant
+    alive rather than sending a token to the wrong issuer. A caller that
+    must tell "issuer unknown" apart from "nothing to revoke" reads the
+    row's ``oauth_provider`` itself before calling. Pass the row's
+    ``refresh_token`` and
+    ``token_type`` too: Google revokes through the refresh token, and a
+    Composio-backed row (``token_type == COMPOSIO_TOKEN_TYPE``) holds a
+    Composio connected-account id rather than a provider token -- its grant
+    belongs to Composio's own OAuth app and is removed by deleting that
+    account (``delete_scoped_user_oauth_accounts``), never here.
+
+    A Google row with no recorded ``provider_user_id`` (legacy rows) is never
+    revoked: Google revokes the account's whole grant for this client, and
+    without the upstream identity nothing can prove that no other
+    connection -- the same user's Drive, another user's Gmail -- still
+    relies on that grant.
+
+    Returns ``None`` when there's nothing to revoke -- a Composio-backed row,
+    an unknown issuer, a provider with no revoke implementation (only GitHub
+    and Google have one), a Google row without an upstream identity, an
+    empty token, no configured provider row, or a missing secret -- so
+    callers can skip revocation outright. Only reads the
     database and makes no network call, so it is safe to call while still
     holding a disconnect transaction's locks; do the actual provider call
     (:func:`revoke_builtin_oauth_grant_if_unreferenced`) only after that
     commits.
     """
-    if provider != "github" or not access_token:
+    if token_type == COMPOSIO_TOKEN_TYPE:
+        return None
+    if oauth_provider is None:
+        logger.warning(
+            "Skipping OAuth grant revocation: the connection recorded no "
+            "issuing provider, so it cannot be revoked without guessing"
+        )
+        return None
+    if oauth_provider == "google":
+        if not (refresh_token or access_token):
+            return None
+        if provider_user_id is None:
+            logger.info(
+                "Skipping Google OAuth grant revocation: the connection "
+                "recorded no Google account id"
+            )
+            return None
+        return BuiltinOAuthRevocation(
+            provider="google",
+            access_token=access_token,
+            client_id="",
+            client_secret="",
+            provider_user_id=provider_user_id,
+            refresh_token=refresh_token or None,
+        )
+    if oauth_provider != "github" or not access_token:
         return None
     from ..models.oauth_provider import OAuthProvider
 
@@ -3773,17 +3926,74 @@ def resolve_builtin_oauth_revocation(
     )
 
 
+def snapshot_builtin_oauth_revocations(
+    db: Session, accounts: Iterable[UserOAuth]
+) -> list[BuiltinOAuthRevocation]:
+    """Resolve the revocation of every loaded ``UserOAuth`` row a disconnect
+    is about to delete (see :func:`resolve_builtin_oauth_revocation`).
+
+    Must run before the delete -- a bulk delete never loads rows, and an
+    orphan cleanup deletes rows the caller never selected -- so this is the
+    only chance to read their tokens. Only reads the database; the caller
+    revokes after its own commit through :func:`revoke_builtin_oauth_grants`.
+    """
+    resolved = []
+    for account in accounts:
+        if not account.access_token:
+            continue
+        snapshot = resolve_builtin_oauth_revocation(
+            db,
+            oauth_provider=cast(str | None, account.oauth_provider),
+            access_token=str(account.access_token),
+            # is not None, not a truthy check: an empty-string
+            # provider_user_id is still a real (if unlikely) identity value,
+            # and coercing it to None here would silently disable
+            # has_other_builtin_oauth_reference's cross-user protection --
+            # only an actual NULL column means "no known identity".
+            provider_user_id=(
+                str(account.provider_user_id)
+                if account.provider_user_id is not None
+                else None
+            ),
+            refresh_token=cast(str | None, account.refresh_token),
+            token_type=cast(str | None, account.token_type),
+        )
+        if snapshot is not None:
+            resolved.append(snapshot)
+    return resolved
+
+
 def has_other_builtin_oauth_reference(
     db: Session, *, provider: str, provider_user_id: str | None
 ) -> bool:
     """True if any current ``UserOAuth`` row -- any local user, any owner
-    namespace -- still points at the same upstream (provider,
-    provider_user_id) identity.
+    namespace, any app key -- still points at the same upstream
+    (provider, provider_user_id) identity.
 
-    GitHub's grant-delete revokes every token issued to that GitHub
-    account for this OAuth App, not just the one this disconnect deleted --
-    a different XAgent user (or actor namespace) connected to the *same*
+    ``provider`` is the OAuth provider (``BuiltinOAuthRevocation.provider``),
+    matched against each row's recorded issuer (``UserOAuth.oauth_provider``),
+    never against the catalog: a row stays a reference after an admin
+    deletes or retargets the app it was connected through. A native row
+    whose issuer is unknown (NULL) counts as well, because nothing can prove
+    it was not issued by ``provider``; that keeps a revoke from cutting off a
+    connection the backfill could not classify. GitHub's grant-delete revokes
+    every token issued to that GitHub account for this OAuth App, and
+    Google's revoke revokes the account's whole grant for this OAuth client,
+    not just the one token this disconnect deleted -- a different XAgent
+    user (or actor namespace), or a sibling app sharing the client (Drive
+    still connected while Gmail disconnects), connected to the *same*
     upstream account would silently lose their own, still-active token.
+    Composio-backed rows don't count: they hold a Composio connected-account
+    id for a grant issued to Composio's OAuth app, which a revoke through
+    this deployment's own client never touches. For Google, every row with
+    no recorded ``provider_user_id`` (legacy rows) counts too, whichever
+    user or owner namespace holds it: it may be a connection to the very
+    Google account whose whole grant this revoke would kill -- the same
+    user's Gmail, or another xagent user's -- and nothing can prove it
+    isn't. That keeps Google revocation off while any such row survives,
+    which is the safe failure: a grant left alive, never another
+    connection cut off.
+
     This must be checked with a fresh read taken as late as possible (right
     before the network call, never at snapshot/pre-commit time): the row
     that matters may not exist yet when the disconnect that triggered this
@@ -3814,17 +4024,45 @@ def has_other_builtin_oauth_reference(
     why: a cancelled request's ``db.close()`` can otherwise race a worker
     thread still mid-query on that same Session).
     """
+    return bool(
+        _builtin_oauth_references(
+            db, provider=provider, provider_user_id=provider_user_id
+        )
+    )
+
+
+def _builtin_oauth_references(
+    db: Session, *, provider: str, provider_user_id: str | None
+) -> list[UserOAuth]:
+    """The live rows :func:`has_other_builtin_oauth_reference` counts, so a
+    caller can tell *why* a revoke is blocked: rows recording the same
+    account, and -- for Google only -- rows recording no account at all.
+    Either kind must have been issued by ``provider`` or have an unknown
+    issuer."""
     if not provider_user_id:
-        return False
+        return []
+    same_identity = UserOAuth.provider_user_id == provider_user_id
+    if provider == "google":
+        same_identity = or_(
+            same_identity,
+            UserOAuth.provider_user_id.is_(None),
+        )
     candidates = (
         db.query(UserOAuth)
         .filter(
-            UserOAuth.provider == provider,
-            UserOAuth.provider_user_id == provider_user_id,
+            or_(
+                UserOAuth.oauth_provider == provider,
+                UserOAuth.oauth_provider.is_(None),
+            ),
+            same_identity,
+            or_(
+                UserOAuth.token_type.is_(None),
+                UserOAuth.token_type != COMPOSIO_TOKEN_TYPE,
+            ),
         )
         .all()
     )
-    return any(candidate.access_token for candidate in candidates)
+    return [candidate for candidate in candidates if candidate.access_token]
 
 
 def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:
@@ -3856,8 +4094,154 @@ def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> No
     )
 
 
+def revoke_resolved_builtin_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:
+    """Database-free provider call for one already-resolved revocation,
+    dispatched on the provider that issued it.
+
+    Google revokes through the refresh token when the row had one, else the
+    access token (see :func:`_revoke_google_oauth_token`); GitHub goes
+    through :func:`revoke_resolved_github_oauth_grant`. A provider with no
+    revoke implementation is logged and skipped -- it can only come from a
+    hand-built record, never from :func:`resolve_builtin_oauth_revocation`.
+    Same contract as that function: no Session, never raises, and the caller
+    must already have cleared :func:`has_other_builtin_oauth_reference`.
+    """
+    match revocation.provider:
+        case "google" if revocation.refresh_token:
+            _revoke_google_oauth_token(revocation.refresh_token, kind="refresh_token")
+        case "google":
+            _revoke_google_oauth_token(revocation.access_token, kind="access_token")
+        case "github":
+            revoke_resolved_github_oauth_grant(revocation)
+        case _:
+            logger.warning(
+                "Skipping OAuth grant revocation: no revoke implementation for "
+                "provider %r",
+                revocation.provider,
+            )
+
+
+class _RevocationClaim(NamedTuple):
+    """A revocation cleared to reach its provider.
+
+    ``deadline`` is the fence deadline its provider call must start well
+    before (see ``services.oauth_revocation_fences``); ``None`` for a row
+    with no recorded upstream account, which has neither a reference check
+    nor a fence to hold.
+    """
+
+    deadline: datetime | None
+
+
+def _claim_builtin_oauth_revocation(
+    db: Session, revocation: BuiltinOAuthRevocation, *, context: str
+) -> _RevocationClaim | None:
+    """Reference-check one revocation under its upstream account's fence and,
+    when nothing references the account any more, open the fence.
+
+    The fence row stays locked from before the reference check until this
+    commits, and an OAuth callback for the same account takes the same lock
+    before storing its credentials. So a callback either committed first and
+    the reference check sees its row, or it finds the opened fence and is
+    refused instead of storing tokens this revoke may kill. A revoker that
+    finds the fence already open (another revocation of the account is in
+    flight, or only just ended) skips too: that call revokes the same grant,
+    and a second holder closing the fence early could let a reconnect
+    through. Returns ``None`` when the revoke must not go ahead. Commits
+    ``db``; raises on database failure.
+
+    ``context`` names the disconnect path in the skip log lines.
+    """
+    if revocation.provider_user_id is None:
+        return _RevocationClaim(deadline=None)
+    fence = lock_oauth_revocation_fence(
+        db,
+        provider=revocation.provider,
+        provider_user_id=revocation.provider_user_id,
+    )
+    references = _builtin_oauth_references(
+        db,
+        provider=revocation.provider,
+        provider_user_id=revocation.provider_user_id,
+    )
+    if references:
+        # Decided before the commit, which expires the loaded rows.
+        only_unidentified = all(row.provider_user_id is None for row in references)
+        db.commit()
+        # Once an unidentified legacy Google row exists, every Google revoke
+        # is skipped (see has_other_builtin_oauth_reference), so say which
+        # rule fired for operators wondering why grants linger.
+        logger.info(
+            "Skipping %s OAuth grant revocation (%s): %s",
+            revocation.provider,
+            context,
+            "a legacy connection with no recorded account id may share this grant"
+            if only_unidentified
+            else "another local connection still references this account",
+        )
+        return None
+    if oauth_revocation_fence_is_open(fence):
+        db.commit()
+        logger.info(
+            "Skipping %s OAuth grant revocation (%s): another revocation of "
+            "this account is in flight",
+            revocation.provider,
+            context,
+        )
+        return None
+    deadline = open_oauth_revocation_fence(fence)
+    db.commit()
+    return _RevocationClaim(deadline=deadline)
+
+
+def _claimed_revocation_may_call(
+    revocation: BuiltinOAuthRevocation, claim: _RevocationClaim
+) -> bool:
+    """Whether the provider call can still start safely inside the fence."""
+    if claim.deadline is None or oauth_revocation_call_allowed(claim.deadline):
+        return True
+    logger.warning(
+        "Skipping %s OAuth grant revocation: it was delayed past its fence",
+        revocation.provider,
+    )
+    return False
+
+
+def _release_builtin_oauth_revocation(
+    db: Session, revocation: BuiltinOAuthRevocation, claim: _RevocationClaim
+) -> None:
+    """Close the fence once the provider call is over, so a reconnect whose
+    exchange starts from now on (past the close margin) is accepted. Commits
+    ``db``.
+
+    Never raises: it runs in ``finally`` blocks, where an exception would
+    replace a propagating cancellation. A failed release leaves the deadline
+    in place, which only delays reconnects until it lapses.
+    """
+    if claim.deadline is None or revocation.provider_user_id is None:
+        return
+    try:
+        close_oauth_revocation_fence(
+            db,
+            provider=revocation.provider,
+            provider_user_id=revocation.provider_user_id,
+            deadline=claim.deadline,
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "%s OAuth revocation fence release failed (exception_type=%s)",
+            revocation.provider,
+            type(exc).__name__,
+        )
+
+
 def revoke_builtin_oauth_grant_if_unreferenced(
-    db: Session, revocation: BuiltinOAuthRevocation
+    db: Session,
+    revocation: BuiltinOAuthRevocation,
+    *,
+    context: str = "synchronous disconnect",
 ) -> None:
     """Best-effort provider-side revoke of one already-resolved builtin
     OAuth grant, skipped if another local connection (any owner, any user)
@@ -3865,55 +4249,54 @@ def revoke_builtin_oauth_grant_if_unreferenced(
 
     Must run strictly after the disconnect that produced ``revocation`` has
     committed: the reference check is a fresh read of current ``UserOAuth``
-    rows (see :func:`has_other_builtin_oauth_reference` for exactly what
-    that does and does not make safe). Never raises: unlike
-    :func:`revoke_resolved_github_oauth_grant`, the reference check here
-    does real database work that can fail (a dropped connection, a pool
-    timeout), and this function -- not just its network-only half --
-    promises never to raise, so that failure is caught here too, rolling
-    the session back first so a caller that keeps using ``db`` afterward
-    doesn't inherit a transaction Postgres has already poisoned.
+    rows, taken under the account's revocation fence (see
+    :func:`_claim_builtin_oauth_revocation`). Commits ``db``. Never raises:
+    unlike :func:`revoke_resolved_builtin_oauth_grant`, the fence and the
+    reference check do real database work that can fail (a dropped
+    connection, a pool timeout), and this function -- not just its
+    network-only half -- promises never to raise, so that failure is caught
+    here too, rolling the session back first so a caller that keeps using
+    ``db`` afterward doesn't inherit a transaction Postgres has already
+    poisoned. ``context`` names the disconnect path in the skip log lines.
 
-    For a fully synchronous caller only (Toby's disconnect path, via
-    :func:`revoke_builtin_oauth_grant`, and this module's own tests): the
-    Session it does real query work on is ``db``, the caller's own, on
-    whatever thread the caller itself is already running on. An async
-    caller must NOT hand this whole function to ``asyncio.to_thread`` with
-    its request-scoped session -- see :func:`has_other_builtin_oauth_reference`
-    and :func:`revoke_resolved_github_oauth_grant` for the safe async shape.
+    For a fully synchronous caller only (:func:`revoke_builtin_oauth_grant`
+    and this module's own tests): the Session it does real query work on is
+    ``db``, the caller's own, on whatever thread the caller itself is
+    already running on. An async caller must NOT hand this whole function to
+    ``asyncio.to_thread`` with its request-scoped session -- see
+    :func:`revoke_builtin_oauth_grants` for the safe async shape.
     """
     try:
-        if has_other_builtin_oauth_reference(
-            db,
-            provider=revocation.provider,
-            provider_user_id=revocation.provider_user_id,
-        ):
-            logger.info(
-                "Skipping GitHub OAuth grant revocation: another local "
-                "connection still references this account"
-            )
-            return
+        claim = _claim_builtin_oauth_revocation(db, revocation, context=context)
     except Exception as exc:
         db.rollback()
         logger.warning(
-            "GitHub OAuth grant reference check failed (exception_type=%s)",
+            "%s OAuth grant reference check failed (exception_type=%s)",
+            revocation.provider,
             type(exc).__name__,
         )
         return
-    revoke_resolved_github_oauth_grant(revocation)
+    if claim is None:
+        return
+    if _claimed_revocation_may_call(revocation, claim):
+        revoke_resolved_builtin_oauth_grant(revocation)
+    _release_builtin_oauth_revocation(db, revocation, claim)
 
 
 def revoke_builtin_oauth_grant(
     db: Session,
     *,
-    provider: str,
+    oauth_provider: str | None,
     access_token: str,
     provider_user_id: str | None,
+    refresh_token: str | None = None,
+    token_type: str | None = None,
 ) -> None:
     """Best-effort provider-side revoke of one deleted ``UserOAuth`` row.
 
-    Called after the local disconnect has committed. Only GitHub is
-    implemented today (see :func:`_revoke_github_oauth_grant`); every other
+    Called after the local disconnect has committed. Only GitHub (see
+    :func:`_revoke_github_oauth_grant`) and Google (see
+    :func:`_revoke_google_oauth_token`) are implemented today; every other
     provider is a deliberate no-op here -- add a branch as each provider's
     own "silently reuses an existing grant" behavior needs the same fix.
     Never raises. A fully synchronous convenience wrapper around
@@ -3922,13 +4305,16 @@ def revoke_builtin_oauth_grant(
     already run off the event loop (e.g. inside ``anyio.to_thread.run_sync``);
     an async caller should call those two directly instead, so credential
     resolution can happen before its commit and the reference check plus
-    network call after.
+    network call after. No production disconnect path calls it today: the
+    async endpoints use :func:`revoke_builtin_oauth_grants`.
     """
     resolved = resolve_builtin_oauth_revocation(
         db,
-        provider=provider,
+        oauth_provider=oauth_provider,
         access_token=access_token,
         provider_user_id=provider_user_id,
+        refresh_token=refresh_token,
+        token_type=token_type,
     )
     if resolved is None:
         return
@@ -3945,33 +4331,42 @@ async def revoke_builtin_oauth_grants(
     The single shared implementation for every async disconnect endpoint
     (mcp.py's ``delete_mcp_server`` and ``teardown_mcp_app_server``,
     cloud_storage.py's ``delete_connected_account``) -- so the
-    reference-check-then-revoke sequence, and its cancellation-safety
-    shape, has exactly one place to get right instead of being copied at
-    each call site. Each entry's reference check
-    (:func:`has_other_builtin_oauth_reference`) runs synchronously on the
-    event loop against the caller's own ``db`` -- never via
-    ``asyncio.to_thread``, per that function's own docstring -- and only
-    the resulting network call is offloaded. Never raises: a dead network,
-    a still-live sibling reference, or a failed reference-check query must
-    not turn an already-successful local disconnect into a failed request.
+    fence-check-revoke sequence, and its cancellation-safety shape, has
+    exactly one place to get right instead of being copied at each call
+    site. Each entry's fence and reference check
+    (:func:`_claim_builtin_oauth_revocation`) run synchronously on the event
+    loop against the caller's own ``db`` -- never via ``asyncio.to_thread``,
+    per :func:`has_other_builtin_oauth_reference`'s docstring -- and only
+    the resulting network call is offloaded. Commits ``db``. Never raises: a
+    dead network, a still-live sibling reference, or a failed database step
+    must not turn an already-successful local disconnect into a failed
+    request.
 
     ``context`` is folded into the warning log line so a failure can be
-    traced back to which disconnect path it came from.
+    traced back to which disconnect path it came from. Identical records --
+    one row snapshotted by two cleanup steps of the same disconnect -- are
+    revoked once. A cancelled request still finishes its in-flight provider
+    call and closes its fence before the cancellation propagates.
     """
-    for revocation in revocations:
+    for revocation in dict.fromkeys(revocations):
         try:
-            if has_other_builtin_oauth_reference(
-                db,
-                provider=revocation.provider,
-                provider_user_id=revocation.provider_user_id,
-            ):
-                logger.info(
-                    "Skipping GitHub OAuth grant revocation (%s): another "
-                    "local connection still references this account",
-                    context,
-                )
+            claim = _claim_builtin_oauth_revocation(db, revocation, context=context)
+            if claim is None:
                 continue
-            await asyncio.to_thread(revoke_resolved_github_oauth_grant, revocation)
+            try:
+                if _claimed_revocation_may_call(revocation, claim):
+                    # Drained, not abandoned, when this task is cancelled:
+                    # the fence may only close once the provider call has
+                    # really ended, never while its thread is still in flight.
+                    await run_db_io_cancellation_safe(
+                        partial(revoke_resolved_builtin_oauth_grant, revocation)
+                    )
+            finally:
+                # Also on cancellation (which is no ``Exception``): the call
+                # is over by now, and a fence left open would refuse
+                # reconnects for the rest of its deadline. Synchronous and
+                # non-raising, so cancellation still propagates after it.
+                _release_builtin_oauth_revocation(db, revocation, claim)
         except Exception:
             db.rollback()
             logger.warning("Builtin OAuth grant revocation failed (%s)", context)
@@ -3993,11 +4388,12 @@ def _generic_oauth_login(
     force_google_consent: bool = False,
     auth_backend: str | None = None,
 ) -> Any:
-    """Build an ordinary or trusted actor provider authorization redirect.
+    """Build a native, ordinary Composio, or trusted actor OAuth redirect.
 
     ``auth_backend`` is ``None`` for a native start, or Composio's backend for
-    an actor start of an app that goes through Composio. Any other value is a
-    programming error and raises ``ValueError`` before anything is read.
+    a start of an app that goes through Composio, actor or ordinary. Any other
+    value is a programming error and raises ``ValueError`` before anything is
+    read.
     """
     from .. import composio_auth
 
@@ -4006,25 +4402,28 @@ def _generic_oauth_login(
     # Every native-only rule below (our client id, the Google gates, shared
     # grants) keys on this one flag (#3649).
     native_start = auth_backend is None
+    composio_ordinary = not native_start and actor_flow_nonce is None
     if db is None:
         raise RuntimeError("db session is required")
-    if not db_provider:
-        return HTMLResponse(
-            content="<h1>Error: Provider not configured</h1>", status_code=500
-        )
-
-    client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
-    # A Composio start keeps only this start's state: Composio's own app
-    # authorizes, so our client id is never sent (composio_auth). The one
-    # later reader, Google shared-grant mode below, never takes a Composio
-    # start (#3649).
-    if not client_id and native_start:
-        return _oauth_provider_config_error(
-            provider, [_oauth_env_name(provider, "CLIENT_ID")]
-        )
-    auth_url = db_provider.auth_url
-
-    redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+    if native_start:
+        if not db_provider:
+            return HTMLResponse(
+                content="<h1>Error: Provider not configured</h1>", status_code=500
+            )
+        client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
+        if not client_id:
+            return _oauth_provider_config_error(
+                provider, [_oauth_env_name(provider, "CLIENT_ID")]
+            )
+        auth_url = db_provider.auth_url
+        redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
+        default_scopes = db_provider.default_scopes
+    else:
+        # A Composio start keeps only the state; the URL built here is discarded.
+        client_id = ""
+        auth_url = ""
+        redirect_uri = ""
+        default_scopes = None
 
     user_id = trusted_user_id
     session_epoch: str | None = trusted_session_epoch
@@ -4040,8 +4439,7 @@ def _generic_oauth_login(
             status_code=401,
         )
 
-    # Only the actor start passes ``auth_backend``, and only for an app that
-    # goes through Composio, whose start never reaches Google (see above).
+    # A Composio start never reaches Google, so this gate is native-only.
     if native_start and (error_response := _google_gmail_error(provider, app_id)):
         return error_response
 
@@ -4110,6 +4508,12 @@ def _generic_oauth_login(
             browser_state_nonce.encode("ascii")
         ).hexdigest()
         state_payload["browser_nonce_hash"] = browser_nonce_hash
+    if composio_ordinary:
+        # The one-time claim and flow row an actor flow spends, without the
+        # owner claim that would make the callback read it as an actor flow.
+        assert browser_nonce_hash is not None
+        state_payload["actor_flow_nonce"] = browser_nonce_hash
+        state_payload[composio_auth.AUTH_BACKEND_CLAIM] = auth_backend
     if bound_account is not None:
         state_payload["oauth_account"] = bound_account
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
@@ -4209,9 +4613,7 @@ def _generic_oauth_login(
                 app_scopes = app_info["oauth_scopes"]
             app_optional_scopes = app_info.get("optional_oauth_scopes") or []
 
-    scopes, scope_str = _merged_oauth_scopes(
-        db_provider.default_scopes, app_scopes, provider
-    )
+    scopes, scope_str = _merged_oauth_scopes(default_scopes, app_scopes, provider)
     # Sent via the authorize request's own optional_scope parameter (see
     # get_builtin_execution_fields_and_optional_scopes) rather than merged
     # into `scopes` above: a scope tier-gated on the connected account's
@@ -4291,7 +4693,7 @@ def _generic_oauth_login(
 
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
-    from urllib.parse import urlencode
+    from urllib.parse import urlencode, urlsplit
 
     params = {
         "response_type": "code",
@@ -4360,24 +4762,46 @@ def _generic_oauth_login(
         if optional_scope_str:
             params["optional_scope"] = optional_scope_str
 
-    separator = "&" if "?" in auth_url else "?"
-    full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
-    response = RedirectResponse(full_auth_url)
+    cookie_secure: bool
+    cookie_path: str = "/"
+    if composio_ordinary:
+        assert browser_nonce_hash is not None
+        callback_url = composio_auth.shared_callback_url(
+            db,
+            db_provider
+            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+            else None,
+        )
+        response = RedirectResponse(composio_auth.begin_location(callback_url, state))
+        cookie_secure, cookie_path = _oauth_cookie_scope_for(callback_url)
+        # Committed before the redirect returns: the browser follows it at
+        # once. Begin only checks this row; the verify or denied trip spends it.
+        db.add(
+            ActorOAuthFlowState(
+                nonce=browser_nonce_hash,
+                expires_at=datetime.now(timezone.utc) + _ACTOR_OAUTH_FLOW_TTL,
+            )
+        )
+        db.commit()
+    else:
+        separator = "&" if "?" in auth_url else "?"
+        full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
+        response = RedirectResponse(full_auth_url)
+        cookie_secure = urlsplit(redirect_uri).scheme.lower() == "https"
+        # Match the callback URL's transport, rather than an environment
+        # label. Development can run behind HTTPS and production can be
+        # reached over HTTP during local health checks; the cookie must
+        # follow the browser-visible OAuth origin.
     if browser_state_nonce is not None:
-        from urllib.parse import urlsplit
-
         assert browser_nonce_hash is not None
         response.set_cookie(
             _ordinary_oauth_cookie_name(browser_nonce_hash),
             browser_state_nonce,
             max_age=600,
             httponly=True,
-            # Match the callback URL's transport, rather than an environment
-            # label. Development can run behind HTTPS and production can be
-            # reached over HTTP during local health checks; the cookie must
-            # follow the browser-visible OAuth origin.
-            secure=urlsplit(redirect_uri).scheme.lower() == "https",
+            secure=cookie_secure,
             samesite="lax",
+            path=cookie_path,
         )
     return response
 
@@ -5161,6 +5585,10 @@ def generic_oauth_callback(
             # The client secret and code go only to the bound account host.
             post_kwargs["allow_redirects"] = False
 
+        # Before the exchange: a grant revocation for this upstream account
+        # that may reach the provider after this point would kill the tokens
+        # the exchange is about to be issued (see the fence check below).
+        exchange_started_at = datetime.now(timezone.utc)
         token_response = requests.post(
             token_url,
             headers=headers,
@@ -5764,6 +6192,42 @@ def generic_oauth_callback(
                 return HTMLResponse(
                     content="<h1>Error: Invalid or expired state</h1>", status_code=400
                 )
+            # A disconnect of the same upstream account may have revoked its
+            # whole grant after this exchange started, killing these tokens.
+            # The fence lock is held until this callback commits, so a
+            # revocation that has not opened it yet will see this
+            # credential in its reference check instead.
+            if (
+                provider.lower() in BUILTIN_OAUTH_REVOCATION_PROVIDERS
+                and provider_user_id
+                and oauth_revocation_fence_refuses(
+                    lock_oauth_revocation_fence(
+                        db,
+                        provider=provider.lower(),
+                        provider_user_id=str(provider_user_id),
+                    ),
+                    exchange_started_at=exchange_started_at,
+                )
+            ):
+                db.rollback()
+                rejection_reason = "grant_revoked_during_exchange"
+                _log_oauth_callback_rejection(
+                    provider,
+                    rejection_reason,
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
+                if is_actor_flow:
+                    return _actor_oauth_flow_rejected_response(rejection_reason)
+                return HTMLResponse(
+                    content=(
+                        "<h1>Connection interrupted</h1>"
+                        f"<p>This {html.escape(provider)} account was being "
+                        "disconnected while you connected it. Please connect "
+                        "again.</p>"
+                    ),
+                    status_code=409,
+                )
             google_shared_scopes_claim = payload.get("google_shared_scopes")
             google_shared_state = bool(
                 provider.lower() == "google"
@@ -5963,6 +6427,12 @@ def generic_oauth_callback(
                 "provider_user_id",
                 str(provider_user_id) if provider_user_id else None,
             )
+            # The issuer of the tokens written below is the provider whose
+            # route served this callback (an ``OAuthProvider.provider_name``),
+            # whatever app key the row is stored under. Recorded on every
+            # write, new or revived row alike, so a later revocation never
+            # has to infer it from the mutable catalog.
+            setattr(oauth_account, "oauth_provider", provider)
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
@@ -6315,15 +6785,30 @@ def oauth_login(
     db: Session = Depends(get_db),
 ) -> Any:
     """In-process adapter; never expose its token argument as an HTTP query."""
+    from .. import composio_auth
     from ..models.oauth_provider import OAuthProvider
 
+    composio_app = composio_auth.composio_web_app(provider, app_id)
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
-    if not db_provider:
+    if db_provider is None and composio_app is None:
         return HTMLResponse(
             content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
             status_code=400,
+        )
+    if composio_app is not None:
+        if (refusal := composio_auth.start_preflight(composio_app.app_id)) is not None:
+            return refusal
+        return generic_oauth_login(
+            provider,
+            token,
+            app_id,
+            redirect,
+            db,
+            db_provider,
+            account=account,
+            auth_backend=composio_auth.AUTH_BACKEND,
         )
 
     # But now everything can be routed through generic
@@ -6434,13 +6919,21 @@ def redeem_oauth_launch(
             "Invalid or expired authorization ticket",
             headers=_OAUTH_LAUNCH_HEADERS,
         )
+    from .. import composio_auth
     from ..models.oauth_provider import OAuthProvider
 
+    composio_app = composio_auth.composio_web_app(provider, options.app_id)
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
-    if db_provider is None:
+    if db_provider is None and composio_app is None:
         raise HTTPException(400, "Unsupported provider", headers=_OAUTH_LAUNCH_HEADERS)
+    if (
+        composio_app is not None
+        and (refusal := composio_auth.start_preflight(composio_app.app_id)) is not None
+    ):
+        refusal.headers.update(_OAUTH_LAUNCH_HEADERS)
+        return refusal
     response = _generic_oauth_login(
         provider,
         token=None,
@@ -6453,6 +6946,7 @@ def redeem_oauth_launch(
         resource_owner_key=None,
         actor_flow_nonce=None,
         account=options.account,
+        auth_backend=(composio_auth.AUTH_BACKEND if composio_app is not None else None),
     )
     response.headers.update(_OAUTH_LAUNCH_HEADERS)
     return response
@@ -6495,14 +6989,29 @@ def start_oauth_authorization(
         raise HTTPException(
             400, "Invalid authorization options", headers=private_headers
         ) from None
+    from .. import composio_auth
+
+    composio_app = composio_auth.composio_web_app(provider, payload.app_id)
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
-    if db_provider is None:
+    if db_provider is None and composio_app is None:
         raise HTTPException(
             status_code=400, detail="Unsupported provider", headers=private_headers
         )
-    callback = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    if composio_app is not None:
+        if (refusal := composio_auth.start_preflight(composio_app.app_id)) is not None:
+            refusal.headers.update(private_headers)
+            return refusal
+        callback_url = composio_auth.shared_callback_url(
+            db,
+            db_provider
+            if provider.lower() == composio_auth.DEFAULT_CALLBACK_PROVIDER
+            else None,
+        )
+    else:
+        callback_url = _resolve_oauth_redirect_uri(provider, db_provider)
+    callback = urlparse(callback_url)
     if (
         callback.scheme not in {"http", "https"}
         or not callback.netloc

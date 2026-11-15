@@ -5,8 +5,10 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import inspect
 import json
 import logging
+import textwrap
 import tracemalloc
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ import pytest
 
 from tests.shared.structured_path_reference import reference_render
 from xagent.core.agent.structured_output import StructuredOutputFormat
+from xagent.core.agent.structured_schema import json_kind
 from xagent.web.services import response_format
 from xagent.web.services.response_format import (
     CLEAR,
@@ -42,7 +45,7 @@ CORPUS_PATH = (
 CORPUS = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
 
 # Changing the corpus means changing this digest in the same commit.
-CORPUS_SHA256 = "5f8ef162f956483be8d2d5e32a40c9ae0765b61bdee3ea5dff1748201cbdbe9d"
+CORPUS_SHA256 = "a5ba545a1031f39ec50a1232350c7ee6c2be9ac383acd1e81b376ae4cf49139c"
 
 SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -56,7 +59,7 @@ EXPECTED_TEXTS = {
     "N2": 'type must be "text" or "json_schema".',
     "N3": (
         "A response_format may only have the key type, "
-        'plus json_schema when type is "json_schema".'
+        'plus json_schema and accept_partial when type is "json_schema".'
     ),
     "N4": (
         "json_schema must be an object with a schema key and no keys other "
@@ -72,6 +75,7 @@ EXPECTED_TEXTS = {
         "non-strict structured output is not supported."
     ),
     "N8": "Structured output is not supported for workforce keys.",
+    "N9": "accept_partial, when present, must be true or false.",
     "S1": (
         "The schema must be JSON of at most 16384 bytes, with no NaN or "
         "Infinity, no NUL or surrogate characters, and no excessively "
@@ -153,9 +157,9 @@ def _expected_message(rule: str, path: str) -> str:
 # --- the message --------------------------------------------------------------
 
 
-def test_the_rule_texts_are_the_twenty_two_published_sentences() -> None:
+def test_the_rule_texts_are_the_twenty_three_published_sentences() -> None:
     assert RULE_TEXTS == EXPECTED_TEXTS
-    assert len(RULE_TEXTS) == 22
+    assert len(RULE_TEXTS) == 23
 
 
 def test_a_message_names_the_rule_the_place_and_the_fixed_text() -> None:
@@ -204,6 +208,9 @@ def test_every_corpus_acceptance_keeps_the_schema_as_given(
     assert result.name == body["name"]
     assert result.schema == body["schema"]
     assert result.description == body.get("description")
+    assert result.accept_partial is (
+        entry["response_format"].get("accept_partial") is True
+    )
 
 
 def test_the_corpus_digest_is_pinned() -> None:
@@ -222,6 +229,51 @@ def test_strict_true_is_accepted() -> None:
     result = normalize_response_format(_format(strict=True))
 
     assert isinstance(result, ResponseFormat)
+
+
+def _json_kind_names() -> set[str]:
+    """Every string ``json_kind`` can return, read from its return statements."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(json_kind)))
+    return {
+        node.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+
+
+# Every kind of value the switch can be given, plus the values the contract
+# names as easy to confuse with a boolean.
+_SWITCH_NOT_BOOLEAN: list[Any] = [None, 0, 1, 1.0, "true", "", [], {}]
+
+
+def _with_switch(value: Any) -> dict[str, Any]:
+    raw = _format()
+    raw["accept_partial"] = value
+    return raw
+
+
+def test_the_switch_samples_cover_every_json_kind() -> None:
+    kinds = {json_kind(sample) for sample in [True, *_SWITCH_NOT_BOOLEAN]}
+    corpus_kinds = {
+        json_kind(entry["response_format"]["accept_partial"])
+        for entry in CORPUS["reject"]
+        if entry["rule"] == "N9"
+    }
+
+    assert kinds == _json_kind_names() - {"other"}
+    assert corpus_kinds == kinds - {"boolean"}
+
+
+def test_n9_runs_after_n3_and_before_n4() -> None:
+    bad_outer = _with_switch("true")
+    bad_outer["zzz"] = 1
+    bad_body = _with_switch("true")
+    bad_body["json_schema"] = "x"
+
+    assert str(_rejection(bad_outer)) == _expected_message("N3", "/zzz")
+    assert str(_rejection(bad_body)) == _expected_message("N9", "/accept_partial")
 
 
 @pytest.mark.parametrize(
@@ -371,6 +423,43 @@ def test_storing_none_changes_nothing_and_clear_removes_the_key() -> None:
     assert cleared == {"keep": 1}
     assert config == {RESPONSE_FORMAT_CONFIG_KEY: {"type": "json_schema"}, "keep": 1}
     assert store_response_format({}, CLEAR) == {}
+
+
+# The stored value of a format without the switch, as written before the switch
+# existed.
+_STORED_WITHOUT_SWITCH = (
+    '{"type": "json_schema", "name": "result", "schema": '
+    '{"type": "object", "properties": {"a": {"type": "string"}}, '
+    '"required": ["a"], "additionalProperties": false}, "description": %s}'
+)
+
+
+@pytest.mark.parametrize("switch", [None, False], ids=["absent", "false"])
+@pytest.mark.parametrize("description", [None, "the answer"], ids=["bare", "described"])
+def test_store_without_switch_is_byte_identical(
+    switch: bool | None, description: str | None
+) -> None:
+    extra: dict[str, Any] = {} if switch is None else {"accept_partial": switch}
+    raw = {**_format(), **extra}
+    if description is not None:
+        raw["json_schema"]["description"] = description
+    change = normalize_response_format(raw)
+
+    stored = store_response_format({}, change)[RESPONSE_FORMAT_CONFIG_KEY]
+
+    expected = _STORED_WITHOUT_SWITCH % (
+        "null" if description is None else json.dumps(description)
+    )
+    assert json.dumps(stored) == expected
+
+
+def test_storing_the_switch_adds_a_fifth_key_after_the_four() -> None:
+    change = normalize_response_format(_with_switch(True))
+
+    stored = store_response_format({}, change)[RESPONSE_FORMAT_CONFIG_KEY]
+
+    assert list(stored) == ["type", "name", "schema", "description", "accept_partial"]
+    assert stored["accept_partial"] is True
 
 
 def test_storing_replaces_an_earlier_format() -> None:
@@ -693,6 +782,54 @@ def test_a_stored_schema_violation_names_the_path_of_the_violation(
     message = _parse_invalid(_stored(schema=schema), caplog)
 
     assert message.endswith("rule=S3 at /properties/a/minLength")
+
+
+# A stored switch is read as a boolean (True or False) or refused: the value
+# is the boolean read, or the tail of the WARNING that names the fault.
+_STORED_SWITCH_CASES: list[tuple[dict[str, Any], bool | str]] = [
+    ({}, False),
+    ({"accept_partial": True}, True),
+    ({"accept_partial": False}, False),
+    *[
+        ({"accept_partial": value}, "stored_shape at /accept_partial")
+        for value in _SWITCH_NOT_BOOLEAN
+    ],
+    ({"accept_partial": True, "strict": True}, "stored_shape at /strict"),
+]
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    _STORED_SWITCH_CASES,
+    ids=lambda v: repr(v) if isinstance(v, dict) else None,
+)
+def test_parse_stored_accept_partial(
+    extra: dict[str, Any],
+    expected: bool | str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    if isinstance(expected, str):
+        message = _parse_invalid(_stored(**extra), caplog)
+        assert message.endswith(f"rule={expected}")
+        return
+    fmt = parse_stored_response_format(_stored(**extra))
+
+    assert fmt is not INVALID
+    assert fmt.accept_partial is expected
+
+
+def test_the_switch_is_checked_after_the_type_and_before_the_name(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    first = _parse_invalid(_stored(type="text", accept_partial=1, name=1), caplog)
+    second = _parse_invalid(_stored(accept_partial=1, name=1), caplog)
+
+    assert first.endswith("rule=stored_shape at /type")
+    assert second.endswith("rule=stored_shape at /accept_partial")
+
+
+def test_the_invalid_format_never_has_the_switch() -> None:
+    assert INVALID.accept_partial is False
 
 
 def test_the_checks_stop_at_the_first_step_that_fails(

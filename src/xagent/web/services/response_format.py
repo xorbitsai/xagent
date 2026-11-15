@@ -10,7 +10,7 @@ module is the only writer of that key. A request value goes through
 copy of a task's ``agent_config``.
 
 A rejection is a :class:`ResponseFormatError` whose message is
-``<rule> at <where>: <text>``. The rule is one of the 22 ids in
+``<rule> at <where>: <text>``. The rule is one of the 23 ids in
 :data:`RULE_TEXTS`, ``<where>`` is a rendered path, and ``<text>`` is the fixed
 sentence of the rule. Nothing of the rejected value is echoed except through
 the path.
@@ -45,7 +45,7 @@ RULE_TEXTS: dict[str, str] = {
     "N2": 'type must be "text" or "json_schema".',
     "N3": (
         "A response_format may only have the key type, "
-        'plus json_schema when type is "json_schema".'
+        'plus json_schema and accept_partial when type is "json_schema".'
     ),
     "N4": (
         "json_schema must be an object with a schema key and no keys other "
@@ -61,6 +61,7 @@ RULE_TEXTS: dict[str, str] = {
         "non-strict structured output is not supported."
     ),
     "N8": "Structured output is not supported for workforce keys.",
+    "N9": "accept_partial, when present, must be true or false.",
     "S1": (
         "The schema must be JSON of at most 16384 bytes, with no NaN or "
         "Infinity, no NUL or surrogate characters, and no excessively "
@@ -123,7 +124,7 @@ RULE_TEXTS: dict[str, str] = {
 
 _OUTER_KEYS = {
     "text": frozenset({"type"}),
-    "json_schema": frozenset({"type", "json_schema"}),
+    "json_schema": frozenset({"type", "json_schema", "accept_partial"}),
 }
 _JSON_SCHEMA_KEYS = frozenset({"name", "schema", "strict", "description"})
 
@@ -158,11 +159,13 @@ class ResponseFormatError(ValueError):
 @dataclass(frozen=True)
 class ResponseFormat:
     """A checked ``json_schema`` format. ``schema`` is the caller's value,
-    unchanged."""
+    unchanged. ``accept_partial`` is the caller's switch asking for the values
+    extracted from a partial, blocked or incomplete run to be kept."""
 
     name: str
     schema: dict[str, Any]
     description: str | None
+    accept_partial: bool = False
 
 
 class _Clear(Enum):
@@ -180,9 +183,9 @@ def normalize_response_format(raw: Any) -> ResponseFormatChange:
 
     Returns ``None`` when the request carries no format (the stored one stays),
     :data:`CLEAR` for ``{"type": "text"}``, and a :class:`ResponseFormat` for a
-    valid ``json_schema`` format. Rules N1 to N7 run in that order, then the
-    schema rules S1 to S13 on ``json_schema.schema``; the first violation
-    raises :class:`ResponseFormatError`. Every JSON value is judged by its
+    valid ``json_schema`` format. Rules N1 to N3, N9 and N4 to N7 run in that
+    order, then the schema rules S1 to S13 on ``json_schema.schema``; the first
+    violation raises :class:`ResponseFormatError`. Every JSON value is judged by its
     exact type, so a bool is never a number and ``1`` is never ``true``.
 
     Pure CPU work, so an async caller runs it in a worker thread.
@@ -201,6 +204,11 @@ def normalize_response_format(raw: Any) -> ResponseFormatChange:
             raise ResponseFormatError("N3", [key])
     if format_type == "text":
         return CLEAR
+    accept_partial = False
+    if "accept_partial" in raw:
+        accept_partial = raw["accept_partial"]
+        if json_kind(accept_partial) != "boolean":
+            raise ResponseFormatError("N9", ["accept_partial"])
 
     body = raw.get("json_schema")
     if json_kind(body) != "object":
@@ -233,7 +241,12 @@ def normalize_response_format(raw: Any) -> ResponseFormatChange:
     violation = check_schema_structure(schema)
     if violation is not None:
         raise ResponseFormatError(violation.rule, violation.path)
-    return ResponseFormat(name=name, schema=schema, description=description)
+    return ResponseFormat(
+        name=name,
+        schema=schema,
+        description=description,
+        accept_partial=accept_partial,
+    )
 
 
 def store_response_format(
@@ -243,7 +256,9 @@ def store_response_format(
 
     ``None`` leaves the format alone, :data:`CLEAR` removes it, and a
     :class:`ResponseFormat` replaces it with
-    ``{"type": "json_schema", "name", "schema", "description"}``. The input is
+    ``{"type": "json_schema", "name", "schema", "description"}``, plus
+    ``"accept_partial": True`` after those four keys when the switch is set
+    (a format without the switch is stored exactly as before). The input is
     never modified. This is the only place that writes the format key.
 
     Downstream embedders that create or append to tasks themselves must call
@@ -253,18 +268,21 @@ def store_response_format(
     if change is CLEAR:
         new_agent_config.pop(RESPONSE_FORMAT_CONFIG_KEY, None)
     elif isinstance(change, ResponseFormat):
-        new_agent_config[RESPONSE_FORMAT_CONFIG_KEY] = {
+        stored: dict[str, Any] = {
             "type": "json_schema",
             "name": change.name,
             "schema": change.schema,
             "description": change.description,
         }
+        if change.accept_partial is True:
+            stored["accept_partial"] = True
+        new_agent_config[RESPONSE_FORMAT_CONFIG_KEY] = stored
     return new_agent_config
 
 
 # The order in which a missing key is reported.
 _STORED_KEY_ORDER = ("type", "name", "schema", "description")
-_STORED_KEYS = frozenset(_STORED_KEY_ORDER)
+_STORED_KEYS = frozenset(_STORED_KEY_ORDER) | {"accept_partial"}
 
 
 def _stored_violation(value: Any) -> tuple[str, list[PathSegment]] | None:
@@ -285,6 +303,8 @@ def _stored_violation(value: Any) -> tuple[str, list[PathSegment]] | None:
     stored_type = value["type"]
     if json_kind(stored_type) != "string" or stored_type != "json_schema":
         return "stored_shape", ["type"]
+    if "accept_partial" in value and json_kind(value["accept_partial"]) != "boolean":
+        return "stored_shape", ["accept_partial"]
     name = value["name"]
     if json_kind(name) != "string" or NAME_PATTERN.fullmatch(name) is None:
         return "N5", ["name"]
@@ -307,8 +327,10 @@ def parse_stored_response_format(
     """Check the format stored on a task again and return it for a run.
 
     ``value`` is what :func:`store_response_format` wrote:
-    ``{"type": "json_schema", "name", "schema", "description"}``. The shape of
-    those four keys is checked first, then ``name`` and ``description`` as
+    ``{"type": "json_schema", "name", "schema", "description"}`` and, when the
+    switch is set, ``"accept_partial": True``. The shape of those keys (the
+    four required ones and the optional boolean ``accept_partial``) is checked
+    first, then ``name`` and ``description`` as
     rules N5 and N6, then the schema as rules S1 to S13. The first failed step
     logs one WARNING with ``task_id``, the rule and the rendered path (only the
     keys and list indices that lead to the fault), never the name, the
@@ -328,6 +350,7 @@ def parse_stored_response_format(
             name=value["name"],
             description=value["description"],
             schema=value["schema"],
+            accept_partial=value.get("accept_partial") is True,
         )
     rule, path = found
     where = render_error_path(path) or (

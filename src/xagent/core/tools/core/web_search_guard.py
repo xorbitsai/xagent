@@ -21,6 +21,7 @@ the hook is logged (without the query) and never fails the search.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from dataclasses import dataclass
@@ -49,7 +50,8 @@ class SearchAuditEvent:
     # "success" or "failure".
     outcome: Literal["success", "failure"]
     # On failure: the class name of the underlying error (the cause when the
-    # core wrapped it, e.g. "ConnectTimeout", "HTTPStatusError"); else None.
+    # core wrapped it, e.g. "ConnectTimeout", "HTTPStatusError"), "cancelled"
+    # when the task was cancelled mid-call, or "redaction_error"; else None.
     failure_kind: Optional[str] = None
 
 
@@ -131,6 +133,20 @@ async def run_guarded_search(
         raise error
     try:
         result = await call(redacted.text)
+    except asyncio.CancelledError:
+        # Not an ``Exception``: record the abandoned call, then let the
+        # cancellation continue. The hook stays best-effort.
+        await _emit(
+            SearchAuditEvent(
+                provider=provider,
+                query=redacted.text,
+                entities=redacted.entities,
+                result_count=None,
+                outcome="failure",
+                failure_kind="cancelled",
+            )
+        )
+        raise
     except Exception as exc:
         await _emit(
             SearchAuditEvent(

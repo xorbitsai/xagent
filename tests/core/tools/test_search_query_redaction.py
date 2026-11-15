@@ -38,6 +38,25 @@ from xagent.core.tools.core.search_query_redaction import (
         ("ABN 51824753556", "ABN [ABN]", ("abn",)),
         ("Medicare 2123 45670 1", "Medicare [MEDICARE]", ("medicare",)),
         ("Medicare 2123456701", "Medicare [MEDICARE]", ("medicare",)),
+        # digits glued behind a "+" number are not part of it (>15 digits)
+        (
+            "contact +61 412 345 678 123456782",
+            "contact [PHONE] [TFN]",
+            ("phone", "tfn"),
+        ),
+        (
+            "call +44 20 7946 0958 then TFN 123 456 782",
+            "call [PHONE] then TFN [TFN]",
+            ("phone", "tfn"),
+        ),
+        # short trailing digits (a year) are not swallowed by a +61 number
+        ("call +61 412 345 678 2024", "call [PHONE] 2024", ("phone",)),
+        # an independent TFN next to an invalid ABN is still redacted
+        (
+            "TFN 123 456 782 ABN 50 123 456 782",
+            "TFN [TFN] ABN 50 123 456 782",
+            ("tfn",),
+        ),
         (
             "jane.doe@example.com 0412 345 678",
             "[EMAIL] [PHONE]",
@@ -69,6 +88,9 @@ def test_redacts_true_positives(query, expected, entities):
         # checksum failures survive
         "TFN 123 456 783",
         "ABN 51 824 753 557",
+        # the tail of a failed ABN / Medicare is not a TFN
+        "ABN 50 123 456 782",
+        "Medicare 2123 456 782",
         "Medicare 2123 45671 1",
         "Medicare 2123456711",
         "number 98765432101",

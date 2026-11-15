@@ -1067,7 +1067,10 @@ def _shrink_node(
         seen.add(node_id)
         shrunk: Dict[Any, Any] = {}
         remaining[0] -= 2  # rendered braces
-        for key, item in value.items():
+        # Redact a search call's query *before* its leaves are measured or cut,
+        # so the byte budget can never leave a fragment of the original query.
+        projected = _project_search_call(value)
+        for key, item in projected.items():
             key_cost = _rendered_width(f"{key!r}: , ")
             # A key is charged in full and can't be truncated, so decide
             # before spending: stopping here instead of after keeps the copy
@@ -1112,6 +1115,111 @@ def _shrink_node(
     return value
 
 
+# Tool names whose ``query`` argument is sent to an external search provider.
+# The single definition: a new search tool (e.g. Brave) is added here, and
+# ``tests/core/tools/test_web_search_redaction_providers.py`` fails if a
+# registered search tool name is missing from the set.
+SEARCH_TOOL_NAMES = frozenset(
+    {"web_search", "tavily_web_search", "zhipu_web_search", "exa_web_search"}
+)
+
+# Keys under which a tool call carries its arguments, across the shapes the
+# trace sees: ``tool_params`` (tool events), ``args`` (normalised calls and the
+# checkpoint ledger), ``arguments`` (OpenAI ``function``), ``input`` / ``params``
+# / ``parameters`` (other adapters).
+_SEARCH_ARG_KEYS = ("tool_params", "args", "arguments", "input", "params", "parameters")
+
+
+def _search_call_name(node: Dict[Any, Any]) -> Optional[str]:
+    for key in ("tool_name", "name"):
+        name = node.get(key)
+        if isinstance(name, str):
+            return name
+    return None
+
+
+def _redact_search_args(args: Any) -> Any:
+    """Return ``args`` with its ``query`` redacted (copy on change)."""
+    from ..tools.core.search_query_redaction import redact_search_query
+
+    if isinstance(args, dict):
+        if "query" not in args:
+            return args
+        query = args["query"]
+        redacted = redact_search_query(query if isinstance(query, str) else str(query))
+        return {**args, "query": redacted.text}
+    if isinstance(args, str):
+        # OpenAI-style ``function.arguments`` is a JSON string. Parse it so only
+        # the query changes; if it does not parse (malformed, or cut by a
+        # provider), redact the whole text rather than let anything through.
+        try:
+            parsed = json.loads(args)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            return json.dumps(_redact_search_args(parsed), ensure_ascii=False)
+        return redact_search_query(args).text
+    return args
+
+
+def _project_search_call(node: Dict[Any, Any]) -> Dict[Any, Any]:
+    """Return ``node`` with a search call's query redacted, one level only.
+
+    ``node`` is a search call when its ``tool_name`` / ``name`` is a search
+    tool; an OpenAI ``{"function": {"name": ..., "arguments": ...}}`` wrapper
+    is handled when the caller reaches its ``function`` child. The caller walks
+    the children itself, so this never recurses. Returns ``node`` itself when
+    nothing needs to change.
+    """
+    result = node
+    name = _search_call_name(node)
+    if name in SEARCH_TOOL_NAMES:
+        for key in _SEARCH_ARG_KEYS:
+            if key in node:
+                redacted = _redact_search_args(node[key])
+                if redacted is not node[key]:
+                    if result is node:
+                        result = dict(node)
+                    result[key] = redacted
+    return result
+
+
+def _project_search_calls(
+    value: Any, depth: int = 0, seen: Optional[Set[int]] = None
+) -> Any:
+    """Copy-on-write walk redacting every search call in ``value``.
+
+    Used only where the byte-budgeted shrink walk does not run
+    (``max_bytes <= 0``); depth is capped and cycles are cut.
+    """
+    if seen is None:
+        seen = set()
+    if depth >= _MAX_TRACE_DEPTH:
+        return value
+    if isinstance(value, dict):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        projected = _project_search_call(value)
+        out = projected
+        for key, item in projected.items():
+            new = _project_search_calls(item, depth + 1, seen)
+            if new is not item:
+                if out is value:
+                    out = dict(projected)
+                out[key] = new
+        seen.discard(id(value))
+        return out
+    if isinstance(value, list):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        items = [_project_search_calls(item, depth + 1, seen) for item in value]
+        seen.discard(id(value))
+        return items if any(a is not b for a, b in zip(items, value)) else value
+    return value
+
+
 def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> str:
     """Render ``event.data`` into a size-bounded string for console logging.
 
@@ -1143,7 +1251,7 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
         max_bytes = get_max_trace_payload_bytes()
 
     if max_bytes <= 0:
-        return f"{data}"
+        return f"{_project_search_calls(data)}"
 
     rendered = f"{_shrink_within_budget(data, max_bytes)}"
     encoded = rendered.encode("utf-8", errors="replace")
@@ -1153,31 +1261,6 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
     # char, matching the string-leaf truncation above.
     head = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return f"{head}...[truncated {len(rendered) - len(head)} chars]"
-
-
-# Tool names whose ``query`` argument is sent to an external search provider.
-_SEARCH_TOOL_NAMES = frozenset({"web_search", "zhipu_web_search", "exa_web_search"})
-
-
-def _redact_search_params_for_log(data: Any) -> Any:
-    """Return ``data`` with a search tool's ``tool_params["query"]`` redacted.
-
-    Console-log sink only: the original payload (and therefore the persisted
-    trace rows) is left untouched; a shallow copy is returned when a change is
-    needed. Applied to every scope's console line because any event that
-    carries ``tool_params`` for a search tool (start, end, error, settlement,
-    cancellation) would otherwise print the model's raw query.
-    """
-    if not isinstance(data, dict) or data.get("tool_name") not in _SEARCH_TOOL_NAMES:
-        return data
-    params = data.get("tool_params")
-    if not isinstance(params, dict) or "query" not in params:
-        return data
-    from ..tools.core.search_query_redaction import redact_search_query
-
-    query = params["query"]
-    redacted = redact_search_query(query if isinstance(query, str) else str(query))
-    return {**data, "tool_params": {**params, "query": redacted.text}}
 
 
 class ConsoleTraceHandler(BaseTraceHandler):
@@ -1198,25 +1281,25 @@ class ConsoleTraceHandler(BaseTraceHandler):
     async def _handle_task_event(self, event: TraceEvent) -> None:
         """Handle task-level events."""
         logger.info(
-            f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {_render_event_data_for_log(_redact_search_params_for_log(event.data))}"
+            f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_step_event(self, event: TraceEvent) -> None:
         """Handle step-level events."""
         logger.info(
-            f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(_redact_search_params_for_log(event.data))}"
+            f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_action_event(self, event: TraceEvent) -> None:
         """Handle action-level events."""
         logger.info(
-            f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(_redact_search_params_for_log(event.data))}"
+            f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_system_event(self, event: TraceEvent) -> None:
         """Handle system-level events."""
         logger.info(
-            f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {_render_event_data_for_log(_redact_search_params_for_log(event.data))}"
+            f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {_render_event_data_for_log(event.data)}"
         )
 
 

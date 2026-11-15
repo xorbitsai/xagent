@@ -7,6 +7,9 @@ is stubbed. All personal data below is invented.
 import json
 import logging
 import sys
+import copy
+import importlib
+import pkgutil
 import types
 from typing import Any, Dict, List
 
@@ -14,6 +17,7 @@ import httpx
 import pytest
 
 from xagent.core.agent.trace import (
+    SEARCH_TOOL_NAMES,
     ConsoleTraceHandler,
     TraceAction,
     TraceCategory,
@@ -241,6 +245,35 @@ async def test_hook_reports_failure_outcome(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cancelled_search_is_reported_and_stays_cancelled(monkeypatch):
+    import asyncio
+
+    events: List[SearchAuditEvent] = []
+    set_search_audit_hook(events.append)
+    started = asyncio.Event()
+
+    async def slow(_q: str) -> str:
+        started.set()
+        await asyncio.sleep(30)
+        return "never"
+
+    from xagent.core.tools.core.web_search_guard import run_guarded_search
+
+    task = asyncio.ensure_future(run_guarded_search("google", QUERY, slow, len))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    assert len(events) == 1
+    assert events[0].outcome == "failure"
+    assert events[0].failure_kind == "cancelled"
+    assert events[0].result_count is None
+    assert events[0].query == REDACTED
+
+
+@pytest.mark.asyncio
 async def test_no_hook_registered_by_default_and_search_unchanged(monkeypatch):
     assert get_search_audit_hook() is None
     _, results = await _run_provider("google", monkeypatch)
@@ -307,6 +340,121 @@ async def test_console_trace_leaves_other_tools_alone(caplog):
     with caplog.at_level(logging.INFO):
         await ConsoleTraceHandler().handle_event(event)
     assert EMAIL in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# --- structural projection of search calls in console payloads ----------------
+
+from xagent.core.agent.trace import _render_event_data_for_log  # noqa: E402
+
+
+def _args(query: str = QUERY) -> Dict[str, Any]:
+    return {"query": query, "num_results": 3}
+
+
+def _real_shapes(query: str = QUERY) -> Dict[str, Dict[str, Any]]:
+    openai_call = {
+        "id": "c1",
+        "type": "function",
+        "function": {"name": "web_search", "arguments": json.dumps(_args(query))},
+    }
+    return {
+        # run_streaming_llm_call -> on_llm_end: normalised {name, args} calls
+        "llm_end_args": {
+            "response": {
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "name": "web_search", "args": _args(query)}
+                ],
+            },
+            "success": True,
+        },
+        # raw OpenAI shape: arguments is a JSON string
+        "llm_end_openai": {
+            "response": {"content": "", "tool_calls": [openai_call]},
+            "success": True,
+        },
+        # the prompt replay in an LLM start event
+        "context_preview": {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [openai_call]},
+            ]
+        },
+        # checkpoint snapshot
+        "checkpoint": {
+            "pattern_state": {
+                "pending_tool_calls": [
+                    {"id": "c1", "name": "web_search", "args": _args(query)}
+                ],
+                "tool_ledger": [
+                    {"tool_name": "exa_web_search", "tool_params": _args(query)}
+                ],
+                "last_response": {"tool_calls": [openai_call]},
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize("shape", list(_real_shapes()))
+@pytest.mark.parametrize("max_bytes", [None, 0])
+def test_console_render_redacts_real_payload_shapes(shape, max_bytes):
+    data = _real_shapes()[shape]
+    snapshot = copy.deepcopy(data)
+    rendered = _render_event_data_for_log(data, max_bytes)
+    for value in RAW_VALUES:
+        assert value not in rendered
+    assert "[EMAIL]" in rendered
+    # the stored payload is untouched
+    assert data == snapshot
+
+
+def test_console_render_redacts_unparseable_arguments_string():
+    data = {
+        "function": {
+            "name": "web_search",
+            "arguments": '{"query": "mail ' + EMAIL + ' now", "num_res',
+        }
+    }
+    rendered = _render_event_data_for_log(data)
+    assert EMAIL not in rendered and "[EMAIL]" in rendered
+
+
+@pytest.mark.parametrize("shape", list(_real_shapes()))
+def test_no_fragment_of_the_query_survives_any_byte_budget(shape):
+    # Redaction happens before the byte budget cuts the payload, so no budget
+    # can leave the start of an identifier behind.
+    pad = "x " * 200
+    data = _real_shapes(pad + QUERY)[shape]
+    full = len(_render_event_data_for_log(data, 10**9))
+    fragments = ["jane", "example.com", "412 3", "Smith", "123 4", "1234567"]
+    for budget in range(40, full + 40, 13):
+        rendered = _render_event_data_for_log(data, budget)
+        for fragment in fragments:
+            assert fragment not in rendered, (budget, fragment)
+
+
+def test_console_render_leaves_other_tools_alone():
+    data = {"tool_calls": [{"name": "write_file", "args": {"query": EMAIL}}]}
+    assert EMAIL in _render_event_data_for_log(data)
+
+
+def test_search_tool_name_set_covers_every_registered_search_tool():
+    import xagent.core.tools.adapters.vibe as vibe
+
+    names = set()
+    for mod in pkgutil.iter_modules(vibe.__path__):
+        if not mod.name.endswith("web_search"):
+            continue
+        module = importlib.import_module(f"{vibe.__name__}.{mod.name}")
+        for obj in vars(module).values():
+            if (
+                isinstance(obj, type)
+                and obj.__module__ == module.__name__
+                and obj.__name__.endswith("Tool")
+            ):
+                names.add(obj.name.fget(None))
+    assert names, "no search tool classes discovered"
+    assert names <= SEARCH_TOOL_NAMES, names - SEARCH_TOOL_NAMES
 
 
 # --- redaction failure fails closed ------------------------------------------

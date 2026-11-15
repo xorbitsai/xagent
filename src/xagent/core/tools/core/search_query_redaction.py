@@ -166,8 +166,28 @@ _PHONE_NANP_RE = re.compile(
 )
 
 
-def _intl_ok(m: Match[str]) -> bool:
-    return 8 <= len(_digits(m.group(0))) <= 15
+def _intl_prefix_len(text: str) -> int:
+    """Length of the phone-number prefix of an international-shaped match.
+
+    E.164 allows at most 15 digits; ``+61`` and ``+1`` numbers have 11. The
+    pattern is greedy, so digits that follow a number (a TFN, an order id) can
+    be glued onto it. Take the longest prefix of digit groups that fits the
+    cap and has at least 8 digits; 0 means no usable prefix.
+    """
+    groups = list(re.finditer(r"\d+", text))
+    if not groups:
+        return 0
+    country = groups[0].group(0)
+    cap = 11 if country in ("61", "1") else 15
+    total = 0
+    best = 0
+    for g in groups:
+        total += len(g.group(0))
+        if total > cap:
+            break
+        if total >= 8:
+            best = g.end()
+    return best
 
 
 def _sub(
@@ -187,6 +207,24 @@ def _sub(
     return pattern.sub(repl, text)
 
 
+def _sub_intl_phone(text: str, found: List[str]) -> str:
+    def repl(m: Match[str]) -> str:
+        raw = m.group(0)
+        cut = _intl_prefix_len(raw)
+        if cut == 0:
+            return raw
+        if PHONE not in found:
+            found.append(PHONE)
+        # Whatever follows the number stays for the later recognisers.
+        return _PLACEHOLDERS[PHONE] + raw[cut:]
+
+    return _PHONE_INTL_RE.sub(repl, text)
+
+
+def _spans(pattern: "re.Pattern[str]", text: str) -> List[Tuple[int, int]]:
+    return [m.span() for m in pattern.finditer(text)]
+
+
 def redact_search_query(query: str) -> RedactionResult:
     """Return ``query`` with personal data replaced by typed placeholders.
 
@@ -203,13 +241,24 @@ def redact_search_query(query: str) -> RedactionResult:
         text = _sub(text, _ADDRESS_CTX_RE, ADDRESS, found)
         text = _sub(text, _PO_BOX_RE, ADDRESS, found)
         # "+" numbers first so their trailing digits are never read as a TFN.
-        text = _sub(text, _PHONE_INTL_RE, PHONE, found, _intl_ok)
+        text = _sub_intl_phone(text, found)
         # Longest identifier first so an 11-digit ABN is never read as a TFN.
         text = _sub(text, _ABN_RE, ABN, found, lambda m: valid_abn(m.group(0)))
         text = _sub(
             text, _MEDICARE_RE, MEDICARE, found, lambda m: valid_medicare(m.group(0))
         )
-        text = _sub(text, _TFN_RE, TFN, found, lambda m: valid_tfn(m.group(0)))
+        # What is still ABN- or Medicare-shaped here failed its checksum. A TFN
+        # candidate that starts inside one is just its tail ("ABN 50 123 456 782"
+        # must not become "ABN 50 [TFN]").
+        rejected = _spans(_ABN_RE, text) + _spans(_MEDICARE_RE, text)
+        text = _sub(
+            text,
+            _TFN_RE,
+            TFN,
+            found,
+            lambda m: valid_tfn(m.group(0))
+            and not any(a <= m.start() < b for a, b in rejected),
+        )
         text = _sub(text, _PHONE_AU_RE, PHONE, found)
         text = _sub(text, _PHONE_NANP_RE, PHONE, found)
         return RedactionResult(text, tuple(found))

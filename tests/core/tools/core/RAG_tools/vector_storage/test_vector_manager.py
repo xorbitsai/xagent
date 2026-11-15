@@ -235,7 +235,7 @@ class TestVectorValidation:
         validate_query_vector([1.0, 2.0, 3.0], model_tag="test_model")
 
 
-def _bound_collection_with_a_chunk(model: str = "m-old") -> None:
+def _bound_collection_with_a_chunk(model: str | None = "m-old") -> None:
     import asyncio
     from datetime import datetime, timezone
 
@@ -348,6 +348,23 @@ class TestWriteAfterMigration:
 
         assert _write_batch().upsert_count == 1
         assert _vectorless_chunks() == 0
+
+    def test_a_collection_without_a_binding_keeps_the_batch(self) -> None:
+        _bound_collection_with_a_chunk(model=None)
+
+        assert _write_batch().upsert_count == 1
+        assert _vectorless_chunks() == 0
+
+    def test_a_frozen_collection_without_a_binding_refuses_the_batch(self) -> None:
+        from xagent.core.tools.core.RAG_tools.core.exceptions import (
+            CollectionMigratingError,
+        )
+
+        _bound_collection_with_a_chunk(model=None)
+        _freeze_from_another_connection()
+
+        with pytest.raises(CollectionMigratingError, match="frozen"):
+            _write_batch()
 
     def test_another_attempts_rows_survive_a_refused_batch_of_the_document(
         self,

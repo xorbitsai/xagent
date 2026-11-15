@@ -96,7 +96,7 @@ def write_vectors_to_db(
     only serializes the cheap write and barely dents throughput.
 
     With ``verify_bound``, returns only if, after the commit, the migration row is not
-    frozen and the collection either has no metadata row or is bound to the batch model.
+    frozen and the collection has no metadata row, no binding, or the batch model bound.
     """
     from ..management.collection_manager import _get_collection_thread_lock
 
@@ -134,7 +134,9 @@ def _refuse_unless_still_bound(
             info = get_collection_if_present_sync(collection)
             if info is None:
                 return
-            if {_normalize_model_id(info.embedding_model_id)} == written:
+            bound = _normalize_model_id(info.embedding_model_id)
+            # No binding cannot be a finished switch: a switch always leaves one.
+            if bound is None or {bound} == written:
                 return
             reason = f"is now bound to '{info.embedding_model_id}'"
     except Exception as exc:  # noqa: BLE001 - unreadable proves nothing either way

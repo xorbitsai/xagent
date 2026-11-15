@@ -3,6 +3,7 @@
 import inspect
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
@@ -131,6 +132,12 @@ _TRUNCATABLE_CONTENT_FIELDS = frozenset(
 )
 
 
+# Opens every truncation marker the reducers below write
+# (``...[truncated N chars]``, ``...[truncated N middle items]``). The console
+# sink keys on it to recognise text that was cut upstream.
+_TRUNCATION_MARKER = "...[truncated "
+
+
 def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
     """Recursive per-leaf truncation of a trace value.
 
@@ -196,7 +203,7 @@ def _truncate_string(value: str, budget: int) -> str:
     slack = min(30, max(8, budget // 4))
     head_budget = max(1, budget - slack)
     head = encoded[:head_budget].decode("utf-8", errors="ignore")
-    return f"{head}...[truncated {len(value) - len(head)} chars]"
+    return f"{head}{_TRUNCATION_MARKER}{len(value) - len(head)} chars]"
 
 
 def _placeholder(message: str) -> Dict[str, str]:
@@ -229,7 +236,7 @@ def _reduce_text_list(value: Any, budget: int) -> Any:
             [_reduce_text(v, per_item) for v in value[-keep_tail:]] if keep_tail else []
         )
         omitted = len(value) - keep_head - keep_tail
-        marker = f"...[truncated {omitted} middle items]"
+        marker = f"{_TRUNCATION_MARKER}{omitted} middle items]"
         candidate: List[Any] = head + [marker] + tail
         if _serialized_size(candidate) <= budget:
             return candidate
@@ -627,7 +634,7 @@ def _trim_subtree(value: Any, max_bytes: int, _depth: int = 0) -> Any:
         # U+FFFD replacement chars — otherwise len(head) inflates and the
         # reported truncation count becomes inaccurate (can even go negative).
         head = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        return f"{head}...[truncated {len(value) - len(head)} chars]"
+        return f"{head}{_TRUNCATION_MARKER}{len(value) - len(head)} chars]"
 
     if isinstance(value, list):
         per_item = max(1, max_bytes // max(1, len(value)))
@@ -1015,7 +1022,7 @@ def _shrink_string_leaf(
     marked = ""
     for _ in range(_LOG_TRUNCATE_FIT_PASSES):
         head = encoded[:cut].decode("utf-8", errors="ignore")
-        marked = f"{head}...[truncated {len(value) - len(head)} chars]"
+        marked = f"{head}{_TRUNCATION_MARKER}{len(value) - len(head)} chars]"
         marked_width = _leaf_width(marked, depth)
         if marked_width <= spendable or cut == 0:
             break
@@ -1057,7 +1064,9 @@ def _shrink_node(
         return too_deep
 
     if isinstance(value, str):
-        return _shrink_string_leaf(value, remaining, depth, slack)
+        return _shrink_string_leaf(
+            _withhold_truncated_query_text(value), remaining, depth, slack
+        )
 
     if isinstance(value, dict):
         node_id = id(value)
@@ -1138,28 +1147,84 @@ def _search_call_name(node: Dict[Any, Any]) -> Optional[str]:
     return None
 
 
-def _redact_search_args(args: Any) -> Any:
-    """Return ``args`` with its ``query`` redacted (copy on change)."""
+# Fixed replacements. Neither contains any of the text it stands for.
+_SEARCH_ARGS_WITHHELD = "[search arguments withheld]"
+_QUERY_TEXT_WITHHELD = "[truncated text containing a query withheld]"
+
+# The bare word ``query`` followed, after any run of quotes and backslashes (so
+# at any JSON/repr escaping depth: ``"query":``, ``'query':``, ``\\"query\\":``),
+# by a colon: how a ``query`` key looks inside serialised arguments.
+_QUERY_KEY_RE = re.compile(r"query[\\\"']*\s*:")
+
+
+def _withhold_truncated_query_text(text: str) -> str:
+    """Make a string leaf that holds serialised search arguments safe to log.
+
+    ``_shrink_message`` dumps a dict or list message value (a legacy
+    ``function_call``, Anthropic content blocks) to a string, and may then cut
+    it, so the structural projection never sees the call. Two cases:
+
+    * cut (carries a truncation marker) and holding a ``query:`` key: replaced
+      wholesale, because a query value can only follow its key, and a cut
+      value leaves a fragment no recogniser can match (``jane.doe@exa``);
+    * complete and naming a search tool next to a ``query:`` key: every entity
+      in it is redacted.
+
+    The wholesale rule over-masks any truncated text that merely mentions
+    ``query:`` (prose, other tools' ``query`` arguments); it affects only the
+    console line.
+    """
+    if not _QUERY_KEY_RE.search(text):
+        return text
+    if _TRUNCATION_MARKER in text:
+        return _QUERY_TEXT_WITHHELD
+    if any(name in text for name in SEARCH_TOOL_NAMES):
+        from ..tools.core.search_query_redaction import redact_search_query
+
+        return redact_search_query(text).text
+    return text
+
+
+def _redact_search_value(value: Any, key: Any = None) -> Any:
+    """Redact every string leaf of a search call's arguments (copy on change)."""
     from ..tools.core.search_query_redaction import redact_search_query
 
-    if isinstance(args, dict):
-        if "query" not in args:
-            return args
-        query = args["query"]
-        redacted = redact_search_query(query if isinstance(query, str) else str(query))
-        return {**args, "query": redacted.text}
+    if isinstance(value, str):
+        if _TRUNCATION_MARKER in value:
+            return _SEARCH_ARGS_WITHHELD
+        text = redact_search_query(value).text
+        return value if text == value else text
+    if isinstance(value, dict):
+        out = {k: _redact_search_value(v, k) for k, v in value.items()}
+        return out if any(out[k] is not value[k] for k in value) else value
+    if isinstance(value, list):
+        items = [_redact_search_value(v) for v in value]
+        return items if any(a is not b for a, b in zip(items, value)) else value
+    if key == "query" and value is not None and not isinstance(value, bool):
+        return redact_search_query(str(value)).text
+    return value
+
+
+def _redact_search_args(args: Any) -> Any:
+    """Return a search call's arguments with every string leaf redacted.
+
+    Console projection only; the provider-bound contract stays "the ``query``
+    argument". Every string is redacted, not just ``query``, because arguments
+    that failed to parse reach the tool as ``{"input": <raw text>}``. A string
+    that is not a JSON object/array (malformed, or cut upstream) is replaced
+    wholesale by a fixed marker.
+    """
     if isinstance(args, str):
-        # OpenAI-style ``function.arguments`` is a JSON string. Parse it so only
-        # the query changes; if it does not parse (malformed, or cut by a
-        # provider), redact the whole text rather than let anything through.
+        if not args.strip():
+            return args
         try:
             parsed = json.loads(args)
         except ValueError:
-            parsed = None
-        if isinstance(parsed, dict):
-            return json.dumps(_redact_search_args(parsed), ensure_ascii=False)
-        return redact_search_query(args).text
-    return args
+            return _SEARCH_ARGS_WITHHELD
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(_redact_search_value(parsed), ensure_ascii=False)
+        return _SEARCH_ARGS_WITHHELD
+    return _redact_search_value(args)
 
 
 def _project_search_call(node: Dict[Any, Any]) -> Dict[Any, Any]:
@@ -1196,6 +1261,8 @@ def _project_search_calls(
         seen = set()
     if depth >= _MAX_TRACE_DEPTH:
         return value
+    if isinstance(value, str):
+        return _withhold_truncated_query_text(value)
     if isinstance(value, dict):
         if id(value) in seen:
             return value
@@ -1260,7 +1327,7 @@ def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> st
     # Slice on a byte boundary and drop an incomplete trailing multi-byte
     # char, matching the string-leaf truncation above.
     head = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    return f"{head}...[truncated {len(rendered) - len(head)} chars]"
+    return f"{head}{_TRUNCATION_MARKER}{len(rendered) - len(head)} chars]"
 
 
 class ConsoleTraceHandler(BaseTraceHandler):

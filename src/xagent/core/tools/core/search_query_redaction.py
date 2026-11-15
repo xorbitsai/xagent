@@ -18,6 +18,44 @@ Design constraints:
 * :func:`redact_search_query` never raises. If redaction itself fails, it fails
   closed: the whole query is replaced by a fixed placeholder instead of being
   passed through unredacted.
+
+Recognised and not recognised
+-----------------------------
+Email: the local part and each domain label may contain any Unicode letter or
+digit (RFC 6531), the domain may use an ASCII or ideographic dot, and a quoted
+local part is accepted. The domain must contain at least one dot, so
+``user@localhost`` and ``user@[IP]`` are not recognised, nor is an address with
+spaces around the ``@``.
+
+Phone: an international number starting with ``+`` (or the full-width ``＋``),
+checked against the structure of its country code (+61: 9 national digits,
++1: 10, +44: 10; any other code: at most 15 digits in total), with an optional
+trunk prefix (``(0)`` or a leading ``0``). Exactly the digits that belong to
+the number are replaced; digits that follow it stay in the query. Also
+Australian mobile (04xx xxx xxx, 04 xxxx xxxx, separators space, dot or
+hyphen) and landline ((0x) xxxx xxxx), and US/Canada style ten-digit numbers
+with separators. An extension (``ext 12``, ``x12``) is kept. 13xx/1300/1800
+business numbers are not recognised.
+
+TFN, ABN, Medicare: replaced only when the number stands alone (not glued to
+letters, digits or a hyphen, and not part of a decimal or thousands figure),
+is written with single spaces, hyphens or nothing between its groups, and its
+checksum passes. Numbers glued to letters, written with dots, or grouped
+irregularly are not recognised, so order numbers, versions and prices survive.
+
+Address: an English-style street address (house number with optional unit or
+level, a capitalised street name and a street-type word), or any-case street
+name followed by ``<suburb> <STATE> <postcode>``; and PO Box, GPO Box, Locked
+Bag and Private Bag numbers. A suburb or postcode on its own is not replaced.
+Lowercase street names without a suburb and state, addresses in other
+languages, and addresses that do not start with a house number are not
+recognised.
+
+Not covered: names of people and organisations; text the model restates in its
+reply; search tool arguments other than ``query`` (for example Exa's
+``include_text``); results returned by a provider. In console trace lines, a
+search call's arguments that were cut or cannot be parsed are replaced whole by
+a fixed marker, never partly shown.
 """
 
 from __future__ import annotations
@@ -117,8 +155,16 @@ def valid_medicare(value: str) -> bool:
 _NUM_START = r"(?<![\w\-./$€£,])"
 _NUM_END = r"(?![\w\-]|[.,]\d)"
 
+# Local part: a quoted string or dot-atom text; ``\w`` is Unicode-aware, so
+# internationalised mailboxes (RFC 6531) match. Domain: Unicode letters/digits
+# and hyphens per label, labels joined by an ASCII or ideographic dot.
+_DOMAIN_LABEL = r"(?:[^\W_]|-){1,63}"
 _EMAIL_RE = re.compile(
-    r"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){1,8}"
+    r"(?:\"[^\"\\\r\n@]{1,64}\"|[\w.%+\-]{1,64})@"
+    + _DOMAIN_LABEL
+    + r"(?:[.\u3002\uff0e\uff61]"
+    + _DOMAIN_LABEL
+    + r"){1,8}"
 )
 
 _ABN_RE = re.compile(_NUM_START + r"\d{2}[ -]?\d{3}[ -]?\d{3}[ -]?\d{3}" + _NUM_END)
@@ -150,40 +196,61 @@ _ADDRESS_CTX_RE = re.compile(
     r"(?:" + _AU_STATES + r")\s+\d{4}\b",
     re.IGNORECASE,
 )
-_PO_BOX_RE = re.compile(r"\bP\.?\s?O\.?\s+Box\s+\d{1,6}\b", re.IGNORECASE)
+_PO_BOX_RE = re.compile(
+    r"\b(?:P\.?\s?O\.?\s+Box|GPO\s+Box|(?:Locked|Private)\s+Bag)\s+\d{1,6}\b",
+    re.IGNORECASE,
+)
 
 # Phone numbers. International needs a leading "+"; Australian national forms
 # are mobile 04xx xxx xxx and landline (0x) xxxx xxxx; NANP needs separators.
 _PHONE_INTL_RE = re.compile(
-    r"(?<![\w+])\+\d{1,3}[ .\-]?(?:\(\d{1,4}\)[ .\-]?)?\d{1,4}(?:[ .\-]?\d{2,5}){1,4}(?!\d)"
+    r"(?<![\w+\uff0b])[+\uff0b]\d{1,3}[ .\-]?(?:\(\d{1,4}\)[ .\-]?)?\d{1,4}"
+    r"(?:[ .\-]?\d{2,5}){1,4}(?!\d)"
 )
 _PHONE_AU_RE = re.compile(
-    r"(?<![\w\-./$+])(?:\(0[2378]\)|0[2378])[ \-]?\d{4}[ \-]?\d{4}(?!\d)"
-    r"|(?<![\w\-./$+])04\d{2}[ \-]?\d{3}[ \-]?\d{3}(?!\d)"
+    r"(?<![\w\-./$+\uff0b])(?:\(0[2378]\)|0[2378])[ \-]?\d{4}[ \-]?\d{4}(?!\d)"
+    r"|(?<![\w\-./$+\uff0b])(?:\(04\)|04)"
+    r"(?:\d{2}[ .\-]?\d{3}[ .\-]?\d{3}|[ .\-]?\d{4}[ .\-]?\d{4})(?!\d)"
 )
 _PHONE_NANP_RE = re.compile(
-    r"(?<![\w\-./$+])(?:\(\d{3}\)[ ]?|\d{3}[ .\-])\d{3}[ .\-]\d{4}(?![\w\-]|[.,]\d)"
+    r"(?<![\w\-./$+\uff0b])(?:\(\d{3}\)[ ]?|\d{3}[ .\-])\d{3}[ .\-]\d{4}(?![\w\-]|[.,]\d)"
 )
+
+
+# National significant number length by country code: +61 9 digits, +1 10,
+# +44 10 (UK numbers are 9-10; the longer is taken). The trunk prefix after the
+# country code ("(0)" or a leading 0 of +61/+44 numbers) is not part of it.
+_NATIONAL_LEN = {"61": 9, "44": 10, "1": 10}
 
 
 def _intl_prefix_len(text: str) -> int:
     """Length of the phone-number prefix of an international-shaped match.
 
-    E.164 allows at most 15 digits; ``+61`` and ``+1`` numbers have 11. The
-    pattern is greedy, so digits that follow a number (a TFN, an order id) can
-    be glued onto it. Take the longest prefix of digit groups that fits the
-    cap and has at least 8 digits; 0 means no usable prefix.
+    The pattern is greedy, so digits that follow a number (a TFN, an order id)
+    can be glued onto it. For a known country code the structure fixes how many
+    national digits belong to the number (the trunk ``0`` is skipped) and
+    exactly that many are consumed, even in the middle of a group. For other
+    country codes the longest prefix of digit groups with at most 15 digits
+    (E.164) and at least 8 is taken. 0 means no usable prefix.
     """
+    digits = [(i, c) for i, c in enumerate(text) if c.isdigit()]
+    num = "".join(c for _, c in digits)
+    for cc in ("61", "44", "1"):
+        if num.startswith(cc):
+            national = num[len(cc) :]
+            skip = 1 if cc != "1" and national.startswith("0") else 0
+            need = _NATIONAL_LEN[cc]
+            have = len(national) - skip
+            if len(cc) + skip + min(have, need) < 8:
+                return 0
+            last = len(cc) + skip + min(have, need) - 1
+            return digits[last][0] + 1
     groups = list(re.finditer(r"\d+", text))
-    if not groups:
-        return 0
-    country = groups[0].group(0)
-    cap = 11 if country in ("61", "1") else 15
     total = 0
     best = 0
     for g in groups:
         total += len(g.group(0))
-        if total > cap:
+        if total > 15:
             break
         if total >= 8:
             best = g.end()

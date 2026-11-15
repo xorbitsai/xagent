@@ -145,3 +145,22 @@ def test_long_input_is_fast():
     start = time.perf_counter()
     redact_search_query(query)
     assert time.perf_counter() - start < 2.0
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "é" * 60000,
+        "a@" + "b." * 30000,
+        "a-" * 40000 + "@x.y",
+        "+61 " + "1 " * 30000,
+        '"' + "a" * 60000,
+        "例" * 40000 + "@" + "例" * 40000,
+    ],
+)
+def test_hostile_unicode_input_stays_fast(hostile):
+    import time
+
+    start = time.monotonic()
+    redact_search_query(hostile)
+    assert time.monotonic() - start < 5

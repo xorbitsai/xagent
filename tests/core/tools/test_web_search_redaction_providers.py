@@ -4,12 +4,12 @@ HTTP uses a real ``httpx`` client on ``httpx.MockTransport``; the Exa SDK call
 is stubbed. All personal data below is invented.
 """
 
-import json
-import logging
-import sys
 import copy
 import importlib
+import json
+import logging
 import pkgutil
+import sys
 import types
 from typing import Any, Dict, List
 
@@ -416,7 +416,8 @@ def test_console_render_redacts_unparseable_arguments_string():
         }
     }
     rendered = _render_event_data_for_log(data)
-    assert EMAIL not in rendered and "[EMAIL]" in rendered
+    assert EMAIL not in rendered and "mail" not in rendered
+    assert "[search arguments withheld]" in rendered
 
 
 @pytest.mark.parametrize("shape", list(_real_shapes()))
@@ -431,6 +432,170 @@ def test_no_fragment_of_the_query_survives_any_byte_budget(shape):
         rendered = _render_event_data_for_log(data, budget)
         for fragment in fragments:
             assert fragment not in rendered, (budget, fragment)
+
+
+def _replay_message(shape: str, query: str) -> Dict[str, Any]:
+    arguments = json.dumps({"query": query, "n": 3})
+    return {
+        "openai_str": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": arguments},
+                }
+            ],
+        },
+        "arguments_dict": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": {"query": query}},
+                }
+            ],
+        },
+        # string arguments inside a dict that _shrink_message dumps again
+        "legacy_function_call": {
+            "role": "assistant",
+            "content": None,
+            "function_call": {"name": "web_search", "arguments": arguments},
+        },
+        "content_blocks": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "c1",
+                    "name": "web_search",
+                    "input": {"query": query},
+                }
+            ],
+        },
+        "name_args": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "name": "web_search", "args": {"query": query}}
+            ],
+        },
+    }[shape]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "openai_str",
+        "arguments_dict",
+        "legacy_function_call",
+        "content_blocks",
+        "name_args",
+    ],
+)
+@pytest.mark.parametrize("pad", [0, 3, 8, 14])
+def test_normalizer_then_console_never_leaves_a_query_fragment(shape, pad):
+    # The trace boundary may cut a search call's arguments before the console
+    # sink sees them (normalize_llm_trace_payload). Whatever budget cuts them,
+    # the console line must carry no part of the identifier.
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    query = "word " * pad + "find jane.doe@example.com now"
+    messages = [
+        {"role": "user", "content": "hi " + "x" * 300},
+        _replay_message(shape, query),
+    ]
+    fragments = ["jane", "@exa", "doe@", "example"]
+    for budget in range(250, 1500, 3):
+        stored = normalize_llm_trace_payload(
+            {"context_preview": copy.deepcopy(messages), "success": True},
+            max_bytes=budget,
+        )
+        snapshot = copy.deepcopy(stored)
+        rendered = _render_event_data_for_log(stored)
+        assert stored == snapshot  # the stored payload is untouched
+        for fragment in fragments:
+            assert fragment not in rendered, (shape, pad, budget, fragment)
+
+
+def test_unparsed_arguments_fallback_input_is_redacted():
+    # ReAct passes malformed JSON arguments on as {"input": <raw text>}.
+    data = {
+        "tool_name": "web_search",
+        "tool_params": {"input": f"mail {EMAIL} or call {PHONE}"},
+    }
+    snapshot = copy.deepcopy(data)
+    for max_bytes in (None, 0):
+        rendered = _render_event_data_for_log(data, max_bytes)
+        assert EMAIL not in rendered and "412 345" not in rendered
+        assert "[EMAIL]" in rendered and "[PHONE]" in rendered
+    assert data == snapshot
+
+
+def test_every_string_leaf_of_search_arguments_is_redacted():
+    data = {
+        "tool_name": "web_search",
+        "tool_params": {
+            "query": "ok",
+            "filters": {"site": EMAIL, "tags": [f"a {PHONE}"]},
+            "num_results": 3,
+        },
+    }
+    rendered = _render_event_data_for_log(data)
+    assert EMAIL not in rendered and "412 345" not in rendered
+    assert "'num_results': 3" in rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"query": "find jane.doe@exa...[truncated 20 chars]',
+        "{'query': 'find jane.doe@exa...[truncated 20 chars]",
+        '[{"function_call": "{\\"query\\": \\"find jane.doe@exa...[truncated 9 chars]',
+        '{\\\\"query\\\\" : \\\\"jane.doe@exa...[truncated 9 chars]',
+    ],
+)
+def test_truncated_text_holding_a_query_key_is_withheld_whole(text):
+    rendered = _render_event_data_for_log({"content": text})
+    assert "jane" not in rendered and "@exa" not in rendered
+    assert "[truncated text containing a query withheld]" in rendered
+
+
+def test_cut_leaf_inside_search_arguments_is_withheld():
+    data = {
+        "tool_name": "web_search",
+        "tool_params": {"query": "find jane.doe@exa...[truncated 9 chars]"},
+    }
+    for max_bytes in (None, 0):
+        rendered = _render_event_data_for_log(data, max_bytes)
+        assert "jane" not in rendered and "@exa" not in rendered
+        assert "[search arguments withheld]" in rendered
+
+
+def test_cut_query_text_is_withheld_when_nothing_is_truncated_by_the_sink():
+    data = {"content": '{"query": "jane.doe@exa...[truncated 9 chars]'}
+    rendered = _render_event_data_for_log(data, 0)
+    assert "jane" not in rendered
+    assert "[truncated text containing a query withheld]" in rendered
+
+
+def test_truncated_text_without_a_query_key_is_kept():
+    text = "an ordinary long answer...[truncated 99 chars]"
+    assert text in _render_event_data_for_log({"content": text})
+
+
+def test_truncation_marker_constant_matches_every_reducer():
+    from xagent.core.agent import trace
+
+    marker = trace._TRUNCATION_MARKER
+    assert marker in trace._truncate_string("x" * 500, 50)
+    assert marker in trace._trim_subtree("x" * 500, 50)
+    assert marker in trace._shrink_node("x" * 500, [100], 1, set(), 12)
+    middle = trace._reduce_text_list(["x" * 200] * 20, 400)
+    assert any(isinstance(i, str) and marker in i for i in middle)
 
 
 def test_console_render_leaves_other_tools_alone():

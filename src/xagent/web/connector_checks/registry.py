@@ -197,6 +197,16 @@ def _declared_l3(app_id: str) -> ReadCheck:
     return check
 
 
+# Mixpanel's Free plan refuses the Query API ("your plan does not allow API
+# calls") and answers only the user-profile (Engage) call, so Mixpanel's check
+# is Engage, not the L3 probe (`mixpanel_list_event_names`, a Query API call).
+_MIXPANEL_QUERY_API_NEEDS_A_PAID_PLAN = (
+    "read that the test project's Free plan refuses with 'your plan does not "
+    "allow API calls'; whether it gets a check once the project has a plan "
+    f"with the Query API is decided in {_TIER_2}"
+)
+
+
 def _xero_list_check(list_field: str, *, paged: bool, capped: bool = True) -> ReadCheck:
     """A structural read check on one of Xero's list tools that take no id.
 
@@ -1847,6 +1857,47 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=("linear_create_issue", "linear_add_comment"),
         ),
     ),
+    "mixpanel": ConnectorChecks(
+        "mixpanel",
+        reads=(
+            ReadCheck(
+                "mixpanel.query_engage",
+                "mixpanel_query_engage",
+                {},
+                assertions=(
+                    StatusSuccess(),
+                    HasKeys((), ("engage", "truncated")),
+                    HasKeys(("engage",), ("page", "page_size", "results", "total")),
+                    IsType(("engage", "results"), "array"),
+                    IsType(("engage", "total"), "number"),
+                    IsType(("truncated",), "boolean"),
+                ),
+            ),
+        ),
+        exemptions=(
+            *(
+                ToolExemption(tool, _MIXPANEL_QUERY_API_NEEDS_A_PAID_PLAN)
+                for tool in (
+                    "mixpanel_list_event_names",
+                    "mixpanel_get_top_events",
+                    "mixpanel_list_funnels",
+                )
+            ),
+            *_exemptions(
+                issue=_TIER_2,
+                reads=(
+                    "mixpanel_get_event_properties",
+                    "mixpanel_query_user_activity",
+                    "mixpanel_query_segmentation",
+                    "mixpanel_query_retention",
+                    "mixpanel_query_funnel",
+                    "mixpanel_list_annotations",
+                    "mixpanel_export_events",
+                ),
+                writes_without_cleanup=("mixpanel_create_annotation",),
+            ),
+        ),
+    ),
     "intercom": ConnectorChecks(
         "intercom",
         reads=(
@@ -2043,7 +2094,6 @@ LEGACY_CONNECTORS: frozenset[str] = frozenset(
         "linkedin",
         "magento",
         "meta-ads",
-        "mixpanel",
         "myob",
         "posthog",
         "rocketlane",

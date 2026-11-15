@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
@@ -52,6 +52,13 @@ SALESFORCE_TOOLKIT_SLUG = "salesforce"
 # On the org's own host: login.salesforce.com's userinfo does not serve
 # sandbox orgs.
 SALESFORCE_USERINFO_PATH = "/services/oauth2/userinfo"
+COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
+COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
+# Every Composio app's trips (begin, verification, denial) land on one shared
+# callback URL: XAGENT_COMPOSIO_CALLBACK_URL, else the Meta callback URL.
+COMPOSIO_CALLBACK_PATH = "/api/auth/composio/callback"
+# The two routes that accept the trips; the setting must name one of them.
+_CALLBACK_PATHS = (COMPOSIO_CALLBACK_PATH, "/api/auth/meta/callback")
 
 
 class ComposioApp(NamedTuple):
@@ -334,3 +341,24 @@ def _uses_composio(app: ComposioApp) -> bool:
 
 
 _WARNED_BACKENDS: set[tuple[str, str]] = set()
+
+
+def composio_config_present(app: ComposioApp) -> bool:
+    """Whether this deployment holds the Composio settings the app's connects need."""
+    return all(
+        _env(name)
+        for name in (
+            COMPOSIO_API_KEY_ENV,
+            app.auth_config_env,
+            COMPOSIO_USER_ID_SECRET_ENV,
+        )
+    )
+
+
+def provider_is_composio_only(provider: str, app_ids: Iterable[str]) -> bool:
+    """Whether every app listed runs its web connect through a configured
+    Composio; callers pass builtin registry apps only."""
+    apps = [composio_web_app(provider, app_id) for app_id in app_ids]
+    return bool(apps) and all(
+        app is not None and composio_config_present(app) for app in apps
+    )

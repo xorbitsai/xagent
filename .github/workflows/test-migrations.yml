@@ -1159,6 +1159,21 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # The issuer backfill decodes the catalog audit trail's JSON snapshots,
+      # which each dialect stores and returns differently.
+      - name: Test UserOAuth issuer backfill (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/migrations/test_20261115_user_oauth_issuer.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
   migrations-summary:
     name: Migrations Summary
     runs-on: ubuntu-latest

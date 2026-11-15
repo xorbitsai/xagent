@@ -292,6 +292,14 @@ FilterExpression = Union[
 ]
 
 
+def is_missing_collection_error(collection_name: str, exc: BaseException) -> bool:
+    """Whether a ``get_collection`` error means the row or its table is missing."""
+    return str(exc) in {
+        f"Collection '{collection_name}' not found",
+        "Table 'collection_metadata' was not found",
+    }
+
+
 class MetadataStore(ABC):
     """Control-plane metadata storage contract."""
 

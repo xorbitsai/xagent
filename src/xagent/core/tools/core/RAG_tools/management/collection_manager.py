@@ -28,7 +28,7 @@ from ..core.exceptions import CollectionNotFrozenError
 from ..core.parser_registry import get_supported_parsers, validate_parser_compatibility
 from ..core.schemas import CollectionInfo
 from ..LanceDB.schema_manager import _safe_close_table
-from ..storage.contracts import MetadataStore
+from ..storage.contracts import MetadataStore, is_missing_collection_error
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import list_table_names
 from ..utils.model_resolution_pin import pinned_resolution
@@ -911,6 +911,27 @@ def get_collection_sync(collection_name: str) -> "CollectionInfo":
 
 def _get_collection_sync_impl(collection_name: str) -> "CollectionInfo":
     return _sync_wrapper(collection_manager.get_collection)(collection_name)
+
+
+def get_collection_if_present_sync(collection_name: str) -> Optional["CollectionInfo"]:
+    """The metadata row, ``None`` only when it or its table is missing.
+
+    Unlike ``get_collection_sync``, a failed read is raised, not reported as absent.
+    """
+    return _get_maintenance_compatibility_facade().get_collection_if_present_sync(
+        collection_name
+    )
+
+
+def _get_collection_if_present_sync_impl(
+    collection_name: str,
+) -> Optional["CollectionInfo"]:
+    try:
+        return _sync_wrapper(get_metadata_store().get_collection)(collection_name)
+    except ValueError as exc:
+        if is_missing_collection_error(collection_name, exc):
+            return None
+        raise
 
 
 def initialize_collection_embedding_sync(

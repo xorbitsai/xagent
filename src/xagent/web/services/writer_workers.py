@@ -15,6 +15,7 @@ import contextvars
 import functools
 import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import Executor
 from contextlib import contextmanager
 from typing import Any, TypeVar
 
@@ -29,6 +30,34 @@ _active = 0
 
 async def run_tracked(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
     """``asyncio.to_thread``, counted until the thread itself returns.
+
+    See :func:`run_tracked_in` for the same accounting on a dedicated executor.
+    """
+    return await _run_tracked(None, fn, args, kwargs)
+
+
+async def run_tracked_in(
+    executor: Executor,
+    fn: Callable[..., T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    """:func:`run_tracked` on ``executor`` instead of the default one.
+
+    A bounded executor keeps one stuck job from exhausting the loop's default
+    thread pool, which every ``asyncio.to_thread`` caller shares.
+    """
+    return await _run_tracked(executor, fn, args, kwargs)
+
+
+async def _run_tracked(
+    executor: Executor | None,
+    fn: Callable[..., T],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> T:
+    """Run ``fn`` in a thread, counted until the thread itself returns.
 
     Cancelling the await before the thread started drops the work and the
     count; once it started the thread keeps its count until it finishes.
@@ -52,7 +81,12 @@ async def run_tracked(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
     with _lock:
         _active += 1
     try:
-        return await asyncio.to_thread(runner)
+        if executor is None:
+            return await asyncio.to_thread(runner)
+        context = contextvars.copy_context()
+        return await asyncio.get_running_loop().run_in_executor(
+            executor, functools.partial(context.run, runner)
+        )
     finally:
         with _lock:
             if not state["started"]:

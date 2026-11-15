@@ -106,7 +106,7 @@ def _revoke_alices_grant(db: Session) -> None:
     """Alice's disconnect of the same Google account, after its commit."""
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="google",
+        oauth_provider="google",
         access_token="alice-access",
         provider_user_id=SUBJECT,
         refresh_token="alice-refresh",
@@ -273,7 +273,7 @@ def test_a_second_revoker_cannot_close_the_fence_under_one_in_flight(
             reconnect_status.append(0)  # re-entrancy guard
             auth_api.revoke_builtin_oauth_grant(
                 carol_db,
-                provider="google",
+                oauth_provider="google",
                 access_token="carol-access",
                 provider_user_id=SUBJECT,
                 refresh_token="carol-refresh",

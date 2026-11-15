@@ -11,6 +11,7 @@ import httpx
 
 from ...utils.public_http_transport import create_public_async_client
 from .web_content import get_trusted_proxy_url
+from .web_search_guard import run_guarded_search
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,36 @@ class ZhipuWebSearchCore:
         Returns:
             Raw response JSON from Zhipu Web Search API
         """
+        return await run_guarded_search(
+            "zhipu",
+            query,
+            lambda redacted: self._search_redacted(
+                redacted,
+                search_engine=search_engine,
+                search_intent=search_intent,
+                count=count,
+                search_domain_filter=search_domain_filter,
+                search_recency_filter=search_recency_filter,
+                content_size=content_size,
+                request_id=request_id,
+                user_id=user_id,
+            ),
+            lambda response: len(response.get("search_result") or []),
+        )
+
+    async def _search_redacted(
+        self,
+        query: str,
+        search_engine: str,
+        search_intent: bool,
+        count: int,
+        search_domain_filter: Optional[str],
+        search_recency_filter: str,
+        content_size: str,
+        request_id: Optional[str],
+        user_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Run the search; ``query`` has already been redacted."""
         logger.info(
             "🔍 Zhipu web search query='%s' engine=%s count=%s intent=%s",
             query,

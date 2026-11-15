@@ -877,6 +877,37 @@ def test_process_document_fails_without_success_when_the_commit_fails(
     ]
 
 
+def test_a_write_refused_by_the_migration_check_fails_the_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+
+    _patch_pipeline_dependencies(monkeypatch)
+    refusal = (
+        "Collection 'demo' is frozen for an embedding migration; "
+        "this write is refused, retry it."
+    )
+
+    def _refused(**_kwargs: object) -> None:
+        raise CollectionMigratingError(refusal)
+
+    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _refused)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(),
+    )
+
+    assert result.status == "partial"
+    assert result.failed_step == "write_vectors_to_db"
+    assert result.message == refusal
+    assert result.vector_count == 0
+    assert STATUS_EVENTS[-1]["status"] == DocumentProcessingStatus.FAILED.value
+
+
 def test_process_document_commit_failure_keeps_completed_steps_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

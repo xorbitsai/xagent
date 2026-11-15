@@ -77,6 +77,16 @@ class KBMaintenanceCompatibilityFacade:
         with self._storage_context():
             return _get_collection_sync_impl(collection_name)
 
+    def get_collection_if_present_sync(
+        self, collection_name: str
+    ) -> Optional["CollectionInfo"]:
+        from ..management.collection_manager import (
+            _get_collection_if_present_sync_impl,
+        )
+
+        with self._storage_context():
+            return _get_collection_if_present_sync_impl(collection_name)
+
     def initialize_collection_embedding_sync(
         self, collection_name: str, embedding_model_id: str
     ) -> "CollectionInfo":

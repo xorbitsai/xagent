@@ -35,6 +35,7 @@ from ..management.migration_state import (
     holding_leases,
     verify_active_leases,
 )
+from ..storage.contracts import is_missing_collection_error
 from ..storage.factory import StorageFactory
 from ..utils.user_scope import resolve_user_scope
 from .api_compatibility import KBApiCompatibilityFacade
@@ -1900,11 +1901,7 @@ class KBCoordinator:
 
     @staticmethod
     def _is_missing_collection_error(collection: str, exc: ValueError) -> bool:
-        message = str(exc)
-        return message in {
-            f"Collection '{collection}' not found",
-            "Table 'collection_metadata' was not found",
-        }
+        return is_missing_collection_error(collection, exc)
 
     @staticmethod
     def _resolve_user_scope(request: KBContextRequest) -> KBUserScope:

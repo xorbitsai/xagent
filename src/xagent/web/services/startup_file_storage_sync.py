@@ -137,12 +137,120 @@ _StartupSyncCursor = tuple[int, int]
 _SessionFactory = Callable[[], Session]
 
 
+class StartupSyncCancelled(RuntimeError):
+    """The sync was told to stop (deadline exceeded or process shutdown)."""
+
+
+class StartupSyncControl:
+    """Cooperative cancel flag and progress counters shared with a watchdog.
+
+    The sync thread checks :meth:`checkpoint` between files and batches, so a
+    deadline can stop it at the next boundary. A single storage or database
+    call that never returns cannot be interrupted from here; the watchdog's
+    thread dump is what makes that case diagnosable.
+    """
+
+    def __init__(self) -> None:
+        self.cancel = threading.Event()
+        self.scanned = 0
+        self.phase = "starting"
+
+    def checkpoint(self, phase: str | None = None) -> None:
+        if phase is not None:
+            self.phase = phase
+        if self.cancel.is_set():
+            raise StartupSyncCancelled("Startup file storage sync was cancelled")
+
+
+@dataclass(frozen=True)
+class StartupFileStoragePreflight:
+    """Outcome of the read-only pass: does any registered file need a write?"""
+
+    scanned: int = 0
+    needs_write: int = 0
+    skipped_missing_local: int = 0
+    skipped_backend: bool = False
+
+    @property
+    def clean(self) -> bool:
+        return self.needs_write == 0
+
+
+def preflight_registered_files(
+    *,
+    storage: FsspecFileStorage | Any | None = None,
+    batch_size: int = 500,
+    session_factory: _SessionFactory | None = None,
+    control: StartupSyncControl | None = None,
+) -> StartupFileStoragePreflight:
+    """Classify every registered file without writing storage or the database.
+
+    Uses the same candidate scan and per-user listing as the real sync and the
+    same "already durable" test, but never adopts, uploads or persists. A
+    standby runs it before activation so activation can skip the write pass
+    when nothing needs writing.
+    """
+    backend = _detect_backend(storage)
+    if backend != "s3":
+        return StartupFileStoragePreflight(skipped_backend=True)
+
+    factory = session_factory or _resolve_session_factory(None, None)
+    scanned = 0
+    needs_write = 0
+    skipped_missing_local = 0
+    cursor: _StartupSyncCursor | None = None
+    current_user_id: int | None = None
+    remote_objects: dict[str, Any] = {}
+    user_storage: ScopedFileStorage | None = None
+    while True:
+        if control is not None:
+            control.checkpoint("preflight scan")
+        candidates, next_cursor = _load_startup_sync_candidates(
+            factory, after=cursor, limit=max(1, int(batch_size))
+        )
+        if not candidates:
+            break
+        for candidate, _version in candidates:
+            scanned += 1
+            if candidate.user_id != current_user_id or user_storage is None:
+                current_user_id = candidate.user_id
+                user_storage = _user_scoped_storage(storage, candidate.user_id)
+                remote_objects = _list_remote_objects_for_user(user_storage)
+            key = _expected_storage_key(candidate)
+            if key in remote_objects:
+                if not _has_complete_durable_metadata(candidate):
+                    needs_write += 1  # adoption persists the row
+                continue
+            local_path = Path(candidate.storage_path)
+            if not local_path.exists() or not local_path.is_file():
+                skipped_missing_local += 1
+                continue
+            needs_write += 1
+        cursor = next_cursor
+        if control is not None:
+            control.scanned = scanned
+    result = StartupFileStoragePreflight(
+        scanned=scanned,
+        needs_write=needs_write,
+        skipped_missing_local=skipped_missing_local,
+    )
+    logger.info(
+        "Startup file storage preflight complete: scanned=%s needs_write=%s "
+        "skipped_missing_local=%s",
+        result.scanned,
+        result.needs_write,
+        result.skipped_missing_local,
+    )
+    return result
+
+
 def sync_registered_files_to_durable_storage(
     db: Session | None = None,
     *,
     storage: FsspecFileStorage | Any | None = None,
     batch_size: int = 500,
     session_factory: _SessionFactory | None = None,
+    control: StartupSyncControl | None = None,
 ) -> StartupFileStorageSyncResult:
     """Reconcile DB registrations without holding a connection during storage I/O.
 
@@ -168,11 +276,12 @@ def sync_registered_files_to_durable_storage(
     file_lock = None
     try:
         SessionLocal = _resolve_session_factory(db, session_factory)
-        file_lock = _acquire_file_lock_after_contention()
+        file_lock = _acquire_file_lock_after_contention(control)
         return _sync_registered_files(
             SessionLocal,
             storage=storage,
             batch_size=batch_size,
+            control=control,
         )
     finally:
         if file_lock is not None:
@@ -199,9 +308,13 @@ def _resolve_session_factory(
     return get_session_local()
 
 
-def _acquire_file_lock_after_contention() -> Any:
+def _acquire_file_lock_after_contention(
+    control: StartupSyncControl | None = None,
+) -> Any:
     file_lock = _acquire_file_lock()
     while file_lock is None:
+        if control is not None:
+            control.checkpoint("waiting for sync lock holder")
         logger.info(
             "Startup file storage sync is already running in another process; waiting"
         )
@@ -236,6 +349,7 @@ def _sync_registered_files(
     *,
     storage: FsspecFileStorage | Any | None,
     batch_size: int,
+    control: StartupSyncControl | None = None,
 ) -> StartupFileStorageSyncResult:
     scanned = 0
     already_present = 0
@@ -249,6 +363,8 @@ def _sync_registered_files(
     user_storage: ScopedFileStorage | None = None
     remote_objects: dict[str, Any] = {}
     while True:
+        if control is not None:
+            control.checkpoint("sync scan")
         candidates, next_cursor = _load_startup_sync_candidates(
             session_factory,
             after=cursor,
@@ -258,6 +374,9 @@ def _sync_registered_files(
             break
         for candidate, expected_version in candidates:
             scanned += 1
+            if control is not None:
+                control.scanned = scanned
+                control.checkpoint()
             user_id = candidate.user_id
             if user_id != current_user_id or user_storage is None:
                 current_user_id = user_id

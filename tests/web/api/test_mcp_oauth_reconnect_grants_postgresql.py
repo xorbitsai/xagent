@@ -30,6 +30,7 @@ from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
@@ -59,6 +60,7 @@ def factory():
                 PublicMCPApp.__table__,
                 MCPOAuthClient.__table__,
                 MCPOAuthGrant.__table__,
+                OAuthRevocationFence.__table__,
                 MCPOAuthFlowState.__table__,
                 CredentialRevocation.__table__,
             ],

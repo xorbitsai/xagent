@@ -919,3 +919,30 @@ async def test_a_tombstoned_row_with_an_unknown_issuer_fails_without_a_call(
     assert "unknown issuer" in record.last_error
     _assert_erased(record)
     assert google.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_recreated_server_reusing_local_ids_is_not_mistaken_for_a_successor(
+    factory, rfc7009
+):
+    """SQLite hands the highest deleted ids to the next inserts. A server
+    deleted and recreated before the worker runs gets the old server and
+    client row ids back, but registers a different remote client: its grant
+    is a different authorization and must not keep the old one alive."""
+    with factory() as db:
+        user = _user(db)
+        server, client, grant = _mcp(db, user)
+        old_ids = (server.id, client.id)
+        db.commit()
+        db.delete(grant)
+        db.commit()
+        db.execute(text("DELETE FROM mcp_servers WHERE id = :id"), {"id": server.id})
+        db.commit()
+
+        server, client, _ = _mcp(db, user)
+        client.client_id = "recreated-remote-client"
+        db.commit()
+        assert (server.id, client.id) == old_ids
+
+    assert (await _run(factory)).outcomes == {"revoked": 1}
+    assert [call["client_id"] for call in rfc7009.calls] == ["mcp-client"] * 2

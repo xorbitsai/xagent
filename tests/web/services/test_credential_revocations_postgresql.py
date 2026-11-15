@@ -27,6 +27,8 @@ from xagent.web.models.credential_revocation import CredentialRevocation
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.oauth_revocation_fence import OAuthRevocationFence
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import credential_revocations as outbox
@@ -48,6 +50,8 @@ def factory():
                 MCPServer.__table__,
                 MCPOAuthClient.__table__,
                 MCPOAuthGrant.__table__,
+                OAuthRevocationFence.__table__,
+                OAuthProvider.__table__,
                 CredentialRevocation.__table__,
             ],
         )

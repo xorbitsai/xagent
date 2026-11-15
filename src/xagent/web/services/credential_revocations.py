@@ -631,7 +631,9 @@ async def _revoke_user_oauth(
         if not references:
             return None
         if all(row.provider_user_id is None for row in references):
-            return "a legacy connection with no recorded account id may share this grant"
+            return (
+                "a legacy connection with no recorded account id may share this grant"
+            )
         return "another local connection still references this account"
 
     claim = await run_tracked(

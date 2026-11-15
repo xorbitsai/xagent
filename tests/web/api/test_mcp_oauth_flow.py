@@ -5739,3 +5739,141 @@ async def test_regional_bootstrap_moves_proof_without_changing_flow_client(
     with pytest.raises(HTTPException) as exc:
         redeem_handoff("au", bootstrap, db)
     assert exc.value.status_code == 401
+
+
+# --- a reconnect racing the deferred revocation of its own authorization -----
+
+
+def _disconnected_grant_awaiting_revocation(db, user, state: str):
+    """A connect flow, and a grant of the same authorization that was just
+    deleted, so its revocation waits in the credential revocation outbox."""
+    server, client, flow_state = _add_callback_client_and_state(
+        db,
+        user,
+        state=state,
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=flow_state.resource_owner_key,
+        issuer=flow_state.issuer,
+        resource=flow_state.resource,
+        scope="records.read",
+        access_token=encrypt_value("disconnected-access"),
+    )
+    db.add(grant)
+    db.commit()
+    db.delete(grant)
+    db.commit()
+    return server
+
+
+def _revocation_endpoint(monkeypatch) -> list[str]:
+    """Answer the outbox worker's RFC 7009 calls; returns the tokens sent."""
+    sent: list[str] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(parse_qs(request.content.decode())["token"][0])
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **_: real_async_client(transport=httpx.MockTransport(handler)),
+    )
+    return sent
+
+
+def _run_outbox(db):
+    from datetime import datetime, timezone
+
+    from xagent.web.services.credential_revocations import (
+        run_credential_revocation_batch,
+    )
+
+    return run_credential_revocation_batch(
+        sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False),
+        now=lambda: datetime.now(timezone.utc) + timedelta(seconds=1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_whose_exchange_overlaps_the_revocation_is_refused(
+    db_session, monkeypatch
+):
+    """The disconnected grant's revocation reaches the provider while the
+    reconnect's code exchange is in flight. An authorization server that
+    ends the whole authorization would kill the tokens just issued, so the
+    callback must not store them and report success: the shared fence
+    refuses them, they are compensated, and the user is asked to reconnect."""
+    db, user, _ = db_session
+    _disconnected_grant_awaiting_revocation(db, user, "overlapping-reconnect")
+    sent = _revocation_endpoint(monkeypatch)
+    compensated: list[str] = []
+
+    async def exchange_while_the_outbox_revokes(**_kwargs):
+        report = await _run_outbox(db)
+        assert report.outcomes == {"revoked": 1}
+        return {
+            "access_token": "reconnected-access",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    async def record_compensation(snapshot):
+        compensated.append(snapshot.access_token)
+
+    monkeypatch.setattr(
+        mcp_api, "_exchange_mcp_oauth_code", exchange_while_the_outbox_revokes
+    )
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_compensation
+    )
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=overlapping-reconnect"),
+        db,
+    )
+
+    assert _redirect_query(response)["mcp_oauth_error"] == [
+        "grant_revoked_during_exchange"
+    ]
+    assert sent == ["disconnected-access"]
+    assert compensated == ["reconnected-access"]
+    db.expire_all()
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_that_commits_first_keeps_its_authorization(
+    db_session, monkeypatch
+):
+    """The other order: the reconnect commits before the worker locks the
+    fence, so the worker's reference check sees the live successor and
+    skips the revocation that would end it."""
+    db, user, _ = db_session
+    _disconnected_grant_awaiting_revocation(db, user, "first-reconnect")
+    sent = _revocation_endpoint(monkeypatch)
+
+    async def exchange(**_kwargs):
+        return {
+            "access_token": "reconnected-access",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", exchange)
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=first-reconnect"),
+        db,
+    )
+    assert _redirect_query(response) == {"mcp_oauth_success": ["1"]}
+
+    assert (await _run_outbox(db)).outcomes == {"skipped": 1}
+    assert sent == []
+    assert credential_revocation_statuses(db) == ["skipped"]
+    assert db.query(MCPOAuthGrant).one().status == "active"

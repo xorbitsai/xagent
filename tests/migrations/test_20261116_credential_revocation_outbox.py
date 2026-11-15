@@ -157,3 +157,119 @@ def test_sqlite_migration_installs_what_the_models_install(tmp_path) -> None:
 def test_postgresql_migration_installs_what_the_models_install() -> None:
     with disposable_database_factory("xagent_credential_revocations") as make:
         _assert_migration_matches_models(make)
+
+
+def _assert_upgrade_retries_a_revoked_grant(
+    make_engine: Callable[[str], sa.Engine], monkeypatch
+) -> None:
+    """A grant was marked revoked before this revision while its provider
+    revocation failed, so its tokens are still live. The upgrade must leave
+    a receipt for it, and the worker then revokes it."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    from sqlalchemy.orm import sessionmaker
+
+    from xagent.core.utils.encryption import decrypt_value_strict, encrypt_value
+    from xagent.web.models.credential_revocation import CredentialRevocation
+    from xagent.web.models.mcp import MCPServer
+    from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+    from xagent.web.models.user import User
+    from xagent.web.services import mcp_oauth as mcp_oauth_service
+    from xagent.web.services.credential_revocations import (
+        run_credential_revocation_batch,
+    )
+
+    engine = make_engine("cutover")
+    Base.metadata.create_all(engine)
+    with engine.connect() as connection:
+        _strip_outbox(connection)
+        connection.commit()
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    with factory() as db:
+        user = User(username="alice", password_hash="x", is_admin=False)
+        server = MCPServer.from_config(
+            {
+                "name": "records",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            }
+        )
+        db.add_all([user, server])
+        db.flush()
+        client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="mcp-client",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://app.example.com/api/mcp/oauth/callback",
+            metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+        )
+        db.add(client)
+        db.flush()
+        for status, token in (("revoked", "still-live"), ("active", "in-use")):
+            db.add(
+                MCPOAuthGrant(
+                    mcp_server_id=server.id,
+                    user_id=user.id,
+                    mcp_oauth_client_id=client.id,
+                    resource_owner_key=f"xagent:user:{user.id}:{status}",
+                    issuer="https://auth.example.com",
+                    resource="https://mcp.example.com/mcp",
+                    scope="records.read",
+                    access_token=encrypt_value(f"{token}-access"),
+                    refresh_token=encrypt_value(f"{token}-refresh"),
+                    status=status,
+                )
+            )
+        db.commit()
+
+    config = create_alembic_config(engine)
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, REVISION)
+        connection.commit()
+
+    with factory() as db:
+        [receipt] = db.query(CredentialRevocation).all()
+        assert receipt.status == "pending"
+        assert decrypt_value_strict(receipt.access_token) == "still-live-access"
+        assert receipt.client_id == "mcp-client"
+        assert receipt.revocation_endpoint == "https://auth.example.com/revoke"
+
+    sent: list[str] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(httpx.QueryParams(request.content.decode())["token"])
+        return httpx.Response(200)
+
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **_: real_async_client(transport=httpx.MockTransport(handler)),
+    )
+    report = asyncio.run(
+        run_credential_revocation_batch(
+            factory, now=lambda: datetime.now(timezone.utc) + timedelta(seconds=1)
+        )
+    )
+    assert report.outcomes == {"revoked": 1}
+    assert sent == ["still-live-access", "still-live-refresh"]
+
+
+def test_sqlite_upgrade_retries_a_grant_revoked_before_it(tmp_path, monkeypatch):
+    _assert_upgrade_retries_a_revoked_grant(
+        lambda name: sa.create_engine(f"sqlite:///{tmp_path / name}.db"), monkeypatch
+    )
+
+
+@pytest.mark.postgresql
+def test_postgresql_upgrade_retries_a_grant_revoked_before_it(monkeypatch):
+    with disposable_database_factory("xagent_credential_revocation_cutover") as make:
+        _assert_upgrade_retries_a_revoked_grant(make, monkeypatch)

@@ -4,8 +4,9 @@ disconnected.
 Google grants are stored under the connecting app's id (``gmail``,
 ``google-drive``, ...) or the bare ``google`` key, and every one of them was
 issued to the same Google OAuth client -- so the revoke resolves the
-provider through the catalog, revokes through the refresh token, and skips
-while any sibling row for the same Google account is still connected.
+provider from the row's recorded issuer (``UserOAuth.oauth_provider``),
+revokes through the refresh token, and skips while any sibling row for the
+same Google account is still connected.
 """
 
 from __future__ import annotations
@@ -83,10 +84,10 @@ def _assert_revoked_with(post: Mock, token: str) -> None:
     assert kwargs["data"] == {"token": token}
 
 
-def test_resolve_maps_an_app_key_to_a_google_revocation(db):
+def test_resolve_maps_a_google_issuer_to_a_google_revocation(db):
     resolved = auth_api.resolve_builtin_oauth_revocation(
         db,
-        provider="gmail",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -108,7 +109,7 @@ def test_resolve_skips_a_composio_backed_row(db):
     assert (
         auth_api.resolve_builtin_oauth_revocation(
             db,
-            provider="gmail",
+            oauth_provider=None,
             access_token="ca_composio-account",
             provider_user_id="sub-1",
             token_type=COMPOSIO_TOKEN_TYPE,
@@ -136,7 +137,7 @@ def test_revoke_prefers_the_refresh_token(db, post):
     with invalid_token without revoking the grant behind it."""
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="google-drive",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -148,7 +149,7 @@ def test_revoke_prefers_the_refresh_token(db, post):
 def test_revoke_falls_back_to_the_access_token(db, post):
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="google",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
     )
@@ -164,6 +165,7 @@ def test_revoke_skips_while_a_sibling_google_app_is_connected(db, post):
         UserOAuth(
             user_id=int(user.id),
             provider="google-drive",
+            oauth_provider="google",
             provider_user_id="sub-1",
             access_token="drive-access",
         )
@@ -172,7 +174,7 @@ def test_revoke_skips_while_a_sibling_google_app_is_connected(db, post):
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="gmail",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -196,7 +198,7 @@ def test_a_composio_sibling_does_not_block_the_revoke(db, post):
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="gmail",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -213,6 +215,7 @@ def test_a_google_row_without_an_upstream_id_is_never_revoked(db, post):
         UserOAuth(
             user_id=int(user.id),
             provider="google-drive",
+            oauth_provider="google",
             provider_user_id="sub-1",
             access_token="drive-access",
         )
@@ -221,7 +224,7 @@ def test_a_google_row_without_an_upstream_id_is_never_revoked(db, post):
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="gmail",
+        oauth_provider="google",
         access_token="access",
         provider_user_id=None,
         refresh_token="refresh",
@@ -238,6 +241,7 @@ def test_a_same_user_google_row_without_an_upstream_id_blocks_the_revoke(db, pos
         UserOAuth(
             user_id=int(user.id),
             provider="gmail",
+            oauth_provider="google",
             provider_user_id=None,
             access_token="legacy-gmail-access",
         )
@@ -246,7 +250,7 @@ def test_a_same_user_google_row_without_an_upstream_id_blocks_the_revoke(db, pos
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="google-drive",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -265,6 +269,7 @@ def test_another_users_google_row_without_an_upstream_id_blocks_the_revoke(db, p
         UserOAuth(
             user_id=int(other.id),
             provider="gmail",
+            oauth_provider="google",
             provider_user_id=None,
             access_token="bobs-legacy-access",
         )
@@ -273,7 +278,7 @@ def test_another_users_google_row_without_an_upstream_id_blocks_the_revoke(db, p
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="google-drive",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -293,6 +298,7 @@ def test_a_tokenless_or_composio_google_row_without_an_upstream_id_does_not_bloc
             UserOAuth(
                 user_id=int(user.id),
                 provider="gmail",
+                oauth_provider="google",
                 provider_user_id=None,
                 access_token="",
             ),
@@ -309,7 +315,7 @@ def test_a_tokenless_or_composio_google_row_without_an_upstream_id_does_not_bloc
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="google-drive",
+        oauth_provider="google",
         access_token="access",
         provider_user_id="sub-1",
         refresh_token="refresh",
@@ -330,6 +336,7 @@ async def test_the_skip_log_names_an_unidentified_legacy_row_and_the_context(
         UserOAuth(
             user_id=int(user.id),
             provider="gmail",
+            oauth_provider="google",
             provider_user_id=None,
             access_token="legacy-gmail-access",
         )
@@ -361,6 +368,7 @@ def test_the_skip_log_names_a_sibling_row_recording_the_same_account(db, post, c
         UserOAuth(
             user_id=int(user.id),
             provider="google-drive",
+            oauth_provider="google",
             provider_user_id="sub-1",
             access_token="drive-access",
         )
@@ -370,7 +378,7 @@ def test_the_skip_log_names_a_sibling_row_recording_the_same_account(db, post, c
     with caplog.at_level(logging.INFO, logger=auth_api.logger.name):
         auth_api.revoke_builtin_oauth_grant(
             db,
-            provider="gmail",
+            oauth_provider="google",
             access_token="access",
             provider_user_id="sub-1",
             refresh_token="refresh",
@@ -477,6 +485,7 @@ async def test_delete_mcp_server_revokes_the_google_grant(db, post):
         UserOAuth(
             user_id=int(user.id),
             provider="gmail",
+            oauth_provider="google",
             provider_user_id="sub-1",
             access_token="access",
             refresh_token="refresh",
@@ -498,6 +507,7 @@ def _shared_grant_with_tombstoned_last_link(db: Session, user: User) -> UserOAut
     shared = UserOAuth(
         user_id=int(user.id),
         provider="google",
+        oauth_provider="google",
         provider_user_id="sub-1",
         access_token="shared-access",
         refresh_token="shared-refresh",
@@ -506,6 +516,7 @@ def _shared_grant_with_tombstoned_last_link(db: Session, user: User) -> UserOAut
     legacy = UserOAuth(
         user_id=int(user.id),
         provider="google-drive",
+        oauth_provider="google",
         provider_user_id="sub-1",
         access_token="shared-access",
         refresh_token="shared-refresh",
@@ -580,6 +591,7 @@ async def test_a_shared_grant_a_sibling_app_still_links_is_not_revoked(db, post)
     calendar = UserOAuth(
         user_id=int(user.id),
         provider="google-calendar",
+        oauth_provider="google",
         provider_user_id="sub-1",
         access_token="shared-access",
         refresh_token="shared-refresh",
@@ -612,6 +624,7 @@ async def test_deleting_a_non_google_account_leaves_the_google_fences_alone(db, 
     dropbox = UserOAuth(
         user_id=int(user.id),
         provider="dropbox",
+        oauth_provider="dropbox",
         provider_user_id="dropbox-1",
         access_token="dropbox-access",
     )

@@ -1916,6 +1916,10 @@ def _store_grant(
             provider_user_id=provider_user_id,
             access_token=account_id,
             token_type=COMPOSIO_TOKEN_TYPE,
+            # The grant behind a Composio account was issued to Composio's own
+            # OAuth app, never this deployment's client, so there is no
+            # native issuer to record or revoke with.
+            oauth_provider=None,
             refresh_token=None,
             expires_at=None,
             instance_url=composio_user,

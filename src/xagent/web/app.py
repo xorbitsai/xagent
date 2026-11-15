@@ -1,4 +1,6 @@
 import asyncio
+import contextvars
+import faulthandler
 import functools
 import importlib
 import json
@@ -6,9 +8,11 @@ import logging
 import mimetypes
 import os
 import random
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -151,7 +155,7 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
-from .services.writer_workers import drain_workers, run_tracked
+from .services.writer_workers import drain_workers, run_tracked, run_tracked_in
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
@@ -276,10 +280,94 @@ _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
 FILE_STORAGE_STARTUP_SYNC_GATE_POLL_INTERVAL_SECONDS = 0.25
+# One attempt is logged every progress interval. If it makes no progress (no
+# file or batch completed) for the dump threshold, every thread's stack is
+# dumped; after the stall window it is cancelled and retried from where it got
+# to. A long scan that keeps completing work is never cancelled.
+FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS = 30.0
+FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS = 60.0
+FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS = 600.0
+FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS = 10.0
+
+# Path prefixes the host app keeps answering while the startup sync runs, so
+# control endpoints (a release host's lifecycle probe) never wait on file I/O.
+_file_storage_startup_sync_exempt_prefixes: set[str] = set()
+_file_storage_sync_executor: ThreadPoolExecutor | None = None
+
+
+def register_file_storage_startup_sync_exempt_prefix(prefix: str) -> None:
+    """Let requests under ``prefix`` bypass the startup file storage sync gate."""
+    normalized = str(prefix or "").strip()
+    if not normalized.startswith("/"):
+        raise ValueError("exempt prefix must start with '/'")
+    _file_storage_startup_sync_exempt_prefixes.add(normalized)
+
+
+def _is_file_storage_startup_sync_exempt(path: str) -> bool:
+    if path in FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS:
+        return True
+    return any(
+        path.startswith(prefix) for prefix in _file_storage_startup_sync_exempt_prefixes
+    )
+
+
+def _get_file_storage_sync_executor() -> ThreadPoolExecutor:
+    """Small dedicated pool: a stuck sync cannot starve ``asyncio.to_thread``."""
+    global _file_storage_sync_executor
+    if _file_storage_sync_executor is None:
+        _file_storage_sync_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="startup-file-sync"
+        )
+    return _file_storage_sync_executor
+
+
+def get_file_storage_startup_sync_status(app_instance: FastAPI) -> dict[str, Any]:
+    """Cheap, non-blocking view of the startup sync for host lifecycle reports.
+
+    ``state`` is ``disabled`` | ``pending`` | ``running`` | ``failed`` | ``done``;
+    ``gating`` says whether client requests currently wait on it.
+    """
+    state = app_instance.state
+    task = getattr(state, "file_storage_startup_sync_task", None)
+    error = getattr(state, "file_storage_startup_sync_error", None)
+    completed = bool(getattr(state, "file_storage_startup_sync_completed", False))
+    started = getattr(state, "file_storage_startup_sync_started_at", None)
+    finished = getattr(state, "file_storage_startup_sync_finished_at", None)
+    if not get_file_storage_startup_sync_enabled():
+        name = "disabled"
+    elif error is not None:
+        name = "failed"
+    elif completed:
+        name = "done"
+    elif task is not None and not task.done():
+        name = "running"
+    else:
+        name = "pending"
+    elapsed: float | None = None
+    if started is not None:
+        elapsed = round(
+            (finished if finished is not None else time.monotonic()) - started, 3
+        )
+    status: dict[str, Any] = {
+        "state": name,
+        "elapsed_seconds": elapsed,
+        "gating": bool(getattr(state, "file_storage_startup_sync_gating", True)),
+    }
+    if error is not None:
+        status["error"] = type(error).__name__
+    return status
+
+
+# Carries the attempt's cancel/progress control into the sync thread without
+# widening the signature hosts and tests patch.
+_file_storage_sync_control: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "file_storage_sync_control", default=None
+)
 
 
 def run_startup_file_storage_sync() -> None:
     """Synchronize DB-registered local files into durable S3 storage."""
+    control = _file_storage_sync_control.get()
     if not get_file_storage_startup_sync_enabled():
         logger.info("Startup file storage sync is disabled")
         return
@@ -288,11 +376,87 @@ def run_startup_file_storage_sync() -> None:
         sync_registered_files_to_durable_storage,
     )
 
-    result = sync_registered_files_to_durable_storage()
+    if control is None:
+        result = sync_registered_files_to_durable_storage()
+    else:
+        result = sync_registered_files_to_durable_storage(control=control)
+        if result.locked:
+            # An earlier attempt's thread is still inside the sync (it was
+            # cancelled at its deadline but has not reached a checkpoint).
+            # Reporting success here would mark the sync complete.
+            raise RuntimeError(
+                "Startup file storage sync is still running from a previous attempt"
+            )
     if result.failed:
         raise RuntimeError(
             f"Startup file storage sync failed for {result.failed} registered file(s)"
         )
+
+
+def _dump_all_thread_stacks(reason: str) -> None:
+    logger.error("Dumping all thread stacks to stderr: %s", reason)
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not dump thread stacks")
+
+
+async def _run_bounded_file_storage_sync_attempt(resume: Any = None) -> None:
+    """One sync attempt with progress logs, a stack dump and a stall timeout."""
+    from .services.startup_file_storage_sync import StartupSyncControl
+
+    control = StartupSyncControl(resume)
+    started = time.monotonic()
+
+    def _attempt() -> None:
+        token = _file_storage_sync_control.set(control)
+        try:
+            run_startup_file_storage_sync()
+        finally:
+            _file_storage_sync_control.reset(token)
+
+    future = asyncio.ensure_future(
+        run_tracked_in(_get_file_storage_sync_executor(), _attempt)
+    )
+    dumped = False
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {future},
+                timeout=FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS,
+            )
+            if done:
+                return future.result()
+            now = time.monotonic()
+            elapsed = now - started
+            idle = now - control.last_progress
+            logger.warning(
+                "Startup file storage sync still running: elapsed=%.0fs "
+                "no_progress=%.0fs scanned=%s phase=%s",
+                elapsed,
+                idle,
+                control.scanned,
+                control.phase,
+            )
+            if not dumped and idle >= FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS:
+                dumped = True
+                _dump_all_thread_stacks(
+                    f"startup file storage sync made no progress for {idle:.0f}s"
+                )
+            if idle >= FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS:
+                control.cancel.set()
+                done, _ = await asyncio.wait(
+                    {future}, timeout=FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS
+                )
+                if done:
+                    future.exception()  # cancelled at a checkpoint; retrieve it
+                raise TimeoutError(
+                    "Startup file storage sync made no progress for "
+                    f"{idle:.0f}s (scanned={control.scanned} phase={control.phase})"
+                )
+    except BaseException:
+        control.cancel.set()
+        raise
 
 
 async def _run_file_storage_startup_sync_with_retries(
@@ -300,9 +464,14 @@ async def _run_file_storage_startup_sync_with_retries(
     *,
     retry_interval_seconds: float,
 ) -> None:
+    app_instance.state.file_storage_startup_sync_started_at = time.monotonic()
+    app_instance.state.file_storage_startup_sync_finished_at = None
+    from .services.startup_file_storage_sync import StartupSyncResume
+
+    resume = StartupSyncResume()  # survives retries: a stall does not rescan
     while True:
         try:
-            await run_tracked(run_startup_file_storage_sync)
+            await _run_bounded_file_storage_sync_attempt(resume)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -318,6 +487,7 @@ async def _run_file_storage_startup_sync_with_retries(
         else:
             app_instance.state.file_storage_startup_sync_error = None
             app_instance.state.file_storage_startup_sync_completed = True
+            app_instance.state.file_storage_startup_sync_finished_at = time.monotonic()
             return
 
 
@@ -325,12 +495,21 @@ def start_file_storage_startup_sync_task(
     app_instance: FastAPI,
     *,
     retry_interval_seconds: float | None = None,
+    gating: bool = True,
 ) -> asyncio.Task[Any] | None:
-    """Start durable file storage startup sync without blocking app startup."""
+    """Start durable file storage startup sync without blocking app startup.
+
+    ``gating=False`` runs the same sync in the background while client
+    requests and ``/ready`` proceed; only a standby whose read-only preflight
+    found nothing to write uses it.
+    """
     global _file_storage_startup_sync_task
 
     app_instance.state.file_storage_startup_sync_task = None
     app_instance.state.file_storage_startup_sync_error = None
+    app_instance.state.file_storage_startup_sync_gating = gating
+    app_instance.state.file_storage_startup_sync_started_at = None
+    app_instance.state.file_storage_startup_sync_finished_at = None
 
     if not get_file_storage_startup_sync_enabled():
         logger.info("Startup file storage sync is disabled")
@@ -365,6 +544,10 @@ def start_file_storage_startup_sync_task(
         else:
             app_instance.state.file_storage_startup_sync_error = None
             app_instance.state.file_storage_startup_sync_completed = True
+            if app_instance.state.file_storage_startup_sync_finished_at is None:
+                app_instance.state.file_storage_startup_sync_finished_at = (
+                    time.monotonic()
+                )
 
     task.add_done_callback(_record_file_storage_sync_result)
     logger.info("Started background startup file storage sync task")
@@ -1262,6 +1445,8 @@ def start_temp_file_cleanup_task(
 
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
     """Wait until durable file storage startup sync has completed successfully."""
+    if not getattr(app_instance.state, "file_storage_startup_sync_gating", True):
+        return
     while True:
         error = getattr(app_instance.state, "file_storage_startup_sync_error", None)
         if error is not None:
@@ -1315,7 +1500,7 @@ class FileStorageStartupSyncGateMiddleware:
             return
 
         path = str(scope.get("path") or "")
-        if path in FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS:
+        if _is_file_storage_startup_sync_exempt(path):
             await self.app(scope, receive, send)
             return
         if scope_type == "http" and str(scope.get("method") or "").upper() == "OPTIONS":
@@ -1384,6 +1569,9 @@ async def readiness_check() -> JSONResponse:
     """
     task = getattr(app.state, "file_storage_startup_sync_task", None)
     error = getattr(app.state, "file_storage_startup_sync_error", None)
+    if not getattr(app.state, "file_storage_startup_sync_gating", True):
+        task = None
+        error = None
 
     if error is not None:
         return JSONResponse(
@@ -1975,6 +2163,62 @@ async def _open_admission() -> None:
     release_hold.reopen()
 
 
+async def _run_file_storage_preflight(app_instance: FastAPI) -> None:
+    """Standby: classify registered files read-only, before activation.
+
+    The result lets activation skip the gated write pass when every file is
+    already durable. Any failure leaves no result, which activation reads as
+    "unknown" and answers with the full gated sync.
+    """
+    from .services.startup_file_storage_sync import (
+        StartupSyncControl,
+        preflight_registered_files,
+    )
+
+    control = StartupSyncControl()
+    app_instance.state.file_storage_preflight_control = control
+    app_instance.state.file_storage_preflight_result = None
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            _get_file_storage_sync_executor(),
+            functools.partial(preflight_registered_files, control=control),
+        )
+    except asyncio.CancelledError:
+        control.cancel.set()
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Standby file storage preflight failed; activation will run the full sync"
+        )
+        return
+    app_instance.state.file_storage_preflight_result = result
+
+
+def _start_file_storage_preflight(app_instance: FastAPI) -> None:
+    app_instance.state.file_storage_preflight_task = None
+    app_instance.state.file_storage_preflight_result = None
+    if not get_file_storage_startup_sync_enabled():
+        return
+    app_instance.state.file_storage_preflight_task = asyncio.create_task(
+        _run_file_storage_preflight(app_instance)
+    )
+
+
+def _file_storage_sync_should_gate(app_instance: FastAPI) -> bool:
+    """Whether client requests wait for the post-activation sync.
+
+    Only a standby whose preflight finished before activation and found every
+    registered file already durable (or unreachable locally, which the sync
+    skips) starts the sync in the background. Anything else -- a normal start,
+    a preflight that is unfinished, failed or found files to write -- keeps the
+    gate: those files must be durable before clients are served, as before.
+    """
+    if getattr(app_instance.state, "file_storage_preflight_task", None) is None:
+        return True
+    result = getattr(app_instance.state, "file_storage_preflight_result", None)
+    return result is None or not result.clean
+
+
 async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
@@ -1983,7 +2227,14 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     if not get_shared_task_execution_enabled():
         background_task_manager.start_accepting()
 
-    start_file_storage_startup_sync_task(app_instance)
+    if _file_storage_sync_should_gate(app_instance):
+        start_file_storage_startup_sync_task(app_instance)
+    else:
+        logger.info(
+            "Standby preflight found every registered file durable; the startup "
+            "file storage sync runs in the background without gating requests"
+        )
+        start_file_storage_startup_sync_task(app_instance, gating=False)
     if not get_shared_task_execution_enabled():
         start_trigger_dispatcher_task(app_instance)
         start_task_lease_recovery_task(app_instance)
@@ -2016,6 +2267,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
             "local runtime loops",
             functools.partial(_start_local_runtime_loops, app_instance),
         )
+        _start_file_storage_preflight(app_instance)
         return
 
     await _admit_database_and_host(app_instance, bound=False)
@@ -2607,6 +2859,13 @@ async def _stop_runtime_loops() -> None:
         with suppress(asyncio.CancelledError):
             await _sandbox_idle_sweep_task
     _sandbox_idle_sweep_task = None
+
+    preflight_task = getattr(app.state, "file_storage_preflight_task", None)
+    if preflight_task is not None and not preflight_task.done():
+        preflight_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await preflight_task
+    app.state.file_storage_preflight_task = None
 
     if _file_storage_startup_sync_task and not _file_storage_startup_sync_task.done():
         logger.info("Cancelling background startup file storage sync task...")

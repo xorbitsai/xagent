@@ -136,6 +136,7 @@ from xagent.config import (
     get_background_job_stale_seconds,
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
+    get_brave_search_country,
     get_brave_search_endpoint,
     get_browser_cua_driver_command,
     get_browser_cua_driver_max_elements,
@@ -1041,6 +1042,20 @@ class TestGetWebSearchProvider:
         assert provider not in WEB_SEARCH_PROVIDERS
         assert provider != "auto"
         assert WEB_SEARCH_PROVIDER in caplog.text
+
+
+class TestGetBraveSearchCountry:
+    def test_values(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_BRAVE_SEARCH_COUNTRY", raising=False)
+        assert get_brave_search_country() is None
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", " Au ")
+        assert get_brave_search_country() == "au"
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", "")
+        assert get_brave_search_country() is None
+
+    def test_invalid_value_ignored(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", "AUS")
+        assert get_brave_search_country() is None
 
 
 class TestGetBraveSearchEndpoint:

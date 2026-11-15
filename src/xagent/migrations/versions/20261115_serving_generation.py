@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "20261115_serving_generation"
-down_revision = "20261114_oauth_revocation_fences"
+down_revision = "20261115_user_oauth_issuer"
 branch_labels = None
 depends_on = None
 

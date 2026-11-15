@@ -55,7 +55,7 @@ def test_revision_chains_onto_the_previous_head(tmp_path) -> None:
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'h.db'}")
     script = ScriptDirectory.from_config(create_alembic_config(engine))
     revision = script.get_revision("20261115_serving_generation")
-    assert revision.down_revision == "20261114_oauth_revocation_fences"
+    assert revision.down_revision == "20261115_user_oauth_issuer"
     assert len(script.get_heads()) == 1
 
 

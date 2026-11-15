@@ -221,6 +221,7 @@ SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 BRAVE_SEARCH_ENDPOINT = "XAGENT_BRAVE_SEARCH_ENDPOINT"
+BRAVE_SEARCH_COUNTRY = "XAGENT_BRAVE_SEARCH_COUNTRY"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 TOOL_PARALLEL_ENABLED = "XAGENT_TOOL_PARALLEL_ENABLED"
 TOOL_MAX_CONCURRENCY = "XAGENT_TOOL_MAX_CONCURRENCY"
@@ -4638,6 +4639,26 @@ def get_brave_search_endpoint() -> str:
         ", ".join(sorted(BRAVE_SEARCH_ENDPOINTS)),
     )
     return "web"
+
+
+def get_brave_search_country() -> str | None:
+    """Get the optional Brave Search country, as a lower-case two-letter code.
+
+    Unset or empty means the parameter is not sent (Brave then defaults to
+    ``US``). A value that is not exactly two ASCII letters is ignored with one
+    warning that does not echo the value.
+    """
+    raw = (os.getenv(BRAVE_SEARCH_COUNTRY) or "").strip()
+    if not raw:
+        return None
+    if len(raw) == 2 and raw.isascii() and raw.isalpha():
+        return raw.lower()
+    logger.warning(
+        "Ignoring invalid %s value (expected two ASCII letters, got %d characters).",
+        BRAVE_SEARCH_COUNTRY,
+        len(raw),
+    )
+    return None
 
 
 def get_web_crawl_tls_impersonate() -> str | None:

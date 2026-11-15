@@ -173,6 +173,60 @@ async def test_llm_context_without_include_content_has_no_content(
 
 
 @pytest.mark.asyncio
+async def test_country_sent_on_web_endpoint_when_set(transport, monkeypatch):
+    monkeypatch.delenv("XAGENT_BRAVE_SEARCH_ENDPOINT", raising=False)
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", " au ")
+    requests = transport(lambda r: httpx.Response(200, json=WEB_BODY))
+    await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+    assert requests[0].url.params["country"] == "AU"
+    assert "search_lang" not in requests[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_country_sent_on_llm_context_endpoint_when_set(transport, monkeypatch):
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", "llm_context")
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", "AU")
+    requests = transport(lambda r: httpx.Response(200, json=CTX_BODY))
+    await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+    body = json.loads(requests[0].content)
+    assert body["country"] == "au"
+    assert "search_lang" not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["web", "llm_context"])
+@pytest.mark.parametrize("value", [None, "", "  "])
+async def test_country_absent_when_unset(transport, monkeypatch, endpoint, value):
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", endpoint)
+    if value is None:
+        monkeypatch.delenv("XAGENT_BRAVE_SEARCH_COUNTRY", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", value)
+    requests = transport(lambda r: httpx.Response(200, json=WEB_BODY))
+    await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+    sent = requests[0].url.query.decode() + requests[0].content.decode()
+    assert "country" not in sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["web", "llm_context"])
+@pytest.mark.parametrize("value", ["AUS", "7", "1x", "é9", "au-AU"])
+async def test_invalid_country_ignored_with_one_warning(
+    transport, monkeypatch, caplog, endpoint, value
+):
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", endpoint)
+    monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", value)
+    requests = transport(lambda r: httpx.Response(200, json=WEB_BODY))
+    with caplog.at_level(logging.WARNING):
+        await BraveWebSearchCore(api_key=API_KEY).search(QUERY)
+    sent = requests[0].url.query.decode() + requests[0].content.decode()
+    assert "country" not in sent
+    warnings = [r for r in caplog.records if "XAGENT_BRAVE_SEARCH_COUNTRY" in r.message]
+    assert len(warnings) == 1
+    assert value not in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
 async def test_unknown_endpoint_uses_web(transport, monkeypatch, caplog):
     monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", "bogus")
     requests = transport(lambda r: httpx.Response(200, json=WEB_BODY))

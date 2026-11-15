@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from ....config import get_brave_search_endpoint
+from ....config import get_brave_search_country, get_brave_search_endpoint
 from .web_content import WebContentFetcher
 
 logger = logging.getLogger(__name__)
@@ -117,6 +117,8 @@ class BraveWebSearchCore:
             include_content,
         )
 
+        country = get_brave_search_country()
+
         proxy_url = self._get_proxy_url()
         if proxy_url:
             # Do not log the URL: it can carry proxy credentials.
@@ -133,24 +135,30 @@ class BraveWebSearchCore:
         try:
             async with httpx.AsyncClient(**client_kwargs) as client:
                 if endpoint == "llm_context":
+                    body: Dict[str, Any] = {
+                        "q": query,
+                        "count": max_results,
+                        "maximum_number_of_tokens": LLM_CONTEXT_MAX_TOKENS,
+                    }
+                    if country:
+                        body["country"] = country  # documented default: "us"
                     response = await client.post(
                         BRAVE_LLM_CONTEXT_URL,
-                        json={
-                            "q": query,
-                            "count": max_results,
-                            "maximum_number_of_tokens": LLM_CONTEXT_MAX_TOKENS,
-                        },
+                        json=body,
                         headers=headers,
                         timeout=30,
                     )
                 else:
+                    params: Dict[str, Any] = {
+                        "q": query,
+                        "count": max_results,
+                        "text_decorations": "false",
+                    }
+                    if country:
+                        params["country"] = country.upper()  # documented default: "US"
                     response = await client.get(
                         BRAVE_WEB_SEARCH_URL,
-                        params={
-                            "q": query,
-                            "count": max_results,
-                            "text_decorations": "false",
-                        },
+                        params=params,
                         headers=headers,
                         timeout=30,
                     )

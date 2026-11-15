@@ -107,7 +107,9 @@ def _patch_startup(monkeypatch: pytest.MonkeyPatch, events: list[str]) -> _Sandb
         "start_runtime_performance_monitor",
         "start_app_process_diagnostics",
     ):
-        monkeypatch.setattr(app_module, name, lambda _a, n=name: events.append(n))
+        monkeypatch.setattr(
+            app_module, name, lambda _a, n=name, **_kw: events.append(n)
+        )
     monkeypatch.setattr(
         app_module,
         "start_temp_file_cleanup_task",

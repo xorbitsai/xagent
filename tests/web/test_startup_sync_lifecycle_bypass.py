@@ -648,6 +648,8 @@ async def test_retry_after_a_stall_resumes_instead_of_restarting(monkeypatch, tm
     # from the beginning would list users 1-3 again).
     assert sorted(storage.list_prefixes) == sorted(set(storage.list_prefixes))
     assert len(storage.list_prefixes) == 6
+    # The cancelled attempt's thread is still counted until it returns.
+    assert await app_module.drain_workers(10)
 
 
 @pytest.mark.asyncio
@@ -672,6 +674,9 @@ async def test_a_real_stall_still_trips_the_timeout_and_dumps_stacks(monkeypatch
         dump.assert_called_once()
     finally:
         release.set()
+        # The stalled worker keeps its count until the thread returns; let it
+        # finish so the fixture's leak check does not race its last instructions.
+        assert await app_module.drain_workers(10)
 
 
 def test_cancel_during_the_first_listing_stops_before_the_next_users_listing(tmp_path):

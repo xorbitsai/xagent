@@ -13,6 +13,8 @@ Backfill rule -- an existing row gets an issuer only when it is certain:
 
 * Composio-backed rows (``token_type = 'composio'``) stay NULL: their grant
   belongs to Composio's own OAuth app, never this deployment's client.
+  A table that predates ``token_type`` holds no Composio rows, so all of
+  its rows are treated as native.
 * For every other row, the candidate issuers of its key are collected:
 
   1. the key itself, when it is a configured provider
@@ -142,10 +144,16 @@ def resolve_issuers(
     return resolved
 
 
-def _backfill(bind: sa.engine.Connection, tables: set[str]) -> None:
-    native = sa.or_(
-        _user_oauth.c.token_type.is_(None),
-        _user_oauth.c.token_type != COMPOSIO_TOKEN_TYPE,
+def _backfill(bind: sa.engine.Connection, tables: set[str], columns: set[str]) -> None:
+    # A user_oauth that predates ``token_type`` (an old schema being carried
+    # through the chain) cannot hold Composio rows, so every row is native.
+    native = (
+        sa.or_(
+            _user_oauth.c.token_type.is_(None),
+            _user_oauth.c.token_type != COMPOSIO_TOKEN_TYPE,
+        )
+        if "token_type" in columns
+        else sa.true()
     )
     keys = [
         str(key)
@@ -192,9 +200,10 @@ def upgrade() -> None:
     # already with this column and no rows to backfill.
     if TABLE not in tables:
         return
-    if COLUMN not in _columns(inspector):
+    columns = _columns(inspector)
+    if COLUMN not in columns:
         op.add_column(TABLE, sa.Column(COLUMN, sa.String(50), nullable=True))
-    _backfill(bind, tables)
+    _backfill(bind, tables, columns)
 
 
 def downgrade() -> None:

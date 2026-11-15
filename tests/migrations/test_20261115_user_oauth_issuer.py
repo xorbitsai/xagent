@@ -264,6 +264,23 @@ def test_a_provider_less_history_entry_is_not_a_candidate(engine: sa.Engine) -> 
         assert _issuers(conn) == {1: "google"}
 
 
+def test_a_table_without_token_type_is_backfilled(engine: sa.Engine) -> None:
+    """An old ``user_oauth`` carried through the chain may predate
+    ``token_type``; it holds no Composio rows, so every row is native."""
+    with engine.begin() as conn:
+        _create_tables(conn)
+        conn.execute(sa.text("ALTER TABLE user_oauth DROP COLUMN token_type"))
+        conn.execute(
+            sa.text(
+                "INSERT INTO user_oauth (id, user_id, provider, access_token) "
+                "VALUES (1, 1, 'google', 'tok'), (2, 1, 'mystery-app', 'tok')"
+            )
+        )
+        conn.execute(sa.text("INSERT INTO oauth_providers VALUES (1, 'google')"))
+        _upgrade(conn)
+        assert _issuers(conn) == {1: "google", 2: None}
+
+
 def test_composio_rows_are_left_untouched(engine: sa.Engine) -> None:
     with engine.begin() as conn:
         _create_tables(conn)

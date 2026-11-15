@@ -280,11 +280,13 @@ _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
 FILE_STORAGE_STARTUP_SYNC_GATE_POLL_INTERVAL_SECONDS = 0.25
-# One attempt is logged every progress interval, dumps every thread's stack
-# once it passes the dump threshold, and is cancelled at the deadline.
+# One attempt is logged every progress interval. If it makes no progress (no
+# file or batch completed) for the dump threshold, every thread's stack is
+# dumped; after the stall window it is cancelled and retried from where it got
+# to. A long scan that keeps completing work is never cancelled.
 FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS = 30.0
 FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS = 60.0
-FILE_STORAGE_STARTUP_SYNC_DEADLINE_SECONDS = 600.0
+FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS = 600.0
 FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS = 10.0
 
 # Path prefixes the host app keeps answering while the startup sync runs, so
@@ -399,11 +401,11 @@ def _dump_all_thread_stacks(reason: str) -> None:
         logger.exception("Could not dump thread stacks")
 
 
-async def _run_bounded_file_storage_sync_attempt() -> None:
-    """One sync attempt with progress logs, a stack dump and a deadline."""
+async def _run_bounded_file_storage_sync_attempt(resume: Any = None) -> None:
+    """One sync attempt with progress logs, a stack dump and a stall timeout."""
     from .services.startup_file_storage_sync import StartupSyncControl
 
-    control = StartupSyncControl()
+    control = StartupSyncControl(resume)
     started = time.monotonic()
 
     def _attempt() -> None:
@@ -425,21 +427,23 @@ async def _run_bounded_file_storage_sync_attempt() -> None:
             )
             if done:
                 return future.result()
-            elapsed = time.monotonic() - started
+            now = time.monotonic()
+            elapsed = now - started
+            idle = now - control.last_progress
             logger.warning(
                 "Startup file storage sync still running: elapsed=%.0fs "
-                "scanned=%s phase=%s",
+                "no_progress=%.0fs scanned=%s phase=%s",
                 elapsed,
+                idle,
                 control.scanned,
                 control.phase,
             )
-            if not dumped and elapsed >= FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS:
+            if not dumped and idle >= FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS:
                 dumped = True
                 _dump_all_thread_stacks(
-                    f"startup file storage sync exceeded "
-                    f"{FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS:.0f}s"
+                    f"startup file storage sync made no progress for {idle:.0f}s"
                 )
-            if elapsed >= FILE_STORAGE_STARTUP_SYNC_DEADLINE_SECONDS:
+            if idle >= FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS:
                 control.cancel.set()
                 done, _ = await asyncio.wait(
                     {future}, timeout=FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS
@@ -447,9 +451,8 @@ async def _run_bounded_file_storage_sync_attempt() -> None:
                 if done:
                     future.exception()  # cancelled at a checkpoint; retrieve it
                 raise TimeoutError(
-                    "Startup file storage sync exceeded its "
-                    f"{FILE_STORAGE_STARTUP_SYNC_DEADLINE_SECONDS:.0f}s deadline "
-                    f"(scanned={control.scanned} phase={control.phase})"
+                    "Startup file storage sync made no progress for "
+                    f"{idle:.0f}s (scanned={control.scanned} phase={control.phase})"
                 )
     except BaseException:
         control.cancel.set()
@@ -463,9 +466,12 @@ async def _run_file_storage_startup_sync_with_retries(
 ) -> None:
     app_instance.state.file_storage_startup_sync_started_at = time.monotonic()
     app_instance.state.file_storage_startup_sync_finished_at = None
+    from .services.startup_file_storage_sync import StartupSyncResume
+
+    resume = StartupSyncResume()  # survives retries: a stall does not rescan
     while True:
         try:
-            await _run_bounded_file_storage_sync_attempt()
+            await _run_bounded_file_storage_sync_attempt(resume)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

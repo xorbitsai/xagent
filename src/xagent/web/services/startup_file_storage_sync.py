@@ -141,25 +141,43 @@ class StartupSyncCancelled(RuntimeError):
     """The sync was told to stop (deadline exceeded or process shutdown)."""
 
 
-class StartupSyncControl:
-    """Cooperative cancel flag and progress counters shared with a watchdog.
+class StartupSyncResume:
+    """Where the last attempt got to, kept across the retry loop's attempts.
 
-    The sync thread checks :meth:`checkpoint` between files and batches, so a
-    deadline can stop it at the next boundary. A single storage or database
-    call that never returns cannot be interrupted from here; the watchdog's
-    thread dump is what makes that case diagnosable.
+    ``cursor`` is the last candidate that finished without a failure; a retry
+    continues after it instead of rescanning every user. It never moves past a
+    failed candidate, so that candidate is attempted again.
     """
 
     def __init__(self) -> None:
+        self.cursor: tuple[int, int] | None = None
+
+
+class StartupSyncControl:
+    """Cooperative cancel flag, progress marker and resume point for one attempt.
+
+    The sync thread calls :meth:`checkpoint` before each file's storage I/O
+    and between batches, so a watchdog can stop it at the next boundary and
+    can tell a long but progressing scan from a stalled one
+    (:attr:`last_progress`). A single storage or database call that never
+    returns cannot be interrupted from here; the watchdog's thread dump is what
+    makes that case diagnosable.
+    """
+
+    def __init__(self, resume: StartupSyncResume | None = None) -> None:
         self.cancel = threading.Event()
         self.scanned = 0
         self.phase = "starting"
+        self.resume = resume if resume is not None else StartupSyncResume()
+        self.last_progress = time.monotonic()
 
-    def checkpoint(self, phase: str | None = None) -> None:
+    def checkpoint(self, phase: str | None = None, *, progress: bool = True) -> None:
         if phase is not None:
             self.phase = phase
         if self.cancel.is_set():
             raise StartupSyncCancelled("Startup file storage sync was cancelled")
+        if progress:
+            self.last_progress = time.monotonic()
 
 
 @dataclass(frozen=True)
@@ -211,6 +229,8 @@ def preflight_registered_files(
         if not candidates:
             break
         for candidate, _version in candidates:
+            if control is not None:
+                control.checkpoint()  # before this candidate's storage I/O
             scanned += 1
             if candidate.user_id != current_user_id or user_storage is None:
                 current_user_id = candidate.user_id
@@ -314,7 +334,7 @@ def _acquire_file_lock_after_contention(
     file_lock = _acquire_file_lock()
     while file_lock is None:
         if control is not None:
-            control.checkpoint("waiting for sync lock holder")
+            control.checkpoint("waiting for sync lock holder", progress=False)
         logger.info(
             "Startup file storage sync is already running in another process; waiting"
         )
@@ -358,7 +378,10 @@ def _sync_registered_files(
     failed = 0
 
     resolved_batch_size = max(1, int(batch_size))
-    cursor: _StartupSyncCursor | None = None
+    cursor: _StartupSyncCursor | None = (
+        control.resume.cursor if control is not None else None
+    )
+    previous: _StartupFileStorageCandidate | None = None
     current_user_id: int | None = None
     user_storage: ScopedFileStorage | None = None
     remote_objects: dict[str, Any] = {}
@@ -373,10 +396,16 @@ def _sync_registered_files(
         if not candidates:
             break
         for candidate, expected_version in candidates:
-            scanned += 1
             if control is not None:
-                control.scanned = scanned
-                control.checkpoint()
+                # The previous candidate finished cleanly: a retry resumes
+                # after it. Frozen once any file failed, so that file (and
+                # whatever follows) is attempted again.
+                if previous is not None and failed == 0:
+                    control.resume.cursor = (previous.user_id, previous.id)
+                control.checkpoint()  # before this candidate's storage I/O
+                control.scanned = scanned + 1
+            previous = candidate
+            scanned += 1
             user_id = candidate.user_id
             if user_id != current_user_id or user_storage is None:
                 current_user_id = user_id
@@ -486,6 +515,8 @@ def _sync_registered_files(
             uploaded += 1
 
         cursor = next_cursor
+        if control is not None and failed == 0 and next_cursor is not None:
+            control.resume.cursor = next_cursor
 
     result = StartupFileStorageSyncResult(
         scanned=scanned,

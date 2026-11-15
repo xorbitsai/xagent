@@ -128,7 +128,7 @@ async def test_status_reports_running_failed_done_with_elapsed(monkeypatch):
 
     release = asyncio.Event()
 
-    async def _attempt() -> None:
+    async def _attempt(*_args) -> None:
         await release.wait()
 
     monkeypatch.setattr(app_module, "_run_bounded_file_storage_sync_attempt", _attempt)
@@ -318,7 +318,7 @@ async def test_clean_standby_activation_never_gates_requests(monkeypatch):
     )
     release = asyncio.Event()
 
-    async def _attempt() -> None:
+    async def _attempt(*_args) -> None:
         await release.wait()
 
     monkeypatch.setattr(app_module, "_run_bounded_file_storage_sync_attempt", _attempt)
@@ -353,7 +353,7 @@ async def test_standby_with_files_to_write_still_gates(monkeypatch):
     )
     release = asyncio.Event()
 
-    async def _attempt() -> None:
+    async def _attempt(*_args) -> None:
         await release.wait()
 
     monkeypatch.setattr(app_module, "_run_bounded_file_storage_sync_attempt", _attempt)
@@ -389,12 +389,12 @@ def test_non_gating_sync_does_not_fail_requests_when_it_errors():
 
 
 @pytest.mark.asyncio
-async def test_attempt_logs_progress_dumps_stacks_and_cancels_at_deadline(monkeypatch):
+async def test_attempt_logs_progress_dumps_stacks_and_cancels_when_stalled(monkeypatch):
     monkeypatch.setattr(
         app_module, "FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS", 0.05
     )
     monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS", 0.1)
-    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_DEADLINE_SECONDS", 0.3)
+    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS", 0.3)
     monkeypatch.setattr(
         app_module, "FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS", 2.0
     )
@@ -406,7 +406,7 @@ async def test_attempt_logs_progress_dumps_stacks_and_cancels_at_deadline(monkey
         control = app_module._file_storage_sync_control.get()
         while True:
             try:
-                control.checkpoint("stuck")
+                control.checkpoint("stuck", progress=False)
             except StartupSyncCancelled:
                 saw_cancel.set()
                 raise
@@ -414,7 +414,7 @@ async def test_attempt_logs_progress_dumps_stacks_and_cancels_at_deadline(monkey
 
     monkeypatch.setattr(app_module, "run_startup_file_storage_sync", _stuck_sync)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="no progress"):
         await app_module._run_bounded_file_storage_sync_attempt()
 
     dump.assert_called_once()
@@ -532,3 +532,199 @@ async def test_ready_is_not_held_by_a_non_gating_sync(monkeypatch):
         assert (await app_module.readiness_check()).status_code == 200
     finally:
         task.cancel()
+
+
+# --- review: stall (not total) timeout, resume, cancel before storage I/O --------
+
+
+class _SlowListStorage(_Storage):
+    """Every per-user listing succeeds but takes a while (listings cache off)."""
+
+    def __init__(self, keys=(), delay=0.1, on_list=None):
+        super().__init__(keys)
+        self.delay = delay
+        self.list_prefixes: list[str] = []
+        self.on_list = on_list
+
+    def list(self, prefix):
+        self.list_prefixes.append(prefix)
+        if self.on_list is not None:
+            self.on_list(len(self.list_prefixes))
+        time.sleep(self.delay)
+        return super().list(prefix)
+
+
+def _many_user_db(tmp_path, users=8):
+    # A file database: the sync runs on executor threads.
+    engine = create_engine(f"sqlite:///{tmp_path}/sync.sqlite")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    keys = set()
+    ids = []
+    with factory() as db:
+        for n in range(users):
+            user = User(username=f"u{n}", password_hash="h", is_admin=False)
+            db.add(user)
+            db.commit()
+            ids.append(int(user.id))
+    for uid in ids:
+        path = tmp_path / f"f{uid}.txt"
+        path.write_text("x")
+        keys.add(_durable_row(factory, uid, path, f"file{uid}"))
+    return factory, keys
+
+
+@pytest.mark.asyncio
+async def test_steadily_progressing_scan_longer_than_the_stall_window_completes(
+    monkeypatch, tmp_path
+):
+    """Regression: a total deadline restarted a healthy long scan forever."""
+    factory, keys = _many_user_db(tmp_path, users=8)
+    storage = _SlowListStorage(keys, delay=0.1)  # ~0.8 s in total
+    monkeypatch.setattr(
+        app_module, "FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS", 0.05
+    )
+    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS", 60)
+    monkeypatch.setenv(
+        "XAGENT_FILE_STORAGE_STARTUP_SYNC_LOCK_FILE", str(tmp_path / "l.lock")
+    )
+    real = sync_module.sync_registered_files_to_durable_storage
+    monkeypatch.setattr(
+        sync_module,
+        "sync_registered_files_to_durable_storage",
+        lambda **kw: real(storage=storage, session_factory=factory, **kw),
+    )
+    test_app = FastAPI()
+    task = app_module.start_file_storage_startup_sync_task(
+        test_app, retry_interval_seconds=0
+    )
+    await asyncio.wait_for(task, 10)
+
+    assert test_app.state.file_storage_startup_sync_completed is True
+    assert test_app.state.file_storage_startup_sync_error is None
+    # one pass: no restarts, each user listed exactly once
+    assert len(storage.list_prefixes) == 8
+    await asyncio.wait_for(app_module.wait_for_file_storage_startup_sync(test_app), 1)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_stall_resumes_instead_of_restarting(monkeypatch, tmp_path):
+    factory, keys = _many_user_db(tmp_path, users=6)
+    stall_once = {"done": False}
+
+    def on_list(call_number):
+        if call_number == 4 and not stall_once["done"]:
+            stall_once["done"] = True
+            time.sleep(0.6)  # a real stall inside the 4th listing
+
+    storage = _SlowListStorage(keys, delay=0.01, on_list=on_list)
+    monkeypatch.setattr(
+        app_module, "FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS", 0.05
+    )
+    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(
+        app_module, "FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS", 0.05
+    )
+    monkeypatch.setattr(app_module, "_dump_all_thread_stacks", Mock())
+    monkeypatch.setenv(
+        "XAGENT_FILE_STORAGE_STARTUP_SYNC_LOCK_FILE", str(tmp_path / "l.lock")
+    )
+    real = sync_module.sync_registered_files_to_durable_storage
+    monkeypatch.setattr(
+        sync_module,
+        "sync_registered_files_to_durable_storage",
+        lambda **kw: real(storage=storage, session_factory=factory, **kw),
+    )
+    test_app = FastAPI()
+    task = app_module.start_file_storage_startup_sync_task(
+        test_app, retry_interval_seconds=0.7
+    )
+    await asyncio.wait_for(task, 15)
+
+    assert test_app.state.file_storage_startup_sync_completed is True
+    # The stalled attempt finished user 4 before it saw the cancel, and the
+    # retry continued after it: every user is listed exactly once (a restart
+    # from the beginning would list users 1-3 again).
+    assert sorted(storage.list_prefixes) == sorted(set(storage.list_prefixes))
+    assert len(storage.list_prefixes) == 6
+
+
+@pytest.mark.asyncio
+async def test_a_real_stall_still_trips_the_timeout_and_dumps_stacks(monkeypatch):
+    monkeypatch.setattr(
+        app_module, "FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS", 0.05
+    )
+    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS", 0.1)
+    monkeypatch.setattr(app_module, "FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS", 0.3)
+    monkeypatch.setattr(
+        app_module, "FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS", 0.05
+    )
+    dump = Mock()
+    monkeypatch.setattr(app_module, "_dump_all_thread_stacks", dump)
+    release = threading.Event()
+    monkeypatch.setattr(
+        app_module, "run_startup_file_storage_sync", lambda: release.wait(10)
+    )
+    try:
+        with pytest.raises(TimeoutError, match="no progress"):
+            await app_module._run_bounded_file_storage_sync_attempt()
+        dump.assert_called_once()
+    finally:
+        release.set()
+
+
+def test_cancel_during_the_first_listing_stops_before_the_next_users_listing(tmp_path):
+    factory, keys = _many_user_db(tmp_path, users=3)
+    control = StartupSyncControl()
+    storage = _SlowListStorage(keys, delay=0, on_list=lambda n: control.cancel.set())
+    with pytest.raises(StartupSyncCancelled):
+        preflight_registered_files(
+            storage=storage, session_factory=factory, control=control
+        )
+    assert len(storage.list_prefixes) == 1
+
+
+def test_cancel_during_the_first_listing_stops_the_sync_too(tmp_path, monkeypatch):
+    factory, keys = _many_user_db(tmp_path, users=3)
+    control = StartupSyncControl()
+    storage = _SlowListStorage(keys, delay=0, on_list=lambda n: control.cancel.set())
+    monkeypatch.setenv(
+        "XAGENT_FILE_STORAGE_STARTUP_SYNC_LOCK_FILE", str(tmp_path / "l.lock")
+    )
+    with pytest.raises(StartupSyncCancelled):
+        sync_module.sync_registered_files_to_durable_storage(
+            storage=storage, session_factory=factory, control=control
+        )
+    assert len(storage.list_prefixes) == 1
+
+
+def test_resume_cursor_never_moves_past_a_failed_file(tmp_path, monkeypatch):
+    factory, keys = _many_user_db(tmp_path, users=3)
+    with factory() as db:  # user 1's row is not durable and its upload fails
+        row = db.query(UploadedFile).order_by(UploadedFile.id).first()
+        row.storage_status = "legacy"
+        row.storage_key = None
+        row.checksum = None
+        row.storage_backend = None
+        db.commit()
+    first_user_key = (
+        f"users/{row.user_id}/uploads/{row.file_id}/{Path(row.storage_path).name}"
+    )
+    storage = _SlowListStorage(keys - {first_user_key}, delay=0)
+
+    def failing_put(*args, **kwargs):
+        raise RuntimeError("s3 down")
+
+    storage.put_file = failing_put
+    monkeypatch.setenv(
+        "XAGENT_FILE_STORAGE_STARTUP_SYNC_LOCK_FILE", str(tmp_path / "l.lock")
+    )
+    control = StartupSyncControl()
+
+    result = sync_module.sync_registered_files_to_durable_storage(
+        storage=storage, session_factory=factory, control=control
+    )
+
+    assert result.failed == 1
+    assert control.resume.cursor is None  # a retry starts at the failed file

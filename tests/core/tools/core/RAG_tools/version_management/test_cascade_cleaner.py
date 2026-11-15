@@ -604,15 +604,14 @@ def test_cleanup_embed_cascade_preserves_multiple_predicates_per_table() -> None
     with (
         patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.embedding_cleanup_filters_for_table"
         ) as mock_build_filters,
         patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
     ):
         conn = MagicMock(spec=["table_names", "open_table"])
+        conn.table_names.return_value = ["embeddings_m1"]
         mock_get_conn.return_value = conn
-        mock_build_filters.return_value = {
-            "embeddings_m1": ["chunk_id == 'ch1'", "chunk_id == 'ch2'"],
-        }
+        mock_build_filters.return_value = ["chunk_id == 'ch1'", "chunk_id == 'ch2'"]
         mock_plan.return_value = {"embeddings_m1": 2}
 
         result = get_vector_index_store().cleanup_cascade_by_scope(
@@ -636,7 +635,7 @@ def test_cleanup_embed_cascade_deletes_multiple_predicates_per_table() -> None:
     with (
         patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.embedding_cleanup_filters_for_table"
         ) as mock_build_filters,
     ):
         table = MagicMock()
@@ -645,9 +644,7 @@ def test_cleanup_embed_cascade_deletes_multiple_predicates_per_table() -> None:
         conn.table_names.return_value = ["embeddings_m1"]
         conn.open_table.return_value = table
         mock_get_conn.return_value = conn
-        mock_build_filters.return_value = {
-            "embeddings_m1": ["chunk_id == 'ch1'", "chunk_id == 'ch2'"],
-        }
+        mock_build_filters.return_value = ["chunk_id == 'ch1'", "chunk_id == 'ch2'"]
 
         result = get_vector_index_store().cleanup_cascade_by_scope(
             "c_multi",
@@ -787,14 +784,15 @@ def test_cleanup_cascade_plans_unless_confirmed_outside_preview(
     with (
         patch.object(LanceDBVectorIndexStore, "_get_connection") as mock_get_conn,
         patch(
-            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.build_embedding_cleanup_filters"
+            "xagent.core.tools.core.RAG_tools.storage.lancedb_cleanup_filters.embedding_cleanup_filters_for_table"
         ) as mock_build_filters,
         patch(f"{_STORE}._vis_plan_by_predicates") as mock_plan,
         patch(f"{_STORE}._vis_delete_by_predicates") as mock_delete,
     ):
         conn = MagicMock(spec=["table_names", "open_table"])
+        conn.table_names.return_value = ["embeddings_m1"]
         mock_get_conn.return_value = conn
-        mock_build_filters.return_value = {"embeddings_m1": ["collection == 'c_gate'"]}
+        mock_build_filters.return_value = ["collection == 'c_gate'"]
         mock_plan.return_value = {"embeddings_m1": 1}
 
         result = get_vector_index_store().cleanup_cascade_by_scope(
@@ -810,3 +808,17 @@ def test_cleanup_cascade_plans_unless_confirmed_outside_preview(
     assert result == {"embeddings": 1}
     mock_plan.assert_called_once()
     mock_delete.assert_not_called()
+
+
+@pytest.mark.parametrize("key", ["embeddings_m1", "__embeddings__"])
+def test_a_cascade_refuses_embedding_predicates_built_ahead_of_the_delete(
+    key: str,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    conn = MagicMock(spec=["table_names", "open_table"])
+    with pytest.raises(ValueError):
+        lancedb_stores._vis_execute_or_plan_by_predicates(
+            conn, {key: ["true"]}, preview_only=False, confirm=True
+        )
+    conn.open_table.assert_not_called()

@@ -33,52 +33,56 @@ def build_embedding_cleanup_filters(
     scope: KBCleanupScope,
 ) -> dict[str, list[str]]:
     """Build per-embeddings-table cleanup predicates for a resolved scope."""
-    table_filters: dict[str, list[str]] = {}
-    for table_name in select_embedding_tables(conn, model_tag=scope.model_tag):
-        table = None
-        try:
-            table = conn.open_table(table_name)
-            table_filters[table_name] = _build_filters_for_table(table, scope)
-        except Exception:
-            table_filters[table_name] = _build_filters_without_schema(scope)
-        finally:
-            _safe_close_table(table)
-    return table_filters
+    return {
+        table_name: embedding_cleanup_filters_for_table(conn, table_name, scope)
+        for table_name in select_embedding_tables(conn, model_tag=scope.model_tag)
+    }
 
 
-def build_embedding_cleanup_filters_from_base(
+def embedding_cleanup_filters_for_table(
+    conn: Any, table_name: str, scope: KBCleanupScope
+) -> list[str]:
+    """The cleanup predicates of a resolved scope for one embeddings table."""
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        return _build_filters_for_table(table, scope)
+    except Exception:
+        return _build_filters_without_schema(scope)
+    finally:
+        _safe_close_table(table)
+
+
+def embedding_cleanup_filters_from_base(
     conn: Any,
+    table_name: str,
     *,
     base_filter: str,
     user_id: Optional[int],
     is_admin: bool,
-    model_tag: Optional[str] = None,
-) -> dict[str, list[str]]:
-    """Build per-embeddings-table predicate lists from an existing base filter."""
-    table_filters: dict[str, list[str]] = {}
-    for table_name in select_embedding_tables(conn, model_tag=model_tag):
-        table = None
-        try:
-            table = conn.open_table(table_name)
-            table_filters[table_name] = [
-                append_user_filter_for_table(
-                    table=table,
-                    filter_expr=base_filter,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-            ]
-        except Exception:
-            table_filters[table_name] = [
-                append_user_filter_without_schema(
-                    filter_expr=base_filter,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-            ]
-        finally:
-            _safe_close_table(table)
-    return table_filters
+) -> list[str]:
+    """One embeddings table's predicates from an existing base filter."""
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        return [
+            append_user_filter_for_table(
+                table=table,
+                filter_expr=base_filter,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        ]
+    except Exception:
+        return [
+            append_user_filter_without_schema(
+                filter_expr=base_filter,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        ]
+    finally:
+        _safe_close_table(table)
 
 
 def append_user_filter_for_table(

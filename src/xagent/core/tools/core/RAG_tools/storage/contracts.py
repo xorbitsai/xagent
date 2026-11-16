@@ -750,7 +750,9 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
-    def open_embeddings_table(self, model_tag: str) -> Tuple[Any, str]:
+    def open_embeddings_table(
+        self, model_tag: str, *, provider_name_fallback: bool = True
+    ) -> Tuple[Any, str]:
         """Open embeddings table with legacy fallback support.
 
         Tries the primary Hub ID-based table name first, then falls back
@@ -761,6 +763,7 @@ class VectorIndexStore(ABC):
 
         Args:
             model_tag: Model tag for the embeddings table.
+            provider_name_fallback: Whether to try the provider-name table.
 
         Returns:
             Tuple of (table_object, actual_table_name_used).

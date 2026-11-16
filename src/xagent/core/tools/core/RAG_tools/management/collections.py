@@ -88,8 +88,8 @@ def _count_rows_uncached(conn: Any, table_name: str, filter_expr: str) -> int:
 
 
 def _searched_embeddings_table(collection: str) -> Optional[str]:
-    """The listed table name ``open_embeddings_table`` gives for the collection's
-    bound model, or ``None`` when the sum over every table is to be kept."""
+    """The listed candidate table of the bound model that search opens, or ``None``
+    when the sum over every table is to be kept."""
     from ..kb.collection_handle import ledger_holds_vectors
     from .collection_manager import _normalize_model_id, get_collection_if_present_sync
 
@@ -99,7 +99,11 @@ def _searched_embeddings_table(collection: str) -> Optional[str]:
             bound = _normalize_model_id(info.embedding_model_id) if info else None
             if info and info.is_initialized and bound:
                 try:
-                    table, name = get_vector_index_store().open_embeddings_table(bound)
+                    # The provider-name table is resolved through the model hub,
+                    # which creates its table in the SQL database.
+                    table, name = get_vector_index_store().open_embeddings_table(
+                        bound, provider_name_fallback=False
+                    )
                 except DatabaseOperationError:
                     return None
                 _safe_close_table(table)

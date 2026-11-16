@@ -1153,7 +1153,9 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             _safe_close_table(table)
         return None
 
-    def open_embeddings_table(self, model_tag: str) -> Tuple[Any, str]:
+    def open_embeddings_table(
+        self, model_tag: str, *, provider_name_fallback: bool = True
+    ) -> Tuple[Any, str]:
         """Open embeddings table with legacy fallback support.
 
         Tries the candidate Hub ID-based table names in order, then falls back
@@ -1161,6 +1163,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         Args:
             model_tag: Model tag for the embeddings table.
+            provider_name_fallback: Whether to try the provider-name table.
 
         Returns:
             Tuple of (table_object, actual_table_name_used).
@@ -1174,7 +1177,6 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             to_model_tag,
             written_embeddings_table_name,
         )
-        from ..utils.model_resolver import resolve_embedding_adapter
 
         conn = self._get_connection()
         candidate_table_names = embeddings_table_candidates(model_tag)
@@ -1189,11 +1191,14 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         # Try legacy fallback
         legacy_table_name: Optional[str] = None
-        try:
-            cfg, _ = resolve_embedding_adapter(model_tag)
-            legacy_table_name = f"embeddings_{to_model_tag(cfg.model_name)}"
-        except Exception:
-            legacy_table_name = None
+        if provider_name_fallback:
+            from ..utils.model_resolver import resolve_embedding_adapter
+
+            try:
+                cfg, _ = resolve_embedding_adapter(model_tag)
+                legacy_table_name = f"embeddings_{to_model_tag(cfg.model_name)}"
+            except Exception:
+                legacy_table_name = None
 
         if legacy_table_name and legacy_table_name not in tried_table_names:
             tried_table_names.append(legacy_table_name)

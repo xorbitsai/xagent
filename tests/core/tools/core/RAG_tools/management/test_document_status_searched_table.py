@@ -6,12 +6,10 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
 import pytest
 
-from xagent.core.model.model import EmbeddingModelConfig
-from xagent.core.model.storage.error import ModelNotFoundError
 from xagent.core.tools.core.RAG_tools.core.schemas import DocumentProcessingStatus as S
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_candidates,
@@ -25,6 +23,9 @@ from xagent.core.tools.core.RAG_tools.management import (
     get_document_stats,
     list_documents,
 )
+from xagent.core.tools.core.RAG_tools.utils import model_resolver
+
+OPEN_MODEL_HUB = model_resolver._get_or_init_model_hub
 
 KB = "kb"
 # Writer table embeddings_vendor_new_model, once-tagged embeddings_VENDOR_new_model.
@@ -32,46 +33,20 @@ BOUND = "Vendor/new-model"
 OTHER = "BAAI/old-model"
 WRITER, ONCE = embeddings_table_candidates(BOUND)
 OTHER_TABLE = embeddings_table_candidates(OTHER)[0]
-# A hub id whose model_name differs: no candidate table, a provider-name table.
+# No candidate table of LEGACY; its rows sit in a provider-name table.
 LEGACY = "acme-embed"
 LEGACY_NAME = "acme-embed-v2"
 LEGACY_TABLE = embeddings_table_name(LEGACY_NAME)
 UNRESOLVED = "Could not resolve the searched table"
 
 
-def _config(model_id: str, model_name: Optional[str] = None) -> EmbeddingModelConfig:
-    return EmbeddingModelConfig(
-        id=model_id,
-        model_name=model_name or model_id,
-        model_provider="dashscope",
-        api_key="k",
-        dimension=2,
-        abilities=["embedding"],
-    )
-
-
-class _Hub:
-    def __init__(self, models: Dict[str, EmbeddingModelConfig]) -> None:
-        self.models = models
-
-    def load(self, model_id: str, **_kwargs: Any) -> EmbeddingModelConfig:
-        for config in self.models.values():
-            if model_id in (config.id, config.model_name):
-                return config
-        raise ModelNotFoundError(model_id)
-
-    def list(self) -> Dict[str, EmbeddingModelConfig]:
-        return self.models
-
-    def close(self) -> None:
-        pass
+HUB_OPENED: List[str] = []
 
 
 @pytest.fixture(autouse=True)
 def store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
-    """A temporary LanceDB directory and SQL file; the hub is served in memory."""
+    """A temporary LanceDB directory and SQL file; opening the model hub is recorded."""
     from xagent.core.tools.core.RAG_tools.storage import reset_rag_storage_for_tests
-    from xagent.core.tools.core.RAG_tools.utils import model_resolver
 
     lancedb_dir = tmp_path / "status-lancedb"
     lancedb_dir.mkdir()
@@ -80,21 +55,18 @@ def store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     monkeypatch.delenv("XAGENT_VECTOR_BACKEND", raising=False)
     monkeypatch.delenv("VECTOR_STORE_BACKEND", raising=False)
     model_resolver._reset_model_hub_cache()
-    served = _Hub(
-        {
-            BOUND: _config(BOUND),
-            OTHER: _config(OTHER),
-            LEGACY: _config(LEGACY, LEGACY_NAME),
-        }
-    )
-    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: served)
-    monkeypatch.setattr(
-        model_resolver, "create_embedding_adapter", lambda *_a, **_k: object()
-    )
+    HUB_OPENED.clear()
+
+    def _record_hub() -> Any:
+        HUB_OPENED.append("opened")
+        raise RuntimeError("the model hub was opened")
+
+    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", _record_hub)
     reset_rag_storage_for_tests()
     yield lancedb_dir
     reset_rag_storage_for_tests()
     model_resolver._reset_model_hub_cache()
+    assert HUB_OPENED == []
 
 
 @pytest.fixture
@@ -249,10 +221,12 @@ def _project(
 ) -> Tuple[Any, Any]:
     listed = list_documents(KB, user_id=user_id, is_admin=is_admin)
     assert listed.status == "success", listed.message
+    assert HUB_OPENED == []
     detail = get_document_stats(
         KB, "d1", model_tag=model_tag, user_id=user_id, is_admin=is_admin
     )
     assert detail.status == "success", detail.message
+    assert HUB_OPENED == []
     summary = {doc.doc_id: doc for doc in listed.documents}["d1"]
     return summary, detail.data
 
@@ -263,9 +237,19 @@ def _bound_c1_other_c1() -> None:
     _write(OTHER, ["c1"])
 
 
-def test_other_model_rows_do_not_complete_a_partially_embedded_document() -> None:
+def test_other_model_rows_do_not_complete_a_partially_embedded_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _save_collection()
     _bound_c1_other_c1()
+    closed: List[Optional[str]] = []
+    real_close = collections_module._safe_close_table
+
+    def _close(table: Any) -> None:
+        closed.append(getattr(table, "name", None))
+        real_close(table)
+
+    monkeypatch.setattr(collections_module, "_safe_close_table", _close)
 
     summary, detail = _project()
 
@@ -274,6 +258,7 @@ def test_other_model_rows_do_not_complete_a_partially_embedded_document() -> Non
     assert (summary.chunk_count, summary.embedding_count) == (2, 2)
     assert (detail.chunk_count, detail.embedding_count) == (2, 2)
     assert detail.embedding_breakdown == {WRITER: 1, OTHER_TABLE: 1}
+    assert closed.count(WRITER) == 2
 
 
 @pytest.mark.parametrize("other_rows", [False, True])
@@ -347,6 +332,9 @@ def test_without_a_dimensioned_binding_the_sum_over_every_table_is_kept(
     if binding is not None:
         _save_collection(*binding)
     _bound_c1_other_c1()
+    if binding == ("none", 2):
+        # The placeholder names no model, even with a table spelled after it.
+        _create_table("embeddings_none")
     caplog.clear()
 
     summary, detail = _project()
@@ -470,6 +458,7 @@ def test_the_list_reads_the_binding_once(monkeypatch: pytest.MonkeyPatch) -> Non
 
     listed = list_documents(KB, is_admin=True)
 
+    assert HUB_OPENED == []
     assert [doc.status for doc in listed.documents] == [
         S.PARTIALLY_EMBEDDED,
         S.CHUNKED,
@@ -496,34 +485,23 @@ def test_a_writer_table_that_does_not_open_is_passed_over_as_search_does(
     assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
 
 
-def test_a_provider_name_table_is_counted_as_search_reads_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_rows_only_in_a_provider_name_table_keep_the_sum_over_every_table() -> None:
     _save_collection(LEGACY)
     _seed_core()
     _write(LEGACY_NAME, ["c1"])
     _write(OTHER, ["c1"])
     assert LEGACY_TABLE not in embeddings_table_candidates(LEGACY)
-    assert _store().open_embeddings_table(LEGACY)[1] == LEGACY_TABLE
-    closed: List[Optional[str]] = []
-    real_close = collections_module._safe_close_table
-
-    def _close(table: Any) -> None:
-        closed.append(getattr(table, "name", None))
-        real_close(table)
-
-    monkeypatch.setattr(collections_module, "_safe_close_table", _close)
 
     summary, detail = _project()
 
-    assert (summary.status, summary.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
-    assert (detail.status, detail.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
+    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
+    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
     assert detail.embedding_breakdown == {LEGACY_TABLE: 1, OTHER_TABLE: 1}
-    assert closed.count(LEGACY_TABLE) == 2
 
 
 def test_a_returned_name_the_listing_lacks_keeps_the_sum_over_every_table(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
         LanceDBVectorIndexStore,
@@ -533,8 +511,8 @@ def test_a_returned_name_the_listing_lacks_keeps_the_sum_over_every_table(
     _bound_c1_other_c1()
     real_open = LanceDBVectorIndexStore.open_embeddings_table
 
-    def _other_spelling(self: Any, model_tag: str) -> Any:
-        table, _name = real_open(self, model_tag)
+    def _other_spelling(self: Any, model_tag: str, **kwargs: Any) -> Any:
+        table, _name = real_open(self, model_tag, **kwargs)
         return table, ONCE
 
     monkeypatch.setattr(
@@ -547,3 +525,55 @@ def test_a_returned_name_the_listing_lacks_keeps_the_sum_over_every_table(
     assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
     assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
     assert detail.embedding_breakdown == {WRITER: 1, OTHER_TABLE: 1}
+    assert UNRESOLVED not in caplog.text
+
+
+def test_a_status_read_leaves_a_fresh_sql_database_ready_for_init_db(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from sqlalchemy import create_engine, inspect
+
+    from xagent.db.migration import get_alembic_revision
+    from xagent.web.models import database
+
+    url = f"sqlite:///{tmp_path / 'fresh.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", OPEN_MODEL_HUB)
+    for name in (
+        "_MODEL_HUB_ENGINE",
+        "_MODEL_HUB_SESSION_LOCAL",
+        "_MODEL_HUB_MODEL",
+        "_MODEL_HUB_DB_URL",
+    ):
+        monkeypatch.setattr(model_resolver, name, None)
+    previous_engine = database._engine
+    monkeypatch.setattr(database, "_engine", previous_engine)
+    monkeypatch.setattr(database, "_SessionLocal", database._SessionLocal)
+    _save_collection()
+    _seed_core()
+    _write(OTHER, ["c1", "c2"])
+
+    def _tables() -> List[str]:
+        engine = create_engine(url)
+        try:
+            return inspect(engine).get_table_names()
+        finally:
+            engine.dispose()
+
+    try:
+        assert _tables() == []
+        listed = list_documents(KB, is_admin=True)
+        detail = get_document_stats(KB, "d1", is_admin=True)
+        tables_after_reads = _tables()
+
+        database.init_db(db_url=url)
+
+        assert get_alembic_revision(database.get_engine())
+        assert tables_after_reads == []
+        assert [doc.status for doc in listed.documents] == [S.SUCCESS]
+        assert detail.data is not None and detail.data.status == S.SUCCESS
+    finally:
+        if model_resolver._MODEL_HUB_ENGINE is not None:
+            model_resolver._MODEL_HUB_ENGINE.dispose()
+        if database._engine is not None and database._engine is not previous_engine:
+            database._engine.dispose()

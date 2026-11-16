@@ -404,6 +404,7 @@ async def test_a_wound_down_asr_session_closes_1012_and_releases_its_token(
     monkeypatch,
 ):
     from xagent.web.api import speech
+    from xagent.web.services import speech_streams
 
     blocked = asyncio.Event()
 
@@ -419,7 +420,7 @@ async def test_a_wound_down_asr_session_closes_1012_and_releases_its_token(
 
     monkeypatch.setattr(speech, "get_authenticated_user", authenticated)
     monkeypatch.setattr(speech, "accept_authenticated_websocket", accept)
-    monkeypatch.setattr(speech, "_receive_asr_message", receive)
+    monkeypatch.setattr(speech_streams, "_receive_asr_message", receive)
     socket = _AsrSocket()
 
     handler = asyncio.create_task(
@@ -1532,6 +1533,7 @@ def test_a_tracked_thread_is_counted_from_before_it_starts_until_it_returns():
 
 async def test_a_foreign_cancel_beside_the_fence_cancel_is_not_swallowed(monkeypatch):
     from xagent.web.api import speech
+    from xagent.web.services import speech_streams
 
     blocked = asyncio.Event()
 
@@ -1547,7 +1549,7 @@ async def test_a_foreign_cancel_beside_the_fence_cancel_is_not_swallowed(monkeyp
 
     monkeypatch.setattr(speech, "get_authenticated_user", authenticated)
     monkeypatch.setattr(speech, "accept_authenticated_websocket", accept)
-    monkeypatch.setattr(speech, "_receive_asr_message", receive)
+    monkeypatch.setattr(speech_streams, "_receive_asr_message", receive)
     socket = _AsrSocket()
 
     handler = asyncio.create_task(

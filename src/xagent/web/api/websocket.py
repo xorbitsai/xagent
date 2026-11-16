@@ -47,10 +47,10 @@ from sqlalchemy.orm import Session
 from starlette.websockets import WebSocketState
 
 from ...config import (
-    get_ws_restart_close_window_seconds,
     get_external_upload_dirs,
     get_shared_task_execution_enabled,
     get_uploads_dir,
+    get_ws_restart_close_window_seconds,
 )
 from ...core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,

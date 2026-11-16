@@ -8,8 +8,9 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -62,6 +63,7 @@ from ..sandbox.base import (
     grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
+from ..sandbox.settle import await_shielded
 from .sandbox_keys import (
     DURABLE_CHROME_LIFECYCLE_TYPE,
     USER_LIFECYCLE_TYPE,
@@ -77,6 +79,25 @@ _WORKER_LIFECYCLE_MARKER = "::worker::"
 # sites, rather than each falling back to the backend's own (backend-specific,
 # potentially unbounded) default.
 _SANDBOX_STOP_TIMEOUT_SECONDS = 30
+
+# Startup bound for the quiesce, as seconds from its start. It only limits how
+# many further stops are *issued*: an issued stop is never abandoned, because
+# cancelling the awaiter would release the same-name lock and barrier while the
+# daemon call still runs in its thread. Read by ``_quiesce`` only; the legacy
+# cleanup (backends without spec reconciliation) must finish, so it ignores it.
+_QUIESCE_BUDGET_SECONDS: ContextVar[float | None] = ContextVar(
+    "xagent_sandbox_quiesce_budget_seconds", default=None
+)
+
+
+@contextmanager
+def bounded_quiesce(seconds: float) -> Iterator[None]:
+    """Stop issuing new quiesce stops after ``seconds`` within this block."""
+    token = _QUIESCE_BUDGET_SECONDS.set(seconds)
+    try:
+        yield
+    finally:
+        _QUIESCE_BUDGET_SECONDS.reset(token)
 
 
 class SandboxCapacityError(RuntimeError):
@@ -2583,6 +2604,14 @@ class SandboxManager:
                 pass
             await self._service.delete(warmup_name)
             logger.info(f"Sandbox image warmup completed: {image}")
+        except asyncio.CancelledError:
+            # Warmup runs as a background task that retirement, shutdown or a
+            # failed activation cancels. A cancel cannot stop a Docker create
+            # or stop already issued, so finish removing the reserved container
+            # before the cancellation is allowed to complete.
+            with suppress(Exception):
+                await await_shielded(self._service.delete(warmup_name))
+            raise
         except Exception as e:
             logger.error(f"Failed to warmup sandbox image: {e}")
 
@@ -2609,58 +2638,74 @@ class SandboxManager:
         method's. This intentionally replaces the legacy config-diff
         delete-guessing for this backend (see ``_legacy_cleanup``).
         """
-        quiesce_started = time.monotonic()
-        list_failed = False
         try:
-            sandboxes = await self._service.list_sandboxes()
-        except Exception as exc:
-            logger.error(f"Failed to list sandboxes for quiesce: {exc}")
-            sandboxes = []
-            list_failed = True
-
-        seen = len(sandboxes or [])
-        running = 0
-        stopped = 0
-        failed = 0
-        stop_seconds = 0.0
-        for sb in sandboxes or []:
+            quiesce_started = time.monotonic()
+            budget = _QUIESCE_BUDGET_SECONDS.get()
+            deadline = None if budget is None else quiesce_started + budget
+            deferred = 0
+            list_failed = False
             try:
-                lifecycle_type, _ = self.parse_sandbox_name(sb.name)
-            except (TypeError, ValueError):
-                lifecycle_type = None
-            if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
-                continue
-            if sb.state != "running":
-                continue
-            running += 1
-            stop_started = time.monotonic()
-            try:
-                await self._service.stop_existing(
-                    sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
-                )
-                stopped += 1
-                logger.debug(f"Stopped sandbox: {sb.name}")
+                sandboxes = await self._service.list_sandboxes()
             except Exception as exc:
-                failed += 1
-                logger.error(f"Failed to stop sandbox {sb.name} during quiesce: {exc}")
-            finally:
-                stop_seconds += time.monotonic() - stop_started
+                logger.error(f"Failed to list sandboxes for quiesce: {exc}")
+                sandboxes = []
+                list_failed = True
 
-        self._cache.clear()
-        self._config_cache.clear()
-        self._lease_providers.clear()
-        self._activity.clear()
-        self._reconcile_budget.clear()
+            seen = len(sandboxes or [])
+            running = 0
+            stopped = 0
+            failed = 0
+            stop_seconds = 0.0
+            for sb in sandboxes or []:
+                try:
+                    lifecycle_type, _ = self.parse_sandbox_name(sb.name)
+                except (TypeError, ValueError):
+                    lifecycle_type = None
+                if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                    continue
+                if sb.state != "running":
+                    continue
+                running += 1
+                if deadline is not None and time.monotonic() >= deadline:
+                    # Out of budget: issue no further stop. The container stays
+                    # running and the next use reconciles it (this backend
+                    # reconciles specs); a stop already issued is never cut.
+                    deferred += 1
+                    continue
+                stop_started = time.monotonic()
+                try:
+                    await self._service.stop_existing(
+                        sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+                    )
+                    stopped += 1
+                    logger.debug(f"Stopped sandbox: {sb.name}")
+                except Exception as exc:
+                    failed += 1
+                    logger.error(
+                        f"Failed to stop sandbox {sb.name} during quiesce: {exc}"
+                    )
+                finally:
+                    stop_seconds += time.monotonic() - stop_started
+
+        finally:
+            # Also on cancel (startup bounds this call): stale process-local
+            # state must never survive a quiesce that was cut short.
+            self._cache.clear()
+            self._config_cache.clear()
+            self._lease_providers.clear()
+            self._activity.clear()
+            self._reconcile_budget.clear()
         # One summary line per quiesce: stops are serial and each rides the full
         # stop timeout, so stop_time grows with the running count and dominates
         # startup.
         logger.info(
             "Sandbox quiesce completed: seen=%d running=%d stopped=%d failed=%d "
-            "stop_time=%.2fs total=%.2fs status=%s",
+            "deferred=%d stop_time=%.2fs total=%.2fs status=%s",
             seen,
             running,
             stopped,
             failed,
+            deferred,
             stop_seconds,
             time.monotonic() - quiesce_started,
             # status keeps a list-discovery failure from reading as clean empty work

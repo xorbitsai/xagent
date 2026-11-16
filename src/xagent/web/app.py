@@ -283,6 +283,8 @@ _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
 _trigger_dispatcher_task: asyncio.Task[Any] | None = None
 _task_command_dispatcher_task: asyncio.Task[Any] | None = None
 _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
+_sandbox_warmup_task: asyncio.Task[None] | None = None
+SANDBOX_WARMUP_TASK_NAME = "sandbox-warmup"
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
@@ -2707,15 +2709,40 @@ async def _admit_memory_and_lancedb() -> None:
         logger.info("Started background uploaded files reconcile task")
 
 
+async def _run_sandbox_warmup(sandbox_mgr: Any) -> None:
+    with _startup_phase("sandbox warmup (background)"):
+        try:
+            await sandbox_mgr.warmup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Sandbox warmup failed")
+
+
 async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
     # cleanup() quiesce can be awaited inline for minutes with no logs.
     # Time each sub-phase so the next slow start names the exact one; the
     # quiesce summary breaks it down further.
+    from ..config import get_sandbox_startup_cleanup_timeout_seconds
+    from .sandbox_manager import bounded_quiesce
+
+    # Thirteen processes share one Docker daemon during a release, so the
+    # quiesce gets a budget after which it issues no further stops. It is a
+    # limit on scheduling more cleanup, never a cancel: abandoning an issued
+    # stop would release its same-name lock while the daemon call still runs.
+    # A container left running is reconciled on first use on backends that
+    # reconcile specs; the legacy cleanup for those that do not ignores the
+    # budget and must finish (or fail activation at the step bound).
     with _startup_phase("sandbox cleanup"):
-        await sandbox_mgr.cleanup()
-    with _startup_phase("sandbox warmup"):
-        await sandbox_mgr.warmup()
-    logger.info("Sandbox manager initialized and warmed up")
+        with bounded_quiesce(get_sandbox_startup_cleanup_timeout_seconds()):
+            await sandbox_mgr.cleanup()
+
+    # The image warmup only pre-pulls and pre-creates; nothing waits on it, so it
+    # runs after admission opens instead of inside the activation budget.
+    global _sandbox_warmup_task
+    _sandbox_warmup_task = asyncio.create_task(_run_sandbox_warmup(sandbox_mgr))
+    _sandbox_warmup_task.set_name(SANDBOX_WARMUP_TASK_NAME)
+    logger.info("Sandbox manager initialized; warmup started in the background")
 
     from ..config import get_sandbox_idle_ttl
 
@@ -2856,7 +2883,8 @@ async def _stop_runtime_loops() -> None:
         _uploaded_file_reconcile_task, \
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
-        _sandbox_idle_sweep_task
+        _sandbox_idle_sweep_task, \
+        _sandbox_warmup_task
 
     # The temp-file walk runs in a thread a task cancel cannot stop; its stop
     # event is what ends it (see ``start_temp_file_cleanup_task``).
@@ -2885,6 +2913,12 @@ async def _stop_runtime_loops() -> None:
         with suppress(asyncio.CancelledError):
             await _sandbox_idle_sweep_task
     _sandbox_idle_sweep_task = None
+
+    if _sandbox_warmup_task is not None and not _sandbox_warmup_task.done():
+        _sandbox_warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sandbox_warmup_task
+    _sandbox_warmup_task = None
 
     preflight_task = getattr(app.state, "file_storage_preflight_task", None)
     if preflight_task is not None and not preflight_task.done():

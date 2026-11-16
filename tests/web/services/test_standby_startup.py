@@ -182,12 +182,16 @@ async def test_startup_event_defers_every_write_and_singleton_until_activation(
         "start_task_lease_recovery_task",
         "memory_admission",
         "sandbox_cleanup",
-        "sandbox_warmup",
         "command_dispatcher",
         "start_composio_reconcile_task",
     ]
     positions = [after.index(name) for name in expected_order]
     assert positions == sorted(positions), after
+    # The warmup is not an activation step: it runs in the background afterwards.
+    warmup_task = app_module._sandbox_warmup_task
+    assert warmup_task is not None
+    await warmup_task
+    assert "sandbox_warmup" in events
     assert "init_db" not in events
     assert not release_hold.closed and standby.phase is StandbyPhase.ACTIVE
 

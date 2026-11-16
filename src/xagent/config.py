@@ -54,6 +54,13 @@ EXECUTION_EVENT_STORAGE_ENTRIES = "XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES"
 EXECUTION_EVENT_STORAGE_USER_IDS = "XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 STANDBY = "XAGENT_STANDBY"
+STANDBY_STEP_TIMEOUT_SECONDS = "XAGENT_STANDBY_STEP_TIMEOUT_SECONDS"
+SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS = (
+    "XAGENT_SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS"
+)
+TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS = (
+    "XAGENT_TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS"
+)
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
 WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
@@ -1287,6 +1294,44 @@ def get_shared_task_execution_enabled() -> bool:
     if configured is not None and configured.strip():
         return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
     return get_worker_count() is not None or get_task_execution_role() != "combined"
+
+
+def _positive_seconds_env(name: str, default: float) -> float:
+    """A strictly positive, finite number of seconds; a bad value fails closed."""
+    import math
+
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number of seconds, got {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite, got {raw!r}")
+    return value
+
+
+def get_standby_step_timeout_seconds() -> float:
+    """Upper bound for one activation step (``XAGENT_STANDBY_STEP_TIMEOUT_SECONDS``).
+
+    Default 60 s: under the host's 90 s activation budget, so a stuck step
+    fails with its name instead of leaving the host waiting in silence.
+    """
+    return _positive_seconds_env(STANDBY_STEP_TIMEOUT_SECONDS, 60.0)
+
+
+def get_sandbox_startup_cleanup_timeout_seconds() -> float:
+    """Budget after which the startup quiesce issues no further stops.
+
+    Never cancels a stop already issued; see ``bounded_quiesce``.
+    """
+    return _positive_seconds_env(SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS, 20.0)
+
+
+def get_task_event_bridge_start_timeout_seconds() -> float:
+    """How long the task event bridge may retry Redis before start fails."""
+    return _positive_seconds_env(TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS, 30.0)
 
 
 def get_standby_enabled() -> bool:

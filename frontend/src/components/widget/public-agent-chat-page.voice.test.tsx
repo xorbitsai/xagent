@@ -6,7 +6,7 @@ import type { WidgetVoiceCallOptions } from "@/hooks/use-widget-voice-call"
 import type { VoiceAudioTransport } from "@/lib/voice-audio"
 
 const app = vi.hoisted(() => ({
-  state: { taskId: null as number | null, currentTask: null as null | { status: string }, isHistoryLoading: false, isProcessing: false, messages: [] },
+  state: { taskId: null as number | null, currentTask: null as null | { id: string; status: string; waitingRequestId?: string }, isHistoryLoading: false, isProcessing: false, messages: [] },
   connectionPhase: "connected",
   isConnected: true,
   sendMessage: vi.fn(),
@@ -182,7 +182,21 @@ describe("widget voice call wiring", () => {
     await act(async () => { await voice.props!.onSend("spoken words", "voice-id") })
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/api/widget/chat/task/create"))).toBe(true)
     expect(app.setTaskId).toHaveBeenCalledWith(60, { navigate: false })
-    expect(app.sendMessage).toHaveBeenCalledWith("spoken words", { targetTaskId: 60 }, [])
+    expect(app.sendMessage).toHaveBeenCalledWith("spoken words", { clientMessageId: "voice-id", targetTaskId: 60 }, [])
+  })
+
+  it.each([
+    { label: "waiting on a question", status: "waiting_for_user", taskId: "71", metadata: { request_id: "question-9" } },
+    { label: "waiting on another task's question", status: "waiting_for_user", taskId: "70", metadata: undefined },
+    { label: "running", status: "running", taskId: "71", metadata: undefined },
+  ])("answers like a typed message while the task is $label", async ({ status, taskId, metadata }) => {
+    localStorage.setItem("widget_task_17_guest-1", "71")
+    app.state.taskId = 71
+    app.state.currentTask = { id: taskId, status, waitingRequestId: "question-9" }
+    await renderPage({ voice_enabled: true })
+    await act(async () => { await voice.props!.onSend("my answer", "voice-id") })
+    expect(app.sendMessage).toHaveBeenCalledExactlyOnceWith(
+      "my answer", { clientMessageId: "voice-id", ...(metadata ? { metadata } : {}) }, [])
   })
 
   it("never pauses the run when the visitor talks over it", async () => {

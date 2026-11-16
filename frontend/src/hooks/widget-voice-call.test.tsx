@@ -40,6 +40,7 @@ class Context {
   createGain = () => ({ gain: { value: 0 }, connect: vi.fn(), disconnect: vi.fn() })
 }
 const getUserMedia = vi.fn()
+const tracks: Array<{ stop: typeof stopTrack; enabled: boolean }> = []
 const fetchMock = vi.fn()
 const requestTts = vi.fn()
 
@@ -50,10 +51,11 @@ const transport = {
   classify: classifyWidgetVoiceEvent,
 }
 
-const latest = { call: null as VoiceCall | null, openChanges: [] as boolean[] }
+const latest = { call: null as VoiceCall | null, openChanges: [] as boolean[], setOpen: null as null | ((open: boolean) => void) }
 type HarnessProps = Partial<Omit<WidgetVoiceCallOptions, "open" | "onOpenChange">>
 function Harness(props: HarnessProps) {
   const [open, setOpen] = useState(true)
+  latest.setOpen = setOpen
   latest.call = useWidgetVoiceCall({
     transport, taskId: null, messages: [], busy: false, waiting: false, disabled: false,
     onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: () => false, ...props,
@@ -68,7 +70,13 @@ beforeEach(() => {
   Socket.instances = []
   latest.call = null
   latest.openChanges = []
-  getUserMedia.mockImplementation(async () => { order.push("microphone"); return { getTracks: () => [{ stop: stopTrack, enabled: true }] } })
+  tracks.length = 0
+  getUserMedia.mockImplementation(async () => {
+    order.push("microphone")
+    const track = { stop: stopTrack, enabled: true }
+    tracks.push(track)
+    return { getTracks: () => [track] }
+  })
   fetchMock.mockImplementation(async () => { order.push("fetch"); return new Response(null, { status: 500 }) })
   requestTts.mockReset()
   vi.stubGlobal("WebSocket", Socket)
@@ -219,6 +227,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(socket.close).toHaveBeenCalled()
     expect(call().alert).toBe("voiceConversation.widget.connectionEnded")
     expect(call().retryDisabled).toBe(true)
+    expect(stopTrack).toHaveBeenCalled()
   },
   21: () => each([null, 8], async next => {
     const { view, socket } = await connected({ taskId: 7 })
@@ -229,8 +238,14 @@ const scenarios: Record<number, () => Promise<void>> = {
   }),
   22: async () => {
     const { view } = await connected()
+    // Open again, and make the start path run again: muting passes the call
+    // through another phase, and busy changes rerun it as well.
+    act(() => latest.setOpen!(true))
+    act(() => call().toggleMute())
+    act(() => call().toggleMute())
     view.rerender(<Harness busy />)
     view.rerender(<Harness />)
+    await act(async () => { await Promise.resolve() })
     expect(Socket.instances).toHaveLength(1)
     expect(getUserMedia).toHaveBeenCalledOnce()
     expect(call().phase).toBe("listening")
@@ -271,6 +286,44 @@ describe("widget voice call state table", () => {
 })
 
 describe("widget voice call around the conversation", () => {
+  it("opens a new recognition socket when the visitor retries after a failure", async () => {
+    const { socket } = await connected()
+    act(() => socket.onclose!({ code: 1006, reason: "" }))
+    expect(call().phase).toBe("error")
+    act(() => call().retry())
+    await waitFor(() => expect(Socket.instances).toHaveLength(2))
+    expect(getUserMedia).toHaveBeenCalledTimes(2)
+    expect(call().alert).toBeUndefined()
+  })
+
+  it.each(["end", "unmount"])("never opens recognition when the call is gone before the microphone answers (%s)", async how => {
+    let grant: (media: unknown) => void = () => {}
+    getUserMedia.mockImplementation(() => new Promise(resolve => { grant = resolve }))
+    const view = render(<Harness />)
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledOnce())
+    if (how === "end") act(() => call().end())
+    else view.unmount()
+    const before = latest.call
+    const track = { stop: vi.fn(), enabled: true }
+    await act(async () => { grant({ getTracks: () => [track] }); await new Promise(resolve => setTimeout(resolve, 0)) })
+    expect(Socket.instances).toHaveLength(0)
+    expect(track.stop).toHaveBeenCalled()
+    expect(latest.call).toBe(before)
+    if (how === "end") expect(call().open).toBe(false)
+  })
+
+  it("mutes and unmutes the microphone", async () => {
+    await connected()
+    act(() => call().toggleMute())
+    expect(tracks[0].enabled).toBe(false)
+    expect(call().muted).toBe(true)
+    expect(call().phase).toBe("muted")
+    act(() => call().toggleMute())
+    expect(tracks[0].enabled).toBe(true)
+    expect(call().muted).toBe(false)
+    expect(call().phase).toBe("listening")
+  })
+
   it.each([
     { label: "permission refused", setup: () => getUserMedia.mockRejectedValue(new DOMException("denied", "NotAllowedError")) },
     { label: "no microphone", setup: () => getUserMedia.mockRejectedValue(new DOMException("none", "NotFoundError")) },

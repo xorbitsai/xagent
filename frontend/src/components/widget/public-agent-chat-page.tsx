@@ -489,7 +489,16 @@ function PublicConversationContent({
     : state.isProcessing || isMessageDeliveryPending || !isConnected || isSendInFlight
       || WIDGET_VOICE_TASK_STATUSES_BUSY.includes(taskStatus)
   const voiceDisabled = state.taskId !== null && connectionPhase === "lost"
-  const sendSpoken = useCallback((text: string) => handleSend(text, undefined, []), [handleSend])
+  // Spoken words are sent exactly as the composer sends typed ones: with the
+  // call's client message id, and answering the question the task is waiting
+  // on (the same request id the conversation panel hands the composer).
+  const sendSpoken = useCallback((text: string, clientMessageId: string) => {
+    const task = state.currentTask
+    const requestId = task?.status === "waiting_for_user" && task.id === String(state.taskId)
+      ? task.waitingRequestId
+      : undefined
+    return handleSend(text, { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }, [])
+  }, [handleSend, state.currentTask, state.taskId])
   const openVoiceCall = useCallback(() => setVoiceOpen(true), [])
   const VoiceScope = voiceCallOffered ? VoiceCallStoreProvider : React.Fragment
 

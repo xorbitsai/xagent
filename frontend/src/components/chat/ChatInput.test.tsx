@@ -12,6 +12,19 @@ const authUserMock = vi.hoisted(() => ({
   current: { id: "1", is_admin: true } as { id: string; is_admin: boolean },
 }))
 
+// Passes straight through to the real hook; only records the enabled flag.
+const voiceModelsEnabled = vi.hoisted(() => [] as boolean[])
+vi.mock("@/hooks/use-voice-models", async () => {
+  const actual = await vi.importActual<typeof import("@/hooks/use-voice-models")>("@/hooks/use-voice-models")
+  return {
+    ...actual,
+    useVoiceModels: (enabled: boolean, refreshKey?: boolean) => {
+      voiceModelsEnabled.push(enabled)
+      return actual.useVoiceModels(enabled, refreshKey)
+    },
+  }
+})
+
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
     "@/lib/api-wrapper"
@@ -312,6 +325,15 @@ describe("ChatInput", () => {
     expect(await screen.findByTestId("voice-call-bar")).toBeInTheDocument()
     await Promise.resolve()
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("never looks the account models up for a provided call, even with dictation on", () => {
+    voiceModelsEnabled.length = 0
+    render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} voiceConversationSource="provided"
+      voiceInputEnabled inputValue="" onInputChange={vi.fn()} hideConfig />)
+    expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeInTheDocument()
+    expect(voiceModelsEnabled.length).toBeGreaterThan(0)
+    expect(voiceModelsEnabled.every(enabled => enabled === false)).toBe(true)
   })
 
   it("keeps the account call behind dictation when no source is given", () => {

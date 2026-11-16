@@ -20,8 +20,6 @@ interface WidgetVoiceStateRow {
   row: number
   event: string
   result: string
-  /** Only the Session page reaches this row. */
-  sessionOnly?: boolean
   /** Transport refusals this row covers, and the failure they end the call with (undefined: only a note). */
   match?: TransportMatch[]
   failure?: VoiceAudioFailure
@@ -55,7 +53,7 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 12, event: "sending the words failed", result: "call ends, fixed send-failed text, retryable" },
   { row: 13, event: "one sentence could not be synthesized", result: "call continues with a playback note",
     match: [{ kind: "tts_response", statuses: [400, 422, 500, 502, 504] }] },
-  { row: 14, event: "synthesis 401 after one credential refresh", result: "unavailable, not retryable", sessionOnly: true,
+  { row: 14, event: "Session synthesis 401 after one credential refresh", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [401] }], failure: "voice_unavailable" },
   { row: 15, event: "guest synthesis 401 / 403", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [401, 403] }], failure: "voice_unavailable" },

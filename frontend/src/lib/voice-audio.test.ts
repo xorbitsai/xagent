@@ -319,6 +319,27 @@ it.each([undefined, 0.5])("only submits an explicitly supported VAD timing overr
   call.close()
 })
 
+describe("signed-in speech transport", () => {
+  it("talks to the signed-in speech endpoints with the login", async () => {
+    const call = new VoiceAudio({ ...options(), voice: "narrator", vadSilenceThreshold: 0.5 })
+    const socket = await start(call)
+    expect(socket.url.endsWith("/api/models/speech/asr/stream")).toBe(true)
+    expect(socket.protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.login-token"])
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toEqual({
+      type: "start", model_id: "live", format: "pcm", sample_rate: 16000, vad: true, vad_silence_threshold_secs: 0.5,
+    })
+    const request = vi.fn(async () => new Response(null, { status: 500 }))
+    vi.stubGlobal("fetch", request)
+    await expect(call.speak("Hello")).rejects.toThrow("Speech synthesis failed")
+    const [url, init] = request.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url.endsWith("/api/models/speech/tts/stream")).toBe(true)
+    expect(init.method).toBe("POST")
+    expect(init.headers).toEqual({ Authorization: "Bearer current-login-token", "Content-Type": "application/json" })
+    expect(JSON.parse(String(init.body))).toEqual({ model_id: "speaker", voice: "narrator", text: "Hello", format: "pcm", sample_rate: 24000 })
+    call.close()
+  })
+})
+
 describe("injected speech transport", () => {
   const callbacks = () => ({ activity: vi.fn(), transcript: vi.fn(), error: vi.fn(), vadFallback: vi.fn() })
   const transport = (over: Partial<VoiceAudioTransport> = {}) => ({

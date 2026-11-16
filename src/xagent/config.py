@@ -2421,14 +2421,15 @@ def get_widget_voice_tts_ip_rate_limit() -> str:
 def get_widget_voice_tts_visitor_daily_chars() -> str:
     """Raw daily synthesis character budget for one widget visitor.
 
-    Parsed by the widget voice budget, which falls back to its default with a
-    warning on a negative or unparsable value. 0 refuses every request.
+    Parsed by the widget voice budget: empty means no limit, 0 refuses every
+    request, and a negative or unparsable value means no limit with a warning.
     """
     return (os.getenv(WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS) or "").strip()
 
 
 def get_widget_voice_tts_entity_daily_chars() -> str:
-    """Raw daily synthesis character budget for one widget agent or workforce."""
+    """Raw daily synthesis character budget for one widget agent or workforce;
+    empty means no limit."""
     return (os.getenv(WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS) or "").strip()
 
 

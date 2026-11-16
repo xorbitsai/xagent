@@ -77,6 +77,57 @@ def test_zero_refuses_everything_and_bad_values_fall_back(monkeypatch, caplog):
     assert "Invalid widget voice budget" in caplog.text
 
 
+def _unset(monkeypatch, settings: dict[str, str]) -> None:
+    for name in settings.values():
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_unset_visitor_and_entity_budgets_have_no_limit(monkeypatch):
+    _unset(monkeypatch, SETTINGS)
+    # One visitor reserves 250,000 characters in a day.
+    for _ in range(5):
+        reserve_tts_sync("agent:1", "1.2.3.4", 50_000)
+    assert _counts() == {
+        "tts-visitor": 250_000,
+        "tts-entity": 250_000,
+        "tts-site": 250_000,
+    }
+
+
+def test_unset_site_budget_refuses_at_a_million_characters(monkeypatch):
+    _unset(monkeypatch, SETTINGS)
+    for visitor in range(4):
+        reserve_tts_sync("agent:1", f"v{visitor}", 250_000)
+    before = dict(widget_voice_budget._memory_store._counts)
+    with pytest.raises(VoiceBudgetExhausted) as refused:
+        reserve_tts_sync("agent:1", "v0", 1)
+    assert str(refused.value) == "tts-site"
+    assert widget_voice_budget._memory_store._counts == before
+    assert _counts()["tts-site"] == 1_000_000
+
+
+@pytest.mark.parametrize("bucket", ["tts-visitor", "tts-entity"])
+def test_zero_visitor_or_entity_budget_refuses_everything(monkeypatch, bucket):
+    _unset(monkeypatch, SETTINGS)
+    monkeypatch.setenv(SETTINGS[bucket], "0")
+    with pytest.raises(VoiceBudgetExhausted) as refused:
+        reserve_tts_sync("agent:1", "v", 1)
+    assert str(refused.value) == bucket
+    assert set(_counts().values()) <= {0}
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "-5", "lots"])
+@pytest.mark.parametrize("index", [0, 1], ids=["tts-visitor", "tts-entity"])
+def test_blank_or_bad_visitor_and_entity_budgets_mean_no_limit(
+    monkeypatch, caplog, index, raw
+):
+    bucket = TTS_BUCKETS[index]
+    monkeypatch.setenv(SETTINGS[bucket.name], raw)
+    assert widget_voice_budget.bucket_limit(bucket) is None
+    warned = f"{bucket.name}={raw!r}; falling back to no limit" in caplog.text
+    assert warned == bool(raw.strip())
+
+
 @pytest.mark.parametrize("next_day", [False, True])
 def test_budget_window_is_the_utc_calendar_day(monkeypatch, next_day):
     monkeypatch.setenv(SETTINGS["tts-entity"], "10")
@@ -154,6 +205,33 @@ def test_configured_redis_never_falls_back_to_memory(monkeypatch, failure):
         reserve_tts_sync("agent:1", "v", 4)
         assert sorted(fake.values.values()) == [4, 4, 4]
     assert widget_voice_budget._memory_store._counts == {}
+
+
+@pytest.mark.parametrize(
+    ("setting", "attribute", "default"),
+    [
+        (
+            "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT",
+            "_widget_voice_tts_ip_limit",
+            "120/minute",
+        ),
+        (
+            "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT",
+            "_widget_voice_tts_entity_limit",
+            "600/minute",
+        ),
+    ],
+)
+def test_unparsable_synthesis_rate_limit_uses_its_default(
+    monkeypatch, setting, attribute, default
+):
+    from limits import parse
+
+    monkeypatch.setenv(setting, "often")
+    share_rate_limit.reset_share_rate_limiter()
+    limiter = share_rate_limit.get_share_rate_limiter()
+    assert getattr(limiter, attribute) == parse(default)
+    share_rate_limit.reset_share_rate_limiter()
 
 
 @pytest.mark.parametrize("phase", ["test", "hit"])

@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from redis import Redis
 from redis.backoff import NoBackoff
@@ -58,20 +58,26 @@ class VoiceBudgetUnavailable(Exception):
 class BudgetBucket:
     name: str
     setting: Callable[[], str]
-    default: int
+    # None: the bucket has no limit unless its setting gives one.
+    default: int | None
 
 
 TTS_BUCKETS = (
-    BudgetBucket("tts-visitor", get_widget_voice_tts_visitor_daily_chars, 40_000),
-    BudgetBucket("tts-entity", get_widget_voice_tts_entity_daily_chars, 200_000),
+    BudgetBucket("tts-visitor", get_widget_voice_tts_visitor_daily_chars, None),
+    BudgetBucket("tts-entity", get_widget_voice_tts_entity_daily_chars, None),
     BudgetBucket("tts-site", get_widget_voice_tts_site_daily_chars, 1_000_000),
 )
 
 
-def _parse_amount(raw: str, default: int, name: str, ceiling: int | None) -> int:
+_DefaultT = TypeVar("_DefaultT", bound="int | None")
+
+
+def _parse_amount(
+    raw: str, default: _DefaultT, name: str, ceiling: int | None
+) -> int | _DefaultT:
     """0 is a real limit (refuse all); empty means the default; a negative,
     unparsable, or over-ceiling value falls back to the default with a
-    warning."""
+    warning. A ``None`` default means no limit."""
     if not raw:
         return default
     try:
@@ -80,13 +86,17 @@ def _parse_amount(raw: str, default: int, name: str, ceiling: int | None) -> int
         value = -1
     if value < 0 or (ceiling is not None and value > ceiling):
         logger.warning(
-            "Invalid widget voice budget %s=%r; falling back to %s", name, raw, default
+            "Invalid widget voice budget %s=%r; falling back to %s",
+            name,
+            raw,
+            "no limit" if default is None else default,
         )
         return default
     return value
 
 
-def bucket_limit(bucket: BudgetBucket) -> int:
+def bucket_limit(bucket: BudgetBucket) -> int | None:
+    """The bucket's daily limit, or ``None`` when it has no limit."""
     return _parse_amount(bucket.setting(), bucket.default, bucket.name, None)
 
 
@@ -175,7 +185,9 @@ def _reserve(
             key = f"xagent:widget-voice:{day}:{bucket.name}:{scope}"
             value = store.incrby(key, amount)
             added.append(key)
-            if value > bucket_limit(bucket):
+            # A bucket without a limit is still counted.
+            limit = bucket_limit(bucket)
+            if limit is not None and value > limit:
                 raise VoiceBudgetExhausted(bucket.name)
     except BaseException as exc:
         # Best effort: a failed subtraction only leaves the day over-counted.

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
+import re
 import secrets
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
@@ -11,6 +15,7 @@ from sqlalchemy import and_, column, event, exists, literal_column, select, text
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.types import Boolean
 
+from xagent.web.api import conversation_logs
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_engine
@@ -972,6 +977,439 @@ def test_list_sql_has_no_time_window_clause_without_time_parameters() -> None:
     assert len(with_window) == 1
     assert "task_chat_messages" in with_window[0]
     assert "task_execution_events" in with_window[0]
+
+
+EXPORT_URL = "/api/conversation-logs/export"
+EXPORT_HEADER = [
+    "conversation_id",
+    "agent",
+    "channel",
+    "status",
+    "title",
+    "started_at",
+    "last_activity_at",
+    "message_count",
+    "total_tokens",
+    "first_message",
+    "latest_answer",
+    "error_message",
+]
+FORMULA_PREFIXES = ["=", "+", "-", "@", "\t", "\r"]
+
+
+def _export(headers: dict[str, str], **params: Any) -> Any:
+    return client.get(EXPORT_URL, params=params, headers=headers)
+
+
+def _csv_rows(response: Any) -> list[list[str]]:
+    text = response.content.decode("utf-8-sig")
+    return list(csv.reader(io.StringIO(text, newline="")))
+
+
+def _exported_by_column(response: Any) -> list[dict[str, str]]:
+    header, *rows = _csv_rows(response)
+    return [dict(zip(header, row)) for row in rows]
+
+
+def _set_task_fields(task_id: int, **fields: Any) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(fields)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_export_returns_csv_with_bom_and_fixed_header() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    _create_task_row(user_id=user_id, title="row", source="sdk", is_visible=False)
+
+    response = _export(headers)
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/csv")
+    assert response.headers["cache-control"] == "no-store"
+    assert re.fullmatch(
+        r'attachment; filename="conversation-logs-\d{8}-\d{6}\.csv"',
+        response.headers["content-disposition"],
+    )
+    assert response.content.startswith(b"\xef\xbb\xbf")
+    assert _csv_rows(response)[0] == EXPORT_HEADER
+    assert len(_csv_rows(response)) == 2
+
+
+def test_export_with_no_rows_is_only_the_header() -> None:
+    response = _export(_admin_headers(), **WINDOW_PARAMS)
+
+    assert response.status_code == 200, response.text
+    assert _csv_rows(response) == [EXPORT_HEADER]
+
+
+def test_export_columns_carry_the_listed_values() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Export Agent")
+    created = datetime(2026, 3, 1, 8, tzinfo=timezone.utc)
+    last_message = datetime(2026, 3, 10, 12, tzinfo=timezone.utc)
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="Export title",
+        description="first words",
+        output_text="latest reply",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+        created_at=created,
+        updated_at=created,
+    )
+    _set_task_fields(task_id, error_message="boom")
+    _add_chat_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="user",
+        content="hi",
+        created_at=last_message,
+    )
+
+    (row,) = _exported_by_column(_export(headers))
+
+    assert row == {
+        "conversation_id": str(task_id),
+        "agent": "Export Agent",
+        "channel": "Widget",
+        "status": "completed",
+        "title": "Export title",
+        "started_at": "2026-03-01T08:00:00+00:00",
+        "last_activity_at": "2026-03-10T12:00:00+00:00",
+        "message_count": "1",
+        "total_tokens": "8",
+        "first_message": "first words",
+        "latest_answer": "latest reply",
+        "error_message": "boom",
+    }
+
+
+@pytest.mark.parametrize("prefix", FORMULA_PREFIXES, ids=repr)
+@pytest.mark.parametrize(
+    "column", ["agent", "title", "first_message", "latest_answer", "error_message"]
+)
+def test_export_prefixes_formula_like_text_in_every_text_column(
+    column: str, prefix: str
+) -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    dangerous = f"{prefix}1+1"
+    agent_name = dangerous if column == "agent" else "Plain Agent"
+    agent_id = _create_agent_row(user_id=user_id, name=agent_name)
+    task_id = _create_task_row(
+        user_id=user_id,
+        title=dangerous if column == "title" else "plain title",
+        description=dangerous if column == "first_message" else "plain first",
+        output_text=dangerous if column == "latest_answer" else "plain answer",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    _set_task_fields(
+        task_id, error_message=dangerous if column == "error_message" else "plain err"
+    )
+
+    (row,) = _exported_by_column(_export(headers))
+
+    assert row[column] == "'" + dangerous
+    for other in ("agent", "title", "first_message", "latest_answer", "error_message"):
+        if other != column:
+            assert not row[other].startswith("'")
+
+
+@pytest.mark.parametrize("column", ["channel", "status"])
+def test_csv_line_guards_text_columns_not_fed_by_user_data(column: str) -> None:
+    index = EXPORT_HEADER.index(column)
+    for prefix in FORMULA_PREFIXES:
+        cells: list[Any] = ["x"] * len(EXPORT_HEADER)
+        cells[index] = f"{prefix}cmd"
+        parsed = next(
+            csv.reader(io.StringIO(conversation_logs._csv_line(cells), newline=""))
+        )
+        assert parsed[index] == f"'{prefix}cmd"
+
+
+def test_export_quotes_every_field_so_separators_cannot_split_cells() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    _create_task_row(
+        user_id=user_id,
+        title="safe;=1+1",
+        description="first, second",
+        output_text="plain text",
+        source="sdk",
+        is_visible=False,
+    )
+
+    response = _export(headers)
+
+    text = response.content.decode("utf-8-sig")
+    assert '"safe;=1+1"' in text
+    assert '"first, second"' in text
+    (row,) = _exported_by_column(response)
+    assert row["title"] == "safe;=1+1"
+    assert row["latest_answer"] == "plain text"
+
+
+def test_export_has_the_same_rows_in_the_same_order_as_the_listing() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    alpha = _create_agent_row(user_id=user_id, name="Alpha")
+    base = datetime(2026, 3, 10, tzinfo=timezone.utc)
+    db = _direct_db_session()
+    try:
+        for index in range(105):
+            # Groups of rows share one activity time so the id tie-break is
+            # part of the order being compared.
+            when = base + timedelta(minutes=index // 3)
+            db.add(
+                Task(
+                    user_id=user_id,
+                    title=f"bulk {index}",
+                    description=f"needle {index}" if index % 2 else f"hay {index}",
+                    status=TaskStatus.COMPLETED,
+                    source="widget" if index % 5 == 0 else "sdk",
+                    is_visible=False,
+                    agent_id=alpha,
+                    created_at=when,
+                    updated_at=when,
+                )
+            )
+        db.commit()
+    finally:
+        db.close()
+
+    def listed(params: dict[str, Any]) -> list[str]:
+        ids: list[str] = []
+        page = 1
+        while True:
+            response = client.get(
+                "/api/conversation-logs",
+                params={**params, "per_page": 100, "page": page},
+                headers=headers,
+            )
+            assert response.status_code == 200, response.text
+            body = response.json()
+            ids.extend(str(item["task_id"]) for item in body["logs"])
+            if page >= body["pagination"]["total_pages"]:
+                return ids
+            page += 1
+
+    filters: list[dict[str, Any]] = [
+        {},
+        {
+            "source": "rest_api",
+            "search": "needle",
+            "agent_id": alpha,
+            "active_from": "2026-03-10T00:05:00Z",
+            "active_to": "2026-03-10T00:30:00Z",
+        },
+    ]
+    for params in filters:
+        expected = listed(params)
+        assert expected
+        exported = [
+            row["conversation_id"]
+            for row in _exported_by_column(_export(headers, **params))
+        ]
+        assert exported == expected
+    assert len(listed({})) == 105
+
+
+def test_export_applies_the_time_window_and_source_validation() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    inside = _create_task_row(
+        user_id=user_id,
+        title="in",
+        source="sdk",
+        is_visible=False,
+        updated_at=datetime(2026, 3, 10, 12, tzinfo=timezone.utc),
+    )
+    _create_task_row(
+        user_id=user_id,
+        title="out",
+        source="sdk",
+        is_visible=False,
+        updated_at=datetime(2026, 3, 20, 12, tzinfo=timezone.utc),
+    )
+
+    rows = _exported_by_column(_export(headers, **WINDOW_PARAMS))
+
+    assert [row["conversation_id"] for row in rows] == [str(inside)]
+    assert _export(headers, source="internal").status_code == 400
+    assert _export(headers, active_from="2026-03-10T00:00:00").status_code == 422
+
+
+def test_export_is_scoped_to_the_callers_own_logs_unless_admin() -> None:
+    admin_headers = _admin_headers()
+    bob_headers = _register_second_user(username="bob")
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+    admin_task = _create_task_row(
+        user_id=admin_id, title="admin row", source="sdk", is_visible=False
+    )
+    bob_task = _create_task_row(
+        user_id=bob_id, title="bob row", source="sdk", is_visible=False
+    )
+
+    bob_ids = {r["conversation_id"] for r in _exported_by_column(_export(bob_headers))}
+    admin_ids = {
+        r["conversation_id"] for r in _exported_by_column(_export(admin_headers))
+    }
+
+    assert bob_ids == {str(bob_task)}
+    assert admin_ids == {str(admin_task), str(bob_task)}
+
+
+def test_export_requires_authentication() -> None:
+    response = client.get(EXPORT_URL)
+
+    assert response.status_code in (401, 403), response.text
+
+
+def test_export_message_count_matches_the_listing_for_a_v1_row() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    task_id = _create_task_row(
+        user_id=user_id, title="chat", source="sdk", is_visible=False
+    )
+    for index in range(3):
+        _add_chat_message(
+            task_id=task_id, user_id=user_id, role="user", content=f"m{index}"
+        )
+
+    listed = client.get("/api/conversation-logs", headers=headers).json()["logs"]
+    (row,) = _exported_by_column(_export(headers))
+
+    assert listed[0]["message_count"] == 3
+    assert row["message_count"] == str(listed[0]["message_count"])
+
+
+class _RecordingSpool(tempfile.SpooledTemporaryFile):  # type: ignore[type-arg]
+    instances: list[Any] = []
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        _RecordingSpool.instances.append(self)
+
+
+@pytest.fixture
+def _recorded_spools(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    _RecordingSpool.instances = []
+    monkeypatch.setattr(
+        conversation_logs.tempfile, "SpooledTemporaryFile", _RecordingSpool
+    )
+    return _RecordingSpool.instances
+
+
+def _three_rows() -> None:
+    user_id = _user_id("admin")
+    for index in range(3):
+        _create_task_row(
+            user_id=user_id, title=f"row {index}", source="sdk", is_visible=False
+        )
+
+
+def test_export_over_the_row_limit_is_a_422_without_a_file(
+    monkeypatch: pytest.MonkeyPatch, _recorded_spools: list[Any]
+) -> None:
+    headers = _admin_headers()
+    _three_rows()
+    monkeypatch.setattr(conversation_logs, "EXPORT_ROW_LIMIT", 2)
+
+    response = _export(headers)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "code": "conversation_log_export_too_large",
+        "reason": "rows",
+        "limit": 2,
+    }
+    assert "text/csv" not in response.headers["content-type"]
+    assert _recorded_spools and all(spool.closed for spool in _recorded_spools)
+
+
+def test_export_exactly_at_the_row_limit_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _three_rows()
+    monkeypatch.setattr(conversation_logs, "EXPORT_ROW_LIMIT", 3)
+
+    response = _export(headers)
+
+    assert response.status_code == 200, response.text
+    assert len(_csv_rows(response)) == 4
+
+
+def test_export_over_the_byte_limit_is_a_422_without_a_file(
+    monkeypatch: pytest.MonkeyPatch, _recorded_spools: list[Any]
+) -> None:
+    headers = _admin_headers()
+    _three_rows()
+    header_bytes = len(conversation_logs._csv_line(EXPORT_HEADER).encode("utf-8"))
+    monkeypatch.setattr(conversation_logs, "EXPORT_BYTE_LIMIT", header_bytes + 10)
+
+    response = _export(headers)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == {
+        "code": "conversation_log_export_too_large",
+        "reason": "bytes",
+        "limit": header_bytes + 10,
+    }
+    assert _recorded_spools and all(spool.closed for spool in _recorded_spools)
+
+
+def test_export_releases_the_connection_before_the_first_byte_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _create_task_row(
+        user_id=_user_id("admin"), title="row", source="sdk", is_visible=False
+    )
+    order: list[str] = []
+    outstanding = 0
+    original_iter = conversation_logs._iter_export_file
+    pool_return_event = "checkin"  # codespell:ignore checkin
+
+    def recording_iter(raw: Any) -> Any:
+        for chunk in original_iter(raw):
+            order.append(f"first-chunk(outstanding={outstanding})")
+            yield chunk
+            return
+
+    def on_checkout(*_args: Any) -> None:
+        nonlocal outstanding
+        outstanding += 1
+        order.append("checkout")
+
+    def on_checkin(*_args: Any) -> None:
+        nonlocal outstanding
+        outstanding -= 1
+        order.append("returned")
+
+    monkeypatch.setattr(conversation_logs, "_iter_export_file", recording_iter)
+    engine = get_engine()
+    event.listen(engine, "checkout", on_checkout)
+    event.listen(engine, pool_return_event, on_checkin)
+    try:
+        response = _export(headers)
+    finally:
+        event.remove(engine, "checkout", on_checkout)
+        event.remove(engine, pool_return_event, on_checkin)
+
+    assert response.status_code == 200, response.text
+    first_chunk = next(i for i, name in enumerate(order) if "first-chunk" in name)
+    assert "returned" in order[:first_chunk], order
+    assert order[first_chunk] == "first-chunk(outstanding=0)", order
 
 
 def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:

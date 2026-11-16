@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import math
+import tempfile
+from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Annotated, Any, Sequence
+from typing import Annotated, Any, Iterable, Iterator, Sequence
 from typing import cast as typing_cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import (
     JSON,
     String,
@@ -25,6 +30,7 @@ from sqlalchemy.orm import Session, aliased, defer, selectinload
 from sqlalchemy.sql import ColumnElement, visitors
 from sqlalchemy.sql.elements import ColumnClause, TextClause
 from sqlalchemy.types import Boolean
+from starlette.background import BackgroundTask
 
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
@@ -100,12 +106,41 @@ EXTERNAL_TASK_SOURCES = {
     EXTERNAL_TASK_SOURCE,
 }
 
+# One export is built in a temporary file before any byte is sent, so both the
+# row count and the byte size are capped; an over-limit export fails instead
+# of being truncated.
+EXPORT_ROW_LIMIT = 10_000
+EXPORT_BYTE_LIMIT = 50 * 1024 * 1024
+EXPORT_SPOOL_BYTES = 8 * 1024 * 1024
+EXPORT_READ_CHUNK_BYTES = 64 * 1024
+EXPORT_FETCH_BATCH = 500
+EXPORT_TOO_LARGE_CODE = "conversation_log_export_too_large"
+EXPORT_COLUMNS = (
+    "conversation_id",
+    "agent",
+    "channel",
+    "status",
+    "title",
+    "started_at",
+    "last_activity_at",
+    "message_count",
+    "total_tokens",
+    "first_message",
+    "latest_answer",
+    "error_message",
+)
+# A spreadsheet reads a cell starting with one of these as a formula.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
-def _status_value(task: Task) -> str:
-    status = getattr(task, "status", None)
+
+def _status_text(status: Any) -> str:
     if status is None:
         return "unknown"
     return str(getattr(status, "value", status) or "unknown")
+
+
+def _status_value(task: Task) -> str:
+    return _status_text(getattr(task, "status", None))
 
 
 def _agent_config(task: Task) -> dict[str, Any]:
@@ -466,6 +501,14 @@ def _apply_task_filters(
             )
         )
     return query
+
+
+def _validated_source_filter(source: str) -> str:
+    """The normalized ``source`` query value; unsupported values are a 400."""
+    normalized = source.strip().lower()
+    if normalized not in {"all", *SOURCE_ORDER}:
+        raise HTTPException(status_code=400, detail="Unsupported conversation source")
+    return normalized
 
 
 def _activity_window(
@@ -1004,11 +1047,7 @@ async def list_conversation_logs(
     options to conversations whose last activity is in ``[active_from,
     active_to)``.
     """
-    normalized_source = source.strip().lower()
-    allowed_sources = {"all", *SOURCE_ORDER}
-    if normalized_source not in allowed_sources:
-        raise HTTPException(status_code=400, detail="Unsupported conversation source")
-
+    normalized_source = _validated_source_filter(source)
     window_start, window_end = _activity_window(active_from, active_to)
     search_value = search.strip() if search else None
     source_query, ui_source = _conversation_source_query(
@@ -1073,6 +1112,187 @@ async def list_conversation_logs(
             "total_pages": max(1, math.ceil(total / per_page)),
         },
     }
+
+
+def _csv_text(value: Any) -> str:
+    """A text cell safe to open in a spreadsheet.
+
+    A value starting with a formula prefix gets a leading ``'`` so it is read
+    as text; ``None`` is an empty cell.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    if text.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
+
+
+def _csv_line(cells: Iterable[Any]) -> str:
+    """One CSV record, with every text cell passed through ``_csv_text``."""
+    buffer = io.StringIO()
+    csv.writer(buffer, quoting=csv.QUOTE_ALL).writerow(
+        [
+            _csv_text(cell) if cell is None or isinstance(cell, str) else cell
+            for cell in cells
+        ]
+    )
+    return buffer.getvalue()
+
+
+def _export_too_large(reason: str, limit: int) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail={"code": EXPORT_TOO_LARGE_CODE, "reason": reason, "limit": limit},
+    )
+
+
+def _write_export_file(
+    rows: Iterable[Sequence[Any]],
+) -> tempfile.SpooledTemporaryFile[bytes]:
+    """The CSV (UTF-8 with BOM, header first) in a rewound temporary file.
+
+    Raises a 422 ``_export_too_large`` once more than ``EXPORT_ROW_LIMIT`` rows
+    or ``EXPORT_BYTE_LIMIT`` bytes would be written. On any failure the file is
+    closed before the error propagates.
+    """
+    raw = tempfile.SpooledTemporaryFile(max_size=EXPORT_SPOOL_BYTES)
+    wrapper = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+    try:
+        written = 0
+        wrapper.write(header := _csv_line(EXPORT_COLUMNS))
+        written += len(header.encode("utf-8"))
+        for row_count, cells in enumerate(rows, start=1):
+            if row_count > EXPORT_ROW_LIMIT:
+                raise _export_too_large("rows", EXPORT_ROW_LIMIT)
+            line = _csv_line(cells)
+            written += len(line.encode("utf-8"))
+            if written > EXPORT_BYTE_LIMIT:
+                raise _export_too_large("bytes", EXPORT_BYTE_LIMIT)
+            wrapper.write(line)
+        wrapper.flush()
+        # Detach so collecting the wrapper does not close the file.
+        wrapper.detach()
+        raw.seek(0)
+    except BaseException:
+        with suppress(ValueError):
+            wrapper.close()
+        raw.close()
+        raise
+    return raw
+
+
+def _iter_export_file(
+    raw: tempfile.SpooledTemporaryFile[bytes],
+) -> Iterator[bytes]:
+    while chunk := raw.read(EXPORT_READ_CHUNK_BYTES):
+        yield chunk
+
+
+@router.get("/export")
+def export_conversation_logs(
+    source: str = Query("all"),
+    agent_id: int | None = Query(None),
+    search: str | None = Query(None),
+    active_from: Annotated[datetime | None, Query()] = None,
+    active_to: Annotated[datetime | None, Query()] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Export the filtered conversation logs as a CSV, one row per conversation.
+
+    Takes the list's filters and returns exactly the rows the list shows when
+    paged to the end, in the same order. More than ``EXPORT_ROW_LIMIT`` rows or
+    ``EXPORT_BYTE_LIMIT`` bytes is a 422 with no file. This is a plain ``def``
+    so FastAPI runs the blocking reads and writes in a worker thread. The
+    database session is released before the file is streamed.
+    """
+    normalized_source = _validated_source_filter(source)
+    window_start, window_end = _activity_window(active_from, active_to)
+    search_value = search.strip() if search else None
+    source_query, ui_source = _conversation_source_query(
+        db,
+        user,
+        agent_id=agent_id,
+        search=search_value,
+        active_from=window_start,
+        active_to=window_end,
+    )
+    filtered_query = source_query.filter(ui_source.isnot(None))
+    if normalized_source != "all":
+        filtered_query = filtered_query.filter(ui_source == normalized_source)
+
+    activity = _latest_message_activity_subquery(
+        db, filtered_query.with_entities(Task.id).statement.correlate(None)
+    )
+    last_activity = _last_activity_expression(activity)
+    # One row more than the limit is read so exceeding it is observable.
+    rows = (
+        filtered_query.outerjoin(activity, activity.c.task_id == Task.id)
+        .outerjoin(Agent, Agent.id == Task.agent_id)
+        .with_entities(
+            Task.id,
+            Agent.name,
+            ui_source,
+            Task.status,
+            Task.title,
+            Task.created_at,
+            last_activity,
+            activity.c.message_count,
+            Task.total_tokens,
+            Task.description,
+            Task.output,
+            Task.error_message,
+        )
+        .order_by(last_activity.desc(), Task.id.desc())
+        .limit(EXPORT_ROW_LIMIT + 1)
+        .yield_per(EXPORT_FETCH_BATCH)
+    )
+    raw = _write_export_file(
+        (
+            (
+                int(task_id),
+                agent_name,
+                _source_label(row_ui_source),
+                _status_text(status),
+                title,
+                format_datetime_for_api(created_at),
+                format_datetime_for_api(last_activity_at),
+                int(message_count or 0),
+                int(total_tokens or 0),
+                description,
+                output,
+                error_message,
+            )
+            for (
+                task_id,
+                agent_name,
+                row_ui_source,
+                status,
+                title,
+                created_at,
+                last_activity_at,
+                message_count,
+                total_tokens,
+                description,
+                output,
+                error_message,
+            ) in rows
+        )
+    )
+    # Return the connection to the pool now; ``get_db`` would otherwise hold it
+    # until the response has been sent.
+    db.close()
+    filename = datetime.now(timezone.utc).strftime("conversation-logs-%Y%m%d-%H%M%S")
+    return StreamingResponse(
+        _iter_export_file(raw),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}.csv"',
+            "Cache-Control": "no-store",
+        },
+        background=BackgroundTask(raw.close),
+    )
 
 
 @router.get("/{task_id}")

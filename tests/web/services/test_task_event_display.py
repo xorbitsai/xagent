@@ -372,6 +372,84 @@ async def test_v2_log_detail_and_list_use_event_counts_activity_and_compaction(
         )
 
 
+@pytest.mark.asyncio
+async def test_v2_export_message_count_matches_the_listing(canonical):
+    import csv
+    import io
+
+    from xagent.web.api.conversation_logs import (
+        export_conversation_logs,
+        list_conversation_logs,
+    )
+    from xagent.web.models.user import User
+
+    factory, task_id = canonical
+    with factory() as db:
+        task = db.get(Task, task_id)
+        task.source = "sdk"
+        task.is_visible = False
+        user = db.get(User, task.user_id)
+        fact(
+            db,
+            task_id,
+            "input_accepted",
+            "first",
+            {"content": "hello", "message_type": "user"},
+            flat=True,
+            turn_id="first",
+        )
+        fact(
+            db,
+            task_id,
+            "assistant_message",
+            "answer",
+            {"content": "answer", "message_type": "assistant_response"},
+            flat=True,
+        )
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "audit-question",
+            {
+                "__audit_only__": True,
+                "expect_response": True,
+                "visible": True,
+                "message": "private audit",
+            },
+        )
+        db.commit()
+        listed = await list_conversation_logs(
+            source="all",
+            agent_id=None,
+            search=None,
+            page=1,
+            per_page=20,
+            active_from=None,
+            active_to=None,
+            db=db,
+            user=user,
+        )
+        # The export releases the session, so it is the last use of ``db``.
+        response = export_conversation_logs(
+            source="all",
+            agent_id=None,
+            search=None,
+            active_from=None,
+            active_to=None,
+            db=db,
+            user=user,
+        )
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        await response.background()
+
+    assert listed["logs"][0]["message_count"] == 2
+    header, row = csv.reader(io.StringIO(body.decode("utf-8-sig"), newline=""))
+    exported = dict(zip(header, row))
+    assert exported["message_count"] == str(listed["logs"][0]["message_count"])
+    assert exported["last_activity_at"] == listed["logs"][0]["last_activity_at"]
+
+
 V2_WINDOW_START = datetime(2026, 3, 10, tzinfo=timezone.utc)
 V2_WINDOW_END = datetime(2026, 3, 11, tzinfo=timezone.utc)
 

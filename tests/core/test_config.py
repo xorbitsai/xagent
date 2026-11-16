@@ -5105,3 +5105,27 @@ def test_execution_event_storage_getters_raw_parsing(monkeypatch, getter, env, l
 def test_execution_event_storage_getters_do_not_validate(monkeypatch):
     monkeypatch.setenv(config.EXECUTION_EVENT_STORAGE_USER_IDS, "1, abc, -2")
     assert config.get_execution_event_storage_user_ids() == ["1", "abc", "-2"]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 0.0),
+        ("", 0.0),
+        ("20", 20.0),
+        ("2.5", 2.5),
+        ("0", 0.0),
+        ("-1", 0.0),
+        ("inf", 0.0),
+        ("nan", 0.0),
+        ("1e400", 0.0),
+        ("bad", 0.0),
+    ],
+)
+def test_ws_restart_close_window(value, expected, monkeypatch):
+    from xagent.config import get_ws_restart_close_window_seconds
+
+    monkeypatch.delenv("XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS", value)
+    assert get_ws_restart_close_window_seconds() == expected

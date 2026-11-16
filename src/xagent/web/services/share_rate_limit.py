@@ -51,6 +51,8 @@ from ...config import (
     get_widget_task_create_rate_limit,
     get_widget_upload_ip_rate_limit,
     get_widget_upload_rate_limit,
+    get_widget_voice_connect_ip_rate_limit,
+    get_widget_voice_connect_rate_limit,
     get_widget_voice_tts_ip_rate_limit,
     get_widget_voice_tts_rate_limit,
     get_widget_ws_connect_ip_rate_limit,
@@ -117,6 +119,8 @@ _WIDGET_RUN_NAMESPACE = "widget-run"
 _WIDGET_RUN_IP_NAMESPACE = "widget-run-ip"
 _WIDGET_VOICE_TTS_ENTITY_NAMESPACE = "widget-voice-tts"
 _WIDGET_VOICE_TTS_IP_NAMESPACE = "widget-voice-tts-ip"
+_WIDGET_VOICE_CONNECT_ENTITY_NAMESPACE = "widget-voice-connect"
+_WIDGET_VOICE_CONNECT_IP_NAMESPACE = "widget-voice-connect-ip"
 
 
 def _parse_rate(value: str, *, fallback: str) -> RateLimitItem:
@@ -298,6 +302,12 @@ class ShareRateLimiter:
         )
         self._widget_voice_tts_ip_limit = _parse_rate(
             get_widget_voice_tts_ip_rate_limit(), fallback="120/minute"
+        )
+        self._widget_voice_connect_entity_limit = _parse_rate(
+            get_widget_voice_connect_rate_limit(), fallback="120/minute"
+        )
+        self._widget_voice_connect_ip_limit = _parse_rate(
+            get_widget_voice_connect_ip_rate_limit(), fallback="120/minute"
         )
         self._run_share_limit = _parse_rate(get_share_run_quota(), fallback="500/day")
         self._run_guest_limit = _parse_rate(
@@ -552,6 +562,30 @@ class ShareRateLimiter:
             self._widget_voice_tts_entity_limit,
             _WIDGET_VOICE_TTS_ENTITY_NAMESPACE,
             entity_key,
+        )
+
+    @_fail_closed
+    def allow_widget_voice_connect_ip(self, remote_ip: str | None) -> bool:
+        """Count one widget voice transcription connection attempt for an IP.
+
+        Runs before the handshake is accepted, when no credential has been
+        read, so only the IP is known. Fails closed like the other widget
+        voice gates.
+        """
+        return self._limiter.hit(
+            self._widget_voice_connect_ip_limit,
+            _WIDGET_VOICE_CONNECT_IP_NAMESPACE,
+            remote_ip or "unknown",
+        )
+
+    @_fail_closed
+    def allow_widget_voice_connect_entity(self, entity_key: str | None) -> bool:
+        """Count one verified widget voice transcription connection for its
+        widget entity; fails closed."""
+        return self._limiter.hit(
+            self._widget_voice_connect_entity_limit,
+            _WIDGET_VOICE_CONNECT_ENTITY_NAMESPACE,
+            entity_key or "unknown",
         )
 
     @_fail_open

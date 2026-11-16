@@ -2628,7 +2628,7 @@ class TestTriggerRateLimitConfig:
 
 
 class TestWidgetVoiceConfig:
-    """Widget voice settings: models, budgets and the synthesis text limit."""
+    """Widget voice settings: models, budgets, session caps and the text limit."""
 
     _AMOUNTS = [
         (
@@ -2650,6 +2650,36 @@ class TestWidgetVoiceConfig:
             "get_widget_voice_tts_max_text_chars",
             "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS",
             1000,
+        ),
+        (
+            "get_widget_voice_asr_visitor_daily_seconds",
+            "XAGENT_WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS",
+            None,
+        ),
+        (
+            "get_widget_voice_asr_entity_daily_seconds",
+            "XAGENT_WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS",
+            None,
+        ),
+        (
+            "get_widget_voice_asr_site_daily_seconds",
+            "XAGENT_WIDGET_VOICE_ASR_SITE_DAILY_SECONDS",
+            86_400,
+        ),
+        (
+            "get_widget_voice_max_sessions",
+            "XAGENT_WIDGET_VOICE_MAX_SESSIONS",
+            0,
+        ),
+        (
+            "get_widget_voice_max_sessions_per_entity",
+            "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY",
+            0,
+        ),
+        (
+            "get_widget_voice_max_sessions_per_visitor",
+            "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR",
+            0,
         ),
     ]
 
@@ -2708,6 +2738,7 @@ class TestWidgetVoiceConfig:
     @pytest.mark.parametrize(
         "func_name,env_var",
         [
+            ("get_widget_voice_asr_model", "XAGENT_WIDGET_VOICE_ASR_MODEL"),
             ("get_widget_voice_tts_model", "XAGENT_WIDGET_VOICE_TTS_MODEL"),
             ("get_widget_voice_tts_voice", "XAGENT_WIDGET_VOICE_TTS_VOICE"),
         ],
@@ -2810,6 +2841,16 @@ class TestShareRateLimitConfig:
         (
             "get_widget_voice_tts_ip_rate_limit",
             "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT",
+            "120/minute",
+        ),
+        (
+            "get_widget_voice_connect_ip_rate_limit",
+            "XAGENT_WIDGET_VOICE_CONNECT_IP_RATE_LIMIT",
+            "120/minute",
+        ),
+        (
+            "get_widget_voice_connect_rate_limit",
+            "XAGENT_WIDGET_VOICE_CONNECT_RATE_LIMIT",
             "120/minute",
         ),
     ]

@@ -302,6 +302,7 @@ WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
 WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
 WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
 WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
+WIDGET_VOICE_ASR_MODEL = "XAGENT_WIDGET_VOICE_ASR_MODEL"
 WIDGET_VOICE_TTS_MODEL = "XAGENT_WIDGET_VOICE_TTS_MODEL"
 WIDGET_VOICE_TTS_VOICE = "XAGENT_WIDGET_VOICE_TTS_VOICE"
 WIDGET_VOICE_TTS_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT"
@@ -310,6 +311,14 @@ WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CH
 WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS"
 WIDGET_VOICE_TTS_SITE_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS"
 WIDGET_VOICE_TTS_MAX_TEXT_CHARS = "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS"
+WIDGET_VOICE_CONNECT_RATE_LIMIT = "XAGENT_WIDGET_VOICE_CONNECT_RATE_LIMIT"
+WIDGET_VOICE_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_VOICE_CONNECT_IP_RATE_LIMIT"
+WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS = "XAGENT_WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS"
+WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS = "XAGENT_WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS"
+WIDGET_VOICE_ASR_SITE_DAILY_SECONDS = "XAGENT_WIDGET_VOICE_ASR_SITE_DAILY_SECONDS"
+WIDGET_VOICE_MAX_SESSIONS = "XAGENT_WIDGET_VOICE_MAX_SESSIONS"
+WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY = "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY"
+WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR = "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -2437,6 +2446,15 @@ def _get_optional_setting(env_var: str) -> str | None:
     return (os.getenv(env_var) or "").strip() or None
 
 
+def get_widget_voice_asr_model() -> str | None:
+    """The ``model_id`` of the live transcription model widget voice uses.
+
+    A deployment setting, never the owner's own model choice. Unset means
+    widget voice is not configured on this deployment.
+    """
+    return _get_optional_setting(WIDGET_VOICE_ASR_MODEL)
+
+
 def get_widget_voice_tts_model() -> str | None:
     """The ``model_id`` of the synthesis model widget voice uses.
 
@@ -2527,6 +2545,62 @@ def get_widget_voice_tts_max_text_chars() -> int:
         WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT,
         ceiling=WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING,
     )
+
+
+def get_widget_voice_connect_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget voice transcription connection attempts.
+
+    Checked before the handshake is accepted, when no credential has been
+    read, so it is keyed per IP only.
+    """
+    return _get_rate_limit(WIDGET_VOICE_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_widget_voice_connect_rate_limit() -> str:
+    """Per-widget-entity limit on widget voice transcription connections,
+    checked once the guest credential is verified."""
+    return _get_rate_limit(WIDGET_VOICE_CONNECT_RATE_LIMIT, "120/minute")
+
+
+def get_widget_voice_asr_visitor_daily_seconds() -> int | None:
+    """Daily transcription budget, in seconds, for one widget visitor (widget
+    entity plus caller IP); ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS, None)
+
+
+def get_widget_voice_asr_entity_daily_seconds() -> int | None:
+    """Daily transcription budget, in seconds, for one widget agent or
+    workforce; ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS, None)
+
+
+def get_widget_voice_asr_site_daily_seconds() -> int:
+    """Daily transcription budget, in seconds, for all widget voice on this
+    site."""
+    return _get_widget_voice_amount(WIDGET_VOICE_ASR_SITE_DAILY_SECONDS, 86_400)
+
+
+def get_widget_voice_max_sessions() -> int:
+    """Cap on live widget voice transcription sessions in this process.
+
+    Counts guest sessions only; signed-in speech is never counted. Unset or
+    blank, ``0``, and an invalid value (with a warning) all mean no cap.
+    """
+    return _get_widget_voice_amount(WIDGET_VOICE_MAX_SESSIONS, 0)
+
+
+def get_widget_voice_max_sessions_per_entity() -> int:
+    """Cap on live widget voice transcription sessions per widget agent or
+    workforce in this process. Unset or blank, ``0``, and an invalid value
+    (with a warning) all mean no cap."""
+    return _get_widget_voice_amount(WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY, 0)
+
+
+def get_widget_voice_max_sessions_per_visitor() -> int:
+    """Cap on live widget voice transcription sessions per visitor of one
+    widget agent or workforce in this process. Unset or blank, ``0``, and an
+    invalid value (with a warning) all mean no cap."""
+    return _get_widget_voice_amount(WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR, 0)
 
 
 def get_share_run_quota() -> str:

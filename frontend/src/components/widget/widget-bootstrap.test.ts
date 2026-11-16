@@ -82,6 +82,85 @@ describe("widget bootstrap", () => {
       .toBe("clipboard-write")
   })
 
+  describe("data-voice microphone opt-in", () => {
+    const GRANT = "eyJhbGciOiJIUzI1NiJ9.grant-one.sig"
+    const cases: Array<[string, string | undefined, boolean]> = [
+      ["missing", undefined, false],
+      ["true", "true", true],
+      ["padded upper-case TRUE", " TRUE ", true],
+      ["false", "false", false],
+      ["1", "1", false],
+      ["empty", "", false],
+    ]
+
+    beforeEach(() => {
+      // Session mode dedupes grants per page view; each case boots afresh.
+      Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetGrants")
+    })
+
+    function voiceAttrs(value: string | undefined): Record<string, string> {
+      return value === undefined ? {} : { "data-voice": value }
+    }
+
+    function frame() {
+      return document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")
+    }
+
+    it.each(cases)("guest-token mode with data-voice %s", (_label, value, declared) => {
+      runWidget({ "data-token": "legacy-token", "data-timezone": "Australia/Perth", ...voiceAttrs(value) })
+      expect(frame()?.getAttribute("allow")).toBe(declared ? "clipboard-write; microphone" : "clipboard-write")
+      const url = new URL(frame()!.src)
+      expect(url.searchParams.getAll("voice")).toEqual(declared ? ["1"] : [])
+      expect(url.pathname).toBe("/widget/chat/legacy-token")
+      expect(url.searchParams.get("guest_id")).toBe("guest-fixed")
+      expect(url.searchParams.get("timezone")).toBe("Australia/Perth")
+      if (!declared) {
+        expect(frame()!.src).toBe(
+          "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed&timezone=Australia%2FPerth",
+        )
+      }
+    })
+
+    it.each(cases)("embed-ticket mode with data-voice %s", async (_label, value, declared) => {
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "ticket/one", agent_id: 17 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+      runWidget({ "data-widget-key": "widget-secret", ...voiceAttrs(value) })
+      await vi.waitFor(() => {
+        expect(frame()?.src).toContain("embed_ticket=")
+      })
+      expect(frame()?.getAttribute("allow")).toBe(declared ? "clipboard-write; microphone" : "clipboard-write")
+      const url = new URL(frame()!.src)
+      expect(url.searchParams.getAll("voice")).toEqual(declared ? ["1"] : [])
+      expect(url.searchParams.get("guest_id")).toBe("guest-fixed")
+      expect(url.searchParams.get("agent_id")).toBe("17")
+      expect(url.searchParams.get("embed_ticket")).toBe("ticket/one")
+      if (!declared) {
+        expect(frame()!.src).toBe(
+          "https://chat.example/widget/chat/default?guest_id=guest-fixed&agent_id=17&embed_ticket=ticket%2Fone",
+        )
+      }
+    })
+
+    it.each(cases)("session mode with data-voice %s", (_label, value, declared) => {
+      fetchMock.mockReturnValueOnce(new Promise(() => undefined))
+      runWidget({ "data-encrypted-context": GRANT, ...voiceAttrs(value) })
+      expect(frame()?.getAttribute("allow")).toBe(declared ? "clipboard-write; microphone" : "clipboard-write")
+      expect(frame()?.src).toBe(
+        declared ? "https://chat.example/widget/chat/session?voice=1" : "https://chat.example/widget/chat/session",
+      )
+    })
+
+    it("session mode keeps the timezone parameter next to voice=1", () => {
+      fetchMock.mockReturnValueOnce(new Promise(() => undefined))
+      runWidget({ "data-encrypted-context": GRANT, "data-voice": "true", "data-timezone": "Australia/Perth" })
+      const url = new URL(frame()!.src)
+      expect(url.searchParams.getAll("voice")).toEqual(["1"])
+      expect(url.searchParams.getAll("timezone")).toEqual(["Australia/Perth"])
+    })
+  })
+
   it("generates and persists a guest id for a first-time visitor", async () => {
     localStorage.removeItem("xagent_guest_id")
     vi.spyOn(Math, "random")

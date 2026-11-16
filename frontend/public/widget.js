@@ -313,6 +313,16 @@
     return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
   }
 
+  // Voice calls are opt-in per embedding site: only data-voice="true" (after
+  // trim and lowercase) delegates the microphone to the chat iframe and marks
+  // its URL with voice=1. Any other value, or none, leaves both unchanged.
+  var embedVoice = (scriptTag.getAttribute('data-voice') || '').trim().toLowerCase() === 'true';
+
+  function withVoice(url) {
+    if (!embedVoice) return url;
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'voice=1';
+  }
+
   // Panel width: resizable via the left-edge drag handle, persisted across
   // reloads. Inline width is only ever applied above MOBILE_BREAKPOINT --
   // below it the CSS media query owns sizing, and inline width would win
@@ -613,11 +623,14 @@
   // Iframe
   var iframe = document.createElement('iframe');
   iframe.className = 'xagent-widget-iframe';
-  // The chat is cross-origin to the host page, and browsers refuse the async
-  // Clipboard API in a cross-origin iframe unless the embedder delegates it
-  // here; without this the chat's copy buttons could only rely on the legacy
-  // execCommand fallback.
-  iframe.setAttribute('allow', 'clipboard-write');
+  // The chat is cross-origin to the host page, so the embedder must delegate
+  // each powerful feature here. clipboard-write: without it the chat's copy
+  // buttons could only rely on the legacy execCommand fallback. microphone:
+  // needed for voice calls. Delegating it only lets the chat page request the
+  // microphone; the visitor still has to agree in the browser's permission
+  // prompt. It is therefore delegated only when the site explicitly declares
+  // data-voice="true" and is never granted by default.
+  iframe.setAttribute('allow', embedVoice ? 'clipboard-write; microphone' : 'clipboard-write');
   panel.appendChild(iframe);
 
   // Left-edge resize handle
@@ -1353,7 +1366,7 @@
           if (ticket) {
             url += '&embed_ticket=' + encodeURIComponent(ticket);
           }
-          iframe.src = withTimezone(url);
+          iframe.src = withTimezone(withVoice(url));
         }
 
         // Request a short-lived embed ticket from the top-level page. This fetch
@@ -1485,7 +1498,7 @@
 
     function attach(iframe) {
       state.iframe = iframe;
-      iframe.src = withTimezone(host + '/widget/chat/session');
+      iframe.src = withTimezone(withVoice(host + '/widget/chat/session'));
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);

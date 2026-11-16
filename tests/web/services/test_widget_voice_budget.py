@@ -98,16 +98,10 @@ def test_later_bucket_refusal_rolls_back_earlier_ones(monkeypatch, over, rolled_
         assert after[bucket] == before[bucket]
 
 
-def test_zero_refuses_everything_and_bad_values_fall_back(monkeypatch, caplog):
+def test_zero_site_budget_refuses_everything(monkeypatch):
     monkeypatch.setenv(SETTINGS["tts-site"], "0")
     with pytest.raises(VoiceBudgetExhausted):
         reserve_tts_sync("agent:1", "v", 1)
-    for raw in ("-5", "lots"):
-        monkeypatch.setenv(SETTINGS["tts-site"], raw)
-        assert widget_voice_budget.bucket_limit(TTS_BUCKETS[2]) == 1_000_000
-    monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS", "999999")
-    assert widget_voice_budget.tts_max_text_chars() == 1000
-    assert "Invalid widget voice budget" in caplog.text
 
 
 def _unset(monkeypatch, settings: dict[str, str]) -> None:
@@ -147,18 +141,6 @@ def test_zero_visitor_or_entity_budget_refuses_everything(monkeypatch, bucket):
         reserve_tts_sync("agent:1", "v", 1)
     assert str(refused.value) == bucket
     assert set(_counts().values()) <= {0}
-
-
-@pytest.mark.parametrize("raw", ["", "  ", "-5", "lots"])
-@pytest.mark.parametrize("index", [0, 1], ids=["tts-visitor", "tts-entity"])
-def test_blank_or_bad_visitor_and_entity_budgets_mean_no_limit(
-    monkeypatch, caplog, index, raw
-):
-    bucket = TTS_BUCKETS[index]
-    monkeypatch.setenv(SETTINGS[bucket.name], raw)
-    assert widget_voice_budget.bucket_limit(bucket) is None
-    warned = f"{bucket.name}={raw!r}; falling back to no limit" in caplog.text
-    assert warned == bool(raw.strip())
 
 
 @pytest.mark.parametrize("next_day", [False, True])

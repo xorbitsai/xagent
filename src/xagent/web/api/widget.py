@@ -18,6 +18,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
+from ...config import (
+    WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING,
+    WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT,
+    get_widget_voice_tts_max_text_chars,
+)
 from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..jwt_codec import JWTError
@@ -43,7 +48,6 @@ from ..services.widget_domains import (
     require_domain_allowed,
 )
 from ..services.widget_voice import resolve_widget_voice_models
-from ..services.widget_voice_budget import tts_max_text_chars
 from .auth import create_access_token
 from .public_chat_access import (
     PublicChatAccessContext,
@@ -662,12 +666,20 @@ class WidgetVoiceTTSRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    text: str = Field(min_length=1)
+    text: str = Field(
+        min_length=1,
+        description=(
+            "Text to speak. At most XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS "
+            f"characters (default {WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT}, "
+            f"never more than {WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING}); a longer "
+            "text is refused with 422."
+        ),
+    )
 
     @field_validator("text")
     @classmethod
     def _within_limit(cls, text: str) -> str:
-        if len(text) > tts_max_text_chars():
+        if len(text) > get_widget_voice_tts_max_text_chars():
             raise ValueError("Text is too long")
         return text
 

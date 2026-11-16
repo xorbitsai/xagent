@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Protocol, TypeVar
+from typing import Protocol
 
 from redis import Redis
 from redis.backoff import NoBackoff
@@ -32,7 +32,6 @@ from redis.retry import Retry
 from ...config import (
     get_redis_url,
     get_widget_voice_tts_entity_daily_chars,
-    get_widget_voice_tts_max_text_chars,
     get_widget_voice_tts_site_daily_chars,
     get_widget_voice_tts_visitor_daily_chars,
 )
@@ -45,9 +44,6 @@ _KEY_TTL_SECONDS = 48 * 3600
 # The process-memory store keeps the same days a Redis key lives: the
 # incoming key's UTC day and the day before it.
 _MEMORY_KEEP_DAYS = _KEY_TTL_SECONDS // (24 * 3600)
-_MAX_TEXT_CHARS_DEFAULT = 1000
-# The text bound of TTSStreamRequest; a larger setting could never be sent.
-_MAX_TEXT_CHARS_CEILING = 5000
 
 
 class VoiceBudgetExhausted(Exception):
@@ -61,57 +57,15 @@ class VoiceBudgetUnavailable(Exception):
 @dataclass(frozen=True)
 class BudgetBucket:
     name: str
-    setting: Callable[[], str]
-    # None: the bucket has no limit unless its setting gives one.
-    default: int | None
+    # None: the bucket has no limit.
+    limit: Callable[[], int | None]
 
 
 TTS_BUCKETS = (
-    BudgetBucket("tts-visitor", get_widget_voice_tts_visitor_daily_chars, None),
-    BudgetBucket("tts-entity", get_widget_voice_tts_entity_daily_chars, None),
-    BudgetBucket("tts-site", get_widget_voice_tts_site_daily_chars, 1_000_000),
+    BudgetBucket("tts-visitor", get_widget_voice_tts_visitor_daily_chars),
+    BudgetBucket("tts-entity", get_widget_voice_tts_entity_daily_chars),
+    BudgetBucket("tts-site", get_widget_voice_tts_site_daily_chars),
 )
-
-
-_DefaultT = TypeVar("_DefaultT", bound="int | None")
-
-
-def _parse_amount(
-    raw: str, default: _DefaultT, name: str, ceiling: int | None
-) -> int | _DefaultT:
-    """0 is a real limit (refuse all); empty means the default; a negative,
-    unparsable, or over-ceiling value falls back to the default with a
-    warning. A ``None`` default means no limit."""
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        value = -1
-    if value < 0 or (ceiling is not None and value > ceiling):
-        logger.warning(
-            "Invalid widget voice budget %s=%r; falling back to %s",
-            name,
-            raw,
-            "no limit" if default is None else default,
-        )
-        return default
-    return value
-
-
-def bucket_limit(bucket: BudgetBucket) -> int | None:
-    """The bucket's daily limit, or ``None`` when it has no limit."""
-    return _parse_amount(bucket.setting(), bucket.default, bucket.name, None)
-
-
-def tts_max_text_chars() -> int:
-    """The longest text one widget voice synthesis request may carry."""
-    return _parse_amount(
-        get_widget_voice_tts_max_text_chars(),
-        _MAX_TEXT_CHARS_DEFAULT,
-        "tts-max-text",
-        _MAX_TEXT_CHARS_CEILING,
-    )
 
 
 class _Store(Protocol):
@@ -201,7 +155,7 @@ def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
             value = store.incrby(key, chars)
             added.append(key)
             # A bucket without a limit is still counted.
-            limit = bucket_limit(bucket)
+            limit = bucket.limit()
             if limit is not None and value > limit:
                 raise VoiceBudgetExhausted(bucket.name)
     except BaseException as exc:

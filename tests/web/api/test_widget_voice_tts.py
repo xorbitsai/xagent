@@ -425,6 +425,9 @@ def test_widget_voice_request_body_is_documented():
     assert set(schema["properties"]) == {"text"}
     assert schema["additionalProperties"] is False
     assert schema["required"] == ["text"]
+    description = schema["properties"]["text"]["description"]
+    assert "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS" in description
+    assert "1000" in description and "5000" in description
 
 
 def test_widget_voice_without_a_visitor_address_is_unavailable(voice, monkeypatch):

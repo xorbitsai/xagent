@@ -1,14 +1,17 @@
 """Daily usage budgets for widget voice, whose callers are not signed in.
 
-Synthesis is counted in characters in three buckets: per visitor (the widget
-entity plus the visitor key), per widget entity, and per site. Each bucket is
-a fixed UTC calendar-day window: the key carries the date, so a new day
-starts from zero.
+Synthesis is counted in characters and transcription in seconds, each in
+three buckets: per visitor (the widget entity plus the visitor key), per
+widget entity, and per site. Each bucket is a fixed UTC calendar-day window:
+the key carries the date, so a new day starts from zero.
 
 A reservation adds the amount to one bucket at a time and compares after each
 addition; when a bucket ends over its limit, the buckets after it are left
 alone, everything added so far is subtracted again, and the request is
-refused. With ``XAGENT_REDIS_URL`` set the counters live only in
+refused. A transcription session reserves its longest possible duration up
+front and refunds what it did not use when it ends, on the same day keys it
+reserved under; a refund that fails only leaves the day over-counted. With
+``XAGENT_REDIS_URL`` set the counters live only in
 Redis (keys expire after 48 hours), and a client that cannot be built or any
 Redis error refuses the request: there is no fallback to memory. Without it
 the counters live in this process: each web process counts on its own, so N
@@ -25,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from redis import Redis
 from redis.backoff import NoBackoff
@@ -33,6 +36,9 @@ from redis.retry import Retry
 
 from ...config import (
     get_redis_url,
+    get_widget_voice_asr_entity_daily_seconds,
+    get_widget_voice_asr_site_daily_seconds,
+    get_widget_voice_asr_visitor_daily_seconds,
     get_widget_voice_tts_entity_daily_chars,
     get_widget_voice_tts_site_daily_chars,
     get_widget_voice_tts_visitor_daily_chars,
@@ -41,6 +47,8 @@ from .db_runtime import await_task_settlement
 from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 _KEY_TTL_SECONDS = 48 * 3600
 # The process-memory store keeps the same days a Redis key lives: the
@@ -67,6 +75,11 @@ TTS_BUCKETS = (
     BudgetBucket("tts-visitor", get_widget_voice_tts_visitor_daily_chars),
     BudgetBucket("tts-entity", get_widget_voice_tts_entity_daily_chars),
     BudgetBucket("tts-site", get_widget_voice_tts_site_daily_chars),
+)
+ASR_BUCKETS = (
+    BudgetBucket("asr-visitor", get_widget_voice_asr_visitor_daily_seconds),
+    BudgetBucket("asr-entity", get_widget_voice_asr_entity_daily_seconds),
+    BudgetBucket("asr-site", get_widget_voice_asr_site_daily_seconds),
 )
 
 
@@ -139,33 +152,35 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
 
-def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
-    """Count ``chars`` against the three synthesis buckets, or refuse.
+def _reserve(
+    buckets: tuple[BudgetBucket, ...], scopes: tuple[str, ...], amount: int
+) -> tuple[str, ...]:
+    """Add ``amount`` to every bucket and return the keys it was added to.
 
     Raises :class:`VoiceBudgetExhausted` when a bucket would go over its
     limit and :class:`VoiceBudgetUnavailable` when the storage fails; either
     way nothing stays counted (unless the subtraction itself fails).
     """
-    scopes = (f"{entity_key}|{visitor_key}", entity_key, "all")
     day = _utc_day()
     added: list[str] = []
     store: _Store | None = None
     try:
         store = _store()
-        for bucket, scope in zip(TTS_BUCKETS, scopes, strict=True):
+        for bucket, scope in zip(buckets, scopes, strict=True):
             key = f"xagent:widget-voice:{day}:{bucket.name}:{scope}"
-            value = store.incrby(key, chars)
+            value = store.incrby(key, amount)
             added.append(key)
             # A bucket without a limit is still counted.
             limit = bucket.limit()
             if limit is not None and value > limit:
                 raise VoiceBudgetExhausted(bucket.name)
+        return tuple(added)
     except BaseException as exc:
         # Best effort: a failed subtraction only leaves the day over-counted.
         for key in added:
             try:
                 assert store is not None
-                store.decrby(key, chars)
+                store.decrby(key, amount)
             except Exception:
                 logger.warning("Widget voice budget rollback failed", exc_info=True)
         if isinstance(exc, (VoiceBudgetExhausted, VoiceBudgetUnavailable)):
@@ -176,16 +191,84 @@ def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
         raise
 
 
-async def reserve_tts(entity_key: str, visitor_key: str, chars: int) -> None:
-    """:func:`reserve_tts_sync` off the event loop, counted as a tracked writer
-    and drained on cancellation so a reservation is never left half-applied.
+def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
+    """Count ``chars`` against the three synthesis buckets, or refuse.
+
+    Raises like :func:`_reserve`.
+    """
+    _reserve(TTS_BUCKETS, (f"{entity_key}|{visitor_key}", entity_key, "all"), chars)
+
+
+async def _run_settled(function: Callable[..., _T], *args: object) -> _T:
+    """``function`` in a tracked worker thread that a cancellation of the
+    caller cannot cut short.
 
     The worker task is shielded from the caller's cancellation, so the tracked
     thread always starts and finishes; the cancellation is re-raised only after
-    the reservation has settled."""
-    worker = asyncio.get_running_loop().create_task(
-        run_tracked(reserve_tts_sync, entity_key, visitor_key, chars)
-    )
-    _, cancellation = await await_task_settlement(worker)
+    the work has settled."""
+    worker = asyncio.get_running_loop().create_task(run_tracked(function, *args))
+    result, cancellation = await await_task_settlement(worker)
     if cancellation is not None:
         raise cancellation
+    return result
+
+
+async def reserve_tts(entity_key: str, visitor_key: str, chars: int) -> None:
+    """:func:`reserve_tts_sync` off the event loop, counted as a tracked writer
+    and drained on cancellation so a reservation is never left half-applied."""
+    await _run_settled(reserve_tts_sync, entity_key, visitor_key, chars)
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """The counter keys one reservation added ``amount`` to."""
+
+    keys: tuple[str, ...]
+    amount: int
+
+
+def reserve_asr_sync(entity_key: str, visitor_key: str, seconds: int) -> Reservation:
+    """Count ``seconds`` against the three transcription buckets, or refuse.
+
+    Raises like :func:`_reserve`. The returned reservation is what
+    :func:`refund_sync` gives back from.
+    """
+    keys = _reserve(
+        ASR_BUCKETS, (f"{entity_key}|{visitor_key}", entity_key, "all"), seconds
+    )
+    return Reservation(keys, seconds)
+
+
+def refund_sync(reservation: Reservation, amount: int) -> None:
+    """Subtract ``amount`` (at most the reserved amount) from every key the
+    reservation counted on. Never raises: a failed subtraction is logged and
+    only leaves that day over-counted."""
+    amount = min(max(amount, 0), reservation.amount)
+    if not amount:
+        return
+    try:
+        store = _store()
+        for key in reservation.keys:
+            store.decrby(key, amount)
+    except Exception:
+        logger.warning("Widget voice budget refund failed", exc_info=True)
+
+
+async def reserve_asr(entity_key: str, visitor_key: str, seconds: int) -> Reservation:
+    """:func:`reserve_asr_sync` off the event loop. A cancellation that
+    arrives while it runs waits for it, gives a completed reservation back,
+    and is then raised, so nothing stays counted."""
+    worker = asyncio.get_running_loop().create_task(
+        run_tracked(reserve_asr_sync, entity_key, visitor_key, seconds)
+    )
+    reservation, cancellation = await await_task_settlement(worker)
+    if cancellation is not None:
+        await _run_settled(refund_sync, reservation, reservation.amount)
+        raise cancellation
+    return reservation
+
+
+async def refund(reservation: Reservation, amount: int) -> None:
+    """:func:`refund_sync` as a tracked writer. A cancellation that arrives
+    while it runs waits for the refund to finish and is then raised."""
+    await _run_settled(refund_sync, reservation, amount)

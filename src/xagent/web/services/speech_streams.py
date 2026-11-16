@@ -10,8 +10,10 @@ themselves, and they bill :attr:`SpeechStreamPlan.user_id`.
 A plan's ``audience`` names who is calling. ``member`` (a signed-in user)
 keeps the established responses. ``guest`` (a widget visitor who is not signed
 in, with the usage recorded on the widget owner) adds the daily voice budget
-and answers every failure with a fixed ``{"detail": {"code", "message"}}``
-body that carries no provider text, owner configuration, or usage-gate detail.
+and, for transcription, the per-process caps on live guest sessions; every
+guest failure is answered with a fixed code and message (a
+``{"detail": {"code", "message"}}`` body, or an error frame and close reason)
+that carries no provider text, owner configuration, or usage-gate detail.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import aclosing, suppress
 from dataclasses import asdict, dataclass
@@ -32,6 +36,11 @@ from pydantic import ValidationError
 from starlette.types import Message, Receive, Scope, Send
 from starlette.websockets import WebSocketState
 
+from ...config import (
+    get_widget_voice_max_sessions,
+    get_widget_voice_max_sessions_per_entity,
+    get_widget_voice_max_sessions_per_visitor,
+)
 from ...core.model.asr.adapter import get_asr_model_instance
 from ...core.model.asr.base import ASRStreamSession, BaseASR
 from ...core.model.tts.adapter import get_tts_model_instance
@@ -49,8 +58,11 @@ from ..tracking.standalone_usage import (
 from .db_runtime import cancel_and_drain_async_task, drain_async_task_cancellation_safe
 from .release_hold import WritersRetired, release_hold
 from .widget_voice_budget import (
+    Reservation,
     VoiceBudgetExhausted,
     VoiceBudgetUnavailable,
+    refund,
+    reserve_asr,
     reserve_tts,
 )
 
@@ -68,7 +80,9 @@ _TERMINAL_TIMEOUT = 1.0
 _OptionsT = TypeVar("_OptionsT", ASRStreamStart, TTSStreamRequest)
 Audience = Literal["member", "guest"]
 
-# The only text a guest ever receives for a refusal, keyed by its code.
+# The only text a guest ever receives for a refusal, keyed by its code. A
+# refused periodic recheck sends no error frame; its close carries the
+# callback's code with the "voice_unavailable" text as the reason.
 GUEST_REFUSAL_MESSAGES = {
     "invalid_request": "Invalid speech request",
     "voice_disabled": "Voice is not available for this chat",
@@ -78,6 +92,9 @@ GUEST_REFUSAL_MESSAGES = {
     "model_unavailable": "Voice is unavailable",
     "voice_budget_exhausted": "Voice limit reached, try again later",
     "speech_synthesis_failed": "Speech synthesis failed",
+    "voice_busy": "Voice is busy",
+    "session_timeout": "Speech session timed out",
+    "stream_failed": "Speech stream failed",
 }
 
 
@@ -123,6 +140,78 @@ class SpeechStreamPlan(Generic[_OptionsT]):
                 raise ValueError("A member speech plan carries no budget keys")
         else:
             raise ValueError(f"Unknown speech audience: {self.audience!r}")
+
+
+# Settlement clock for a guest transcription session's budget.
+_now = time.monotonic
+
+
+class _GuestSessions:
+    """Live guest transcription sessions in this process: in total, per
+    widget entity, and per visitor of an entity. Only touched from the event
+    loop."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.by_entity: dict[str, int] = {}
+        # Keyed like the per-visitor budget: ``entity_key|visitor_key``.
+        self.by_visitor: dict[str, int] = {}
+
+    def admit(self, entity_key: str, visitor_key: str) -> bool:
+        """Take a slot when all three caps allow it. There is no await between
+        the checks and the increments, so concurrent sessions cannot
+        overshoot, and a refused session changes no count."""
+        total_cap = get_widget_voice_max_sessions()
+        entity_cap = get_widget_voice_max_sessions_per_entity()
+        visitor_cap = get_widget_voice_max_sessions_per_visitor()
+        visitor = f"{entity_key}|{visitor_key}"
+        entity_held = self.by_entity.get(entity_key, 0)
+        visitor_held = self.by_visitor.get(visitor, 0)
+        if (
+            (total_cap and self.total >= total_cap)
+            or (entity_cap and entity_held >= entity_cap)
+            or (visitor_cap and visitor_held >= visitor_cap)
+        ):
+            return False
+        self.total += 1
+        self.by_entity[entity_key] = entity_held + 1
+        self.by_visitor[visitor] = visitor_held + 1
+        return True
+
+    def release(self, entity_key: str, visitor_key: str) -> None:
+        self.total -= 1
+        for counts, key in (
+            (self.by_entity, entity_key),
+            (self.by_visitor, f"{entity_key}|{visitor_key}"),
+        ):
+            held = counts[key] - 1
+            if held:
+                counts[key] = held
+            else:
+                del counts[key]
+
+
+_guest_sessions = _GuestSessions()
+
+
+class _RevalidationRefused(Exception):
+    """The session's periodic recheck returned a close code."""
+
+    def __init__(self, close_code: int) -> None:
+        super().__init__(close_code)
+        self.close_code = close_code
+
+
+class _RevalidationFailed(Exception):
+    """The session's periodic recheck itself raised."""
+
+
+@dataclass
+class _ASRMeter:
+    """What a transcription session has used, for its budget settlement."""
+
+    audio_bytes: int = 0
+    opened: bool = False
 
 
 class _ASRSessionTimeout(TimeoutError):
@@ -209,9 +298,11 @@ async def _send_asr_error(
 
 
 async def _receive_asr_audio(
-    websocket: WebSocket, ready: asyncio.Future[ASRStreamSession], start: ASRStreamStart
+    websocket: WebSocket,
+    ready: asyncio.Future[ASRStreamSession],
+    start: ASRStreamStart,
+    meter: _ASRMeter,
 ) -> None:
-    audio_bytes = 0
     width = 2 if start.format == "pcm" else 1
     while True:
         message = await _receive_asr_message(websocket)
@@ -223,8 +314,8 @@ async def _receive_asr_audio(
                 raise ValueError("Audio frame exceeds 64 KiB")
             if len(audio) % width:
                 raise ValueError("PCM fragments must contain complete 16-bit samples")
-            audio_bytes += len(audio)
-            if audio_bytes > start.sample_rate * width * _SESSION_SECONDS:
+            meter.audio_bytes += len(audio)
+            if meter.audio_bytes > start.sample_rate * width * _SESSION_SECONDS:
                 raise ValueError("ASR audio duration limit reached")
             stream = await asyncio.shield(ready)
             await stream.send_audio(audio)
@@ -246,6 +337,7 @@ async def _relay_asr_events(
     model: BaseASR,
     ready: asyncio.Future[ASRStreamSession],
     start: ASRStreamStart,
+    meter: _ASRMeter,
 ) -> None:
     options = start.model_dump(exclude={"type", "model_id"}, exclude_none=True)
     try:
@@ -254,6 +346,7 @@ async def _relay_asr_events(
         _log_provider_error(model, exc)
         raise HTTPException(status_code=400, detail="ASR model unavailable") from None
     async with stream:
+        meter.opened = True
         ready.set_result(stream)
         async for event in stream:
             try:
@@ -262,10 +355,58 @@ async def _relay_asr_events(
                 raise _ASRWriteTimeout from None
 
 
+async def _recheck(
+    revalidate: Callable[[], Awaitable[int | None]], every: float
+) -> None:
+    """Run ``revalidate`` every ``every`` seconds until it refuses or raises."""
+    while True:
+        await asyncio.sleep(every)
+        try:
+            close_code = await revalidate()
+        except Exception as exc:
+            raise _RevalidationFailed() from exc
+        if close_code is not None:
+            raise _RevalidationRefused(close_code)
+
+
+def _settled_seconds(
+    meter: _ASRMeter, started: float | None, start: ASRStreamStart | None
+) -> int:
+    """Seconds a transcription session is charged: 0 when the provider stream
+    never opened; otherwise the longer of the audio received and the wall
+    time since ``started``, rounded up and capped at the session limit."""
+    if started is None or start is None or not meter.opened:
+        return 0
+    width = 2 if start.format == "pcm" else 1
+    audio = meter.audio_bytes / (start.sample_rate * width)
+    used = max(audio, _now() - started)
+    return min(int(_SESSION_SECONDS), math.ceil(used))
+
+
+def _log_asr_usage(
+    plan: SpeechStreamPlan[ASRStreamStart], seconds: int, result: str
+) -> None:
+    """One line per transcription session, written when it ends; always on."""
+    logger.info(
+        "Speech transcription usage: audience=%s user_id=%s entity=%s visitor=%s "
+        "model=%s seconds=%d result=%s",
+        plan.audience,
+        plan.user_id,
+        plan.entity_key,
+        _loggable_visitor(plan.visitor_key),
+        plan.config.model_id,
+        seconds,
+        result,
+    )
+
+
 async def run_asr_stream(
     websocket: WebSocket,
     *,
     prepare: Callable[[str], Awaitable[SpeechStreamPlan[ASRStreamStart]]],
+    audience: Audience,
+    revalidate: Callable[[], Awaitable[int | None]] | None = None,
+    recheck_seconds: float | None = None,
 ) -> None:
     """Serve one live transcription session on an accepted, authenticated socket.
 
@@ -275,10 +416,34 @@ async def run_asr_stream(
     ``_SESSION_SECONDS`` limit, every error frame and close code, and closing
     the socket. ``prepare`` receives the raw first text frame and returns the
     plan to run; it may raise ``ValidationError`` or ``ValueError`` (invalid
-    request), ``HTTPException`` (model unavailable), or
+    request), ``HTTPException`` (model unavailable: a signed-in member gets a
+    ``model_unavailable`` error frame carrying the detail, a guest gets ``voice_unavailable`` with no detail, both closing 1008), or
     ``_WebSocketAuthenticationTerminated`` (the client was already answered),
     which are reported exactly as the same failures inside the session are.
+
+    ``audience`` (required) is the audience of the plans ``prepare`` returns,
+    and a plan for another audience ends the session with 1011
+    ``stream_failed`` before anything is reserved or opened. It decides,
+    from the first frame on, whether failures carry the established texts
+    (``member``) or only fixed guest codes and messages (``guest``, where an
+    ``HTTPException`` from ``prepare`` is reported as ``voice_unavailable``).
+    A guest session also takes a slot under the per-process session caps
+    (1008 "Voice is busy" when none is free) and reserves the longest session
+    from the daily transcription budget (1008 ``voice_budget_exhausted``, or
+    ``voice_unavailable`` when the budget storage fails). When it ends, the
+    slot is released and the budget keeps only the settled seconds (see
+    :func:`_settled_seconds`), on every exit path including cancellation.
+
+    ``revalidate``, given with ``recheck_seconds``, runs every
+    ``recheck_seconds`` while audio is relayed: it returns ``None`` to keep
+    the session or a close code to end it with (the socket is closed with
+    that code and a fixed reason, and no error frame), and when it raises the
+    session ends with 1011 ``stream_failed``. Every session that got a plan
+    writes one usage log line.
     """
+    if (revalidate is None) != (recheck_seconds is None):
+        raise TypeError("revalidate and recheck_seconds are given together")
+    guest = audience == "guest"
     # Transcription meters usage when it ends, so a session is a socket write
     # the host's retire waits for (and winds down when the fence goes up). A
     # retired process cannot write, so the client reconnects to the new one;
@@ -290,17 +455,42 @@ async def run_asr_stream(
     except WritersRetired:
         await _close_asr_socket(websocket, 1012, "Service restart")
         return
+
+    async def fail(
+        code: str, message: str, close_code: int, close_reason: str | None = None
+    ) -> None:
+        if guest:
+            message, close_reason = GUEST_REFUSAL_MESSAGES[code], None
+        await _send_asr_error(websocket, code, message, close_code, close_reason)
+
     model: BaseASR | None = None
     config: SimpleNamespace | None = None
     model_closed = False
+    plan: SpeechStreamPlan[ASRStreamStart] | None = None
+    admitted: tuple[str, str] | None = None
+    reservation: Reservation | None = None
+    meter = _ASRMeter()
+    started: float | None = None
+    result = "incomplete"
     try:
         message = await _receive_asr_message(websocket)
         if message["type"] == "websocket.disconnect":
+            result = "disconnected"
             return
         text = message.get("text") or ""
         if len(text.encode("utf-8")) > _CONTROL_FRAME_BYTES:
             raise ValueError("Control frame exceeds 4 KiB")
-        plan = await prepare(text)
+        try:
+            plan = await prepare(text)
+        except HTTPException:
+            if not guest:
+                raise
+            # A guest is never told why the route refused.
+            result = "voice_unavailable"
+            await fail("voice_unavailable", "", 1008)
+            return
+        if plan.audience != audience:
+            raise RuntimeError("The speech plan is for another audience")
         config = plan.config
         start = plan.options
         try:
@@ -314,6 +504,19 @@ async def run_asr_stream(
             raise HTTPException(
                 status_code=400, detail="Selected ASR model does not support live audio"
             )
+        if guest:
+            entity_key, visitor_key = plan.entity_key, plan.visitor_key
+            if not entity_key or not visitor_key:
+                raise RuntimeError("A guest speech plan has no budget keys")
+            if not _guest_sessions.admit(entity_key, visitor_key):
+                result = "busy"
+                await fail("voice_busy", GUEST_REFUSAL_MESSAGES["voice_busy"], 1008)
+                return
+            admitted = (entity_key, visitor_key)
+            reservation = await reserve_asr(
+                entity_key, visitor_key, int(_SESSION_SECONDS)
+            )
+        started = _now()
         async with usage_scope(
             plan.user_id,
             usage_source=plan.usage_source,
@@ -326,10 +529,13 @@ async def run_asr_stream(
                         ready: asyncio.Future[ASRStreamSession] = (
                             asyncio.get_running_loop().create_future()
                         )
-                        await _race(
-                            _receive_asr_audio(websocket, ready, start),
-                            _relay_asr_events(websocket, model, ready, start),
-                        )
+                        operations = [
+                            _receive_asr_audio(websocket, ready, start, meter),
+                            _relay_asr_events(websocket, model, ready, start, meter),
+                        ]
+                        if revalidate is not None and recheck_seconds is not None:
+                            operations.append(_recheck(revalidate, recheck_seconds))
+                        await _race(*operations)
                 except TimeoutError:
                     if not deadline.expired():
                         raise
@@ -338,9 +544,12 @@ async def run_asr_stream(
                 # Close before the opening scope delivers ASR input duration.
                 model_closed = True
                 await _close_model(model)
+        result = "ok"
     except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
+        result = "disconnected"
         return
     except asyncio.CancelledError:
+        result = "cancelled"
         if not release_hold.socket_writes_fenced:
             raise
         # The retire fence wound this session down: tell the client to
@@ -351,37 +560,74 @@ async def run_asr_stream(
             # A foreign cancel (shutdown, the revalidate wrapper) landed with
             # the fence cancel: it must not be swallowed.
             raise
+        result = "service_restart"
         await _close_asr_socket(websocket, 1012, "Service restart")
     except _ASRWriteTimeout:
+        result = "session_timeout"
         await _close_asr_socket(websocket, 1000, "Speech session timed out")
     except _ASRSessionTimeout:
-        await _send_asr_error(
-            websocket, "session_timeout", "Speech session timed out", 1000
+        result = "session_timeout"
+        await fail("session_timeout", "Speech session timed out", 1000)
+    except _RevalidationRefused as exc:
+        result = "revoked"
+        # The close code is the only signal, like the routes' own access
+        # refusals: an error frame would hide which code the callback chose.
+        await _close_asr_socket(
+            websocket, exc.close_code, GUEST_REFUSAL_MESSAGES["voice_unavailable"]
         )
+    except _RevalidationFailed as exc:
+        result = "recheck_failed"
+        cause = exc.__cause__
+        _log_provider_error(None, cause if isinstance(cause, Exception) else exc)
+        await fail("stream_failed", "Speech stream failed", 1011)
+    except VoiceBudgetExhausted:
+        result = "budget_exhausted"
+        await fail(
+            "voice_budget_exhausted",
+            GUEST_REFUSAL_MESSAGES["voice_budget_exhausted"],
+            1008,
+        )
+    except VoiceBudgetUnavailable:
+        result = "budget_unavailable"
+        await fail("voice_unavailable", "", 1008)
     except (ValidationError, ValueError) as exc:
-        await _send_asr_error(
-            websocket, "invalid_request", "Invalid speech stream request", 1008
-        )
+        result = "invalid_request"
+        await fail("invalid_request", "Invalid speech stream request", 1008)
         logger.debug("Invalid ASR stream request: %s", type(exc).__name__)
     except StandaloneUsageRefused as exc:
+        result = "usage_refused"
         # The gate's message can outgrow a close frame's 123-byte reason.
-        await _send_asr_error(
-            websocket,
+        await fail(
             STANDALONE_USAGE_REFUSED,
             exc.message,
             1008,
             close_reason="Usage limit reached",
         )
     except HTTPException as exc:
-        await _send_asr_error(websocket, "model_unavailable", exc.detail, 1008)
+        result = "model_unavailable"
+        await fail("model_unavailable", exc.detail, 1008)
     except Exception as exc:
+        result = "stream_failed"
         _log_provider_error(model or config, exc)
-        await _send_asr_error(websocket, "stream_failed", "Speech stream failed", 1011)
+        await fail("stream_failed", "Speech stream failed", 1011)
     finally:
         try:
-            if model is not None and not model_closed:
-                await _close_model(model)
-            await _close_asr_socket(websocket)
+            try:
+                if model is not None and not model_closed:
+                    await _close_model(model)
+                await _close_asr_socket(websocket)
+            finally:
+                if admitted is not None:
+                    _guest_sessions.release(*admitted)
+                seconds = _settled_seconds(
+                    meter, started, plan.options if plan is not None else None
+                )
+                if plan is not None:
+                    _log_asr_usage(plan, seconds, result)
+                if reservation is not None:
+                    # Settle off the cancellable path: a cancellation waits
+                    # for the refund and is raised after it.
+                    await refund(reservation, reservation.amount - seconds)
         finally:
             write_token.release()
 

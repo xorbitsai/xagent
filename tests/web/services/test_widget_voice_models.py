@@ -153,6 +153,34 @@ async def test_probe_instance_is_closed_when_resolution_is_cancelled(api, monkey
     assert probe.close_count == 1
 
 
+@pytest.mark.parametrize("ability", ["asr", "tts"])
+async def test_a_provider_that_never_answers_makes_voice_unavailable(
+    api, monkeypatch, caplog, ability
+):
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(widget_voice, "_CAPABILITY_CHECK_TIMEOUT_SECONDS", 0.05)
+    hung = _Discovered(None)
+    asr, tts = (
+        (hung, _Discovered(True)) if ability == "asr" else (_Discovered(True), hung)
+    )
+    _install_probes(monkeypatch, asr, tts)
+    if ability == "asr":
+        result = await asyncio.wait_for(
+            widget_voice.resolve_widget_transcription_model(1, request_db=None), 5
+        )
+        assert result is None
+    else:
+        resolution = await asyncio.wait_for(
+            widget_voice.resolve_widget_voice_models(1, request_db=None), 5
+        )
+        assert (resolution.models, resolution.reason) == (
+            None,
+            "voice_models_unavailable",
+        )
+    assert hung.asked.is_set() and hung.close_count == 1
+    assert "capability check failed: TimeoutError" in caplog.text
+
+
 @pytest.mark.parametrize("streams", [True, False])
 async def test_xinference_models_stream_only_after_discovery(api, monkeypatch, streams):
     monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MODEL", "voice")
@@ -180,3 +208,108 @@ async def test_xinference_models_stream_only_after_discovery(api, monkeypatch, s
     else:
         assert (result.models, result.reason) == (None, "voice_models_unavailable")
         assert len(tts_asked) == 1
+
+
+def _install_probes(monkeypatch, asr: _Discovered, tts: _Discovered):
+    monkeypatch.setenv("XAGENT_WIDGET_VOICE_ASR_MODEL", "live")
+    monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MODEL", "voice")
+    asr_factory, tts_factory = Mock(return_value=asr), Mock(return_value=tts)
+    monkeypatch.setattr(widget_voice, "get_asr_model_instance", asr_factory)
+    monkeypatch.setattr(widget_voice, "get_tts_model_instance", tts_factory)
+    return asr_factory, tts_factory
+
+
+async def test_each_resolution_asks_only_about_the_model_it_runs_on(api, monkeypatch):
+    asr, tts = _Discovered(True), _Discovered(True)
+    asr_factory, tts_factory = _install_probes(monkeypatch, asr, tts)
+
+    transcription = await widget_voice.resolve_widget_transcription_model(
+        1, request_db=None
+    )
+    assert transcription is not None
+    assert transcription.asr.model_id == "live"
+    # ElevenLabs commits a segment after half a second of silence.
+    assert transcription.vad_silence_threshold_secs == 0.5
+    assert (asr_factory.call_count, tts_factory.call_count) == (1, 0)
+    assert (asr.close_count, tts.close_count) == (1, 0)
+
+    synthesis = await widget_voice.resolve_widget_voice_models(1, request_db=None)
+    assert synthesis.models is not None
+    assert synthesis.models.tts.model_id == "voice"
+    assert (asr_factory.call_count, tts_factory.call_count) == (1, 1)
+    assert (asr.close_count, tts.close_count) == (1, 1)
+
+
+async def test_a_model_that_is_not_used_cannot_make_a_resolution_unavailable(
+    api, monkeypatch
+):
+    # The other model is unset and its provider would fail if it were asked.
+    broken = _Discovered(RuntimeError("down"))
+    asr, tts = _Discovered(True), _Discovered(True)
+    _install_probes(monkeypatch, asr, tts)
+    monkeypatch.delenv("XAGENT_WIDGET_VOICE_TTS_MODEL")
+    monkeypatch.setattr(
+        widget_voice, "get_tts_model_instance", Mock(return_value=broken)
+    )
+    transcription = await widget_voice.resolve_widget_transcription_model(
+        1, request_db=None
+    )
+    assert transcription is not None
+
+    _install_probes(monkeypatch, broken, tts)
+    monkeypatch.delenv("XAGENT_WIDGET_VOICE_ASR_MODEL")
+    synthesis = await widget_voice.resolve_widget_voice_models(1, request_db=None)
+    assert synthesis.models is not None
+    assert not broken.asked.is_set()
+
+
+@pytest.mark.parametrize(
+    "case", ["unset", "not_visible", "not_streaming", "check_raises", "times_out"]
+)
+async def test_transcription_model_unavailable(api, monkeypatch, caplog, case):
+    caplog.set_level(logging.WARNING)
+    asr, tts = _Discovered(True), _Discovered(True)
+    _install_probes(monkeypatch, asr, tts)
+    owner = 1
+    if case == "unset":
+        monkeypatch.setenv("XAGENT_WIDGET_VOICE_ASR_MODEL", " ")
+    elif case == "not_visible":
+        owner = 2
+    elif case == "not_streaming":
+        asr.answer = False
+    elif case == "check_raises":
+        asr.answer = RuntimeError(f"provider said {SECRET}")
+    else:
+        asr.answer = TimeoutError()
+
+    result = await widget_voice.resolve_widget_transcription_model(
+        owner, request_db=None
+    )
+
+    assert SECRET not in caplog.text
+    assert result is None
+    assert asr.close_count == (0 if case in ("unset", "not_visible") else 1)
+    assert not tts.asked.is_set()
+
+
+@pytest.mark.parametrize("raw", ["", "  "])
+@pytest.mark.parametrize(
+    "setting", ["XAGENT_WIDGET_VOICE_ASR_MODEL", "XAGENT_WIDGET_VOICE_TTS_MODEL"]
+)
+async def test_blank_model_setting_is_not_configured(api, monkeypatch, setting, raw):
+    # A deployment that leaves the variable empty passes an empty string.
+    asr, tts = _Discovered(True), _Discovered(True)
+    asr_factory, tts_factory = _install_probes(monkeypatch, asr, tts)
+    monkeypatch.setenv(setting, raw)
+    if setting.endswith("ASR_MODEL"):
+        assert (
+            await widget_voice.resolve_widget_transcription_model(1, request_db=None)
+            is None
+        )
+    else:
+        resolution = await widget_voice.resolve_widget_voice_models(1, request_db=None)
+        assert (resolution.models, resolution.reason) == (
+            None,
+            "voice_models_not_configured",
+        )
+    assert (asr_factory.call_count, tts_factory.call_count) == (0, 0)

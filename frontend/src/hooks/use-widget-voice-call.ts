@@ -36,8 +36,11 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 3, event: "microphone refused or missing", result: "error naming the microphone, no backend request" },
   { row: 4, event: "recognition closed 4003 / 4403", result: "unavailable, not retryable",
     match: [{ kind: "asr_close", codes: [4003, 4403] }], failure: "voice_unavailable" },
-  { row: 5, event: "recognition closed 1008 busy or rate limited", result: "busy, retryable",
-    match: [{ kind: "asr_close", codes: [1008], reasons: ["Voice is busy", "Too many requests"] }], failure: "voice_busy" },
+  { row: 5, event: "recognition refused as busy (error frame) or closed 1008 busy or rate limited", result: "busy, retryable",
+    match: [
+      { kind: "asr_error", codes: ["voice_busy"] },
+      { kind: "asr_close", codes: [1008], reasons: ["Voice is busy", "Too many requests"] },
+    ], failure: "voice_busy" },
   { row: 6, event: "recognition refused: budget exhausted", result: "error, retry later",
     match: [{ kind: "asr_error", codes: ["voice_budget_exhausted"] }], failure: "voice_retry_later" },
   { row: 7, event: "recognition refused: unavailable, model unavailable or invalid request", result: "unavailable, not retryable",

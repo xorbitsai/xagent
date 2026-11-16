@@ -285,6 +285,30 @@ describe("widget voice call state table", () => {
   })
 })
 
+describe("refusals sent as an error frame before the close", () => {
+  // The backend explains these in an error frame and then closes; the frame
+  // arrives first, so it alone must decide the outcome.
+  it.each([
+    { code: "voice_busy", close: [1008, "Voice is busy"], alert: "busy", retryable: true },
+    { code: "invalid_request", close: [1008, "Invalid speech stream request"], alert: "unavailable", retryable: false },
+    { code: "voice_unavailable", close: [1008, "Voice is unavailable"], alert: "unavailable", retryable: false },
+    { code: "model_unavailable", close: [1008, "Model unavailable"], alert: "unavailable", retryable: false },
+    { code: "voice_budget_exhausted", close: [1008, "Voice budget exhausted"], alert: "temporarilyUnavailable", retryable: true },
+    { code: "standalone_usage_refused", close: [1008, "Usage limit reached"], alert: "unavailable", retryable: false },
+    { code: "voice_unavailable", close: [4003, ""], alert: "unavailable", retryable: false },
+    { code: "voice_unavailable", close: [4403, ""], alert: "unavailable", retryable: false },
+    { code: "stream_failed", close: [1011, "Speech stream failed"], alert: "connectionEnded", retryable: true },
+    { code: "session_timeout", close: [1000, "Speech session timed out"], alert: "sessionTimeout", retryable: true },
+  ] as const)("$code then $close.0 reads as $alert", async ({ code, close, alert, retryable }) => {
+    const { socket } = await connected()
+    act(() => {
+      socket.onmessage?.({ data: JSON.stringify({ type: "error", code, message: "fixed text" }) })
+      socket.onclose?.({ code: close[0], reason: close[1] })
+    })
+    expectStopped(alert, retryable)
+  })
+})
+
 describe("widget voice call around the conversation", () => {
   it("opens a new recognition socket when the visitor retries after a failure", async () => {
     const { socket } = await connected()

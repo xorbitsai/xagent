@@ -168,10 +168,16 @@ async def test_idle_counts_every_admitted_ledger_kind(kind) -> None:
 
 @pytest.mark.asyncio
 async def test_idle_ignores_the_dispatchers_own_polling_tokens() -> None:
-    for kind in ("command_attempt", "command_dispatch"):
-        assert release_hold.try_begin_attempt(kind, "n") is not None
+    tokens = [
+        release_hold.try_begin_attempt(kind, "n")
+        for kind in ("command_attempt", "command_dispatch")
+    ]
+    assert all(token is not None for token in tokens)
     release_hold.begin_finishing()
     assert (await finishing_status_async())["idle"] is True
+    # Released: the hold is a process singleton other test files read.
+    for token in tokens:
+        token.release()
 
 
 @pytest.mark.asyncio

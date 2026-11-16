@@ -26,6 +26,8 @@ T = TypeVar("T")
 
 _lock = threading.Lock()
 _active = 0
+# Workers ever started (counted), never decremented; see ``worker_starts``.
+_starts = 0
 
 
 async def run_tracked(fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
@@ -62,7 +64,7 @@ async def _run_tracked(
     Cancelling the await before the thread started drops the work and the
     count; once it started the thread keeps its count until it finishes.
     """
-    global _active
+    global _active, _starts
     state = {"started": False, "abandoned": False}
 
     @functools.wraps(fn)
@@ -80,6 +82,7 @@ async def _run_tracked(
 
     with _lock:
         _active += 1
+        _starts += 1
     try:
         if executor is None:
             return await asyncio.to_thread(runner)
@@ -134,7 +137,7 @@ def start_tracked_thread(
     The count is taken before the thread starts, so a drain never sees a
     started thread as absent.
     """
-    global _active
+    global _active, _starts
 
     def runner() -> None:
         global _active
@@ -147,6 +150,7 @@ def start_tracked_thread(
     thread = threading.Thread(target=runner, name=name, daemon=daemon)
     with _lock:
         _active += 1
+        _starts += 1
     try:
         thread.start()
     except BaseException:
@@ -188,6 +192,16 @@ install_blocking_tracker()
 def active_workers() -> int:
     with _lock:
         return _active
+
+
+def worker_starts() -> int:
+    """How many tracked workers were ever counted; only grows.
+
+    Two reads that differ mean a worker was counted in between, even one that
+    has already finished.
+    """
+    with _lock:
+        return _starts
 
 
 async def drain_workers(timeout: float) -> bool:

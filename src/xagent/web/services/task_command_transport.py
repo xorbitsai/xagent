@@ -2845,6 +2845,20 @@ async def _dispatch_shared_task_command(
         background_task_manager.release_dispatch_slot(reservation)
         skipped_task_ids.add(task_id)
 
+    # The cap above was snapshotted before the waits since (``ensure`` can wait
+    # for an old owner). If finish-only mode began meanwhile, the stale open cap
+    # would let this claim open an execution the fence forbids, and rebuilding
+    # the cap would not help: this attempt's own slot reservation makes the task
+    # look active. A command that would open an execution for a task no
+    # execution of this process holds goes back to the serving generation.
+    if (
+        release_hold.finishing
+        and kind.value in EXECUTION_OPENING_KINDS
+        and not background_task_manager.holds_execution(task_id)
+    ):
+        background_task_manager.release_dispatch_slot(reservation)
+        return False
+
     # A control command holds no slot token: its attempt was counted when its scan
     # found it, and its dispatch moves neither the balance nor the attempt count.
     if attempt is not None and reservation is not None:

@@ -158,6 +158,10 @@ class ReleaseHold:
         self._reason: str | None = None
         self._responsibilities: dict[int, Responsibility] = {}
         self._keys = itertools.count()
+        # Admissions ever made (ledger entries and socket writes), never
+        # decremented: a status read compares it across an await to see work
+        # that came and went in between.
+        self._admissions = 0
         # Refusals since the hold last closed, by entry kind; diagnostics only.
         self._refused: Counter[str] = Counter()
         self._sealed = False
@@ -242,6 +246,7 @@ class ReleaseHold:
         if self._socket_writes_fenced:
             raise WritersRetired()
         key = next(self._keys)
+        self._admissions += 1
         self._socket_writes[key] = interrupt
         return SocketWriteToken(self, key)
 
@@ -317,6 +322,10 @@ class ReleaseHold:
 
     def _register(self, kind: str, identity: str) -> HoldToken:
         key = next(self._keys)
+        if kind not in _LEDGER_KINDS_NOT_COUNTED:
+            # The dispatcher's own polling tokens are not work (and would make
+            # every status read look unstable): the same exclusion as idle's.
+            self._admissions += 1
         self._responsibilities[key] = Responsibility(
             kind=kind, identity=identity, started_at=time.monotonic()
         )
@@ -583,8 +592,10 @@ async def finishing_status_async() -> dict[str, Any]:
     if not release_hold.finishing:
         return {"active": False, "pending_replies": 0, "idle": False}
     from .db_runtime import run_db_io_cancellation_safe
+    from .writer_workers import worker_starts
 
     fields, readable, total = _loop_owned_status()
+    marker = (release_hold._admissions, worker_starts())
     try:
         pending_replies: int | None = await run_db_io_cancellation_safe(
             _pending_reply_count
@@ -593,11 +604,13 @@ async def finishing_status_async() -> dict[str, Any]:
         logger.warning("Could not count pending replies", exc_info=True)
         pending_replies = None
         readable = False
-    # The probe awaited: re-read the loop-owned counts so work admitted while
-    # it ran is never missed. Counts can grow here: the fence stops new
+    # The probe awaited. Counts can grow meanwhile: the fence stops new
     # execution, not socket writes (a steering command still enqueues) or
-    # threads already started.
+    # threads already started. Work that was admitted, committed after the
+    # probe's snapshot and released again inside the window is in neither read,
+    # so the admission and thread-start sequences must not have moved either.
     fields_after, readable_after, total_after = _loop_owned_status()
+    stable = marker == (release_hold._admissions, worker_starts())
     return {
         "active": True,
         **fields_after,
@@ -605,6 +618,7 @@ async def finishing_status_async() -> dict[str, Any]:
         "idle": bool(
             readable
             and readable_after
+            and stable
             and total == 0
             and total_after == 0
             and not pending_replies

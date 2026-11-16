@@ -9,6 +9,7 @@ import pytest
 from pydantic import BaseModel
 from sqlalchemy.exc import OperationalError
 
+from tests.shared.widget_voice_env import clear_widget_voice_env
 from xagent.web.api import admin_widget_voice
 from xagent.web.api import agents as agents_api
 from xagent.web.api import workforces as workforces_api
@@ -23,6 +24,12 @@ from .conftest import _admin_headers, _direct_db_session, _register_second_user,
 from .test_workforce_widget import _create_workforce, _enable_widget
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+@pytest.fixture(autouse=True)
+def _widget_voice_env(monkeypatch):
+    clear_widget_voice_env(monkeypatch)
+
 
 COLUMN = "widget_voice_enabled"
 OWNER_MODULES = (

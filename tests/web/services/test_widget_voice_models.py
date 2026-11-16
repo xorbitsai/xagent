@@ -10,10 +10,17 @@ from unittest.mock import Mock
 import pytest
 from sqlalchemy.exc import OperationalError
 
+from tests.shared.widget_voice_env import clear_widget_voice_env
 from tests.web.api.test_speech_streaming import FakeASR, FakeTTS, api  # noqa: F401
 from xagent.web.api import speech
 from xagent.web.models.model import Model
 from xagent.web.services import widget_voice
+
+
+@pytest.fixture(autouse=True)
+def _widget_voice_env(monkeypatch):
+    clear_widget_voice_env(monkeypatch)
+
 
 CASES = [
     "available",

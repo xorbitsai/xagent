@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from tests.shared.widget_voice_env import clear_widget_voice_env
 from tests.web.api.test_speech_streaming import FakeASR, FakeTTS
 from xagent.web import jwt_codec as jwt
 from xagent.web.api import widget as widget_api
@@ -61,6 +62,11 @@ def _set_switch(model: type, owner_id: int, column: str = "owner_id") -> None:
         db.commit()
     finally:
         db.close()
+
+
+@pytest.fixture(autouse=True)
+def _widget_voice_env(monkeypatch):
+    clear_widget_voice_env(monkeypatch)
 
 
 @pytest.fixture

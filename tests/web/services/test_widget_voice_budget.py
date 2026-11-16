@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 from redis.exceptions import RedisError
 
+from tests.shared.widget_voice_env import clear_widget_voice_env
 from xagent.web.services import share_rate_limit, widget_voice_budget
 from xagent.web.services.widget_voice_budget import (
     TTS_BUCKETS,
@@ -24,6 +25,7 @@ SETTINGS = {
 
 @pytest.fixture(autouse=True)
 def memory_budget(monkeypatch):
+    clear_widget_voice_env(monkeypatch)
     monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
     monkeypatch.setattr(
         widget_voice_budget, "_memory_store", widget_voice_budget._MemoryStore()

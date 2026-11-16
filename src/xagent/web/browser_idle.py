@@ -127,11 +127,6 @@ def request_session_claims(user: User) -> dict[str, str]:
     return browser_session_claims(sid) if sid else {}
 
 
-def idle_timeout(user: User, policy: BrowserIdlePolicy) -> timedelta:
-    """The server-side role decides the threshold, never a client claim."""
-    return timedelta(seconds=policy.timeout_seconds(bool(user.is_admin)))
-
-
 def _current_timeout(
     user: User, recorded_admin: bool, policy: BrowserIdlePolicy
 ) -> timedelta:
@@ -169,7 +164,6 @@ def revoke_browser_session(
     *,
     reason: str,
     user_id: int | None = None,
-    now: datetime | None = None,
 ) -> bool:
     """Mark one login revoked; the caller commits. Never touches other logins."""
     query = db.query(BrowserSession).filter(
@@ -179,7 +173,7 @@ def revoke_browser_session(
         query = query.filter(BrowserSession.user_id == user_id)
     changed = query.update(
         {
-            BrowserSession.revoked_at: now or utcnow(),
+            BrowserSession.revoked_at: utcnow(),
             BrowserSession.revoked_reason: reason,
         },
         synchronize_session=False,
@@ -222,12 +216,6 @@ def enforcement_leases(db: Session) -> list[EnforcementLease]:
 def _active_leases(db: Session, now: datetime) -> list[EnforcementLease]:
     """Threshold sets some replica is still enforcing (lease not yet ended)."""
     return [lease for lease in enforcement_leases(db) if lease.until > now]
-
-
-def enforced_until(db: Session) -> datetime | None:
-    """The latest lease end over all threshold sets, or None if never enforced."""
-    leases = enforcement_leases(db)
-    return max((lease.until for lease in leases), default=None)
 
 
 def renew_enforcement_lease(
@@ -816,14 +804,13 @@ async def run_browser_session_sweep_loop(
     session_factory: sessionmaker[Session],
     *,
     stop_event: asyncio.Event,
-    heartbeat_seconds: float = ENFORCEMENT_HEARTBEAT_SECONDS,
-    sweep_seconds: float = SWEEP_INTERVAL_SECONDS,
 ) -> None:
     """Renew the enforcement lease and sweep until stopped.
 
-    With the policy enabled the lease is renewed every ``heartbeat_seconds``,
-    starting immediately; the sweep runs every ``sweep_seconds``. Failures are
-    logged and retried; while enabled, a replica enforces without the lease,
+    With the policy enabled the lease is renewed every
+    ``ENFORCEMENT_HEARTBEAT_SECONDS``, starting immediately; the sweep runs
+    every ``SWEEP_INTERVAL_SECONDS``. Failures are logged and retried; while
+    enabled, a replica enforces without the lease,
     so a failed renewal never weakens enforcement. Each tick writes, so it runs
     through ``run_tracked`` and shutdown's ``retire_writers`` waits for it.
     """
@@ -855,6 +842,6 @@ async def run_browser_session_sweep_loop(
                 pass
 
     await asyncio.gather(
-        every(heartbeat_seconds, heartbeat, "enforcement lease renewal"),
-        every(sweep_seconds, sweep, "session sweep"),
+        every(ENFORCEMENT_HEARTBEAT_SECONDS, heartbeat, "enforcement lease renewal"),
+        every(SWEEP_INTERVAL_SECONDS, sweep, "session sweep"),
     )

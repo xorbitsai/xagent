@@ -8,6 +8,8 @@ wall-clock idle time.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -263,6 +265,11 @@ def test_sweep_revokes_logins_no_request_ever_saw_expire(monkeypatch):
     _assert_idle_rejection(_verify(closed))
     _assert_idle_rejection(_refresh(closed))
     assert _verify(active).status_code == 200
+
+
+def _latest_lease_end(session) -> datetime | None:
+    ends = [row.enforced_until for row in session.query(BrowserIdleEnforcement)]
+    return max((_as_utc(end) for end in ends), default=None)
 
 
 def _lease_until(at: datetime, ordinary_minutes: int = 30) -> None:
@@ -639,7 +646,7 @@ def test_the_lease_runs_ahead_of_now_and_never_moves_back():
         browser_idle.renew_enforcement_lease(session, now=now)
         browser_idle.renew_enforcement_lease(session, now=now - timedelta(hours=1))
         session.commit()
-        until = browser_idle.enforced_until(session)
+        until = _latest_lease_end(session)
     assert until == now + browser_idle.ENFORCEMENT_LEASE
     assert browser_idle.ENFORCEMENT_LEASE > timedelta(
         seconds=browser_idle.ENFORCEMENT_HEARTBEAT_SECONDS
@@ -655,20 +662,42 @@ def test_the_heartbeat_renews_the_lease_only_while_enabled(monkeypatch, on):
         session.query(User).filter_by(username="member").one().is_admin = True
         session.commit()
 
-    async def one_tick():
+    # The heartbeat reads the policy on each tick; wait for a tick to finish
+    # (on: its lease and role writes are visible) with a bounded deadline.
+    ticked = threading.Event()
+    read_policy = browser_idle.get_browser_idle_policy
+
+    def policy_read_by_a_tick():
+        ticked.set()
+        return read_policy()
+
+    monkeypatch.setattr(browser_idle, "get_browser_idle_policy", policy_read_by_a_tick)
+
+    def tick_done() -> bool:
+        if not on:
+            return ticked.is_set()
+        with auth_tests.TestingSessionLocal() as session:
+            return (
+                _latest_lease_end(session) is not None
+                and session.get(BrowserSession, _sid(member)).recorded_admin
+            )
+
+    async def until_a_tick_is_done():
         stop = asyncio.Event()
         task = asyncio.create_task(
             browser_idle.run_browser_session_sweep_loop(
                 auth_tests.TestingSessionLocal, stop_event=stop
             )
         )
-        await asyncio.sleep(0.2)
+        deadline = time.monotonic() + 10
+        while not tick_done() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
         stop.set()
         await task
 
-    asyncio.run(one_tick())
+    asyncio.run(until_a_tick_is_done())
     with auth_tests.TestingSessionLocal() as session:
-        assert (browser_idle.enforced_until(session) is not None) is on
+        assert (_latest_lease_end(session) is not None) is on
     # While enforced, the heartbeat also records the promotion.
     assert _row(_sid(member)).recorded_admin is on
 

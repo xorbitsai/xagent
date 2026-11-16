@@ -2602,6 +2602,101 @@ class TestTriggerRateLimitConfig:
         assert get_trigger_crud_rate_limit() == "5/minute"
 
 
+class TestWidgetVoiceConfig:
+    """Widget voice settings: models, budgets and the synthesis text limit."""
+
+    _AMOUNTS = [
+        (
+            "get_widget_voice_tts_visitor_daily_chars",
+            "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS",
+            None,
+        ),
+        (
+            "get_widget_voice_tts_entity_daily_chars",
+            "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS",
+            None,
+        ),
+        (
+            "get_widget_voice_tts_site_daily_chars",
+            "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS",
+            1_000_000,
+        ),
+        (
+            "get_widget_voice_tts_max_text_chars",
+            "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS",
+            1000,
+        ),
+    ]
+
+    @pytest.mark.parametrize("raw", [None, "", "  "])
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_unset_or_blank_is_the_default(
+        self, monkeypatch, func_name, env_var, default, raw
+    ):
+        if raw is None:
+            monkeypatch.delenv(env_var, raising=False)
+        else:
+            monkeypatch.setenv(env_var, raw)
+        assert getattr(config, func_name)() == default
+
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_zero_is_a_real_limit(self, monkeypatch, func_name, env_var, default):
+        monkeypatch.setenv(env_var, "0")
+        assert getattr(config, func_name)() == 0
+
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_value_is_parsed(self, monkeypatch, func_name, env_var, default):
+        monkeypatch.setenv(env_var, " 250 ")
+        assert getattr(config, func_name)() == 250
+
+    @pytest.mark.parametrize("raw", ["-5", "lots", "1.5"])
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_invalid_value_is_the_default_with_a_warning(
+        self, monkeypatch, caplog, func_name, env_var, default, raw
+    ):
+        monkeypatch.setenv(env_var, raw)
+        assert getattr(config, func_name)() == default
+        assert f"Invalid {env_var}=" in caplog.text
+
+    @pytest.mark.parametrize("raw,expected", [("5000", 5000), ("5001", 1000)])
+    def test_max_text_chars_is_capped(self, monkeypatch, caplog, raw, expected):
+        monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS", raw)
+        assert config.get_widget_voice_tts_max_text_chars() == expected
+        assert ("Invalid XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS=" in caplog.text) == (
+            raw == "5001"
+        )
+
+    def test_max_text_chars_over_the_ceiling_is_the_default(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS", "999999")
+        assert config.get_widget_voice_tts_max_text_chars() == 1000
+
+    def test_ceiling_matches_the_synthesis_request_bound(self):
+        from xagent.web.schemas.speech import TTSStreamRequest
+
+        bound = next(
+            m.max_length
+            for m in TTSStreamRequest.model_fields["text"].metadata
+            if hasattr(m, "max_length")
+        )
+        assert config.WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING == bound
+
+    @pytest.mark.parametrize(
+        "func_name,env_var",
+        [
+            ("get_widget_voice_tts_model", "XAGENT_WIDGET_VOICE_TTS_MODEL"),
+            ("get_widget_voice_tts_voice", "XAGENT_WIDGET_VOICE_TTS_VOICE"),
+        ],
+    )
+    def test_model_and_voice_settings(self, monkeypatch, func_name, env_var):
+        getter = getattr(config, func_name)
+        monkeypatch.delenv(env_var, raising=False)
+        assert getter() is None
+        monkeypatch.setenv(env_var, "  ")
+        assert getter() is None
+        monkeypatch.setenv(env_var, "  x  ")
+        assert getter() == "x"
+
+
 class TestShareRateLimitConfig:
     """Config for public share-channel rate limits and run quotas (#973)."""
 
@@ -2682,6 +2777,16 @@ class TestShareRateLimitConfig:
         ),
         ("get_widget_run_quota", "XAGENT_WIDGET_RUN_QUOTA", "500/day"),
         ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "120/hour"),
+        (
+            "get_widget_voice_tts_rate_limit",
+            "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT",
+            "600/minute",
+        ),
+        (
+            "get_widget_voice_tts_ip_rate_limit",
+            "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT",
+            "120/minute",
+        ),
     ]
 
     @pytest.mark.parametrize("func_name,env_var,default", _CASES)

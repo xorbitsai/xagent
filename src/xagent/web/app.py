@@ -73,6 +73,7 @@ from .api.admin_memory_embedding_authority import (
     router as admin_memory_embedding_authority_router,
 )
 from .api.admin_users import router as admin_users_router
+from .api.admin_widget_voice import router as admin_widget_voice_router
 from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
 from .api.auth import auth_router
@@ -2100,6 +2101,7 @@ app.include_router(admin_interaction_rollout_router)
 app.include_router(admin_execution_events_router)
 app.include_router(execution_budget_router)
 app.include_router(admin_memory_embedding_authority_router)
+app.include_router(admin_widget_voice_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(skill_hub_router)

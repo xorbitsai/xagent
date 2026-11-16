@@ -203,6 +203,7 @@ async def test_tts_gate_and_metering_share_the_plan_usage_source(api, monkeypatc
         config=SimpleNamespace(model_id="voice"),
         options=TTSStreamRequest(model_id="voice", text="Hello"),
         usage_source="telegram_voice",
+        audience="member",
     )
     response = await speech_streams.tts_stream_response(plan=plan)
     incoming, messages = asyncio.Queue(), []

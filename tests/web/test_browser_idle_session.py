@@ -318,7 +318,11 @@ def test_a_login_alive_at_switch_off_is_free_at_once(monkeypatch):
     assert _refresh(tokens).status_code == 200
 
 
-@pytest.mark.parametrize("offset_seconds,rejected", [(-1, True), (1, False)])
+@pytest.mark.parametrize(
+    "offset_seconds,rejected",
+    # A deadline at the lease end counts, as in the conditional writes.
+    [(-1, True), (0, True), (1, False)],
+)
 def test_switch_off_decision_at_the_lease_boundary(
     monkeypatch, offset_seconds, rejected
 ):

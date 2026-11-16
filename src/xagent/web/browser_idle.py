@@ -298,14 +298,14 @@ def expired_while_enforced(
     """Whether a login expired while a recorded threshold set was enforced.
 
     True if, under any recorded threshold set and the strictest of ``roles``,
-    its deadline has passed and fell before that set's lease ended. Needs no
-    core User, so adapters that keep their own session state can use it with
-    ``enforcement_leases(db)``.
+    its deadline has passed and fell no later than that set's lease end (the
+    same boundary the conditional writes use). Needs no core User, so adapters
+    that keep their own session state can use it with ``enforcement_leases(db)``.
     """
     last = _as_utc(last_activity_at)
     for lease in leases:
         deadline = last + lease.strictest_timeout(*roles)
-        if deadline <= now and deadline < lease.until:
+        if deadline <= now and deadline <= lease.until:
             return True
     return False
 

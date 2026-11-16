@@ -134,8 +134,8 @@ switch on renews, every 5 seconds and in a loop of its own, a lease in
 seconds". Each threshold set has its own row, so replicas running different
 thresholds during a rolling change do not overwrite each other; a row only
 moves forward. With the switch off, a replica rejects a login if,
-under any recorded threshold set, its deadline has passed and fell before that
-set's lease ended. A login still valid when the last enforcing replica stopped
+under any recorded threshold set, its deadline has passed and fell no later
+than that set's lease end. A login still valid when the last enforcing replica stopped
 is free at once, and its later activity is recorded as usual. While any
 replica still enforces, its lease keeps moving, so switched-off replicas reach
 the same decisions; their activity and refresh writes repeat the test in the

@@ -204,6 +204,18 @@ stricter of the recorded and current role, but a threshold increase made in
 that gap can. A promotion made while renewal had stopped can go unrecorded,
 like one in the last renewal interval before switch-off (see Role).
 
+One narrow race remains. Requests read committed state without locking, so a
+write that passed its check just before a deadline can commit just after it (a
+refresh may wait on a lock, for example another write to the same user). A
+request in that gap is rejected, and once the write commits the login is
+accepted again, as if the write had committed a moment earlier. Activity moves
+the deadline. Refresh and the heartbeat's role recording move no deadline, so
+for them this matters only after a role change that moves the login to a longer
+threshold (a demotion, or a promotion where admins have the longer threshold),
+and the user holds exactly the rights of the new role. Closing the gap would
+need a row lock on the rejection path, which is not worth it for a window this
+narrow.
+
 ## Logout
 
 With the switch on, logout revokes the presented access token's login. Whether

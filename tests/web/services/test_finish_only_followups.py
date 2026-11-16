@@ -52,7 +52,13 @@ def factory(engine, monkeypatch):
 
 
 async def _dispatch_start_of_owned_idle_task(
-    factory, task_id, monkeypatch, *, fence: str, holds_execution: bool = False
+    factory,
+    task_id,
+    monkeypatch,
+    *,
+    fence: str,
+    holds_execution: bool = False,
+    kind: str = "start",
 ) -> tuple[list[int], dict[int, int]]:
     """A START of a task this process leases but does not run, dispatched."""
     from xagent.web.services import task_coordinator_service as service
@@ -75,7 +81,7 @@ async def _dispatch_start_of_owned_idle_task(
         db.add(task)
         db.flush()
         row = TaskExecutionCommand(
-            task_id=task.id, command_id="s1", kind="start", payload={}
+            task_id=task.id, command_id="s1", kind=kind, payload={}
         )
         db.add(row)
         db.flush()
@@ -96,6 +102,11 @@ async def _dispatch_start_of_owned_idle_task(
         _command_tasks: set[int] = set()
 
         async def execute_command(self, _task: Any, apply: Any) -> Any:
+            if fence == "during_execute":
+                # The awaits inside the real execute_command (the task hop, the
+                # command lock, the admission release) before it calls apply.
+                release_hold.begin_finishing()
+                await asyncio.sleep(0)
             return await apply()
 
         def require_recovery(self) -> None:
@@ -115,17 +126,14 @@ async def _dispatch_start_of_owned_idle_task(
 
     async def executor(command: Any) -> Any:
         applied.append(command.id)
-        return None
+        return transport.SettledTaskCommand()
 
-    try:
-        await transport._dispatch_shared_task_command(executor, command_db_id=row_id)
-    except AttributeError:
-        pass  # the stub executor returns no result; only the claim matters
+    await transport._dispatch_shared_task_command(executor, command_db_id=row_id)
     return applied, dict(manager._dispatch_reservations)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fence", ["during", "before"])
+@pytest.mark.parametrize("fence", ["during", "during_execute", "before"])
 async def test_start_of_an_idle_owned_task_is_not_claimed_after_the_fence(
     factory, task_id, monkeypatch, fence
 ) -> None:
@@ -263,3 +271,72 @@ async def test_the_dispatchers_polling_tokens_do_not_make_idle_flap(
 
     status = await _probe_paused_across(monkeypatch, during)
     assert status["idle"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_coordinator_handed_back_after_the_fence_still_reaches_idle(
+    factory, task_id, monkeypatch
+) -> None:
+    """The hand-back skips execute_command, which is what schedules the idle check.
+
+    A coordinator that finished acquiring just before the fence would stay
+    ACTIVE, renewing its lease, and keep ``idle`` false for good.
+    """
+    now = datetime.now(timezone.utc)
+    with factory() as db, db.begin():
+        user_id = db.get(Task, task_id).user_id
+        task = Task(user_id=user_id, title="unowned", status=TaskStatus.PAUSED)
+        db.add(task)
+        db.flush()
+        row = TaskExecutionCommand(
+            task_id=task.id, command_id="s1", kind="start", payload={}
+        )
+        db.add(row)
+        db.flush()
+        row_id, owned_id = row.id, task.id
+    del now
+    monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    monkeypatch.setattr(task_event_bridge, "_bridge", SimpleNamespace(host_id="H"))
+    registry = runtime.TaskCoordinatorRegistry()
+    real_ensure = registry.ensure
+
+    async def ensure_then_fence(tid: int) -> Any:
+        coordinator = await real_ensure(tid)
+        release_hold.begin_finishing()  # lands before ensure's caller resumes
+        return coordinator
+
+    monkeypatch.setattr(registry, "ensure", ensure_then_fence)
+    monkeypatch.setattr(runtime, "get_task_coordinator_registry", lambda: registry)
+    monkeypatch.setattr(runtime, "_registry", registry)  # what idle counts
+
+    async def executor(_command: Any) -> Any:
+        raise AssertionError("nothing may be applied after the fence")
+
+    try:
+        assert (
+            await transport._dispatch_shared_task_command(
+                executor, command_db_id=row_id
+            )
+            is False
+        )
+        for _ in range(300):
+            if runtime.live_coordinator_count() == 0:
+                break
+            await asyncio.sleep(0.02)
+        assert runtime.live_coordinator_count() == 0
+        status = await finishing_status_async()
+        assert status["owned_runs"] == 0 and status["idle"] is True
+        with factory() as db:
+            assert db.get(Task, owned_id).runner_id is None
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_a_control_of_an_owned_idle_task_is_still_claimed_after_the_fence(
+    factory, task_id, monkeypatch
+) -> None:
+    applied, _ = await _dispatch_start_of_owned_idle_task(
+        factory, task_id, monkeypatch, fence="during_execute", kind="pause"
+    )
+    assert len(applied) == 1

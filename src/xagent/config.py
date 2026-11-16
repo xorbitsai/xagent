@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -295,6 +295,14 @@ WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
 WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
 WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
 WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
+WIDGET_VOICE_TTS_MODEL = "XAGENT_WIDGET_VOICE_TTS_MODEL"
+WIDGET_VOICE_TTS_VOICE = "XAGENT_WIDGET_VOICE_TTS_VOICE"
+WIDGET_VOICE_TTS_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT"
+WIDGET_VOICE_TTS_IP_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT"
+WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS"
+WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS"
+WIDGET_VOICE_TTS_SITE_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS"
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS = "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -2365,6 +2373,102 @@ def get_widget_run_ip_quota() -> str:
     (example.env carries the same caveat for all per-IP buckets.)
     """
     return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
+
+
+def _get_optional_setting(env_var: str) -> str | None:
+    return (os.getenv(env_var) or "").strip() or None
+
+
+def get_widget_voice_tts_model() -> str | None:
+    """The ``model_id`` of the synthesis model widget voice uses.
+
+    A deployment setting, never the owner's own model choice. Unset means
+    widget voice is not configured on this deployment.
+    """
+    return _get_optional_setting(WIDGET_VOICE_TTS_MODEL)
+
+
+def get_widget_voice_tts_voice() -> str | None:
+    """Optional voice for widget voice synthesis; unset uses the model's own."""
+    return _get_optional_setting(WIDGET_VOICE_TTS_VOICE)
+
+
+def get_widget_voice_tts_rate_limit() -> str:
+    """Per-widget-entity limit on widget guest speech synthesis requests.
+
+    The loose backstop across all callers of one widget. A reply is
+    synthesized sentence by sentence, so one spoken reply is several requests.
+    """
+    return _get_rate_limit(WIDGET_VOICE_TTS_RATE_LIMIT, "600/minute")
+
+
+def get_widget_voice_tts_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget guest speech synthesis requests.
+
+    The tight bucket: six spoken replies of twenty sentences each in one
+    minute is 120 requests from one caller.
+    """
+    return _get_rate_limit(WIDGET_VOICE_TTS_IP_RATE_LIMIT, "120/minute")
+
+
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT = 1000
+# The text bound of TTSStreamRequest; a larger setting could never be sent.
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING = 5000
+
+_AmountT = TypeVar("_AmountT", bound="int | None")
+
+
+def _get_widget_voice_amount(
+    env_var: str, default: _AmountT, *, ceiling: int | None = None
+) -> int | _AmountT:
+    """A widget voice amount setting.
+
+    Unset or blank is ``default`` (``None`` means no limit); ``0`` is a real
+    limit; a negative, non-integer, or above-``ceiling`` value is ``default``,
+    with a warning.
+    """
+    raw = (os.getenv(env_var) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0 or (ceiling is not None and value > ceiling):
+        logger.warning(
+            "Invalid %s=%r; falling back to %s",
+            env_var,
+            raw,
+            "no limit" if default is None else default,
+        )
+        return default
+    return value
+
+
+def get_widget_voice_tts_visitor_daily_chars() -> int | None:
+    """Daily synthesis character budget for one widget visitor (the widget
+    entity plus the caller IP); ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS, None)
+
+
+def get_widget_voice_tts_entity_daily_chars() -> int | None:
+    """Daily synthesis character budget for one widget agent or workforce;
+    ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS, None)
+
+
+def get_widget_voice_tts_site_daily_chars() -> int:
+    """Daily synthesis character budget for all widget voice on this site."""
+    return _get_widget_voice_amount(WIDGET_VOICE_TTS_SITE_DAILY_CHARS, 1_000_000)
+
+
+def get_widget_voice_tts_max_text_chars() -> int:
+    """Longest text one widget voice synthesis request may carry."""
+    return _get_widget_voice_amount(
+        WIDGET_VOICE_TTS_MAX_TEXT_CHARS,
+        WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT,
+        ceiling=WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING,
+    )
 
 
 def get_share_run_quota() -> str:

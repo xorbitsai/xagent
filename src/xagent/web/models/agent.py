@@ -5,7 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import JSON, Boolean, Column, DateTime
 from sqlalchemy import Enum as SQLEnum
-from sqlalchemy import ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import ForeignKey, Index, Integer, String, Text, false, text
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -133,6 +133,12 @@ class Agent(Base):  # type: ignore
     share_enabled = Column(Boolean, default=False, nullable=False)
     share_token = Column(String(255), nullable=True, index=True)
     share_updated_at = Column(DateTime(timezone=True), nullable=True)
+    # Whether widget guests of this agent may use voice. Written only by the
+    # admin widget-voice API; owner-reachable writers and responses never
+    # carry it, and it survives an ownership change.
+    widget_voice_enabled = Column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
 
     # Status
     origin = Column(

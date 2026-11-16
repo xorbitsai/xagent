@@ -43,6 +43,7 @@ from tests.shared.auth_database import auth_db_override
 from tests.shared.db_teardown import drop_all_tables
 from xagent.web import jwt_codec as jwt
 from xagent.web.api.a2a import router as a2a_router
+from xagent.web.api.admin_widget_voice import router as admin_widget_voice_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
 from xagent.web.api.agents import router as agents_router
 from xagent.web.api.auth import auth_router
@@ -99,6 +100,7 @@ app_for_tests.include_router(widget_router)
 app_for_tests.include_router(share_router)
 app_for_tests.include_router(triggers_router)
 app_for_tests.include_router(v1_router)
+app_for_tests.include_router(admin_widget_voice_router)
 app_for_tests.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 app_for_tests.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[arg-type]
 

@@ -51,6 +51,8 @@ from ...config import (
     get_widget_task_create_rate_limit,
     get_widget_upload_ip_rate_limit,
     get_widget_upload_rate_limit,
+    get_widget_voice_tts_ip_rate_limit,
+    get_widget_voice_tts_rate_limit,
     get_widget_ws_connect_ip_rate_limit,
     get_widget_ws_turn_ip_rate_limit,
     get_widget_ws_turn_rate_limit,
@@ -113,6 +115,8 @@ _RUN_SHARE_NAMESPACE = "share-run"
 _RUN_GUEST_NAMESPACE = "share-run-guest"
 _WIDGET_RUN_NAMESPACE = "widget-run"
 _WIDGET_RUN_IP_NAMESPACE = "widget-run-ip"
+_WIDGET_VOICE_TTS_ENTITY_NAMESPACE = "widget-voice-tts"
+_WIDGET_VOICE_TTS_IP_NAMESPACE = "widget-voice-tts-ip"
 
 
 def _parse_rate(value: str, *, fallback: str) -> RateLimitItem:
@@ -152,6 +156,30 @@ def _fail_open(method: _F) -> _F:
                 exc_info=True,
             )
             return True
+
+    return wrapper  # type: ignore[return-value]
+
+
+def _fail_closed(method: _F) -> _F:
+    """Make an ``allow_*`` gate refuse on storage/backend errors.
+
+    For gates in front of work that callers who are not signed in start on a
+    widget owner's account, where admitting during a Redis outage would leave
+    the work unthrottled: any exception is logged and treated as "refuse".
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: "ShareRateLimiter", *args: object, **kwargs: object) -> bool:
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            logger.warning(
+                "Share rate limiter (%s) failed closed: %s",
+                method.__name__,
+                exc,
+                exc_info=True,
+            )
+            return False
 
     return wrapper  # type: ignore[return-value]
 
@@ -264,6 +292,12 @@ class ShareRateLimiter:
         )
         self._widget_task_create_ip_limit = _parse_rate(
             get_widget_task_create_ip_rate_limit(), fallback="60/minute"
+        )
+        self._widget_voice_tts_entity_limit = _parse_rate(
+            get_widget_voice_tts_rate_limit(), fallback="600/minute"
+        )
+        self._widget_voice_tts_ip_limit = _parse_rate(
+            get_widget_voice_tts_ip_rate_limit(), fallback="120/minute"
         )
         self._run_share_limit = _parse_rate(get_share_run_quota(), fallback="500/day")
         self._run_guest_limit = _parse_rate(
@@ -493,6 +527,30 @@ class ShareRateLimiter:
             remote_ip,
             self._widget_task_create_entity_limit,
             _WIDGET_TASK_CREATE_ENTITY_NAMESPACE,
+            entity_key,
+        )
+
+    @_fail_closed
+    def allow_widget_voice_tts(
+        self, entity_key: str | None, remote_ip: str | None
+    ) -> bool:
+        """Count one widget guest speech synthesis request; False when exceeded.
+
+        The tight-IP / loose-entity pairing of the other widget gates, but it
+        fails closed: the caller is not signed in and the usage is recorded on
+        the widget owner, so a storage error refuses rather than admits. A
+        Redis URL unusable at construction still degrades this limiter to
+        per-process memory. The widget voice daily budget bounds the total
+        across web processes only when ``XAGENT_REDIS_URL`` is set; without
+        it each process keeps its own counts, which restart from zero when
+        the process restarts.
+        """
+        return self._admit_ip_and_entity(
+            self._widget_voice_tts_ip_limit,
+            _WIDGET_VOICE_TTS_IP_NAMESPACE,
+            remote_ip,
+            self._widget_voice_tts_entity_limit,
+            _WIDGET_VOICE_TTS_ENTITY_NAMESPACE,
             entity_key,
         )
 

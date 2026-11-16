@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 
 from tests.shared.widget_voice_env import clear_widget_voice_env
-from tests.web.api.test_speech_streaming import FakeASR, FakeTTS
+from tests.web.api.test_speech_streaming import FakeTTS
 from tests.web.services.test_widget_voice_models import _Discovered
 from xagent.web import jwt_codec as jwt
 from xagent.web.api import widget as widget_api
@@ -83,7 +83,7 @@ def voice(monkeypatch):
     db = _direct_db_session()
     try:
         owner_id = int(db.query(User).filter(User.username == "admin").one().id)
-        for model_id, ability in (("live", "asr"), ("voice", "tts")):
+        for model_id, ability in (("voice", "tts"),):
             row = Model(
                 model_id=model_id,
                 model_name=model_id,
@@ -121,7 +121,6 @@ def voice(monkeypatch):
         db.close()
     _set_switch(Agent, agent_id, "id")
 
-    monkeypatch.setenv("XAGENT_WIDGET_VOICE_ASR_MODEL", "live")
     monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MODEL", "voice")
     monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_VOICE", "deployment-voice")
     monkeypatch.delenv("XAGENT_REDIS_URL", raising=False)
@@ -132,12 +131,8 @@ def voice(monkeypatch):
     )
     tts = FakeTTS()
     tts_factory = Mock(return_value=tts)
-    monkeypatch.setattr(
-        widget_voice, "get_asr_model_instance", Mock(return_value=FakeASR())
-    )
-    monkeypatch.setattr(
-        widget_voice, "get_tts_model_instance", Mock(return_value=FakeTTS())
-    )
+    probe_factory = Mock(return_value=FakeTTS())
+    monkeypatch.setattr(widget_voice, "get_tts_model_instance", probe_factory)
     monkeypatch.setattr(speech_streams, "get_tts_model_instance", tts_factory)
     usage: list[tuple[Any, ...]] = []
     gated: list[tuple[Any, ...]] = []
@@ -168,6 +163,7 @@ def voice(monkeypatch):
         guest=_authenticate_widget_guest_by_key(key),
         tts=tts,
         tts_factory=tts_factory,
+        probe_factory=probe_factory,
         usage=usage,
         gated=gated,
         gate_models=gate_models,
@@ -393,6 +389,15 @@ def test_widget_voice_usage_log(voice, caplog):
     assert "model=voice chars=5 result=ok" in lines[0]
 
 
+def test_widget_voice_probes_the_synthesis_model_once_per_stage(voice):
+    response = client.post(PATH, headers=voice.guest, json={"text": "Hello"})
+    assert response.status_code == 200, response.text
+    # One capability probe while resolving the model, one on the instance that
+    # then synthesizes; no other model is built.
+    assert voice.probe_factory.call_count == 1
+    assert voice.tts_factory.call_count == 1
+
+
 @pytest.mark.parametrize(
     "keys",
     [
@@ -484,9 +489,6 @@ def test_widget_voice_releases_the_connection_before_reading_the_body(
 
 def test_widget_voice_serves_a_model_that_streams_after_discovery(voice, monkeypatch):
     monkeypatch.setattr(
-        widget_voice, "get_asr_model_instance", Mock(return_value=_Discovered(True))
-    )
-    monkeypatch.setattr(
         widget_voice, "get_tts_model_instance", Mock(return_value=_Discovered(True))
     )
     response = client.post(PATH, headers=voice.guest, json={"text": "Hello"})
@@ -505,13 +507,13 @@ async def test_resolution_returns_the_request_connection_first(voice, monkeypatc
     engine = _install_one_slot_queue_pool(monkeypatch)
     checked_out: list[int] = []
 
-    class CountingASR(FakeASR):
+    class CountingTTS(FakeTTS):
         async def get_streaming_capabilities(self):
             checked_out.append(engine.pool.checkedout())
             return await super().get_streaming_capabilities()
 
     monkeypatch.setattr(
-        widget_voice, "get_asr_model_instance", Mock(return_value=CountingASR())
+        widget_voice, "get_tts_model_instance", Mock(return_value=CountingTTS())
     )
     db = get_session_local()()
     try:
@@ -530,9 +532,7 @@ async def test_resolution_returns_the_request_connection_first(voice, monkeypatc
 async def test_resolution_refuses_a_request_session_with_uncommitted_work(
     voice, monkeypatch
 ):
-    asr_factory = Mock(return_value=FakeASR())
     tts_factory = Mock(return_value=FakeTTS())
-    monkeypatch.setattr(widget_voice, "get_asr_model_instance", asr_factory)
     monkeypatch.setattr(widget_voice, "get_tts_model_instance", tts_factory)
     db = get_session_local()()
     try:
@@ -541,7 +541,6 @@ async def test_resolution_refuses_a_request_session_with_uncommitted_work(
             await widget_voice.resolve_widget_voice_models(
                 voice.owner_id, request_db=db
             )
-        asr_factory.assert_not_called()
         tts_factory.assert_not_called()
     finally:
         db.rollback()

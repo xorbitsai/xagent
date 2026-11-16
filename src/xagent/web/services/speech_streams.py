@@ -89,10 +89,6 @@ def guest_refusal(status_code: int, code: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail=guest_refusal_detail(code))
 
 
-class VoiceUnavailable(Exception):
-    """Widget voice cannot run: its models are not configured or not usable."""
-
-
 @dataclass(frozen=True)
 class SpeechStreamPlan(Generic[_OptionsT]):
     """What a route resolved for one speech session before the provider runs.

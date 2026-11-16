@@ -295,7 +295,6 @@ WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
 WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
 WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
 WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
-WIDGET_VOICE_ASR_MODEL = "XAGENT_WIDGET_VOICE_ASR_MODEL"
 WIDGET_VOICE_TTS_MODEL = "XAGENT_WIDGET_VOICE_TTS_MODEL"
 WIDGET_VOICE_TTS_VOICE = "XAGENT_WIDGET_VOICE_TTS_VOICE"
 WIDGET_VOICE_TTS_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT"
@@ -2380,18 +2379,12 @@ def _get_optional_setting(env_var: str) -> str | None:
     return (os.getenv(env_var) or "").strip() or None
 
 
-def get_widget_voice_asr_model() -> str | None:
-    """The ``model_id`` of the live transcription model widget voice uses.
+def get_widget_voice_tts_model() -> str | None:
+    """The ``model_id`` of the synthesis model widget voice uses.
 
     A deployment setting, never the owner's own model choice. Unset means
     widget voice is not configured on this deployment.
     """
-    return _get_optional_setting(WIDGET_VOICE_ASR_MODEL)
-
-
-def get_widget_voice_tts_model() -> str | None:
-    """The ``model_id`` of the synthesis model widget voice uses; unset means
-    widget voice is not configured on this deployment."""
     return _get_optional_setting(WIDGET_VOICE_TTS_MODEL)
 
 

@@ -35,7 +35,6 @@ from ..services.share_rate_limit import (
 )
 from ..services.speech_streams import (
     SpeechStreamPlan,
-    VoiceUnavailable,
     guest_refusal,
     tts_stream_response,
 )
@@ -723,15 +722,12 @@ async def widget_voice_tts(
     visitor_key = remote_ip_from_request(request)
     if not get_share_rate_limiter().allow_widget_voice_tts(entity_key, visitor_key):
         raise guest_refusal(429, "rate_limited")
-    try:
-        if visitor_key is None:
-            raise VoiceUnavailable("no visitor address")
-        resolution = await resolve_widget_voice_models(owner_user_id, request_db=db)
-        if resolution.models is None:
-            raise VoiceUnavailable(resolution.reason)
-    except VoiceUnavailable:
-        raise guest_refusal(503, "voice_unavailable") from None
+    if visitor_key is None:
+        raise guest_refusal(503, "voice_unavailable")
+    resolution = await resolve_widget_voice_models(owner_user_id, request_db=db)
     models = resolution.models
+    if models is None:
+        raise guest_refusal(503, "voice_unavailable")
     return await tts_stream_response(
         plan=SpeechStreamPlan(
             user_id=owner_user_id,

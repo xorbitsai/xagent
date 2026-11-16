@@ -1,30 +1,26 @@
-"""What widget voice runs on: the deployment's voice models.
+"""What widget voice runs on: the deployment's synthesis model.
 
-Widget guests never choose a model. The deployment names one live
-transcription model and one synthesis model by ``model_id``; they are resolved
-for the entity's owner with the same visibility rules as the owner's own
-speech requests, so a model an administrator shared and later unshared or
-disabled makes widget voice unavailable rather than reachable.
+Widget guests never choose a model. The deployment names the synthesis model
+by ``model_id``; it is resolved for the entity's owner with the same
+visibility rules as the owner's own speech requests, so a model an
+administrator shared and later unshared or disabled makes widget voice
+unavailable rather than reachable.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from ...config import (
-    get_widget_voice_asr_model,
     get_widget_voice_tts_model,
     get_widget_voice_tts_voice,
 )
-from ...core.model.asr.adapter import get_asr_model_instance
 from ...core.model.tts.adapter import get_tts_model_instance
 from ..api.speech import _load_speech_config
 from ..models.database import release_db_connection_if_clean
@@ -39,19 +35,14 @@ VOICE_MODELS_UNAVAILABLE = "voice_models_unavailable"
 # The voice shape TTSStreamRequest accepts; a deployment voice outside it
 # could never be sent, so it makes widget voice unavailable.
 _VOICE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-# ElevenLabs live transcription commits a segment after this much silence,
-# the value the browser call controller uses for the same provider.
-_ELEVENLABS_VAD_SILENCE_SECS = 0.5
 
 
 @dataclass(frozen=True)
 class WidgetVoiceModels:
-    """The resolved model configurations widget voice runs on for one owner."""
+    """The resolved synthesis configuration widget voice runs on for one owner."""
 
-    asr: SimpleNamespace
     tts: SimpleNamespace
     voice: str | None
-    vad_silence_threshold_secs: float | None
 
 
 @dataclass(frozen=True)
@@ -64,9 +55,8 @@ class WidgetVoiceResolution:
 
 @dataclass(frozen=True)
 class _ConfiguredModels:
-    """The deployment's two model configurations, read but not yet asked about."""
+    """The deployment's synthesis model configuration, read but not yet asked about."""
 
-    asr: SimpleNamespace
     tts: SimpleNamespace
     voice: str | None
 
@@ -75,9 +65,8 @@ def _read_configured_models(
     owner_user_id: int,
 ) -> _ConfiguredModels | WidgetVoiceResolution:
     # Blocking: runs in a worker thread, in short sessions of its own.
-    asr_model_id = get_widget_voice_asr_model()
     tts_model_id = get_widget_voice_tts_model()
-    if not asr_model_id or not tts_model_id:
+    if not tts_model_id:
         return WidgetVoiceResolution(None, VOICE_MODELS_NOT_CONFIGURED)
     unavailable = WidgetVoiceResolution(None, VOICE_MODELS_UNAVAILABLE)
     voice = get_widget_voice_tts_voice()
@@ -85,21 +74,19 @@ def _read_configured_models(
         logger.warning("Widget voice setting has an unusable synthesis voice")
         return unavailable
     try:
-        asr = _load_speech_config(owner_user_id, asr_model_id, "asr")
         tts = _load_speech_config(owner_user_id, tts_model_id, "tts")
     except HTTPException as exc:
         logger.warning(
-            "Widget voice models %s / %s unavailable for owner %s: %s",
-            asr_model_id,
+            "Widget voice model %s unavailable for owner %s: %s",
             tts_model_id,
             owner_user_id,
             exc.detail,
         )
         return unavailable
-    return _ConfiguredModels(asr=asr, tts=tts, voice=voice)
+    return _ConfiguredModels(tts=tts, voice=voice)
 
 
-async def _streams(config: SimpleNamespace, factory: Callable[[Any], Any]) -> bool:
+async def _streams(config: SimpleNamespace) -> bool:
     """Ask the provider whether ``config``'s model streams.
 
     Some providers only know after this call, so the adapter's
@@ -108,7 +95,7 @@ async def _streams(config: SimpleNamespace, factory: Callable[[Any], Any]) -> bo
     The probe instance is closed however the call ends.
     """
     try:
-        model = factory(config)
+        model = get_tts_model_instance(config)
     except ValueError:
         logger.warning(
             "Widget voice model %s cannot be built from its configuration",
@@ -149,7 +136,7 @@ def release_request_connection(request_db: Session) -> None:
 async def resolve_widget_voice_models(
     owner_user_id: int, *, request_db: Session | None
 ) -> WidgetVoiceResolution:
-    """Resolve the deployment's voice models as visible to ``owner_user_id``.
+    """Resolve the deployment's synthesis model as visible to ``owner_user_id``.
 
     ``request_db`` is the caller's request session, or ``None`` when the caller
     has none. Its connection is returned to the pool before anything else,
@@ -159,8 +146,9 @@ async def resolve_widget_voice_models(
 
     The model settings are read in a worker thread, in short sessions of its
     own. Then, with no database session held, the provider is asked whether
-    each model streams, and each probe instance is closed. Missing settings
-    are ``voice_models_not_configured``. A model that is missing, not visible
+    the synthesis model streams, and the probe instance is closed. A missing
+    synthesis model setting is ``voice_models_not_configured``. A synthesis
+    model that is missing, not visible
     to the owner, inactive, of the wrong ability, cannot be built, whose
     capability check raises or times out, or that cannot stream is
     ``voice_models_unavailable`` and logged with its ``model_id``. A database
@@ -173,20 +161,6 @@ async def resolve_widget_voice_models(
     )
     if isinstance(read, WidgetVoiceResolution):
         return read
-    for config, factory in (
-        (read.asr, get_asr_model_instance),
-        (read.tts, get_tts_model_instance),
-    ):
-        if not await _streams(config, factory):
-            return WidgetVoiceResolution(None, VOICE_MODELS_UNAVAILABLE)
-    provider = str(read.asr.model_provider or "").strip().lower()
-    return WidgetVoiceResolution(
-        WidgetVoiceModels(
-            asr=read.asr,
-            tts=read.tts,
-            voice=read.voice,
-            vad_silence_threshold_secs=(
-                _ELEVENLABS_VAD_SILENCE_SECS if provider == "elevenlabs" else None
-            ),
-        )
-    )
+    if not await _streams(read.tts):
+        return WidgetVoiceResolution(None, VOICE_MODELS_UNAVAILABLE)
+    return WidgetVoiceResolution(WidgetVoiceModels(tts=read.tts, voice=read.voice))

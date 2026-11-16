@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { createWidgetVoiceAudio, VoiceAudio, VoiceAudioError, type VoiceAudioTransport } from "./voice-audio"
+import { createWidgetVoiceAudio, VoiceAudio, VoiceAudioError, type VoiceAudioFailure, type VoiceAudioTransport, type VoiceTransportEvent } from "./voice-audio"
 import { createVoiceVad } from "./voice-vad"
 
 const detectors = vi.hoisted(() => [] as Array<{ options: { speech: (active: boolean) => void; error: () => void }; process: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }>)
@@ -325,8 +325,10 @@ describe("injected speech transport", () => {
     openAsrSocket: vi.fn(() => new WebSocket("wss://widget.example/api/widget/voice/asr", ["guest-protocol"])),
     startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
     requestTts: vi.fn(async () => new Response(new Uint8Array([0, 0]), { headers: { "X-Audio-Format": "pcm", "X-Audio-Sample-Rate": "24000" } })),
-    authFailure: vi.fn((failure: Response | CloseEvent) => (
-      failure instanceof Response ? failure.status === 401 : failure.code === 4003) ? "authentication_required" as const : undefined),
+    classify: vi.fn((event: VoiceTransportEvent): VoiceAudioFailure | undefined =>
+      event.kind === "asr_close" && event.code === 4003 ? "voice_unavailable"
+        : event.kind === "asr_error" && event.code === "voice_budget_exhausted" ? "voice_retry_later"
+          : event.kind === "tts_response" && event.status === 429 ? "voice_retry_later" : undefined),
     ...over,
   })
 
@@ -358,31 +360,36 @@ describe("injected speech transport", () => {
     call.close()
   })
 
-  it("lets the transport classify a refused socket close", async () => {
+  it.each([
+    { label: "a classified error frame", deliver: (socket: Socket) => socket.onmessage!({ data: JSON.stringify({ type: "error", code: "voice_budget_exhausted" }) }),
+      event: { kind: "asr_error", code: "voice_budget_exhausted" }, reported: "voice_retry_later" },
+    { label: "an unclassified error frame", deliver: (socket: Socket) => socket.onmessage!({ data: JSON.stringify({ type: "error", code: "session_timeout" }) }),
+      event: { kind: "asr_error", code: "session_timeout" }, reported: "session_timeout" },
+    { label: "a classified close", deliver: (socket: Socket) => socket.onclose!({ code: 4003, reason: "" }),
+      event: { kind: "asr_close", code: 4003, reason: "" }, reported: "voice_unavailable" },
+    { label: "an unclassified close", deliver: (socket: Socket) => socket.onclose!({ code: 1006, reason: "" }),
+      event: { kind: "asr_close", code: 1006, reason: "" }, reported: "connection_failed" },
+  ])("ends recognition by the transport's reading of $label", async ({ deliver, event, reported }) => {
+    const supplied = transport()
     const events = callbacks()
-    const call = createWidgetVoiceAudio(transport(), events)
-    const socket = await start(call)
-    socket.onclose!({ code: 4003, reason: "" })
-    expect(events.error).toHaveBeenCalledExactlyOnceWith("authentication_required")
-  })
-
-  it("keeps the timeout reading for closes the transport does not classify", async () => {
-    const events = callbacks()
-    const call = createWidgetVoiceAudio(transport(), events)
-    const socket = await start(call)
-    socket.onclose!({ code: 1000, reason: "Speech session timed out" })
-    expect(events.error).toHaveBeenCalledExactlyOnceWith("session_timeout")
+    const call = createWidgetVoiceAudio(supplied, events)
+    deliver(await start(call))
+    expect(supplied.classify).toHaveBeenCalledExactlyOnceWith(event)
+    expect(events.error).toHaveBeenCalledExactlyOnceWith(reported)
+    expect(stopTrack).toHaveBeenCalledOnce()
   })
 
   it.each([
-    { status: 401, outcome: { code: "authentication_required" } },
-    { status: 503, outcome: new Error("Speech synthesis failed") },
-  ])("lets the transport classify a refused synthesis ($status)", async ({ status, outcome }) => {
-    const supplied = transport({ requestTts: vi.fn(async () => new Response(null, { status })) })
+    { status: 429, body: { detail: "voice_budget_exhausted" }, code: "voice_budget_exhausted", outcome: { code: "voice_retry_later" } },
+    { status: 502, body: { detail: "Speech synthesis failed" }, code: "Speech synthesis failed", outcome: new Error("Speech synthesis failed") },
+    { status: 503, body: null, code: undefined, outcome: new Error("Speech synthesis failed") },
+  ])("lets the transport read a refused synthesis ($status)", async ({ status, body, code, outcome }) => {
+    const supplied = transport({ requestTts: vi.fn(async () => new Response(body && JSON.stringify(body), { status })) })
     const call = createWidgetVoiceAudio(supplied, callbacks())
     await start(call)
     if (outcome instanceof Error) await expect(call.speak("Hello")).rejects.toThrow(outcome.message)
     else await expect(call.speak("Hello")).rejects.toMatchObject(outcome)
+    expect(supplied.classify).toHaveBeenLastCalledWith({ kind: "tts_response", status, code })
     expect(supplied.requestTts).toHaveBeenCalledOnce()
     call.close()
   })

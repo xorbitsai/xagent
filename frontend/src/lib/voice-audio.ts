@@ -5,6 +5,8 @@ import { encodePcm16, VoiceResampler } from "./voice-conversation"
 import { createVoiceVad, type VoiceVad } from "./voice-vad"
 
 export type VoiceAudioFailure = "session_timeout" | "authentication_required" | "connection_failed"
+  // Only an injected transport's `classify` produces these three.
+  | "voice_unavailable" | "voice_busy" | "voice_retry_later"
 export class VoiceAudioError extends Error {
   constructor(public code: VoiceAudioFailure) { super(code) }
 }
@@ -24,9 +26,22 @@ export interface VoiceAudioTransport {
   startFrame: object
   /** Send one synthesis request; resolves with the raw response. */
   requestTts(text: string, signal: AbortSignal): Promise<Response>
-  /** The credential failure a refused response or socket close means, if any. */
-  authFailure(failure: Response | CloseEvent): VoiceAudioFailure | undefined
+  /**
+   * What a refusal means for the call. A failure ends the call with that
+   * reason; undefined leaves the default reading (an error frame or close is
+   * a timeout or a dropped connection, a refused synthesis only skips that
+   * sentence).
+   */
+  classify(event: VoiceTransportEvent): VoiceAudioFailure | undefined
 }
+
+/** A refusal seen on the speech transport, as handed to `classify`. */
+export type VoiceTransportEvent =
+  /** An error frame the recognition socket sent before closing. */
+  | { kind: "asr_error"; code: string | undefined }
+  | { kind: "asr_close"; code: number; reason: string }
+  /** A synthesis response that was not a playable stream. */
+  | { kind: "tts_response"; status: number; code: string | undefined }
 
 /** What a call reports back while it runs, whoever supplies its transport. */
 export interface VoiceAudioCallbacks {
@@ -115,9 +130,9 @@ export class VoiceAudio {
           body: JSON.stringify({ model_id: options.tts, voice: options.voice, text, format: "pcm", sample_rate: 24000 }),
         })
       },
-      authFailure: failure => (failure instanceof Response
-        ? failure.status === 401 || failure.status === 403
-        : failure.code === 4001) ? "authentication_required" : undefined,
+      classify: event => (event.kind === "tts_response"
+        ? event.status === 401 || event.status === 403
+        : event.kind === "asr_close" && event.code === 4001) ? "authentication_required" : undefined,
     }
   }
 
@@ -176,11 +191,15 @@ export class VoiceAudio {
                 this.options.activity(false)
               }
             }
-          } else if (event.type === "error") this.fail(event.code === "session_timeout" ? "session_timeout" : "connection_failed")
+          } else if (event.type === "error") {
+            const code = typeof event.code === "string" ? event.code : undefined
+            this.fail(this.transport.classify({ kind: "asr_error", code }) ?? (event.code === "session_timeout" ? "session_timeout" : "connection_failed"))
+          }
         } catch { this.fail("connection_failed") }
       }
       socket.onerror = () => this.fail("connection_failed")
-      socket.onclose = event => this.fail(this.transport.authFailure(event) ?? (event.reason === "Speech session timed out" ? "session_timeout" : "connection_failed"))
+      socket.onclose = event => this.fail(this.transport.classify({ kind: "asr_close", code: event.code, reason: event.reason })
+        ?? (event.reason === "Speech session timed out" ? "session_timeout" : "connection_failed"))
     })
     if (this.closed) return
     const resampler = new VoiceResampler(context.sampleRate)
@@ -253,8 +272,11 @@ export class VoiceAudio {
     // A synthesis request is billable; never automatically replay a failed POST.
     const response = await this.transport.requestTts(text, signal)
     if (!response.ok || !response.body) {
-      await response.body?.cancel()
-      const failure = this.transport.authFailure(response)
+      // An injected transport may explain the refusal in a fixed JSON code.
+      let code: string | undefined
+      if (this.options.transport) code = await refusalCode(response)
+      else await response.body?.cancel()
+      const failure = this.transport.classify({ kind: "tts_response", status: response.status, code })
       if (failure) throw new VoiceAudioError(failure)
       throw new Error("Speech synthesis failed")
     }
@@ -325,6 +347,15 @@ export class VoiceAudio {
     this.microphone?.getTracks().forEach(track => track.stop())
     void this.context?.close().catch(() => {})
   }
+}
+
+/** The fixed code in a refused response body (`code`, or a string `detail`). */
+async function refusalCode(response: Response): Promise<string | undefined> {
+  try {
+    const body = await response.json()
+    const code = body?.code ?? body?.detail?.code ?? body?.detail
+    return typeof code === "string" ? code : undefined
+  } catch { return undefined }
 }
 
 /**

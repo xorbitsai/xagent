@@ -3,6 +3,9 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const toastMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
+
+vi.mock("sonner", () => ({ toast: toastMock }))
 
 // TraceEventRenderer (reused for tool-call display) pulls in next/navigation
 // useRouter() and the app-context useApp(); both need providers that aren't
@@ -48,6 +51,10 @@ vi.mock("@/contexts/i18n-context", () => ({
       // formatted date via t(key, { date }); mirror it so the rendered date
       // string is assertable instead of being swallowed by the key fallback.
       if (vars?.date) return `${key}:${vars.date}`
+      // The export limit messages interpolate the limit; mirror it so the
+      // number is assertable.
+      if (vars?.limit !== undefined) return `${key}:${vars.limit}`
+      if (vars?.limitMb !== undefined) return `${key}:${vars.limitMb}`
       const labels: Record<string, string> = {
         "conversationLogs.title": "Conversation Logs",
         "conversationLogs.searchPlaceholder": "Search conversations",
@@ -210,6 +217,7 @@ const webhookDetailPayload = {
 describe("ConversationLogsPage", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+    toastMock.error.mockReset()
     apiRequestMock.mockImplementation((url: string) => {
       const parsed = new URL(url)
       if (parsed.pathname === "/api/conversation-logs/101") {
@@ -471,5 +479,218 @@ describe("ConversationLogsPage", () => {
 
     expect(await screen.findByText("Qualify this lead")).toBeInTheDocument()
     expect(screen.queryByText("conversationLogs.expired.traceEvents")).not.toBeInTheDocument()
+  })
+
+  describe("time window and export", () => {
+    const FROM_LOCAL = "2026-06-29T08:00"
+    const TO_LOCAL = "2026-06-30T08:00"
+
+    function listUrls(): URL[] {
+      return apiRequestMock.mock.calls
+        .map(([url]) => new URL(String(url)))
+        .filter((url) => url.pathname === "/api/conversation-logs")
+    }
+
+    function exportUrls(): URL[] {
+      return apiRequestMock.mock.calls
+        .map(([url]) => new URL(String(url)))
+        .filter((url) => url.pathname === "/api/conversation-logs/export")
+    }
+
+    function mockExport(respond: () => Response) {
+      const listImplementation = apiRequestMock.getMockImplementation()
+      apiRequestMock.mockImplementation((url: string) => {
+        if (new URL(url).pathname === "/api/conversation-logs/export") {
+          return Promise.resolve(respond())
+        }
+        return listImplementation?.(url)
+      })
+    }
+
+    function setWindow(from: string, to: string) {
+      fireEvent.change(screen.getByLabelText("conversationLogs.activeFromLabel"), {
+        target: { value: from },
+      })
+      fireEvent.change(screen.getByLabelText("conversationLogs.activeToLabel"), {
+        target: { value: to },
+      })
+    }
+
+    function exportButton() {
+      return screen.getByRole("button", { name: /^conversationLogs\.export(ing)?$/ })
+    }
+
+    it("sends the chosen window to the list API as UTC ISO timestamps", async () => {
+      render(<ConversationLogsPage />)
+      await screen.findAllByText("Sales Agent")
+
+      setWindow(FROM_LOCAL, TO_LOCAL)
+
+      await waitFor(() => {
+        const last = listUrls().at(-1)!
+        expect(last.searchParams.get("active_from")).toBe(
+          new Date(FROM_LOCAL).toISOString()
+        )
+        expect(last.searchParams.get("active_to")).toBe(new Date(TO_LOCAL).toISOString())
+      })
+      expect(listUrls()[0].searchParams.has("active_from")).toBe(false)
+    })
+
+    it("drops a time parameter once its input is cleared", async () => {
+      render(<ConversationLogsPage />)
+      await screen.findAllByText("Sales Agent")
+
+      setWindow(FROM_LOCAL, TO_LOCAL)
+      await waitFor(() => expect(listUrls().at(-1)!.searchParams.has("active_from")).toBe(true))
+      fireEvent.click(
+        screen.getByRole("button", {
+          name: "conversationLogs.clearTime - conversationLogs.activeFromLabel",
+        })
+      )
+
+      await waitFor(() => {
+        const last = listUrls().at(-1)!
+        expect(last.searchParams.has("active_from")).toBe(false)
+        expect(last.searchParams.get("active_to")).toBe(new Date(TO_LOCAL).toISOString())
+      })
+    })
+
+    it("does not request or allow export when the start is not before the end", async () => {
+      render(<ConversationLogsPage />)
+      await screen.findAllByText("Sales Agent")
+      expect(exportButton()).toBeEnabled()
+      const requestsBefore = listUrls().length
+
+      setWindow(TO_LOCAL, FROM_LOCAL)
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "conversationLogs.timeRangeInvalid"
+      )
+      expect(exportButton()).toBeDisabled()
+      await act(async () => {
+        await Promise.resolve()
+      })
+      const afterInvalid = listUrls().slice(requestsBefore)
+      expect(afterInvalid.some((url) => url.searchParams.has("active_from") &&
+        url.searchParams.has("active_to"))).toBe(false)
+      // Equal bounds are the same empty window.
+      setWindow(FROM_LOCAL, FROM_LOCAL)
+      expect(await screen.findByRole("alert")).toBeInTheDocument()
+      expect(exportButton()).toBeDisabled()
+    })
+
+    it("disables export when the result is empty", async () => {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (new URL(url).pathname === "/api/conversation-logs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                ...listPayload,
+                logs: [],
+                pagination: { ...listPayload.pagination, total: 0 },
+              }),
+              { status: 200 }
+            )
+          )
+        }
+        throw new Error(`Unhandled apiRequest: ${url}`)
+      })
+      render(<ConversationLogsPage />)
+
+      await screen.findByText("No conversation logs yet")
+      expect(exportButton()).toBeDisabled()
+    })
+
+    it("exports with exactly the filters of the current list request", async () => {
+      const createObjectURL = vi.fn(() => "blob:test")
+      const revokeObjectURL = vi.fn()
+      vi.stubGlobal("URL", Object.assign(URL, { createObjectURL, revokeObjectURL }))
+      const downloads: string[] = []
+      const clickSpy = vi
+        .spyOn(HTMLAnchorElement.prototype, "click")
+        .mockImplementation(function (this: HTMLAnchorElement) {
+          downloads.push(this.download)
+        })
+      mockExport(() => new Response("a,b\r\n", { status: 200 }))
+
+      render(<ConversationLogsPage />)
+      await screen.findAllByText("Sales Agent")
+      fireEvent.click(screen.getByText("Webhook 1"))
+      fireEvent.change(screen.getByPlaceholderText("Search conversations"), {
+        target: { value: "crm" },
+      })
+      setWindow(FROM_LOCAL, TO_LOCAL)
+      await waitFor(() => {
+        const last = listUrls().at(-1)!
+        expect(last.searchParams.get("source")).toBe("webhook")
+        expect(last.searchParams.get("search")).toBe("crm")
+        expect(last.searchParams.has("active_to")).toBe(true)
+      })
+      const currentList = listUrls().at(-1)!
+
+      fireEvent.click(exportButton())
+
+      await waitFor(() => expect(exportUrls()).toHaveLength(1))
+      const listFilters = new URLSearchParams(currentList.searchParams)
+      listFilters.delete("page")
+      listFilters.delete("per_page")
+      expect(Array.from(exportUrls()[0].searchParams.entries()).sort()).toEqual(
+        Array.from(listFilters.entries()).sort()
+      )
+      await waitFor(() => expect(downloads).toHaveLength(1))
+      expect(downloads[0]).toMatch(/^conversation-logs-\d{8}-\d{6}\.csv$/)
+      expect(toastMock.error).not.toHaveBeenCalled()
+      clickSpy.mockRestore()
+    })
+
+    it.each([
+      [
+        "too many rows",
+        422,
+        { detail: { code: "conversation_log_export_too_large", reason: "rows", limit: 10000 } },
+        "conversationLogs.exportTooManyRows:10000",
+      ],
+      [
+        "too large a file",
+        422,
+        {
+          detail: {
+            code: "conversation_log_export_too_large",
+            reason: "bytes",
+            limit: 52428800,
+          },
+        },
+        "conversationLogs.exportTooLargeFile:50",
+      ],
+      [
+        "an unknown reason",
+        422,
+        { detail: { code: "conversation_log_export_too_large", reason: "disk", limit: 5 } },
+        "conversationLogs.exportFailed",
+      ],
+      [
+        "a non-numeric limit",
+        422,
+        { detail: { code: "conversation_log_export_too_large", reason: "rows", limit: "x" } },
+        "conversationLogs.exportFailed",
+      ],
+      [
+        "another 422",
+        422,
+        { detail: [{ msg: "bad", loc: ["query", "active_from"] }] },
+        "conversationLogs.exportFailed",
+      ],
+      ["a server error", 500, { detail: "boom" }, "conversationLogs.exportFailed"],
+    ])("reports %s on export", async (_name, status, body, expectedMessage) => {
+      mockExport(() => new Response(JSON.stringify(body), { status }))
+      render(<ConversationLogsPage />)
+      await screen.findAllByText("Sales Agent")
+
+      fireEvent.click(exportButton())
+
+      await waitFor(() => expect(toastMock.error).toHaveBeenCalledWith(expectedMessage))
+      expect(toastMock.error).toHaveBeenCalledTimes(1)
+      await waitFor(() => expect(exportButton()).toBeEnabled())
+    })
   })
 })

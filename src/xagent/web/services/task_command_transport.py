@@ -981,6 +981,19 @@ _OPEN_COMMAND_AND_REPLY_PRESENCE = select(
 
 
 def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
+    if release_hold.finishing:
+        # Finish-only mode: only commands of tasks whose lease this process
+        # holds, controls included. Never a task nobody or another process
+        # owns, and never one whose lease has lapsed (lease recovery is stopped
+        # here, so the serving generation takes those over).
+        #
+        # Every kind of an owned task stays claimable, START, RESUME_INPUT and
+        # MESSAGE included (the closed-cap ``active_ids`` branch passes them):
+        # a run waiting for user input could never finish otherwise. A task
+        # that keeps receiving follow-ups is therefore not handed over while
+        # they keep coming; that overlap is bounded by the deadline of the
+        # host action that began finishing, not by this process.
+        return and_(Task.runner_id == runner_id, Task.lease_expires_at > now)
     if get_shared_task_execution_enabled():
         # An empty immutable target must not let another worker steal live
         # owner commands and spend the defer budget waiting for that owner.

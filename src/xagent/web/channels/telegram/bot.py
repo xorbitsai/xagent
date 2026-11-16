@@ -94,6 +94,7 @@ from ...services.generation import (
     tick_allowed,
 )
 from ...services.managed_task_lease import ManagedTaskLease
+from ...services.release_hold import release_hold
 from ...services.shared_channel_execution import (
     SharedChannelTurn,
 )
@@ -3118,6 +3119,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
             self._menu_generation = uuid4().hex[:12]
             # Shared ordinary inputs resolve receipts after restart. Old controls
             # are filtered independently; callbacks carry a startup generation.
+            # Connect point: nothing opens once finish-only mode began.
+            if release_hold.finishing:
+                return
             await self.bot.delete_webhook(
                 drop_pending_updates=not get_shared_task_execution_enabled()
             )
@@ -3135,6 +3139,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 return
             # Get bot info manually just for logging (optional, since dp.start_polling also logs)
             # We remove the duplicate log to avoid confusion
+            # Connect point again: the awaits above can span the fence.
+            if release_hold.finishing:
+                return
             await self.dp.start_polling(self.bot, handle_signals=False)
         except Exception as e:
             logger.error(
@@ -3248,6 +3255,10 @@ class TelegramChannelManager:
     async def _sync_bots_async(self) -> None:
         if not get_channel_ingress_enabled():
             return
+        # Finish-only mode ends chat intake for good (begin_finishing stopped
+        # the channels); a later channel create/update sync must not reopen it.
+        if release_hold.finishing:
+            return
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable
             # record counts as not serving, so nothing new opens until serving
@@ -3304,6 +3315,12 @@ class TelegramChannelManager:
         channel_id: Optional[int] = None,
         channel_name: Optional[str] = None,
     ) -> None:
+        # Re-checked here, with no await before the registration below: a sync
+        # that passed the guard before begin_finishing() and then waited on
+        # configuration I/O must not open intake afterwards. A bot registered
+        # before the fence is in ``self.bots`` and is stopped by it.
+        if release_hold.finishing:
+            return
         if token not in self.bots:
             instance_id = token[:8] + "..." if len(token) > 8 else "unknown"
             logger.info(f"Initializing Telegram channel {instance_id}...")

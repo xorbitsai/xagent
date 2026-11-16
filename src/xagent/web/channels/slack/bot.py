@@ -80,6 +80,7 @@ from ...services.generation import (
 )
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
+from ...services.release_hold import release_hold
 from ...services.shared_channel_execution import (
     SharedChannelTurn,
 )
@@ -1334,6 +1335,10 @@ class SlackBotInstance:
         if not self._accepting:
             return
 
+        # Connect point: nothing opens a socket once finish-only mode began,
+        # whatever path got here (sync, retry). No await before the call.
+        if release_hold.finishing:
+            return
         self.socket_client = SocketModeClient(
             app_token=self.app_token,
             web_client=self.web_client,
@@ -1429,6 +1434,9 @@ class SlackOAuthSocketGateway:
         try:
             while self._accepting:
                 try:
+                    # Connect point, passed by every retry of this loop too.
+                    if release_hold.finishing:
+                        return
                     self.socket_client = SocketModeClient(
                         app_token=self.app_token,
                         web_client=AsyncWebClient(),
@@ -1523,6 +1531,10 @@ class SlackChannelManager:
 
     async def _sync_bots_async(self) -> None:
         if not get_channel_ingress_enabled():
+            return
+        # Finish-only mode ends chat intake for good (begin_finishing stopped
+        # the channels); a later channel create/update sync must not reopen it.
+        if release_hold.finishing:
             return
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable
@@ -1670,6 +1682,10 @@ class SlackChannelManager:
                 await self._stop_oauth_bot(team_id)
                 existing = None
             if existing is None:
+                # Registration point: re-checked after the awaits above, with
+                # none between here and the assignment.
+                if release_hold.finishing:
+                    return
                 self.oauth_bots[team_id] = SlackBotInstance(
                     bot_token=str(info["bot_token"]),
                     app_token=None,
@@ -1702,6 +1718,9 @@ class SlackChannelManager:
         ):
             return
         await self._stop_oauth_gateway()
+        # Registration point: after the await above, none before the creation.
+        if release_hold.finishing:
+            return
         self.oauth_gateway = SlackOAuthSocketGateway(
             app_token=app_token,
             bot_lookup=self._oauth_bot_for_payload,
@@ -1733,6 +1752,12 @@ class SlackChannelManager:
         channel_id: int,
         channel_name: str,
     ) -> None:
+        # Re-checked here, with no await before the registration below: a sync
+        # that passed the guard before begin_finishing() and then waited on
+        # configuration I/O must not open intake afterwards. A bot registered
+        # before the fence is in ``self.bots`` and is stopped by it.
+        if release_hold.finishing:
+            return
         if bot_token in self.bots:
             return
         bot = SlackBotInstance(

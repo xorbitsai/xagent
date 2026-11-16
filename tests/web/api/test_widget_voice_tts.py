@@ -9,14 +9,17 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from sqlalchemy import select
 
 from tests.shared.widget_voice_env import clear_widget_voice_env
 from tests.web.api.test_speech_streaming import FakeASR, FakeTTS
+from tests.web.services.test_widget_voice_models import _Discovered
 from xagent.web import jwt_codec as jwt
 from xagent.web.api import widget as widget_api
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.database import get_session_local
 from xagent.web.models.deployment import Deployment
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserModel
@@ -31,7 +34,12 @@ from xagent.web.services import (
 from xagent.web.services.speech_streams import SpeechStreamPlan, guest_refusal_detail
 from xagent.web.services.widget_voice_budget import TTS_BUCKETS
 
-from .conftest import _admin_headers, _direct_db_session, client
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _install_one_slot_queue_pool,
+    client,
+)
 from .test_workforce_widget import (
     _authenticate_widget_guest_by_key,
     _create_workforce,
@@ -472,3 +480,69 @@ def test_widget_voice_releases_the_connection_before_reading_the_body(
     assert response.status_code == 200, response.text
     # The credential check's session no longer holds a connection.
     assert states == [False]
+
+
+def test_widget_voice_serves_a_model_that_streams_after_discovery(voice, monkeypatch):
+    monkeypatch.setattr(
+        widget_voice, "get_asr_model_instance", Mock(return_value=_Discovered(True))
+    )
+    monkeypatch.setattr(
+        widget_voice, "get_tts_model_instance", Mock(return_value=_Discovered(True))
+    )
+    response = client.post(PATH, headers=voice.guest, json={"text": "Hello"})
+    assert response.status_code == 200, response.text
+    assert response.content == b"firstsecond"
+
+
+def test_widget_voice_tts_answers_on_a_one_slot_pool(voice, monkeypatch):
+    _install_one_slot_queue_pool(monkeypatch)
+    response = client.post(PATH, headers=voice.guest, json={"text": "Hello"})
+    assert response.status_code == 200, response.text
+    assert response.content == b"firstsecond"
+
+
+async def test_resolution_returns_the_request_connection_first(voice, monkeypatch):
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out: list[int] = []
+
+    class CountingASR(FakeASR):
+        async def get_streaming_capabilities(self):
+            checked_out.append(engine.pool.checkedout())
+            return await super().get_streaming_capabilities()
+
+    monkeypatch.setattr(
+        widget_voice, "get_asr_model_instance", Mock(return_value=CountingASR())
+    )
+    db = get_session_local()()
+    try:
+        # A text() statement counts as a possible write; an ORM SELECT does not.
+        db.execute(select(User.id)).all()
+        result = await widget_voice.resolve_widget_voice_models(
+            voice.owner_id, request_db=db
+        )
+        assert result.reason is None and result.models is not None
+        assert db.in_transaction() is False
+        assert checked_out == [0]
+    finally:
+        db.close()
+
+
+async def test_resolution_refuses_a_request_session_with_uncommitted_work(
+    voice, monkeypatch
+):
+    asr_factory = Mock(return_value=FakeASR())
+    tts_factory = Mock(return_value=FakeTTS())
+    monkeypatch.setattr(widget_voice, "get_asr_model_instance", asr_factory)
+    monkeypatch.setattr(widget_voice, "get_tts_model_instance", tts_factory)
+    db = get_session_local()()
+    try:
+        db.add(User(username="pending", password_hash="x"))
+        with pytest.raises(RuntimeError):
+            await widget_voice.resolve_widget_voice_models(
+                voice.owner_id, request_db=db
+            )
+        asr_factory.assert_not_called()
+        tts_factory.assert_not_called()
+    finally:
+        db.rollback()
+        db.close()

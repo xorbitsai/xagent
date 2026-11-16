@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent
-from ..models.database import get_db, get_session_local, release_db_connection_if_clean
+from ..models.database import get_db, get_session_local
 from ..models.deployment import Deployment, DeploymentOwnerType
 from ..models.user import User
 from ..models.workforce import Workforce
@@ -26,6 +26,7 @@ from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.widget_voice import (
     WidgetVoiceResolution,
+    release_request_connection,
     resolve_widget_voice_models,
 )
 from .admin_memory_embedding_authority import require_admin
@@ -118,17 +119,16 @@ async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
     """Read the target in a short session of its own.
 
     ``db`` is the request session the admin check ran on; its connection goes
-    back to the pool first, so this request never waits for a second one.
+    back to the pool first, so this request never waits for a second one. A
+    session that cannot return it raises ``RuntimeError``.
     """
-    release_db_connection_if_clean(db)
+    release_request_connection(db)
     return await run_db_io_cancellation_safe(read)
 
 
 async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
-    resolution = await run_db_io_cancellation_safe(
-        lambda: resolve_widget_voice_models(target.owner_user_id)
-    )
+    resolution = await resolve_widget_voice_models(target.owner_user_id, request_db=db)
     return _response(target.enabled, resolution)
 
 
@@ -140,11 +140,11 @@ async def _put(
 ) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
     # Resolve before writing: a resolution that raises leaves the switch as it was.
-    resolution = await run_db_io_cancellation_safe(
-        lambda: resolve_widget_voice_models(target.owner_user_id)
-    )
+    resolution = await resolve_widget_voice_models(target.owner_user_id, request_db=db)
     # The row is read again: it may have been deleted meanwhile (404). A new
-    # owner does not matter: the switch belongs to the row, not to its owner.
+    # owner does not matter to the write: the switch belongs to the row, not to
+    # its owner. ``available`` in the response describes the owner read before
+    # the resolution.
     await run_db_io_cancellation_safe(write)
     return _response(enabled, resolution)
 

@@ -28,7 +28,6 @@ from ..models.user import User
 from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateResponse, WidgetTaskCreateRequest
 from ..schemas.speech import TTSStreamRequest
-from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
 from ..services.share_rate_limit import (
     get_share_rate_limiter,
@@ -727,9 +726,7 @@ async def widget_voice_tts(
     try:
         if visitor_key is None:
             raise VoiceUnavailable("no visitor address")
-        resolution = await run_db_io_cancellation_safe(
-            lambda: resolve_widget_voice_models(owner_user_id)
-        )
+        resolution = await resolve_widget_voice_models(owner_user_id, request_db=db)
         if resolution.models is None:
             raise VoiceUnavailable(resolution.reason)
     except VoiceUnavailable:

@@ -19,6 +19,7 @@ from xagent.web.api import workforces as workforces_api
 from xagent.web.api.v1 import agents as v1_agents_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
+from xagent.web.models.user import User
 from xagent.web.schemas import v1 as v1_schemas
 from xagent.web.services import agent_management
 from xagent.web.services.agent_store import _AGENT_UPDATE_FIELDS
@@ -241,7 +242,7 @@ def test_admin_put_leaves_the_switch_when_model_resolution_fails(monkeypatch) ->
     workforce_id = _create_workforce("Failing resolution workforce")
     _enable_widget(workforce_id)
 
-    def broken(_owner_user_id):
+    async def broken(_owner_user_id, *, request_db):
         raise OperationalError("SELECT", {}, Exception("down"))
 
     monkeypatch.setattr(admin_widget_voice, "resolve_widget_voice_models", broken)
@@ -298,7 +299,7 @@ def test_admin_put_writes_nothing_when_the_target_disappears(
 ) -> None:
     path, target_id = _make_target(entity, voice)
 
-    def delete_target(_owner_user_id):
+    async def delete_target(_owner_user_id, *, request_db):
         db = _direct_db_session()
         try:
             if entity == "agent":
@@ -324,4 +325,22 @@ def test_admin_put_writes_nothing_when_the_target_disappears(
         else:
             assert db.query(Deployment).filter_by(owner_id=target_id).count() == 0
     finally:
+        db.close()
+
+
+async def test_admin_target_refuses_a_request_session_with_uncommitted_work() -> None:
+    reads: list[int] = []
+
+    def read() -> admin_widget_voice._Target:
+        reads.append(1)
+        return admin_widget_voice._Target(1, False)
+
+    db = _direct_db_session()
+    try:
+        db.add(User(username="pending", password_hash="x"))
+        with pytest.raises(RuntimeError):
+            await admin_widget_voice._target(db, read)
+        assert reads == []
+    finally:
+        db.rollback()
         db.close()

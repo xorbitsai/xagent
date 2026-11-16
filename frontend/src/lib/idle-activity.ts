@@ -33,9 +33,9 @@ export interface IdleActivityReporterOptions {
   /** Records the report time for every tab of this login before the request is sent. */
   markReported: () => void | Promise<void>
   /**
-   * Sends the activity report; resolves false when it did not reach the server.
+   * Sends the activity report; resolves false when the report should be retried.
    * `isStillFresh` tells whether the input is still recent, so a report that
-   * waited (for example for a token refresh) can be dropped before a replay.
+   * waited (for a retry timer or a token refresh) is dropped before it is sent.
    */
   report: (isStillFresh: () => boolean) => Promise<boolean>
   isUserEvent?: (event: Event) => boolean

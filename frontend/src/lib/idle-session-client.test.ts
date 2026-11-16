@@ -1,11 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, RequestNotSentError } from "@/lib/api-wrapper"
 import { AUTH_CACHE_KEY, readAuthSessionSnapshot, readCurrentIdleSession } from "@/lib/auth-cache"
 import { IDLE_SESSION_STORAGE_KEY } from "@/lib/idle-session"
 import { reportIdleActivity, revalidateIdleSession } from "@/lib/idle-session-client"
 
-vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+vi.mock("@/lib/api-wrapper", async importOriginal => ({
+  RequestNotSentError: (await importOriginal<typeof import("@/lib/api-wrapper")>()).RequestNotSentError,
+  apiRequest: vi.fn(),
+}))
 
 const alwaysFresh = () => true
 
@@ -46,9 +49,15 @@ describe("idle session client", () => {
     await expect(reportIdleActivity("browser-login", isStillFresh)).resolves.toBe(true)
     expect(apiRequest).toHaveBeenCalledWith(
       expect.stringMatching(/\/api\/auth\/activity$/), { method: "POST" }, readAuthSessionSnapshot(),
-      { beforeReplay: isStillFresh },
+      { shouldSend: isStillFresh },
     )
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
+  })
+
+  it("treats a report that was not sent because its input went stale as finished", async () => {
+    login()
+    vi.mocked(apiRequest).mockRejectedValue(new RequestNotSentError())
+    await expect(reportIdleActivity("browser-login", () => false)).resolves.toBe(true)
   })
 
   it.each([

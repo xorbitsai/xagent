@@ -1,4 +1,4 @@
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, RequestNotSentError } from "@/lib/api-wrapper"
 import { readAuthCache, readAuthSessionSnapshot, recordIdleSessionIfCurrent } from "@/lib/auth-cache"
 import { getApiUrl } from "@/lib/utils"
 
@@ -11,15 +11,18 @@ export async function reportIdleActivity(sessionId: string, isStillFresh: () => 
   const captured = readAuthSessionSnapshot()
   if (captured.sessionId !== sessionId || !captured.accessToken) return true
   try {
-    // A refresh before the replay can take a while; do not replay stale input.
-    const response = await apiRequest(`${getApiUrl()}/api/auth/activity`, { method: "POST" }, captured, { beforeReplay: isStillFresh })
+    // The server credits the time a report arrives, so every attempt
+    // (retries after a lost connection, the replay after a refresh) is
+    // sent only while the input it stands for is still recent.
+    const response = await apiRequest(`${getApiUrl()}/api/auth/activity`, { method: "POST" }, captured, { shouldSend: isStillFresh })
     if (response.ok) {
       await recordIdleSessionIfCurrent(captured, await response.json().catch(() => null))
       return true
     }
     return response.status < 500
-  } catch {
-    return false
+  } catch (error) {
+    // Stale input is dropped, not retried; anything else is retried.
+    return error instanceof RequestNotSentError
   }
 }
 

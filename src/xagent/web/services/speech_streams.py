@@ -17,6 +17,7 @@ body that carries no provider text, owner configuration, or usage-gate detail.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
@@ -525,6 +526,24 @@ class _TTSAudioResponse(StreamingResponse):
             )(scope, receive, send)
 
 
+def _loggable_visitor(visitor_key: str | None) -> str | None:
+    """The visitor key as the usage log records it.
+
+    A caller IP is cut to its network (IPv4 /24, IPv6 /48), so the log never
+    holds a full client address; any other key is logged as given.
+    """
+    if visitor_key is None:
+        return None
+    try:
+        address = ipaddress.ip_address(visitor_key)
+    except ValueError:
+        return visitor_key
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    prefix = 24 if address.version == 4 else 48
+    return str(ipaddress.ip_network(f"{address}/{prefix}", strict=False))
+
+
 def _log_tts_usage(
     audience: Audience,
     user_id: int,
@@ -534,14 +553,16 @@ def _log_tts_usage(
     chars: int,
     result: str,
 ) -> None:
-    """One line per synthesis request, written when it ends; always on."""
+    """One line per synthesis request, written when it ends; always on.
+
+    A caller IP is logged as its network only."""
     logger.info(
         "Speech synthesis usage: audience=%s user_id=%s entity=%s visitor=%s "
         "model=%s chars=%d result=%s",
         audience,
         user_id,
         entity_key,
-        visitor_key,
+        _loggable_visitor(visitor_key),
         model_id,
         chars,
         result,

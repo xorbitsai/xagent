@@ -370,7 +370,10 @@ def test_widget_voice_error_bodies_are_fixed_text(voice, monkeypatch, failure):
     assert SECRET not in response.text and "owner-plan" not in response.text
 
 
-def test_widget_voice_usage_log(voice, caplog):
+def test_widget_voice_usage_log(voice, caplog, monkeypatch):
+    monkeypatch.setattr(
+        widget_api, "remote_ip_from_request", lambda _request: "203.0.113.77"
+    )
     caplog.set_level(logging.INFO, logger=speech_streams.__name__)
     assert (
         client.post(PATH, headers=voice.guest, json={"text": "Hello"}).status_code
@@ -387,6 +390,22 @@ def test_widget_voice_usage_log(voice, caplog):
         in lines[0]
     )
     assert "model=voice chars=5 result=ok" in lines[0]
+    assert "visitor=203.0.113.0/24" in lines[0]
+    assert "203.0.113.77" not in lines[0]
+
+
+@pytest.mark.parametrize(
+    "visitor_key,logged",
+    [
+        ("203.0.113.77", "203.0.113.0/24"),
+        ("2001:db8:abcd:12::1", "2001:db8:abcd::/48"),
+        ("::ffff:203.0.113.9", "203.0.113.0/24"),
+        ("end-user-42", "end-user-42"),
+        (None, None),
+    ],
+)
+def test_usage_log_visitor_is_a_network(visitor_key, logged):
+    assert speech_streams._loggable_visitor(visitor_key) == logged
 
 
 def test_widget_voice_probes_the_synthesis_model_once_per_stage(voice):

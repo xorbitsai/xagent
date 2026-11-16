@@ -92,7 +92,10 @@ never needs a second database connection. The sweep decides and writes in one
 conditional UPDATE. Every replica runs the sweep every 60 seconds;
 it also deletes rows whose last use is older than the refresh-token lifetime
 plus the access-token lifetime plus one day, when no token for them can still
-be valid. Revocation is keyed by `sid`, so it never affects another login of
+be valid. It never deletes a row that a still valid refresh token points to
+(`users.browser_session_id`), so lowering `XAGENT_REFRESH_TOKEN_EXPIRE_DAYS`
+later does not sign out logins whose refresh tokens were issued under the
+longer lifetime. Revocation is keyed by `sid`, so it never affects another login of
 the user.
 
 | Case | Switch on | Switch off |

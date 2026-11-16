@@ -341,6 +341,7 @@ OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+XROUTER_CALL_HISTORY_ENABLED = "XAGENT_XROUTER_CALL_HISTORY_ENABLED"
 FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
@@ -1144,6 +1145,18 @@ def get_xrouter_excluded_models() -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(item.strip() for item in value.split(",") if item.strip())
     )
+
+
+def get_xrouter_call_history_enabled() -> bool:
+    """Return whether Auto routing decisions are written to the call history.
+
+    The history stores each routing prompt (the user's text) with the candidate
+    models and the selection. On by default. Unset means on; any set value other
+    than ``1``, ``true``, ``yes`` or ``on`` (case-insensitive, surrounding
+    whitespace ignored) means off, including an empty value. Read when a process
+    first builds the routing service, so a change applies to new processes.
+    """
+    return _get_bool_env(XROUTER_CALL_HISTORY_ENABLED, True)
 
 
 def get_form_answer_continuation_enabled() -> bool:

@@ -126,6 +126,7 @@ from xagent.config import (
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
     WEB_SEARCH_PROVIDERS,
+    XROUTER_CALL_HISTORY_ENABLED,
     XROUTER_EXCLUDED_MODELS,
     ExternalUploadsDirConfigurationError,
     format_file_size,
@@ -244,6 +245,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    get_xrouter_call_history_enabled,
     get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
@@ -471,6 +473,9 @@ class TestEnvironmentVariableConstants:
 
     def test_xrouter_excluded_models_constant(self):
         assert XROUTER_EXCLUDED_MODELS == "XAGENT_XROUTER_EXCLUDED_MODELS"
+
+    def test_xrouter_call_history_enabled_constant(self):
+        assert XROUTER_CALL_HISTORY_ENABLED == "XAGENT_XROUTER_CALL_HISTORY_ENABLED"
 
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
@@ -730,6 +735,26 @@ class TestOpenRouterConfig:
             "z-ai/glm-5.3-flash",
             "openai/gpt-5.6-luna",
         )
+
+
+class TestXrouterCallHistoryConfig:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(None, True, id="unset-is-on"),
+            pytest.param("true", True, id="true"),
+            pytest.param(" ON ", True, id="on-padded-uppercase"),
+            pytest.param("false", False, id="false"),
+            pytest.param("0", False, id="zero"),
+            pytest.param("", False, id="empty-is-off"),
+        ],
+    )
+    def test_xrouter_call_history_enabled(self, monkeypatch, value, expected):
+        if value is None:
+            monkeypatch.delenv(XROUTER_CALL_HISTORY_ENABLED, raising=False)
+        else:
+            monkeypatch.setenv(XROUTER_CALL_HISTORY_ENABLED, value)
+        assert get_xrouter_call_history_enabled() is expected
 
 
 class TestFormAnswerContinuationConfig:

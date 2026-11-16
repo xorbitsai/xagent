@@ -1282,6 +1282,35 @@ def test_build_service_keeps_serialized_backend_without_env(monkeypatch) -> None
     assert constructed[0]["embedding_backend"] is None
 
 
+def test_build_service_records_call_history_by_default(monkeypatch) -> None:
+    from xagent.core.model.chat.basic import router
+
+    constructed = _stub_service_construction(monkeypatch)
+    monkeypatch.delenv("XAGENT_XROUTER_CALL_HISTORY_ENABLED", raising=False)
+
+    router._build_service("model.joblib", "models", "routers")
+
+    assert constructed[0]["store"] == "store"
+
+
+def test_build_service_skips_call_history_when_disabled(monkeypatch, tmp_path) -> None:
+    from xagent.core.model.chat.basic import router
+
+    constructed = _stub_service_construction(monkeypatch)
+    opened: list[str] = []
+    monkeypatch.setattr("xrouter_llm.store.CallStore", lambda path: opened.append(path))
+    monkeypatch.setenv("XAGENT_XROUTER_DB", str(tmp_path / "calls.db"))
+    monkeypatch.setenv("XAGENT_XROUTER_CALL_HISTORY_ENABLED", "false")
+
+    router._build_service("model.joblib", "models", "routers")
+
+    assert opened == []
+    store = constructed[0]["store"]
+    assert isinstance(store, router._NullStore)
+    assert store.record(prompt="user text") == 0
+    assert not (tmp_path / "calls.db").exists()
+
+
 def test_build_service_rejects_unknown_backend_before_loading_anything(
     monkeypatch,
 ) -> None:

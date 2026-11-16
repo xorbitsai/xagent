@@ -1,4 +1,4 @@
-"""A document without a status record is inferred from the table search reads."""
+"""A document without a status record is inferred from its fullest embeddings table."""
 
 from __future__ import annotations
 
@@ -13,12 +13,8 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.schemas import DocumentProcessingStatus as S
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import (
     embeddings_table_candidates,
-    embeddings_table_name,
 )
 from xagent.core.tools.core.RAG_tools.management import collection_manager as cm
-from xagent.core.tools.core.RAG_tools.management import (
-    collections as collections_module,
-)
 from xagent.core.tools.core.RAG_tools.management import (
     get_document_stats,
     list_documents,
@@ -28,17 +24,10 @@ from xagent.core.tools.core.RAG_tools.utils import model_resolver
 OPEN_MODEL_HUB = model_resolver._get_or_init_model_hub
 
 KB = "kb"
-# Writer table embeddings_vendor_new_model, once-tagged embeddings_VENDOR_new_model.
 BOUND = "Vendor/new-model"
 OTHER = "BAAI/old-model"
-WRITER, ONCE = embeddings_table_candidates(BOUND)
+WRITER = embeddings_table_candidates(BOUND)[0]
 OTHER_TABLE = embeddings_table_candidates(OTHER)[0]
-# No candidate table of LEGACY; its rows sit in a provider-name table.
-LEGACY = "acme-embed"
-LEGACY_NAME = "acme-embed-v2"
-LEGACY_TABLE = embeddings_table_name(LEGACY_NAME)
-UNRESOLVED = "Could not resolve the searched table"
-
 
 HUB_OPENED: List[str] = []
 
@@ -67,18 +56,6 @@ def store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     reset_rag_storage_for_tests()
     model_resolver._reset_model_hub_cache()
     assert HUB_OPENED == []
-
-
-@pytest.fixture
-def both_spellings(store: Path) -> None:
-    probe = store.parent / "case-probe"
-    probe.mkdir()
-    if (store.parent / "CASE-PROBE").exists():
-        pytest.skip(
-            "the writer and once-tagged table names differ only in letter case, "
-            "and this filesystem does not tell them apart"
-        )
-    probe.rmdir()
 
 
 def _store() -> Any:
@@ -206,14 +183,6 @@ def _create_table(name: str) -> None:
     ensure_embeddings_table(conn, name.removeprefix("embeddings_"), vector_dim=2)
 
 
-def _move_writer_rows_to_once_tagged() -> None:
-    conn = _store().get_raw_connection()
-    rows = conn.open_table(WRITER).search().where("true").to_arrow()
-    _create_table(ONCE)
-    conn.open_table(ONCE).add(rows)
-    conn.drop_table(WRITER)
-
-
 def _project(
     user_id: Optional[int] = None,
     is_admin: bool = True,
@@ -237,46 +206,47 @@ def _bound_c1_other_c1() -> None:
     _write(OTHER, ["c1"])
 
 
-def test_other_model_rows_do_not_complete_a_partially_embedded_document(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_one_chunk_in_two_tables_is_partially_embedded() -> None:
     _save_collection()
     _bound_c1_other_c1()
-    closed: List[Optional[str]] = []
-    real_close = collections_module._safe_close_table
-
-    def _close(table: Any) -> None:
-        closed.append(getattr(table, "name", None))
-        real_close(table)
-
-    monkeypatch.setattr(collections_module, "_safe_close_table", _close)
 
     summary, detail = _project()
 
-    assert summary.status == S.PARTIALLY_EMBEDDED
-    assert detail.status == S.PARTIALLY_EMBEDDED
-    assert (summary.chunk_count, summary.embedding_count) == (2, 2)
-    assert (detail.chunk_count, detail.embedding_count) == (2, 2)
+    assert (summary.status, summary.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
+    assert (detail.status, detail.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
+    assert summary.chunk_count == detail.chunk_count == 2
     assert detail.embedding_breakdown == {WRITER: 1, OTHER_TABLE: 1}
-    assert closed.count(WRITER) == 2
+
+
+def test_chunks_split_across_two_tables_are_partially_embedded() -> None:
+    _save_collection()
+    _seed_core()
+    _write(BOUND, ["c1"])
+    _write(OTHER, ["c2"])
+
+    summary, detail = _project()
+
+    assert (summary.status, summary.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
+    assert (detail.status, detail.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
+    assert detail.embedding_breakdown == {WRITER: 1, OTHER_TABLE: 1}
 
 
 @pytest.mark.parametrize("other_rows", [False, True])
-def test_complete_bound_rows_infer_success(other_rows: bool) -> None:
+def test_every_chunk_in_one_table_is_success(other_rows: bool) -> None:
     _save_collection()
     _seed_core()
     _write(BOUND, ["c1", "c2"])
     if other_rows:
-        _write(OTHER, ["c1", "c2"])
+        _write(OTHER, ["c1"])
 
     summary, detail = _project()
 
-    expected = 4 if other_rows else 2
+    expected = 3 if other_rows else 2
     assert (summary.status, summary.embedding_count) == (S.SUCCESS, expected)
     assert (detail.status, detail.embedding_count) == (S.SUCCESS, expected)
 
 
-def test_other_model_rows_only_with_the_searched_table_present() -> None:
+def test_every_chunk_in_a_table_of_a_model_not_bound_is_success() -> None:
     _save_collection()
     _seed_core()
     _create_table(WRITER)
@@ -284,22 +254,18 @@ def test_other_model_rows_only_with_the_searched_table_present() -> None:
 
     summary, detail = _project()
 
-    assert (summary.status, summary.embedding_count) == (S.CHUNKED, 2)
-    assert (detail.status, detail.embedding_count) == (S.CHUNKED, 2)
+    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
+    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
 
 
-def test_no_table_of_the_bound_model_keeps_the_sum_over_every_table(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_chunks_without_embedding_rows_are_chunked() -> None:
     _save_collection()
     _seed_core()
-    _write(OTHER, ["c1", "c2"])
 
     summary, detail = _project()
 
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-    assert UNRESOLVED not in caplog.text
+    assert (summary.status, summary.embedding_count) == (S.CHUNKED, 0)
+    assert (detail.status, detail.embedding_count) == (S.CHUNKED, 0)
 
 
 def test_a_status_record_is_reported_as_recorded(
@@ -322,60 +288,21 @@ def test_a_status_record_is_reported_as_recorded(
     assert (detail.status, detail.embedding_count) == (S.FAILED, 2)
 
 
-@pytest.mark.parametrize(
-    "binding", [(BOUND, None), (None, None), ("none", 2), None], ids=str
-)
-def test_without_a_dimensioned_binding_the_sum_over_every_table_is_kept(
-    binding: Optional[Tuple[Optional[str], Optional[int]]],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    if binding is not None:
-        _save_collection(*binding)
-    _bound_c1_other_c1()
-    if binding == ("none", 2):
-        # The placeholder names no model, even with a table spelled after it.
-        _create_table("embeddings_none")
-    caplog.clear()
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-    assert UNRESOLVED not in caplog.text
-    assert "not found in hub" not in caplog.text
-
-
-@pytest.mark.usefixtures("both_spellings")
-def test_the_writer_table_is_counted_when_it_opens_even_when_empty() -> None:
-    _save_collection()
-    _seed_core()
-    _write(BOUND, ["c1", "c2"])
-    _move_writer_rows_to_once_tagged()
-    _create_table(WRITER)
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.CHUNKED, 2)
-    assert (detail.status, detail.embedding_count) == (S.CHUNKED, 2)
-    assert detail.embedding_breakdown == {ONCE: 2}
-
-
-@pytest.mark.usefixtures("both_spellings")
-def test_the_once_tagged_table_is_counted_when_the_writer_table_is_absent() -> None:
+def test_an_explicit_model_tag_counts_that_models_tables() -> None:
     _save_collection()
     _seed_core()
     _write(BOUND, ["c1"])
-    _move_writer_rows_to_once_tagged()
-    _write(OTHER, ["c2"])
+    _write(OTHER, ["c1", "c2"])
 
-    summary, detail = _project()
+    _, detail = _project(model_tag=BOUND)
 
-    assert (summary.status, summary.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
-    assert (detail.status, detail.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
-    assert detail.embedding_breakdown == {ONCE: 1, OTHER_TABLE: 1}
+    assert (detail.status, detail.embedding_count) == (S.PARTIALLY_EMBEDDED, 1)
+    assert detail.embedding_breakdown == {
+        name: 1 if name == WRITER else 0 for name in embeddings_table_candidates(BOUND)
+    }
 
 
-def test_the_list_counts_the_callers_rows_of_the_searched_table() -> None:
+def test_the_list_infers_from_the_callers_rows_and_the_detail_from_all_owners() -> None:
     _save_collection()
     _seed_core()
     _write(BOUND, ["c1"])
@@ -387,145 +314,8 @@ def test_the_list_counts_the_callers_rows_of_the_searched_table() -> None:
 
     assert (summary.status, summary.embedding_count) == (S.PARTIALLY_EMBEDDED, 2)
     assert (admin_summary.status, admin_summary.embedding_count) == (S.SUCCESS, 3)
-    # The detail infers from rows of every owner and reports the caller's breakdown.
     assert (detail.status, detail.embedding_count) == (S.SUCCESS, 3)
     assert detail.embedding_breakdown == {WRITER: 1, OTHER_TABLE: 1}
-
-
-def test_an_explicit_model_tag_keeps_counting_that_models_tables() -> None:
-    _save_collection()
-    _seed_core()
-    _write(BOUND, ["c1"])
-    _write(OTHER, ["c1", "c2"])
-
-    _, detail = _project(model_tag=OTHER)
-
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-    assert detail.embedding_breakdown == {
-        name: 2 if name == OTHER_TABLE else 0
-        for name in embeddings_table_candidates(OTHER)
-    }
-
-
-def test_an_unreadable_binding_keeps_the_sum_over_every_table(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    _save_collection()
-    _seed_core(doc_ids=("d1", "d2"))
-    _write(BOUND, ["c1"])
-    _write(OTHER, ["c1"])
-
-    def _fail(name: str) -> Any:
-        raise RuntimeError("metadata unavailable")
-
-    monkeypatch.setattr(cm, "get_collection_if_present_sync", _fail)
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-    assert caplog.text.count(UNRESOLVED) == 2
-
-
-def test_a_milvus_deployment_keeps_the_sum_over_every_table(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _save_collection()
-    _seed_core()
-    _create_table(WRITER)
-    _write(OTHER, ["c1", "c2"])
-    monkeypatch.setenv("XAGENT_VECTOR_BACKEND", "milvus")
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-
-
-def test_the_list_reads_the_binding_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    _save_collection()
-    _seed_core(doc_ids=("d1", "d2", "d3"))
-    _write(BOUND, ["c1"])
-    calls: List[str] = []
-    real = cm.get_collection_if_present_sync
-
-    def _spy(name: str) -> Any:
-        calls.append(name)
-        return real(name)
-
-    monkeypatch.setattr(cm, "get_collection_if_present_sync", _spy)
-
-    listed = list_documents(KB, is_admin=True)
-
-    assert HUB_OPENED == []
-    assert [doc.status for doc in listed.documents] == [
-        S.PARTIALLY_EMBEDDED,
-        S.CHUNKED,
-        S.CHUNKED,
-    ]
-    assert calls == [KB]
-
-
-@pytest.mark.usefixtures("both_spellings")
-def test_a_writer_table_that_does_not_open_is_passed_over_as_search_does(
-    store: Path,
-) -> None:
-    _save_collection()
-    _seed_core()
-    _write(BOUND, ["c1", "c2"])
-    _move_writer_rows_to_once_tagged()
-    (store / f"{WRITER}.lance").mkdir()
-    assert WRITER in _store().list_table_names()
-    assert _store().open_embeddings_table(BOUND)[1] == ONCE
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-
-
-def test_rows_only_in_a_provider_name_table_keep_the_sum_over_every_table() -> None:
-    _save_collection(LEGACY)
-    _seed_core()
-    _write(LEGACY_NAME, ["c1"])
-    _write(OTHER, ["c1"])
-    assert LEGACY_TABLE not in embeddings_table_candidates(LEGACY)
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-    assert detail.embedding_breakdown == {LEGACY_TABLE: 1, OTHER_TABLE: 1}
-
-
-def test_a_returned_name_the_listing_lacks_keeps_the_sum_over_every_table(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
-        LanceDBVectorIndexStore,
-    )
-
-    _save_collection()
-    _bound_c1_other_c1()
-    real_open = LanceDBVectorIndexStore.open_embeddings_table
-
-    def _other_spelling(self: Any, model_tag: str, **kwargs: Any) -> Any:
-        table, _name = real_open(self, model_tag, **kwargs)
-        return table, ONCE
-
-    monkeypatch.setattr(
-        LanceDBVectorIndexStore, "open_embeddings_table", _other_spelling
-    )
-    assert ONCE not in _store().list_table_names()
-
-    summary, detail = _project()
-
-    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
-    assert (detail.status, detail.embedding_count) == (S.SUCCESS, 2)
-    assert detail.embedding_breakdown == {WRITER: 1, OTHER_TABLE: 1}
-    assert UNRESOLVED not in caplog.text
 
 
 def test_a_status_read_leaves_a_fresh_sql_database_ready_for_init_db(
@@ -577,3 +367,54 @@ def test_a_status_read_leaves_a_fresh_sql_database_ready_for_init_db(
             model_resolver._MODEL_HUB_ENGINE.dispose()
         if database._engine is not None and database._engine is not previous_engine:
             database._engine.dispose()
+
+
+def test_an_injected_coordinator_does_not_infer_from_the_global_binding() -> None:
+    from typing import cast
+    from unittest.mock import AsyncMock, MagicMock
+
+    from xagent.core.tools.core.RAG_tools.core.schemas import CollectionInfo
+    from xagent.core.tools.core.RAG_tools.kb import KBCoordinator
+    from xagent.core.tools.core.RAG_tools.storage.factory import StorageFactory
+
+    _save_collection(BOUND)
+    _seed_core()
+    _create_table(WRITER)
+    _write(OTHER, ["c1", "c2"])
+    vector_store = _store()
+
+    class _StatusStore:
+        def load_ingestion_status(self, **_kwargs: Any) -> List[Any]:
+            return []
+
+    class _InjectedFactory:
+        def get_vector_index_store(self) -> Any:
+            return vector_store
+
+        def get_ingestion_status_store(self) -> Any:
+            return _StatusStore()
+
+        def get_metadata_store(self) -> Any:
+            metadata = MagicMock()
+            metadata.get_collection = AsyncMock(
+                return_value=CollectionInfo(
+                    name=KB, embedding_model_id=OTHER, embedding_dimension=2
+                )
+            )
+            return metadata
+
+        def get_main_pointer_store(self) -> Any:
+            return MagicMock()
+
+    injected = KBCoordinator(storage_factory=cast(StorageFactory, _InjectedFactory()))
+
+    listed = injected.management.list_documents(KB, is_admin=True)
+    detail = injected.management.get_document_stats(KB, "d1", is_admin=True)
+
+    assert listed.status == "success", listed.message
+    assert detail.status == "success", detail.message
+    summary = {doc.doc_id: doc for doc in listed.documents}["d1"]
+    assert (summary.status, summary.embedding_count) == (S.SUCCESS, 2)
+    assert detail.data is not None
+    assert (detail.data.status, detail.data.embedding_count) == (S.SUCCESS, 2)
+    assert HUB_OPENED == []

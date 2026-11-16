@@ -87,45 +87,12 @@ def _count_rows_uncached(conn: Any, table_name: str, filter_expr: str) -> int:
         _safe_close_table(table)
 
 
-def _searched_embeddings_table(collection: str) -> Optional[str]:
-    """The listed candidate table of the bound model that search opens, or ``None``
-    when the sum over every table is to be kept."""
-    from ..kb.collection_handle import ledger_holds_vectors
-    from .collection_manager import _normalize_model_id, get_collection_if_present_sync
-
-    try:
-        if ledger_holds_vectors():
-            info = get_collection_if_present_sync(collection)
-            bound = _normalize_model_id(info.embedding_model_id) if info else None
-            if info and info.is_initialized and bound:
-                try:
-                    # The provider-name table is resolved through the model hub,
-                    # which creates its table in the SQL database.
-                    table, name = get_vector_index_store().open_embeddings_table(
-                        bound, provider_name_fallback=False
-                    )
-                except DatabaseOperationError:
-                    return None
-                _safe_close_table(table)
-                # The count dicts are keyed by listed names; a case-insensitive
-                # store opens a table under a spelling the listing does not have.
-                if name in get_vector_index_store().list_table_names():
-                    return name
-    except Exception as exc:  # noqa: BLE001 - fall back to every table
-        logger.warning(
-            "Could not resolve the searched table of %s: %s", collection, exc
-        )
-    return None
-
-
-def _inferred_embedding_count(
-    per_table: Dict[str, int], searched_table: Optional[str]
-) -> int:
-    """Embedding rows a status inference counts: the searched table's, else all."""
-    if searched_table is not None:
-        return per_table.get(searched_table, 0)
-    return sum(
-        count for name, count in per_table.items() if name.startswith("embeddings_")
+def _inferred_embedding_count(per_table: Dict[str, int]) -> int:
+    """The largest ``embeddings_*`` entry of a document's row counts. A search reads
+    rows of at most one entry, so the entries are not added up."""
+    return max(
+        (count for name, count in per_table.items() if name.startswith("embeddings_")),
+        default=0,
     )
 
 
@@ -1096,12 +1063,7 @@ def _get_document_stats_impl(
         # If no status record exists, infer status from chunk and embedding counts
         if chunk_count > 0:
             inferred_count = (
-                embedding_count
-                if model_tag
-                else _inferred_embedding_count(
-                    totals,
-                    _searched_embeddings_table(collection),
-                )
+                embedding_count if model_tag else _inferred_embedding_count(totals)
             )
             if inferred_count == 0:
                 status_value = DocumentProcessingStatus.CHUNKED
@@ -1217,7 +1179,6 @@ def _list_documents_impl(
     doc_ids = (
         set(document_info.keys()) | set(row_counts.keys()) | set(status_records.keys())
     )
-    searched_table = _searched_embeddings_table(collection)
 
     # Build summaries
     summaries: List[DocumentSummary] = []
@@ -1236,7 +1197,7 @@ def _list_documents_impl(
             except ValueError:
                 status_value = DocumentProcessingStatus.PENDING
         elif chunk_count > 0:
-            inferred_count = _inferred_embedding_count(per_table, searched_table)
+            inferred_count = _inferred_embedding_count(per_table)
             if inferred_count == 0:
                 status_value = DocumentProcessingStatus.CHUNKED
             elif inferred_count < chunk_count:

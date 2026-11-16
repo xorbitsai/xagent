@@ -270,7 +270,7 @@ describe("widget voice call state table", () => {
 
   it.each(WIDGET_VOICE_CALL_STATES.filter(row => row.match).flatMap(row => row.match!.flatMap(match => {
     const events: VoiceTransportEvent[] = match.kind === "tts_response"
-      ? match.statuses.map(status => ({ kind: "tts_response", status, code: undefined }))
+      ? match.statuses.flatMap(status => (match.codes ?? [undefined]).map(code => ({ kind: "tts_response" as const, status, code })))
       : match.kind === "asr_error"
         ? match.codes.map(code => ({ kind: "asr_error", code }))
         : match.codes.flatMap(code => (match.reasons ?? [""]).map(reason => ({ kind: "asr_close" as const, code, reason })))
@@ -282,6 +282,25 @@ describe("widget voice call state table", () => {
   it("leaves unknown refusals to the default reading", () => {
     expect(classifyWidgetVoiceEvent({ kind: "asr_close", code: 1008, reason: "Other" })).toBeUndefined()
     expect(classifyWidgetVoiceEvent({ kind: "asr_error", code: undefined })).toBeUndefined()
+  })
+})
+
+describe("synthesis refusals read by their body code", () => {
+  it.each([
+    { label: "400 model_unavailable", body: { detail: { code: "model_unavailable", message: "fixed" } }, ends: true },
+    { label: "400 speech_synthesis_failed", body: { detail: { code: "speech_synthesis_failed", message: "fixed" } }, ends: false },
+    { label: "400 without a code", body: null, ends: false },
+  ])("$label", async ({ body, ends }) => {
+    requestTts.mockResolvedValue(new Response(body && JSON.stringify(body), { status: 400 }))
+    await speakReply()
+    if (ends) {
+      await waitFor(() => expect(call().phase).toBe("error"))
+      expectStopped("unavailable", false)
+    } else {
+      await waitFor(() => expect(call().note).toBe("voiceConversation.widget.playbackFailed"))
+      expect(call().phase).not.toBe("error")
+      expect(Socket.instances[0].close).not.toHaveBeenCalled()
+    }
   })
 })
 

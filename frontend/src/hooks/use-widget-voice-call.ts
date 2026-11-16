@@ -14,7 +14,8 @@ import type { VoiceCall, VoiceReplyMessage } from "@/hooks/use-voice-call"
 type TransportMatch =
   | { kind: "asr_error"; codes: string[] }
   | { kind: "asr_close"; codes: number[]; reasons?: string[] }
-  | { kind: "tts_response"; statuses: number[] }
+  /** With `codes`, only responses whose body carries one of these codes. */
+  | { kind: "tts_response"; statuses: number[]; codes?: string[] }
 
 interface WidgetVoiceStateRow {
   row: number
@@ -62,8 +63,9 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
     match: [{ kind: "tts_response", statuses: [401, 403] }], failure: "voice_unavailable" },
   { row: 16, event: "synthesis 402; Session synthesis 403", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [402, 403] }], failure: "voice_unavailable" },
-  { row: 17, event: "synthesis 503", result: "unavailable, not retryable",
-    match: [{ kind: "tts_response", statuses: [503] }], failure: "voice_unavailable" },
+  { row: 17, event: "synthesis 503, or 400 with model_unavailable", result: "unavailable, not retryable",
+    match: [{ kind: "tts_response", statuses: [503] }, { kind: "tts_response", statuses: [400], codes: ["model_unavailable"] }],
+    failure: "voice_unavailable" },
   { row: 18, event: "synthesis 429", result: "call ends, temporarily unavailable, retry later",
     match: [{ kind: "tts_response", statuses: [429] }], failure: "voice_retry_later" },
   { row: 19, event: "page unloaded or call closed", result: "microphone, recognition and playback released" },
@@ -75,15 +77,27 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
 
 function matches(match: TransportMatch, event: VoiceTransportEvent): boolean {
   if (event.kind !== match.kind) return false
-  if (match.kind === "tts_response") return match.statuses.includes((event as { status: number }).status)
+  if (match.kind === "tts_response") {
+    const response = event as { status: number; code?: string }
+    return match.statuses.includes(response.status) && (!match.codes || match.codes.includes(response.code ?? ""))
+  }
   if (match.kind === "asr_error") return match.codes.includes((event as { code?: string }).code ?? "")
   const close = event as { code: number; reason: string }
   return match.codes.includes(close.code) && (!match.reasons || match.reasons.includes(close.reason))
 }
 
-/** The widget transports' `classify`: the failure of the first state-table row that matches. */
+const specific = (match: TransportMatch) => match.kind === "tts_response" && !!match.codes
+
+/**
+ * The widget transports' `classify`: the failure of the first state-table row
+ * that matches. A match that also names a body code is tried before matches
+ * on the status alone, so a 400 that says the model is unavailable is not read
+ * as an ordinary failed sentence.
+ */
 export function classifyWidgetVoiceEvent(event: VoiceTransportEvent): VoiceAudioFailure | undefined {
-  return WIDGET_VOICE_CALL_STATES.find(row => row.match?.some(match => matches(match, event)))?.failure
+  const first = (pick: (match: TransportMatch) => boolean) =>
+    WIDGET_VOICE_CALL_STATES.find(row => row.match?.some(match => pick(match) && matches(match, event)))
+  return (first(specific) ?? first(match => !specific(match)))?.failure
 }
 
 /** Why a widget call stopped, beyond the transport's own failures. */

@@ -4,6 +4,9 @@ import asyncio
 import functools
 import json
 import logging
+import math
+import os
+import random
 import uuid
 import weakref
 from collections import OrderedDict
@@ -240,6 +243,29 @@ WS_CLOSE_SERVICE_RESTART = 1012
 # Shared by ``close_for_restart`` and the closes of sockets registered while
 # the manager is draining.
 RESTART_CLOSE_TIMEOUT_SECONDS = 2.0
+# Window over which ``close_for_restart`` spreads the 1012 closes of sockets
+# that need no reply wait. Closing them all in one instant makes every client
+# reconnect in the same second; 0 restores the immediate close.
+RESTART_CLOSE_WINDOW_ENV = "XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS"
+RESTART_CLOSE_WINDOW_DEFAULT_SECONDS = 30.0
+# Slack past the window before the remaining closes are forced at once.
+RESTART_CLOSE_WINDOW_GRACE_SECONDS = 2.0
+# Width of one close batch inside the window.
+RESTART_CLOSE_BATCH_INTERVAL_SECONDS = 0.25
+
+
+def restart_close_window_seconds() -> float:
+    """The configured close window; invalid or negative values mean the default."""
+    raw = os.environ.get(RESTART_CLOSE_WINDOW_ENV)
+    if raw is None or not raw.strip():
+        return RESTART_CLOSE_WINDOW_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return RESTART_CLOSE_WINDOW_DEFAULT_SECONDS
+    if value != value or value < 0:  # NaN or negative
+        return RESTART_CLOSE_WINDOW_DEFAULT_SECONDS
+    return value
 
 
 def _make_command_reply(websocket: WebSocket) -> CommandReply:
@@ -1631,6 +1657,7 @@ class ConnectionManager:
         *,
         reply_deadline_seconds: float = 5.0,
         close_timeout_seconds: float = RESTART_CLOSE_TIMEOUT_SECONDS,
+        close_window_seconds: float | None = None,
     ) -> int:
         """Close registered WebSockets with ``1012 Service Restart``.
 
@@ -1644,6 +1671,15 @@ class ConnectionManager:
         handler wrapped by ``_holds_ingress`` (``chat``, ``execute_task`` and
         the other durable commands) counts as pending for its whole run. SSE
         sinks (``is_broadcast_only``) are not WebSockets and stay open.
+
+        Closes of sockets with no pending command are spread over
+        ``close_window_seconds`` (default ``XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS``,
+        else 30) in randomized batches, so clients do not all reconnect in the
+        same second; ``0`` closes them all at once. The call returns once
+        every socket is closed, at most the window plus a short grace after
+        it starts; what is still open then is closed at once. If the call is
+        cancelled, the not-yet-closed sockets of that spread are closed at
+        once before it unwinds.
 
         The manager then keeps draining: a socket registered afterwards is
         closed with 1012 at once, until ``end_restart_drain``. A socket that
@@ -1675,31 +1711,19 @@ class ConnectionManager:
             waiting = [ws for ws in sockets if self._has_pending_command(ws)]
             waiting_ids = {id(ws) for ws in waiting}
             immediate = [ws for ws in sockets if id(ws) not in waiting_ids]
-            await asyncio.gather(
-                *(
-                    self._close_for_restart(ws, close_timeout_seconds, generation)
-                    for ws in immediate
-                )
+            window = (
+                restart_close_window_seconds()
+                if close_window_seconds is None
+                else max(0.0, close_window_seconds)
             )
-            while waiting and self._restart_drain_generation == generation:
-                ready = [
-                    ws
-                    for ws in waiting
-                    if not self._has_pending_command(ws) or loop.time() >= deadline
-                ]
-                if ready:
-                    await asyncio.gather(
-                        *(
-                            self._close_for_restart(
-                                ws, close_timeout_seconds, generation
-                            )
-                            for ws in ready
-                        )
-                    )
-                    ready_ids = {id(ws) for ws in ready}
-                    waiting = [ws for ws in waiting if id(ws) not in ready_ids]
-                if waiting:
-                    await asyncio.sleep(0.05)
+            await asyncio.gather(
+                self._close_staggered(
+                    immediate, window, close_timeout_seconds, generation
+                ),
+                self._close_when_replied(
+                    waiting, deadline, close_timeout_seconds, generation
+                ),
+            )
             completed = True
             # An abort leaves its waiting sockets open and unhandled.
             if self._restart_drain_generation != generation:
@@ -1708,6 +1732,104 @@ class ConnectionManager:
         finally:
             if not completed and self._restart_drain_generation == generation:
                 self.end_restart_drain()
+
+    async def _close_when_replied(
+        self,
+        waiting: list[WebSocket],
+        deadline: float,
+        close_timeout_seconds: float,
+        generation: int,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        while waiting and self._restart_drain_generation == generation:
+            ready = [
+                ws
+                for ws in waiting
+                if not self._has_pending_command(ws) or loop.time() >= deadline
+            ]
+            if ready:
+                await asyncio.gather(
+                    *(
+                        self._close_for_restart(ws, close_timeout_seconds, generation)
+                        for ws in ready
+                    )
+                )
+                ready_ids = {id(ws) for ws in ready}
+                waiting[:] = [ws for ws in waiting if id(ws) not in ready_ids]
+            if waiting:
+                await asyncio.sleep(0.05)
+
+    async def _close_staggered(
+        self,
+        sockets: list[WebSocket],
+        window: float,
+        close_timeout_seconds: float,
+        generation: int,
+    ) -> None:
+        """Close ``sockets`` in randomized batches spread over ``window``.
+
+        Each batch closes together at a random moment inside its slot of the
+        window. Returns after the last close, or ``window`` plus a grace
+        after the start, whichever is first; the rest is then closed at once.
+        Cancellation closes the rest at once before it propagates. An aborted
+        drain (generation moved) sends nothing further.
+        """
+        if not sockets:
+            return
+        loop = asyncio.get_running_loop()
+        remaining = list(sockets)  # filtered by registry: closed ones are gone
+
+        async def close_now(batch: list[WebSocket]) -> None:
+            await asyncio.gather(
+                *(
+                    self._close_for_restart(ws, close_timeout_seconds, generation)
+                    for ws in batch
+                )
+            )
+
+        if window <= 0:
+            await close_now(remaining)
+            return
+        slots = max(
+            1, min(len(sockets), int(window / RESTART_CLOSE_BATCH_INTERVAL_SECONDS))
+        )
+        size = math.ceil(len(sockets) / slots)
+        order = list(sockets)
+        random.shuffle(order)
+        slot_width = window / slots
+        start = loop.time()
+        batches = [order[i : i + size] for i in range(0, len(order), size)]
+
+        async def run_batch(index: int, batch: list[WebSocket]) -> None:
+            at = start + index * slot_width + random.uniform(0, slot_width)
+            while loop.time() < at:
+                if self._restart_drain_generation != generation:
+                    return  # aborted: the rest stays open
+                await asyncio.sleep(min(0.1, max(0.0, at - loop.time())))
+            await close_now(batch)
+
+        tasks = [asyncio.ensure_future(run_batch(i, b)) for i, b in enumerate(batches)]
+        try:
+            _, pending = await asyncio.wait(
+                tasks, timeout=window + RESTART_CLOSE_WINDOW_GRACE_SECONDS
+            )
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await close_now(self._still_registered(remaining))
+            raise
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await close_now(self._still_registered(remaining))
+        for task in tasks:
+            if not task.cancelled() and task.exception() is not None:
+                raise cast(BaseException, task.exception())
+
+    def _still_registered(self, sockets: list[WebSocket]) -> list[WebSocket]:
+        return [ws for ws in sockets if ws in self._connection_task_ids]
 
     async def _close_for_restart(
         self, websocket: WebSocket, timeout: float, generation: int

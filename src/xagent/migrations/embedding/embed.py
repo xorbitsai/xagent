@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from xagent.core.model.embedding.base import BaseEmbedding
 from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
@@ -156,14 +156,9 @@ def warm_up(
 ) -> List[CollectionReport]:
     """Process every collection in scope; a failed one does not stop the next, an
     aborted one does."""
-    target_id, dimension, adapter = resolve_hub_target(model_id, dry_run=dry_run)
-    conn = connection()
-    names = resolve_collection_names(collections=collections, conn=conn)
-    require_target_table(target_id, conn)
-    refuse_owner_migration(target_id, conn)
-    if adapter is not None and rate_limit <= 0:
-        logger.warning("No --rate-limit: the provider's whole quota may be used")
-    target = Target(target_id, dimension, adapter, RateLimiter(rate_limit))
+    target, conn, names = start_run(
+        model_id, collections=collections, dry_run=dry_run, rate_limit=rate_limit
+    )
     reports: List[CollectionReport] = []
     for name in names:
         report = CollectionReport(name=name)
@@ -179,6 +174,25 @@ def warm_up(
             logger.error("Run aborted after %s", name)
             break
     return reports
+
+
+def start_run(
+    model_id: str,
+    *,
+    collections: Optional[Sequence[str]],
+    dry_run: bool,
+    rate_limit: float,
+) -> Tuple[Target, Any, List[str]]:
+    """The target, the connection and the collections in scope; raises when the
+    run must not start."""
+    target_id, dimension, adapter = resolve_hub_target(model_id, dry_run=dry_run)
+    conn = connection()
+    names = resolve_collection_names(collections=collections, conn=conn)
+    require_target_table(target_id, conn)
+    refuse_owner_migration(target_id, conn)
+    if adapter is not None and rate_limit <= 0:
+        logger.warning("No --rate-limit: the provider's whole quota may be used")
+    return Target(target_id, dimension, adapter, RateLimiter(rate_limit)), conn, names
 
 
 def resolve_hub_target(
@@ -363,18 +377,22 @@ def warm_document(
 
 
 def write_rows(
-    report: CollectionReport, rows: List[Dict[str, Any]], target: Target, conn: Any
+    report: CollectionReport,
+    rows: List[Dict[str, Any]],
+    target: Target,
+    conn: Any,
+    *,
+    before_write: Optional[Callable[[], Any]] = None,
 ) -> None:
     assert target.adapter is not None
     by_owner: Dict[int, List[Dict[str, Any]]] = {}
     for row in rows:
         # Every row is checked before the first provider call, not batch by batch.
-        source_metadata(row["metadata"])
+        record(row, target.model_id)
         by_owner.setdefault(int(row["user_id"]), []).append(row)
     for owner, items in by_owner.items():
         for start in range(0, len(items), DEFAULT_EMBEDDING_BATCH_SIZE):
             batch = items[start : start + DEFAULT_EMBEDDING_BATCH_SIZE]
-            metadata = [source_metadata(row["metadata"]) for row in batch]
             texts = [str(row["text"]) for row in batch]
             target.limiter.acquire(len(texts))
             vectors = normalize_raw_embedding_to_vectors(target.adapter.encode(texts))
@@ -383,27 +401,25 @@ def write_rows(
             ):
                 raise ValueError(f"unusable provider answer for {len(texts)} texts")
             verify_active_leases(report.name)
+            if before_write is not None:
+                before_write()
             require_target_table(target.model_id, conn)
             write_vectors_to_db(
                 report.name,
-                [
-                    ChunkEmbeddingData(
-                        doc_id=chunk_key(row)[0],
-                        chunk_id=chunk_key(row)[1],
-                        parse_hash=row["parse_hash"],
-                        model=target.model_id,
-                        vector=vector,
-                        text=text,
-                        chunk_hash=row["chunk_hash"],
-                        metadata=meta,
-                    )
-                    for row, text, vector, meta in zip(batch, texts, vectors, metadata)
-                ],
+                [record(row, target.model_id, v) for row, v in zip(batch, vectors)],
                 create_index=False,
                 user_id=owner,
                 verify_bound=False,
             )
             report.written += len(batch)
+
+
+def record(row: Dict[str, Any], model: str, vector: Any = None) -> ChunkEmbeddingData:
+    """What ``write_rows`` writes for a source row; raises for a row it cannot write."""
+    keys = dict(zip(("doc_id", "chunk_id"), chunk_key(row)), model=model)
+    meta = source_metadata(row["metadata"])
+    data = {**row, **keys, "text": str(row["text"]), "metadata": meta}
+    return ChunkEmbeddingData(**data, vector=vector or [])
 
 
 def source_metadata(raw: Any) -> Optional[Dict[str, Any]]:
@@ -457,11 +473,16 @@ def build_indexes(report: CollectionReport, model_id: str, conn: Any) -> None:
     if table not in table_names(conn) or not holds_rows(conn, table, report.name):
         return
     with leased(report, conn):
-        store = get_vector_index_store()
-        status = store.create_index(to_model_tag(model_id), readonly=False).status
-        compact_target(report.name, model_id)
+        status = index_target(report.name, model_id)
     if status in FAILED_INDEX_STATUSES:
         report.index_error = f"index build on {table} ended {status}"
+
+
+def index_target(collection: str, model_id: str) -> str:
+    store = get_vector_index_store()
+    status = store.create_index(to_model_tag(model_id), readonly=False).status
+    compact_target(collection, model_id)
+    return status
 
 
 def compact_target(collection: str, model_id: str) -> None:

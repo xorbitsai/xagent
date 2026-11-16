@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import secrets
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
 import pytest
@@ -723,6 +723,255 @@ def test_conversation_logs_list_sorts_by_last_message_activity() -> None:
         stale_activity_task_id,
     ]
     assert logs[0]["last_activity_at"] == "2026-01-01T12:00:00+00:00"
+
+
+WINDOW_START = datetime(2026, 3, 10, tzinfo=timezone.utc)
+WINDOW_END = datetime(2026, 3, 11, tzinfo=timezone.utc)
+WINDOW_PARAMS = {
+    "active_from": "2026-03-10T00:00:00Z",
+    "active_to": "2026-03-11T00:00:00Z",
+}
+
+
+def _listed_ids(headers: dict[str, str], **params: Any) -> list[int]:
+    response = client.get("/api/conversation-logs", params=params, headers=headers)
+    assert response.status_code == 200, response.text
+    return [item["task_id"] for item in response.json()["logs"]]
+
+
+def _displayed_activity_in_window(
+    headers: dict[str, str], start: datetime, end: datetime
+) -> set[int]:
+    response = client.get(
+        "/api/conversation-logs", params={"per_page": 100}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    return {
+        item["task_id"]
+        for item in response.json()["logs"]
+        if start <= datetime.fromisoformat(item["last_activity_at"]) < end
+    }
+
+
+@pytest.mark.parametrize("inside", [True, False], ids=["inside", "outside"])
+@pytest.mark.parametrize("has_messages", [True, False], ids=["messages", "bare"])
+def test_activity_window_matches_displayed_last_activity_for_v1_rows(
+    has_messages: bool, inside: bool
+) -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Window Agent")
+    in_window = datetime(2026, 3, 10, 12, tzinfo=timezone.utc)
+    before = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+    after = datetime(2026, 3, 12, 12, tzinfo=timezone.utc)
+    target_time = in_window if inside else after
+    opposite_time = before if inside else in_window
+
+    target_id = _create_task_row(
+        user_id=user_id,
+        title="target",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        created_at=before,
+        # With messages, the message time decides; updated_at points the other
+        # way so a filter that read it instead would disagree with the list.
+        updated_at=opposite_time if has_messages else target_time,
+    )
+    if has_messages:
+        _add_chat_message(
+            task_id=target_id,
+            user_id=user_id,
+            role="user",
+            content="hello",
+            created_at=target_time,
+        )
+    # Controls on both sides of the window keep the result set non-trivial.
+    control_in = _create_task_row(
+        user_id=user_id,
+        title="control in",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        created_at=before,
+        updated_at=in_window,
+    )
+    _create_task_row(
+        user_id=user_id,
+        title="control out",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        created_at=before,
+        updated_at=before,
+    )
+
+    expected = _displayed_activity_in_window(headers, WINDOW_START, WINDOW_END)
+    assert (target_id in expected) is inside
+    assert control_in in expected
+    assert set(_listed_ids(headers, per_page=100, **WINDOW_PARAMS)) == expected
+
+
+def test_activity_window_scopes_counts_agents_and_logs_together() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    alpha = _create_agent_row(user_id=user_id, name="Alpha")
+    beta = _create_agent_row(user_id=user_id, name="Beta")
+    gamma = _create_agent_row(user_id=user_id, name="Gamma")
+    inside = datetime(2026, 3, 10, 12, tzinfo=timezone.utc)
+    outside = datetime(2026, 3, 20, 12, tzinfo=timezone.utc)
+
+    def make(title: str, source: str, agent_id: int, when: datetime) -> int:
+        return _create_task_row(
+            user_id=user_id,
+            title=title,
+            source=source,
+            is_visible=False,
+            agent_id=agent_id,
+            created_at=outside,
+            updated_at=when,
+        )
+
+    alpha_rest = make("alpha rest in", "sdk", alpha, inside)
+    make("alpha widget out", "widget", alpha, outside)
+    beta_widget = make("beta widget in", "widget", beta, inside)
+    make("gamma rest out", "sdk", gamma, outside)
+    make("gamma widget out", "widget", gamma, outside)
+
+    response = client.get(
+        "/api/conversation-logs", params=WINDOW_PARAMS, headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert {item["task_id"] for item in body["logs"]} == {alpha_rest, beta_widget}
+    assert body["source_counts"] == {
+        "all": 2,
+        "widget": 1,
+        "rest_api": 1,
+        "shared_link": 0,
+        "webhook": 0,
+    }
+    assert {item["agent_id"] for item in body["agents"]} == {alpha, beta}
+    assert body["pagination"]["total"] == 2
+
+
+@pytest.mark.parametrize(
+    ("row_offset_us", "bound", "included"),
+    [(0, "start", True), (0, "end", False), (-1, "end", True), (-1, "start", False)],
+    ids=["at-start", "at-end", "just-before-end", "just-before-start"],
+)
+def test_activity_window_is_half_open(
+    row_offset_us: int, bound: str, included: bool
+) -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    edge = datetime(2026, 3, 10, 0, 0, 0, 123456, tzinfo=timezone.utc)
+    row_time = edge + timedelta(microseconds=row_offset_us)
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="edge",
+        source="sdk",
+        is_visible=False,
+        created_at=row_time,
+        updated_at=row_time,
+    )
+    far = timedelta(days=1)
+    if bound == "start":
+        params = {
+            "active_from": edge.isoformat(),
+            "active_to": (edge + far).isoformat(),
+        }
+    else:
+        params = {
+            "active_from": (edge - far).isoformat(),
+            "active_to": edge.isoformat(),
+        }
+
+    assert (task_id in _listed_ids(headers, **params)) is included
+
+
+def test_activity_window_converts_offsets_to_utc() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    stored = datetime(2026, 11, 16, 1, 0, tzinfo=timezone.utc)
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="utc 01:00",
+        source="sdk",
+        is_visible=False,
+        created_at=stored,
+        updated_at=stored,
+    )
+
+    offset_hit = _listed_ids(headers, active_from="2026-11-16T08:30:00+08:00")
+    utc_hit = _listed_ids(headers, active_from="2026-11-16T00:30:00Z")
+    offset_miss = _listed_ids(headers, active_from="2026-11-16T09:30:00+08:00")
+    utc_miss = _listed_ids(headers, active_from="2026-11-16T01:30:00Z")
+
+    assert offset_hit == utc_hit == [task_id]
+    assert offset_miss == utc_miss == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"active_from": "2026-03-10T00:00:00"},
+        {"active_to": "2026-03-10T00:00:00"},
+        {"active_from": "2026-03-10T00:00:00Z", "active_to": "2026-03-10T00:00:00Z"},
+        {"active_from": "2026-03-11T00:00:00Z", "active_to": "2026-03-10T00:00:00Z"},
+        {"active_from": "yesterday"},
+        {"active_to": "not-a-date"},
+    ],
+    ids=[
+        "naive-from",
+        "naive-to",
+        "from-equals-to",
+        "from-after-to",
+        "unparseable-from",
+        "unparseable-to",
+    ],
+)
+def test_activity_window_rejects_invalid_input(params: dict[str, str]) -> None:
+    response = client.get(
+        "/api/conversation-logs", params=params, headers=_admin_headers()
+    )
+
+    assert response.status_code == 422, response.text
+
+
+def test_list_sql_has_no_time_window_clause_without_time_parameters() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    _create_task_row(
+        user_id=user_id,
+        title="row",
+        source="sdk",
+        is_visible=False,
+        updated_at=datetime(2026, 3, 10, 12, tzinfo=timezone.utc),
+    )
+
+    def summary_statements(**params: Any) -> list[str]:
+        with _capture_sql_statements() as statements:
+            response = client.get(
+                "/api/conversation-logs", params=params, headers=headers
+            )
+        assert response.status_code == 200, response.text
+        return [
+            statement
+            for statement, _parameters in statements
+            if "GROUP BY" in statement and "count(tasks.id)" in statement
+        ]
+
+    without_window = summary_statements()
+    with_window = summary_statements(**WINDOW_PARAMS)
+
+    assert len(without_window) == 1
+    assert "task_chat_messages" not in without_window[0]
+    assert "task_execution_events" not in without_window[0]
+    assert len(with_window) == 1
+    assert "task_chat_messages" in with_window[0]
+    assert "task_execution_events" in with_window[0]
 
 
 def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:

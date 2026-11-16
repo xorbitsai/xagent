@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import timezone
-from typing import Any, Sequence
+from datetime import datetime, timezone
+from typing import Annotated, Any, Sequence
 from typing import cast as typing_cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -468,6 +468,73 @@ def _apply_task_filters(
     return query
 
 
+def _activity_window(
+    active_from: datetime | None, active_to: datetime | None
+) -> tuple[datetime | None, datetime | None]:
+    """Validate the optional last-activity window; the interval is half-open.
+
+    Both bounds must carry a timezone offset: a naive value would be read in
+    the server's zone, which the caller cannot know. A window with
+    ``active_from >= active_to`` selects nothing, so it is rejected instead of
+    returning an empty page.
+    """
+    for name, value in (("active_from", active_from), ("active_to", active_to)):
+        if value is not None and value.utcoffset() is None:
+            raise HTTPException(
+                status_code=422, detail=f"{name} must include a timezone offset"
+            )
+    if active_from is not None and active_to is not None and active_from >= active_to:
+        raise HTTPException(
+            status_code=422, detail="active_from must be earlier than active_to"
+        )
+    return active_from, active_to
+
+
+def _window_bound_for_db(db: Session, value: datetime) -> datetime:
+    """A window bound in the form the connected database compares correctly.
+
+    Stored timestamps are UTC. PostgreSQL compares timezone-aware values by
+    instant; SQLite stores naive UTC text, so an aware bound would be compared
+    as a different string and match the wrong rows.
+    """
+    utc_value = value.astimezone(timezone.utc)
+    if db.get_bind().dialect.name == "sqlite":
+        return utc_value.replace(tzinfo=None)
+    return utc_value
+
+
+def _last_activity_expression(activity: Any) -> ColumnElement[Any]:
+    """The last-activity instant shown on a log row.
+
+    ``activity`` is ``_latest_message_activity_subquery``'s result. This is the
+    single definition used for ordering, the time window and the export.
+    """
+    return func.coalesce(activity.c.last_message_at, Task.updated_at, Task.created_at)
+
+
+def _last_activity_window_clause(
+    db: Session,
+    candidate_ids: Any,
+    start: datetime | None,
+    end: datetime | None,
+) -> ColumnElement[bool]:
+    """``Task.id`` is among ``candidate_ids`` and its last activity is in
+    ``[start, end)``.
+
+    ``candidate_ids`` is a ``select`` of the task ids that already passed the
+    scope and filters; the activity subquery is summarised over exactly those.
+    """
+    activity = _latest_message_activity_subquery(db, candidate_ids)
+    last_activity = _last_activity_expression(activity)
+    window = select(Task.id).outerjoin(activity, activity.c.task_id == Task.id)
+    window = window.where(Task.id.in_(candidate_ids))
+    if start is not None:
+        window = window.where(last_activity >= _window_bound_for_db(db, start))
+    if end is not None:
+        window = window.where(last_activity < _window_bound_for_db(db, end))
+    return Task.id.in_(window.correlate(None))
+
+
 def _base_task_query(db: Session, user: User) -> Any:
     query = db.query(Task).options(
         selectinload(Task.agent),
@@ -488,6 +555,8 @@ def _conversation_source_query(
     *,
     agent_id: int | None,
     search: str | None,
+    active_from: datetime | None = None,
+    active_to: datetime | None = None,
 ) -> tuple[Any, Any]:
     latest_run_ids = (
         db.query(
@@ -531,6 +600,15 @@ def _conversation_source_query(
         .outerjoin(latest_trigger, latest_trigger.id == latest_run.trigger_id)
     )
     query = _apply_task_filters(query, agent_id=agent_id, search=search)
+    if active_from is not None or active_to is not None:
+        query = query.filter(
+            _last_activity_window_clause(
+                db,
+                query.with_entities(Task.id).statement.correlate(None),
+                active_from,
+                active_to,
+            )
+        )
     return query, ui_source
 
 
@@ -540,6 +618,10 @@ def _last_activity_at(task: Task) -> Any:
         latest_message = max(messages, key=_message_sort_key)
         return latest_message.created_at or task.updated_at or task.created_at
     return task.updated_at or task.created_at
+
+
+def _source_label(ui_source: str) -> str:
+    return SOURCE_LABELS.get(ui_source, ui_source)
 
 
 def _serialize_log_summary(
@@ -552,7 +634,7 @@ def _serialize_log_summary(
         "description": task.description,
         "status": _status_value(task),
         "source": ui_source,
-        "source_label": SOURCE_LABELS.get(ui_source, ui_source),
+        "source_label": _source_label(ui_source),
         "stored_source": task.source,
         "agent_id": int(task.agent_id) if task.agent_id is not None else None,
         "agent_name": agent.name if agent else None,
@@ -909,25 +991,33 @@ async def list_conversation_logs(
     search: str | None = Query(None),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
+    active_from: Annotated[datetime | None, Query()] = None,
+    active_to: Annotated[datetime | None, Query()] = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """List hidden external conversation logs.
 
     Admin users can inspect hidden external conversation logs across all users.
-    Non-admin users are limited to their own logs.
+    Non-admin users are limited to their own logs. ``active_from`` /
+    ``active_to`` restrict the rows, the per-source counts and the agent
+    options to conversations whose last activity is in ``[active_from,
+    active_to)``.
     """
     normalized_source = source.strip().lower()
     allowed_sources = {"all", *SOURCE_ORDER}
     if normalized_source not in allowed_sources:
         raise HTTPException(status_code=400, detail="Unsupported conversation source")
 
+    window_start, window_end = _activity_window(active_from, active_to)
     search_value = search.strip() if search else None
     source_query, ui_source = _conversation_source_query(
         db,
         user,
         agent_id=agent_id,
         search=search_value,
+        active_from=window_start,
+        active_to=window_end,
     )
     source_counts, agent_options = _source_summary_from_query(source_query, ui_source)
 
@@ -940,11 +1030,7 @@ async def list_conversation_logs(
     latest_message_activity = _latest_message_activity_subquery(
         db, filtered_query.with_entities(Task.id).statement.correlate(None)
     )
-    last_activity_at = func.coalesce(
-        latest_message_activity.c.last_message_at,
-        Task.updated_at,
-        Task.created_at,
-    )
+    last_activity_at = _last_activity_expression(latest_message_activity)
     page_rows = (
         filtered_query.outerjoin(
             latest_message_activity,

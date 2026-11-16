@@ -372,6 +372,71 @@ async def test_v2_log_detail_and_list_use_event_counts_activity_and_compaction(
         )
 
 
+V2_WINDOW_START = datetime(2026, 3, 10, tzinfo=timezone.utc)
+V2_WINDOW_END = datetime(2026, 3, 11, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inside", [True, False], ids=["inside", "outside"])
+@pytest.mark.parametrize("has_messages", [True, False], ids=["messages", "bare"])
+async def test_v2_activity_window_matches_displayed_last_activity(
+    canonical, has_messages, inside
+):
+    from xagent.web.api.conversation_logs import list_conversation_logs
+    from xagent.web.models.user import User
+
+    factory, task_id = canonical
+    in_window = datetime(2026, 3, 10, 12, tzinfo=timezone.utc)
+    before = datetime(2026, 3, 1, 12, tzinfo=timezone.utc)
+    after = datetime(2026, 3, 12, 12, tzinfo=timezone.utc)
+    target_time = in_window if inside else after
+    opposite_time = before if inside else in_window
+    with factory() as db:
+        task = db.get(Task, task_id)
+        task.source = "sdk"
+        task.is_visible = False
+        task.created_at = before
+        # With messages the event time decides; updated_at points the other way.
+        task.updated_at = opposite_time if has_messages else target_time
+        user = db.get(User, task.user_id)
+        if has_messages:
+            append_fact_no_commit(
+                db,
+                task_id=task_id,
+                kind="input_accepted",
+                key="first",
+                payload={"content": "hello", "message_type": "user"},
+                occurred_at=target_time,
+                turn_id="first",
+            )
+        db.commit()
+
+        async def listed(**window):
+            return await list_conversation_logs(
+                source="all",
+                agent_id=None,
+                search=None,
+                page=1,
+                per_page=100,
+                db=db,
+                user=user,
+                **window,
+            )
+
+        unfiltered = await listed(active_from=None, active_to=None)
+        expected = {
+            row["task_id"]
+            for row in unfiltered["logs"]
+            if V2_WINDOW_START
+            <= datetime.fromisoformat(row["last_activity_at"])
+            < V2_WINDOW_END
+        }
+        assert (task_id in expected) is inside
+        windowed = await listed(active_from=V2_WINDOW_START, active_to=V2_WINDOW_END)
+        assert {row["task_id"] for row in windowed["logs"]} == expected
+        assert windowed["source_counts"]["all"] == len(expected)
+
+
 @pytest.mark.asyncio
 async def test_monitor_counts_each_task_source_once_and_isolates_child_scope(canonical):
     from xagent.web.api.monitor import (

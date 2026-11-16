@@ -23,6 +23,8 @@ switch value, or a threshold outside that range or not a whole number while
 the switch is on, stops startup instead of falling back to a weaker value. The
 role is read from the database on every check; claims and organisation or team
 roles never select the threshold. Use the same values on every replica.
+Activity is recorded at most once a minute (see Activity), so with a 1-minute
+threshold activity cannot extend a login; use 2 minutes or more.
 
 ## Logins
 

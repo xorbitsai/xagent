@@ -397,7 +397,6 @@ def _expired(
 def _rejects(
     db: Session,
     user: User,
-    sid: str | None,
     row: BrowserSession | None,
     *,
     now: datetime | None,
@@ -463,7 +462,6 @@ def session_rejected(
     return _rejects(
         db,
         user,
-        sid,
         _load(db, user, sid),
         now=now,
         policy=policy or get_browser_idle_policy(),
@@ -531,7 +529,7 @@ def check_browser_session(
     """
     policy = policy or get_browser_idle_policy()
     row = _load(db, user, presented_sid)
-    if _rejects(db, user, presented_sid, row, now=None, policy=policy):
+    if _rejects(db, user, row, now=None, policy=policy):
         raise BrowserSessionRejected()
     if row is None and enforcement_leases(db):
         # A refresh token the policy refused while enforced is not migrated
@@ -637,7 +635,7 @@ def record_activity(
     # Nothing written: another report got there first (coalesced), or the
     # login expired or was revoked. Decide from the committed state.
     current = _load(db, user, sid)
-    if current is None or _rejects(db, user, sid, current, now=now, policy=policy):
+    if current is None or _rejects(db, user, current, now=now, policy=policy):
         raise BrowserSessionRejected()
     return _as_utc(cast(datetime, current.last_activity_at))
 

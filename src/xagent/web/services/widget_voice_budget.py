@@ -21,7 +21,7 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Protocol, TypeVar
 
@@ -41,6 +41,9 @@ from .db_runtime import await_task_settlement
 logger = logging.getLogger(__name__)
 
 _KEY_TTL_SECONDS = 48 * 3600
+# The process-memory store keeps the same days a Redis key lives: the
+# incoming key's UTC day and the day before it.
+_MEMORY_KEEP_DAYS = _KEY_TTL_SECONDS // (24 * 3600)
 _MAX_TEXT_CHARS_DEFAULT = 1000
 # The text bound of TTSStreamRequest; a larger setting could never be sent.
 _MAX_TEXT_CHARS_CEILING = 5000
@@ -117,7 +120,10 @@ class _Store(Protocol):
 
 
 class _MemoryStore:
-    """Per-process counters; only today's keys are kept."""
+    """Per-process counters for the incoming key's UTC day and the day before
+    it, the two days a Redis key lives. Older days are dropped; a later day is
+    never dropped, so a reservation that took its day just before midnight
+    cannot erase the new day's counts."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -125,8 +131,11 @@ class _MemoryStore:
 
     def incrby(self, key: str, amount: int) -> int:
         day = key.split(":", 3)[2]
+        oldest_kept = (
+            date.fromisoformat(day) - timedelta(days=_MEMORY_KEEP_DAYS - 1)
+        ).strftime("%Y%m%d")
         with self._lock:
-            for stale in [k for k in self._counts if k.split(":", 3)[2] != day]:
+            for stale in [k for k in self._counts if k.split(":", 3)[2] < oldest_kept]:
                 del self._counts[stale]
             self._counts[key] = self._counts.get(key, 0) + amount
             return self._counts[key]

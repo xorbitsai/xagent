@@ -139,10 +139,43 @@ def test_budget_window_is_the_utc_calendar_day(monkeypatch, next_day):
     if next_day:
         day["value"] = "20261115"
         reserve_tts_sync("agent:1", "v", 8)
-        assert _counts()["tts-entity"] == 8
+        counts = widget_voice_budget._memory_store._counts
+        assert counts["xagent:widget-voice:20261115:tts-entity:agent:1"] == 8
     else:
         with pytest.raises(VoiceBudgetExhausted):
             reserve_tts_sync("agent:1", "v", 8)
+
+
+def test_late_prior_day_reservation_keeps_the_new_day_counts(monkeypatch):
+    monkeypatch.setenv(SETTINGS["tts-site"], "10")
+    day = {"value": "20261117"}
+    monkeypatch.setattr(widget_voice_budget, "_utc_day", lambda: day["value"])
+    reserve_tts_sync("agent:1", "v", 10)
+    day["value"] = "20261116"
+    reserve_tts_sync("agent:1", "v", 5)
+    day["value"] = "20261117"
+    with pytest.raises(VoiceBudgetExhausted):
+        reserve_tts_sync("agent:1", "v", 1)
+    counts = widget_voice_budget._memory_store._counts
+    assert counts["xagent:widget-voice:20261117:tts-site:all"] == 10
+    assert counts["xagent:widget-voice:20261116:tts-site:all"] == 5
+
+
+def test_memory_budget_drops_counters_two_days_old(monkeypatch):
+    _unset(monkeypatch, SETTINGS)
+    day = {"value": "20261130"}
+    monkeypatch.setattr(widget_voice_budget, "_utc_day", lambda: day["value"])
+    reserve_tts_sync("agent:1", "v", 3)
+    day["value"] = "20261201"
+    reserve_tts_sync("agent:1", "v", 3)
+    keys = widget_voice_budget._memory_store._counts
+    assert "xagent:widget-voice:20261130:tts-site:all" in keys
+    assert "xagent:widget-voice:20261201:tts-site:all" in keys
+    day["value"] = "20261202"
+    reserve_tts_sync("agent:1", "v", 3)
+    assert not [k for k in keys if ":20261130:" in k]
+    assert "xagent:widget-voice:20261201:tts-site:all" in keys
+    assert "xagent:widget-voice:20261202:tts-site:all" in keys
 
 
 def test_budget_day_is_taken_in_utc(monkeypatch):

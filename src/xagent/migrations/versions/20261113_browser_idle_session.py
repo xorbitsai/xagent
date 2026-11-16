@@ -8,14 +8,14 @@ token, so refresh tokens issued before this release can be counted.
 Both start empty; the idle policy is off by default.
 
 Revision ID: 20261113_browser_idle_session
-Revises: 20261110_rename_atlassian_to_confluence
+Revises: 20261115_serving_generation
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "20261113_browser_idle_session"
-down_revision = "20261110_rename_atlassian_to_confluence"
+down_revision = "20261115_serving_generation"
 branch_labels = None
 depends_on = None
 

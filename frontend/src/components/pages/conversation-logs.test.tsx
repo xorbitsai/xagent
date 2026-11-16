@@ -579,6 +579,76 @@ describe("ConversationLogsPage", () => {
       expect(exportButton()).toBeDisabled()
     })
 
+    it.each([
+      ["start", "conversationLogs.activeFromLabel"],
+      ["end", "conversationLogs.activeToLabel"],
+    ])("returns to the first page when the %s time changes", async (_name, label) => {
+      apiRequestMock.mockImplementation((url: string) => {
+        const parsed = new URL(url)
+        if (parsed.pathname === "/api/conversation-logs/101") {
+          return Promise.resolve(
+            new Response(JSON.stringify(detailPayload), { status: 200 })
+          )
+        }
+        if (parsed.pathname === "/api/conversation-logs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                ...listPayload,
+                pagination: {
+                  page: Number(parsed.searchParams.get("page")),
+                  per_page: 20,
+                  total: 40,
+                  total_pages: 2,
+                },
+              }),
+              { status: 200 }
+            )
+          )
+        }
+        throw new Error(`Unhandled apiRequest: ${url}`)
+      })
+      render(<ConversationLogsPage />)
+      await screen.findAllByText("Sales Agent")
+
+      fireEvent.click(screen.getByRole("button", { name: /common\.next/ }))
+      await waitFor(() => expect(listUrls().at(-1)!.searchParams.get("page")).toBe("2"))
+
+      fireEvent.change(screen.getByLabelText(label), { target: { value: FROM_LOCAL } })
+
+      await waitFor(() => {
+        const last = listUrls().at(-1)!
+        expect(last.searchParams.get("page")).toBe("1")
+        expect(last.searchParams.has(label.endsWith("FromLabel") ? "active_from" : "active_to")).toBe(true)
+      })
+    })
+
+    it("treats a time window alone as a filter when the result is empty", async () => {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (new URL(url).pathname === "/api/conversation-logs") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                ...listPayload,
+                logs: [],
+                pagination: { ...listPayload.pagination, total: 0 },
+              }),
+              { status: 200 }
+            )
+          )
+        }
+        throw new Error(`Unhandled apiRequest: ${url}`)
+      })
+      render(<ConversationLogsPage />)
+      expect(await screen.findByText("No conversation logs yet")).toBeInTheDocument()
+
+      fireEvent.change(screen.getByLabelText("conversationLogs.activeFromLabel"), {
+        target: { value: FROM_LOCAL },
+      })
+
+      expect(await screen.findByText("No matching logs")).toBeInTheDocument()
+    })
+
     it("disables export when the result is empty", async () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (new URL(url).pathname === "/api/conversation-logs") {
@@ -602,9 +672,17 @@ describe("ConversationLogsPage", () => {
     })
 
     it("exports with exactly the filters of the current list request", async () => {
-      const createObjectURL = vi.fn(() => "blob:test")
-      const revokeObjectURL = vi.fn()
-      vi.stubGlobal("URL", Object.assign(URL, { createObjectURL, revokeObjectURL }))
+      // jsdom has no object URL support, so give the two methods something
+      // to spy on and remove them again afterwards.
+      for (const name of ["createObjectURL", "revokeObjectURL"] as const) {
+        Object.defineProperty(URL, name, {
+          configurable: true,
+          writable: true,
+          value: () => "blob:test",
+        })
+      }
+      const createObjectURL = vi.spyOn(URL, "createObjectURL")
+      const revokeObjectURL = vi.spyOn(URL, "revokeObjectURL")
       const downloads: string[] = []
       const clickSpy = vi
         .spyOn(HTMLAnchorElement.prototype, "click")
@@ -640,7 +718,13 @@ describe("ConversationLogsPage", () => {
       await waitFor(() => expect(downloads).toHaveLength(1))
       expect(downloads[0]).toMatch(/^conversation-logs-\d{8}-\d{6}\.csv$/)
       expect(toastMock.error).not.toHaveBeenCalled()
+      expect(createObjectURL).toHaveBeenCalledTimes(1)
+      expect(revokeObjectURL).toHaveBeenCalledTimes(1)
       clickSpy.mockRestore()
+      createObjectURL.mockRestore()
+      revokeObjectURL.mockRestore()
+      delete (URL as Partial<typeof URL>).createObjectURL
+      delete (URL as Partial<typeof URL>).revokeObjectURL
     })
 
     it.each([
@@ -661,24 +745,6 @@ describe("ConversationLogsPage", () => {
           },
         },
         "conversationLogs.exportTooLargeFile:50",
-      ],
-      [
-        "an unknown reason",
-        422,
-        { detail: { code: "conversation_log_export_too_large", reason: "disk", limit: 5 } },
-        "conversationLogs.exportFailed",
-      ],
-      [
-        "a non-numeric limit",
-        422,
-        { detail: { code: "conversation_log_export_too_large", reason: "rows", limit: "x" } },
-        "conversationLogs.exportFailed",
-      ],
-      [
-        "another 422",
-        422,
-        { detail: [{ msg: "bad", loc: ["query", "active_from"] }] },
-        "conversationLogs.exportFailed",
       ],
       ["a server error", 500, { detail: "boom" }, "conversationLogs.exportFailed"],
     ])("reports %s on export", async (_name, status, body, expectedMessage) => {

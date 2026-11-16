@@ -1248,38 +1248,44 @@ def export_conversation_logs(
         .limit(EXPORT_ROW_LIMIT + 1)
         .yield_per(EXPORT_FETCH_BATCH)
     )
-    raw = _write_export_file(
-        (
+    # The result is closed here, on every path: a cursor left to garbage
+    # collection would close after the connection was back in the pool.
+    result_rows = iter(rows)
+    try:
+        raw = _write_export_file(
             (
-                int(task_id),
-                agent_name,
-                _source_label(row_ui_source),
-                _status_text(status),
-                title,
-                format_datetime_for_api(created_at),
-                format_datetime_for_api(last_activity_at),
-                int(message_count or 0),
-                int(total_tokens or 0),
-                description,
-                output,
-                error_message,
+                (
+                    int(task_id),
+                    agent_name,
+                    _source_label(row_ui_source),
+                    _status_text(status),
+                    title,
+                    format_datetime_for_api(created_at),
+                    format_datetime_for_api(last_activity_at),
+                    int(message_count or 0),
+                    int(total_tokens or 0),
+                    description,
+                    output,
+                    error_message,
+                )
+                for (
+                    task_id,
+                    agent_name,
+                    row_ui_source,
+                    status,
+                    title,
+                    created_at,
+                    last_activity_at,
+                    message_count,
+                    total_tokens,
+                    description,
+                    output,
+                    error_message,
+                ) in result_rows
             )
-            for (
-                task_id,
-                agent_name,
-                row_ui_source,
-                status,
-                title,
-                created_at,
-                last_activity_at,
-                message_count,
-                total_tokens,
-                description,
-                output,
-                error_message,
-            ) in rows
         )
-    )
+    finally:
+        result_rows.close()
     # Return the connection to the pool now; ``get_db`` would otherwise hold it
     # until the response has been sent.
     db.close()

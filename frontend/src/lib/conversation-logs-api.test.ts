@@ -51,6 +51,7 @@ describe("downloadConversationLogsCsv", () => {
     [{ detail: { code: "conversation_log_export_too_large", reason: "rows", limit: "1" } }],
     [{ detail: { code: "other", reason: "rows", limit: 1 } }],
     [{ detail: "nope" }],
+    [{ detail: [{ msg: "bad", loc: ["query", "active_from"] }] }],
   ])("treats %j as an ordinary failure", async (body) => {
     const err = await failure(422, body)
     expect(err).toBeInstanceOf(Error)

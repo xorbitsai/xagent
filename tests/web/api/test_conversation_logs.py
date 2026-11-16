@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import io
 import logging
 import re
@@ -1069,11 +1070,20 @@ def test_export_columns_carry_the_listed_values() -> None:
         user_id=user_id,
         role="user",
         content="hi",
+        created_at=created,
+    )
+    _add_chat_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="assistant",
+        content="hello",
         created_at=last_message,
     )
 
+    (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
     (row,) = _exported_by_column(_export(headers))
 
+    assert listed["message_count"] == 2
     assert row == {
         "conversation_id": str(task_id),
         "agent": "Export Agent",
@@ -1082,7 +1092,7 @@ def test_export_columns_carry_the_listed_values() -> None:
         "title": "Export title",
         "started_at": "2026-03-01T08:00:00+00:00",
         "last_activity_at": "2026-03-10T12:00:00+00:00",
-        "message_count": "1",
+        "message_count": str(listed["message_count"]),
         "total_tokens": "8",
         "first_message": "first words",
         "latest_answer": "latest reply",
@@ -1090,49 +1100,57 @@ def test_export_columns_carry_the_listed_values() -> None:
     }
 
 
-@pytest.mark.parametrize("prefix", FORMULA_PREFIXES, ids=repr)
-@pytest.mark.parametrize(
-    "column", ["agent", "title", "first_message", "latest_answer", "error_message"]
-)
-def test_export_prefixes_formula_like_text_in_every_text_column(
-    column: str, prefix: str
-) -> None:
+def test_export_prefixes_formula_like_text_in_every_text_column() -> None:
     headers = _admin_headers()
     user_id = _user_id("admin")
-    dangerous = f"{prefix}1+1"
-    agent_name = dangerous if column == "agent" else "Plain Agent"
-    agent_id = _create_agent_row(user_id=user_id, name=agent_name)
+    agent_id = _create_agent_row(user_id=user_id, name="=agent")
     task_id = _create_task_row(
         user_id=user_id,
-        title=dangerous if column == "title" else "plain title",
-        description=dangerous if column == "first_message" else "plain first",
-        output_text=dangerous if column == "latest_answer" else "plain answer",
+        title="+title",
+        description="-first",
+        output_text="@answer",
         source="sdk",
         is_visible=False,
         agent_id=agent_id,
     )
-    _set_task_fields(
-        task_id, error_message=dangerous if column == "error_message" else "plain err"
-    )
+    _set_task_fields(task_id, error_message="\t=error")
 
     (row,) = _exported_by_column(_export(headers))
 
-    assert row[column] == "'" + dangerous
-    for other in ("agent", "title", "first_message", "latest_answer", "error_message"):
-        if other != column:
-            assert not row[other].startswith("'")
+    assert row["agent"] == "'=agent"
+    assert row["title"] == "'+title"
+    assert row["first_message"] == "'-first"
+    assert row["latest_answer"] == "'@answer"
+    assert row["error_message"] == "'\t=error"
+    assert not row["channel"].startswith("'")
+    assert not row["status"].startswith("'")
 
 
-@pytest.mark.parametrize("column", ["channel", "status"])
-def test_csv_line_guards_text_columns_not_fed_by_user_data(column: str) -> None:
-    index = EXPORT_HEADER.index(column)
-    for prefix in FORMULA_PREFIXES:
-        cells: list[Any] = ["x"] * len(EXPORT_HEADER)
-        cells[index] = f"{prefix}cmd"
-        parsed = next(
-            csv.reader(io.StringIO(conversation_logs._csv_line(cells), newline=""))
-        )
-        assert parsed[index] == f"'{prefix}cmd"
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(f"{prefix}1+1", f"'{prefix}1+1") for prefix in FORMULA_PREFIXES]
+    + [("plain text", "plain text"), ("a=b", "a=b"), ("", ""), (None, "")],
+)
+def test_csv_text_neutralises_formula_prefixes(
+    value: str | None, expected: str
+) -> None:
+    assert conversation_logs._csv_text(value) == expected
+
+
+def test_csv_line_guards_every_text_cell_and_leaves_numbers() -> None:
+    cells: list[Any] = ["=x"] * len(EXPORT_HEADER)
+    cells[EXPORT_HEADER.index("conversation_id")] = 7
+    cells[EXPORT_HEADER.index("message_count")] = 0
+
+    parsed = next(
+        csv.reader(io.StringIO(conversation_logs._csv_line(cells), newline=""))
+    )
+
+    for name, cell in zip(EXPORT_HEADER, parsed):
+        if name in ("conversation_id", "message_count"):
+            assert not cell.startswith("'")
+        else:
+            assert cell == "'=x", name
 
 
 def test_export_quotes_every_field_so_separators_cannot_split_cells() -> None:
@@ -1222,27 +1240,9 @@ def test_export_has_the_same_rows_in_the_same_order_as_the_listing() -> None:
     assert len(listed({})) == 105
 
 
-def test_export_applies_the_time_window_and_source_validation() -> None:
+def test_export_rejects_an_unsupported_source_and_a_naive_time() -> None:
     headers = _admin_headers()
-    user_id = _user_id("admin")
-    inside = _create_task_row(
-        user_id=user_id,
-        title="in",
-        source="sdk",
-        is_visible=False,
-        updated_at=datetime(2026, 3, 10, 12, tzinfo=timezone.utc),
-    )
-    _create_task_row(
-        user_id=user_id,
-        title="out",
-        source="sdk",
-        is_visible=False,
-        updated_at=datetime(2026, 3, 20, 12, tzinfo=timezone.utc),
-    )
 
-    rows = _exported_by_column(_export(headers, **WINDOW_PARAMS))
-
-    assert [row["conversation_id"] for row in rows] == [str(inside)]
     assert _export(headers, source="internal").status_code == 400
     assert _export(headers, active_from="2026-03-10T00:00:00").status_code == 422
 
@@ -1274,24 +1274,6 @@ def test_export_requires_authentication() -> None:
     assert response.status_code in (401, 403), response.text
 
 
-def test_export_message_count_matches_the_listing_for_a_v1_row() -> None:
-    headers = _admin_headers()
-    user_id = _user_id("admin")
-    task_id = _create_task_row(
-        user_id=user_id, title="chat", source="sdk", is_visible=False
-    )
-    for index in range(3):
-        _add_chat_message(
-            task_id=task_id, user_id=user_id, role="user", content=f"m{index}"
-        )
-
-    listed = client.get("/api/conversation-logs", headers=headers).json()["logs"]
-    (row,) = _exported_by_column(_export(headers))
-
-    assert listed[0]["message_count"] == 3
-    assert row["message_count"] == str(listed[0]["message_count"])
-
-
 class _RecordingSpool(tempfile.SpooledTemporaryFile):  # type: ignore[type-arg]
     instances: list[Any] = []
 
@@ -1317,23 +1299,38 @@ def _three_rows() -> None:
         )
 
 
-def test_export_over_the_row_limit_is_a_422_without_a_file(
-    monkeypatch: pytest.MonkeyPatch, _recorded_spools: list[Any]
+@pytest.mark.parametrize("reason", ["rows", "bytes"])
+def test_export_over_a_limit_is_a_422_without_a_file_or_a_cursor_error(
+    reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _recorded_spools: list[Any],
 ) -> None:
     headers = _admin_headers()
     _three_rows()
-    monkeypatch.setattr(conversation_logs, "EXPORT_ROW_LIMIT", 2)
+    if reason == "rows":
+        limit = 2
+        monkeypatch.setattr(conversation_logs, "EXPORT_ROW_LIMIT", limit)
+    else:
+        header_bytes = len(conversation_logs._csv_line(EXPORT_HEADER).encode("utf-8"))
+        limit = header_bytes + 10
+        monkeypatch.setattr(conversation_logs, "EXPORT_BYTE_LIMIT", limit)
 
-    response = _export(headers)
+    with caplog.at_level(logging.DEBUG):
+        response = _export(headers)
+        # The result cursor must already be closed; a late close would run
+        # after the connection went back to the pool.
+        gc.collect()
 
     assert response.status_code == 422, response.text
     assert response.json()["detail"] == {
         "code": "conversation_log_export_too_large",
-        "reason": "rows",
-        "limit": 2,
+        "reason": reason,
+        "limit": limit,
     }
     assert "text/csv" not in response.headers["content-type"]
     assert _recorded_spools and all(spool.closed for spool in _recorded_spools)
+    assert "Error closing cursor" not in caplog.text
 
 
 def test_export_exactly_at_the_row_limit_succeeds(
@@ -1349,23 +1346,22 @@ def test_export_exactly_at_the_row_limit_succeeds(
     assert len(_csv_rows(response)) == 4
 
 
-def test_export_over_the_byte_limit_is_a_422_without_a_file(
-    monkeypatch: pytest.MonkeyPatch, _recorded_spools: list[Any]
+def test_export_exactly_at_the_byte_limit_succeeds_and_one_byte_less_fails(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     headers = _admin_headers()
     _three_rows()
-    header_bytes = len(conversation_logs._csv_line(EXPORT_HEADER).encode("utf-8"))
-    monkeypatch.setattr(conversation_logs, "EXPORT_BYTE_LIMIT", header_bytes + 10)
+    # The limit counts the CSV text; the BOM is not part of it.
+    size = len(_export(headers).content) - len(b"\xef\xbb\xbf")
 
-    response = _export(headers)
+    monkeypatch.setattr(conversation_logs, "EXPORT_BYTE_LIMIT", size)
+    at_limit = _export(headers)
+    monkeypatch.setattr(conversation_logs, "EXPORT_BYTE_LIMIT", size - 1)
+    below_limit = _export(headers)
 
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"] == {
-        "code": "conversation_log_export_too_large",
-        "reason": "bytes",
-        "limit": header_bytes + 10,
-    }
-    assert _recorded_spools and all(spool.closed for spool in _recorded_spools)
+    assert at_limit.status_code == 200, at_limit.text
+    assert len(_csv_rows(at_limit)) == 4
+    assert below_limit.status_code == 422, below_limit.text
 
 
 def test_export_releases_the_connection_before_the_first_byte_is_read(

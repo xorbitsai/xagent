@@ -283,6 +283,7 @@ _trigger_dispatcher_task: asyncio.Task[Any] | None = None
 _task_command_dispatcher_task: asyncio.Task[Any] | None = None
 _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 _sandbox_warmup_task: asyncio.Task[None] | None = None
+SANDBOX_WARMUP_TASK_NAME = "sandbox-warmup"
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
@@ -2742,6 +2743,7 @@ async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
     # runs after admission opens instead of inside the activation budget.
     global _sandbox_warmup_task
     _sandbox_warmup_task = asyncio.create_task(_run_sandbox_warmup(sandbox_mgr))
+    _sandbox_warmup_task.set_name(SANDBOX_WARMUP_TASK_NAME)
     logger.info("Sandbox manager initialized; warmup started in the background")
 
     from ..config import get_sandbox_idle_ttl

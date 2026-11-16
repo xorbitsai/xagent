@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, cast
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, case, insert, select
+from sqlalchemy import and_, case, exists, insert, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -68,9 +68,10 @@ SWEEP_INTERVAL_SECONDS = 60.0
 ENFORCEMENT_HEARTBEAT_SECONDS = 5.0
 ENFORCEMENT_LEASE = timedelta(seconds=15)
 _MIN_THRESHOLD = timedelta(minutes=1)
-# A row unused for longer than this cannot back any valid token: its refresh
-# token was last rotated no later than last_used_at, and every access token
-# expires within its own lifetime.
+# A row unused for longer than this cannot back any valid access token, nor a
+# refresh token issued under the current lifetime: its refresh token was last
+# rotated no later than last_used_at. The sweep also keeps any row a still
+# valid refresh token points to, in case the lifetime was lowered since.
 _RETENTION = (
     timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -796,9 +797,15 @@ def sweep_browser_sessions(
                     synchronize_session=False,
                 )
             )
+    # Retention follows the current refresh lifetime; a refresh token issued
+    # under a longer one (before it was lowered) can still point at its row.
+    held = exists().where(
+        User.browser_session_id == BrowserSession.sid,
+        User.refresh_token_expires_at > now,
+    )
     deleted = (
         db.query(BrowserSession)
-        .filter(BrowserSession.last_used_at < now - _RETENTION)
+        .filter(BrowserSession.last_used_at < now - _RETENTION, ~held)
         .delete(synchronize_session=False)
     )
     db.commit()

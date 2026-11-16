@@ -29,7 +29,10 @@ interface WidgetVoiceStateRow {
 /**
  * Every event a widget voice call reacts to and what the visitor then sees.
  * The rows with `match` are also the transport classifier: an event is read
- * by the first row that matches it.
+ * by the first row with a match that names a body code and fits it, and
+ * otherwise by the first row with any match that fits it (see
+ * `classifyWidgetVoiceEvent`). An error frame sent before a close is read on
+ * its own, so its code, not the close that follows, decides the outcome.
  */
 export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 1, event: "call button pressed", result: "audio unlocked in the click, then the microphone, then recognition" },

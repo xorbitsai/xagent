@@ -16,8 +16,8 @@ not the policy is enabled.
 Switching the policy off must not revive a login that expired while it was
 enforced, including one no request saw expire. Replicas with the policy
 enabled keep renewing an enforcement lease (``browser_idle_enforcement``). With
-the policy disabled, a login whose deadline passed before the lease ended is
-still rejected; a login alive at switch-off is free at once.
+the policy disabled, a login whose deadline passed no later than the lease end
+is still rejected; a login alive at switch-off is free at once.
 Deployments that never enable the policy have no lease and behave as before.
 
 Rows live in the database, so all workers see the same state and it survives

@@ -51,7 +51,7 @@ class BrowserIdleEnforcement(Base):  # type: ignore[no-any-unimported]
 
     Every replica with the policy enabled pushes the row for its own
     thresholds a lease ahead of now. With the policy disabled, a login that
-    expired under any recorded threshold set before that set's
+    expired under any recorded threshold set no later than that set's
     ``enforced_until`` stays rejected, so switching the policy off cannot
     revive it, even after a rolling threshold change.
     """

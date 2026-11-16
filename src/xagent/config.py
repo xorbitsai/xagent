@@ -71,6 +71,7 @@ ENCRYPTION_MIGRATION_KEY = "XAGENT_ENCRYPTION_MIGRATION_KEY"
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
 TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
+WS_RESTART_CLOSE_WINDOW_SECONDS = "XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -542,6 +543,27 @@ def get_task_reply_wait_timeout_seconds() -> int:
         "Invalid %s=%r; falling back to 30", TASK_REPLY_WAIT_TIMEOUT_SECONDS, value
     )
     return 30
+
+
+def get_ws_restart_close_window_seconds() -> float:
+    """Window over which a planned restart spreads its WebSocket closes.
+
+    Env override, default 0 (close all at once). Negative, non-finite or
+    unparsable values fall back to 0 with a warning.
+    """
+    value = os.getenv(WS_RESTART_CLOSE_WINDOW_SECONDS)
+    if value is None or not value.strip():
+        return 0.0
+    try:
+        seconds = float(value)
+        if math.isfinite(seconds) and seconds >= 0:
+            return seconds
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r; falling back to 0", WS_RESTART_CLOSE_WINDOW_SECONDS, value
+    )
+    return 0.0
 
 
 def get_input_review_timeout_seconds() -> float:

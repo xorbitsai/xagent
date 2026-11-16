@@ -455,6 +455,29 @@ def test_a_promotion_that_expired_a_login_is_recorded_for_a_later_demotion(
     _assert_idle_rejection(_refresh(member))
 
 
+def test_a_rolling_change_mixing_threshold_orders_keeps_the_promotion(monkeypatch):
+    """This replica gives admins 60 minutes; another still enforces 15."""
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_ADMIN_MINUTES, "60")
+    _users()
+    member = _login("member")
+    _idle_for(member, 20)  # Alive under 30/60, expired as an admin under 30/15.
+    other = BrowserIdlePolicy(enabled=True, ordinary_minutes=30, admin_minutes=15)
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session, policy=other)
+        session.query(User).filter_by(username="member").one().is_admin = True
+        session.commit()
+        browser_idle.renew_enforcement_lease(session)  # This replica's heartbeat.
+        browser_idle.record_current_admin_roles(session)
+        session.commit()
+    assert _row(_sid(member)).recorded_admin is True
+
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = False
+        session.commit()
+    _assert_idle_rejection(_verify(member))
+
+
 def test_activity_records_the_current_role(enforced):
     _users()
     member = _login("member")

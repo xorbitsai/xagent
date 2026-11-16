@@ -1322,10 +1322,13 @@ def start_retention_purge_task(
 
 
 def start_browser_session_sweep_task(app_instance: FastAPI) -> asyncio.Task[Any] | None:
-    """Revoke idle-expired browser logins and prune old rows every minute.
+    """Renew the enforcement lease and sweep browser logins.
 
-    Runs on every replica; each sweep is an idempotent conditional UPDATE.
-    Revocation happens only while the idle policy is enabled; pruning always.
+    Runs on every replica. While the idle policy is enabled it renews this
+    replica's enforcement lease and records current admins' roles every few
+    seconds (so a switch-off or demotion cannot revive expired logins) and
+    revokes idle-expired logins every minute; old rows are pruned either way.
+    Each step is an idempotent conditional write.
     """
     from .browser_idle import run_browser_session_sweep_loop
     from .models.database import get_session_local

@@ -113,11 +113,8 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
     assert len({owner for _, owner in events}) == 1
     assert events[0][1] != threading.get_ident()
     events.clear()
-    # Force a different token so UPDATE is observable even within one JWT second,
-    # keeping the login's sid so the refresh takes the production fence path.
-    from unittest.mock import patch
-
-    real_create_refresh_token = auth.create_refresh_token
+    # The refresh token keeps the login's sid, so the refresh takes the
+    # production fence path; its jti makes the rotated value differ.
     updated_tables: list[str] = []
 
     @event.listens_for(engine, "before_cursor_execute")
@@ -126,13 +123,9 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
             # PostgreSQL runs in a per-test schema: keep only the table name.
             updated_tables.append(sql.split()[1].replace('"', "").rsplit(".", 1)[-1])
 
-    def rotated(data):
-        return real_create_refresh_token({**data, "rotation": "test"})
-
-    with patch.object(auth, "create_refresh_token", side_effect=rotated):
-        renewed = await auth.refresh_token(
-            auth.RefreshTokenRequest(refresh_token=response["refresh_token"]), factory
-        )
+    renewed = await auth.refresh_token(
+        auth.RefreshTokenRequest(refresh_token=response["refresh_token"]), factory
+    )
     assert renewed.refresh_token != response["refresh_token"]
     sid = token_browser_session_id(response["refresh_token"])
     assert sid is not None

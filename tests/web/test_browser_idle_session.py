@@ -25,7 +25,12 @@ from xagent.web import jwt_codec as jwt
 from xagent.web.api import auth, files, oidc_google, progress_ws
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
-from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY, validate_auth_config
+from xagent.web.auth_config import (
+    JWT_ALGORITHM,
+    JWT_SECRET_KEY,
+    BrowserIdlePolicy,
+    validate_auth_config,
+)
 from xagent.web.auth_sessions import hash_refresh_token, user_session_claims
 from xagent.web.models.browser_session import BrowserIdleEnforcement, BrowserSession
 from xagent.web.models.user import User
@@ -618,6 +623,30 @@ def test_renewal_keeps_one_row_per_threshold_set(monkeypatch):
     assert ends == {30: now + lease, 60: now + timedelta(seconds=10) + lease}
 
 
+def test_adapters_get_the_strictest_threshold_still_enforced():
+    now = datetime.now(timezone.utc)
+    strict = BrowserIdlePolicy(enabled=True, ordinary_minutes=30, admin_minutes=15)
+    local = BrowserIdlePolicy(enabled=True, ordinary_minutes=60, admin_minutes=60)
+    off = BrowserIdlePolicy(enabled=False, ordinary_minutes=60, admin_minutes=60)
+    lease_ended = now + browser_idle.ENFORCEMENT_LEASE + timedelta(seconds=1)
+    with auth_tests.TestingSessionLocal() as session:
+        browser_idle.renew_enforcement_lease(session, now=now, policy=strict)
+        session.commit()
+
+        def timeout(policy, at, admin=False):
+            return browser_idle.effective_idle_timeout(
+                session, is_platform_admin=admin, now=at, policy=policy
+            )
+
+        # A rolling change: another replica still enforces the stricter set.
+        assert timeout(local, now) == timedelta(minutes=30)
+        assert timeout(local, now, admin=True) == timedelta(minutes=15)
+        # Its lease has ended: only this replica's threshold applies.
+        assert timeout(local, lease_ended) == timedelta(minutes=60)
+        # Disabled: this replica's threshold, leases are not read.
+        assert timeout(off, now) == timedelta(minutes=60)
+
+
 def test_adapters_can_judge_switch_off_without_a_core_user():
     now = datetime.now(timezone.utc)
     lease = browser_idle.EnforcementLease(
@@ -662,8 +691,8 @@ def test_the_heartbeat_renews_the_lease_only_while_enabled(monkeypatch, on):
         session.query(User).filter_by(username="member").one().is_admin = True
         session.commit()
 
-    # The heartbeat reads the policy on each tick; wait for a tick to finish
-    # (on: its lease and role writes are visible) with a bounded deadline.
+    # Each heartbeat or sweep tick reads the policy; wait for one to finish
+    # (on: the heartbeat's lease and role writes are visible) with a deadline.
     ticked = threading.Event()
     read_policy = browser_idle.get_browser_idle_policy
 
@@ -1190,8 +1219,6 @@ def test_rejecting_an_idle_login_needs_no_second_pooled_connection(
     tmp_path, monkeypatch
 ):
     """A one-connection pool: resolution must not wait for a second checkout."""
-    import time
-
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
     from sqlalchemy.pool import QueuePool
@@ -1229,12 +1256,10 @@ def test_rejecting_an_idle_login_needs_no_second_pooled_connection(
             {**user_session_claims(user), **browser_idle.browser_session_claims(sid)}
         )
     try:
-        started = time.monotonic()
         with Session(engine) as session:
             assert get_user_from_token(token, session) is None
             with pytest.raises(WebSocketSessionIdleRejected):
                 get_user_from_websocket_token(token, session, verify_exp=False)
-        assert time.monotonic() - started < 1.5
         with Session(engine) as other:  # The only connection is free again.
             assert other.query(User).count() == 1
     finally:

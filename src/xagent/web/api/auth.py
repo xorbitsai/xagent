@@ -3076,7 +3076,7 @@ async def refresh_token(
 
 
 @auth_router.post("/logout")
-async def logout(
+def logout(
     request: Optional[LogoutRequest] = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

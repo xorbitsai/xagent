@@ -309,16 +309,22 @@ def _lease_conditions(
     for lease in leases:
         cutoff_end = min(now, lease.until)
         conditions.append(
-            BrowserSession.last_activity_at
-            > case(
-                (
-                    BrowserSession.recorded_admin.is_(True),
-                    cutoff_end - lease.strictest_timeout(True, current),
-                ),
-                else_=cutoff_end - lease.strictest_timeout(False, current),
+            _active_after(
+                cutoff_end - lease.strictest_timeout(True, current),
+                cutoff_end - lease.strictest_timeout(False, current),
             )
         )
     return conditions
+
+
+def _active_after(
+    recorded_admin_cutoff: datetime, recorded_member_cutoff: datetime
+) -> Any:
+    """SQL: last activity is after the cutoff for the row's recorded role."""
+    return BrowserSession.last_activity_at > case(
+        (BrowserSession.recorded_admin.is_(True), recorded_admin_cutoff),
+        else_=recorded_member_cutoff,
+    )
 
 
 def _alive_condition(
@@ -337,13 +343,9 @@ def _alive_condition(
     conditions = _lease_conditions(enforcement_leases(db), current=current, now=now)
     if policy.enabled:
         conditions.append(
-            BrowserSession.last_activity_at
-            > case(
-                (
-                    BrowserSession.recorded_admin.is_(True),
-                    now - _current_timeout(user, True, policy),
-                ),
-                else_=now - _current_timeout(user, False, policy),
+            _active_after(
+                now - _current_timeout(user, True, policy),
+                now - _current_timeout(user, False, policy),
             )
         )
     return and_(*conditions) if conditions else None

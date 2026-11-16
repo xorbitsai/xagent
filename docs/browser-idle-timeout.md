@@ -36,9 +36,10 @@ device does not end the first device's login: as before, the first device
 fails at its next refresh, and until then it follows its own idle deadline.
 
 Rows live in the database, so every replica sees the same state and it survives
-restarts. Activity, refresh and logout use conditional UPDATEs on the login's
-row (taken before the `users` row) that repeat the deadline and revocation
-tests, so a request racing expiry cannot revive a login.
+restarts. Activity and refresh update the login's row with conditional
+UPDATEs that repeat the deadline and revocation tests, so a request racing
+expiry cannot revive a login. Refresh, and logout with the policy on, take the
+login's row before the `users` row.
 
 ## Activity
 
@@ -113,10 +114,11 @@ expired"). An access token past its own expiry still gets
 `TokenExpired`, and a refresh token already replaced by a newer login gets the
 existing invalid-refresh-token error.
 
-401 responses carry `WWW-Authenticate: Bearer` and apply to every route using
-`get_current_user`, refresh, verify, activity, file stream tickets and OAuth
-launch/handoff tickets; optional authentication treats the request as
-anonymous. An open WebSocket is closed with code 4010. A rejected WebSocket
+These 401 responses carry `WWW-Authenticate: Bearer` and apply to every route
+using `get_current_user`, refresh, verify and activity; optional authentication
+treats the request as anonymous. File stream tickets and OAuth launch/handoff
+tickets minted for a rejected login are refused with their existing 401
+responses. An open WebSocket is closed with code 4010. A rejected WebSocket
 handshake keeps the endpoint's existing close code (4001 or 1008); on 4001 the
 browser refreshes once and then receives `SessionIdleExpired`. Do not refresh
 on `SessionIdleExpired` or 4010; `TokenExpired` and 4001 keep their meaning.

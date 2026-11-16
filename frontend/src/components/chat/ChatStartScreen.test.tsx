@@ -547,3 +547,44 @@ describe("ChatStartScreen during a voice call", () => {
     expect(screen.getByTestId("team-strip").closest("[aria-hidden='true']")).toBeNull()
   })
 })
+
+describe("ChatStartScreen with a provided voice call", () => {
+  function Published() {
+    const call: VoiceCall = {
+      open: true, phase: "listening", active: true, caption: "", muted: false, status: "Listening",
+      settingsLink: false, retryable: true, retryDisabled: false,
+      level: () => 0, retry: vi.fn(), end: vi.fn(), toggleMute: vi.fn(),
+    }
+    usePublishVoiceCall(call)
+    return null
+  }
+
+  it("shows the orb with dictation off and hands the source to the composer", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const openVoice = vi.fn()
+    render(
+      <VoiceCallStoreProvider>
+        <Published />
+        <ChatStartScreen title="Support Agent" onSend={vi.fn()} voiceInputEnabled={false}
+          onVoiceConversation={openVoice} voiceConversationSource="provided" />
+      </VoiceCallStoreProvider>
+    )
+    expect(screen.getByTestId("voice-orb-hero")).toBeInTheDocument()
+    const props = chatInputProps.current as unknown as Record<string, unknown>
+    expect(props.voiceConversationSource).toBe("provided")
+    expect(props.onVoiceConversation).toBe(openVoice)
+    expect(props.voiceInputEnabled).toBe(false)
+  })
+
+  it("keeps the account source by default, where dictation off hides the orb", () => {
+    render(
+      <VoiceCallStoreProvider>
+        <Published />
+        <ChatStartScreen title="Support Agent" onSend={vi.fn()} voiceInputEnabled={false} onVoiceConversation={vi.fn()} />
+      </VoiceCallStoreProvider>
+    )
+    expect(screen.queryByTestId("voice-orb-hero")).not.toBeInTheDocument()
+    expect((chatInputProps.current as unknown as Record<string, unknown>).voiceConversationSource).toBe("account")
+  })
+})

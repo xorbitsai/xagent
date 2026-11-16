@@ -287,6 +287,39 @@ describe("ChatInput", () => {
     expect(container.querySelector("[contenteditable]")?.closest(".hidden")).toBeNull()
   })
 
+  it.each([
+    { label: "the start screen composer", compact: true },
+    { label: "the conversation panel composer", compact: false },
+  ])("offers a provided call in $label without dictation or a model lookup", async ({ compact }) => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    const openVoice = vi.fn()
+    function Harness({ call }: { call: VoiceCall | null }) {
+      return (
+        <VoiceCallStoreProvider>
+          {call && <PublishedCall call={call} />}
+          <ChatInput onSend={vi.fn()} onVoiceConversation={openVoice} voiceConversationSource="provided"
+            voiceInputEnabled={false} inputValue="" onInputChange={vi.fn()} compact={compact} hideConfig />
+        </VoiceCallStoreProvider>
+      )
+    }
+    const view = render(<Harness call={null} />)
+    const button = screen.getByRole("button", { name: "voiceConversation.open" })
+    expect(button).toBeEnabled()
+    fireEvent.click(button)
+    expect(openVoice).toHaveBeenCalledOnce()
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
+    view.rerender(<Harness call={fakeCall()} />)
+    expect(await screen.findByTestId("voice-call-bar")).toBeInTheDocument()
+    await Promise.resolve()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("keeps the account call behind dictation when no source is given", () => {
+    render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} voiceInputEnabled={false}
+      inputValue="" onInputChange={vi.fn()} hideConfig />)
+    expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
+  })
+
   it("labels the non-compact send icon and submits through it", async () => {
     const onSend = vi.fn()
     render(<ChatInput onSend={onSend} inputValue="Send my draft" onInputChange={vi.fn()}

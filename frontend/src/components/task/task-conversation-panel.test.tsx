@@ -876,6 +876,23 @@ describe("TaskConversationPanel", () => {
     expect(chatInputProps.current?.onVoiceConversation).toBeUndefined()
   })
 
+  it("hands a provided voice call to the composer without mounting the signed-in call", () => {
+    const openVoice = vi.fn()
+    appControls.voiceInputEnabled = false
+    render(<TaskConversationPanel mode="page" onProvidedVoiceConversation={openVoice} />)
+    const props = chatInputProps.current as unknown as Record<string, unknown>
+    expect(props.voiceConversationSource).toBe("provided")
+    expect(props.onVoiceConversation).toBe(openVoice)
+    expect(props.voiceInputEnabled).toBe(false)
+    expect(voiceProps.current).toBeNull()
+  })
+
+  it("keeps the account voice source when no call is provided", () => {
+    render(<TaskConversationPanel mode="page" voiceConversationEnabled />)
+    expect((chatInputProps.current as unknown as Record<string, unknown>).voiceConversationSource).toBe("account")
+    expect(voiceProps.current).not.toBeNull()
+  })
+
   it("omits task controls from ChatInput when the transport disables them", () => {
     appControls.taskControlsEnabled = false
 

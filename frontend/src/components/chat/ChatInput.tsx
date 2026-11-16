@@ -87,6 +87,14 @@ interface ChatInputProps {
   voiceInputEnabled?: boolean;
   onVoiceConversation?: (config: AgentConfig) => void;
   voiceConversationDisabled?: boolean;
+  // Who supplies the voice call. "account" (the default) runs it on the
+  // signed-in user's own speech models, so the call button also needs
+  // dictation to be enabled and looks the models up. "provided" means the
+  // caller already decided a call is available (for example a widget whose
+  // server advertised voice): the call button and the call bar follow
+  // `onVoiceConversation` alone and no model lookup is made. Dictation always
+  // follows `voiceInputEnabled`.
+  voiceConversationSource?: "account" | "provided";
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
@@ -186,6 +194,7 @@ export function ChatInput({
   voiceInputEnabled = true,
   onVoiceConversation,
   voiceConversationDisabled = false,
+  voiceConversationSource = "account",
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
@@ -224,7 +233,8 @@ export function ChatInput({
   const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
-  const voiceModels = useVoiceModels(Boolean(voiceInputEnabled && onVoiceConversation));
+  const voiceProvided = voiceConversationSource === "provided";
+  const voiceModels = useVoiceModels(Boolean(!voiceProvided && voiceInputEnabled && onVoiceConversation));
   const voiceCall = useVoiceCallView();
 
   useEffect(() => {
@@ -915,7 +925,7 @@ export function ChatInput({
   const showStopButton = offersStopControl && !hasDraft;
   // With nothing typed, the composer's main action starts a voice call; once
   // there is something to send it becomes the send button.
-  const voiceOffered = Boolean(voiceInputEnabled && onVoiceConversation);
+  const voiceOffered = Boolean((voiceProvided || voiceInputEnabled) && onVoiceConversation);
   const showVoiceStart = Boolean(voiceOffered && !hasDraft && !isInputBusy && !showStopButton);
   // The stop control and the send control take turns in the same slot, so the
   // size and the box styling come from here instead of each of them carrying
@@ -1078,9 +1088,9 @@ export function ChatInput({
   // still accepts live guidance for that run.
   const voiceRunInProgress = Boolean(isLoading)
     || ["running", "pending", "pause_requested", "resume_requested"].includes(String(normalizedTaskStatus));
-  const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
+  const voiceConversationButton = voiceOffered && onVoiceConversation ? (
     <VoiceModeButton iconOnly
-      reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
+      reason={voiceProvided ? undefined : voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
       disabled={voiceConversationDisabled || isInputBusy || voiceRunInProgress || voiceInput.status !== "idle"}
       disabledHint={voiceRunInProgress ? t("voiceConversation.busy") : undefined}
       onClick={() => {

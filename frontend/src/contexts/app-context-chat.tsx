@@ -518,6 +518,7 @@ export interface Interaction {
 import {
   useWebSocket,
   MessageDeliveryError,
+  type ConnectionPhase,
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
@@ -2760,6 +2761,9 @@ interface AppContextType {
   sameTaskReconnects: number
   connectionError: Error | null
   connectionNotice: ConnectionNotice
+  // The chat socket's lifecycle as use-websocket derives it. "lost" means no
+  // socket is open, none is opening and no reconnect is scheduled.
+  connectionPhase: ConnectionPhase
   startNewConversation: () => Promise<void>
   canStopTask: boolean
   stopTask: () => void
@@ -8610,6 +8614,7 @@ export function AppProvider({
           sameTaskReconnects,
           connectionError,
           connectionNotice,
+          connectionPhase,
           startNewConversation,
           canStopTask,
           stopTask,

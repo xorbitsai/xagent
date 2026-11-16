@@ -96,6 +96,8 @@ type ChatStartScreenProps = {
   attachmentsBusy?: boolean;
   voiceInputEnabled?: boolean;
   onVoiceConversation?: React.ComponentProps<typeof ChatInput>["onVoiceConversation"];
+  // Passed to the input; see ChatInput for what "provided" changes.
+  voiceConversationSource?: React.ComponentProps<typeof ChatInput>["voiceConversationSource"];
   taskConfig?: React.ComponentProps<typeof ChatInput>["taskConfig"];
   autoFocus?: boolean;
   inputMinHeightClass?: string;
@@ -133,6 +135,7 @@ export function ChatStartScreen({
   attachmentsBusy = false,
   voiceInputEnabled = true,
   onVoiceConversation,
+  voiceConversationSource = "account",
   taskConfig,
   autoFocus = false,
   inputMinHeightClass,
@@ -168,7 +171,7 @@ export function ChatStartScreen({
 
   // During a voice call the greeting gives way to the orb.
   const voiceCall = useVoiceCallView();
-  const voiceHero = Boolean(voiceCall && voiceInputEnabled && onVoiceConversation);
+  const voiceHero = Boolean(voiceCall && (voiceConversationSource === "provided" || voiceInputEnabled) && onVoiceConversation);
 
   return (
     <div className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center">
@@ -236,6 +239,7 @@ export function ChatStartScreen({
             attachmentsBusy={attachmentsBusy}
             voiceInputEnabled={voiceInputEnabled}
             onVoiceConversation={onVoiceConversation}
+            voiceConversationSource={voiceConversationSource}
             hideFileUpload={filesBlocked}
             taskConfig={taskConfig}
             autoFocus={autoFocus}

@@ -166,6 +166,18 @@ const zh = {
       stopped: "已停止",
       error: "语音连接已结束，请检查麦克风和模型配置后重试。",
     },
+    // Calls in an embedded chat: the visitor has no account or settings.
+    widget: {
+      unavailable: "语音通话暂不可用。",
+      busy: "语音通话繁忙，请稍后再试。",
+      tryLater: "请稍后再试。",
+      temporarilyUnavailable: "语音暂时不可用，请稍后再试。",
+      sessionTimeout: "通话已超时，请重试以继续。",
+      microphoneDenied: "无法使用麦克风。请确认麦克风已连接并允许此页面使用，然后重试。",
+      playbackFailed: "部分语音未能播放。",
+      sendFailed: "消息发送失败，请重试。",
+      connectionEnded: "通话意外中断，请重试。",
+    },
   },
   voiceInput: {
     start: "语音输入",

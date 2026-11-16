@@ -166,6 +166,18 @@ const en = {
       stopped: "Stopped",
       error: "Voice connection ended. Check your microphone and models, then try again.",
     },
+    // Calls in an embedded chat: the visitor has no account or settings.
+    widget: {
+      unavailable: "Voice calls are not available right now.",
+      busy: "Voice calls are busy. Please try again in a moment.",
+      tryLater: "Please try again in a moment.",
+      temporarilyUnavailable: "Voice is temporarily unavailable. Please try again later.",
+      sessionTimeout: "The call timed out. Try again to continue.",
+      microphoneDenied: "The microphone could not be used. Check that it is connected and allowed for this page, then try again.",
+      playbackFailed: "Part of the reply could not be played.",
+      sendFailed: "Your message could not be sent. Please try again.",
+      connectionEnded: "The call ended unexpectedly. Please try again.",
+    },
   },
   voiceInput: {
     start: "Voice input",

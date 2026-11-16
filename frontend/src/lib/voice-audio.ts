@@ -12,6 +12,32 @@ export class VoiceAudioError extends Error {
 /** Which side of the call a level reading is for. */
 export type VoiceLevelSource = "mic" | "output"
 
+/**
+ * Where a call's speech traffic goes and how its credential failures read.
+ * The signed-in call builds its own from the login (see `VoiceAudio`); other
+ * callers supply one and own every address and credential in it.
+ */
+export interface VoiceAudioTransport {
+  /** Open the recognition socket (address and handshake credential). */
+  openAsrSocket(): WebSocket
+  /** The JSON frame sent as soon as the recognition socket opens. */
+  startFrame: object
+  /** Send one synthesis request; resolves with the raw response. */
+  requestTts(text: string, signal: AbortSignal): Promise<Response>
+  /** The credential failure a refused response or socket close means, if any. */
+  authFailure(failure: Response | CloseEvent): VoiceAudioFailure | undefined
+}
+
+/** What a call reports back while it runs, whoever supplies its transport. */
+export interface VoiceAudioCallbacks {
+  /** See `VoiceAudio`'s `context` option. */
+  context?: AudioContext
+  activity: (active: boolean) => void
+  transcript: (type: "partial" | "final", text: string, segmentId: number) => void
+  error: (reason?: VoiceAudioFailure) => void
+  vadFallback?: () => void
+}
+
 /** One call owns its microphone, socket, playback sources and fetches. */
 export class VoiceAudio {
   private closed = false
@@ -59,7 +85,41 @@ export class VoiceAudio {
     transcript: (type: "partial" | "final", text: string, segmentId: number) => void
     error: (reason?: VoiceAudioFailure) => void
     vadFallback?: () => void
-  }) {}
+    /**
+     * Speech traffic for a caller that is not the signed-in user. Without it
+     * the call talks to the signed-in speech endpoints with `token`, and
+     * synthesis uses the current login only while it is still `sessionId`.
+     */
+    transport?: VoiceAudioTransport
+  }) {
+    this.transport = options.transport ?? this.accountTransport()
+  }
+
+  private transport: VoiceAudioTransport
+
+  private accountTransport(): VoiceAudioTransport {
+    const options = this.options
+    return {
+      openAsrSocket: () => new WebSocket(`${getWsUrl().replace(/\/$/, "")}/api/models/speech/asr/stream`, websocketAuthProtocols(options.token)),
+      startFrame: {
+        type: "start", model_id: options.asr, format: "pcm", sample_rate: 16000,
+        vad: true, vad_silence_threshold_secs: options.vadSilenceThreshold,
+      },
+      requestTts: (text, signal) => {
+        const login = readAuthSessionSnapshot()
+        const token = login.accessToken
+        if (!token || login.sessionId !== options.sessionId) throw new VoiceAudioError("authentication_required")
+        return fetch(`${getApiUrl()}/api/models/speech/tts/stream`, {
+          method: "POST", signal,
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model_id: options.tts, voice: options.voice, text, format: "pcm", sample_rate: 24000 }),
+        })
+      },
+      authFailure: failure => (failure instanceof Response
+        ? failure.status === 401 || failure.status === 403
+        : failure.code === 4001) ? "authentication_required" : undefined,
+    }
+  }
 
   async start(): Promise<void> {
     this.context = this.options.context ?? new AudioContext()
@@ -90,15 +150,12 @@ export class VoiceAudio {
       if (this.serverSpeaking) { this.serverSpeaking = false; this.options.activity(false) }
       this.vad = vad
     }).catch(() => this.useServerVad())
-    const socket = new WebSocket(`${getWsUrl().replace(/\/$/, "")}/api/models/speech/asr/stream`, websocketAuthProtocols(this.options.token))
+    const socket = this.transport.openAsrSocket()
     this.socket = socket
     await new Promise<void>((resolve, reject) => {
       this.rejectReady = reject
       this.readyTimeout = setTimeout(() => this.fail("connection_failed"), 30000)
-      socket.onopen = () => socket.send(JSON.stringify({
-        type: "start", model_id: this.options.asr, format: "pcm", sample_rate: 16000,
-        vad: true, vad_silence_threshold_secs: this.options.vadSilenceThreshold,
-      }))
+      socket.onopen = () => socket.send(JSON.stringify(this.transport.startFrame))
       socket.onmessage = ({ data }) => {
         if (this.closed) return
         try {
@@ -123,7 +180,7 @@ export class VoiceAudio {
         } catch { this.fail("connection_failed") }
       }
       socket.onerror = () => this.fail("connection_failed")
-      socket.onclose = event => this.fail(event.code === 4001 ? "authentication_required" : event.reason === "Speech session timed out" ? "session_timeout" : "connection_failed")
+      socket.onclose = event => this.fail(this.transport.authFailure(event) ?? (event.reason === "Speech session timed out" ? "session_timeout" : "connection_failed"))
     })
     if (this.closed) return
     const resampler = new VoiceResampler(context.sampleRate)
@@ -193,18 +250,12 @@ export class VoiceAudio {
     const controller = new AbortController()
     this.synthesis = controller
     const signal = controller.signal
-    const login = readAuthSessionSnapshot()
-    const token = login.accessToken
-    if (!token || login.sessionId !== this.options.sessionId) throw new VoiceAudioError("authentication_required")
     // A synthesis request is billable; never automatically replay a failed POST.
-    const response = await fetch(`${getApiUrl()}/api/models/speech/tts/stream`, {
-      method: "POST", signal,
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: this.options.tts, voice: this.options.voice, text, format: "pcm", sample_rate: 24000 }),
-    })
+    const response = await this.transport.requestTts(text, signal)
     if (!response.ok || !response.body) {
       await response.body?.cancel()
-      if (response.status === 401 || response.status === 403) throw new VoiceAudioError("authentication_required")
+      const failure = this.transport.authFailure(response)
+      if (failure) throw new VoiceAudioError(failure)
       throw new Error("Speech synthesis failed")
     }
     const rate = Number(response.headers.get("X-Audio-Sample-Rate"))
@@ -274,4 +325,12 @@ export class VoiceAudio {
     this.microphone?.getTracks().forEach(track => track.stop())
     void this.context?.close().catch(() => {})
   }
+}
+
+/**
+ * A call whose speech traffic is not the signed-in user's: the caller must
+ * supply every address and credential, so it can never fall back to the login.
+ */
+export function createWidgetVoiceAudio(transport: VoiceAudioTransport, callbacks: VoiceAudioCallbacks): VoiceAudio {
+  return new VoiceAudio({ ...callbacks, transport, asr: "", tts: "", token: "", sessionId: null })
 }

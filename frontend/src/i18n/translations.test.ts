@@ -194,6 +194,18 @@ describe("translations", () => {
     )
   })
 
+  it("keeps embedded-chat voice copy free of account and settings directions", () => {
+    for (const locale of ["en", "zh"] as const) {
+      const copy = translations[locale].voiceConversation.widget
+      assertTranslationLeavesNonEmpty(copy, `translations.${locale}.voiceConversation.widget`)
+      for (const text of Object.values(copy)) {
+        expect(text).not.toMatch(/sign in|log in|login|model|setting|登录|模型|设置/i)
+      }
+    }
+    expect(Object.keys(translations.zh.voiceConversation.widget).sort())
+      .toEqual(Object.keys(translations.en.voiceConversation.widget).sort())
+  })
+
   it("reports a missing dynamic key and uses its explicit fallback", () => {
     const onMissing = vi.fn()
 

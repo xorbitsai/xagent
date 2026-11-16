@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { VoiceAudio, VoiceAudioError } from "./voice-audio"
+import { createWidgetVoiceAudio, VoiceAudio, VoiceAudioError, type VoiceAudioTransport } from "./voice-audio"
 import { createVoiceVad } from "./voice-vad"
 
 const detectors = vi.hoisted(() => [] as Array<{ options: { speech: (active: boolean) => void; error: () => void }; process: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }>)
@@ -317,4 +317,82 @@ it.each([undefined, 0.5])("only submits an explicitly supported VAD timing overr
   expect(payload.vad_silence_threshold_secs).toBe(threshold)
   if (threshold === undefined) expect(payload).not.toHaveProperty("vad_silence_threshold_secs")
   call.close()
+})
+
+describe("injected speech transport", () => {
+  const callbacks = () => ({ activity: vi.fn(), transcript: vi.fn(), error: vi.fn(), vadFallback: vi.fn() })
+  const transport = (over: Partial<VoiceAudioTransport> = {}) => ({
+    openAsrSocket: vi.fn(() => new WebSocket("wss://widget.example/api/widget/voice/asr", ["guest-protocol"])),
+    startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
+    requestTts: vi.fn(async () => new Response(new Uint8Array([0, 0]), { headers: { "X-Audio-Format": "pcm", "X-Audio-Sample-Rate": "24000" } })),
+    authFailure: vi.fn((failure: Response | CloseEvent) => (
+      failure instanceof Response ? failure.status === 401 : failure.code === 4003) ? "authentication_required" as const : undefined),
+    ...over,
+  })
+
+  it("opens recognition and sends the start frame through the transport only", async () => {
+    const supplied = transport()
+    const call = createWidgetVoiceAudio(supplied, callbacks())
+    const socket = await start(call)
+    expect(supplied.openAsrSocket).toHaveBeenCalledOnce()
+    expect(Socket.instances).toHaveLength(1)
+    expect(socket.url).toBe("wss://widget.example/api/widget/voice/asr")
+    expect(socket.protocols).toEqual(["guest-protocol"])
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toEqual({ type: "start", format: "pcm", sample_rate: 16000 })
+    call.close()
+  })
+
+  it("synthesizes through the transport without reading the login", async () => {
+    const supplied = transport()
+    const request = vi.fn()
+    vi.stubGlobal("fetch", request)
+    login.sessionId = "some-other-login"
+    const call = createWidgetVoiceAudio(supplied, callbacks())
+    await start(call)
+    const speaking = call.speak("Hello")
+    for (let step = 0; step < 20 && !playback.length; step++) await Promise.resolve()
+    playback.forEach(source => source.onended?.())
+    await speaking
+    expect(supplied.requestTts).toHaveBeenCalledExactlyOnceWith("Hello", expect.any(AbortSignal))
+    expect(request).not.toHaveBeenCalled()
+    call.close()
+  })
+
+  it("lets the transport classify a refused socket close", async () => {
+    const events = callbacks()
+    const call = createWidgetVoiceAudio(transport(), events)
+    const socket = await start(call)
+    socket.onclose!({ code: 4003, reason: "" })
+    expect(events.error).toHaveBeenCalledExactlyOnceWith("authentication_required")
+  })
+
+  it("keeps the timeout reading for closes the transport does not classify", async () => {
+    const events = callbacks()
+    const call = createWidgetVoiceAudio(transport(), events)
+    const socket = await start(call)
+    socket.onclose!({ code: 1000, reason: "Speech session timed out" })
+    expect(events.error).toHaveBeenCalledExactlyOnceWith("session_timeout")
+  })
+
+  it.each([
+    { status: 401, outcome: { code: "authentication_required" } },
+    { status: 503, outcome: new Error("Speech synthesis failed") },
+  ])("lets the transport classify a refused synthesis ($status)", async ({ status, outcome }) => {
+    const supplied = transport({ requestTts: vi.fn(async () => new Response(null, { status })) })
+    const call = createWidgetVoiceAudio(supplied, callbacks())
+    await start(call)
+    if (outcome instanceof Error) await expect(call.speak("Hello")).rejects.toThrow(outcome.message)
+    else await expect(call.speak("Hello")).rejects.toMatchObject(outcome)
+    expect(supplied.requestTts).toHaveBeenCalledOnce()
+    call.close()
+  })
+
+  it("requires a transport for the widget call", () => {
+    // Compile-time contract: the widget factory has no login fallback.
+    const missing = () => {
+      // @ts-expect-error the transport is required
+      createWidgetVoiceAudio(undefined, callbacks())
+    }
+    expect(typeof missing).toBe("function")
+  })
 })

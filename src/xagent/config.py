@@ -1329,8 +1329,6 @@ def get_shared_task_execution_enabled() -> bool:
 
 def _positive_seconds_env(name: str, default: float) -> float:
     """A strictly positive, finite number of seconds; a bad value fails closed."""
-    import math
-
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
@@ -1355,7 +1353,8 @@ def get_standby_step_timeout_seconds() -> float:
 def get_sandbox_startup_cleanup_timeout_seconds() -> float:
     """Budget after which the startup quiesce issues no further stops.
 
-    Never cancels a stop already issued; see ``bounded_quiesce``.
+    Never cancels a stop already issued; see ``bounded_quiesce``. Containers
+    deferred by it are stopped in the background after activation.
     """
     return _positive_seconds_env(SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS, 20.0)
 
@@ -1363,6 +1362,17 @@ def get_sandbox_startup_cleanup_timeout_seconds() -> float:
 def get_task_event_bridge_start_timeout_seconds() -> float:
     """How long the task event bridge may retry Redis before start fails."""
     return _positive_seconds_env(TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS, 30.0)
+
+
+def validate_activation_timeouts() -> None:
+    """Fail at boot on a malformed activation timeout.
+
+    The three getters are strict and otherwise read only at activation time, by
+    which point the host may already have retired the serving generation.
+    """
+    get_standby_step_timeout_seconds()
+    get_sandbox_startup_cleanup_timeout_seconds()
+    get_task_event_bridge_start_timeout_seconds()
 
 
 def get_standby_enabled() -> bool:

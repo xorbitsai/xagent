@@ -1,5 +1,8 @@
 """Only the admin widget-voice API writes or returns the widget voice switch."""
 
+# Pytest fixture imports are intentionally shadowed by test parameters.
+# ruff: noqa: F811
+
 from __future__ import annotations
 
 import dataclasses
@@ -19,8 +22,16 @@ from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.schemas import v1 as v1_schemas
 from xagent.web.services import agent_management
 from xagent.web.services.agent_store import _AGENT_UPDATE_FIELDS
+from xagent.web.services.widget_voice import WidgetVoiceResolution
 
-from .conftest import _admin_headers, _direct_db_session, _register_second_user, client
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _install_one_slot_queue_pool,
+    _register_second_user,
+    client,
+)
+from .test_widget_voice_tts import voice  # noqa: F401
 from .test_workforce_widget import _create_workforce, _enable_widget
 
 pytestmark = pytest.mark.usefixtures("_test_db")
@@ -244,3 +255,73 @@ def test_admin_put_leaves_the_switch_when_model_resolution_fails(monkeypatch) ->
         response = client.put(path, headers=admin, json={"enabled": True})
         assert response.status_code == 500
         assert read() is False
+
+
+def _make_target(entity: str, voice) -> tuple[str, int]:
+    if entity == "agent":
+        return f"/api/admin/widget-voice/agents/{voice.agent_id}", voice.agent_id
+    workforce_id = _create_workforce("One slot workforce")
+    _enable_widget(workforce_id)
+    return f"/api/admin/widget-voice/workforces/{workforce_id}", workforce_id
+
+
+def _switch(entity: str, target_id: int) -> bool:
+    return (
+        _agent_switch(target_id) if entity == "agent" else _deployment_switch(target_id)
+    )
+
+
+@pytest.mark.parametrize("entity", ["agent", "workforce"])
+def test_admin_routes_answer_on_a_one_slot_pool(entity, voice, monkeypatch) -> None:
+    path, target_id = _make_target(entity, voice)
+    _install_one_slot_queue_pool(monkeypatch)
+    before = _switch(entity, target_id)
+    assert before is (entity == "agent")
+
+    first = client.get(path, headers=voice.admin)
+    assert first.status_code == 200, first.text
+    assert first.json() == {"enabled": before, "available": True, "reason": None}
+
+    written = client.put(path, headers=voice.admin, json={"enabled": not before})
+    assert written.status_code == 200, written.text
+    assert written.json() == {"enabled": not before, "available": True, "reason": None}
+    assert _switch(entity, target_id) is (not before)
+
+    after = client.get(path, headers=voice.admin)
+    assert after.status_code == 200, after.text
+    assert after.json()["enabled"] is (not before)
+
+
+@pytest.mark.parametrize("entity", ["agent", "workforce"])
+def test_admin_put_writes_nothing_when_the_target_disappears(
+    entity, voice, monkeypatch
+) -> None:
+    path, target_id = _make_target(entity, voice)
+
+    def delete_target(_owner_user_id):
+        db = _direct_db_session()
+        try:
+            if entity == "agent":
+                db.query(Agent).filter(Agent.id == target_id).delete()
+            else:
+                db.query(Deployment).filter_by(
+                    owner_type=DeploymentOwnerType.WORKFORCE.value, owner_id=target_id
+                ).delete()
+            db.commit()
+        finally:
+            db.close()
+        return WidgetVoiceResolution(None, "voice_models_not_configured")
+
+    monkeypatch.setattr(
+        admin_widget_voice, "resolve_widget_voice_models", delete_target
+    )
+    response = client.put(path, headers=voice.admin, json={"enabled": True})
+    assert response.status_code == 404, response.text
+    db = _direct_db_session()
+    try:
+        if entity == "agent":
+            assert db.query(Agent).filter(Agent.id == target_id).count() == 0
+        else:
+            assert db.query(Deployment).filter_by(owner_id=target_id).count() == 0
+    finally:
+        db.close()

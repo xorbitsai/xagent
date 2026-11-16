@@ -9,6 +9,8 @@ effect can be explained.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -16,10 +18,11 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.deployment import Deployment, DeploymentOwnerType
 from ..models.user import User
 from ..models.workforce import Workforce
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.widget_voice import (
     WidgetVoiceResolution,
@@ -74,53 +77,121 @@ def _workforce_deployment(
     return workforce, deployment
 
 
+@dataclass(frozen=True)
+class _Target:
+    """What the switch routes need from the target row, detached from its session."""
+
+    owner_user_id: int
+    enabled: bool
+
+
+def _read_agent(agent_id: int) -> _Target:
+    with get_session_local()() as db:
+        agent = _agent(db, agent_id)
+        return _Target(int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled))
+
+
+def _write_agent(agent_id: int, enabled: bool) -> None:
+    with get_session_local()() as db:
+        agent = _agent(db, agent_id)
+        cast(Any, agent).widget_voice_enabled = enabled
+        db.commit()
+
+
+def _read_workforce(workforce_id: int) -> _Target:
+    with get_session_local()() as db:
+        workforce, deployment = _workforce_deployment(db, workforce_id)
+        return _Target(
+            int(cast(Any, workforce.owner_user_id)),
+            bool(deployment.widget_voice_enabled),
+        )
+
+
+def _write_workforce(workforce_id: int, enabled: bool) -> None:
+    with get_session_local()() as db:
+        _, deployment = _workforce_deployment(db, workforce_id)
+        cast(Any, deployment).widget_voice_enabled = enabled
+        db.commit()
+
+
+async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
+    """Read the target in a short session of its own.
+
+    ``db`` is the request session the admin check ran on; its connection goes
+    back to the pool first, so this request never waits for a second one.
+    """
+    release_db_connection_if_clean(db)
+    return await run_db_io_cancellation_safe(read)
+
+
+async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchResponse:
+    target = await _target(db, read)
+    resolution = await run_db_io_cancellation_safe(
+        lambda: resolve_widget_voice_models(target.owner_user_id)
+    )
+    return _response(target.enabled, resolution)
+
+
+async def _put(
+    db: Session,
+    read: Callable[[], _Target],
+    write: Callable[[], None],
+    enabled: bool,
+) -> WidgetVoiceSwitchResponse:
+    target = await _target(db, read)
+    # Resolve before writing: a resolution that raises leaves the switch as it was.
+    resolution = await run_db_io_cancellation_safe(
+        lambda: resolve_widget_voice_models(target.owner_user_id)
+    )
+    # The row is read again: it may have been deleted meanwhile (404). A new
+    # owner does not matter: the switch belongs to the row, not to its owner.
+    await run_db_io_cancellation_safe(write)
+    return _response(enabled, resolution)
+
+
 @router.get("/agents/{agent_id}", response_model=WidgetVoiceSwitchResponse)
-def get_agent_widget_voice(
+async def get_agent_widget_voice(
     agent_id: int,
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> WidgetVoiceSwitchResponse:
-    agent = _agent(db, agent_id)
-    resolution = resolve_widget_voice_models(int(cast(Any, agent.user_id)))
-    return _response(bool(agent.widget_voice_enabled), resolution)
+    return await _get(db, lambda: _read_agent(agent_id))
 
 
 @router.put("/agents/{agent_id}", response_model=WidgetVoiceSwitchResponse)
-def put_agent_widget_voice(
+async def put_agent_widget_voice(
     agent_id: int,
     request: WidgetVoiceSwitchRequest,
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> WidgetVoiceSwitchResponse:
-    agent = _agent(db, agent_id)
-    # Resolve first: a failed read leaves the switch as it was.
-    resolution = resolve_widget_voice_models(int(cast(Any, agent.user_id)))
-    cast(Any, agent).widget_voice_enabled = request.enabled
-    db.commit()
-    return _response(request.enabled, resolution)
+    return await _put(
+        db,
+        lambda: _read_agent(agent_id),
+        lambda: _write_agent(agent_id, request.enabled),
+        request.enabled,
+    )
 
 
 @router.get("/workforces/{workforce_id}", response_model=WidgetVoiceSwitchResponse)
-def get_workforce_widget_voice(
+async def get_workforce_widget_voice(
     workforce_id: int,
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> WidgetVoiceSwitchResponse:
-    workforce, deployment = _workforce_deployment(db, workforce_id)
-    resolution = resolve_widget_voice_models(int(cast(Any, workforce.owner_user_id)))
-    return _response(bool(deployment.widget_voice_enabled), resolution)
+    return await _get(db, lambda: _read_workforce(workforce_id))
 
 
 @router.put("/workforces/{workforce_id}", response_model=WidgetVoiceSwitchResponse)
-def put_workforce_widget_voice(
+async def put_workforce_widget_voice(
     workforce_id: int,
     request: WidgetVoiceSwitchRequest,
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> WidgetVoiceSwitchResponse:
-    workforce, deployment = _workforce_deployment(db, workforce_id)
-    # Resolve first: a failed read leaves the switch as it was.
-    resolution = resolve_widget_voice_models(int(cast(Any, workforce.owner_user_id)))
-    cast(Any, deployment).widget_voice_enabled = request.enabled
-    db.commit()
-    return _response(request.enabled, resolution)
+    return await _put(
+        db,
+        lambda: _read_workforce(workforce_id),
+        lambda: _write_workforce(workforce_id, request.enabled),
+        request.enabled,
+    )

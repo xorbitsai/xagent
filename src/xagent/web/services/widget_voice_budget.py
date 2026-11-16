@@ -11,7 +11,9 @@ alone, everything added so far is subtracted again, and the request is
 refused. With ``XAGENT_REDIS_URL`` set the counters live only in
 Redis (keys expire after 48 hours), and a client that cannot be built or any
 Redis error refuses the request: there is no fallback to memory. Without it
-the counters live in this process and start over when the process restarts.
+the counters live in this process: each web process counts on its own, so N
+processes admit up to N times each limit, and the counts start over when the
+process restarts.
 """
 
 from __future__ import annotations

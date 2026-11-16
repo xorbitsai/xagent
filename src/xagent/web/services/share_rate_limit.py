@@ -538,9 +538,12 @@ class ShareRateLimiter:
 
         The tight-IP / loose-entity pairing of the other widget gates, but it
         fails closed: the caller is not signed in and the usage is recorded on
-        the widget owner, so a storage error refuses rather than admits. (A Redis URL unusable at construction
-        still degrades this limiter to per-process memory; the widget voice
-        budget is the hard daily cap.)
+        the widget owner, so a storage error refuses rather than admits. A
+        Redis URL unusable at construction still degrades this limiter to
+        per-process memory. The widget voice daily budget bounds the total
+        across web processes only when ``XAGENT_REDIS_URL`` is set; without
+        it each process keeps its own counts, which restart from zero when
+        the process restarts.
         """
         return self._admit_ip_and_entity(
             self._widget_voice_tts_ip_limit,

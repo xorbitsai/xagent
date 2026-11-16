@@ -165,20 +165,83 @@ async def test_warmup_is_not_awaited_inside_the_activation_step(no_idle_sweep) -
     assert manager.warmup_finished
 
 
+def _running(name: str):
+    from xagent.sandbox.base import SandboxConfig, SandboxInfo, SandboxTemplate
+
+    return SandboxInfo(
+        name=name,
+        state="running",
+        template=SandboxTemplate(type="image", image="img:v1"),
+        config=SandboxConfig(),
+    )
+
+
+class _StopService:
+    """Reconciling backend whose first stop outlives the cleanup budget."""
+
+    def __init__(self, names: list[str], *, reconciles: bool = True) -> None:
+        self.names = names
+        self.reconciles = reconciles
+        self.issued: list[str] = []
+        self.finished: list[str] = []
+        self.deleted: list[str] = []
+
+    async def supports_runtime_spec(self) -> bool:
+        return self.reconciles
+
+    async def list_sandboxes(self):
+        return [_running(n) for n in self.names]
+
+    async def stop_existing(self, name: str, *, timeout: float) -> None:
+        self.issued.append(name)
+        await asyncio.sleep(0.3)  # a stop the budget must not cut short
+        self.finished.append(name)
+
+    async def delete(self, name: str) -> None:
+        self.deleted.append(name)
+
+
 @pytest.mark.asyncio
-async def test_cleanup_timeout_is_logged_and_activation_continues(
-    monkeypatch, no_idle_sweep, caplog
+async def test_cleanup_budget_stops_issuing_stops_but_never_cuts_an_issued_one(
+    monkeypatch, no_idle_sweep
 ) -> None:
+    from xagent.web.sandbox_manager import SandboxManager
+
     monkeypatch.setenv("XAGENT_SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS", "0.1")
-    manager = _Manager(cleanup_hangs=True)
+    service = _StopService(["a", "b", "c"])
+    manager = SandboxManager(service)  # type: ignore[arg-type]
+    manager.warmup = AsyncMock()  # type: ignore[method-assign]
 
-    with caplog.at_level("WARNING", logger=app_module.logger.name):
-        await asyncio.wait_for(app_module._start_sandbox_runtime(manager), 2)
+    await asyncio.wait_for(app_module._start_sandbox_runtime(manager), 5)
 
-    assert "Sandbox cleanup did not finish within" in caplog.text
+    # The first stop was issued before the budget ran out and ran to completion;
+    # nothing was cancelled mid-stop, and no further stop was issued.
+    assert service.issued == ["a"]
+    assert service.finished == ["a"]
     task = app_module._sandbox_warmup_task
     assert task is not None  # the step went on to schedule the warmup
-    await asyncio.wait_for(manager.warmup_started.wait(), 2)
+    await asyncio.wait_for(task, 2)
+
+
+@pytest.mark.asyncio
+async def test_legacy_cleanup_ignores_the_budget_so_required_work_is_not_skipped(
+    monkeypatch, no_idle_sweep
+) -> None:
+    from xagent.web.sandbox_manager import SandboxManager, bounded_quiesce
+
+    service = _StopService(["a", "b"], reconciles=False)
+    manager = SandboxManager(service)  # type: ignore[arg-type]
+    manager._get_sandbox_image_and_config = lambda: ("img:v1", None)  # type: ignore[method-assign]
+
+    async def stop_existing(name: str, *, timeout: float) -> None:
+        service.issued.append(name)
+
+    service.stop_existing = stop_existing  # type: ignore[method-assign]
+
+    with bounded_quiesce(0.0):  # budget already spent
+        await manager.cleanup()
+
+    assert service.issued == ["a", "b"]
 
 
 @pytest.mark.asyncio

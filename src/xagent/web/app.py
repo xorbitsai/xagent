@@ -2722,22 +2722,18 @@ async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
     # Time each sub-phase so the next slow start names the exact one; the
     # quiesce summary breaks it down further.
     from ..config import get_sandbox_startup_cleanup_timeout_seconds
+    from .sandbox_manager import bounded_quiesce
 
-    # Cleanup is best-effort: it stops containers a previous process left
-    # running, and a sandbox that is not stopped now is reconciled on first use.
-    # Thirteen processes share one Docker daemon during a release, so an
-    # unbounded cleanup could hold activation past the host's budget. On the
-    # bound, log and continue; activation must not fail on it.
-    cleanup_timeout = get_sandbox_startup_cleanup_timeout_seconds()
+    # Thirteen processes share one Docker daemon during a release, so the
+    # quiesce gets a budget after which it issues no further stops. It is a
+    # limit on scheduling more cleanup, never a cancel: abandoning an issued
+    # stop would release its same-name lock while the daemon call still runs.
+    # A container left running is reconciled on first use on backends that
+    # reconcile specs; the legacy cleanup for those that do not ignores the
+    # budget and must finish (or fail activation at the step bound).
     with _startup_phase("sandbox cleanup"):
-        try:
-            await asyncio.wait_for(sandbox_mgr.cleanup(), timeout=cleanup_timeout)
-        except TimeoutError:
-            logger.warning(
-                "Sandbox cleanup did not finish within %.0fs; continuing "
-                "(leftover containers are reconciled on first use)",
-                cleanup_timeout,
-            )
+        with bounded_quiesce(get_sandbox_startup_cleanup_timeout_seconds()):
+            await sandbox_mgr.cleanup()
 
     # The image warmup only pre-pulls and pre-creates; nothing waits on it, so it
     # runs after admission opens instead of inside the activation budget.

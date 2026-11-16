@@ -1301,7 +1301,10 @@ def get_standby_step_timeout_seconds() -> float:
 
 
 def get_sandbox_startup_cleanup_timeout_seconds() -> float:
-    """Best-effort bound for the sandbox quiesce run during startup/activation."""
+    """Budget after which the startup quiesce issues no further stops.
+
+    Never cancels a stop already issued; see ``bounded_quiesce``.
+    """
     return _positive_seconds_env(SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS, 20.0)
 
 

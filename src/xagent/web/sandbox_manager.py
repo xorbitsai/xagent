@@ -9,7 +9,9 @@ import re
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
@@ -77,6 +79,25 @@ _WORKER_LIFECYCLE_MARKER = "::worker::"
 # sites, rather than each falling back to the backend's own (backend-specific,
 # potentially unbounded) default.
 _SANDBOX_STOP_TIMEOUT_SECONDS = 30
+
+# Startup bound for the quiesce, as seconds from its start. It only limits how
+# many further stops are *issued*: an issued stop is never abandoned, because
+# cancelling the awaiter would release the same-name lock and barrier while the
+# daemon call still runs in its thread. Read by ``_quiesce`` only; the legacy
+# cleanup (backends without spec reconciliation) must finish, so it ignores it.
+_QUIESCE_BUDGET_SECONDS: ContextVar[float | None] = ContextVar(
+    "xagent_sandbox_quiesce_budget_seconds", default=None
+)
+
+
+@contextmanager
+def bounded_quiesce(seconds: float) -> Iterator[None]:
+    """Stop issuing new quiesce stops after ``seconds`` within this block."""
+    token = _QUIESCE_BUDGET_SECONDS.set(seconds)
+    try:
+        yield
+    finally:
+        _QUIESCE_BUDGET_SECONDS.reset(token)
 
 
 class SandboxCapacityError(RuntimeError):
@@ -2611,6 +2632,9 @@ class SandboxManager:
         """
         try:
             quiesce_started = time.monotonic()
+            budget = _QUIESCE_BUDGET_SECONDS.get()
+            deadline = None if budget is None else quiesce_started + budget
+            deferred = 0
             list_failed = False
             try:
                 sandboxes = await self._service.list_sandboxes()
@@ -2634,6 +2658,12 @@ class SandboxManager:
                 if sb.state != "running":
                     continue
                 running += 1
+                if deadline is not None and time.monotonic() >= deadline:
+                    # Out of budget: issue no further stop. The container stays
+                    # running and the next use reconciles it (this backend
+                    # reconciles specs); a stop already issued is never cut.
+                    deferred += 1
+                    continue
                 stop_started = time.monotonic()
                 try:
                     await self._service.stop_existing(
@@ -2662,11 +2692,12 @@ class SandboxManager:
         # startup.
         logger.info(
             "Sandbox quiesce completed: seen=%d running=%d stopped=%d failed=%d "
-            "stop_time=%.2fs total=%.2fs status=%s",
+            "deferred=%d stop_time=%.2fs total=%.2fs status=%s",
             seen,
             running,
             stopped,
             failed,
+            deferred,
             stop_seconds,
             time.monotonic() - quiesce_started,
             # status keeps a list-discovery failure from reading as clean empty work

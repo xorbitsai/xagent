@@ -299,6 +299,12 @@
   // zone. Optional: absent means the iframe URL is unchanged.
   var embedTimezone = (scriptTag.getAttribute('data-timezone') || '').trim();
 
+  // Appends name=value with the right separator. The value must already be
+  // encoded by the caller.
+  function appendParam(url, name, value) {
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + name + '=' + value;
+  }
+
   function withTimezone(url) {
     if (!embedTimezone) return url;
     var encoded;
@@ -310,17 +316,27 @@
     } catch {
       return url;
     }
-    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
+    return appendParam(url, 'timezone', encoded);
   }
 
   // Voice calls are opt-in per embedding site: only data-voice="true" (after
   // trim and lowercase) delegates the microphone to the chat iframe and marks
-  // its URL with voice=1. Any other value, or none, leaves both unchanged.
-  var embedVoice = (scriptTag.getAttribute('data-voice') || '').trim().toLowerCase() === 'true';
+  // its URL with voice=1. Any other value, or none, leaves both unchanged; a
+  // non-empty value that is neither "true" nor "false" also logs a warning.
+  // voice=1 is an unsigned hint that any page can add to the URL itself. It
+  // only says the embedder delegated the microphone and is not a permission:
+  // whether voice calls are offered is decided by the server (the
+  // widget_voice_enabled switch on the agent or deployment, re-checked on
+  // every voice request).
+  var embedVoiceRaw = (scriptTag.getAttribute('data-voice') || '').trim().toLowerCase();
+  var embedVoice = embedVoiceRaw === 'true';
+  if (embedVoiceRaw && embedVoiceRaw !== 'true' && embedVoiceRaw !== 'false') {
+    console.warn('Xagent Widget: data-voice must be "true" or "false"; ignoring it.');
+  }
 
   function withVoice(url) {
     if (!embedVoice) return url;
-    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'voice=1';
+    return appendParam(url, 'voice', '1');
   }
 
   // Panel width: resizable via the left-edge drag handle, persisted across

@@ -9,7 +9,7 @@ from alembic.operations import Operations
 def _migration():
     path = (
         Path(__file__).parents[2]
-        / "src/xagent/migrations/versions/20261113_browser_idle_session.py"
+        / "src/xagent/migrations/versions/20261116_browser_idle_session.py"
     )
     spec = importlib.util.spec_from_file_location("browser_idle_migration", path)
     migration = importlib.util.module_from_spec(spec)

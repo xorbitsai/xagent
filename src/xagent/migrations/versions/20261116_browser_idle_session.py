@@ -7,15 +7,15 @@ known to be enforced, so switching it off does not revive expired logins.
 token, so refresh tokens issued before this release can be counted.
 Both start empty; the idle policy is off by default.
 
-Revision ID: 20261113_browser_idle_session
-Revises: 20261115_serving_generation
+Revision ID: 20261116_browser_idle_session
+Revises: 20261114_add_widget_voice_enabled
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "20261113_browser_idle_session"
-down_revision = "20261115_serving_generation"
+revision = "20261116_browser_idle_session"
+down_revision = "20261114_add_widget_voice_enabled"
 branch_labels = None
 depends_on = None
 

@@ -36,6 +36,7 @@ def steps(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     for name in (
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",
@@ -74,6 +75,7 @@ async def test_retire_writers_stops_every_writer_once_and_is_idempotent(steps):
     assert first == [
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",
@@ -402,6 +404,7 @@ async def test_a_wound_down_asr_session_closes_1012_and_releases_its_token(
     monkeypatch,
 ):
     from xagent.web.api import speech
+    from xagent.web.services import speech_streams
 
     blocked = asyncio.Event()
 
@@ -417,7 +420,7 @@ async def test_a_wound_down_asr_session_closes_1012_and_releases_its_token(
 
     monkeypatch.setattr(speech, "get_authenticated_user", authenticated)
     monkeypatch.setattr(speech, "accept_authenticated_websocket", accept)
-    monkeypatch.setattr(speech, "_receive_asr_message", receive)
+    monkeypatch.setattr(speech_streams, "_receive_asr_message", receive)
     socket = _AsrSocket()
 
     handler = asyncio.create_task(
@@ -1078,6 +1081,7 @@ async def test_a_failed_channel_stop_leaves_the_retire_unpublished(
     for name in (
         "stop_orphan_upload_gc_task",
         "stop_composio_reconcile_task",
+        "stop_composio_missing_account_task",
         "stop_retention_purge_task",
         "stop_task_cleanup_retry_task",
         "stop_uploaded_file_recovery_task",
@@ -1529,6 +1533,7 @@ def test_a_tracked_thread_is_counted_from_before_it_starts_until_it_returns():
 
 async def test_a_foreign_cancel_beside_the_fence_cancel_is_not_swallowed(monkeypatch):
     from xagent.web.api import speech
+    from xagent.web.services import speech_streams
 
     blocked = asyncio.Event()
 
@@ -1544,7 +1549,7 @@ async def test_a_foreign_cancel_beside_the_fence_cancel_is_not_swallowed(monkeyp
 
     monkeypatch.setattr(speech, "get_authenticated_user", authenticated)
     monkeypatch.setattr(speech, "accept_authenticated_websocket", accept)
-    monkeypatch.setattr(speech, "_receive_asr_message", receive)
+    monkeypatch.setattr(speech_streams, "_receive_asr_message", receive)
     socket = _AsrSocket()
 
     handler = asyncio.create_task(

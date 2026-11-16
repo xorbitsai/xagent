@@ -7,7 +7,9 @@ deletes the owner's other active grants for the same server, client, issuer
 and resource, so one usable grant is left.
 Grants of other owners, users, clients, issuers, resources and servers are
 not touched, a callback that fails keeps the earlier grant, and the runtime
-refresh path keeps working with the grant that is left.
+refresh path keeps working with the grant that is left. A runtime refresh
+whose grant is deleted or revoked while the token endpoint request is in
+flight revokes the token pair it was issued, which no row can hold.
 """
 
 from __future__ import annotations
@@ -640,7 +642,14 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     engine, db_session, monkeypatch, provider
 ):
     """A refresh of the earlier grant that is in flight while the callback
-    replaces it selects the new grant instead of failing."""
+    replaces it selects the new grant instead of failing.
+
+    The refresh is answered with a rotated pair that nothing stores, but it is
+    not revoked: the callback replaced the grant on purpose, without revoking,
+    and the provider here ends the whole authorization (user, application and
+    audience) when any token is revoked, as Auth0 does with "Refresh Token
+    Revocation Deletes Grant". Revoking the rotated pair would end the new
+    grant's authorization too."""
     db, user = db_session
     server = _add_server(db, user, AUTH)
     client = _add_client(db, server)
@@ -651,6 +660,17 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     _token_response(monkeypatch, {**ISSUED_TOKENS, "scope": NARROW})
     callback_db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
     refreshed_tokens: list[str] = []
+    authorization = {"alive": True, "revoked": []}
+
+    async def revoke_the_whole_authorization(snapshot):
+        authorization["revoked"].append(snapshot.refresh_token)
+        authorization["alive"] = False
+
+    monkeypatch.setattr(
+        mcp_api,
+        "_revoke_mcp_oauth_issued_token_externally",
+        revoke_the_whole_authorization,
+    )
 
     async def reconnect_during_refresh(
         _client, *, refresh_token, resource, client=None, **_kwargs
@@ -660,7 +680,11 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
             _callback_request("state-inflight"), callback_db
         )
         assert _redirect_query(response) == {"mcp_oauth_success": ["1"]}
-        return {"access_token": "refreshed-earlier-access-token", "scope": FULL}
+        return {
+            "access_token": "refreshed-earlier-access-token",
+            "refresh_token": "rotated-earlier-refresh-token",
+            "scope": FULL,
+        }
 
     monkeypatch.setattr(
         mcp_oauth_service, "_refresh_mcp_oauth_grant", reconnect_during_refresh
@@ -683,6 +707,134 @@ async def test_runtime_refreshing_a_replaced_grant_moves_to_the_new_grant(
     assert runtime_auth.grant_id == int(grant.id) != earlier_id
     assert runtime_auth.access_token == "issued-access-token"
     assert runtime_auth.refreshed is False
+    assert authorization == {"alive": True, "revoked": []}
+    assert grant.status == "active"
+    assert decrypt_value(grant.refresh_token) == "issued-refresh-token"
+
+
+REFRESHED_TOKENS = {
+    "access_token": "refreshed-access-token",
+    "refresh_token": "refreshed-refresh-token",
+    "token_type": "Bearer",
+    "expires_in": 3600,
+}
+
+
+async def _refresh_expired_grant(engine, db, user, monkeypatch, *, during_refresh):
+    """Run a runtime refresh of an expired grant whose token endpoint request
+    calls ``during_refresh(grant_id, session)`` on another connection before
+    it returns ``REFRESHED_TOKENS``. Returns the server and the grant id."""
+    server = _add_server(db, user, AUTH)
+    client = _add_client(db, server)
+    grant_id = _add_grant(db, server=server, user=user, client=client, scope=FULL)
+    _expire(db, db.get(MCPOAuthGrant, grant_id))
+
+    async def token_endpoint(
+        _client, *, refresh_token, resource, client=None, **_kwargs
+    ):
+        assert refresh_token == "earlier-refresh-token"
+        other = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
+        try:
+            during_refresh(grant_id, other)
+            other.commit()
+        finally:
+            other.close()
+        return dict(REFRESHED_TOKENS)
+
+    monkeypatch.setattr(mcp_oauth_service, "_refresh_mcp_oauth_grant", token_endpoint)
+    with pytest.raises(mcp_oauth_service.MCPOAuthRuntimeError) as raised:
+        await resolve_mcp_oauth_runtime_auth(
+            db,
+            server_id=server.id,
+            user_id=user.id,
+            auth_config=AUTH,
+            resource_owner_key=OWNER,
+        )
+    assert raised.value.code == "authorization_required"
+    return server, grant_id
+
+
+def _delete_grant(grant_id: int, session) -> None:
+    session.query(MCPOAuthGrant).filter(MCPOAuthGrant.id == grant_id).delete()
+
+
+def _revoke_grant(grant_id: int, session) -> None:
+    session.query(MCPOAuthGrant).filter(MCPOAuthGrant.id == grant_id).update(
+        {MCPOAuthGrant.status: "revoked"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_whose_grant_is_deleted_meanwhile_revokes_what_it_was_issued(
+    engine, db_session, monkeypatch, provider
+):
+    """The token endpoint answers after the grant was deleted, so the rotated
+    pair has nowhere to be stored. Revoking only the grant's old tokens at
+    deletion cannot reach it: it is revoked here, and nothing is persisted."""
+    db, user = db_session
+
+    server, _grant_id = await _refresh_expired_grant(
+        engine, db, user, monkeypatch, during_refresh=_delete_grant
+    )
+
+    [snapshot] = provider["issued"]
+    assert snapshot.access_token == "refreshed-access-token"
+    assert snapshot.refresh_token == "refreshed-refresh-token"
+    assert snapshot.revocation_endpoint == f"{ISSUER}/revoke"
+    assert snapshot.client_id == "client-1"
+    assert _owner_grants(db, server) == []
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_whose_grant_is_revoked_meanwhile_revokes_what_it_was_issued(
+    engine, db_session, monkeypatch, provider
+):
+    """A grant marked revoked locally (a suspension does not call the
+    provider) is not a place to store a refresh either: the row keeps its old
+    tokens and the issued pair is revoked."""
+    db, user = db_session
+
+    server, grant_id = await _refresh_expired_grant(
+        engine, db, user, monkeypatch, during_refresh=_revoke_grant
+    )
+
+    [snapshot] = provider["issued"]
+    assert snapshot.access_token == "refreshed-access-token"
+    assert snapshot.refresh_token == "refreshed-refresh-token"
+    [grant] = _owner_grants(db, server)
+    assert int(grant.id) == grant_id
+    assert grant.status == "revoked"
+    assert decrypt_value(grant.access_token) == "earlier-access-token"
+    assert decrypt_value(grant.refresh_token) == "earlier-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_that_is_stored_revokes_nothing(
+    engine, db_session, monkeypatch, provider
+):
+    db, user = db_session
+    server = _add_server(db, user, AUTH)
+    client = _add_client(db, server)
+    grant_id = _add_grant(db, server=server, user=user, client=client, scope=FULL)
+    _expire(db, db.get(MCPOAuthGrant, grant_id))
+
+    async def token_endpoint(_client, **_kwargs):
+        return dict(REFRESHED_TOKENS)
+
+    monkeypatch.setattr(mcp_oauth_service, "_refresh_mcp_oauth_grant", token_endpoint)
+
+    runtime_auth = await resolve_mcp_oauth_runtime_auth(
+        db,
+        server_id=server.id,
+        user_id=user.id,
+        auth_config=AUTH,
+        resource_owner_key=OWNER,
+    )
+
+    assert runtime_auth.refreshed is True
+    assert provider["issued"] == []
+    [grant] = _owner_grants(db, server)
+    assert decrypt_value(grant.refresh_token) == "refreshed-refresh-token"
 
 
 @pytest.mark.parametrize(

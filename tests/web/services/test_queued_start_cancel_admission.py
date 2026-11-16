@@ -19,13 +19,16 @@ from xagent.web.models.task_runtime_secret import TaskRuntimeSecret
 from xagent.web.services import (
     a2a_task_cancel,
     external_task_cancel,
+    sdk_task_cancel,
     task_command_execution,
 )
 from xagent.web.services import task_command_transport as transport
+from xagent.web.services import task_execution_admission as admission
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
 )
+from xagent.web.services.task_admission_execution import AdmissionWaiting
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload
 from xagent.web.services.task_runtime_secrets import stage_runtime_values
 
@@ -38,7 +41,7 @@ from .test_task_execution_admission import (
 )
 
 
-@pytest.mark.parametrize("scope", ["a2a", "external"])
+@pytest.mark.parametrize("scope", ["a2a", "external", "sdk"])
 async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
     """External runtime input is the supported host contract for its START."""
     monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
@@ -49,6 +52,7 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
     monkeypatch.setattr(
         external_task_cancel, "get_session_local", lambda: host.sessions
     )
+    monkeypatch.setattr(sdk_task_cancel, "get_session_local", lambda: host.sessions)
     monkeypatch.setattr(
         "xagent.web.services.task_event_bridge.get_task_event_bridge", lambda: Mock()
     )
@@ -116,18 +120,26 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
         )
         assert executed == []
 
-        payload = {"agent_id": agent_id, "target_state_version": 0}
-        if scope == "external":
-            payload.update({"scope": "external", "turn_id": turn_id})
         with host.sessions() as db:
-            cancel = transport.enqueue_task_command(
-                db,
-                task_id=task_id,
-                actor_user_id=host.user,
-                command_id=f"cancel:{task_id}:0",
-                kind=transport.TaskCommandKind.CANCEL,
-                payload=payload,
-            )
+            if scope == "sdk":
+                # Built as the endpoint builds it, which aims the command at
+                # the queued turn's run.
+                queued_run_id = db.get(TaskExecutionCommand, start_id).target_run_id
+                cancel = sdk_task_cancel._enqueue_cancel(
+                    db, db.get(Task, task_id), 0, queued_run_id=queued_run_id
+                )
+            else:
+                payload = {"agent_id": agent_id, "target_state_version": 0}
+                if scope == "external":
+                    payload.update({"scope": "external", "turn_id": turn_id})
+                cancel = transport.enqueue_task_command(
+                    db,
+                    task_id=task_id,
+                    actor_user_id=host.user,
+                    command_id=f"cancel:{task_id}:0",
+                    kind=transport.TaskCommandKind.CANCEL,
+                    payload=payload,
+                )
 
         assert await transport.dispatch_one_task_command(
             task_command_execution.execute_durable_task_command,
@@ -152,11 +164,11 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
             }
             assert (task.status, task.error_message) == (
                 TaskStatus.FAILED,
-                (
-                    "Stopped by the visitor."
-                    if scope == "external"
-                    else "Task canceled by A2A client."
-                ),
+                {
+                    "external": "Stopped by the visitor.",
+                    "a2a": "Task canceled by A2A client.",
+                    "sdk": sdk_task_cancel.SDK_CANCEL_ERROR_MESSAGE,
+                }[scope],
             )
             assert queued_start.status == "failed"
             assert queued_start.error == "Task command stopped by a control request."
@@ -181,3 +193,83 @@ async def test_cancel_settles_capacity_waiting_start(scope, host, monkeypatch):
         execute, command_db_id=start_id
     )
     assert executed == []
+
+
+async def test_an_appended_turn_sent_back_to_the_admission_queue_is_withdrawn(
+    host, monkeypatch
+):
+    """A START that was attempted and sent back to wait for capacity still
+    waits for admission, so the cancel overtakes it and withdraws the turn,
+    leaving the task as the turn before it."""
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(
+        task_command_execution, "get_session_local", lambda: host.sessions
+    )
+    monkeypatch.setattr(sdk_task_cancel, "get_session_local", lambda: host.sessions)
+    monkeypatch.setattr(
+        "xagent.web.services.task_event_bridge.get_task_event_bridge", lambda: Mock()
+    )
+    with host.sessions() as db:
+        agent = Agent(user_id=host.user, name="Appended sdk cancellation")
+        db.add(agent)
+        db.flush()
+        task = Task(
+            user_id=host.user,
+            agent_id=agent.id,
+            source="sdk",
+            title="Appended sdk task",
+            status=TaskStatus.COMPLETED,
+            control_state="completed",
+            run_id="run-before",
+            state_version=3,
+        )
+        db.add(task)
+        db.flush()
+        task_id = int(task.id)
+        accepted = TaskTurnOrchestrator.claim_append_turn_no_commit(
+            db,
+            task_id=task_id,
+            task_owner_user_id=host.user,
+            payload=TaskTurnPayload("Append the turn", turn_id="turn-appended"),
+        )
+        db.commit()
+        start_id = int(accepted.command_db_id)
+
+    async def no_capacity(_command):
+        raise AdmissionWaiting("Waiting for execution admission")
+
+    assert await transport.dispatch_one_task_command(
+        no_capacity, command_db_id=start_id
+    )
+    # The owner drains and releases its tickets: the command waits again.
+    with host.sessions() as db, db.begin():
+        admission._release_tickets(db, TaskAdmissionTicket.command_id == start_id)
+    with host.sessions() as db:
+        start = db.get(TaskExecutionCommand, start_id)
+        ticket = db.get(TaskAdmissionTicket, start_id)
+        assert (start.status, start.attempt_count) == ("pending", 1)
+        assert ticket.owner_attempt_id is None
+        queued_run_id = start.target_run_id
+        cancel = sdk_task_cancel._enqueue_cancel(
+            db, db.get(Task, task_id), 3, queued_run_id=queued_run_id
+        )
+
+    assert await transport.dispatch_one_task_command(
+        task_command_execution.execute_durable_task_command,
+        command_db_id=cancel.command_id,
+    )
+
+    with host.sessions() as db:
+        start = db.get(TaskExecutionCommand, start_id)
+        task = db.get(Task, task_id)
+        assert db.get(TaskExecutionCommand, cancel.command_id).status == "completed"
+        assert start.status == "failed"
+        assert start.result == {"rejection_reason": "cancelled_before_admission"}
+        assert (task.status, task.run_id, task.state_version, task.error_message) == (
+            TaskStatus.COMPLETED,
+            "run-before",
+            3,
+            None,
+        )
+        delivery = db.query(TaskChatMessage).filter_by(turn_id="turn-appended").one()
+        assert delivery.delivery_status == DELIVERY_FAILED

@@ -207,7 +207,7 @@ def _mcp_client() -> SimpleNamespace:
 
 async def _refresh_mcp(
     status: int, payload: object, *, credential_provider: str | None
-) -> str:
+) -> str | mcp_oauth.MCPOAuthRuntimeError:
     async def no_url_policy(url, *, resolve_dns=False):
         return None
 
@@ -227,7 +227,7 @@ async def _refresh_mcp(
                 credential_provider=credential_provider,
             )
     except mcp_oauth.MCPOAuthRuntimeError as exc:
-        return exc.code
+        return exc
     finally:
         mcp_oauth.validate_oauth_http_url = original
     return "ok"
@@ -240,16 +240,26 @@ async def _refresh_mcp(
         # Any other client, a user's own static or registered one, only
         # affects that user.
         ({"error": "invalid_client"}, None, "token_refresh_failed"),
+        # A dead grant is its holder's to fix, not the platform client's.
         ({"error": "invalid_grant"}, "hubspot", "token_refresh_failed"),
     ],
 )
 def test_an_mcp_refresh_rejects_only_the_platform_client(
     payload, credential_provider, code
 ):
-    assert (
-        asyncio.run(_refresh_mcp(400, payload, credential_provider=credential_provider))
-        == code
+    exc = asyncio.run(
+        _refresh_mcp(400, payload, credential_provider=credential_provider)
     )
+    assert isinstance(exc, mcp_oauth.MCPOAuthRuntimeError)
+    assert exc.code == code
+
+
+def test_an_mcp_refresh_raises_the_invalid_grant_error_for_a_dead_grant():
+    exc = asyncio.run(
+        _refresh_mcp(400, {"error": "invalid_grant"}, credential_provider="hubspot")
+    )
+    assert isinstance(exc, mcp_oauth._InvalidGrantRefreshError)
+    assert exc.code == "token_refresh_failed"
 
 
 def test_only_the_deployment_client_is_the_platform_client(monkeypatch):

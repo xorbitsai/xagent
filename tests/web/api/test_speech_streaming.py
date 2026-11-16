@@ -17,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from tests.web.auth_token_cases import build_access_token
+from xagent.config import get_cors_origins
 from xagent.core.model.asr.base import ASRStreamEvent, ASRStreamSession
 from xagent.core.model.chat.token_context import MediaCallType
 from xagent.core.model.media_metering import record_provider_usage
@@ -27,7 +28,7 @@ from xagent.web.models import database
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserModel
 from xagent.web.schemas.speech import TTSStreamRequest
-from xagent.web.services import model_service, quota_hooks
+from xagent.web.services import model_service, quota_hooks, speech_streams
 
 ASR_PATH = "/api/models/speech/asr/stream"
 TTS_PATH = "/api/models/speech/tts/stream"
@@ -191,6 +192,8 @@ def api(monkeypatch, tmp_path):
     asr_factory, tts_factory = Mock(return_value=asr), Mock(return_value=tts)
     monkeypatch.setattr(speech, "get_asr_model_instance", asr_factory)
     monkeypatch.setattr(speech, "get_tts_model_instance", tts_factory)
+    monkeypatch.setattr(speech_streams, "get_asr_model_instance", asr_factory)
+    monkeypatch.setattr(speech_streams, "get_tts_model_instance", tts_factory)
     usage = []
     monkeypatch.setattr(
         quota_hooks, "_standalone_usage_hook", lambda *args: usage.append(args)
@@ -364,12 +367,12 @@ def test_asr_frame_size_checks_precede_json_parsing(api, monkeypatch, stage):
         parse = Mock(wraps=speech.ASRStreamStart.model_validate_json)
         monkeypatch.setattr(speech.ASRStreamStart, "model_validate_json", parse)
     else:
-        parse = Mock(wraps=speech.json.loads)
+        parse = Mock(wraps=speech_streams.json.loads)
     with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
         if stage == "control":
             ws.send_json({"type": "start", "model_id": "live"})
             assert ws.receive_json()["type"] == "session_started"
-            monkeypatch.setattr(speech.json, "loads", parse)
+            monkeypatch.setattr(speech_streams.json, "loads", parse)
         command = (
             {"type": "start", "model_id": "live"}
             if stage == "start"
@@ -433,7 +436,7 @@ def test_asr_failure_before_model_creation_is_logged_safely(
 @pytest.mark.parametrize("size", [64 * 1024 + 1, 32002])
 def test_asr_rejects_oversized_audio_and_closes_the_session(api, monkeypatch, size):
     if size == 32002:
-        monkeypatch.setattr(speech, "_SESSION_SECONDS", 1)
+        monkeypatch.setattr(speech_streams, "_SESSION_SECONDS", 1)
     with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
         ws.send_json({"type": "start", "model_id": "live"})
         ws.receive_json()
@@ -493,9 +496,9 @@ def test_asr_transport_timeouts_are_distinct_from_provider_failure(
     api, monkeypatch, caplog, deadline
 ):
     if deadline in {"initial", "idle"}:
-        monkeypatch.setattr(speech, "_IO_TIMEOUT", 0.1)
+        monkeypatch.setattr(speech_streams, "_IO_TIMEOUT", 0.1)
     elif deadline == "session":
-        monkeypatch.setattr(speech, "_SESSION_SECONDS", 0.1)
+        monkeypatch.setattr(speech_streams, "_SESSION_SECONDS", 0.1)
     else:
         api.asr.send_error = TimeoutError("synthetic-provider-secret")
     with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
@@ -597,8 +600,8 @@ async def test_blocked_asr_terminal_writes_settle_handler_and_watcher(
 ):
     release, blocked_send = asyncio.Event(), asyncio.Event()
     messages = []
-    monkeypatch.setattr(speech, "_IO_TIMEOUT", 0.03)
-    monkeypatch.setattr(speech, "_TERMINAL_TIMEOUT", 0.03, raising=False)
+    monkeypatch.setattr(speech_streams, "_IO_TIMEOUT", 0.03)
+    monkeypatch.setattr(speech_streams, "_TERMINAL_TIMEOUT", 0.03, raising=False)
     monkeypatch.setattr(
         speech,
         "get_authenticated_user",
@@ -708,7 +711,7 @@ async def test_repeated_cancellation_drains_both_stream_halves():
                 await release.wait()
             closed[index].set()
 
-    task = asyncio.create_task(speech._race(operation(0), operation(1)))
+    task = asyncio.create_task(speech_streams._race(operation(0), operation(1)))
     try:
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 2)
         task.cancel()
@@ -741,9 +744,9 @@ def test_tts_stream_has_audio_metadata_and_exactly_one_usage_delivery(api):
     assert response.status_code == 200, response.text
     assert response.content == b"firstsecond"
     assert response.headers["content-type"] == "audio/pcm"
+    assert response.headers["x-audio-format"] == "pcm"
     assert response.headers["x-audio-sample-rate"] == "24000"
     assert response.headers["cache-control"] == "no-store"
-    assert "X-Audio-Sample-Rate" in response.headers["access-control-expose-headers"]
     assert api.tts.calls == [
         {"text": "Hello", "voice": "override", "format": "pcm", "sample_rate": 24000}
     ]
@@ -846,7 +849,7 @@ def test_invalid_tts_output_options_are_local_400_errors(api, options):
 def test_tts_first_audio_timeout_cancels_the_provider_and_closes_its_client(
     api, monkeypatch
 ):
-    monkeypatch.setattr(speech, "_IO_TIMEOUT", 0.01)
+    monkeypatch.setattr(speech_streams, "_IO_TIMEOUT", 0.01)
     api.tts.block_first = True
     api.tts.gate = asyncio.Event()
     response = api.client.post(
@@ -864,7 +867,7 @@ async def test_tts_sends_first_audio_before_completion_and_cancels_on_disconnect
     model = api.tts
     model.gate = asyncio.Event()
     model.block_first = before_first
-    response = speech._TTSAudioResponse(
+    response = speech_streams._TTSAudioResponse(
         model, 1, TTSStreamRequest(model_id="voice", text="Hello")
     )
     incoming = asyncio.Queue()
@@ -902,7 +905,7 @@ async def test_disconnect_during_tts_client_close_waits_for_cleanup_before_meter
         closed.set()
 
     api.tts.aclose = close
-    response = speech._TTSAudioResponse(
+    response = speech_streams._TTSAudioResponse(
         api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
     )
     incoming = asyncio.Queue()
@@ -938,7 +941,7 @@ async def test_disconnect_after_audio_waits_for_usage_delivery(api, monkeypatch)
         delivered.set()
 
     monkeypatch.setattr(quota_hooks, "_standalone_usage_hook", delayed_usage)
-    response = speech._TTSAudioResponse(
+    response = speech_streams._TTSAudioResponse(
         api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
     )
     incoming, messages = asyncio.Queue(), []
@@ -979,11 +982,11 @@ async def test_tts_late_failure_keeps_truncation_without_leaking_provider_detail
     else:
         api.tts.gate = asyncio.Event()
         monkeypatch.setattr(
-            speech,
+            speech_streams,
             "_IO_TIMEOUT" if failure == "chunk_timeout" else "_SESSION_SECONDS",
             0.02,
         )
-    response = speech._TTSAudioResponse(
+    response = speech_streams._TTSAudioResponse(
         api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
     )
     messages, incoming = [], asyncio.Queue()
@@ -1007,8 +1010,8 @@ async def test_tts_late_failure_keeps_truncation_without_leaking_provider_detail
 async def test_tts_session_timeout_before_audio_is_a_504(api, monkeypatch):
     api.tts.gate = asyncio.Event()
     api.tts.block_first = True
-    monkeypatch.setattr(speech, "_SESSION_SECONDS", 0.02)
-    response = speech._TTSAudioResponse(
+    monkeypatch.setattr(speech_streams, "_SESSION_SECONDS", 0.02)
+    response = speech_streams._TTSAudioResponse(
         api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
     )
     messages, incoming = [], asyncio.Queue()
@@ -1028,12 +1031,13 @@ async def test_tts_session_timeout_before_audio_is_a_504(api, monkeypatch):
 async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, failure):
     from xagent.web.app import app
 
+    origin = get_cors_origins()[0].encode()
     if failure == "provider":
         api.tts.error_after_first = RuntimeError("synthetic-provider-secret")
     elif failure:
         api.tts.gate = asyncio.Event()
         monkeypatch.setattr(
-            speech,
+            speech_streams,
             "_IO_TIMEOUT" if failure == "chunk_timeout" else "_SESSION_SECONDS",
             0.05,
         )
@@ -1054,6 +1058,7 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
         "headers": [
             (b"authorization", api.headers["Authorization"].encode()),
             (b"content-type", b"application/json"),
+            (b"origin", origin),
         ],
         "server": ("testserver", 80),
         "client": ("127.0.0.1", 1234),
@@ -1073,6 +1078,12 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
         await asyncio.wait_for(app(scope, incoming.get, send), 10)
     assert messages[0]["status"] == 200
     headers = dict(messages[0]["headers"])
+    assert headers[b"access-control-allow-origin"] == origin
+    exposed_headers = {
+        name.strip().lower()
+        for name in headers[b"access-control-expose-headers"].split(b",")
+    }
+    assert {b"x-audio-format", b"x-audio-sample-rate"} <= exposed_headers
     assert headers[b"x-content-type-options"] == b"nosniff"
     assert headers[b"x-frame-options"] == b"DENY"
     assert any(message.get("body") == b"first" for message in messages)

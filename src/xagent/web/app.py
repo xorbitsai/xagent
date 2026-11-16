@@ -1,4 +1,6 @@
 import asyncio
+import contextvars
+import faulthandler
 import functools
 import importlib
 import json
@@ -6,9 +8,11 @@ import logging
 import mimetypes
 import os
 import random
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from pathlib import PurePosixPath
 from typing import Any, cast
@@ -26,6 +30,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_composio_missing_account_interval_seconds,
     get_composio_reconcile_interval_seconds,
     get_cors_origins,
     get_environment,
@@ -122,6 +127,7 @@ from .services.conversation_storage_rollout import (
     report_unobserved_execution_events,
     validate_conversation_storage_rollout_at_startup,
 )
+from .services.generation import start_allowed, tick_allowed
 from .services.interaction_rollout import (
     get_interaction_rollout_policy,
     is_native_schema_ready,
@@ -150,7 +156,12 @@ from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
 )
-from .services.writer_workers import drain_workers, run_tracked
+from .services.writer_workers import (
+    drain_workers,
+    run_tracked,
+    run_tracked_in,
+    run_tracked_to_completion,
+)
 from .startup_admission import run_host_startup_admissions
 
 # Configure logging when running under gunicorn/uwsgi (no __main__.py)
@@ -275,10 +286,94 @@ _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
 FILE_STORAGE_STARTUP_SYNC_GATE_POLL_INTERVAL_SECONDS = 0.25
+# One attempt is logged every progress interval. If it makes no progress (no
+# file or batch completed) for the dump threshold, every thread's stack is
+# dumped; after the stall window it is cancelled and retried from where it got
+# to. A long scan that keeps completing work is never cancelled.
+FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS = 30.0
+FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS = 60.0
+FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS = 600.0
+FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS = 10.0
+
+# Path prefixes the host app keeps answering while the startup sync runs, so
+# control endpoints (a release host's lifecycle probe) never wait on file I/O.
+_file_storage_startup_sync_exempt_prefixes: set[str] = set()
+_file_storage_sync_executor: ThreadPoolExecutor | None = None
+
+
+def register_file_storage_startup_sync_exempt_prefix(prefix: str) -> None:
+    """Let requests under ``prefix`` bypass the startup file storage sync gate."""
+    normalized = str(prefix or "").strip()
+    if not normalized.startswith("/"):
+        raise ValueError("exempt prefix must start with '/'")
+    _file_storage_startup_sync_exempt_prefixes.add(normalized)
+
+
+def _is_file_storage_startup_sync_exempt(path: str) -> bool:
+    if path in FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS:
+        return True
+    return any(
+        path.startswith(prefix) for prefix in _file_storage_startup_sync_exempt_prefixes
+    )
+
+
+def _get_file_storage_sync_executor() -> ThreadPoolExecutor:
+    """Small dedicated pool: a stuck sync cannot starve ``asyncio.to_thread``."""
+    global _file_storage_sync_executor
+    if _file_storage_sync_executor is None:
+        _file_storage_sync_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="startup-file-sync"
+        )
+    return _file_storage_sync_executor
+
+
+def get_file_storage_startup_sync_status(app_instance: FastAPI) -> dict[str, Any]:
+    """Cheap, non-blocking view of the startup sync for host lifecycle reports.
+
+    ``state`` is ``disabled`` | ``pending`` | ``running`` | ``failed`` | ``done``;
+    ``gating`` says whether client requests currently wait on it.
+    """
+    state = app_instance.state
+    task = getattr(state, "file_storage_startup_sync_task", None)
+    error = getattr(state, "file_storage_startup_sync_error", None)
+    completed = bool(getattr(state, "file_storage_startup_sync_completed", False))
+    started = getattr(state, "file_storage_startup_sync_started_at", None)
+    finished = getattr(state, "file_storage_startup_sync_finished_at", None)
+    if not get_file_storage_startup_sync_enabled():
+        name = "disabled"
+    elif error is not None:
+        name = "failed"
+    elif completed:
+        name = "done"
+    elif task is not None and not task.done():
+        name = "running"
+    else:
+        name = "pending"
+    elapsed: float | None = None
+    if started is not None:
+        elapsed = round(
+            (finished if finished is not None else time.monotonic()) - started, 3
+        )
+    status: dict[str, Any] = {
+        "state": name,
+        "elapsed_seconds": elapsed,
+        "gating": bool(getattr(state, "file_storage_startup_sync_gating", True)),
+    }
+    if error is not None:
+        status["error"] = type(error).__name__
+    return status
+
+
+# Carries the attempt's cancel/progress control into the sync thread without
+# widening the signature hosts and tests patch.
+_file_storage_sync_control: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "file_storage_sync_control", default=None
+)
 
 
 def run_startup_file_storage_sync() -> None:
     """Synchronize DB-registered local files into durable S3 storage."""
+    control = _file_storage_sync_control.get()
     if not get_file_storage_startup_sync_enabled():
         logger.info("Startup file storage sync is disabled")
         return
@@ -287,11 +382,87 @@ def run_startup_file_storage_sync() -> None:
         sync_registered_files_to_durable_storage,
     )
 
-    result = sync_registered_files_to_durable_storage()
+    if control is None:
+        result = sync_registered_files_to_durable_storage()
+    else:
+        result = sync_registered_files_to_durable_storage(control=control)
+        if result.locked:
+            # An earlier attempt's thread is still inside the sync (it was
+            # cancelled at its deadline but has not reached a checkpoint).
+            # Reporting success here would mark the sync complete.
+            raise RuntimeError(
+                "Startup file storage sync is still running from a previous attempt"
+            )
     if result.failed:
         raise RuntimeError(
             f"Startup file storage sync failed for {result.failed} registered file(s)"
         )
+
+
+def _dump_all_thread_stacks(reason: str) -> None:
+    logger.error("Dumping all thread stacks to stderr: %s", reason)
+    try:
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not dump thread stacks")
+
+
+async def _run_bounded_file_storage_sync_attempt(resume: Any = None) -> None:
+    """One sync attempt with progress logs, a stack dump and a stall timeout."""
+    from .services.startup_file_storage_sync import StartupSyncControl
+
+    control = StartupSyncControl(resume)
+    started = time.monotonic()
+
+    def _attempt() -> None:
+        token = _file_storage_sync_control.set(control)
+        try:
+            run_startup_file_storage_sync()
+        finally:
+            _file_storage_sync_control.reset(token)
+
+    future = asyncio.ensure_future(
+        run_tracked_in(_get_file_storage_sync_executor(), _attempt)
+    )
+    dumped = False
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {future},
+                timeout=FILE_STORAGE_STARTUP_SYNC_PROGRESS_INTERVAL_SECONDS,
+            )
+            if done:
+                return future.result()
+            now = time.monotonic()
+            elapsed = now - started
+            idle = now - control.last_progress
+            logger.warning(
+                "Startup file storage sync still running: elapsed=%.0fs "
+                "no_progress=%.0fs scanned=%s phase=%s",
+                elapsed,
+                idle,
+                control.scanned,
+                control.phase,
+            )
+            if not dumped and idle >= FILE_STORAGE_STARTUP_SYNC_DUMP_AFTER_SECONDS:
+                dumped = True
+                _dump_all_thread_stacks(
+                    f"startup file storage sync made no progress for {idle:.0f}s"
+                )
+            if idle >= FILE_STORAGE_STARTUP_SYNC_STALL_SECONDS:
+                control.cancel.set()
+                done, _ = await asyncio.wait(
+                    {future}, timeout=FILE_STORAGE_STARTUP_SYNC_CANCEL_GRACE_SECONDS
+                )
+                if done:
+                    future.exception()  # cancelled at a checkpoint; retrieve it
+                raise TimeoutError(
+                    "Startup file storage sync made no progress for "
+                    f"{idle:.0f}s (scanned={control.scanned} phase={control.phase})"
+                )
+    except BaseException:
+        control.cancel.set()
+        raise
 
 
 async def _run_file_storage_startup_sync_with_retries(
@@ -299,9 +470,14 @@ async def _run_file_storage_startup_sync_with_retries(
     *,
     retry_interval_seconds: float,
 ) -> None:
+    app_instance.state.file_storage_startup_sync_started_at = time.monotonic()
+    app_instance.state.file_storage_startup_sync_finished_at = None
+    from .services.startup_file_storage_sync import StartupSyncResume
+
+    resume = StartupSyncResume()  # survives retries: a stall does not rescan
     while True:
         try:
-            await run_tracked(run_startup_file_storage_sync)
+            await _run_bounded_file_storage_sync_attempt(resume)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -317,6 +493,7 @@ async def _run_file_storage_startup_sync_with_retries(
         else:
             app_instance.state.file_storage_startup_sync_error = None
             app_instance.state.file_storage_startup_sync_completed = True
+            app_instance.state.file_storage_startup_sync_finished_at = time.monotonic()
             return
 
 
@@ -324,12 +501,21 @@ def start_file_storage_startup_sync_task(
     app_instance: FastAPI,
     *,
     retry_interval_seconds: float | None = None,
+    gating: bool = True,
 ) -> asyncio.Task[Any] | None:
-    """Start durable file storage startup sync without blocking app startup."""
+    """Start durable file storage startup sync without blocking app startup.
+
+    ``gating=False`` runs the same sync in the background while client
+    requests and ``/ready`` proceed; only a standby whose read-only preflight
+    found nothing to write uses it.
+    """
     global _file_storage_startup_sync_task
 
     app_instance.state.file_storage_startup_sync_task = None
     app_instance.state.file_storage_startup_sync_error = None
+    app_instance.state.file_storage_startup_sync_gating = gating
+    app_instance.state.file_storage_startup_sync_started_at = None
+    app_instance.state.file_storage_startup_sync_finished_at = None
 
     if not get_file_storage_startup_sync_enabled():
         logger.info("Startup file storage sync is disabled")
@@ -364,6 +550,10 @@ def start_file_storage_startup_sync_task(
         else:
             app_instance.state.file_storage_startup_sync_error = None
             app_instance.state.file_storage_startup_sync_completed = True
+            if app_instance.state.file_storage_startup_sync_finished_at is None:
+                app_instance.state.file_storage_startup_sync_finished_at = (
+                    time.monotonic()
+                )
 
     task.add_done_callback(_record_file_storage_sync_result)
     logger.info("Started background startup file storage sync task")
@@ -452,6 +642,9 @@ async def _run_trigger_dispatcher(
     next_preview_run_reap_at = 0.0
     tick_paused = False
     while True:
+        if not await tick_allowed("trigger-dispatcher"):
+            await asyncio.sleep(poll_interval_seconds)
+            continue
         # Trigger production pauses at the tick boundary while a planned
         # restart holds new execution: a tick already past this point runs to
         # its end (and is counted until then), a later one neither scans due
@@ -551,6 +744,8 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
     if os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Skipping trigger dispatcher (test environment)")
         return None
+    if not start_allowed("trigger-dispatcher"):
+        return None
 
     poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
     batch_size = get_trigger_dispatcher_batch_size()
@@ -582,6 +777,8 @@ def start_task_lease_recovery_task(
     from .services.task_execution_host import consumes_task_commands
 
     if not consumes_task_commands():
+        return None
+    if not start_allowed("task-lease-recovery"):
         return None
 
     existing_task = cast(
@@ -656,6 +853,8 @@ def start_task_auto_resume_task(
     from .services.task_execution_host import consumes_task_commands
 
     if not consumes_task_commands():
+        return None
+    if not start_allowed("task-auto-resume"):
         return None
 
     existing_task = cast(
@@ -902,6 +1101,79 @@ async def stop_composio_reconcile_task(app_instance: FastAPI) -> None:
             pass
         except Exception as exc:
             logger.error("Composio reconcile loop stopped after failure", exc_info=exc)
+
+
+def start_composio_missing_account_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the loop that tombstones grants whose Composio account is gone.
+
+    Runs by default whenever an app's Composio config is complete; each pass
+    looks up the accounts this database's grants name and clears the grant
+    when Composio answers 404 ConnectedAccount_ResourceNotFound. A pass clears
+    a few missing accounts, up to a fixed number of lookups, and resumes where
+    the previous pass stopped in this process. When at least three lookups answer
+    missing and more than half of the pass's lookups do, it writes nothing and
+    logs a warning: a key that cannot see the accounts does not clear them, but
+    neither does a mass deletion, which needs an operator. With fewer than three
+    grants the breaker cannot trip. It reads only this database's grants and
+    deletes nothing in Composio, so it does not need the orphan cleanup's
+    opt-in.
+    """
+    from .composio_auth import _configured_apps, run_missing_account_loop
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "composio_missing_account_task", None),
+    )
+    if existing_task is not None and not existing_task.done():
+        return existing_task
+    app_instance.state.composio_missing_account_task = None
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping Composio missing-account loop (test environment)")
+        return None
+    if not _configured_apps():
+        return None
+    interval_seconds = get_composio_missing_account_interval_seconds()
+    if interval_seconds <= 0:
+        return None
+    stop_event = threading.Event()
+    app_instance.state.composio_missing_account_stop = stop_event
+    task = asyncio.create_task(
+        run_missing_account_loop(
+            interval_seconds=interval_seconds, stop_event=stop_event
+        )
+    )
+    app_instance.state.composio_missing_account_task = task
+    logger.info(
+        "Started Composio missing-account loop (interval=%ss)", interval_seconds
+    )
+    return task
+
+
+async def stop_composio_missing_account_task(app_instance: FastAPI) -> None:
+    """Stop this process's Composio missing-account loop.
+
+    The stop event reaches a pass running in its worker thread, which returns
+    at its next request boundary; the cancel ends the awaiting coroutine.
+    """
+    stop_event = getattr(app_instance.state, "composio_missing_account_stop", None)
+    app_instance.state.composio_missing_account_stop = None
+    if stop_event is not None:
+        stop_event.set()
+    task = getattr(app_instance.state, "composio_missing_account_task", None)
+    app_instance.state.composio_missing_account_task = None
+    if task is not None and not task.done():
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(
+                "Composio missing-account loop stopped after failure", exc_info=exc
+            )
 
 
 def start_task_cleanup_retry_task(
@@ -1228,6 +1500,8 @@ def start_temp_file_cleanup_task(
 
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
     """Wait until durable file storage startup sync has completed successfully."""
+    if not getattr(app_instance.state, "file_storage_startup_sync_gating", True):
+        return
     while True:
         error = getattr(app_instance.state, "file_storage_startup_sync_error", None)
         if error is not None:
@@ -1281,7 +1555,7 @@ class FileStorageStartupSyncGateMiddleware:
             return
 
         path = str(scope.get("path") or "")
-        if path in FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS:
+        if _is_file_storage_startup_sync_exempt(path):
             await self.app(scope, receive, send)
             return
         if scope_type == "http" and str(scope.get("method") or "").upper() == "OPTIONS":
@@ -1350,6 +1624,9 @@ async def readiness_check() -> JSONResponse:
     """
     task = getattr(app.state, "file_storage_startup_sync_task", None)
     error = getattr(app.state, "file_storage_startup_sync_error", None)
+    if not getattr(app.state, "file_storage_startup_sync_gating", True):
+        task = None
+        error = None
 
     if error is not None:
         return JSONResponse(
@@ -1670,8 +1947,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    # The upload retry loop paces itself by this hint across origins.
-    expose_headers=["Retry-After"],
+    # Cross-origin clients read retry hints and streaming audio metadata.
+    expose_headers=["Retry-After", "X-Audio-Format", "X-Audio-Sample-Rate"],
 )
 app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
@@ -1917,11 +2194,11 @@ async def _admit_database_and_host(app_instance: FastAPI, *, bound: bool) -> Non
     ``bound`` is a standby that already bound its engine and passed the
     read-only checks: it completes the deferred half instead of ``init_db``.
     """
+    # Blocking (migrations, key validation, schema seed): off the event loop so
+    # lifecycle requests keep being answered, and never cut short by a cancel
+    # that would leave the schema half-initialized.
     with _startup_phase("database init"):
-        if bound:
-            complete_standby_db_init()
-        else:
-            init_db()
+        await run_tracked_to_completion(complete_standby_db_init if bound else init_db)
 
     # Host checks may rely on the fully migrated database. Nothing below this
     # boundary may admit tasks or launch a writer/dispatcher until every check
@@ -1941,6 +2218,62 @@ async def _open_admission() -> None:
     release_hold.reopen()
 
 
+async def _run_file_storage_preflight(app_instance: FastAPI) -> None:
+    """Standby: classify registered files read-only, before activation.
+
+    The result lets activation skip the gated write pass when every file is
+    already durable. Any failure leaves no result, which activation reads as
+    "unknown" and answers with the full gated sync.
+    """
+    from .services.startup_file_storage_sync import (
+        StartupSyncControl,
+        preflight_registered_files,
+    )
+
+    control = StartupSyncControl()
+    app_instance.state.file_storage_preflight_control = control
+    app_instance.state.file_storage_preflight_result = None
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            _get_file_storage_sync_executor(),
+            functools.partial(preflight_registered_files, control=control),
+        )
+    except asyncio.CancelledError:
+        control.cancel.set()
+        raise
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Standby file storage preflight failed; activation will run the full sync"
+        )
+        return
+    app_instance.state.file_storage_preflight_result = result
+
+
+def _start_file_storage_preflight(app_instance: FastAPI) -> None:
+    app_instance.state.file_storage_preflight_task = None
+    app_instance.state.file_storage_preflight_result = None
+    if not get_file_storage_startup_sync_enabled():
+        return
+    app_instance.state.file_storage_preflight_task = asyncio.create_task(
+        _run_file_storage_preflight(app_instance)
+    )
+
+
+def _file_storage_sync_should_gate(app_instance: FastAPI) -> bool:
+    """Whether client requests wait for the post-activation sync.
+
+    Only a standby whose preflight finished before activation and found every
+    registered file already durable (or unreachable locally, which the sync
+    skips) starts the sync in the background. Anything else -- a normal start,
+    a preflight that is unfinished, failed or found files to write -- keeps the
+    gate: those files must be durable before clients are served, as before.
+    """
+    if getattr(app_instance.state, "file_storage_preflight_task", None) is None:
+        return True
+    result = getattr(app_instance.state, "file_storage_preflight_result", None)
+    return result is None or not result.clean
+
+
 async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     # Reopen process-local task admission before any trigger, command, or
     # channel ingress can create background execution work for this lifespan.
@@ -1949,7 +2282,14 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     if not get_shared_task_execution_enabled():
         background_task_manager.start_accepting()
 
-    start_file_storage_startup_sync_task(app_instance)
+    if _file_storage_sync_should_gate(app_instance):
+        start_file_storage_startup_sync_task(app_instance)
+    else:
+        logger.info(
+            "Standby preflight found every registered file durable; the startup "
+            "file storage sync runs in the background without gating requests"
+        )
+        start_file_storage_startup_sync_task(app_instance, gating=False)
     if not get_shared_task_execution_enabled():
         start_trigger_dispatcher_task(app_instance)
         start_task_lease_recovery_task(app_instance)
@@ -1983,6 +2323,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
             "local runtime loops",
             functools.partial(_start_local_runtime_loops, app_instance),
         )
+        _start_file_storage_preflight(app_instance)
         return
 
     await _admit_database_and_host(app_instance, bound=False)
@@ -2479,6 +2820,15 @@ async def _start_commands_and_channels() -> None:
         app.state.task_command_dispatcher_task = _task_command_dispatcher_task
     logger.info("Task command dispatch configured")
 
+    # Chat intake claims new conversations: only the serving generation takes
+    # it. A restarted old generation must not start receiving again. This is
+    # the cheap early refusal; when the record cannot be read it lets the start
+    # through, and the channel managers' own sync (which every start path,
+    # including channel CRUD, goes through) keeps the channels dormant until
+    # this generation is confirmed as the serving one.
+    if not start_allowed("chat-channels"):
+        return
+
     # Start configured chat channels.
     try:
         from .channels.feishu.bot import get_feishu_channel
@@ -2513,7 +2863,7 @@ async def _start_commands_and_channels() -> None:
 
 
 async def _start_late_tasks() -> None:
-    """Temp-file cleanup and Composio reconcile, deliberately started last."""
+    """Temp-file cleanup and the Composio loops, deliberately started last."""
     auto_migrate = _lancedb_auto_migrate()
     # Kept under the same migration toggle as the uploaded-files reconcile above;
     # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
@@ -2527,9 +2877,10 @@ async def _start_late_tasks() -> None:
     # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
     if auto_migrate:
         start_temp_file_cleanup_task(app)
-    # Last for the same reason: a Composio reconcile pass runs in an executor
-    # thread that only its stop event (set by shutdown_event) can end.
+    # Last for the same reason: a Composio pass runs in an executor thread
+    # that only its stop event (set by shutdown_event) can end.
     start_composio_reconcile_task(app)
+    start_composio_missing_account_task(app)
 
 
 async def _stop_runtime_loops() -> None:
@@ -2560,6 +2911,7 @@ async def _stop_runtime_loops() -> None:
 
     await stop_orphan_upload_gc_task(app)
     await stop_composio_reconcile_task(app)
+    await stop_composio_missing_account_task(app)
     await stop_retention_purge_task(app)
     await stop_browser_session_sweep_task(app)
     await stop_task_cleanup_retry_task(app)
@@ -2573,6 +2925,13 @@ async def _stop_runtime_loops() -> None:
         with suppress(asyncio.CancelledError):
             await _sandbox_idle_sweep_task
     _sandbox_idle_sweep_task = None
+
+    preflight_task = getattr(app.state, "file_storage_preflight_task", None)
+    if preflight_task is not None and not preflight_task.done():
+        preflight_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await preflight_task
+    app.state.file_storage_preflight_task = None
 
     if _file_storage_startup_sync_task and not _file_storage_startup_sync_task.done():
         logger.info("Cancelling background startup file storage sync task...")
@@ -2819,7 +3178,7 @@ async def startup_event() -> None:
         await _preload_channel_modules_in_standby()
     await _run_or_defer("command dispatch and channels", _start_commands_and_channels)
 
-    await _run_or_defer("temp-file cleanup and Composio reconcile", _start_late_tasks)
+    await _run_or_defer("temp-file cleanup and Composio loops", _start_late_tasks)
     start_runtime_performance_monitor(app)
     report_unobserved_execution_events(
         telemetry_started=getattr(app.state, "runtime_performance_task", None)
@@ -2844,10 +3203,11 @@ async def retire_writers(
     thread or task that is in neither is not covered, whatever it does.
 
     **Stopped (tasks cancelled and awaited):** command dispatcher and its
-    detached prompt dispatches, orphan-upload GC, Composio reconcile,
-    retention purge, task-cleanup retry, uploaded-file recovery and reconcile,
-    auto-resume, lease recovery, sandbox idle sweep, startup file-storage
-    sync, LanceDB migration, trigger dispatcher, chat channels.
+    detached prompt dispatches, orphan-upload GC, Composio reconcile and
+    missing-account, retention purge, task-cleanup retry, uploaded-file
+    recovery and reconcile, auto-resume, lease recovery, sandbox idle sweep,
+    startup file-storage sync, LanceDB migration, trigger dispatcher, chat
+    channels.
 
     **Fenced:** socket-owned writes. After the fence no WebSocket handler
     starts a write (message/start commands, builder turns, ASR sessions,
@@ -2865,11 +3225,12 @@ async def retire_writers(
     (``services/triggers``), the LanceDB user-id, documents and
     uploaded-file-link backfills, the retention-purge batch, task-cleanup
     retry (workspace removal, live-id check, claim, settle), the Composio
-    reconcile pass, the socket command enqueue, the channel input
-    acceptance/claim/staging threads (Feishu, Slack, Telegram, shared channel
-    execution) and the blocking calls a builder chat turn makes through
-    ``xagent.core.utils.blocking.run_blocking`` (knowledge-base ingestion and
-    the knowledge-base coordinator, LanceDB metadata-table creation).
+    reconcile and missing-account passes, the socket command enqueue, the
+    channel input acceptance/claim/staging threads (Feishu, Slack, Telegram,
+    shared channel execution) and the blocking calls a builder chat turn makes
+    through ``xagent.core.utils.blocking.run_blocking`` (knowledge-base
+    ingestion and the knowledge-base coordinator, LanceDB metadata-table
+    creation).
 
     **Not covered -- the host must quiesce these itself:** HTTP producers
     (the API routes, including the A2A, triggers, MCP and file routes, and

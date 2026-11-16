@@ -130,14 +130,20 @@ class LanceDBConnectionManager:
     @staticmethod
     @functools.lru_cache(maxsize=None)
     def get_default_lancedb_dir() -> str:
-        """Get the default LanceDB directory path.
+        """The default LanceDB directory, created if missing; cached."""
+        path = LanceDBConnectionManager.locate_default_lancedb_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    @staticmethod
+    def locate_default_lancedb_dir() -> Path:
+        """Get the default LanceDB directory path, without creating it.
 
         Returns:
             Default LanceDB directory path
 
         Note:
             Priority: legacy_location (if has data) > ~/.xagent/data/lancedb
-            Result is cached after first call.
         """
         # TODO: This function has confusing logic and potential issues.
         #
@@ -162,15 +168,13 @@ class LanceDBConnectionManager:
         )
         if legacy_dir.is_dir() and list(legacy_dir.iterdir()):
             logger.info(f"Using legacy LanceDB location: {legacy_dir}")
-            return str(legacy_dir)
+            return legacy_dir
 
         # Use new default location from unified config module
         # Note: get_lancedb_path() returns relative path, so we combine with
         # get_storage_root() to get absolute path.
         # The former is: new_dir = Path.home() / ".xagent" / "data" / "lancedb"
-        new_dir = get_storage_root() / get_lancedb_path()
-        new_dir.mkdir(parents=True, exist_ok=True)
-        return str(new_dir)
+        return get_storage_root() / get_lancedb_path()
 
     @staticmethod
     def _cleanup_expired_connections() -> None:
@@ -255,11 +259,14 @@ class LanceDBConnectionManager:
         """
         return self.get_connection(self.resolve_dir_from_env(env_var))
 
-    def resolve_dir_from_env(self, env_var: str = "LANCEDB_DIR") -> str:
+    def resolve_dir_from_env(
+        self, env_var: str = "LANCEDB_DIR", *, create: bool = True
+    ) -> str:
         """Resolve the configured directory without opening a connection.
 
         Args:
             env_var: Environment variable name containing database directory
+            create: Create the default directory when it is the one resolved
 
         Returns:
             Normalized directory path
@@ -273,7 +280,11 @@ class LanceDBConnectionManager:
         if db_dir is None:
             if env_var == "LANCEDB_DIR":
                 # Use default path only for the standard LANCEDB_DIR environment variable
-                db_dir = self.get_default_lancedb_dir()
+                db_dir = (
+                    self.get_default_lancedb_dir()
+                    if create
+                    else str(self.locate_default_lancedb_dir())
+                )
                 # Reached on every connection request now that the KB stores
                 # no longer memoise one (LanceDBVectorStore still does), so
                 # this must be neither INFO nor an eager f-string.

@@ -124,6 +124,13 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
 # It is the most one reply ever carries; spill_read_page_chars lowers the
 # page further when the tool output limit is smaller.
 SPILL_READ_TOOL_NAME = "read_tool_result"
+# Stands in for the reader's name in the system prompt's tool-name list: the
+# reader joins the tool schema mid-run, so naming it there would change the
+# system text (and the provider's cached prefix) on that call.
+SPILL_READ_AVAILABLE_NOTE = (
+    f" {SPILL_READ_TOOL_NAME} is also available once the engine has stored "
+    "a large tool result; the stored-result notice then names it."
+)
 SPILL_READ_MAX_CHARS = 12_000
 SPILL_READ_TRUNCATED_INSTRUCTION = (
     "Call read_tool_result again with the same path, start, and end and "

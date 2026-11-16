@@ -162,9 +162,11 @@ class SmokeClient:
         return JSONResponse(response.status_code, payload)
 
     def start_launch(
-        self, provider: str, app_id: str, account: str | None = None
+        self, provider: str, app_id: str | None = None, account: str | None = None
     ) -> LaunchStart:
-        body: dict[str, str] = {"app_id": app_id}
+        body: dict[str, str] = {}
+        if app_id is not None:
+            body["app_id"] = app_id
         if account is not None:
             body["account"] = account
         response = self._request("POST", _launch_path(provider), json=body)

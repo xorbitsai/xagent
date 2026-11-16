@@ -1,7 +1,7 @@
 """User-isolated memory store for web application."""
 
 import contextvars
-from typing import Any, List, Optional
+from typing import Any, List, Mapping, Optional
 
 from xagent.core.execution_scope import (
     MEMORY_DIMENSION_METADATA_PREFIX,
@@ -11,10 +11,20 @@ from xagent.core.execution_scope import (
     metadata_carries_scope_dimensions,
 )
 from xagent.core.memory.access_scope import MemoryAccessScope
-from xagent.core.memory.base import MemoryStore
+from xagent.core.memory.base import MemoryScopeTooBroadError, MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.provenance import MEMORY_PROVENANCE_METADATA_KEY
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
+
+
+def _is_server_owned_metadata_key(key: str) -> bool:
+    """Metadata a by-id update restores from the stored note: scope-dimension
+    stamps and ``provenance`` (``user_id`` is re-stamped separately)."""
+    return (
+        key.startswith(MEMORY_DIMENSION_METADATA_PREFIX)
+        or key == MEMORY_PROVENANCE_METADATA_KEY
+    )
 
 
 class UserIsolatedMemoryStore(MemoryStore):
@@ -274,17 +284,18 @@ class UserIsolatedMemoryStore(MemoryStore):
                 existing_isolation_metadata = {
                     key: value
                     for key, value in existing_response.content.metadata.items()
-                    if key.startswith(MEMORY_DIMENSION_METADATA_PREFIX)
+                    if _is_server_owned_metadata_key(key)
                 }
 
-        # Isolation metadata is server-owned. A caller may replace ordinary
-        # metadata, but cannot move an authenticated note to another owner (or
-        # to an invalid/ownerless value), nor add/remove its scope dimensions.
-        # An unscoped note stays unscoped: the stored set is restored even when
-        # it is empty.
+        # Isolation metadata and provenance are server-owned. A caller may
+        # replace ordinary metadata, but cannot move an authenticated note to
+        # another owner (or to an invalid/ownerless value), add/remove its
+        # scope dimensions, or forge/wipe where it was originally learned. An
+        # unscoped (or provenance-less) note stays so: the stored set is
+        # restored even when it is empty.
         if existing_isolation_metadata is not None:
             for key in tuple(note.metadata):
-                if key.startswith(MEMORY_DIMENSION_METADATA_PREFIX):
+                if _is_server_owned_metadata_key(key):
                     note.metadata.pop(key)
             note.metadata.update(existing_isolation_metadata)
         if user_id is not None:
@@ -327,6 +338,62 @@ class UserIsolatedMemoryStore(MemoryStore):
         tenant's notes.
         """
         return self._base_store.delete_by_scope_dimension(dim_key, value)
+
+    def delete_for_scope(self, owner_user_id: int, dims: Mapping[str, str]) -> int:
+        """Bulk-delete ``owner_user_id``'s notes carrying every dimension in ``dims``.
+
+        Control-plane erasure primitive (e.g. "forget everything in this
+        workspace"), delegated straight to the base store and deliberately
+        not gated by the ambient user/scope: the explicit owner + non-empty
+        dimension predicate is what bounds it. Trusted-caller-only, for the
+        same reason as ``delete_by_scope_dimension`` -- never feed it owner or
+        dimension values taken from agent or end-user input. Agent-facing code
+        uses ``delete_current_scope`` instead.
+        """
+        return self._base_store.delete_for_scope(owner_user_id, dims)
+
+    def _current_scope_predicate(self) -> tuple[int, dict[str, str]] | None:
+        """The ``(owner, dimensions)`` bounding ``delete_current_scope``.
+
+        ``None`` when either is missing:
+
+        - no owner: the by-id path is ungated, so there is nothing to bound
+          the delete to;
+        - no memory dimensions: the owner may be shared by many principals
+          that are only told apart by their dimensions (one machine owner per
+          Slack workspace hosting every member), and a dimension-less
+          ``strict_memory_isolation`` scope (creator-direct tasks) cannot be
+          expressed as an ``owner + dimensions`` predicate at all.
+        """
+        owner_user_id = self._get_current_user_id()
+        scope = self._get_memory_scope()
+        dims = dict(scope.memory_dimensions) if scope is not None else {}
+        if owner_user_id is None or not dims:
+            return None
+        return owner_user_id, dims
+
+    def can_delete_current_scope(self) -> bool:
+        """Whether the current owner + scope bound a ``delete_current_scope``."""
+        return self._current_scope_predicate() is not None
+
+    def delete_current_scope(self) -> int:
+        """Delete every note in the current owner + execution scope.
+
+        The deleted set is exactly the notes the by-id ``delete`` could reach
+        from this scope, never wider: the current owner and *every* current
+        memory dimension are all required (``_scope_permits`` semantics). It
+        refuses with ``MemoryScopeTooBroadError`` -- and never falls back to
+        ``clear()`` -- when ``_current_scope_predicate`` finds no bound.
+
+        Returns:
+            int: Number of notes deleted.
+        """
+        predicate = self._current_scope_predicate()
+        if predicate is None:
+            raise MemoryScopeTooBroadError(
+                "the current memory scope has no owner or no scope dimensions"
+            )
+        return self._base_store.delete_for_scope(*predicate)
 
     def list_scope_dimension_values(self, dim_key: str) -> set[str]:
         """Distinct stamped values for one scope dimension, store-wide.

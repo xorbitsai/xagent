@@ -16,7 +16,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Query, sessionmaker
 from starlette.requests import Request
 
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
@@ -4852,6 +4852,123 @@ async def test_delete_grant_revokes_external_tokens_when_endpoint_is_advertised(
     db.refresh(grant)
     assert grant.status == "revoked"
     assert grant.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_grant_treats_a_runtime_delete_during_revoke_as_done(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(
+        db,
+        server,
+        client_secret=encrypt_value("client-secret"),
+        token_endpoint_auth_method="client_secret_post",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value("access-token"),
+        refresh_token=encrypt_value("refresh-token"),
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    grant_id = grant.id
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    async def revoke_and_delete(*args, **kwargs):
+        with SessionLocal() as other_db:
+            other_db.delete(other_db.get(MCPOAuthGrant, grant_id))
+            other_db.commit()
+
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_grant_externally", revoke_and_delete
+    )
+
+    await delete_mcp_oauth_grant(server.id, grant_id, user, db)
+
+    db.expire_all()
+    assert db.get(MCPOAuthGrant, grant_id) is None
+
+
+def test_upsert_mcp_oauth_grant_locks_and_reinserts_a_deleted_row(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _server, _client, flow_state = _add_callback_client_and_state(
+        db, user, state="state-upsert-lock"
+    )
+    token_data = {
+        "access_token": "first-access",
+        "refresh_token": "first-refresh",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "records.read",
+    }
+    grant = mcp_api._upsert_mcp_oauth_grant(
+        db, flow_state=flow_state, token_data=token_data
+    )
+    db.commit()
+    grant_id = grant.id
+    lookup_hash = grant.lookup_hash
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    with SessionLocal() as other_db:
+        other_db.delete(other_db.get(MCPOAuthGrant, grant_id))
+        other_db.commit()
+    db.expire_all()
+    assert db.get(MCPOAuthGrant, grant_id) is None
+
+    lock_queries: list[bool] = []
+    original_with_for_update = Query.with_for_update
+
+    def record_with_for_update(self, *args, **kwargs):
+        lock_queries.append(True)
+        return original_with_for_update(self, *args, **kwargs)
+
+    monkeypatch.setattr(Query, "with_for_update", record_with_for_update)
+
+    mcp_api._upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
+    db.commit()
+
+    assert lock_queries
+    db.expire_all()
+    assert db.get(MCPOAuthGrant, grant_id) is not None
+    assert (
+        db.query(MCPOAuthGrant).filter(MCPOAuthGrant.lookup_hash == lookup_hash).count()
+        == 1
+    )
+
+
+def test_upsert_mcp_oauth_grant_drops_marker_keys_from_a_token_payload(db_session):
+    db, user, _ = db_session
+    _server, _client, flow_state = _add_callback_client_and_state(
+        db, user, state="state-upsert-marker"
+    )
+
+    grant = mcp_api._upsert_mcp_oauth_grant(
+        db,
+        flow_state=flow_state,
+        token_data={
+            "access_token": "access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "records.read",
+            "invalid_grant_at": "2020-01-01T00:00:00+00:00",
+            "invalid_grant_token_sha256": "deadbeef",
+        },
+    )
+    db.commit()
+
+    assert "invalid_grant_at" not in grant.metadata_json
+    assert "invalid_grant_token_sha256" not in grant.metadata_json
 
 
 @pytest.mark.asyncio

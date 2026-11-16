@@ -219,7 +219,7 @@ async def test_startup_in_standby_defers_writes_and_activation_runs_them_in_orde
         "start_task_cleanup_retry_task",
     ):
         monkeypatch.setattr(
-            app_module, name, lambda _app, name=name: events.append(name)
+            app_module, name, lambda _app, name=name, **_kw: events.append(name)
         )
 
     app_module.standby.begin()

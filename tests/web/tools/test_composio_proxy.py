@@ -1541,3 +1541,35 @@ def test_an_account_answer_of_an_unexpected_shape_is_a_composio_error(proxy, pay
     assert "no base_url" not in str(raised.value)
     assert raised.value.status is None
     assert _secrets_in(str(raised.value)) == []
+
+
+def test_a_request_outside_a_batch_is_not_cut_off_at_its_timeout(monkeypatch, proxy):
+    """``requests``' ``timeout`` bounds one connect attempt and each socket
+    read, not the whole exchange. A request sent outside a batch keeps just
+    that: no metered call goes on to wait for it, so a body that keeps arriving
+    is not cut off at an end-to-end deadline."""
+
+    def trickling(**kwargs: Any) -> _Response:
+        trickling_until = time.monotonic() + 0.5
+        while time.monotonic() < trickling_until:
+            time.sleep(0.02)
+        return _Response(200, {"status": 200, "data": {"ok": True}})
+
+    monkeypatch.setattr(composio_proxy.requests, "request", trickling)
+
+    token = composio_proxy.begin_request_count()
+    started = time.monotonic()
+    try:
+        response = composio_proxy.proxy_request(
+            "GET",
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            allowed_hosts=GMAIL_HOSTS,
+            timeout=0.3,
+        )
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+    elapsed = time.monotonic() - started
+
+    assert (response.status, response.data) == (200, {"ok": True})
+    assert accepted == 1
+    assert elapsed >= 0.5, "the call must not be cut off at its timeout"

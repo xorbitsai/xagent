@@ -28,6 +28,11 @@ from .user_oauth import (
 )
 
 GOOGLE_SHARED_OAUTH_PROVIDER = "google"
+# ``UserOAuth.oauth_provider`` of every row holding Google-issued tokens: the
+# Google ``OAuthProvider.provider_name``. Same value as the shared row's key
+# above, but a different fact -- the issuer, not the app key a row is stored
+# under -- so legacy app rows (``gmail``, a custom ``acme-mail``) record it too.
+GOOGLE_OAUTH_ISSUER = "google"
 
 
 class GoogleOAuthGrantConflict(ValueError):
@@ -71,6 +76,45 @@ def normalize_google_oauth_scopes(scopes: str | Iterable[str] | None) -> frozens
     for value in values:
         normalized.update(part for part in re.split(r"[\s,]+", str(value)) if part)
     return frozenset(normalized)
+
+
+# Every Google authorization carries these for the sign-in itself. Google may
+# spell them differently in a refresh response, and none of them gates a
+# connector, so the refresh check below ignores them.
+_GOOGLE_IDENTITY_SCOPES = frozenset(
+    {
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    }
+)
+
+
+def google_connector_scopes(scopes: str | Iterable[str] | None) -> frozenset[str]:
+    """Return the requested scopes that a connector's tools depend on."""
+    return normalize_google_oauth_scopes(scopes) - _GOOGLE_IDENTITY_SCOPES
+
+
+def google_scopes_confirmed_by_refresh(
+    granted_scopes: str | Iterable[str] | None,
+    confirmed_scopes: frozenset[str] | None,
+) -> str:
+    """Narrow granted scopes to what a reused refresh token was shown to yield.
+
+    A code exchange can report more than was requested (``include_granted_scopes``
+    folds in earlier consents). When its token is not the one stored, only the
+    scopes Google's refresh response listed are proven for the stored token, so
+    the connector scopes beyond them must not be recorded. The identity scopes
+    stay as granted. ``None`` means no connector scope was requested, so there
+    was nothing to confirm and nothing to narrow.
+    """
+    granted = normalize_google_oauth_scopes(granted_scopes)
+    if confirmed_scopes is None:
+        return " ".join(sorted(granted))
+    connectors = google_connector_scopes(granted)
+    return " ".join(sorted((granted - connectors) | (connectors & confirmed_scopes)))
 
 
 def google_oauth_grant_covers_scopes(
@@ -248,6 +292,14 @@ def _connected_google_apps_covered_by_bare_account(
 def _copy_shared_google_credentials(
     source: UserOAuth, target: UserOAuth, *, preserve_missing_refresh: bool
 ) -> None:
+    """Mirror a shared Google credential's token material onto ``target``.
+
+    ``source`` is always a shared Google credential, so whatever ``target``
+    held before, the tokens it holds afterwards were issued by Google: the
+    issuer is stamped as a fact rather than copied, which also repairs a
+    mirror whose issuer the backfill left unknown.
+    """
+    setattr(target, "oauth_provider", GOOGLE_OAUTH_ISSUER)
     for field in (
         "access_token",
         "refresh_token",
@@ -584,6 +636,71 @@ def _remove_stale_legacy_associations(
         _delete_orphaned_google_grants(db, grant_ids=grant_ids)
 
 
+def stored_google_refresh_token_for_callback(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    oauth_client_id: str,
+    google_subject: str,
+    legacy_refresh_token: str | None,
+) -> str | None:
+    """Return the stored refresh token a callback without a new one would reuse.
+
+    This mirrors the resolution in ``write_google_shared_oauth_callback`` without
+    taking locks, so the caller can ask Google whether that token still covers
+    the requested scopes before the callback locks anything. The writer receives
+    the token that was verified and refuses to reuse any other one, so a
+    difference between the two (for instance after the writer drops an orphaned
+    grant) ends in a consent rather than in an unverified reuse. It returns None
+    whenever the writer would not reuse a stored token (a rotated OAuth client,
+    an ambiguous identity) or has none to reuse.
+    """
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    subject = _normalized_nonempty(google_subject, field="Google subject")
+    client_fingerprint = google_oauth_client_fingerprint(oauth_client_id)
+    identity_grants = (
+        db.query(GoogleOAuthGrant)
+        .filter(
+            GoogleOAuthGrant.user_id == int(user_id),
+            GoogleOAuthGrant.google_subject == subject,
+            _grant_owner_clause(owner_key),
+        )
+        .order_by(GoogleOAuthGrant.id)
+        .all()
+    )
+    exact_grants = [
+        grant
+        for grant in identity_grants
+        if grant.oauth_client_fingerprint == client_fingerprint
+    ]
+    shared_account: UserOAuth | None
+    if exact_grants:
+        if len(exact_grants) > 1:
+            return None
+        shared_account = db.get(UserOAuth, int(exact_grants[0].oauth_account_id))
+    elif identity_grants:
+        # Another client's grant: the writer migrates it only on a fresh token.
+        return None
+    else:
+        shared_account = (
+            db.query(UserOAuth)
+            .filter(
+                UserOAuth.user_id == int(user_id),
+                user_oauth_owner_clause(owner_key),
+                UserOAuth.provider == GOOGLE_SHARED_OAUTH_PROVIDER,
+                UserOAuth.provider_user_id == subject,
+            )
+            .one_or_none()
+        )
+    stored = (
+        shared_account.refresh_token if shared_account is not None else None
+    ) or legacy_refresh_token
+    if not stored or is_undecryptable_oauth_token(stored):
+        return None
+    return str(stored)
+
+
 def write_google_shared_oauth_callback(
     db: Session,
     *,
@@ -600,12 +717,21 @@ def write_google_shared_oauth_callback(
     token_type: str,
     expires_at: datetime | None,
     legacy_oauth_account: UserOAuth,
+    verified_refresh_token: str | None = None,
 ) -> tuple[UserOAuth, UserOAuth, GoogleOAuthAppAssociation]:
     """Persist a shared callback while retaining one rollback-compatible row.
 
     Existing shared credentials are updated in place. The app-specific legacy
     row mirrors the same token material so disabling the rollout flag takes
     effect immediately and does not require another Google authorization.
+
+    Google returns a refresh token only on the first consent, so an incremental
+    authorization often answers without one. The stored token may then be
+    reused only when it is the one the caller asked Google about and was told
+    still covers the requested scopes (``verified_refresh_token``). Otherwise the
+    callback would store the new access token's scopes next to a token that
+    refreshes to the old ones, and the new app would lose access at the first
+    refresh while the row claimed it had it.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
@@ -680,6 +806,7 @@ def write_google_shared_oauth_callback(
             candidate = UserOAuth(
                 user_id=int(user_id),
                 provider=GOOGLE_SHARED_OAUTH_PROVIDER,
+                oauth_provider=GOOGLE_OAUTH_ISSUER,
                 resource_owner_key=owner_key,
                 provider_user_id=subject,
                 access_token=access_token,
@@ -735,8 +862,10 @@ def write_google_shared_oauth_callback(
         if client_fingerprint_migrated
         else shared_refresh_token or legacy_refresh_token
     )
-    if not resolved_refresh_token or is_undecryptable_oauth_token(
-        resolved_refresh_token
+    if (
+        not resolved_refresh_token
+        or is_undecryptable_oauth_token(resolved_refresh_token)
+        or (not refresh_token and str(resolved_refresh_token) != verified_refresh_token)
     ):
         raise GoogleOAuthRefreshTokenRequired
 
@@ -747,6 +876,9 @@ def write_google_shared_oauth_callback(
     scope_value = " ".join(sorted(scopes))
 
     for account in (shared_account, legacy_oauth_account):
+        # Both rows now hold the tokens Google issued to this callback; an
+        # adopted pre-rollout bare row may still carry a NULL issuer.
+        setattr(account, "oauth_provider", GOOGLE_OAUTH_ISSUER)
         setattr(account, "provider_user_id", subject)
         setattr(account, "access_token", access_token)
         setattr(account, "refresh_token", resolved_refresh_token)
@@ -801,6 +933,7 @@ def write_google_shared_oauth_callback(
             sibling_legacy = UserOAuth(
                 user_id=int(user_id),
                 provider=sibling_app_id,
+                oauth_provider=GOOGLE_OAUTH_ISSUER,
                 resource_owner_key=owner_key,
                 provider_user_id=subject,
                 access_token=access_token,

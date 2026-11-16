@@ -11,7 +11,18 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence, Tuple, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 import pyarrow as pa  # type: ignore
 from filelock import FileLock, Timeout
@@ -348,6 +359,7 @@ class LanceDBMetadataStore(MetadataStore):
         *,
         require_uninitialized: bool = False,
         expected_model_id: Optional[str] = None,
+        expected_updated_at: Optional[datetime] = None,
     ) -> bool:
         from ..LanceDB.schema_manager import _safe_close_table
 
@@ -378,6 +390,11 @@ class LanceDBMetadataStore(MetadataStore):
                 " AND embedding_model_id = "
                 f"'{escape_lancedb_string(expected_model_id)}'"
             )
+        if expected_updated_at is not None:
+            stamp = expected_updated_at.strftime("%Y-%m-%d %H:%M:%S.%f")
+            # Every write sets updated_at, so NULL means no write since creation
+            # (a read reports it as the read time; see migrate_collection_metadata).
+            where += f" AND (updated_at = timestamp '{stamp}' OR updated_at IS NULL)"
         table = conn.open_table("collection_metadata")
         try:
             updated = table.update(where, payload)
@@ -385,7 +402,11 @@ class LanceDBMetadataStore(MetadataStore):
             _safe_close_table(table)
         if updated.rows_updated:
             return True
-        if require_uninitialized or expected_model_id is not None:
+        if (
+            require_uninitialized
+            or expected_model_id is not None
+            or expected_updated_at is not None
+        ):
             return False
         raise ValueError(f"Collection '{collection.name}' not found")
 
@@ -3108,7 +3129,10 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         from ..version_management.main_pointer_manager import (
             _get_main_pointer_impl as get_main_pointer,
         )
-        from .lancedb_cleanup_filters import build_embedding_cleanup_filters
+        from .lancedb_cleanup_filters import (
+            embedding_cleanup_filters_for_table,
+            embedding_cleanup_filters_from_base,
+        )
 
         conn = self._get_connection()
         ensure_documents_table(conn)
@@ -3140,6 +3164,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             }
 
         predicates: Dict[str, list] = {}
+        embedding_filters: Optional[Callable[[str], list]] = None
+        embedding_base: Optional[str] = None
 
         if scope == "parse":
             if old_parse_hash is None:
@@ -3160,14 +3186,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     is_admin=is_admin,
                     skip_user_filter=True,
                 )
-                _vis_replace_embedding_predicates(
-                    predicates=predicates,
-                    conn=conn,
-                    base_expr=base,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    model_tag=model_tag,
-                )
+                embedding_base = base
                 predicates["chunks"] = [
                     _vis_append_user_filter_if_needed(
                         conn=conn,
@@ -3188,14 +3207,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     f"doc_id == '{escaped_doc_id}' AND "
                     f"parse_hash != '{escaped_new_parse_hash}'"
                 )
-                _vis_replace_embedding_predicates(
-                    predicates=predicates,
-                    conn=conn,
-                    base_expr=other,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    model_tag=model_tag,
-                )
+                embedding_base = other
                 predicates["chunks"] = [
                     _vis_append_user_filter_if_needed(
                         conn=conn,
@@ -3232,14 +3244,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     is_admin=is_admin,
                     skip_user_filter=True,
                 )
-                _vis_replace_embedding_predicates(
-                    predicates=predicates,
-                    conn=conn,
-                    base_expr=base,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    model_tag=model_tag,
-                )
+                embedding_base = base
             if new_parse_hash:
                 from ..utils.string_utils import escape_lancedb_string
 
@@ -3251,14 +3256,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     f"doc_id == '{escaped_doc_id}' AND "
                     f"parse_hash != '{escaped_parse_hash}'"
                 )
-                _vis_replace_embedding_predicates(
-                    predicates=predicates,
-                    conn=conn,
-                    base_expr=other,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    model_tag=model_tag,
-                )
+                embedding_base = other
                 predicates["chunks"] = [
                     _vis_append_user_filter_if_needed(
                         conn=conn,
@@ -3276,10 +3274,11 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 is_admin=is_admin,
                 model_tag=model_tag,
             )
-            filters_by_table = build_embedding_cleanup_filters(conn, scope_obj)
-            for table_name, filter_exprs in filters_by_table.items():
-                if filter_exprs:
-                    predicates.setdefault(table_name, []).extend(filter_exprs)
+
+            def _scope_filters(table_name: str) -> list:
+                return embedding_cleanup_filters_for_table(conn, table_name, scope_obj)
+
+            embedding_filters = _scope_filters
         elif scope == "pointers":
             filt = _vis_build_document_filter(
                 conn=conn,
@@ -3293,6 +3292,20 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         else:
             raise CascadeCleanupError(f"Unsupported scope: {scope}")
 
+        if embedding_base is not None:
+            base_expr = embedding_base
+
+            def _base_filters(table_name: str) -> list:
+                return embedding_cleanup_filters_from_base(
+                    conn,
+                    table_name,
+                    base_filter=base_expr,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
+
+            embedding_filters = _base_filters
+
         try:
             result = _vis_execute_or_plan_by_predicates(
                 conn,
@@ -3300,6 +3313,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 preview_only=preview_only,
                 confirm=confirm,
                 model_tag=model_tag,
+                embedding_filters=embedding_filters,
             )
         finally:
             # Earlier tables may already be deleted when a later one raises.
@@ -3329,8 +3343,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             ensure_main_pointers_table,
             ensure_parses_table,
         )
+        from ..utils.lancedb_query_utils import list_table_names
         from ..utils.user_scope import resolve_user_scope
-        from .lancedb_cleanup_filters import select_embedding_tables
 
         user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
         user_id = user_scope.user_id
@@ -3346,7 +3360,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         ensure_main_pointers_table(conn)
         ensure_ingestion_runs_table(conn)
 
-        table_names = _vis_get_table_names(conn)
+        table_names = list(list_table_names(conn))
         predicates: Dict[str, list] = {}
 
         core_tables = [
@@ -3378,17 +3392,19 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 )
             predicates[table_name] = [filter_expr]
 
-        for table_name in select_embedding_tables(conn, model_tag=model_tag):
+        def _embedding_filter(table_name: str) -> list:
             if target == "collection":
-                filter_expr = _vis_build_collection_filter(
-                    conn=conn,
-                    table_name=table_name,
-                    collection=collection,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                )
-            else:
-                filter_expr = _vis_build_document_filter(
+                return [
+                    _vis_build_collection_filter(
+                        conn=conn,
+                        table_name=table_name,
+                        collection=collection,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                    )
+                ]
+            return [
+                _vis_build_document_filter(
                     conn=conn,
                     table_name=table_name,
                     collection=collection,
@@ -3396,7 +3412,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     user_id=user_id,
                     is_admin=is_admin,
                 )
-            predicates[table_name] = [filter_expr]
+            ]
 
         try:
             result = _vis_execute_or_plan_by_predicates(
@@ -3404,7 +3420,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 predicates,
                 preview_only=preview_only,
                 confirm=confirm,
-                model_tag=None,
+                model_tag=model_tag,
+                embedding_filters=_embedding_filter,
             )
         finally:
             # Earlier tables may already be deleted when a later one raises.
@@ -3433,7 +3450,8 @@ def _vis_delete_rows_by_filters(table: Any, filter_exprs: list) -> int:
 
     deleted_count = 0
     for filter_expr in filter_exprs:
-        count = _safe_count_rows(table, filter_expr)
+        # A count read as zero would skip this delete and report it done.
+        count = _safe_count_rows(table, filter_expr, on_error="raise")
         if count > 0:
             table.delete(filter_expr)
         deleted_count += count
@@ -3473,29 +3491,6 @@ def _vis_append_user_filter_if_needed(
         _safe_close_table(table)
 
 
-def _vis_replace_embedding_predicates(
-    *,
-    predicates: Dict[str, list],
-    conn: Any,
-    base_expr: str,
-    user_id: Optional[int],
-    is_admin: bool,
-    model_tag: Optional[str] = None,
-) -> None:
-    from .lancedb_cleanup_filters import build_embedding_cleanup_filters_from_base
-
-    table_filters = build_embedding_cleanup_filters_from_base(
-        conn,
-        base_filter=base_expr,
-        user_id=user_id,
-        is_admin=is_admin,
-        model_tag=model_tag,
-    )
-    for table_name, filter_exprs in table_filters.items():
-        if filter_exprs:
-            predicates[table_name] = list(filter_exprs)
-
-
 def _vis_get_table_names(conn: Any) -> list:
     from ..utils.lancedb_query_utils import list_table_names
 
@@ -3506,10 +3501,9 @@ def _vis_get_table_names(conn: Any) -> list:
 
 
 def _vis_plan_by_predicates(
-    conn: Any, table_to_filter: Dict[str, list], model_tag: Optional[str] = None
+    conn: Any, table_to_filter: Dict[str, list]
 ) -> Dict[str, int]:
     from ..LanceDB.schema_manager import _safe_close_table
-    from .lancedb_cleanup_filters import select_embedding_tables
 
     counts: Dict[str, int] = {}
     table_names = _vis_get_table_names(conn)
@@ -3524,18 +3518,6 @@ def _vis_plan_by_predicates(
                 _safe_close_table(table)
 
     for table_name, filter_exprs in table_to_filter.items():
-        if table_name == "__embeddings__":
-            total = 0
-            target_tables = select_embedding_tables(conn, model_tag=model_tag)
-            for t in target_tables:
-                table = None
-                try:
-                    table = conn.open_table(t)
-                    total += _vis_count_rows_by_filters(table, filter_exprs)
-                finally:
-                    _safe_close_table(table)
-            counts[table_name] = total
-            continue
         if table_name.startswith("embeddings_"):
             continue
         if table_name not in table_names:
@@ -3550,83 +3532,57 @@ def _vis_plan_by_predicates(
     return counts
 
 
-def _vis_delete_by_predicates(
-    conn: Any, table_to_filter: Dict[str, list], model_tag: Optional[str] = None
-) -> Dict[str, int]:
+def _vis_embedding_pass(
+    conn: Any,
+    *,
+    model_tag: Optional[str],
+    embedding_filters: Callable[[str], list],
+    deleted: Dict[str, int],
+) -> None:
+    """The listing raises: a swallowed failure would report a cascade complete
+    with its embedding rows still searchable."""
     import logging as _logging
 
     from ..LanceDB.schema_manager import _safe_close_table
     from .lancedb_cleanup_filters import select_embedding_tables
 
     _logger = _logging.getLogger(__name__)
-    deleted: Dict[str, int] = {}
-    table_names = _vis_get_table_names(conn)
-
-    for t in table_names:
-        if not t.startswith("embeddings_") or t not in table_to_filter:
+    for t in select_embedding_tables(conn, model_tag=model_tag):
+        filter_exprs = embedding_filters(t)
+        if not filter_exprs:
             continue
-        filter_exprs = table_to_filter[t]
         table = None
         try:
             table = conn.open_table(t)
             cnt = _vis_delete_rows_by_filters(table, filter_exprs)
             if cnt > 0:
                 _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, t)
-            deleted[t] = cnt
+            deleted[t] = deleted.get(t, 0) + cnt
         finally:
             _safe_close_table(table)
 
-    order = [
-        "__embeddings__",
-        "chunks",
-        "parses",
-        "main_pointers",
-        "ingestion_runs",
-        "documents",
-    ]
 
-    if "__embeddings__" in table_to_filter:
-        filter_exprs = table_to_filter["__embeddings__"]
-        total = 0
-        target_tables = select_embedding_tables(conn, model_tag=model_tag)
-        for t in target_tables:
-            table = None
-            try:
-                table = conn.open_table(t)
-                total += _vis_delete_rows_by_filters(table, filter_exprs)
-            finally:
-                _safe_close_table(table)
-        deleted["embeddings"] = total
-        if total > 0:
-            _logger.info(
-                "Cascade cleanup: deleted %s rows from embeddings tables", total
-            )
+def _vis_delete_by_predicates(
+    conn: Any,
+    table_to_filter: Dict[str, list],
+    model_tag: Optional[str] = None,
+    embedding_filters: Optional[Callable[[str], list]] = None,
+) -> Dict[str, int]:
+    import logging as _logging
 
-    for name in order[1:]:
-        if name in table_to_filter and name in table_names:
-            table = None
-            try:
-                table = conn.open_table(name)
-                cnt = _vis_delete_rows_by_filters(table, table_to_filter[name])
-                if cnt > 0:
-                    _logger.info("Cascade cleanup: deleted %s rows from %s", cnt, name)
-                deleted[name] = cnt
-            finally:
-                _safe_close_table(table)
+    from ..LanceDB.schema_manager import _safe_close_table
+    from ..utils.lancedb_query_utils import list_table_names
 
-    for name, filter_exprs in table_to_filter.items():
-        if name in (
-            "__embeddings__",
-            "chunks",
-            "parses",
-            "main_pointers",
-            "ingestion_runs",
-            "documents",
-        ) or name.startswith("embeddings_"):
-            continue
-        if name not in table_names:
-            deleted[name] = 0
-            continue
+    _logger = _logging.getLogger(__name__)
+    deleted: Dict[str, int] = {}
+    order = ["chunks", "parses", "main_pointers", "ingestion_runs"]
+    # Documents last: its row is what a retried document delete looks up, so
+    # every failure before this point can still be retried whole.
+    late = ["documents"]
+    # A listing that fails must not shrink this delete to the embeddings.
+    table_names = list(list_table_names(conn))
+
+    def _delete(name: str, filter_exprs: list) -> None:
         table = None
         try:
             table = conn.open_table(name)
@@ -3636,6 +3592,44 @@ def _vis_delete_by_predicates(
             deleted[name] = cnt
         finally:
             _safe_close_table(table)
+
+    # Embeddings first: a failure leaves every core row in place, so a retry
+    # finds the document or the stale chunks again.
+    if embedding_filters is not None:
+        _vis_embedding_pass(
+            conn,
+            model_tag=model_tag,
+            embedding_filters=embedding_filters,
+            deleted=deleted,
+        )
+
+    for name in order:
+        if name in table_to_filter and name in table_names:
+            _delete(name, table_to_filter[name])
+
+    for name, filter_exprs in table_to_filter.items():
+        if name in ("documents", *order):
+            continue
+        if name not in table_names:
+            deleted[name] = 0
+            continue
+        _delete(name, filter_exprs)
+
+    if embedding_filters is not None and any(
+        name in table_to_filter for name in (*order, *late)
+    ):
+        # The chunk rows are gone now: a fresh listing finds the embedding tables
+        # a writer created since the first pass, each with its own predicates.
+        _vis_embedding_pass(
+            conn,
+            model_tag=model_tag,
+            embedding_filters=embedding_filters,
+            deleted=deleted,
+        )
+
+    for name in late:
+        if name in table_to_filter and name in table_names:
+            _delete(name, table_to_filter[name])
 
     return deleted
 
@@ -3647,17 +3641,31 @@ def _vis_execute_or_plan_by_predicates(
     preview_only: bool,
     confirm: bool,
     model_tag: Optional[str] = None,
+    embedding_filters: Optional[Callable[[str], list]] = None,
 ) -> Dict[str, int]:
+    """Embedding tables come only from ``embedding_filters``: a predicate built from
+    an earlier listing misses a table a writer creates while the delete runs."""
+    from .lancedb_cleanup_filters import select_embedding_tables
+
+    if any(
+        name == "__embeddings__" or name.startswith("embeddings_")
+        for name in predicates
+    ):
+        raise ValueError("embedding tables are passed as embedding_filters")
     if not (confirm and not preview_only):
-        return _vis_plan_by_predicates(conn, predicates, model_tag=model_tag)
-    return _vis_delete_by_predicates(conn, predicates, model_tag=model_tag)
+        plan = dict(predicates)
+        if embedding_filters is not None:
+            for table_name in select_embedding_tables(conn, model_tag=model_tag):
+                plan[table_name] = embedding_filters(table_name)
+        return _vis_plan_by_predicates(conn, plan)
+    return _vis_delete_by_predicates(
+        conn, predicates, model_tag=model_tag, embedding_filters=embedding_filters
+    )
 
 
 def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, int]:
     collapsed = dict(counts)
-    embeddings_total = int(collapsed.pop("__embeddings__", 0)) + int(
-        collapsed.pop("embeddings", 0)
-    )
+    embeddings_total = 0
     for table_name in list(collapsed):
         if str(table_name).startswith("embeddings_"):
             embeddings_total += int(collapsed.pop(table_name, 0))
@@ -3866,8 +3874,8 @@ def _vis_cascade_delete_documents(
         ensure_main_pointers_table,
         ensure_parses_table,
     )
+    from ..utils.lancedb_query_utils import list_table_names
     from ..utils.user_scope import resolve_user_scope
-    from .lancedb_cleanup_filters import select_embedding_tables
 
     normalized_doc_ids = sorted({str(d) for d in doc_ids if d})
     if not normalized_doc_ids:
@@ -3885,7 +3893,7 @@ def _vis_cascade_delete_documents(
     ensure_main_pointers_table(conn)
     ensure_ingestion_runs_table(conn)
 
-    table_names = _vis_get_table_names(conn)
+    table_names = list(list_table_names(conn))
     predicates: Dict[str, list] = {}
 
     core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]
@@ -3903,8 +3911,8 @@ def _vis_cascade_delete_documents(
             )
         ]
 
-    for table_name in select_embedding_tables(conn):
-        predicates[table_name] = [
+    def _embedding_filter(table_name: str) -> list:
+        return [
             _vis_build_documents_filter(
                 conn=conn,
                 table_name=table_name,
@@ -3921,6 +3929,7 @@ def _vis_cascade_delete_documents(
         preview_only=preview_only,
         confirm=confirm,
         model_tag=None,
+        embedding_filters=_embedding_filter,
     )
 
 

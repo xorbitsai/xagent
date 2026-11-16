@@ -78,3 +78,42 @@ class TestUserIsolationOnInMemoryPath:
         # pre-existing behavior for non-web callers.
         results = seeded_store.list_all()
         assert {n.id for n in results} == {"a1", "a2", "b1"}
+
+
+class TestProvenanceIsServerOwned:
+    """``provenance`` records where a memory was originally learned; a by-id
+    update (e.g. the REST PUT, which replaces metadata wholesale) can neither
+    forge nor wipe it, mirroring the user_id / scope-dimension stamps."""
+
+    def test_update_restores_stored_provenance(self, store):
+        original = {"channel_kind": "channel", "channel_id": "C1"}
+        with UserContext(1):
+            store.add(
+                MemoryNote(id="p1", content="old", metadata={"provenance": original})
+            )
+            forged = MemoryNote(
+                id="p1",
+                content="new",
+                metadata={"source": "api", "provenance": {"channel_id": "D-forged"}},
+            )
+            assert store.update(forged).success
+            wiped = MemoryNote(id="p1", content="newer", metadata={})
+            assert store.update(wiped).success
+
+            stored = store.get("p1").content
+        assert stored.content == "newer"
+        assert stored.metadata["provenance"] == original
+
+    def test_update_cannot_add_provenance_to_a_note_without_one(self, store):
+        with UserContext(1):
+            store.add(MemoryNote(id="n1", content="hand-written"))
+            assert store.update(
+                MemoryNote(
+                    id="n1",
+                    content="edited",
+                    metadata={"provenance": {"channel_id": "C-forged"}},
+                )
+            ).success
+
+            stored = store.get("n1").content
+        assert "provenance" not in stored.metadata

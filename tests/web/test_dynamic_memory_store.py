@@ -191,6 +191,14 @@ class RecordingStore:
         self.calls.append("list_scope_dimension_values")
         return set()
 
+    def delete_for_scope(self, owner_user_id, dims):
+        self.calls.append("delete_for_scope")
+        return 0
+
+    def delete_current_scope(self):
+        self.calls.append("delete_current_scope")
+        return 0
+
 
 def _manager_with_recording_store(monkeypatch, holder: dict):
     """A manager publishing a RecordingStore, so reach-through is observable."""
@@ -273,6 +281,8 @@ def test_drift_noticed_by_a_new_acquire_revokes_the_old_reference(monkeypatch) -
         lambda store: store.get_stats(),
         lambda store: store.delete_by_scope_dimension("tenant", "acme"),
         lambda store: store.list_scope_dimension_values("tenant"),
+        lambda store: store.delete_for_scope(1, {"tenant": "acme"}),
+        lambda store: store.delete_current_scope(),
     ],
 )
 def test_every_memory_operation_fails_closed_after_revocation(

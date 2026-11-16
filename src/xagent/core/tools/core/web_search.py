@@ -9,7 +9,9 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from .media_usage import record_web_search_usage
 from .web_content import WebContentFetcher, get_proxy_url
+from .web_search_guard import run_guarded_search
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,9 @@ class WebSearchCore:
         """
         Search the web using Google Custom Search API.
 
+        The query is redacted before it is sent or logged; see
+        ``web_search_guard.run_guarded_search``.
+
         Args:
             query: The search query string
             num_results: Number of results to return (max 10)
@@ -38,9 +43,25 @@ class WebSearchCore:
         Returns:
             List of search results with title, link, snippet, and optional content
         """
+        return await run_guarded_search(
+            "google",
+            query,
+            lambda redacted: self._search_redacted(
+                redacted, num_results, include_content
+            ),
+            len,
+        )
+
+    async def _search_redacted(
+        self,
+        query: str,
+        num_results: int,
+        include_content: bool,
+    ) -> List[Dict[str, str]]:
+        """Run the search; ``query`` has already been redacted."""
         logger.info(
-            f"🔍 Starting web search for query: '{query}' "
-            f"(num_results={num_results}, include_content={include_content})"
+            f"🔍 Starting web search (num_results={num_results}, "
+            f"include_content={include_content}) query='{query}'"
         )
 
         api_key = self._api_key or os.getenv("GOOGLE_API_KEY")
@@ -58,8 +79,11 @@ class WebSearchCore:
         if proxy_url:
             logger.info(f"🌐 Using proxy: {proxy_url}")
 
+        # The key travels in a header, never in the URL: httpx puts the request
+        # URL into its request log line and into the text of every
+        # HTTPStatusError, and both end up in logs and tool errors.
+        headers = {"X-goog-api-key": api_key}
         params: Dict[str, Any] = {
-            "key": api_key,
             "cx": cse_id,
             "q": query,
             "num": num_results,
@@ -77,6 +101,7 @@ class WebSearchCore:
                 response = await client.get(
                     "https://www.googleapis.com/customsearch/v1",
                     params=params,
+                    headers=headers,
                     timeout=10,
                 )
 
@@ -84,6 +109,9 @@ class WebSearchCore:
                     self._handle_403_error(response)
 
                 response.raise_for_status()
+                # Google billed this request as soon as it answered 2xx, so
+                # record it before reading the body or fetching any result page.
+                record_web_search_usage("google")
                 data = response.json()
 
                 logger.info("✅ Google API request successful")
@@ -91,6 +119,12 @@ class WebSearchCore:
                     data, include_content, proxy_url
                 )
 
+        except httpx.HTTPStatusError as e:
+            # str(e) and the chained traceback both carry the request URL, and
+            # with it the query. Report the status alone and drop the chain.
+            status = f"{e.response.status_code} {e.response.reason_phrase}".strip()
+            logger.error("❌ Google API HTTP error: %s", status)
+            raise ValueError(f"Google API HTTP error: {status}") from None
         except httpx.RequestError as e:
             logger.error(f"❌ Network error during search: {str(e)}")
             raise ValueError(f"Network error during search: {str(e)}") from e

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
@@ -52,6 +52,13 @@ SALESFORCE_TOOLKIT_SLUG = "salesforce"
 # On the org's own host: login.salesforce.com's userinfo does not serve
 # sandbox orgs.
 SALESFORCE_USERINFO_PATH = "/services/oauth2/userinfo"
+COMPOSIO_API_KEY_ENV = "COMPOSIO_API_KEY"
+COMPOSIO_USER_ID_SECRET_ENV = "COMPOSIO_USER_ID_SECRET"
+# Every Composio app's trips (begin, verification, denial) land on one shared
+# callback URL: XAGENT_COMPOSIO_CALLBACK_URL, else the Meta callback URL.
+COMPOSIO_CALLBACK_PATH = "/api/auth/composio/callback"
+# The two routes that accept the trips; the setting must name one of them.
+_CALLBACK_PATHS = (COMPOSIO_CALLBACK_PATH, "/api/auth/meta/callback")
 
 
 class ComposioApp(NamedTuple):
@@ -84,6 +91,9 @@ class ComposioApp(NamedTuple):
     # change on Composio's page when the account names no usable host. Ends
     # the sentence "Close this window, select Connect again, and ...".
     identity_host_help: str | None = None
+    # Whether ordinary (web) connects also go through Composio; an actor
+    # start follows the app's switch alone.
+    web_start: bool = False
 
 
 # Graph ids, Facebook user ids and Instagram professional account ids alike.
@@ -258,6 +268,7 @@ COMPOSIO_APPS: dict[str, ComposioApp] = {
         identity_id_pattern=_SALESFORCE_USER_ID_RE,
         connect_guidance=SALESFORCE_CONNECT_GUIDANCE,
         identity_host_help=_SALESFORCE_IDENTITY_HOST_HELP,
+        web_start=True,
     ),
 }
 
@@ -300,6 +311,14 @@ def composio_app(provider: str, app_id: str | None) -> ComposioApp | None:
     return app
 
 
+def composio_web_app(provider: str, app_id: str | None) -> ComposioApp | None:
+    """The app whose ordinary web connects go through Composio, if this one does."""
+    app = composio_app(provider, app_id)
+    if app is None or not app.web_start:
+        return None
+    return app
+
+
 def _uses_composio(app: ComposioApp) -> bool:
     backend = (_env(app.backend_env) or "native").lower()
     if (
@@ -322,3 +341,24 @@ def _uses_composio(app: ComposioApp) -> bool:
 
 
 _WARNED_BACKENDS: set[tuple[str, str]] = set()
+
+
+def composio_config_present(app: ComposioApp) -> bool:
+    """Whether this deployment holds the Composio settings the app's connects need."""
+    return all(
+        _env(name)
+        for name in (
+            COMPOSIO_API_KEY_ENV,
+            app.auth_config_env,
+            COMPOSIO_USER_ID_SECRET_ENV,
+        )
+    )
+
+
+def provider_is_composio_only(provider: str, app_ids: Iterable[str]) -> bool:
+    """Whether every app listed runs its web connect through a configured
+    Composio; callers pass builtin registry apps only."""
+    apps = [composio_web_app(provider, app_id) for app_id in app_ids]
+    return bool(apps) and all(
+        app is not None and composio_config_present(app) for app in apps
+    )

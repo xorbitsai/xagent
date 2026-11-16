@@ -13,6 +13,7 @@ from sqlalchemy.exc import OperationalError
 from xagent.core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from xagent.core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from xagent.web.api.mcp import TransportFieldValidator
+from xagent.web.api.v1 import agents as agents_routes
 from xagent.web.api.v1 import mcp_servers as mcp_servers_routes
 from xagent.web.api.v1.errors import _DEFAULT_MESSAGES, V1ErrorCode
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
@@ -227,10 +228,21 @@ def _own_routes() -> list[tuple[str, str]]:
     )
 
 
+def _agent_connector_routes() -> list[tuple[str, str]]:
+    return sorted(
+        (method, f"/v1{route.path}")
+        for route in agents_routes.router.routes
+        if route.path.endswith("/connectors")  # type: ignore[attr-defined]
+        for method in route.methods  # type: ignore[attr-defined]
+    )
+
+
 @pytest.mark.parametrize("kind", _KEY_KINDS)
 @pytest.mark.parametrize(
     ("method", "path"),
     [
+        ("GET", "/v1/agents/{agent_id}/connectors"),
+        ("PUT", "/v1/agents/{agent_id}/connectors"),
         ("GET", "/v1/mcp-servers"),
         ("GET", "/v1/mcp-servers/{server_id}"),
         ("POST", "/v1/mcp-servers"),
@@ -250,10 +262,16 @@ def test_mcp_routes_accept_only_personal_keys(method, path, kind):
         ("POST", "/v1/mcp-servers"),
         ("PUT", "/v1/mcp-servers/{server_id}/enabled"),
     ]
+    assert _agent_connector_routes() == [
+        ("GET", "/v1/agents/{agent_id}/connectors"),
+        ("PUT", "/v1/agents/{agent_id}/connectors"),
+    ]
     bodies = {"POST": _create_body(), "PUT": {"enabled": True}, "PATCH": {}}
+    if path.endswith("/connectors"):
+        bodies["PUT"] = {"connectors": [], "all_connectors": False}
     resp = client.request(
         method,
-        path.replace("{server_id}", "1"),
+        path.replace("{server_id}", "1").replace("{agent_id}", "1"),
         headers=_headers_for(kind),
         json=bodies.get(method),
     )

@@ -88,6 +88,11 @@ from ...services.file_turn import (
     build_uploaded_files_context,
     normalize_attachments_for_persistence,
 )
+from ...services.generation import (
+    current_generation,
+    other_generation_serves,
+    tick_allowed,
+)
 from ...services.managed_task_lease import ManagedTaskLease
 from ...services.shared_channel_execution import (
     SharedChannelTurn,
@@ -3218,8 +3223,14 @@ class TelegramChannelManager:
             return
         while get_channel_ingress_enabled():
             await self._sync_bots_async()
+            # With generations on, a sync that found this process not serving
+            # must be retried until serving is confirmed, even when shared
+            # execution is off (which otherwise ends the loop after one sync).
             if not get_shared_task_execution_enabled():
-                return
+                if current_generation() is None:
+                    return
+                await asyncio.sleep(30)
+                continue
             for bot in tuple(self.bots.values()):
                 if bot.channel_id is not None:
                     await recover_channel_results(
@@ -3238,6 +3249,14 @@ class TelegramChannelManager:
         if not get_channel_ingress_enabled():
             return
         async with self._sync_lock:
+            # Chat intake belongs to the serving generation. An unreadable
+            # record counts as not serving, so nothing new opens until serving
+            # is confirmed; only a record that names another generation closes
+            # what this one already runs (a read blip must not drop intake).
+            if not await tick_allowed("telegram-channels"):
+                if await other_generation_serves("telegram-channels"):
+                    await self.stop()
+                return
             active_tokens = set()
             channel_info_by_token: Dict[str, Dict] = {}
 

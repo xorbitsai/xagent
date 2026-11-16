@@ -764,22 +764,13 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             "get_authenticated_user",
             ("WebSocketDisconnect", "_WebSocketAuthenticationTerminated", "Exception"),
         ),
+        # run_asr_stream handles what this call raises; that mapping is covered
+        # by the parametrized tests in tests/web/api/test_speech_stream_runners.py.
         (
             "web/api/speech.py",
-            "stream_asr",
+            "stream_asr.prepare",
             "get_authenticated_user",
-            (
-                "WebSocketDisconnect",
-                "_WebSocketAuthenticationTerminated",
-                "CancelledError",
-                "_ASRWriteTimeout",
-                "_ASRSessionTimeout",
-                "ValidationError",
-                "ValueError",
-                "StandaloneUsageRefused",
-                "HTTPException",
-                "Exception",
-            ),
+            (),
         ),
     )
     modules = {"xagent.web.auth_dependencies", "xagent.web.api.websocket_auth"}

@@ -1375,7 +1375,7 @@ def test_revoke_builtin_oauth_grant_deletes_github_grant_with_decrypted_secret(
 
     auth_api.revoke_builtin_oauth_grant(
         db,
-        provider="github",
+        oauth_provider="github",
         access_token="live-access-token",
         provider_user_id="42",
     )
@@ -1387,25 +1387,24 @@ def test_revoke_builtin_oauth_grant_deletes_github_grant_with_decrypted_secret(
     assert kwargs["json"] == {"access_token": "live-access-token"}
 
 
-def test_revoke_builtin_oauth_grant_ignores_non_github_providers(
+def test_revoke_builtin_oauth_grant_ignores_providers_without_a_revoke(
     db_session, monkeypatch
 ):
-    """Only GitHub needs this today; every other provider is a no-op and
-    must not even query the database, let alone call out to it."""
+    """Only GitHub and Google have a revoke implementation; every other
+    provider is a no-op and must not call out to anything."""
     db, _user = db_session
 
-    class ExplodingQuery:
-        def query(self, *args, **kwargs):
-            raise AssertionError("non-github provider must not query the database")
-
     delete = Mock()
+    post = Mock()
     monkeypatch.setattr(auth_api.requests, "delete", delete)
+    monkeypatch.setattr(auth_api.requests, "post", post)
 
     auth_api.revoke_builtin_oauth_grant(
-        ExplodingQuery(), provider="slack", access_token="tok", provider_user_id="99"
+        db, oauth_provider="slack", access_token="tok", provider_user_id="99"
     )
 
     delete.assert_not_called()
+    post.assert_not_called()
 
 
 def test_revoke_builtin_oauth_grant_swallows_network_failure(
@@ -1425,7 +1424,7 @@ def test_revoke_builtin_oauth_grant_swallows_network_failure(
     with caplog.at_level(logging.WARNING, logger=auth_api.logger.name):
         auth_api.revoke_builtin_oauth_grant(
             db,
-            provider="github",
+            oauth_provider="github",
             access_token="the-live-access-token",
             provider_user_id="42",
         )
@@ -1452,7 +1451,7 @@ def test_revoke_builtin_oauth_grant_treats_404_as_success_without_a_warning(
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, oauth_provider="github", access_token="tok", provider_user_id="42"
     )
 
     delete.assert_called_once()
@@ -1473,7 +1472,7 @@ def test_revoke_builtin_oauth_grant_logs_422_as_a_real_failure(db_session, monke
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, oauth_provider="github", access_token="tok", provider_user_id="42"
     )
 
     delete.assert_called_once()
@@ -1491,7 +1490,7 @@ def test_revoke_builtin_oauth_grant_is_noop_without_a_provider_row(
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, oauth_provider="github", access_token="tok", provider_user_id="42"
     )
 
     delete.assert_not_called()
@@ -1525,7 +1524,10 @@ def test_revoke_builtin_oauth_grant_skips_when_another_user_shares_the_account(
     monkeypatch.setattr(auth_api.requests, "delete", delete)
 
     auth_api.revoke_builtin_oauth_grant(
-        db, provider="github", access_token="alices-old-token", provider_user_id="42"
+        db,
+        oauth_provider="github",
+        access_token="alices-old-token",
+        provider_user_id="42",
     )
 
     delete.assert_not_called()
@@ -1542,7 +1544,7 @@ def test_resolve_builtin_oauth_revocation_decrypts_credentials(db_session):
 
     resolved = auth_api.resolve_builtin_oauth_revocation(
         db,
-        provider="github",
+        oauth_provider="github",
         access_token="live-access-token",
         provider_user_id="42",
     )
@@ -1563,19 +1565,19 @@ def test_resolve_builtin_oauth_revocation_is_none_when_nothing_to_revoke(db_sess
 
     assert (
         auth_api.resolve_builtin_oauth_revocation(
-            db, provider="slack", access_token="tok", provider_user_id="42"
+            db, oauth_provider="slack", access_token="tok", provider_user_id="42"
         )
         is None
     )
     assert (
         auth_api.resolve_builtin_oauth_revocation(
-            db, provider="github", access_token="", provider_user_id="42"
+            db, oauth_provider="github", access_token="", provider_user_id="42"
         )
         is None
     )
     assert (
         auth_api.resolve_builtin_oauth_revocation(
-            db, provider="github", access_token="tok", provider_user_id="42"
+            db, oauth_provider="github", access_token="tok", provider_user_id="42"
         )
         is None
     )  # no OAuthProvider row seeded yet
@@ -1593,7 +1595,7 @@ def test_resolve_builtin_oauth_revocation_warns_on_missing_provider_row(
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     auth_api.resolve_builtin_oauth_revocation(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, oauth_provider="github", access_token="tok", provider_user_id="42"
     )
 
     warning.assert_called_once()
@@ -1626,7 +1628,7 @@ def test_resolve_builtin_oauth_revocation_warns_on_unresolvable_secret(
     monkeypatch.setattr(auth_api.logger, "warning", warning)
 
     result = auth_api.resolve_builtin_oauth_revocation(
-        db, provider="github", access_token="tok", provider_user_id="42"
+        db, oauth_provider="github", access_token="tok", provider_user_id="42"
     )
 
     assert result is None

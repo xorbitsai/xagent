@@ -1151,6 +1151,70 @@ async def test_actor_composio_facebook_grant_launches_with_composio_env(
 
 
 @pytest.mark.asyncio
+async def test_actor_composio_grant_with_a_gone_account_is_unavailable(
+    db_session, monkeypatch
+) -> None:
+    """A grant the reconcile pass tombstoned is no longer a credential: the
+    connector is reported unavailable instead of launching."""
+    from xagent.web import composio_auth
+
+    monkeypatch.setenv("COMPOSIO_API_KEY", "composio-key")
+    monkeypatch.setenv("COMPOSIO_FACEBOOK_AUTH_CONFIG_ID", "ac_facebook")
+    monkeypatch.setenv("COMPOSIO_USER_ID_SECRET", "composio-secret")
+    monkeypatch.setattr(composio_auth, "_missing_account_cursor", 0)
+    monkeypatch.setattr(
+        composio_auth,
+        "_call",
+        lambda *args, **kwargs: (
+            404,
+            {"error": {"slug": "ConnectedAccount_ResourceNotFound"}},
+        ),
+    )
+    db, user = db_session.db, db_session.user
+    app = get_builtin_public_mcp_app("facebook")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    server = MCPServer(
+        name="Facebook Pages",
+        managed="external",
+        transport="oauth",
+        auth={"app_id": "facebook", "provider": "meta"},
+    )
+    db.add(server)
+    db.flush()
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="facebook",
+            resource_owner_key=OWNER_A,
+            provider_user_id="fb-user-1",
+            access_token="ca_123",
+            instance_url="actor-hmac",
+            token_type="composio",
+        )
+    )
+    db.commit()
+
+    assert composio_auth.tombstone_missing_composio_accounts(db) == 1
+    assert db.query(UserOAuth).one().access_token == ""
+    assert mcp_api._oauth_account_can_connect(db.query(UserOAuth).one()) is False
+
+    configs = await _config(db_session, policy=_policy()).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["reason"] == "oauth_token_required"
+    assert "ca_123" not in str(configs)
+
+
+@pytest.mark.asyncio
 async def test_actor_composio_instagram_grant_is_not_shadowed_by_a_bare_meta_grant(
     db_session, monkeypatch
 ) -> None:

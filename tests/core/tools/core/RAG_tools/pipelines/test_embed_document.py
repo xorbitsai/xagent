@@ -473,3 +473,27 @@ def test_embed_document_chunks_forces_async_path_for_spreadsheets(
     assert all(isinstance(call, str) for call in adapter.calls)
     assert result.embedding_count == 2
     assert result.vector_count == 2
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_a_lost_lease_stops_the_write_at_the_commit_point(
+    monkeypatch: pytest.MonkeyPatch, use_async: bool
+) -> None:
+    """Both embedding branches check the lease right before they write."""
+    from xagent.core.tools.core.RAG_tools.core.exceptions import (
+        CollectionMigratingError,
+    )
+
+    adapter = _StubAdapter()
+    events: List[tuple] = []
+    _install(monkeypatch, lambda **_: _read_response(_chunks(1, start=3)), events)
+
+    def _lost(collection: str) -> None:
+        raise CollectionMigratingError("lease lost")
+
+    monkeypatch.setattr(document_ingestion, "verify_active_leases", _lost)
+
+    with pytest.raises(CollectionMigratingError):
+        _embed(adapter, _cfg(use_async=use_async, batch_size=10))
+
+    assert events == []

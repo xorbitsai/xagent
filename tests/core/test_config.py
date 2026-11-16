@@ -125,6 +125,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    WEB_SEARCH_PROVIDERS,
     XROUTER_EXCLUDED_MODELS,
     ExternalUploadsDirConfigurationError,
     format_file_size,
@@ -135,6 +136,8 @@ from xagent.config import (
     get_background_job_stale_seconds,
     get_background_job_sweep_interval_seconds,
     get_background_job_visibility_timeout_seconds,
+    get_brave_search_country,
+    get_brave_search_endpoint,
     get_browser_cua_driver_command,
     get_browser_cua_driver_max_elements,
     get_browser_cua_driver_socket,
@@ -1024,9 +1027,49 @@ class TestGetWebSearchProvider:
         monkeypatch.setenv(WEB_SEARCH_PROVIDER, " Google ")
         assert get_web_search_provider() == "google"
 
-    def test_invalid_web_search_provider_falls_back_to_auto(self, monkeypatch):
-        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "bing")
+    def test_brave_web_search_provider(self, monkeypatch):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "Brave")
+        assert get_web_search_provider() == "brave"
+
+    def test_empty_web_search_provider_means_auto(self, monkeypatch):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "  ")
         assert get_web_search_provider() == "auto"
+
+    def test_invalid_web_search_provider_fails_closed(self, monkeypatch, caplog):
+        monkeypatch.setenv(WEB_SEARCH_PROVIDER, "bing")
+        with caplog.at_level("ERROR"):
+            provider = get_web_search_provider()
+        assert provider not in WEB_SEARCH_PROVIDERS
+        assert provider != "auto"
+        assert WEB_SEARCH_PROVIDER in caplog.text
+
+
+class TestGetBraveSearchCountry:
+    def test_values(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_BRAVE_SEARCH_COUNTRY", raising=False)
+        assert get_brave_search_country() is None
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", " Au ")
+        assert get_brave_search_country() == "au"
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", "")
+        assert get_brave_search_country() is None
+
+    def test_invalid_value_ignored(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_COUNTRY", "AUS")
+        assert get_brave_search_country() is None
+
+
+class TestGetBraveSearchEndpoint:
+    def test_default_and_values(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_BRAVE_SEARCH_ENDPOINT", raising=False)
+        assert get_brave_search_endpoint() == "web"
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", " LLM_Context ")
+        assert get_brave_search_endpoint() == "llm_context"
+
+    def test_unknown_value_uses_web_and_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("XAGENT_BRAVE_SEARCH_ENDPOINT", "bogus")
+        with caplog.at_level("WARNING"):
+            assert get_brave_search_endpoint() == "web"
+        assert "XAGENT_BRAVE_SEARCH_ENDPOINT" in caplog.text
 
 
 class TestGetWebCrawlTlsImpersonate:
@@ -2719,6 +2762,37 @@ class TestComposioReconcileConfig:
         for invalid in ("5", "hourly"):
             monkeypatch.setenv("XAGENT_COMPOSIO_RECONCILE_INTERVAL_SECONDS", invalid)
             assert get_composio_reconcile_interval_seconds() is None
+
+
+class TestComposioMissingAccountConfig:
+    """How often grants whose Composio account is gone are cleared."""
+
+    def test_on_by_default(self, monkeypatch):
+        from xagent.config import get_composio_missing_account_interval_seconds
+
+        monkeypatch.delenv(
+            "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", raising=False
+        )
+        assert get_composio_missing_account_interval_seconds() == 3600
+        monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", " ")
+        assert get_composio_missing_account_interval_seconds() == 3600
+
+    def test_zero_turns_it_off(self, monkeypatch):
+        from xagent.config import get_composio_missing_account_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", "0")
+        assert get_composio_missing_account_interval_seconds() == 0
+
+    def test_a_set_interval_has_a_floor(self, monkeypatch):
+        from xagent.config import get_composio_missing_account_interval_seconds
+
+        monkeypatch.setenv("XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", "900")
+        assert get_composio_missing_account_interval_seconds() == 900
+        for invalid in ("5", "hourly", "-1"):
+            monkeypatch.setenv(
+                "XAGENT_COMPOSIO_MISSING_ACCOUNT_INTERVAL_SECONDS", invalid
+            )
+            assert get_composio_missing_account_interval_seconds() == 3600
 
 
 class TestTaskCleanupRetryConfig:

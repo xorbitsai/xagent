@@ -61,6 +61,7 @@ from ...config import get_task_cleanup_max_attempts
 from ...core.task_runtime import TaskRuntimeContext
 from ..models.task import Task
 from ..models.task_cleanup_obligation import TaskCleanupObligation
+from .generation import tick_allowed
 from .task_runtime import delete_task_extensions
 from .task_workspace_cleanup import (
     WorkspaceCleanupTarget,
@@ -953,6 +954,9 @@ async def run_cleanup_obligation_loop(
     """
 
     while True:
+        if not await tick_allowed("task-cleanup-retry"):
+            await asyncio.sleep(poll_interval_seconds)
+            continue
         backlog = False
         try:
             report = await run_cleanup_obligation_batch(

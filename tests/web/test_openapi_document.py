@@ -13,6 +13,7 @@ from typing import Any, Iterator
 
 import pytest
 
+from tests.web.api.v1.structured_output_shared import TODAY_TASK_INFO_KEYS
 from xagent.web.app import app
 from xagent.web.services.global_memory_embedding_authority import (
     AuthorityConfiguration,
@@ -81,3 +82,15 @@ def test_the_document_carries_no_root_defs(document):
     """``$defs`` is a schema-local keyword; nothing may reference it as a root."""
     assert "$defs" not in document
     assert not [ref for ref in _refs(document) if ref.startswith("#/$defs/")]
+
+
+def test_task_info_openapi_keeps_properties(document):
+    schemas = document["components"]["schemas"]
+    task_info = schemas["TaskInfoResponse"]
+
+    assert list(task_info["properties"]) == [
+        *TODAY_TASK_INFO_KEYS,
+        "completion_outcome",
+    ]
+    assert task_info["required"] == ["task_id", "agent_id", "status", "created_at"]
+    assert not [name for name in schemas if name.startswith("TaskInfoResponse-")]

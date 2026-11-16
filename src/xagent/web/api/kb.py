@@ -97,7 +97,7 @@ from ...core.tools.core.RAG_tools.management.migration_state import (
     admitted_context_async,
     ensure_collection_writable,
     ensure_collection_writable_async,
-    pending_collection,
+    pending_collection_async,
     run_in_admitted_context,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
@@ -119,6 +119,7 @@ from ...core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
+from ...core.utils.blocking import run_blocking
 from ..auth_dependencies import get_current_user
 from ..config import (
     MAX_COLLECTION_NAME_LENGTH,
@@ -6469,7 +6470,7 @@ async def batch_delete_collections_api(
                         safe_name, int(effective_user.id), is_admin=False
                     )
                 )
-                with pending_collection(safe_name):
+                async with pending_collection_async(safe_name):
                     # A config-only delete removes just the caller's config row; gate data deletes only.
                     if delete_mode == "full":
                         await ensure_collection_writable_async(safe_name)
@@ -7170,7 +7171,9 @@ async def delete_document_api(
             logger.error("%s", error_msg)
             continue
         try:
-            delete_result = delete_document(
+            # The delete takes a write lease and does blocking store I/O.
+            delete_result = await run_blocking(
+                delete_document,
                 safe_collection_name,
                 resolved_doc_id,
                 int(_user.id),

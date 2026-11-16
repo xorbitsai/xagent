@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -132,11 +133,14 @@ async def _create_knowledge_base_from_file_impl(
     from ...core.RAG_tools.core.exceptions import CollectionMigratingError
     from ...core.RAG_tools.management.migration_state import (
         admitted_context_async,
+        holding_leases,
         run_in_admitted_context,
+        verify_active_leases,
     )
 
     collection_name = ""
     ingested_count = 0
+    leases = AsyncExitStack()
     try:
         from sqlalchemy.orm import Session
 
@@ -202,12 +206,19 @@ async def _create_knowledge_base_from_file_impl(
         # the collection is ours to clean up if every file fails.
         collection_existed_before = await kb_service.collection_exists(collection_name)
         # One admission for every file, so a freeze between files cannot strand a partial.
+        # The lease goes in first and spans the same work, so a migration waits
+        # for this tool too.
+        await leases.enter_async_context(
+            holding_leases(collection_name, operation="agent-file-ingestion")
+        )
         admission = await admitted_context_async(collection_name)
 
         ingested_count = 0
         errors = []
 
         for record in file_records:
+            # The pipeline reports a lost lease as a failed file; stop the run.
+            verify_active_leases(collection_name)
             try:
                 source_path = await async_ensure_uploaded_file_local_path(record)
             except DurableObjectIntegrityError:
@@ -255,6 +266,9 @@ async def _create_knowledge_base_from_file_impl(
                 user_id=user_id,
                 is_admin=is_admin,
                 file_id=str(record.file_id),
+                # Before every write: a lease lost to a stalled process means a
+                # migration may already have started switching this collection.
+                commit_gate=partial(verify_active_leases, collection_name),
             )
             try:
                 result = await run_blocking(run_in_admitted_context, admission, func)
@@ -288,6 +302,7 @@ async def _create_knowledge_base_from_file_impl(
                     collection_name,
                 )
 
+        verify_active_leases(collection_name)
         if ingested_count == 0:
             if not collection_existed_before:
                 await kb_service.cleanup_failed_collection(collection_name)
@@ -353,3 +368,5 @@ async def _create_knowledge_base_from_file_impl(
             message=str(e),
             files_ingested=0,
         ).model_dump()
+    finally:
+        await leases.aclose()

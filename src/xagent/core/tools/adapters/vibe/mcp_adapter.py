@@ -56,6 +56,7 @@ from ....utils.public_http_transport import (
     UnsafePublicHttpTarget,
 )
 from ....utils.security import PrivateNetworkHostError, redact_sensitive_text
+from ...core.mcp.composio_requests import COMPOSIO_REQUESTS_META_KEY
 from ...core.mcp.sessions import (
     Connection,
     SSEConnection,
@@ -79,6 +80,7 @@ from .connector_runtime import (
     runtime_bindings_from_config,
 )
 from .mcp_approval_gate import gate_mcp_tools
+from .mcp_error_envelope import is_error_envelope, speaks_error_envelope
 from .mcp_result_integrity import MCPResultIntegrityGuard
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
@@ -2246,6 +2248,28 @@ def _normalized_mcp_call_result(
     }
 
 
+# The private member ``_execute_mcp_call`` hands the subprocess-reported
+# Composio count back under. ``run_json_async`` records the rows and removes
+# it, so it never reaches the model.
+_COMPOSIO_REQUESTS_KEY = "_composio_requests"
+
+
+def _reported_composio_requests(meta: Any) -> int:
+    """How many Composio requests a connector reported for one tool call.
+
+    ``meta`` is the MCP result's ``_meta``, written by the connector
+    subprocess. Only a non-negative int is a count; a missing or malformed
+    value means no request was accepted (or the subprocess does not report
+    them), so nothing is recorded.
+    """
+    if not isinstance(meta, Mapping):
+        return 0
+    count = meta.get(COMPOSIO_REQUESTS_META_KEY)
+    if type(count) is not int or count < 0:
+        return 0
+    return count
+
+
 def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
     """Carry the Excel connector's allowlisted failure code to the runtime."""
     from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
@@ -2386,6 +2410,20 @@ class MCPToolAdapter(AbstractBaseTool):
         self._detect_legacy_plain_text_error = (
             str(source_server or "").casefold() == "xero"
         )
+        # In-repo servers return a vendor error as a {"status": "error"}
+        # envelope with isError unset; see mcp_error_envelope. Only a tool
+        # whose wire annotations declare that a repeat adds no effect (read-only
+        # or idempotent) is reclassified. A write's envelope can follow a request
+        # that went out; a failed result reopens normal tools in flash mode, and
+        # the duplicate-write guard covers only declared non-idempotent tools.
+        # An undeclared tool is treated as a write, as classify_write_hint says.
+        self._detect_error_envelope = speaks_error_envelope(connection) and (
+            self.write_hint is MCPWriteHint.READ_ONLY
+            or (
+                isinstance(raw_annotations, Mapping)
+                and raw_annotations.get(_IDEMPOTENT_HINT) is True
+            )
+        )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -2394,6 +2432,12 @@ class MCPToolAdapter(AbstractBaseTool):
         runtime_config = connection if isinstance(connection, Mapping) else {}
         self._runtime_bindings = runtime_bindings_from_config(runtime_config)
         self._connector_runtime = connector_runtime_from_config(runtime_config)
+        # Set by the server config only for a connector whose subprocess runs on
+        # a Composio grant. That subprocess reports how many Proxy Execute
+        # requests Composio accepted for each call, and the adapter records
+        # that many rows. Absent for every native connector and every other
+        # server, which are not billed to Composio.
+        self._composio_backed = runtime_config.get("composio") is True
         self._signed_upload = self._usable_signed_upload(signed_upload)
         from .base import ToolCategory
 
@@ -3701,6 +3745,18 @@ class MCPToolAdapter(AbstractBaseTool):
                         if retry_result is None:
                             raise
                         result = retry_result
+                    if self._composio_backed:
+                        # Composio bills every Proxy Execute request it accepted,
+                        # so a call that listed once and read ten messages is
+                        # eleven rows. The connector subprocess counted them and
+                        # reported the count on the result's ``_meta``; a retry
+                        # above ran in a new subprocess, so only the retry's
+                        # accepted requests are counted here.
+                        # Local import: media_usage loads the model layer, and
+                        # the MCP loader is used without it.
+                        from ...core.media_usage import record_composio_usage
+
+                        record_composio_usage(result.pop(_COMPOSIO_REQUESTS_KEY, 0))
                     if (
                         self._workspace is not None
                         and self._workspace_download_field is not None
@@ -3843,12 +3899,22 @@ class MCPToolAdapter(AbstractBaseTool):
             result,
             detect_legacy_plain_text_error=self._detect_legacy_plain_text_error,
         )
+        if (
+            self._detect_error_envelope
+            and not normalized["is_error"]
+            and is_error_envelope(normalized["content"])
+        ):
+            normalized["success"] = False
         if self._is_excel_tool:
             failure_code = _excel_failure_code(normalized)
             if failure_code is not None:
                 normalized["failure_code"] = failure_code
                 normalized["success"] = False
                 normalized["is_error"] = True
+        if self._composio_backed:
+            normalized[_COMPOSIO_REQUESTS_KEY] = _reported_composio_requests(
+                getattr(result, "meta", None)
+            )
         return normalized
 
     async def _retry_after_authorization_failure(

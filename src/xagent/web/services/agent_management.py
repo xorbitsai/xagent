@@ -14,12 +14,14 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
+from ...core.tools.adapters.vibe.selection_spec import normalize_mcp_server_name
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.utils.api_key import (
     PREFIX_COLLISION_RETRIES,
     ApiKeyKind,
     generate_api_key,
 )
+from ...core.utils.type_check import ensure_list
 from ...templates.manager import TemplateManager
 from ..models.agent import (
     AGENT_NAME_UNIQUE_INDEX,
@@ -33,10 +35,16 @@ from ..models.model import Model as DBModel
 from ..models.user import User
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
-from ..services.agent_store import AgentStore, invalidate_agent_cache
+from ..services.agent_store import (
+    AgentStore,
+    UnsharedConnectorsError,
+    invalidate_agent_cache,
+)
 from .agent_team_scope import get_agent_team_scope
 from .api_keys import (
     AgentApiKeyService,
+    AgentKeyMetadata,
+    AgentKeyRevocation,
     ApiKeyCandidate,
     KeyRotationConflict,
     RuntimeKeyDeliveryError,
@@ -49,6 +57,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .mcp_server_management import HolderConnectorNames, holder_connector_names
 from .skill_management import SkillManagementRuntime, is_valid_personal_skill_name
 from .workforce_access import can_edit_workforce, filter_visible_workforces
 from .workforce_lifecycle import is_workforce_manager_removal_safe
@@ -114,6 +123,33 @@ class InvalidAgentSkillNamesError(ValueError):
             "These names are neither valid personal skill names nor the names "
             "of skills this key can see: "
             + ", ".join(repr(name)[:100] for name in names[:5])
+        )
+
+
+class InvalidAgentConnectorsError(ValueError):
+    """Raised when a connector list replacement cannot be accepted as given."""
+
+
+class AgentToolsUnconfiguredError(Exception):
+    """Raised when the agent has no tool selection to read connectors from."""
+
+
+class AgentConnectorsNotSharedError(Exception):
+    """Raised when a team agent would select connectors its team cannot use.
+
+    ``connectors`` holds one ``{"name", "reason"}`` entry per connector, with
+    ``reason`` one of ``not_shared``, ``disabled`` or ``unresolved``. The
+    message lists at most five names, each cut to 100 characters of its
+    ``repr``: the names are caller input.
+    """
+
+    def __init__(self, connectors: list[dict[str, str]]) -> None:
+        self.connectors = connectors
+        super().__init__(
+            "The agent's team cannot use these connectors: "
+            + ", ".join(repr(c["name"])[:100] for c in connectors[:5])
+            + ". Share them with the team in the web app; a connector you "
+            "disabled must be enabled first."
         )
 
 
@@ -298,6 +334,70 @@ class AgentSkillsUpdateSnapshot:
 
     skills: tuple[str, ...]
     unresolved_for_caller: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AgentConnectorsSnapshot:
+    """Detached connector selection of one agent."""
+
+    connectors: tuple[str, ...]
+    all_connectors: bool
+    unresolved: tuple[str, ...]
+
+
+_MCP_ENTRY_PREFIX = "mcp:"
+_ALL_MCP_CATEGORY = "mcp"
+
+
+def _selected_connector_names(tool_categories: list[Any]) -> list[str]:
+    """The ``<name>`` of every ``mcp:<name>`` entry, in stored order."""
+    return [
+        entry.split(":", 1)[1]
+        for entry in tool_categories
+        if isinstance(entry, str) and entry.startswith(_MCP_ENTRY_PREFIX)
+    ]
+
+
+def _connector_selection(
+    tool_categories: list[Any] | None, visible: frozenset[str]
+) -> AgentConnectorsSnapshot:
+    """What an agent's tool list selects, as the key holder sees it."""
+    if tool_categories is None:
+        return AgentConnectorsSnapshot((), True, ())
+    names = _selected_connector_names(tool_categories)
+    return AgentConnectorsSnapshot(
+        connectors=tuple(names),
+        all_connectors=_ALL_MCP_CATEGORY in tool_categories,
+        unresolved=tuple(
+            name for name in names if normalize_mcp_server_name(name) not in visible
+        ),
+    )
+
+
+def _relabel_unshared(
+    unshared: list[Any], names: HolderConnectorNames
+) -> list[dict[str, str]]:
+    """Give each refused connector the reason shown to the caller.
+
+    An entry carrying ``reason == "unresolved"`` is ``disabled`` when the name
+    is one of the holder's own disabled connectors and nothing else with that
+    name could be loaded for them.
+    """
+    labelled: list[dict[str, str]] = []
+    for entry in unshared:
+        name = str(entry.get("name", ""))
+        reason = "not_shared"
+        if entry.get("reason") == "unresolved":
+            key = normalize_mcp_server_name(name)
+            reason = (
+                "disabled"
+                if key in names.own_inactive
+                and key not in names.own_active
+                and key not in names.team_keys
+                else "unresolved"
+            )
+        labelled.append({"name": name, "reason": reason})
+    return labelled
 
 
 @dataclass(frozen=True)
@@ -1222,6 +1322,276 @@ class AgentManagementRuntime:
             len(added),
         )
         return tuple(requested), tuple(added)
+
+    async def get_agent_connectors(
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+    ) -> AgentConnectorsSnapshot | None:
+        """The connectors an agent the user can see selects, else ``None``.
+
+        An agent on the default tool set selects every connector. Access is
+        decided before any connector is read. A failure to read the visible
+        connectors propagates.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._get_agent_connectors_sync(user_id=user_id, agent_id=agent_id)
+        )
+
+    @staticmethod
+    def _get_agent_connectors_sync(
+        *, user_id: int, agent_id: int
+    ) -> AgentConnectorsSnapshot | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            agent = AgentStore(db).get_owned_agent(user_id, agent_id, team_scope)
+            if agent is None:
+                return None
+            tool_categories = cast(
+                "list[Any] | None", ensure_list(agent.tool_categories)
+            )
+            if tool_categories is None:
+                return _connector_selection(None, frozenset())
+            visible = holder_connector_names(db, user_id).visible
+            return _connector_selection(tool_categories, visible)
+
+    async def set_agent_connectors(
+        self,
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        connectors: list[str],
+        all_connectors: bool,
+    ) -> AgentConnectorsSnapshot | None:
+        """Replace the connectors an agent the user can see selects.
+
+        Returns ``None`` when the user cannot see the agent. That is checked
+        first, then the visible connector names are read, and then the write
+        takes the agent row lock and decides on the agent as it is under that
+        lock. Each of the three steps uses its own Session, and the team list
+        hook is called once, in the second, while no row lock is held. Only a
+        name the request adds has to be visible to the user. A failure to read
+        the visible names propagates and nothing is written.
+        """
+        if not await run_db_io_cancellation_safe(
+            lambda: self._agent_is_visible_sync(user_id=user_id, agent_id=agent_id)
+        ):
+            return None
+        names = await run_db_io_cancellation_safe(
+            lambda: self._read_holder_connector_names_sync(user_id=user_id)
+        )
+        return await run_db_io_cancellation_safe(
+            lambda: self._set_agent_connectors_sync(
+                user_id=user_id,
+                key_prefix=key_prefix,
+                agent_id=agent_id,
+                connectors=connectors,
+                all_connectors=all_connectors,
+                names=names,
+            )
+        )
+
+    @staticmethod
+    def _agent_is_visible_sync(*, user_id: int, agent_id: int) -> bool:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            agent = AgentStore(db).get_owned_agent(user_id, agent_id, team_scope)
+            return agent is not None
+
+    @staticmethod
+    def _read_holder_connector_names_sync(*, user_id: int) -> HolderConnectorNames:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            return holder_connector_names(db, user_id)
+
+    @staticmethod
+    def _set_agent_connectors_sync(
+        *,
+        user_id: int,
+        key_prefix: str,
+        agent_id: int,
+        connectors: list[str],
+        all_connectors: bool,
+        names: HolderConnectorNames,
+    ) -> AgentConnectorsSnapshot | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            store = AgentStore(db)
+            agent = store.get_owned_agent(
+                user_id, agent_id, team_scope, for_update=True
+            )
+            if agent is None:
+                return None
+            current: list[Any] | None = cast(
+                "list[Any] | None", ensure_list(agent.tool_categories)
+            )
+            if current is None:
+                raise AgentToolsUnconfiguredError()
+            requested = list(dict.fromkeys(connectors))
+            selected = list(dict.fromkeys(_selected_connector_names(current)))
+            if requested == selected and all_connectors == (
+                _ALL_MCP_CATEGORY in current
+            ):
+                return _connector_selection(current, names.visible)
+            added = [name for name in requested if name not in selected]
+            invisible = [
+                name
+                for name in added
+                if normalize_mcp_server_name(name) not in names.visible
+            ]
+            if invisible:
+                raise InvalidAgentConnectorsError(
+                    "These connectors are not visible to the key holder: "
+                    + ", ".join(repr(name)[:100] for name in invisible[:5])
+                )
+            kept = [
+                entry
+                for entry in current
+                if not (isinstance(entry, str) and entry.startswith(_MCP_ENTRY_PREFIX))
+            ]
+            if not all_connectors:
+                kept = [entry for entry in kept if entry != _ALL_MCP_CATEGORY]
+            elif _ALL_MCP_CATEGORY not in kept:
+                kept.append(_ALL_MCP_CATEGORY)
+            replacement = kept + [f"{_MCP_ENTRY_PREFIX}{name}" for name in requested]
+            try:
+                store.update_agent_fields(
+                    user_id,
+                    agent_id,
+                    {"tool_categories": replacement},
+                    team_scope=team_scope,
+                    agent=agent,
+                )
+            except UnsharedConnectorsError as exc:
+                raise AgentConnectorsNotSharedError(
+                    _relabel_unshared(exc.connectors, names)
+                ) from exc
+            stored = list(agent.tool_categories or [])
+            removed = [name for name in selected if name not in requested]
+            logger.info(
+                "personal key agent connectors write: key_prefix=%s user_id=%d "
+                "agent_id=%d added=%d removed=%d all_connectors=%s",
+                key_prefix,
+                user_id,
+                agent_id,
+                len(added),
+                len(removed),
+                all_connectors,
+            )
+            return _connector_selection(stored, names.visible)
+
+    async def list_agent_runtime_keys(
+        self,
+        *,
+        user_id: int,
+        agent_id: int,
+        include_revoked: bool = False,
+    ) -> tuple[AgentKeyMetadata, ...] | None:
+        """The runtime keys of an agent the user can manage, newest first.
+
+        Returns ``None`` when the user cannot manage the agent; that is
+        decided before any key is read. An agent without matching keys is an
+        empty tuple. Revoked keys are left out unless ``include_revoked``.
+        A failed read propagates.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._list_agent_runtime_keys_sync(
+                user_id=user_id,
+                agent_id=agent_id,
+                include_revoked=include_revoked,
+            )
+        )
+
+    @staticmethod
+    def _list_agent_runtime_keys_sync(
+        *, user_id: int, agent_id: int, include_revoked: bool
+    ) -> tuple[AgentKeyMetadata, ...] | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            team_scope = get_agent_team_scope(db, user_id)
+            if AgentStore(db).get_owned_agent(user_id, agent_id, team_scope) is None:
+                return None
+            return tuple(
+                AgentApiKeyService(db).list_keys_for_agent(
+                    agent_id, include_revoked=include_revoked
+                )
+            )
+
+    async def revoke_agent_runtime_key(
+        self,
+        *,
+        user_id: int,
+        credential_ref: str,
+        agent_id: int,
+        key_id: int,
+    ) -> AgentKeyRevocation | None:
+        """Revoke one runtime key of an agent the user can manage.
+
+        Returns ``None`` when the user cannot manage the agent. That is
+        checked before the agent row is locked and before any key is read,
+        and again under the agent's runtime-key transition fence with a
+        freshly resolved team scope, which is the check that decides. Raises
+        :class:`~.api_keys.AgentRuntimeKeyNotFoundError` when the agent has no key with
+        this id. Revoking an already revoked key changes nothing and reports
+        ``revoked=False`` with the original time. A failed commit propagates
+        and leaves the key as it was.
+
+        ``credential_ref`` names the credential the request was made with and
+        is only written to the log line of an effective revocation.
+        """
+        return await run_db_io_cancellation_safe(
+            lambda: self._revoke_agent_runtime_key_sync(
+                user_id=user_id,
+                credential_ref=credential_ref,
+                agent_id=agent_id,
+                key_id=key_id,
+            )
+        )
+
+    @staticmethod
+    def _revoke_agent_runtime_key_sync(
+        *, user_id: int, credential_ref: str, agent_id: int, key_id: int
+    ) -> AgentKeyRevocation | None:
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            store = AgentStore(db)
+            if (
+                store.get_owned_agent(
+                    user_id, agent_id, get_agent_team_scope(db, user_id)
+                )
+                is None
+            ):
+                return None
+            if not acquire_runtime_key_transition_fence(db, agent_id):
+                return None
+            # The fence serializes changes to the agent row. Resolve the team
+            # scope again so a membership change committed since the first
+            # check is honored as well.
+            if (
+                store.get_owned_agent(
+                    user_id, agent_id, get_agent_team_scope(db, user_id)
+                )
+                is None
+            ):
+                return None
+            revocation = AgentApiKeyService(db).revoke_key_for_agent(agent_id, key_id)
+            db.commit()
+        if revocation.revoked:
+            logger.info(
+                "runtime key revoked: credential=%s user_id=%d agent_id=%d "
+                "key_id=%d key_prefix=%s",
+                credential_ref,
+                user_id,
+                agent_id,
+                revocation.key_id,
+                revocation.key_prefix,
+            )
+        return revocation
 
     @staticmethod
     def _run_runtime_key_session_operation(

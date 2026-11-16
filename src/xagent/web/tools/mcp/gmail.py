@@ -9,9 +9,9 @@ from typing import Any
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-not-found]
-from mcp.server.fastmcp import FastMCP
 
 from . import composio_proxy, google_api_proxy
+from .composio_metering import ComposioMeteringFastMCP
 from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +20,7 @@ logger = logging.getLogger("gmail-mcp")
 # Ensure standard proxy environment variables are set to prevent hanging requests
 setup_proxy_env()
 
-mcp = FastMCP("gmail-mcp")
+mcp = ComposioMeteringFastMCP("gmail-mcp")
 
 # Gmail's real limit is 25MB on the base64-encoded message. base64 inflates
 # raw bytes by 4/3, so this caps the raw (pre-encoding) total at 3/4 of that

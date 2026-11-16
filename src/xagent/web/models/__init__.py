@@ -19,9 +19,11 @@ from .mcp import MCPServer, UserMCPServer
 from .mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from .model import Model
 from .oauth_provider import OAuthProvider
+from .oauth_revocation_fence import OAuthRevocationFence
 from .oidc_consumed_token import OidcConsumedToken
 from .public_mcp import PublicMCPApp, PublicMCPAppAudit
 from .sandbox import DurableSandboxLifecycle, SandboxInfo, SandboxSnapshot
+from .serving_generation import ServingGeneration
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task, TaskConnectorRuntimeContext
@@ -88,6 +90,7 @@ __all__ = [
     "TaskAdmissionPacing",
     "TaskAdmissionBucket",
     "TaskAdmissionTicket",
+    "ServingGeneration",
     "TaskExecutionCommand",
     "TaskInputReceipt",
     "ApiIdempotencyKey",
@@ -134,6 +137,7 @@ __all__ = [
     "UserSkill",
     "UserSkillFile",
     "OAuthProvider",
+    "OAuthRevocationFence",
     "OidcConsumedToken",
     "PublicMCPApp",
     "PublicMCPAppAudit",

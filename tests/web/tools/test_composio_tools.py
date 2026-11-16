@@ -418,6 +418,40 @@ def test_execute_tool_sends_the_account_the_user_and_the_arguments(http):
     assert call["hooks"]["response"] is composio_tools._TOOL_REDIRECT_REFUSAL
 
 
+def test_execute_tool_counts_one_accepted_request(http):
+    http.answer(
+        "/tools/execute/GOOGLEDRIVE_CREATE_FILE",
+        200,
+        {"data": {"id": "drive1"}, "error": None, "successful": True},
+    )
+
+    token = composio_proxy.begin_request_count()
+    try:
+        result = _execute(GOOGLEDRIVE_CREATE_FILE, {"name": "notes.txt"})
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert result.successful is True
+    assert accepted == 1
+
+
+def test_a_refused_execute_tool_counts_nothing(http):
+    http.answer(
+        "/tools/execute/GOOGLEDRIVE_CREATE_FILE",
+        429,
+        {"error": {"message": "rate limited", "slug": "TooManyRequests"}},
+    )
+
+    token = composio_proxy.begin_request_count()
+    try:
+        with pytest.raises(composio_tools.ComposioToolError):
+            _execute(GOOGLEDRIVE_CREATE_FILE, {"name": "notes.txt"})
+    finally:
+        accepted = composio_proxy.end_request_count(token)
+
+    assert accepted == 0
+
+
 @pytest.mark.parametrize(
     ("status", "location"),
     [

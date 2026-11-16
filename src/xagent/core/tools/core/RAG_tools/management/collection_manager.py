@@ -28,7 +28,7 @@ from ..core.exceptions import CollectionNotFrozenError
 from ..core.parser_registry import get_supported_parsers, validate_parser_compatibility
 from ..core.schemas import CollectionInfo
 from ..LanceDB.schema_manager import _safe_close_table
-from ..storage.contracts import MetadataStore
+from ..storage.contracts import MetadataStore, is_missing_collection_error
 from ..storage.factory import get_metadata_store, get_vector_index_store
 from ..utils.lancedb_query_utils import list_table_names
 from ..utils.model_resolution_pin import pinned_resolution
@@ -405,6 +405,7 @@ class CollectionManager:
         *,
         require_uninitialized: bool = False,
         expected_model_id: Optional[str] = None,
+        expected_updated_at: Optional[datetime] = None,
         store: Optional[MetadataStore] = None,
         recreate_missing: bool = False,
     ) -> bool:
@@ -422,6 +423,7 @@ class CollectionManager:
                 field_names,
                 require_uninitialized=require_uninitialized,
                 expected_model_id=expected_model_id,
+                expected_updated_at=expected_updated_at,
                 store=store,
                 recreate_missing=recreate_missing,
             )
@@ -433,6 +435,7 @@ class CollectionManager:
         *,
         require_uninitialized: bool = False,
         expected_model_id: Optional[str] = None,
+        expected_updated_at: Optional[datetime] = None,
         store: Optional[MetadataStore] = None,
         recreate_missing: bool = False,
     ) -> bool:
@@ -445,6 +448,12 @@ class CollectionManager:
         row to be re-inserted like the whole-row save it replaced.
         """
         target = store if store is not None else self._get_metadata_store()
+        # Passed only when set: stores that predate the guard keep working.
+        fence = (
+            {}
+            if expected_updated_at is None
+            else {"expected_updated_at": expected_updated_at}
+        )
         try:
             return await _with_retry(
                 lambda: target.update_collection_fields(
@@ -452,6 +461,7 @@ class CollectionManager:
                     field_names,
                     require_uninitialized=require_uninitialized,
                     expected_model_id=expected_model_id,
+                    **fence,
                 ),
                 description=f"field update of collection {collection.name}",
                 deterministic=_is_deterministic_write_error,
@@ -476,6 +486,7 @@ class CollectionManager:
                 field_names,
                 require_uninitialized=require_uninitialized,
                 expected_model_id=expected_model_id,
+                expected_updated_at=expected_updated_at,
                 store=target,
             )
 
@@ -913,6 +924,27 @@ def _get_collection_sync_impl(collection_name: str) -> "CollectionInfo":
     return _sync_wrapper(collection_manager.get_collection)(collection_name)
 
 
+def get_collection_if_present_sync(collection_name: str) -> Optional["CollectionInfo"]:
+    """The metadata row, ``None`` only when it or its table is missing.
+
+    Unlike ``get_collection_sync``, a failed read is raised, not reported as absent.
+    """
+    return _get_maintenance_compatibility_facade().get_collection_if_present_sync(
+        collection_name
+    )
+
+
+def _get_collection_if_present_sync_impl(
+    collection_name: str,
+) -> Optional["CollectionInfo"]:
+    try:
+        return _sync_wrapper(get_metadata_store().get_collection)(collection_name)
+    except ValueError as exc:
+        if is_missing_collection_error(collection_name, exc):
+            return None
+        raise
+
+
 def initialize_collection_embedding_sync(
     collection_name: str, embedding_model_id: str
 ) -> "CollectionInfo":
@@ -1082,11 +1114,13 @@ def write_collection_binding_sync(
     *,
     expected_model_id: Optional[str] = None,
     require_uninitialized: bool = False,
+    expected_updated_at: Optional[datetime] = None,
 ) -> bool:
     """Write a collection's bound model pair, only while it is frozen.
 
     Returns ``False`` when the store's compare-and-set guard no longer holds, so
-    a caller can tell its own write from a concurrent one.
+    a caller can tell its own write from a concurrent one. ``expected_updated_at``
+    also requires the row to be unchanged since the caller read it.
     """
     state = read_migration_state(collection_name)
     if state.state != FROZEN:
@@ -1105,6 +1139,7 @@ def write_collection_binding_sync(
         _BINDING_FIELDS,
         expected_model_id=expected_model_id,
         require_uninitialized=require_uninitialized,
+        expected_updated_at=expected_updated_at,
     )
     if applied or not require_uninitialized:
         return applied
@@ -1115,7 +1150,36 @@ def write_collection_binding_sync(
         return False
     # A whitespace-only id reads as unbound but the unbound clause misses it.
     return _sync_wrapper(collection_manager.update_collection_fields)(
-        target, _BINDING_FIELDS, expected_model_id=stored
+        target,
+        _BINDING_FIELDS,
+        expected_model_id=stored,
+        expected_updated_at=expected_updated_at,
+    )
+
+
+def fence_collection_binding_sync(collection_name: str) -> None:
+    """Touch ``updated_at`` so a binding write guarded by an earlier read misses.
+
+    A missing row has nothing to fence. A touch that misses found the row
+    written since this read, which fences it as well.
+    """
+    _sync_wrapper(_fence_collection_binding)(collection_name)
+
+
+async def _fence_collection_binding(collection_name: str) -> None:
+    try:
+        # The store, not the manager: the manager reports any read error as missing.
+        current = await collection_manager._get_metadata_store().get_collection(
+            collection_name
+        )
+    except ValueError as exc:
+        if "not found" not in str(exc):
+            raise
+        return
+    await collection_manager.update_collection_fields(
+        CollectionInfo(name=collection_name),
+        (),
+        expected_updated_at=current.updated_at,
     )
 
 

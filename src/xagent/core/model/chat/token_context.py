@@ -5,11 +5,12 @@ contextvars let statistics be collected automatically during task execution.
 
 Two dimensions live here. LLM tokens use ``add_token_usage`` and aggregate via
 ``aggregate_token_usage_by_model``. Non-LLM media calls — image, video, TTS,
-ASR, music, sound effect, embedding, rerank — use the ``MediaUnit`` /
-``MediaCallType`` vocabulary, record through ``add_media_usage``, and aggregate
-via ``aggregate_media_usage_by_model``. Both write into the same
-``TokenUsage.details`` list, discriminated by each row's ``type``, so existing
-persistence and quota paths carry media rows with no schema change.
+ASR, music, sound effect, embedding, rerank, web search, Composio connector
+calls — use the ``MediaUnit`` / ``MediaCallType`` vocabulary, record through
+``add_media_usage``, and aggregate via ``aggregate_media_usage_by_model``.
+Both write into the same ``TokenUsage.details`` list, discriminated by each
+row's ``type``, so existing persistence and quota paths carry media rows with
+no schema change.
 """
 
 import contextvars
@@ -86,6 +87,13 @@ class MediaCallType(str, Enum):
     SOUND_EFFECT = ("sound_effect", MediaUnit.SECONDS)
     EMBEDDING = ("embedding", MediaUnit.TEXTS)
     RERANK = ("rerank", MediaUnit.REQUESTS)
+    # Platform-metered requests with nothing finer to bill than the call
+    # itself: one successful search against a search provider's key, and one
+    # request Composio accepted on the platform's grant. A connector tool call
+    # can make several such requests, so a ``composio`` call is metered per
+    # request and the connector reports its count in the MCP result ``_meta``.
+    WEB_SEARCH = ("web_search", MediaUnit.REQUESTS)
+    COMPOSIO = ("composio", MediaUnit.REQUESTS)
 
 
 _MEDIA_CALL_TYPE_VALUES = frozenset(member.value for member in MediaCallType)

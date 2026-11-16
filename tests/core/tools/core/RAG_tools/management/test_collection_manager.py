@@ -736,3 +736,48 @@ class TestRebuildCollectionMetadata:
         assert result.name == "rebuild_test_collection"
         assert result.documents == 5
         assert result.processed_documents == 3
+
+
+def test_get_collection_if_present_reads_a_present_row() -> None:
+    import asyncio
+
+    from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+        collection_manager,
+        get_collection_if_present_sync,
+    )
+
+    asyncio.run(
+        collection_manager.save_collection(
+            CollectionInfo(name="present", embedding_model_id="m")
+        )
+    )
+
+    info = get_collection_if_present_sync("present")
+
+    assert info is not None and info.embedding_model_id == "m"
+
+
+def test_get_collection_if_present_reports_an_absent_row_as_none() -> None:
+    from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+        get_collection_if_present_sync,
+    )
+
+    assert get_collection_if_present_sync("never-created") is None
+
+
+@pytest.mark.parametrize("error", [OSError("store gone"), ValueError("boom")])
+def test_get_collection_if_present_reraises_a_failed_read(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+        get_collection_if_present_sync,
+    )
+    from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
+
+    async def _unreadable(name: str) -> CollectionInfo:
+        raise error
+
+    monkeypatch.setattr(get_metadata_store(), "get_collection", _unreadable)
+
+    with pytest.raises(type(error), match=str(error)):
+        get_collection_if_present_sync("anything")

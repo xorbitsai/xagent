@@ -471,6 +471,8 @@ def test_sequential_callbacks_request_and_resolve_one_shared_scope_union(db_sess
         token_type="Bearer",
         expires_at=None,
         legacy_oauth_account=docs,
+        # Google confirmed the stored token covers the docs scopes too.
+        verified_refresh_token="shared-refresh",
     )
     db.commit()
 
@@ -518,6 +520,7 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
         token_type="Bearer",
         expires_at=None,
         legacy_oauth_account=legacy,
+        verified_refresh_token="refresh",
     )
     db.commit()
     shared_id = int(shared.id)
@@ -544,6 +547,7 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
         token_type="Bearer",
         expires_at=None,
         legacy_oauth_account=legacy,
+        verified_refresh_token="refresh",
     )
     db.commit()
 
@@ -667,6 +671,9 @@ def test_callback_writer_adopts_existing_unowned_bare_google_account(db_session)
     assert association.legacy_oauth_account_id == legacy.id
     assert db.query(UserOAuth).filter_by(provider="google").count() == 1
     assert shared.access_token == "new-shared-access"
+    # Both rows predate issuer tracking (NULL); the callback records Google.
+    assert shared.oauth_provider == "google"
+    assert mirrored.oauth_provider == "google"
 
 
 def test_resolver_rejects_association_after_legacy_link_is_deleted(db_session):
@@ -882,6 +889,8 @@ def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session
 
     assert legacy.access_token == "new-shared-access"
     assert legacy.refresh_token == "rollback-refresh"
+    # A mirror holds Google-issued tokens, whatever issuer it recorded before.
+    assert legacy.oauth_provider == "google"
 
 
 def test_mirror_uses_canonical_builtin_scope_policy(db_session):

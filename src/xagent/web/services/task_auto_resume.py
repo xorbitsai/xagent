@@ -80,6 +80,7 @@ from ..models.task_auto_recovery import (
 from ..models.task_command import TaskExecutionCommand
 from ..utils.db_timezone import format_datetime_for_api
 from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .generation import tick_allowed
 from .ops_signals import (
     TASK_AUTO_RESUME_UNAVAILABLE,
     clear_degradation,
@@ -1878,6 +1879,9 @@ async def run_task_auto_resume_loop(*, poll_interval_seconds: int) -> None:
     failures = 0
     last_failure_log = float("-inf")
     while True:
+        if not await tick_allowed("task-auto-resume"):
+            await asyncio.sleep(poll_interval_seconds)
+            continue
         try:
             report = await run_db_io_cancellation_safe(
                 lambda: run_auto_resume_tick(now=utc_now())
@@ -2779,10 +2783,11 @@ def _terminal_view_snapshot(db: Session, task_id: int) -> Any:
 def status_only_terminal_view(db: Session, task_id: int) -> TerminalView | None:
     """Whether a status-only caller should read ``task_id`` as failed, and why.
 
-    A read model for the public ``/v1`` task reads only: its one caller is
-    ``_load_task_info_snapshot``, which calls it only for a task it loaded
-    PAUSED with control state ``paused``; it is never written anywhere, and
-    the task row stays PAUSED. A caller
+    A read model for the public ``/v1`` task reads: ``_load_task_info_snapshot``
+    calls it only for a task it loaded PAUSED with control state ``paused``,
+    and the SDK cancel request consults it for the same rows so that it
+    refuses exactly the tasks those reads report as failed. It is never
+    written anywhere, and the task row stays PAUSED. A caller
     that sees nothing but the status cannot tell a task waiting for its next
     automatic resume from one that stopped for good, so it would wait on the
     second forever. The answer is a :class:`TerminalView` when all hold:

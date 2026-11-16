@@ -18,7 +18,13 @@ and sends absolute URLs.
 Two kinds of failure stay apart:
 
 - Composio itself refusing or failing (bad key, unknown account, rate limit,
-  an answer that is not a proxy result) raises ``ComposioProxyError``.
+  an answer that is not a proxy result) raises ``ComposioProxyError``. So does
+  a request a batch sent that outlives its end-to-end deadline: ``requests``'
+  ``timeout`` bounds one connect attempt and each socket read, not the whole
+  exchange, so a body that keeps arriving inside the read timeout would never
+  end. Only a batch's request has that deadline, because a metered tool call
+  waits for it after the batch returned; a request sent outside a batch keeps
+  just the ``timeout``.
 - The provider's own answer, error or not, is returned as a ``ProxyResponse``
   with the provider's status, so each connector maps its own API's errors.
 
@@ -35,8 +41,12 @@ import json
 import logging
 import os
 import re
-from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass
+import threading
+import time
+from collections.abc import Callable, Collection, Iterable, Mapping
+from concurrent.futures import Future, wait
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -54,6 +64,11 @@ _LAUNCH_SECRET_ENVS = (
     COMPOSIO_CONNECTED_ACCOUNT_ID_ENV,
     COMPOSIO_USER_ID_ENV,
 )
+# The per-socket timeout given to ``requests``, which bounds one connect attempt
+# and each read, not the whole exchange. A proxied request a batch sent also has
+# it as an end-to-end budget, from the send to the last byte of the answer (a
+# binary answer's download included), because a metered tool call waits for such
+# a request after its batch returned.
 DEFAULT_TIMEOUT_SECONDS = 30
 # The largest JSON body one Proxy Execute call may carry. Composio's API is
 # served by Vercel functions (its answers can carry ``x-vercel-id``), whose
@@ -162,6 +177,64 @@ def serves_composio_grant() -> bool:
     """Whether this connector process serves a Composio-backed grant: it is
     launched with Composio's ids instead of a provider token."""
     return bool(os.environ.get(COMPOSIO_CONNECTED_ACCOUNT_ID_ENV))
+
+
+@dataclass
+class _RequestCount:
+    """What one metered tool call has counted, and what can still count.
+
+    ``accepted`` is the per-request count: a batch's worker threads reach the
+    same object through a copy of the caller's context. ``pending`` holds the
+    batch futures that were still running when their batch returned, because
+    each of those can still be accepted after the batch's deadline.
+    """
+
+    accepted: list[int] = field(default_factory=list)
+    pending: list[Future[Any]] = field(default_factory=list)
+
+
+# The requests the MCP tool call being handled made to Composio. FastMCP
+# handles calls concurrently in one process, so the count is a context
+# variable; outside a metered call (a host-issued call, a direct client use)
+# nothing is counted.
+_request_count: ContextVar[_RequestCount | None] = ContextVar(
+    "composio_request_count", default=None
+)
+
+
+def begin_request_count() -> Token[_RequestCount | None]:
+    """Start counting the requests Composio accepts for one tool call."""
+    return _request_count.set(_RequestCount())
+
+
+def end_request_count(token: Token[_RequestCount | None]) -> int:
+    """Stop counting and return how many requests were accepted."""
+    count = _request_count.get()
+    _request_count.reset(token)
+    return len(count.accepted) if count is not None else 0
+
+
+def record_accepted_request() -> None:
+    """Count one request Composio accepted; a no-op outside a metered call."""
+    count = _request_count.get()
+    if count is not None:
+        # ``list.append`` is atomic under the GIL, so a batch can count from
+        # its worker threads without a lock.
+        count.accepted.append(1)
+
+
+def register_pending_batch_requests(futures: Iterable[Future[Any]]) -> None:
+    """Have the metered call wait for the batch requests in ``futures`` that
+    outlived their batch's deadline; a no-op outside a metered call."""
+    count = _request_count.get()
+    if count is not None:
+        count.pending.extend(futures)
+
+
+def pending_batch_requests() -> tuple[Future[Any], ...]:
+    """The batch requests a metered call still has to wait for."""
+    count = _request_count.get()
+    return tuple(count.pending) if count is not None else ()
 
 
 def redact(value: Any) -> Any:
@@ -944,6 +1017,44 @@ def check_json_body_size(
     )
 
 
+class _DeadlinePassed(Exception):
+    """One proxied send did not finish by the deadline it was given."""
+
+
+def send_within_deadline(deadline: float | None, send: Callable[[], Any]) -> Any:
+    """``send()``, given up on at ``deadline`` (a ``time.monotonic()`` value).
+
+    ``send`` performs one ``requests`` call, whose own ``timeout`` bounds one
+    connect attempt and each socket read, not the whole exchange: a body that
+    keeps arriving inside the read timeout never trips it. Given a deadline,
+    the call runs on a thread of its own and the caller waits only until then,
+    so one deadline can cover several steps of one proxied request (the proxy
+    call and the download of a binary answer); a call that outlives it is
+    abandoned and raises, and nothing this client counts or returns comes from
+    the abandoned call, because the caller counts and reads the answer itself,
+    after this returns. Without a deadline, ``send()`` runs on this thread, as
+    one sent outside a batch does.
+    """
+    if deadline is None:
+        return send()
+    sent: Future[Any] = Future()
+
+    def run() -> None:
+        try:
+            sent.set_result(send())
+        except BaseException as exc:  # handed to the waiting caller
+            sent.set_exception(exc)
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _DeadlinePassed
+    threading.Thread(target=run, name="composio-proxy-send", daemon=True).start()
+    _, unfinished = wait([sent], timeout=remaining)
+    if unfinished:
+        raise _DeadlinePassed
+    return sent.result()
+
+
 def proxy_request(
     method: str,
     endpoint: str,
@@ -954,17 +1065,27 @@ def proxy_request(
     body: Any = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_body_bytes: int | None = None,
+    deadline: float | None = None,
 ) -> ProxyResponse:
     """Send ``method endpoint`` through Composio as the launched grant.
 
     ``allowed_hosts`` are the hostnames an absolute ``endpoint`` may name.
     ``query`` is a mapping or a sequence of pairs, and each name may appear
     only once; ``body`` is sent as JSON. Raises ``ComposioProxyError`` when
-    Composio does not relay the call, and ``ValueError`` before sending
-    anything when the endpoint, a launch variable or a parameter is unusable,
-    when a query name appears more than once, or when the JSON body would
-    exceed ``MAX_JSON_BODY_BYTES``. ``max_body_bytes`` overrides that shared
-    default, for a connector whose real limit differs.
+    Composio does not relay the call, or does not finish a call that has a
+    ``deadline`` inside it, and ``ValueError`` before sending anything when the
+    endpoint, a launch variable or a parameter is unusable, when a query name
+    appears more than once, or when the JSON body would exceed
+    ``MAX_JSON_BODY_BYTES``. ``max_body_bytes`` overrides that shared default,
+    for a connector whose real limit differs.
+
+    ``timeout`` is the per-socket timeout given to ``requests``. ``deadline``
+    is an end-to-end cutoff for the call, as a ``time.monotonic()`` value, for
+    a caller that runs further steps of the same request under it (reading a
+    binary answer): ``GoogleApiProxyHttp`` gives one to each request a batch
+    sends, because a metered tool call waits for those. A call that outlives it
+    is abandoned and raises. Without a deadline the call has no end-to-end
+    cutoff and is bounded only by ``timeout``.
     """
     if isinstance(allowed_hosts, str):
         raise TypeError("allowed_hosts must be a collection of hostnames, not a str")
@@ -974,17 +1095,25 @@ def proxy_request(
     _checked_payload_size(payload, max_body_bytes)
 
     try:
-        response = requests.request(
-            method="POST",
-            url=COMPOSIO_PROXY_URL,
-            headers={
-                "x-api-key": api_key,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
+        response = send_within_deadline(
+            deadline,
+            lambda: requests.request(
+                method="POST",
+                url=COMPOSIO_PROXY_URL,
+                headers={
+                    "x-api-key": api_key,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout,
+            ),
         )
+    except _DeadlinePassed:
+        logger.warning("Composio proxy request did not finish within %gs", timeout)
+        raise ComposioProxyError(
+            f"Composio proxy did not finish the answer within {timeout:g}s"
+        ) from None
     except Exception as exc:
         # Type only: a connection error's text can name the request.
         logger.warning(
@@ -1023,6 +1152,9 @@ def proxy_request(
             "Composio proxy returned a binary answer in an unexpected shape",
             status=status,
         )
+    # Composio accepted this call (the provider's own status, success or not,
+    # is in ``provider_status``), so it is a billed request.
+    record_accepted_request()
     return ProxyResponse(
         status=provider_status,
         data=answer.get("data"),

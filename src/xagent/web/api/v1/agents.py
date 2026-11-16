@@ -1,9 +1,13 @@
 """SDK management endpoints for user-owned agents."""
 
-from fastapi import APIRouter, Depends, Path, Request
+from fastapi import APIRouter, Depends, Path, Query, Request
 
 from ...schemas.v1 import (
+    AgentRuntimeKeyItem,
+    AgentRuntimeKeyRevokeResponse,
     RuntimeKeyResponse,
+    V1AgentConnectorsResponse,
+    V1AgentConnectorsUpdateRequest,
     V1AgentCreateRequest,
     V1AgentCreateResponse,
     V1AgentResponse,
@@ -14,11 +18,15 @@ from ...schemas.v1 import (
     V1AgentTemplateCreateRequest,
 )
 from ...services.agent_management import (
+    AgentConnectorsNotSharedError,
+    AgentConnectorsSnapshot,
     AgentCreateSpec,
     AgentManagementRuntime,
     AgentResponseSnapshot,
     AgentSummarySnapshot,
+    AgentToolsUnconfiguredError,
     DuplicateAgentNameError,
+    InvalidAgentConnectorsError,
     InvalidAgentModelConfigError,
     InvalidAgentSkillNamesError,
     InvalidKnowledgeBaseError,
@@ -26,7 +34,12 @@ from ...services.agent_management import (
     TemplateNotFoundError,
     WorkforceTemplateNotSupportedError,
 )
-from ...services.api_keys import KeyRotationConflict
+from ...services.api_keys import (
+    AgentKeyMetadata,
+    AgentKeyRevocation,
+    AgentRuntimeKeyNotFoundError,
+    KeyRotationConflict,
+)
 from .deps import (
     PersonalApiKeySnapshot,
     UserPrincipalSnapshot,
@@ -42,6 +55,30 @@ def _runtime_key_response(api_key: RuntimeKeySnapshot) -> RuntimeKeyResponse:
         full_key=api_key.full_key,
         key_prefix=api_key.key_prefix,
         created_at=api_key.created_at,
+    )
+
+
+def _runtime_key_item(key: AgentKeyMetadata) -> AgentRuntimeKeyItem:
+    return AgentRuntimeKeyItem(
+        id=key.id,
+        label=key.label,
+        key_prefix=key.key_prefix,
+        masked_key=key.masked_key,
+        status=key.status,
+        created_at=key.created_at,
+        last_used_at=key.last_used_at,
+        revoked_at=key.revoked_at,
+    )
+
+
+def _runtime_key_revoke_response(
+    revocation: AgentKeyRevocation,
+) -> AgentRuntimeKeyRevokeResponse:
+    return AgentRuntimeKeyRevokeResponse(
+        id=revocation.key_id,
+        key_prefix=revocation.key_prefix,
+        revoked=revocation.revoked,
+        revoked_at=revocation.revoked_at,
     )
 
 
@@ -217,6 +254,61 @@ async def rotate_agent_runtime_key(
     return _runtime_key_response(api_key)
 
 
+@router.get("/{agent_id}/api-keys", response_model=list[AgentRuntimeKeyItem])
+async def list_agent_runtime_keys(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    include_revoked: bool = Query(False),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> list[AgentRuntimeKeyItem]:
+    """List the runtime keys of an agent the key holder can manage.
+
+    Revoked keys are left out unless ``include_revoked`` is set. No response
+    carries a key's secret.
+    """
+    user, _key = authed
+    keys = await AgentManagementRuntime().list_agent_runtime_keys(
+        user_id=int(user.id), agent_id=agent_id, include_revoked=include_revoked
+    )
+    if keys is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return [_runtime_key_item(key) for key in keys]
+
+
+@router.delete(
+    "/{agent_id}/api-keys/{key_id}", response_model=AgentRuntimeKeyRevokeResponse
+)
+async def revoke_agent_runtime_key(
+    # ``agents.id`` and ``agent_api_keys.id`` are 32-bit integer columns.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    key_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> AgentRuntimeKeyRevokeResponse:
+    """Revoke one runtime key of an agent the key holder can manage.
+
+    The agent's other keys keep working. Revoking an already revoked key is
+    a no-op that reports ``revoked=false``. A key id that is not bound to
+    this agent is ``api_key_not_found`` whether or not it exists elsewhere.
+    """
+    user, key = authed
+    try:
+        revocation = await AgentManagementRuntime().revoke_agent_runtime_key(
+            user_id=int(user.id),
+            credential_ref=f"personal_key:{key.key_prefix}",
+            agent_id=agent_id,
+            key_id=key_id,
+        )
+    except AgentRuntimeKeyNotFoundError:
+        raise V1ApiError(V1ErrorCode.API_KEY_NOT_FOUND, 404)
+    if revocation is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _runtime_key_revoke_response(revocation)
+
+
 @router.get("/{agent_id}/skills", response_model=V1AgentSkillsResponse)
 async def get_agent_skills(
     # ``agents.id`` is a 32-bit integer column.
@@ -262,3 +354,67 @@ async def set_agent_skills(
         skills=list(result.skills),
         unresolved_for_caller=list(result.unresolved_for_caller),
     )
+
+
+def _connectors_response(
+    agent_id: int, selection: AgentConnectorsSnapshot
+) -> V1AgentConnectorsResponse:
+    return V1AgentConnectorsResponse(
+        agent_id=agent_id,
+        connectors=list(selection.connectors),
+        all_connectors=selection.all_connectors,
+        unresolved=list(selection.unresolved),
+    )
+
+
+@router.get("/{agent_id}/connectors", response_model=V1AgentConnectorsResponse)
+async def get_agent_connectors(
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentConnectorsResponse:
+    """Read the connectors of an agent the key holder can see."""
+    user, _key = authed
+    selection = await AgentManagementRuntime().get_agent_connectors(
+        user_id=int(user.id), agent_id=agent_id
+    )
+    if selection is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _connectors_response(agent_id, selection)
+
+
+@router.put("/{agent_id}/connectors", response_model=V1AgentConnectorsResponse)
+async def set_agent_connectors(
+    request: V1AgentConnectorsUpdateRequest,
+    # ``agents.id`` is a 32-bit integer column.
+    agent_id: int = Path(gt=0, le=2**31 - 1),
+    authed: tuple[UserPrincipalSnapshot, PersonalApiKeySnapshot] = Depends(
+        get_user_from_personal_key
+    ),
+) -> V1AgentConnectorsResponse:
+    """Replace the connectors of an agent the key holder can see."""
+    user, key = authed
+    try:
+        selection = await AgentManagementRuntime().set_agent_connectors(
+            user_id=int(user.id),
+            key_prefix=key.key_prefix,
+            agent_id=agent_id,
+            connectors=request.connectors,
+            all_connectors=request.all_connectors,
+        )
+    except AgentToolsUnconfiguredError:
+        raise V1ApiError(V1ErrorCode.AGENT_TOOLS_UNCONFIGURED, 409)
+    except InvalidAgentConnectorsError as e:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 400, str(e))
+    except AgentConnectorsNotSharedError as e:
+        raise V1ApiError(
+            V1ErrorCode.CONNECTOR_NOT_SHARED,
+            400,
+            str(e),
+            details={"connectors": e.connectors},
+        )
+    if selection is None:
+        raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+    return _connectors_response(agent_id, selection)

@@ -3,7 +3,9 @@
 ``uq_mcp_oauth_grants_lookup`` covers every grant row whatever its status, and
 the lookup hash includes the granted scope. The callback deletes the grants it
 replaces before it looks up the row for the new scope, so neither a later
-refresh nor a refresh running at the same time collides with that constraint.
+refresh nor a refresh running at the same time collides with that constraint. A refresh that
+finds its grant revoked, once it holds the row lock, revokes the token pair it
+was issued only after the lock is gone.
 """
 
 from __future__ import annotations
@@ -315,3 +317,50 @@ def test_reconnect_waits_for_a_refresh_of_the_grant_it_replaces(
     [(grant_id, scope, status, token)] = _owner_grants(factory)
     assert (scope, status, token) == (NARROW, "active", "issued-access-token")
     assert (grant_id == seed["earlier_id"]) is keeps_the_earlier_row
+
+
+def test_tokens_issued_to_a_revoked_grant_are_revoked_with_no_row_lock_held(
+    factory, monkeypatch
+):
+    """The refresh finds its grant revoked under ``FOR UPDATE``. The provider
+    call for the pair it was issued must not run inside that transaction: from
+    another connection the row is lockable while the revocation is sent."""
+    seed = _seed(factory, earlier_expired=True)
+
+    async def fake_refresh(_client, *, refresh_token, resource, client=None, **_kwargs):
+        with factory() as other:
+            other.query(MCPOAuthGrant).filter(
+                MCPOAuthGrant.id == seed["earlier_id"]
+            ).update({MCPOAuthGrant.status: "revoked"})
+            other.commit()
+        return {"access_token": "refreshed-access-token", "refresh_token": "rotated"}
+
+    revoked: list[tuple[str, str | None, bool]] = []
+
+    async def record_revocation(snapshot):
+        with factory() as other:
+            lockable = (
+                other.execute(
+                    text(
+                        "SELECT id FROM mcp_oauth_grants WHERE id = :id "
+                        "FOR UPDATE NOWAIT"
+                    ),
+                    {"id": seed["earlier_id"]},
+                ).first()
+                is not None
+            )
+            other.rollback()
+        revoked.append((snapshot.access_token, snapshot.refresh_token, lockable))
+
+    monkeypatch.setattr(mcp_oauth_service, "_refresh_mcp_oauth_grant", fake_refresh)
+    monkeypatch.setattr(
+        mcp_api, "_revoke_mcp_oauth_issued_token_externally", record_revocation
+    )
+
+    with pytest.raises(mcp_oauth_service.MCPOAuthRuntimeError):
+        _resolve(factory, seed)
+
+    assert revoked == [("refreshed-access-token", "rotated", True)]
+    assert _owner_grants(factory) == [
+        (seed["earlier_id"], FULL, "revoked", "earlier-access-token")
+    ]

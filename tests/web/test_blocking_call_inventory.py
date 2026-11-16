@@ -67,7 +67,7 @@ NETWORK = "Outbound network call (DNS, provider or Google API read): writes no l
 ALLOWED: dict[str, tuple[int, str]] = {
     # -- web/api: HTTP routes ---------------------------------------------------
     "web/api/admin_users.py": (6, HTTP),
-    "web/api/auth.py": (11, HTTP),
+    "web/api/auth.py": (10, HTTP),
     "web/api/chat.py": (8, HTTP),
     "web/api/files.py": (7, HTTP),
     "web/api/kb.py": (16, HTTP),
@@ -81,11 +81,16 @@ ALLOWED: dict[str, tuple[int, str]] = {
     "web/api/workforces.py": (2, HTTP),
     # -- web: lifecycle and telemetry -------------------------------------------
     "web/app.py": (
-        2,
-        "Two calls: the startup check of the auth-attempt storage, which is "
-        "awaited before the lifespan starts any writer, and the temp-file "
+        4,
+        "Four calls: the startup check of the auth-attempt storage, which is "
+        "awaited before the lifespan starts any writer; the temp-file "
         "walk, which deletes temp files only and is stopped through its own "
-        "event (documented in retire_writers).",
+        "event (documented in retire_writers); the dedicated "
+        "'startup-file-sync' pool, whose only writing job (the startup file "
+        "storage sync) is submitted through run_tracked_in and so is counted "
+        "until its thread returns; and the standby preflight, a read-only "
+        "classification that writes nothing and is stopped through its "
+        "StartupSyncControl cancel event.",
     ),
     "web/worker.py": (
         4,
@@ -103,6 +108,7 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "running execution (load); writes nothing.",
     ),
     "web/tools/config.py": (1, NETWORK),
+    "web/tools/mcp/composio_proxy.py": (1, NETWORK),
     "web/tools/mcp/google_api_proxy.py": (1, NETWORK),
     "web/tools/mcp/google_slides.py": (3, NETWORK),
     "web/tracking/standalone_usage.py": (
@@ -154,6 +160,8 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "(an embedding host constructs it); it is not part of any loop "
         "retire_writers stops.",
     ),
+    # Only reads the serving-generation row (is_serving never writes).
+    "web/services/generation.py": (2, READ),
     "web/services/gmail_triggers.py": (
         5,
         "Gmail Pub/Sub webhook collection (collect_gmail_pubsub_events): "
@@ -242,10 +250,21 @@ ALLOWED: dict[str, tuple[int, str]] = {
         "immediately in the sync-to-async bridge.",
     ),
     "core/tools/core/RAG_tools/management/collections.py": (2, READ),
+    "core/tools/core/RAG_tools/management/write_leases.py": (
+        3,
+        "Three daemon helpers: the heartbeat that renews the operation's own "
+        "lease rows while its scope runs (stopped and joined before release, "
+        "and the async decorators release it off the event loop), plus the "
+        "fire-and-forget compaction and expired-row GC of the lease table, "
+        "neither of which writes application data. All belong to the "
+        "HTTP-route and execution classes retire_writers lists under "
+        "'Not covered'.",
+    ),
     "core/tools/core/RAG_tools/management/migration_state.py": (
         1,
         "The freeze guard reads one state row (and opens the metadata "
-        "connection to read it); it writes no row.",
+        "connection to read it). Lease writes go off the loop through "
+        "run_blocking, and a scope releases on its own exit.",
     ),
     "core/tools/core/RAG_tools/pipelines/document_ingestion.py": (
         2,

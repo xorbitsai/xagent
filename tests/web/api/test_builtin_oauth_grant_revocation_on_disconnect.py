@@ -97,6 +97,7 @@ def _connected_github_server(db: Session) -> tuple[User, MCPServer, UserMCPServe
         UserOAuth(
             user_id=int(user.id),
             provider="github",
+            oauth_provider="github",
             access_token="live-access-token",
             provider_user_id="42",
         )
@@ -158,6 +159,7 @@ async def test_delete_mcp_server_skips_revocation_with_a_live_sibling(db, monkey
         UserOAuth(
             user_id=other_user.id,
             provider="github",
+            oauth_provider="github",
             provider_user_id="42",
             access_token="bobs-still-live-token",
         )
@@ -249,6 +251,7 @@ async def test_teardown_mcp_app_server_skips_revocation_with_a_live_sibling(
         UserOAuth(
             user_id=other_user.id,
             provider="github",
+            oauth_provider="github",
             provider_user_id="42",
             access_token="bobs-still-live-token",
         )
@@ -327,6 +330,7 @@ async def test_snapshot_builtin_oauth_revocations_captures_every_matching_row(db
         UserOAuth(
             user_id=int(user.id),
             provider="github",
+            oauth_provider="github",
             provider_user_id="42",
             access_token="first-account-token",
         )
@@ -335,6 +339,7 @@ async def test_snapshot_builtin_oauth_revocations_captures_every_matching_row(db
         UserOAuth(
             user_id=int(user.id),
             provider="github",
+            oauth_provider="github",
             provider_user_id="43",
             access_token="second-account-token",
         )
@@ -378,6 +383,7 @@ def _seed_bare_github_account(db: Session) -> tuple[User, UserOAuth]:
     account = UserOAuth(
         user_id=int(user.id),
         provider="github",
+        oauth_provider="github",
         access_token="live-access-token",
         provider_user_id="42",
     )
@@ -417,6 +423,7 @@ async def test_delete_connected_account_skips_revocation_with_a_live_sibling(
         UserOAuth(
             user_id=other_user.id,
             provider="github",
+            oauth_provider="github",
             provider_user_id="42",
             access_token="bobs-still-live-token",
         )
@@ -446,6 +453,7 @@ async def test_delete_connected_account_ignores_token_cleared_sibling_reference(
     tombstone = UserOAuth(
         user_id=int(other_user.id),
         provider="github",
+        oauth_provider="github",
         provider_user_id="42",
         access_token="",
     )

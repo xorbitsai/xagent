@@ -232,18 +232,39 @@ def test_downgrade_preserves_custom_same_id(tmp_path):
     assert name == "Custom Shopify"
 
 
-def test_seed_row_matches_registry():
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+def test_seed_row_is_the_shape_the_oauth_switch_migrates_from():
+    """The seed is a frozen snapshot; the registry has since moved to OAuth
+    (#2810). The switch migration must recognize exactly what this seeded,
+    or it would refuse to upgrade a database this migration populated."""
+    migration = _load_migration()
+    switch_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20261116_migrate_shopify_to_oauth.py"
+    )
+    spec = importlib.util.spec_from_file_location("shopify_oauth_switch", switch_file)
+    switch = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(switch)
+
+    assert migration.ROW["name"] == switch.APP_NAME
+    assert migration.ROW["description"] == switch.LEGACY_DESCRIPTION
+    assert switch._legacy_catalog_row(migration.ROW)
+
+
+def test_seed_display_fields_still_match_the_registry():
+    """The OAuth switch leaves icon and category alone, so they must not
+    drift from the registry either."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
     migration = _load_migration()
-    registry = next(
-        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "shopify"
-    )
-    assert migration.ROW == registry
+    registry_row = get_builtin_public_mcp_app("shopify")
+
+    assert registry_row is not None
+    for field in ("app_id", "name", "icon", "category"):
+        assert migration.ROW[field] == registry_row[field]
 
 
 def test_upgrade_connect_downgrade_reupgrade_preserves_official_connection(tmp_path):
-    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
     from xagent.web.models.database import Base
     from xagent.web.models.mcp import MCPServer, UserMCPServer
     from xagent.web.models.user import User
@@ -261,23 +282,27 @@ def test_upgrade_connect_downgrade_reupgrade_preserves_official_connection(tmp_p
     user = User(id=1, username="shop-owner", password_hash="x")
     db.add(user)
     db.commit()
-    connect_mcp_app(
-        "shopify",
-        MCPAppConnectRequest(
-            env={
-                "SHOPIFY_STORE_DOMAIN": "acme",
-                "SHOPIFY_ACCESS_TOKEN": "shpat_roundtrip_secret",
-            }
-        ),
-        current_user=user,
-        db=db,
+    # What the token connector's catalog connect created; the registry has
+    # since moved to OAuth, so it is written directly.
+    server = MCPServer(
+        name="shopify",
+        managed="external",
+        transport="stdio",
+        command="python",
+        args=["-m", "xagent.web.tools.mcp.shopify"],
+        auth={"builtin_provenance": migration.BUILTIN_PROVENANCE},
     )
-    server = db.query(MCPServer).filter(MCPServer.name == "shopify").one()
-    association = (
-        db.query(UserMCPServer)
-        .filter(UserMCPServer.mcpserver_id == server.id, UserMCPServer.user_id == 1)
-        .one()
+    db.add(server)
+    db.commit()
+    association = UserMCPServer(
+        user_id=1,
+        mcpserver_id=server.id,
+        is_owner=False,
+        is_active=True,
+        env={"SHOPIFY_ACCESS_TOKEN": "encrypted-roundtrip-secret"},
     )
+    db.add(association)
+    db.commit()
     server_id = int(server.id)
     association_id = int(association.id)
     encrypted_env = association.env
@@ -345,13 +370,17 @@ def test_fresh_registry_seed_accepts_owned_server_from_older_version(tmp_path):
     old_marker["version"] = 0
     session_factory = sessionmaker(bind=engine)
     db = session_factory()
+    # Named as the OAuth catalog connect names it (#2810).
     db.add(
         MCPServer(
-            name="shopify",
+            name="Shopify",
             managed="external",
-            transport="stdio",
-            command="python",
-            auth={"builtin_provenance": old_marker},
+            transport="oauth",
+            auth={
+                "app_id": "shopify",
+                "provider": "shopify",
+                "builtin_provenance": old_marker,
+            },
         )
     )
     db.commit()

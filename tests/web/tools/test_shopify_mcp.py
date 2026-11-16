@@ -1986,21 +1986,6 @@ def test_list_collections_forwards_query(monkeypatch):
     assert "$query: String!" in body["query"]
 
 
-def test_shopify_app_registry_requires_store_domain_and_token():
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
-    shopify_app = next(
-        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "shopify"
-    )
-    assert shopify_app["provider_name"] is None
-    assert shopify_app["category"] == "Commerce"
-    assert shopify_app["transport"] == "stdio"
-    assert shopify_app["launch_config"]["required_env"] == [
-        "SHOPIFY_STORE_DOMAIN",
-        "SHOPIFY_ACCESS_TOKEN",
-    ]
-
-
 def test_custom_shopify_catalog_row_is_not_overlaid_as_builtin():
     from types import SimpleNamespace
 

@@ -702,6 +702,34 @@ def test_a_collection_name_the_write_path_would_strip_is_refused(
     assert _target() == []
 
 
+def _inferred_statuses(doc_id: str = "d1") -> Tuple[str, str]:
+    """The status the default list and detail projections infer for ``doc_id``."""
+    from xagent.core.tools.core.RAG_tools.management import (
+        get_document_stats,
+        list_documents,
+    )
+
+    listed = list_documents("kb", is_admin=True)
+    [summary] = [doc for doc in listed.documents if doc.doc_id == doc_id]
+    detail = get_document_stats("kb", doc_id, is_admin=True)
+    assert detail.data is not None
+    return summary.status.value, detail.data.status.value
+
+
+def test_a_partially_embedded_document_stays_partial_in_the_default_projections(
+    adapter: _Adapter,
+) -> None:
+    _save_collection()
+    _seed_core({"d1": ["c1", "c2"]})
+    _write([_src("c1")])
+    assert _inferred_statuses() == ("partially_embedded", "partially_embedded")
+
+    assert _run().written == 1
+
+    assert _target_ids("d1") == ["c1"]
+    assert _inferred_statuses() == ("partially_embedded", "partially_embedded")
+
+
 def test_a_run_changes_no_table_but_the_target_writer_table(
     adapter: _Adapter,
 ) -> None:

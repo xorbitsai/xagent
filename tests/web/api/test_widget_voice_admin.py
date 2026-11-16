@@ -23,7 +23,7 @@ from xagent.web.models.user import User
 from xagent.web.schemas import v1 as v1_schemas
 from xagent.web.services import agent_management
 from xagent.web.services.agent_store import _AGENT_UPDATE_FIELDS
-from xagent.web.services.widget_voice import WidgetVoiceResolution
+from xagent.web.services.widget_voice import WidgetVoiceAvailability
 
 from .conftest import (
     _admin_headers,
@@ -32,6 +32,7 @@ from .conftest import (
     _register_second_user,
     client,
 )
+from .test_widget_voice_asr import asr_model  # noqa: F401
 from .test_widget_voice_tts import voice  # noqa: F401
 from .test_workforce_widget import _create_workforce, _enable_widget
 
@@ -245,7 +246,7 @@ def test_admin_put_leaves_the_switch_when_model_resolution_fails(monkeypatch) ->
     async def broken(_owner_user_id, *, request_db):
         raise OperationalError("SELECT", {}, Exception("down"))
 
-    monkeypatch.setattr(admin_widget_voice, "resolve_widget_voice_models", broken)
+    monkeypatch.setattr(admin_widget_voice, "resolve_widget_voice_availability", broken)
     for path, read in (
         (f"/api/admin/widget-voice/agents/{agent_id}", lambda: _agent_switch(agent_id)),
         (
@@ -273,7 +274,9 @@ def _switch(entity: str, target_id: int) -> bool:
 
 
 @pytest.mark.parametrize("entity", ["agent", "workforce"])
-def test_admin_routes_answer_on_a_one_slot_pool(entity, voice, monkeypatch) -> None:
+def test_admin_routes_answer_on_a_one_slot_pool(
+    entity, voice, asr_model, monkeypatch
+) -> None:
     path, target_id = _make_target(entity, voice)
     _install_one_slot_queue_pool(monkeypatch)
     before = _switch(entity, target_id)
@@ -311,10 +314,10 @@ def test_admin_put_writes_nothing_when_the_target_disappears(
             db.commit()
         finally:
             db.close()
-        return WidgetVoiceResolution(None, "voice_models_not_configured")
+        return WidgetVoiceAvailability(False, "voice_models_not_configured")
 
     monkeypatch.setattr(
-        admin_widget_voice, "resolve_widget_voice_models", delete_target
+        admin_widget_voice, "resolve_widget_voice_availability", delete_target
     )
     response = client.put(path, headers=voice.admin, json={"enabled": True})
     assert response.status_code == 404, response.text
@@ -344,3 +347,20 @@ async def test_admin_target_refuses_a_request_session_with_uncommitted_work() ->
     finally:
         db.rollback()
         db.close()
+
+
+@pytest.mark.parametrize(
+    "unset", ["XAGENT_WIDGET_VOICE_ASR_MODEL", "XAGENT_WIDGET_VOICE_TTS_MODEL"]
+)
+@pytest.mark.parametrize("entity", ["agent", "workforce"])
+def test_admin_reports_voice_unavailable_when_either_model_is_unset(
+    entity, unset, voice, asr_model, monkeypatch
+) -> None:
+    path, _ = _make_target(entity, voice)
+    monkeypatch.delenv(unset)
+
+    response = client.get(path, headers=voice.admin)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["available"] is False
+    assert response.json()["reason"] == "voice_models_not_configured"

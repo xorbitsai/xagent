@@ -544,7 +544,7 @@ async def test_resolution_returns_the_request_connection_first(voice, monkeypatc
         result = await widget_voice.resolve_widget_voice_models(
             voice.owner_id, request_db=db
         )
-        assert result.reason is None and result.models is not None
+        assert result is not None
         assert db.in_transaction() is False
         assert checked_out == [0]
     finally:

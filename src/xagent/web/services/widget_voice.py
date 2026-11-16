@@ -5,7 +5,8 @@ model and a synthesis model by ``model_id``; they are resolved for the
 entity's owner with the same visibility rules as the owner's own speech
 requests, so a model an administrator shared and later unshared or disabled
 makes widget voice unavailable rather than reachable. A request resolves, and
-asks the provider about, only the model it runs on.
+asks the provider about, only the model it runs on; whether widget voice is
+offered at all needs both.
 """
 
 from __future__ import annotations
@@ -63,19 +64,19 @@ class WidgetVoiceModels:
 
 
 @dataclass(frozen=True)
-class WidgetVoiceResolution:
-    """Either the models (``reason`` None) or why widget voice is unavailable."""
-
-    models: WidgetVoiceModels | None
-    reason: str | None = None
-
-
-@dataclass(frozen=True)
 class WidgetTranscriptionModel:
     """The resolved transcription configuration for one owner."""
 
     asr: SimpleNamespace
     vad_silence_threshold_secs: float | None
+
+
+@dataclass(frozen=True)
+class WidgetVoiceAvailability:
+    """Whether widget voice is offered (both models usable), and if not, why."""
+
+    available: bool
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -215,18 +216,17 @@ async def _resolve(
 
 async def resolve_widget_voice_models(
     owner_user_id: int, *, request_db: Session | None
-) -> WidgetVoiceResolution:
-    """Resolve the deployment's synthesis model as visible to ``owner_user_id``.
+) -> WidgetVoiceModels | None:
+    """Resolve the deployment's synthesis model as visible to ``owner_user_id``,
+    or ``None`` when it is unavailable.
 
     Only the synthesis model is looked up and asked about; see
-    :func:`_resolve` for the connection handling and the failure reasons.
+    :func:`_resolve` for the connection handling and the failure cases.
     """
     read = await _resolve(owner_user_id, request_db, ("tts",))
     if isinstance(read, str):
-        return WidgetVoiceResolution(None, read)
-    return WidgetVoiceResolution(
-        WidgetVoiceModels(tts=read.configs["tts"], voice=read.voice)
-    )
+        return None
+    return WidgetVoiceModels(tts=read.configs["tts"], voice=read.voice)
 
 
 async def resolve_widget_transcription_model(
@@ -249,3 +249,19 @@ async def resolve_widget_transcription_model(
             _ELEVENLABS_VAD_SILENCE_SECS if provider == "elevenlabs" else None
         ),
     )
+
+
+async def resolve_widget_voice_availability(
+    owner_user_id: int, *, request_db: Session | None
+) -> WidgetVoiceAvailability:
+    """Whether widget voice is offered for ``owner_user_id``: both the
+    transcription and the synthesis model resolve.
+
+    Each model is asked about once, and the second is not asked about when the
+    first already failed. See :func:`_resolve` for the connection handling and
+    the failure reasons.
+    """
+    read = await _resolve(owner_user_id, request_db, ("asr", "tts"))
+    if isinstance(read, str):
+        return WidgetVoiceAvailability(False, read)
+    return WidgetVoiceAvailability(True)

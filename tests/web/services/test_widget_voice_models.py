@@ -113,14 +113,12 @@ async def test_resolve_widget_voice_models(api, monkeypatch, caplog, case):
 
     assert SECRET not in caplog.text
     if case == "available":
-        assert result.reason is None and result.models is not None
-        assert result.models.tts.model_id == "voice"
-        assert result.models.voice == "deployment-voice"
+        assert result is not None
+        assert result.tts.model_id == "voice"
+        assert result.voice == "deployment-voice"
         assert tts.close_count == 1
-    elif case == "tts_unset":
-        assert (result.models, result.reason) == (None, "voice_models_not_configured")
     else:
-        assert (result.models, result.reason) == (None, "voice_models_unavailable")
+        assert result is None
     if case == "tts_not_streaming":
         assert tts.close_count == 1
     elif case == "tts_check_raises":
@@ -164,19 +162,13 @@ async def test_a_provider_that_never_answers_makes_voice_unavailable(
         (hung, _Discovered(True)) if ability == "asr" else (_Discovered(True), hung)
     )
     _install_probes(monkeypatch, asr, tts)
-    if ability == "asr":
-        result = await asyncio.wait_for(
-            widget_voice.resolve_widget_transcription_model(1, request_db=None), 5
-        )
-        assert result is None
-    else:
-        resolution = await asyncio.wait_for(
-            widget_voice.resolve_widget_voice_models(1, request_db=None), 5
-        )
-        assert (resolution.models, resolution.reason) == (
-            None,
-            "voice_models_unavailable",
-        )
+
+    availability = await asyncio.wait_for(
+        widget_voice.resolve_widget_voice_availability(1, request_db=None), 5
+    )
+
+    assert availability.available is False
+    assert availability.reason == widget_voice.VOICE_MODELS_UNAVAILABLE
     assert hung.asked.is_set() and hung.close_count == 1
     assert "capability check failed: TimeoutError" in caplog.text
 
@@ -203,10 +195,10 @@ async def test_xinference_models_stream_only_after_discovery(api, monkeypatch, s
     result = await widget_voice.resolve_widget_voice_models(1, request_db=None)
 
     if streams:
-        assert result.reason is None and result.models is not None
+        assert result is not None
         assert len(tts_asked) == 1
     else:
-        assert (result.models, result.reason) == (None, "voice_models_unavailable")
+        assert result is None
         assert len(tts_asked) == 1
 
 
@@ -234,8 +226,8 @@ async def test_each_resolution_asks_only_about_the_model_it_runs_on(api, monkeyp
     assert (asr.close_count, tts.close_count) == (1, 0)
 
     synthesis = await widget_voice.resolve_widget_voice_models(1, request_db=None)
-    assert synthesis.models is not None
-    assert synthesis.models.tts.model_id == "voice"
+    assert synthesis is not None
+    assert synthesis.tts.model_id == "voice"
     assert (asr_factory.call_count, tts_factory.call_count) == (1, 1)
     assert (asr.close_count, tts.close_count) == (1, 1)
 
@@ -259,7 +251,7 @@ async def test_a_model_that_is_not_used_cannot_make_a_resolution_unavailable(
     _install_probes(monkeypatch, broken, tts)
     monkeypatch.delenv("XAGENT_WIDGET_VOICE_ASR_MODEL")
     synthesis = await widget_voice.resolve_widget_voice_models(1, request_db=None)
-    assert synthesis.models is not None
+    assert synthesis is not None
     assert not broken.asked.is_set()
 
 
@@ -292,24 +284,68 @@ async def test_transcription_model_unavailable(api, monkeypatch, caplog, case):
     assert not tts.asked.is_set()
 
 
+AVAILABILITY_CASES = [
+    "available",
+    "asr_unset",
+    "tts_unset",
+    "asr_not_streaming",
+    "tts_not_streaming",
+]
+
+
+@pytest.mark.parametrize("case", AVAILABILITY_CASES)
+async def test_availability_needs_both_models_and_asks_each_once(
+    api, monkeypatch, case
+):
+    asr, tts = _Discovered(True), _Discovered(True)
+    asr_factory, tts_factory = _install_probes(monkeypatch, asr, tts)
+    if case == "asr_unset":
+        monkeypatch.delenv("XAGENT_WIDGET_VOICE_ASR_MODEL")
+    elif case == "tts_unset":
+        monkeypatch.delenv("XAGENT_WIDGET_VOICE_TTS_MODEL")
+    elif case == "asr_not_streaming":
+        asr.answer = False
+    elif case == "tts_not_streaming":
+        tts.answer = False
+
+    result = await widget_voice.resolve_widget_voice_availability(1, request_db=None)
+
+    if case == "available":
+        assert (result.available, result.reason) == (True, None)
+    elif case.endswith("_unset"):
+        assert (result.available, result.reason) == (
+            False,
+            "voice_models_not_configured",
+        )
+    else:
+        assert (result.available, result.reason) == (
+            False,
+            "voice_models_unavailable",
+        )
+    # A model is asked about at most once, and its probe instance is closed;
+    # the synthesis model is not asked about once the transcription one failed.
+    asked = {
+        "available": (1, 1),
+        "asr_unset": (0, 0),
+        "tts_unset": (0, 0),
+        "asr_not_streaming": (1, 0),
+        "tts_not_streaming": (1, 1),
+    }[case]
+    assert (asr_factory.call_count, tts_factory.call_count) == asked
+    assert (asr.close_count, tts.close_count) == asked
+
+
 @pytest.mark.parametrize("raw", ["", "  "])
 @pytest.mark.parametrize(
     "setting", ["XAGENT_WIDGET_VOICE_ASR_MODEL", "XAGENT_WIDGET_VOICE_TTS_MODEL"]
 )
-async def test_blank_model_setting_is_not_configured(api, monkeypatch, setting, raw):
+async def test_blank_model_setting_is_not_configured(monkeypatch, setting, raw):
     # A deployment that leaves the variable empty passes an empty string.
-    asr, tts = _Discovered(True), _Discovered(True)
-    asr_factory, tts_factory = _install_probes(monkeypatch, asr, tts)
+    monkeypatch.setenv("XAGENT_WIDGET_VOICE_ASR_MODEL", "live")
+    monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MODEL", "voice")
     monkeypatch.setenv(setting, raw)
-    if setting.endswith("ASR_MODEL"):
-        assert (
-            await widget_voice.resolve_widget_transcription_model(1, request_db=None)
-            is None
-        )
-    else:
-        resolution = await widget_voice.resolve_widget_voice_models(1, request_db=None)
-        assert (resolution.models, resolution.reason) == (
-            None,
-            "voice_models_not_configured",
-        )
-    assert (asr_factory.call_count, tts_factory.call_count) == (0, 0)
+    availability = await widget_voice.resolve_widget_voice_availability(
+        1, request_db=None
+    )
+    assert availability.available is False
+    assert availability.reason == widget_voice.VOICE_MODELS_NOT_CONFIGURED

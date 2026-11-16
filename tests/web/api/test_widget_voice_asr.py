@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -771,6 +772,40 @@ def test_widget_voice_error_frames_are_fixed_text(asr, monkeypatch, failure):
     assert SECRET not in text and "owner-plan" not in text
 
 
+# ----- the voice flag on POST /api/widget/auth -----
+
+
+def _auth(asr, widget_key: str | None = None) -> dict[str, Any]:
+    if widget_key is None:
+        db = _direct_db_session()
+        try:
+            widget_key = str(db.get(Agent, asr.voice.agent_id).widget_key)
+        finally:
+            db.close()
+    response = client.post(
+        "/api/widget/auth", json={"guest_id": "g", "widget_key": widget_key}
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize(
+    "state", ["on", "switch_off", "asr_unavailable", "tts_unavailable"]
+)
+def test_widget_auth_voice_flag(asr, monkeypatch, state):
+    if state == "switch_off":
+        _switch_off_agent(asr)
+    elif state == "asr_unavailable":
+        monkeypatch.delenv("XAGENT_WIDGET_VOICE_ASR_MODEL")
+    elif state == "tts_unavailable":
+        monkeypatch.delenv("XAGENT_WIDGET_VOICE_TTS_MODEL")
+    resolve = AsyncMock(wraps=widget_api.resolve_widget_voice_availability)
+    monkeypatch.setattr(widget_api, "resolve_widget_voice_availability", resolve)
+    assert _auth(asr)["voice_enabled"] is (state == "on")
+    # The switch is read first; models are resolved only when it is on.
+    assert resolve.call_count == (0 if state == "switch_off" else 1)
+
+
 def test_widget_voice_recheck_runs_on_a_one_slot_pool(asr, monkeypatch):
     monkeypatch.setattr(widget_api, "_WIDGET_VOICE_RECHECK_SECONDS", 0.01)
     _install_one_slot_queue_pool(monkeypatch)
@@ -804,3 +839,114 @@ def test_widget_voice_without_a_source_address_is_unavailable(asr, monkeypatch):
     asr.resolve.assert_not_called()
     asr.reserve.assert_not_called()
     assert widget_voice_budget._memory_store._counts == {}
+
+
+def test_widget_auth_with_a_hung_provider_returns_voice_off(asr, monkeypatch):
+    class HungASR(FakeASR):
+        async def get_streaming_capabilities(self):
+            await asyncio.Event().wait()
+
+    hung = HungASR()
+    asr.probe_factory.return_value = hung
+    monkeypatch.setattr(widget_voice, "_CAPABILITY_CHECK_TIMEOUT_SECONDS", 0.05)
+    assert _auth(asr)["voice_enabled"] is False
+    assert asr.probe_factory.call_count == 1
+
+
+def test_widget_auth_voice_flag_for_a_workforce(asr):
+    workforce_id = _create_workforce("Voice flag workforce")
+    key = _enable_widget(workforce_id)
+    assert _auth(asr, key)["voice_enabled"] is False
+    _set_switch(Deployment, workforce_id)
+    assert _auth(asr, key)["voice_enabled"] is True
+
+
+@pytest.mark.parametrize("entity", ["agent", "workforce"])
+def test_widget_auth_with_voice_on_succeeds_on_a_one_slot_pool(
+    asr, monkeypatch, entity
+):
+    if entity == "workforce":
+        workforce_id = _create_workforce("Voice pool workforce")
+        key = _enable_widget(workforce_id)
+        _set_switch(Deployment, workforce_id)
+    else:
+        db = _direct_db_session()
+        try:
+            key = str(db.get(Agent, asr.voice.agent_id).widget_key)
+        finally:
+            db.close()
+    _install_one_slot_queue_pool(monkeypatch)
+    assert _auth(asr, key)["voice_enabled"] is True
+
+
+@pytest.mark.parametrize("entity", ["agent", "workforce"])
+def test_share_auth_never_advertises_voice(asr, entity):
+    if entity == "agent":
+        response = client.post(
+            f"/api/agents/{asr.voice.agent_id}/share-link", headers=asr.voice.admin
+        )
+        assert response.status_code == 200, response.text
+        share_token = response.json()["share_token"]
+    else:
+        workforce_id = _create_workforce("Voice share workforce")
+        response = client.post(
+            f"/api/workforces/{workforce_id}/share-link", headers=asr.voice.admin
+        )
+        assert response.status_code == 200, response.text
+        share_token = response.json()["share_token"]
+        _set_switch(Deployment, workforce_id)
+    response = client.post("/api/share/auth", json={"share_token": share_token})
+    assert response.status_code == 200, response.text
+    assert response.json()["voice_enabled"] is False
+
+
+@pytest.mark.parametrize("failure", ["switch", "models"])
+def test_widget_auth_voice_flag_read_failure_is_service_error(
+    asr, monkeypatch, failure
+):
+    if failure == "switch":
+        monkeypatch.setattr(
+            widget_api,
+            "_widget_voice_enabled",
+            Mock(side_effect=RuntimeError("database down")),
+        )
+    else:
+        monkeypatch.setattr(
+            widget_voice,
+            "_resolve",
+            AsyncMock(side_effect=RuntimeError("database down")),
+        )
+    db = _direct_db_session()
+    try:
+        key = str(db.get(Agent, asr.voice.agent_id).widget_key)
+    finally:
+        db.close()
+    response = client.post(
+        "/api/widget/auth", json={"guest_id": "g", "widget_key": key}
+    )
+    assert response.status_code == 500
+
+
+def test_widget_auth_asks_each_provider_once_per_login(asr, monkeypatch):
+    """A provider that answers the streaming question over the network is
+    asked once per model for one login, not once per use of the answer."""
+    probes = {"asr": 0, "tts": 0}
+
+    class Probed:
+        def __init__(self, ability: str) -> None:
+            self.ability = ability
+
+        async def get_streaming_capabilities(self) -> dict[str, bool]:
+            probes[self.ability] += 1
+            return {"streaming": True}
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(widget_voice, "get_asr_model_instance", lambda c: Probed("asr"))
+    monkeypatch.setattr(widget_voice, "get_tts_model_instance", lambda c: Probed("tts"))
+
+    assert _auth(asr)["voice_enabled"] is True
+    assert probes == {"asr": 1, "tts": 1}
+    assert _auth(asr)["voice_enabled"] is True
+    assert probes == {"asr": 2, "tts": 2}

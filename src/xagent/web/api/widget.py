@@ -56,6 +56,7 @@ from ..services.widget_domains import (
 )
 from ..services.widget_voice import (
     resolve_widget_transcription_model,
+    resolve_widget_voice_availability,
     resolve_widget_voice_models,
 )
 from .auth import create_access_token
@@ -531,13 +532,17 @@ async def authenticate_widget(
                 "widget_key": owner.widget_key,
             }
         )
-        return WidgetAuthResponse(
+        response = WidgetAuthResponse(
             access_token=access_token,
             workforce_id=int(workforce.id),
             agent_name=workforce.name,
             agent_description=workforce.description,
             suggested_prompts=[],
         )
+        response.voice_enabled = await _widget_voice_offered(
+            db, int(user.id), agent_id=None, workforce_id=int(workforce.id)
+        )
+        return response
 
     agent = owner.agent
     assert agent is not None
@@ -561,7 +566,7 @@ async def authenticate_widget(
         }
     )
 
-    return WidgetAuthResponse(
+    response = WidgetAuthResponse(
         access_token=access_token,
         agent_id=int(agent.id),
         agent_name=agent.name,
@@ -569,6 +574,10 @@ async def authenticate_widget(
         agent_description=agent.description,
         suggested_prompts=agent.suggested_prompts or [],
     )
+    response.voice_enabled = await _widget_voice_offered(
+        db, int(user.id), agent_id=int(agent.id), workforce_id=None
+    )
+    return response
 
 
 get_current_widget_user_dep = build_public_chat_dependency("widget")
@@ -675,6 +684,21 @@ def _widget_voice_enabled(
     return bool(enabled)
 
 
+async def _widget_voice_offered(
+    db: Session, owner_user_id: int, *, agent_id: int | None, workforce_id: int | None
+) -> bool:
+    """Whether a widget guest is told voice is available: the entity's voice
+    switch is on, and only then, the deployment's voice models resolve for
+    the owner. A read failure is raised, never reported as unavailable; the
+    voice routes check the switch and the models again themselves. A provider
+    that does not answer reports voice as unavailable.
+    """
+    if not _widget_voice_enabled(db, agent_id=agent_id, workforce_id=workforce_id):
+        return False
+    availability = await resolve_widget_voice_availability(owner_user_id, request_db=db)
+    return availability.available
+
+
 class WidgetVoiceTTSRequest(BaseModel):
     """Text a widget guest wants spoken; the model and voice are the server's."""
 
@@ -750,8 +774,7 @@ async def widget_voice_tts(
         raise guest_refusal(429, "rate_limited")
     if visitor_key is None:
         raise guest_refusal(503, "voice_unavailable")
-    resolution = await resolve_widget_voice_models(owner_user_id, request_db=db)
-    models = resolution.models
+    models = await resolve_widget_voice_models(owner_user_id, request_db=db)
     if models is None:
         raise guest_refusal(503, "voice_unavailable")
     return await tts_stream_response(

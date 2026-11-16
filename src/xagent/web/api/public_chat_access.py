@@ -108,6 +108,10 @@ class PublicChatAuthResponse(BaseModel):
     suggested_prompts: list[str] = []
     # Set instead of ``agent_id`` when the share token exposes a workforce.
     workforce_id: int | None = None
+    # Whether widget voice can be offered to this guest. Only a widget guest
+    # whose entity has the voice switch on and whose deployment's voice models
+    # resolve for the owner sees True; share links never do.
+    voice_enabled: bool = False
 
 
 @dataclass(frozen=True)

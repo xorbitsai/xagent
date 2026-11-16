@@ -2,8 +2,9 @@
 
 This is the only writer of ``agents.widget_voice_enabled`` and
 ``deployments.widget_voice_enabled``: owners cannot turn widget voice on for
-their own widgets. ``available`` reports whether the deployment's voice
-models resolve for the entity's owner, so a switch that is on but has no
+their own widgets. ``available`` reports whether both of the deployment's voice
+models (speech recognition and speech synthesis) are usable for the entity's
+owner, so a switch that is on but has no
 effect can be explained.
 """
 
@@ -25,9 +26,9 @@ from ..models.workforce import Workforce
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.widget_voice import (
-    WidgetVoiceResolution,
+    WidgetVoiceAvailability,
     release_request_connection,
-    resolve_widget_voice_models,
+    resolve_widget_voice_availability,
 )
 from .admin_memory_embedding_authority import require_admin
 
@@ -47,12 +48,12 @@ class WidgetVoiceSwitchResponse(BaseModel):
 
 
 def _response(
-    enabled: bool, resolution: WidgetVoiceResolution
+    enabled: bool, availability: WidgetVoiceAvailability
 ) -> WidgetVoiceSwitchResponse:
     return WidgetVoiceSwitchResponse(
         enabled=enabled,
-        available=resolution.models is not None,
-        reason=resolution.reason,
+        available=availability.available,
+        reason=availability.reason,
     )
 
 
@@ -128,8 +129,10 @@ async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
 
 async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
-    resolution = await resolve_widget_voice_models(target.owner_user_id, request_db=db)
-    return _response(target.enabled, resolution)
+    availability = await resolve_widget_voice_availability(
+        target.owner_user_id, request_db=db
+    )
+    return _response(target.enabled, availability)
 
 
 async def _put(
@@ -139,14 +142,16 @@ async def _put(
     enabled: bool,
 ) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
-    # Resolve before writing: a resolution that raises leaves the switch as it was.
-    resolution = await resolve_widget_voice_models(target.owner_user_id, request_db=db)
+    # Resolve before writing: a lookup that raises leaves the switch as it was.
+    availability = await resolve_widget_voice_availability(
+        target.owner_user_id, request_db=db
+    )
     # The row is read again: it may have been deleted meanwhile (404). A new
     # owner does not matter to the write: the switch belongs to the row, not to
     # its owner. ``available`` in the response describes the owner read before
-    # the resolution.
+    # the lookup.
     await run_db_io_cancellation_safe(write)
-    return _response(enabled, resolution)
+    return _response(enabled, availability)
 
 
 @router.get("/agents/{agent_id}", response_model=WidgetVoiceSwitchResponse)

@@ -52,7 +52,7 @@ type PublicAuthResult = {
 // A voice call is offered only to an embedded widget whose server said so,
 // and only where the page can use the microphone: as a top-level page, or in
 // an iframe the host page opted into voice for (widget.js then adds voice=1).
-export function widgetVoiceCallOffered(authMode: "widget" | "share", voiceEnabled: boolean | null | undefined): boolean {
+function widgetVoiceCallOffered(authMode: "widget" | "share", voiceEnabled: boolean | null | undefined): boolean {
   if (authMode !== "widget" || voiceEnabled !== true) return false
   let topLevel = false
   try { topLevel = window.self === window.top } catch { topLevel = false }

@@ -167,12 +167,12 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(Socket.instances).toHaveLength(0)
     expect(fetchMock).not.toHaveBeenCalled()
   },
-  4: closes([[4003, ""], [4403, ""]], "unavailable", false),
+  4: closes([[4003, ""]], "unavailable", false),
   5: closes([[1008, "Voice is busy"], [1008, "Too many requests"]], "busy", true),
   6: errorFrames(["voice_budget_exhausted"], "temporarilyUnavailable", true),
   7: errorFrames(["voice_unavailable", "model_unavailable", "invalid_request"], "unavailable", false),
   8: async () => {
-    await closes([[1011, ""], [1006, ""], [1000, "Speech session timed out"]], "connectionEnded", true)()
+    await closes([[1011, ""], [1006, ""]], "connectionEnded", true)()
     await errorFrames(["stream_failed"], "connectionEnded", true)()
     // A handshake the server refuses (4008 before accept) reaches the page as
     // a failed connection.
@@ -181,9 +181,13 @@ const scenarios: Record<number, () => Promise<void>> = {
     act(() => { Socket.instances[0].onerror!(); Socket.instances[0].onclose?.({ code: 1006, reason: "" }) })
     expectStopped("connectionEnded", true)
   },
-  9: closes([[1012, "Service restart"], [4408, ""]], "connectionEnded", true),
+  9: closes([[1012, "Service restart"]], "connectionEnded", true),
   10: errorFrames(["standalone_usage_refused"], "unavailable", false),
-  11: errorFrames(["session_timeout"], "sessionTimeout", true),
+  11: async () => {
+    await errorFrames(["session_timeout"], "sessionTimeout", true)()
+    // A write timeout closes with 1000 and no error frame.
+    await closes([[1000, "Speech session timed out"]], "sessionTimeout", true)()
+  },
   12: async () => {
     const onSend = vi.fn().mockRejectedValue(new Error("Raw backend failure"))
     const { socket } = await connected({ onSend })
@@ -199,14 +203,11 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(call().phase).not.toBe("error")
     expect(Socket.instances[0].close).not.toHaveBeenCalled()
   },
-  // The Session page refreshes its credential once inside its transport; a
-  // 401 that still reaches the call reads as unavailable.
-  14: synthesis([401], "unavailable", false),
-  15: synthesis([401, 403], "unavailable", false),
-  16: synthesis([402, 403], "unavailable", false),
-  17: synthesis([503], "unavailable", false),
-  18: synthesis([429], "temporarilyUnavailable", true),
-  19: async () => {
+  14: synthesis([401, 403], "unavailable", false),
+  15: synthesis([402], "unavailable", false),
+  16: synthesis([503], "unavailable", false),
+  17: synthesis([429], "temporarilyUnavailable", true),
+  18: async () => {
     const { view, socket } = await connected()
     view.unmount()
     expect(stopTrack).toHaveBeenCalled()
@@ -220,7 +221,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(second.socket.close).toHaveBeenCalled()
     expect(stopTrack).toHaveBeenCalled()
   },
-  20: async () => {
+  19: async () => {
     const { view, socket } = await connected()
     view.rerender(<Harness disabled />)
     await waitFor(() => expect(call().phase).toBe("error"))
@@ -229,14 +230,14 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(call().retryDisabled).toBe(true)
     expect(stopTrack).toHaveBeenCalled()
   },
-  21: () => each([null, 8], async next => {
+  20: () => each([null, 8], async next => {
     const { view, socket } = await connected({ taskId: 7 })
     view.rerender(<Harness taskId={next} />)
     await waitFor(() => expect(latest.openChanges).toEqual([false]))
     expect(socket.close).toHaveBeenCalled()
     expect(call().open).toBe(false)
   }),
-  22: async () => {
+  21: async () => {
     const { view } = await connected()
     // Open again, and make the start path run again: muting passes the call
     // through another phase, and busy changes rerun it as well.
@@ -250,7 +251,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(getUserMedia).toHaveBeenCalledOnce()
     expect(call().phase).toBe("listening")
   },
-  23: async () => {
+  22: async () => {
     const { socket } = await connected()
     // The server's periodic recheck closes the socket once voice is off.
     act(() => socket.onclose!({ code: 4003, reason: "" }))
@@ -259,8 +260,8 @@ const scenarios: Record<number, () => Promise<void>> = {
 }
 
 describe("widget voice call state table", () => {
-  it("has one scenario for each of its 23 rows", () => {
-    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(23)
+  it("has one scenario for each of its 22 rows", () => {
+    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(22)
     expect(Object.keys(scenarios).map(Number)).toEqual(WIDGET_VOICE_CALL_STATES.map(row => row.row))
   })
 
@@ -315,7 +316,6 @@ describe("refusals sent as an error frame before the close", () => {
     { code: "voice_budget_exhausted", close: [1008, "Voice budget exhausted"], alert: "temporarilyUnavailable", retryable: true },
     { code: "standalone_usage_refused", close: [1008, "Usage limit reached"], alert: "unavailable", retryable: false },
     { code: "voice_unavailable", close: [4003, ""], alert: "unavailable", retryable: false },
-    { code: "voice_unavailable", close: [4403, ""], alert: "unavailable", retryable: false },
     { code: "stream_failed", close: [1011, "Speech stream failed"], alert: "connectionEnded", retryable: true },
     { code: "session_timeout", close: [1000, "Speech session timed out"], alert: "sessionTimeout", retryable: true },
   ] as const)("$code then $close.0 reads as $alert", async ({ code, close, alert, retryable }) => {

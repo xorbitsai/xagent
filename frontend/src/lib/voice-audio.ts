@@ -349,11 +349,11 @@ export class VoiceAudio {
   }
 }
 
-/** The fixed code in a refused response body (`code`, or a string `detail`). */
+/** The fixed code in a refused response body: `{"detail": {"code", "message"}}`. */
 async function refusalCode(response: Response): Promise<string | undefined> {
   try {
     const body = await response.json()
-    const code = body?.code ?? body?.detail?.code ?? body?.detail
+    const code = body?.detail?.code
     return typeof code === "string" ? code : undefined
   } catch { return undefined }
 }

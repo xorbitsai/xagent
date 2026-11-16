@@ -401,8 +401,8 @@ describe("injected speech transport", () => {
   })
 
   it.each([
-    { status: 429, body: { detail: "voice_budget_exhausted" }, code: "voice_budget_exhausted", outcome: { code: "voice_retry_later" } },
-    { status: 502, body: { detail: "Speech synthesis failed" }, code: "Speech synthesis failed", outcome: new Error("Speech synthesis failed") },
+    { status: 429, body: { detail: { code: "voice_budget_exhausted", message: "fixed" } }, code: "voice_budget_exhausted", outcome: { code: "voice_retry_later" } },
+    { status: 502, body: { detail: "Speech synthesis failed" }, code: undefined, outcome: new Error("Speech synthesis failed") },
     { status: 503, body: null, code: undefined, outcome: new Error("Speech synthesis failed") },
   ])("lets the transport read a refused synthesis ($status)", async ({ status, body, code, outcome }) => {
     const supplied = transport({ requestTts: vi.fn(async () => new Response(body && JSON.stringify(body), { status })) })

@@ -87,6 +87,15 @@ def _count_rows_uncached(conn: Any, table_name: str, filter_expr: str) -> int:
         _safe_close_table(table)
 
 
+def _inferred_embedding_count(per_table: Dict[str, int]) -> int:
+    """The largest ``embeddings_*`` entry of a document's row counts. A search reads
+    rows of at most one entry, so the entries are not added up."""
+    return max(
+        (count for name, count in per_table.items() if name.startswith("embeddings_")),
+        default=0,
+    )
+
+
 def _extract_user_id_from_source_path(source_path: Optional[str]) -> Optional[int]:
     """Recover an owning user ID from legacy upload paths."""
     if not source_path:
@@ -1053,11 +1062,14 @@ def _get_document_stats_impl(
     else:
         # If no status record exists, infer status from chunk and embedding counts
         if chunk_count > 0:
-            if embedding_count == 0:
+            inferred_count = (
+                embedding_count if model_tag else _inferred_embedding_count(totals)
+            )
+            if inferred_count == 0:
                 status_value = DocumentProcessingStatus.CHUNKED
-            elif embedding_count < chunk_count:
+            elif inferred_count < chunk_count:
                 status_value = DocumentProcessingStatus.PARTIALLY_EMBEDDED
-            else:  # embedding_count >= chunk_count
+            else:
                 status_value = DocumentProcessingStatus.SUCCESS
         else:
             status_value = DocumentProcessingStatus.PENDING
@@ -1185,11 +1197,12 @@ def _list_documents_impl(
             except ValueError:
                 status_value = DocumentProcessingStatus.PENDING
         elif chunk_count > 0:
-            if embedding_count == 0:
+            inferred_count = _inferred_embedding_count(per_table)
+            if inferred_count == 0:
                 status_value = DocumentProcessingStatus.CHUNKED
-            elif embedding_count < chunk_count:
+            elif inferred_count < chunk_count:
                 status_value = DocumentProcessingStatus.PARTIALLY_EMBEDDED
-            else:  # embedding_count >= chunk_count
+            else:
                 status_value = DocumentProcessingStatus.SUCCESS
         else:
             status_value = DocumentProcessingStatus.PENDING

@@ -1351,6 +1351,10 @@ class FeishuBotInstance(BatchChannelControl[str]):
             .build()
         )
 
+        # Connect point: nothing opens once finish-only mode began, whatever
+        # path got here. No await before the connect below.
+        if release_hold.finishing:
+            return
         self.ws_client = lark.ws.Client(
             self.app_id,
             self.app_secret,
@@ -1367,6 +1371,9 @@ class FeishuBotInstance(BatchChannelControl[str]):
         except Exception as e:
             logger.error(f"Feishu bot {self.instance_id} connect failed, err: {e}")
             await self.ws_client._disconnect()
+            # The reconnect is a connect point too.
+            if release_hold.finishing:
+                return
             if self.ws_client._auto_reconnect:
                 await self.ws_client._reconnect()
             else:

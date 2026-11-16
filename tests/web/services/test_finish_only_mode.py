@@ -197,6 +197,7 @@ async def test_status_reports_idle_only_when_finishing_and_nothing_is_owed(
         "responsibilities": 0,
         "socket_writes": 0,
         "prompt_dispatches": 0,
+        "tracked_workers": 0,
         "pending_replies": 0,
         "idle": True,
     }
@@ -366,3 +367,52 @@ def test_status_outside_finishing_reads_nothing(monkeypatch):
     monkeypatch.setattr(release_hold_module, "_pending_reply_count", forbidden)
     register_finishing_counter("x", forbidden)
     assert finishing_status()["active"] is False
+
+
+@pytest.mark.parametrize("kind", ["message", "resume_input", "start"])
+def test_finishing_still_claims_every_kind_of_an_owned_active_task(
+    factory, task_id, kind
+):
+    """Pinned: follow-ups of an owned active task keep flowing while finishing.
+
+    A run waiting for user input could never finish otherwise; the overlap a
+    chatty task causes is bounded by the host action's deadline.
+    """
+    from xagent.web.services.task_dispatch_cap import (
+        DispatchCapSnapshot,
+        DispatchPolicy,
+    )
+
+    now = datetime.now(timezone.utc)
+    with factory() as db, db.begin():
+        user_id = db.get(Task, task_id).user_id
+        owned = Task(
+            user_id=user_id,
+            title="owned",
+            status=TaskStatus.RUNNING,
+            runner_id=OLD,
+            lease_attempt_id="o",
+            lease_expires_at=now + timedelta(minutes=5),
+        )
+        db.add(owned)
+        db.flush()
+        row = TaskExecutionCommand(
+            task_id=owned.id, command_id=f"owned-{kind}", kind=kind, payload={}
+        )
+        db.add(row)
+        db.flush()
+        row_id, owned_id = row.id, owned.id
+    cap = DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=4, interactive_reserve=1),
+        active_ids=frozenset({owned_id}),
+        held=True,
+    )
+    release_hold._finishing = True
+    try:
+        with factory() as db:
+            claimed = transport._claimable_query(
+                db, runner_id=OLD, command_db_id=None, cap=cap
+            )
+            assert row_id in {int(r.id) for r in claimed.all()}
+    finally:
+        release_hold._finishing = False

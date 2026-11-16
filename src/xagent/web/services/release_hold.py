@@ -56,9 +56,11 @@ Constraints:
 - One process. Each interpreter has its own hold; a pooled host must collect
   every process's ``execution_status`` and treat a missing report as busy,
   never read one process as the whole pool.
-- Imports only ``xagent.config`` (itself a leaf) besides the stdlib:
-  ``task_execution`` imports this module, so it must stay a leaf to avoid
-  import cycles.
+- Imports only ``xagent.config`` (itself a leaf) at module level:
+  ``task_execution`` imports this module, so it must stay free of top-level
+  imports of the execution modules to avoid import cycles. The finish-only
+  status helpers import the database models, the event bridge and the
+  execution modules lazily inside the function that needs them.
 """
 
 from __future__ import annotations
@@ -278,7 +280,7 @@ class ReleaseHold:
             logger.info("Command attempts sealed (%s)", reason)
         self._sealed = True
 
-    def begin_finishing(self, reason: str = "finishing") -> None:
+    def begin_finishing(self) -> None:
         """Close the hold for good and restrict claims to owned tasks; idempotent.
 
         Unlike :meth:`seal` this keeps command attempts flowing: the dispatcher
@@ -288,9 +290,9 @@ class ReleaseHold:
         its run ends, so the next command of the task goes to the serving
         generation). One-way: :meth:`reopen` does not lift it.
         """
-        self.close(reason)
+        self.close("finishing")
         if not self._finishing:
-            logger.info("Finish-only mode begins (%s)", reason)
+            logger.info("Finish-only mode begins")
         self._finishing = True
 
     def reopen(self) -> None:
@@ -430,14 +432,35 @@ if get_standby_enabled():
 _finishing_counters: dict[str, Callable[[], int]] = {}
 
 
+_RESERVED_FINISHING_KEYS = frozenset(
+    {
+        "active",
+        "owned_runs",
+        "responsibilities",
+        "socket_writes",
+        "prompt_dispatches",
+        "tracked_workers",
+        "pending_replies",
+        "idle",
+    }
+)
+
+
 def register_finishing_counter(name: str, count: Callable[[], int]) -> None:
     """Add a host-owned count of unfinished work to the finishing status.
 
     The count appears under ``name`` in the ``finishing`` object and keeps
-    ``idle`` false while it is non-zero; an exception from ``count`` reads as
-    busy. Registering the same name again replaces the earlier counter. The
-    SaaS layer uses this for its channel turns and schedule runs.
+    ``idle`` false while it is non-zero. ``count`` runs synchronously on the
+    event loop, inside :func:`finishing_status` and :func:`execution_status`,
+    so it must be fast and do no I/O. It must return a non-negative ``int``;
+    an exception, or any other result (a float, a bool, a negative number),
+    reads as unreadable and so as busy. A name that is one of the built-in
+    keys is refused with ``ValueError``. Registering the same name again
+    replaces the earlier counter. The SaaS layer uses this for its channel
+    turns and schedule runs.
     """
+    if name in _RESERVED_FINISHING_KEYS:
+        raise ValueError(f"{name!r} is a built-in finishing status key")
     _finishing_counters[name] = count
 
 
@@ -445,17 +468,18 @@ _LEDGER_KINDS_NOT_COUNTED = frozenset({"command_attempt", "command_dispatch"})
 
 
 def _pending_reply_count() -> int:
-    """START commands whose reply is bound to this process's event bridge.
+    """Unsettled commands of any kind whose reply is bound to this bridge.
 
-    Replies to START commands travel to the ingress process named by
-    ``reply_host_id``; while one is unsettled this process still owes an answer
-    through its bridge, so it cannot stop. Zero without a running bridge, and
-    not counted outside finish-only mode. Runs a query: call it off the event
-    loop only (``finishing_status_async``).
+    Replies travel to the ingress process named by ``reply_host_id``; while a
+    command carrying this process's host id is unsettled this process still
+    owes an answer through its bridge, so it cannot stop. Zero without a
+    running bridge. Runs a query: call it off the event loop only, and only
+    in finish-only mode (``finishing_status_async`` returns before it
+    otherwise).
     """
     from .task_event_bridge import _bridge
 
-    if _bridge is None or not release_hold.finishing:
+    if _bridge is None:
         return 0
     from ..models.database import get_session_local
     from ..models.task_command import (
@@ -482,11 +506,12 @@ def _loop_owned_status() -> tuple[dict[str, Any], bool, int]:
     responsibilities (the dispatcher's own ``command_attempt`` and
     ``command_dispatch`` excluded: it polls twice a second by design and
     whatever it applies is counted through the lease it uses), socket writes,
-    detached prompt dispatches, and the host counters.
+    detached prompt dispatches, tracked writer threads, and the host counters.
     """
     from .task_command_transport import prompt_dispatch_count
     from .task_coordinator_runtime import live_coordinator_count
     from .task_execution import background_task_manager
+    from .writer_workers import active_workers
 
     owned_runs = sum(background_task_manager.release_counts().values()) + (
         live_coordinator_count()
@@ -501,12 +526,19 @@ def _loop_owned_status() -> tuple[dict[str, Any], bool, int]:
         "responsibilities": responsibilities,
         "socket_writes": release_hold.socket_write_count,
         "prompt_dispatches": prompt_dispatch_count(),
+        # Threads of ``run_tracked`` and friends, including ones left running
+        # by loops that were cancelled: a started thread can still commit.
+        "tracked_workers": active_workers(),
     }
     readable = True
     total = sum(fields.values())
     for name, count in list(_finishing_counters.items()):
+        value: int | None
         try:
-            value: int | None = int(count())
+            raw = count()
+            if type(raw) is not int or raw < 0:
+                raise ValueError(f"counter returned {raw!r}, not a count")
+            value = raw
         except Exception:  # noqa: BLE001
             logger.warning("Finishing counter %s failed", name, exc_info=True)
             value = None
@@ -562,16 +594,16 @@ async def finishing_status_async() -> dict[str, Any]:
         pending_replies = None
         readable = False
     # The probe awaited: re-read the loop-owned counts so work admitted while
-    # it ran is never missed (a count only grows here through admissions that
-    # were already past the fence).
+    # it ran is never missed. Counts can grow here: the fence stops new
+    # execution, not socket writes (a steering command still enqueues) or
+    # threads already started.
     fields_after, readable_after, total_after = _loop_owned_status()
     return {
         "active": True,
         **fields_after,
         "pending_replies": pending_replies,
         "idle": bool(
-            release_hold.finishing
-            and readable
+            readable
             and readable_after
             and total == 0
             and total_after == 0
@@ -595,6 +627,10 @@ def execution_status() -> dict[str, Any]:
     ``sealed`` and ``unsettled_total`` (with the bounded ``unsettled`` list)
     are reported beside ``busy`` and never change it; a pooled host blocks on
     ``unsettled_total > 0`` itself.
+
+    ``finishing`` is the finish-only status (:func:`finishing_status`): a
+    constant ``{"active": False, ...}`` outside finish-only mode, and
+    loop-owned counts without ``idle`` inside it; it never changes ``busy``.
     """
     from .task_command_transport import prompt_dispatch_count
     from .task_coordinator_runtime import live_coordinator_count

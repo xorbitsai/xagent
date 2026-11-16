@@ -3119,6 +3119,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
             self._menu_generation = uuid4().hex[:12]
             # Shared ordinary inputs resolve receipts after restart. Old controls
             # are filtered independently; callbacks carry a startup generation.
+            # Connect point: nothing opens once finish-only mode began.
+            if release_hold.finishing:
+                return
             await self.bot.delete_webhook(
                 drop_pending_updates=not get_shared_task_execution_enabled()
             )
@@ -3136,6 +3139,9 @@ class TelegramBotInstance(BatchChannelControl[int]):
                 return
             # Get bot info manually just for logging (optional, since dp.start_polling also logs)
             # We remove the duplicate log to avoid confusion
+            # Connect point again: the awaits above can span the fence.
+            if release_hold.finishing:
+                return
             await self.dp.start_polling(self.bot, handle_signals=False)
         except Exception as e:
             logger.error(

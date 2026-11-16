@@ -2022,19 +2022,25 @@ class DockerSandboxService(SandboxService):
         containers are deliberately invisible, so callers such as capacity
         accounting, idle sweep, and quiesce act only on this owner domain.
         """
-        containers = await asyncio.to_thread(
-            lambda: self._client.containers.list(
+
+        def _list() -> list[SandboxInfo]:
+            # One thread for the daemon call and the per-container store read:
+            # the read is a blocking database query, and doing it per container
+            # on the event loop stalled every request while a standby activated
+            # beside other processes on one daemon. Each store call opens its
+            # own session, so running them here is safe.
+            containers = self._client.containers.list(
                 all=True,
                 filters={"label": _ownership_label_filters(self._namespace)},
             )
-        )
-        result: list[SandboxInfo] = []
-        for container in containers:
-            runtime_info = _parse_container_config(container)
-            stored_info = self._store.get_info(runtime_info.name)
-            info = _merge_info(runtime_info, stored_info)
-            result.append(info)
-        return result
+            result: list[SandboxInfo] = []
+            for container in containers:
+                runtime_info = _parse_container_config(container)
+                stored_info = self._store.get_info(runtime_info.name)
+                result.append(_merge_info(runtime_info, stored_info))
+            return result
+
+        return await asyncio.to_thread(_list)
 
     def count_legacy_containers(self) -> tuple[int, int]:
         """Count running and inactive legacy managed containers.

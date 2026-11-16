@@ -2609,48 +2609,54 @@ class SandboxManager:
         method's. This intentionally replaces the legacy config-diff
         delete-guessing for this backend (see ``_legacy_cleanup``).
         """
-        quiesce_started = time.monotonic()
-        list_failed = False
         try:
-            sandboxes = await self._service.list_sandboxes()
-        except Exception as exc:
-            logger.error(f"Failed to list sandboxes for quiesce: {exc}")
-            sandboxes = []
-            list_failed = True
-
-        seen = len(sandboxes or [])
-        running = 0
-        stopped = 0
-        failed = 0
-        stop_seconds = 0.0
-        for sb in sandboxes or []:
+            quiesce_started = time.monotonic()
+            list_failed = False
             try:
-                lifecycle_type, _ = self.parse_sandbox_name(sb.name)
-            except (TypeError, ValueError):
-                lifecycle_type = None
-            if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
-                continue
-            if sb.state != "running":
-                continue
-            running += 1
-            stop_started = time.monotonic()
-            try:
-                await self._service.stop_existing(
-                    sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
-                )
-                stopped += 1
-                logger.debug(f"Stopped sandbox: {sb.name}")
+                sandboxes = await self._service.list_sandboxes()
             except Exception as exc:
-                failed += 1
-                logger.error(f"Failed to stop sandbox {sb.name} during quiesce: {exc}")
-            finally:
-                stop_seconds += time.monotonic() - stop_started
+                logger.error(f"Failed to list sandboxes for quiesce: {exc}")
+                sandboxes = []
+                list_failed = True
 
-        self._cache.clear()
-        self._config_cache.clear()
-        self._lease_providers.clear()
-        self._activity.clear()
-        self._reconcile_budget.clear()
+            seen = len(sandboxes or [])
+            running = 0
+            stopped = 0
+            failed = 0
+            stop_seconds = 0.0
+            for sb in sandboxes or []:
+                try:
+                    lifecycle_type, _ = self.parse_sandbox_name(sb.name)
+                except (TypeError, ValueError):
+                    lifecycle_type = None
+                if lifecycle_type == DURABLE_CHROME_LIFECYCLE_TYPE:
+                    continue
+                if sb.state != "running":
+                    continue
+                running += 1
+                stop_started = time.monotonic()
+                try:
+                    await self._service.stop_existing(
+                        sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+                    )
+                    stopped += 1
+                    logger.debug(f"Stopped sandbox: {sb.name}")
+                except Exception as exc:
+                    failed += 1
+                    logger.error(
+                        f"Failed to stop sandbox {sb.name} during quiesce: {exc}"
+                    )
+                finally:
+                    stop_seconds += time.monotonic() - stop_started
+
+        finally:
+            # Also on cancel (startup bounds this call): stale process-local
+            # state must never survive a quiesce that was cut short.
+            self._cache.clear()
+            self._config_cache.clear()
+            self._lease_providers.clear()
+            self._activity.clear()
+            self._reconcile_budget.clear()
         # One summary line per quiesce: stops are serial and each rides the full
         # stop timeout, so stop_time grows with the running count and dominates
         # startup.

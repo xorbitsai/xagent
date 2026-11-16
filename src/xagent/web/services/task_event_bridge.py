@@ -15,7 +15,11 @@ from uuid import uuid4
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from ...config import get_redis_url, get_task_event_channel_prefix
+from ...config import (
+    get_redis_url,
+    get_task_event_bridge_start_timeout_seconds,
+    get_task_event_channel_prefix,
+)
 from ...core.runtime_performance import increment_counter
 from ..models.database import get_session_local
 from ..models.task_command import TaskExecutionCommand
@@ -39,6 +43,11 @@ class _Origin:
     # A command can reply several times. Retain only its recent identities;
     # entries disappear with the command or socket, and the registry is bounded.
     delivered: OrderedDict[str, bool] = field(default_factory=OrderedDict)
+
+
+_SUBSCRIBE_ATTEMPT_TIMEOUT_SECONDS = 5.0
+_RECONNECT_INITIAL_DELAY_SECONDS = 0.25
+_RECONNECT_MAX_DELAY_SECONDS = 2.0
 
 
 class TaskEventBridge:
@@ -81,7 +90,11 @@ class TaskEventBridge:
     async def start(self) -> None:
         self._reader = asyncio.create_task(self._listen())
         try:
-            await asyncio.wait_for(self.ready.wait(), timeout=10)
+            # The reader keeps reconnecting with backoff; this is the hard
+            # bound on how long start waits for the first subscription.
+            await asyncio.wait_for(
+                self.ready.wait(), timeout=get_task_event_bridge_start_timeout_seconds()
+            )
         except BaseException:
             await self.close()
             raise
@@ -187,15 +200,22 @@ class TaskEventBridge:
         channels = [self.private_channel]
         if self.deliver is not None:
             channels.append(f"{self.prefix}:events")
+        retry_delay = _RECONNECT_INITIAL_DELAY_SECONDS
         while not self._stopping:
             try:
                 async with self.redis.pubsub() as pubsub:
-                    await pubsub.subscribe(*channels)
+                    # A connect or subscribe that hangs must not eat the whole
+                    # start bound: cut the attempt and retry with backoff.
+                    await asyncio.wait_for(
+                        pubsub.subscribe(*channels),
+                        timeout=_SUBSCRIBE_ATTEMPT_TIMEOUT_SECONDS,
+                    )
                     subscribed: set[str] = set()
                     async for frame in pubsub.listen():
                         if frame["type"] == "subscribe":
                             subscribed.add(frame["channel"])
                             if len(subscribed) == len(channels):
+                                retry_delay = _RECONNECT_INITIAL_DELAY_SECONDS
                                 self.ready.set()
                                 await self._status("stream_resync_required")
                             continue
@@ -213,7 +233,8 @@ class TaskEventBridge:
             finally:
                 self.ready.clear()
             await self._status("stream_unavailable")
-            await asyncio.sleep(1)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, _RECONNECT_MAX_DELAY_SECONDS)
 
     async def _receive(self, body: dict[str, Any]) -> None:
         if body.get("version") != 1:

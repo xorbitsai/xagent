@@ -2853,6 +2853,22 @@ async def _dispatch_shared_task_command(
         )
 
     async def apply() -> bool:
+        # Finish-only mode can begin during the waits since the cap snapshot
+        # (``ensure`` can wait for an old owner, ``execute_command`` takes the
+        # task hop, the command lock and the admission release). The claim below
+        # still carries that stale cap, which would skip the closed-cap filter,
+        # and rebuilding the cap would not help: this attempt's own slot
+        # reservation makes the task look active. So at the last point before
+        # the claim, a command that would open an execution for a task none of
+        # this process's executions holds goes back to the serving generation.
+        # Returning here runs ``execute_command``'s idle check and the
+        # reservation's release below.
+        if (
+            release_hold.finishing
+            and kind.value in EXECUTION_OPENING_KINDS
+            and not background_task_manager.holds_execution(task_id)
+        ):
+            return False
         try:
             return await _dispatch_task_command(
                 executor, command_db_id=selected_id, cap=cap

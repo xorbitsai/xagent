@@ -691,23 +691,59 @@ def test_sweep_never_revokes_while_disabled_and_prunes_unused_rows(monkeypatch):
     _users()
     idle = _login()
     _idle_for(idle, 24 * 60)
-    kept = _login("administrator")
+    # The second admin login holds the refresh token; the first no longer does.
     stale = _login("administrator")
+    kept = _login("administrator")
+    expired = _login("member")
     now = datetime.now(timezone.utc)
     with auth_tests.TestingSessionLocal() as session:
         # Pruned only once no token of the login can still be valid.
         session.get(BrowserSession, _sid(kept)).last_used_at = (
             now - browser_idle._RETENTION + timedelta(hours=1)
         )
-        session.get(BrowserSession, _sid(stale)).last_used_at = (
-            now - browser_idle._RETENTION - timedelta(hours=1)
-        )
+        for tokens in (stale, expired):
+            session.get(BrowserSession, _sid(tokens)).last_used_at = (
+                now - browser_idle._RETENTION - timedelta(hours=1)
+            )
+        # The member's refresh token has expired, so its row backs nothing.
+        session.query(User).filter_by(
+            username="member"
+        ).one().refresh_token_expires_at = now - timedelta(minutes=1)
         session.commit()
         revoked, deleted = browser_idle.sweep_browser_sessions(session, now=now)
-    assert (revoked, deleted) == (0, 1)
+    assert (revoked, deleted) == (0, 2)
     assert _row(_sid(idle)).revoked_at is None
     assert _row(_sid(kept)) is not None
     assert _row(_sid(stale)) is None
+    assert _row(_sid(expired)) is None
+
+
+def test_sweep_keeps_a_login_its_valid_refresh_token_still_points_to(monkeypatch):
+    """The refresh lifetime is lowered after deployment (7 days to 1).
+
+    Retention follows the new lifetime, but the login's refresh token, issued
+    under the old one, is still valid (simulated by ageing last_used_at): its
+    row must survive, or the login is rejected once the switch is on.
+    """
+    _switch(monkeypatch, False)
+    _users()
+    tokens = _login()
+    sid = _sid(tokens)
+    _idle_for(tokens, 3 * 24 * 60)
+    now = datetime.now(timezone.utc)
+    with auth_tests.TestingSessionLocal() as session:
+        session.get(BrowserSession, sid).last_used_at = (
+            now - browser_idle._RETENTION - timedelta(hours=1)
+        )
+        session.commit()
+        _, deleted = browser_idle.sweep_browser_sessions(session, now=now)
+    assert deleted == 0
+    assert _row(sid) is not None
+
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_MINUTES, "525600")
+    assert _verify(tokens).status_code == 200
+    assert _refresh(tokens).status_code == 200
 
 
 def test_platform_admin_threshold_comes_from_the_server_role(enforced):

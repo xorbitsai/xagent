@@ -37,6 +37,7 @@ from ...config import (
     get_widget_voice_tts_visitor_daily_chars,
 )
 from .db_runtime import await_task_settlement
+from .writer_workers import run_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -225,10 +226,14 @@ def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
 
 
 async def reserve_tts(entity_key: str, visitor_key: str, chars: int) -> None:
-    """:func:`reserve_tts_sync` off the event loop, drained on cancellation so
-    a reservation is never left half-applied."""
+    """:func:`reserve_tts_sync` off the event loop, counted as a tracked writer
+    and drained on cancellation so a reservation is never left half-applied.
+
+    The worker task is shielded from the caller's cancellation, so the tracked
+    thread always starts and finishes; the cancellation is re-raised only after
+    the reservation has settled."""
     worker = asyncio.get_running_loop().create_task(
-        asyncio.to_thread(reserve_tts_sync, entity_key, visitor_key, chars)
+        run_tracked(reserve_tts_sync, entity_key, visitor_key, chars)
     )
     _, cancellation = await await_task_settlement(worker)
     if cancellation is not None:

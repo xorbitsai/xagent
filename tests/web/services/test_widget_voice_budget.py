@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timezone
 
 import pytest
@@ -15,6 +17,7 @@ from xagent.web.services.widget_voice_budget import (
     VoiceBudgetUnavailable,
     reserve_tts_sync,
 )
+from xagent.web.services.writer_workers import active_workers
 
 SETTINGS = {
     "tts-visitor": "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS",
@@ -36,6 +39,34 @@ def memory_budget(monkeypatch):
 def _counts() -> dict[str, int]:
     counts = widget_voice_budget._memory_store._counts
     return {key.split(":")[3]: value for key, value in counts.items()}
+
+
+async def test_cancelled_reserve_tts_settles_before_cancellation_propagates(
+    monkeypatch,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_reserve(entity_key, visitor_key, chars):
+        entered.set()
+        release.wait(5)
+        reserve_tts_sync(entity_key, visitor_key, chars)
+        finished.set()
+
+    monkeypatch.setattr(widget_voice_budget, "reserve_tts_sync", blocking_reserve)
+    task = asyncio.ensure_future(widget_voice_budget.reserve_tts("agent:1", "v", 4))
+    assert await asyncio.to_thread(entered.wait, 5)
+    assert active_workers() == 1
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert not task.done()  # still waiting for the reservation to settle
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+    assert active_workers() == 0
+    assert _counts() == {"tts-visitor": 4, "tts-entity": 4, "tts-site": 4}
 
 
 def test_tts_buckets_are_the_three_synthesis_layers():

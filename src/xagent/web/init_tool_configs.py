@@ -78,6 +78,20 @@ def get_default_tool_configs() -> list[Dict[str, Any]]:
             "dependencies": ["brave_api_key"],
         },
         {
+            "tool_name": "keenable_web_search",
+            "tool_type": "builtin",
+            "category": "search",
+            "display_name": "Keenable 网络搜索",
+            "description": "使用 Keenable Search API 进行网络搜索，无需 Google 账号，API Key 可选",
+            "enabled": True,
+            "requires_configuration": False,
+            "config": {
+                "provider": "keenable",
+                "api_key_env": "KEENABLE_API_KEY",
+            },
+            "dependencies": [],
+        },
+        {
             "tool_name": "exa_web_search",
             "tool_type": "builtin",
             "category": "search",

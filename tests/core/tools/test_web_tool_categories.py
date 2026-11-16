@@ -4,6 +4,7 @@ from pathlib import Path
 
 from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.brave_web_search import BraveWebSearchTool
+from xagent.core.tools.adapters.vibe.keenable_web_search import KeenableWebSearchTool
 from xagent.core.tools.adapters.vibe.download_web_asset import DownloadWebAssetTool
 from xagent.core.tools.adapters.vibe.exa_web_search import ExaWebSearchTool
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
@@ -19,6 +20,7 @@ def test_web_research_tools_share_web_search_category(tmp_path: Path) -> None:
         WebSearchTool(),
         TavilyWebSearchTool(),
         BraveWebSearchTool(),
+        KeenableWebSearchTool(),
         ExaWebSearchTool(),
         ZhipuWebSearchTool(),
         FetchWebContentTool(),

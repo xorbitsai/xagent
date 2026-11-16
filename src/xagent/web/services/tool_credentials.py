@@ -158,6 +158,14 @@ TOOL_CREDENTIAL_SPECS: dict[str, dict[str, ToolFieldSpec]] = {
             "label": "API Key",
         }
     },
+    "keenable_web_search": {
+        "api_key": {
+            "secret": True,
+            "env": ["KEENABLE_API_KEY"],
+            "required": False,
+            "label": "API Key (optional)",
+        }
+    },
     "web_search": {
         "api_key": {
             "secret": True,

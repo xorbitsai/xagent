@@ -3132,7 +3132,7 @@ async def check_auth() -> Dict[str, Any]:
 
 
 @auth_router.get("/verify")
-async def verify_current_token(
+def verify_current_token(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:

@@ -1911,7 +1911,7 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
     user = db.query(User).filter(User.username == username, User.id == user_id).first()
     if user is None or not matches_user_session(user, claims):
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
-    # A ticket outlives neither its login's idle deadline nor a newer login.
+    # A ticket never outlives its login's idle deadline or revocation.
     if browser_idle.session_rejected(db, user, claims):
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
     return user

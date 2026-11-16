@@ -1,4 +1,13 @@
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    false,
+)
 
 from .database import Base
 
@@ -32,7 +41,9 @@ class BrowserSession(Base):  # type: ignore[no-any-unimported]
     # The user's platform-admin role at the last login, activity or refresh.
     # With the policy off, expiry is judged by the stricter of this and the
     # current role, so a demotion after switch-off cannot revive a login.
-    recorded_admin = Column(Boolean, nullable=False, default=False)
+    recorded_admin = Column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
 
 class BrowserIdleEnforcement(Base):  # type: ignore[no-any-unimported]

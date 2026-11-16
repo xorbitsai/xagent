@@ -18,7 +18,8 @@ activity (see below); otherwise every login expires after the threshold.
 | `XAGENT_BROWSER_IDLE_TIMEOUT_MINUTES` | `30` | Threshold for ordinary users |
 | `XAGENT_BROWSER_IDLE_TIMEOUT_ADMIN_MINUTES` | `15` | Threshold for platform administrators (`users.is_admin`) |
 
-An unrecognised switch value, or a non-positive or non-numeric threshold while
+Thresholds accept whole minutes from 1 to 525600 (one year). An unrecognised
+switch value, or a threshold outside that range or not a whole number while
 the switch is on, stops startup instead of falling back to a weaker value. The
 role is read from the database on every check; claims and organisation or team
 roles never select the threshold. Use the same values on every replica.

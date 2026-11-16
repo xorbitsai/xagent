@@ -69,6 +69,7 @@ from .base import (
     normalize_sandbox_pids_limit,
 )
 from .keyed_lock import KeyedLockRegistry
+from .settle import await_shielded
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
@@ -1063,7 +1064,7 @@ class DockerSandbox(Sandbox):
         async with self._locks.locked(self._name):
             async with self._control.exclusive_access(mark_deleted=False):
                 container = await self._require_container()
-                await asyncio.to_thread(container.stop)
+                await await_shielded(asyncio.to_thread(container.stop))
                 self._store.update_info_state(self._name, "stopped")
 
     async def info(self) -> SandboxInfo:
@@ -1364,7 +1365,8 @@ async def _create_container(
             )
         }
     return cast(
-        "Container", await asyncio.to_thread(client.containers.create, **kwargs)
+        "Container",
+        await await_shielded(asyncio.to_thread(client.containers.create, **kwargs)),
     )
 
 
@@ -1481,54 +1483,8 @@ class DockerSandboxService(SandboxService):
 
     @staticmethod
     async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
-        """Run ``coro`` to completion even under repeated cancellation.
-
-        Used by create() for its two compensating ``container.remove()``
-        calls, both of which execute inside ``_named_lock(name)``. That
-        lock's ``finally: entry.lock.release()`` runs as soon as a
-        ``CancelledError`` propagates out of the ``async with`` body, so a
-        bare ``await asyncio.to_thread(container.remove, ...)`` releases the
-        lock the instant a cancellation lands on it — while the remove is
-        still running in its background thread (``to_thread`` cancellation
-        stops waiting, it does not stop the thread). A same-name create()
-        that then acquires the freed lock can race that in-flight remove and
-        observe a transient "already exists" error from Docker.
-
-        Mirrors the shield-loop in
-        ``TaskTurnOrchestrator.begin_turn`` (web/services/task_orchestrator.py):
-        wrap the coroutine in its own task and await it under
-        ``asyncio.shield`` in a loop, so any number of cancellations delivered
-        to *this* await is absorbed without cancelling the underlying task.
-        Once the task settles, the original cancellation is re-raised
-        regardless of how the task itself settled (the task's own exception,
-        if any, is logged but not raised) so the caller's cancellation is
-        still honored; if no cancellation occurred, the task's result or
-        exception is returned/propagated unchanged.
-        """
-        task = asyncio.ensure_future(coro)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break
-            if not task.cancelled():
-                task_error = task.exception()
-                if task_error is not None:
-                    logger.error(
-                        "Compensating container operation failed while a"
-                        " cancelled caller was waiting for it to settle",
-                        exc_info=(
-                            type(task_error),
-                            task_error,
-                            task_error.__traceback__,
-                        ),
-                    )
-            raise
+        """Run ``coro`` to completion even under repeated cancellation."""
+        return await await_shielded(coro)
 
     def _get_control(self, name: str) -> _SandboxControl:
         """Get the shared runtime control object for a sandbox."""
@@ -2002,9 +1958,11 @@ class DockerSandboxService(SandboxService):
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state == "running":
                     if timeout is None:
-                        await asyncio.to_thread(container.stop)
+                        await await_shielded(asyncio.to_thread(container.stop))
                     else:
-                        await asyncio.to_thread(container.stop, timeout=timeout)
+                        await await_shielded(
+                            asyncio.to_thread(container.stop, timeout=timeout)
+                        )
                 self._store.update_info_state(name, "stopped")
 
     async def get_store_record(self, name: str) -> Optional[SandboxInfo]:
@@ -2071,7 +2029,9 @@ class DockerSandboxService(SandboxService):
             async with control.exclusive_access(mark_deleted=True):
                 container = await self._find_container(name)
                 if container is not None:
-                    await asyncio.to_thread(container.remove, force=True)
+                    await await_shielded(
+                        asyncio.to_thread(container.remove, force=True)
+                    )
                 self._store.delete_info(name)
                 if self._controls.get(name) is control:
                     self._controls.pop(name)

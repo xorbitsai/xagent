@@ -8,9 +8,8 @@ import os
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
-from collections.abc import Iterator
-from contextlib import asynccontextmanager, contextmanager
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +63,7 @@ from ..sandbox.base import (
     grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
+from ..sandbox.settle import await_shielded
 from .sandbox_keys import (
     DURABLE_CHROME_LIFECYCLE_TYPE,
     USER_LIFECYCLE_TYPE,
@@ -2604,6 +2604,14 @@ class SandboxManager:
                 pass
             await self._service.delete(warmup_name)
             logger.info(f"Sandbox image warmup completed: {image}")
+        except asyncio.CancelledError:
+            # Warmup runs as a background task that retirement, shutdown or a
+            # failed activation cancels. A cancel cannot stop a Docker create
+            # or stop already issued, so finish removing the reserved container
+            # before the cancellation is allowed to complete.
+            with suppress(Exception):
+                await await_shielded(self._service.delete(warmup_name))
+            raise
         except Exception as e:
             logger.error(f"Failed to warmup sandbox image: {e}")
 

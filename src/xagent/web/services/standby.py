@@ -239,8 +239,11 @@ class StandbyController:
         ``asyncio.timeout`` cancels the step and then waits for it to unwind, so
         a step that holds blocking work in ``run_tracked_to_completion`` still
         joins its worker thread before the failure surfaces: a timeout never
-        abandons a running thread. A ``TimeoutError`` raised by the step itself
-        is not ours and propagates unchanged.
+        abandons a running thread. The same holds for Docker lifecycle work:
+        every thread-backed container mutation under a per-name lock is awaited
+        with ``await_shielded``, so cancelling a step cannot release same-name
+        exclusion while an issued stop is still running. A ``TimeoutError``
+        raised by the step itself is not ours and propagates unchanged.
         """
         from ...config import get_standby_step_timeout_seconds
 

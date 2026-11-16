@@ -205,8 +205,8 @@ stored value, unchanged since it was checked; without one, the access token's
 `sid` must hold the refresh token (`users.browser_session_id`). An access token
 without `sid` cannot name its login and keeps the previous revoke-all
 behaviour, an explicit compatibility exception that lasts until every token
-issuer adds `sid` (for xagent-saas, when xorbitsai/xagent-saas#2928's
-integration ships).
+issuer adds `sid` (for xagent-saas, when xorbitsai/xagent-saas#2969 is
+deployed).
 
 ## Streaming and derived access
 
@@ -310,10 +310,15 @@ same `sid` and is not activity.
    login written by a replica still running the previous release during the
    rollout (its refresh token has no `sid`, but an older `sid` is still
    recorded); such a login migrates on its next refresh, or must sign in again
-   at activation if it is never refreshed.
-4. Make sure `scripts/connector_smoke` no longer depends on a long-lived
-   password-login token (#3787) wherever these checks run, staging included.
-5. Turn the switch on in staging, verify, then in production. Logins without
+   at activation if it is never refreshed. To keep every existing login signed
+   in, wait until the count is 0 (at most the refresh-token lifetime).
+4. On xagent-saas, deploy xorbitsai/xagent-saas#2969, which adds `sid` to the
+   tokens xagent-saas signs itself; until it is deployed, turning the switch on
+   rejects those logins.
+5. If the account used by `scripts/connector_smoke` can reach an idle
+   threshold, make sure the checks no longer depend on a long-lived
+   password-login token (#3787) wherever they run, staging included.
+6. Turn the switch on in staging, verify, then in production. Logins without
    `sid`, and logins already idle beyond the threshold, must sign in again.
 
 Rollback: turning the switch off stops new expiries immediately and frees every

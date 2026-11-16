@@ -44,7 +44,9 @@ class CollectionEmbeddingSwitch:
     target_dimension: int
 
 
-def _resolve_configured_model(target_model_id: str) -> tuple[str, int]:
+def _resolve_configured_model(
+    target_model_id: str,
+) -> tuple[str, int, EmbeddingModelConfig]:
     """Return the hub config for ``target_model_id``, never an env fallback.
 
     Binding a model the hub does not know would silently switch the collection to
@@ -63,7 +65,7 @@ def _resolve_configured_model(target_model_id: str) -> tuple[str, int]:
         raise ValueError(
             f"Embedding model '{target_model_id}' has no dimension; cannot bind it."
         )
-    return canonical, config.dimension
+    return canonical, config.dimension, config
 
 
 def _held_state(window: MigrationWindow) -> CollectionMigrationState:
@@ -100,7 +102,7 @@ def switch_collection_embedding_model(
     """
     collection_name = window.collection_name
     state = _held_state(window)
-    canonical_model_id, dimension = _resolve_configured_model(target_model_id)
+    canonical_model_id, dimension, _ = _resolve_configured_model(target_model_id)
 
     stored = get_collection_sync(collection_name)
     observed_model_id = stored.embedding_model_id

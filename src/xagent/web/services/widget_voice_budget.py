@@ -183,17 +183,22 @@ def _utc_day() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
 
-def _reserve(
-    buckets: tuple[BudgetBucket, ...], scopes: tuple[str, ...], amount: int
-) -> None:
+def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
+    """Count ``chars`` against the three synthesis buckets, or refuse.
+
+    Raises :class:`VoiceBudgetExhausted` when a bucket would go over its
+    limit and :class:`VoiceBudgetUnavailable` when the storage fails; either
+    way nothing stays counted (unless the subtraction itself fails).
+    """
+    scopes = (f"{entity_key}|{visitor_key}", entity_key, "all")
     day = _utc_day()
     added: list[str] = []
     store: _Store | None = None
     try:
         store = _store()
-        for bucket, scope in zip(buckets, scopes, strict=True):
+        for bucket, scope in zip(TTS_BUCKETS, scopes, strict=True):
             key = f"xagent:widget-voice:{day}:{bucket.name}:{scope}"
-            value = store.incrby(key, amount)
+            value = store.incrby(key, chars)
             added.append(key)
             # A bucket without a limit is still counted.
             limit = bucket_limit(bucket)
@@ -204,7 +209,7 @@ def _reserve(
         for key in added:
             try:
                 assert store is not None
-                store.decrby(key, amount)
+                store.decrby(key, chars)
             except Exception:
                 logger.warning("Widget voice budget rollback failed", exc_info=True)
         if isinstance(exc, (VoiceBudgetExhausted, VoiceBudgetUnavailable)):
@@ -213,16 +218,6 @@ def _reserve(
             logger.warning("Widget voice budget storage failed: %s", exc)
             raise VoiceBudgetUnavailable() from None
         raise
-
-
-def reserve_tts_sync(entity_key: str, visitor_key: str, chars: int) -> None:
-    """Count ``chars`` against the three synthesis buckets, or refuse.
-
-    Raises :class:`VoiceBudgetExhausted` when a bucket would go over its
-    limit and :class:`VoiceBudgetUnavailable` when the storage fails; either
-    way nothing stays counted (unless the subtraction itself fails).
-    """
-    _reserve(TTS_BUCKETS, (f"{entity_key}|{visitor_key}", entity_key, "all"), chars)
 
 
 async def reserve_tts(entity_key: str, visitor_key: str, chars: int) -> None:

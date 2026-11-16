@@ -406,6 +406,55 @@ def test_a_promotion_while_enforced_is_recorded_without_activity(monkeypatch):
     _assert_idle_rejection(_verify(member))
 
 
+@pytest.mark.parametrize("idle_minutes, recorded", [(31, False), (20, True)])
+def test_recording_a_promotion_never_revives_an_expired_login(
+    monkeypatch, idle_minutes, recorded
+):
+    """Admins may be given the longer threshold (here 60 against 30 minutes)."""
+    _switch(monkeypatch, True)
+    monkeypatch.setenv(ENV_ADMIN_MINUTES, "60")
+    _users()
+    member = _login("member")
+    _idle_for(member, idle_minutes)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = True
+        session.commit()
+        browser_idle.renew_enforcement_lease(session)  # The enabled heartbeat.
+        browser_idle.record_current_admin_roles(session)
+        session.commit()
+    assert _row(_sid(member)).recorded_admin is recorded
+    if recorded:  # Still within 30 minutes: the promotion is recorded.
+        assert _verify(member).status_code == 200
+    else:  # Expired at 30 minutes as a member: it stays expired.
+        _assert_idle_rejection(_verify(member))
+        _assert_idle_rejection(_refresh(member))
+
+
+@pytest.mark.parametrize("on", [True, False])
+def test_a_promotion_that_expired_a_login_is_recorded_for_a_later_demotion(
+    monkeypatch, on
+):
+    """Default thresholds: idle 20 minutes, expired at the admin's 15 once promoted."""
+    _switch(monkeypatch, True)
+    _users()
+    member = _login("member")
+    _idle_for(member, 20)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = True
+        session.commit()
+        browser_idle.renew_enforcement_lease(session)  # The enabled heartbeat.
+        browser_idle.record_current_admin_roles(session)
+        session.commit()
+    assert _row(_sid(member)).recorded_admin is True
+
+    _switch(monkeypatch, on)
+    with auth_tests.TestingSessionLocal() as session:
+        session.query(User).filter_by(username="member").one().is_admin = False
+        session.commit()
+    _assert_idle_rejection(_verify(member))
+    _assert_idle_rejection(_refresh(member))
+
+
 def test_activity_records_the_current_role(enforced):
     _users()
     member = _login("member")

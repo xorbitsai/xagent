@@ -141,7 +141,9 @@ UPDATE.
 
 - **Role**: each login row records the platform-admin role at its last login,
   activity or refresh, and enforcing replicas mark the live logins of current
-  admins with every lease renewal. With the switch on or off, the stricter of
+  admins with every lease renewal (where admins have the longer threshold,
+  skipping logins already expired, so the mark never re-admits one). With the
+  switch on or off, the stricter of
   the recorded and the current role applies to the recorded threshold sets
   and, with the switch on, to the current thresholds, so a demotion revives
   nothing. Exception: a promotion made within the last

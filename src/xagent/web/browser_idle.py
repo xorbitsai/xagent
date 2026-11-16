@@ -263,14 +263,26 @@ def record_current_admin_roles(db: Session) -> int:
 
     Run by enabled replicas with each lease renewal, so a promotion while the
     policy is enforced is recorded even if the login sees no further activity;
-    a demotion after switch-off then cannot loosen the threshold.
+    a demotion after switch-off then cannot loosen the threshold. Where a set
+    gives admins the longer threshold, recording the promotion loosens it, so
+    a login already expired under that set is skipped, as activity and refresh
+    writes do (the renewed lease covers this replica's thresholds). Where
+    admins have the shorter or equal threshold, recording only keeps the
+    stricter one, so it is never skipped.
     """
+    loosening = [
+        lease
+        for lease in enforcement_leases(db)
+        if lease.admin_minutes > lease.ordinary_minutes
+    ]
+    alive = _lease_conditions(loosening, current=True, now=utcnow())
     return (
         db.query(BrowserSession)
         .filter(
             BrowserSession.revoked_at.is_(None),
             BrowserSession.recorded_admin.is_(False),
             BrowserSession.user_id.in_(select(User.id).where(User.is_admin.is_(True))),
+            *alive,
         )
         .update({BrowserSession.recorded_admin: True}, synchronize_session=False)
     )

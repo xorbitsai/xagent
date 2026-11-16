@@ -431,7 +431,7 @@ _finishing_counters: dict[str, Callable[[], int]] = {}
 
 
 def register_finishing_counter(name: str, count: Callable[[], int]) -> None:
-    """Add a host-owned count of unfinished work to ``finishing_status()``.
+    """Add a host-owned count of unfinished work to the finishing status.
 
     The count appears under ``name`` in the ``finishing`` object and keeps
     ``idle`` false while it is non-zero; an exception from ``count`` reads as
@@ -441,12 +441,17 @@ def register_finishing_counter(name: str, count: Callable[[], int]) -> None:
     _finishing_counters[name] = count
 
 
+_LEDGER_KINDS_NOT_COUNTED = frozenset({"command_attempt", "command_dispatch"})
+
+
 def _pending_reply_count() -> int:
     """START commands whose reply is bound to this process's event bridge.
 
     Replies to START commands travel to the ingress process named by
     ``reply_host_id``; while one is unsettled this process still owes an answer
-    through its bridge, so it cannot stop. Zero without a running bridge, and not counted outside finish-only mode.
+    through its bridge, so it cannot stop. Zero without a running bridge, and
+    not counted outside finish-only mode. Runs a query: call it off the event
+    loop only (``finishing_status_async``).
     """
     from .task_event_bridge import _bridge
 
@@ -469,37 +474,36 @@ def _pending_reply_count() -> int:
         )
 
 
-def finishing_status() -> dict[str, Any]:
-    """``{active, owned_runs, pending_replies, idle, ...host counters}``.
+def _loop_owned_status() -> tuple[dict[str, Any], bool, int]:
+    """Counts that live on the event loop; no query and no await.
 
-    ``idle`` is true only when finish-only mode is active and this process holds
-    no task lease, runs nothing and has no reply route pending, plus every
-    registered host counter is zero. A count that cannot be read makes ``idle``
-    false (and is reported as ``None``): idle is evidence the host stops this
-    process on, so an unknown is never idle. Event-loop thread only.
+    Returns ``(fields, readable, total)``. Every work source admitted before
+    the fence counts, each under its own key: task leases and runs, ledger
+    responsibilities (the dispatcher's own ``command_attempt`` and
+    ``command_dispatch`` excluded: it polls twice a second by design and
+    whatever it applies is counted through the lease it uses), socket writes,
+    detached prompt dispatches, and the host counters.
     """
-    if not release_hold.finishing:
-        # Outside finish-only mode nothing is read: no query, no counting.
-        return {"active": False, "owned_runs": 0, "pending_replies": 0, "idle": False}
+    from .task_command_transport import prompt_dispatch_count
     from .task_coordinator_runtime import live_coordinator_count
     from .task_execution import background_task_manager
 
     owned_runs = sum(background_task_manager.release_counts().values()) + (
         live_coordinator_count()
     )
-    readable = True
-    try:
-        pending_replies: int | None = _pending_reply_count()
-    except Exception:  # noqa: BLE001
-        logger.warning("Could not count pending replies", exc_info=True)
-        pending_replies = None
-        readable = False
-    status: dict[str, Any] = {
-        "active": release_hold.finishing,
+    responsibilities = sum(
+        1
+        for item in release_hold._responsibilities.values()
+        if item.kind not in _LEDGER_KINDS_NOT_COUNTED
+    )
+    fields: dict[str, Any] = {
         "owned_runs": owned_runs,
-        "pending_replies": pending_replies,
+        "responsibilities": responsibilities,
+        "socket_writes": release_hold.socket_write_count,
+        "prompt_dispatches": prompt_dispatch_count(),
     }
-    extra = 0
+    readable = True
+    total = sum(fields.values())
     for name, count in list(_finishing_counters.items()):
         try:
             value: int | None = int(count())
@@ -507,16 +511,73 @@ def finishing_status() -> dict[str, Any]:
             logger.warning("Finishing counter %s failed", name, exc_info=True)
             value = None
             readable = False
-        status[name] = value
-        extra += value or 0
-    status["idle"] = bool(
-        release_hold.finishing
-        and readable
-        and owned_runs == 0
-        and not pending_replies
-        and extra == 0
-    )
-    return status
+        fields[name] = value
+        total += value or 0
+    return fields, readable, total
+
+
+def finishing_status() -> dict[str, Any]:
+    """Loop-owned finish-only counts, synchronous and without database access.
+
+    This is what ``execution_status()["finishing"]`` carries. It never reports
+    ``idle``: whether replies are still owed needs a query, so
+    ``pending_replies`` is ``None`` and ``idle`` is ``False`` here. A host that
+    stops the process on idle awaits :func:`finishing_status_async`. Event-loop
+    thread only.
+    """
+    if not release_hold.finishing:
+        # Outside finish-only mode nothing is read: no query, no counting.
+        return {"active": False, "pending_replies": 0, "idle": False}
+    fields, _readable, _total = _loop_owned_status()
+    return {
+        "active": True,
+        **fields,
+        "pending_replies": None,
+        "idle": False,
+    }
+
+
+async def finishing_status_async() -> dict[str, Any]:
+    """``{active, owned_runs, responsibilities, socket_writes, ...}`` with ``idle``.
+
+    ``idle`` is true only when finish-only mode is active and nothing admitted
+    before the fence is still running (see ``_loop_owned_status``), no reply
+    route is pending, and every host counter is zero. A count that cannot be
+    read makes ``idle`` false (reported as ``None``): idle is evidence the host
+    stops this process on, so an unknown is never idle. The loop-owned counts
+    are read on the loop; only the reply probe runs in a worker thread, so a
+    slow or exhausted database pool never stalls the loop.
+    """
+    if not release_hold.finishing:
+        return {"active": False, "pending_replies": 0, "idle": False}
+    from .db_runtime import run_db_io_cancellation_safe
+
+    fields, readable, total = _loop_owned_status()
+    try:
+        pending_replies: int | None = await run_db_io_cancellation_safe(
+            _pending_reply_count
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not count pending replies", exc_info=True)
+        pending_replies = None
+        readable = False
+    # The probe awaited: re-read the loop-owned counts so work admitted while
+    # it ran is never missed (a count only grows here through admissions that
+    # were already past the fence).
+    fields_after, readable_after, total_after = _loop_owned_status()
+    return {
+        "active": True,
+        **fields_after,
+        "pending_replies": pending_replies,
+        "idle": bool(
+            release_hold.finishing
+            and readable
+            and readable_after
+            and total == 0
+            and total_after == 0
+            and not pending_replies
+        ),
+    }
 
 
 def execution_status() -> dict[str, Any]:

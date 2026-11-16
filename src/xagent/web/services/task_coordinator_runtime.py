@@ -283,6 +283,11 @@ class TaskCoordinatorRegistry:
                 return None
             coordinator = self._coordinators.get(task_id)
             if coordinator is None:
+                if release_hold.finishing:
+                    # Finish-only mode takes no new task ownership. A task
+                    # this process owns still has its coordinator here; one
+                    # that does not is left to the serving generation.
+                    return None
                 coordinator = TaskCoordinator(self, task_id)
                 self._coordinators[task_id] = coordinator
                 break
@@ -396,6 +401,11 @@ class TaskCoordinator:
     async def _start(self) -> None:
         self.lease = await run_db_io_cancellation_safe(self._acquire)
         if self.lease is None:
+            return
+        if release_hold.finishing:
+            # Created before finish-only mode began, acquired after it: do not
+            # become the owner. Closing releases the lease just taken.
+            self._request_close()
             return
         # Shutdown may have begun while the acquisition transaction was blocked.
         if self._close_task is None and self._registry._close_task is None:

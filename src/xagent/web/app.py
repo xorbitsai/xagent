@@ -3284,11 +3284,21 @@ async def begin_finishing() -> None:
     ``_command_routing_predicate``). A lease is released normally once its run
     ends, so the next command of that task is claimed by the serving generation.
 
-    ``finishing_status()`` reports when this process is idle. Unlike
+    Requires shared task execution; otherwise it raises before changing anything.
+    ``finishing_status_async()`` reports when this process is idle. Unlike
     ``retire_writers`` nothing waits for runs to end. Safe next to it and to
     shutdown: every step is idempotent. A step that raises leaves the process
     finishing (the claim restriction is already up); calling again continues.
     """
+    if not get_shared_task_execution_enabled():
+        # Finish-only mode relies on shared execution: runs are durable and
+        # owned by a lease, so stopping chat intake cannot cancel one. Without
+        # it a channel turn runs inside the channel's own task, which the
+        # channel stop cancels. Refused before anything is changed.
+        raise RuntimeError(
+            "begin_finishing requires shared task execution "
+            "(XAGENT_SHARED_TASK_EXECUTION_ENABLED)"
+        )
     global _begin_finishing_lock
     if _begin_finishing_lock is None:
         _begin_finishing_lock = asyncio.Lock()

@@ -20,6 +20,7 @@ from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_event_bridge
 from xagent.web.services.release_hold import (
     finishing_status,
+    finishing_status_async,
     register_finishing_counter,
     release_hold,
 )
@@ -147,6 +148,9 @@ def test_claim_applies_the_restriction_in_the_conditional_update(
 ):
     ids = seed(factory, task_id)
     monkeypatch.setattr(transport, "consumes_task_commands", lambda: True)
+    # Non-shared claim path: the shared one returns before the UPDATE when no
+    # task coordinator is current, which would leave the UPDATE unexercised.
+    monkeypatch.setattr(transport, "get_shared_task_execution_enabled", lambda: False)
     release_hold._finishing = True
     # The lookup finds the owned pause; flip ownership before the UPDATE runs.
     real_query = transport._claimable_query
@@ -167,6 +171,7 @@ def test_claim_applies_the_restriction_in_the_conditional_update(
     with factory() as db:
         row = db.get(TaskExecutionCommand, ids["unowned"])
         assert row.status == "pending" and row.attempt_count == 0
+        assert row.claimed_by is None
 
 
 def test_hold_begin_finishing_is_one_way():
@@ -176,35 +181,40 @@ def test_hold_begin_finishing_is_one_way():
     assert release_hold.finishing and release_hold.closed
 
 
-def test_status_reports_idle_only_when_finishing_and_nothing_is_owed(
+@pytest.mark.asyncio
+async def test_status_reports_idle_only_when_finishing_and_nothing_is_owed(
     factory, task_id, monkeypatch
 ):
     monkeypatch.setattr(task_event_bridge, "_bridge", SimpleNamespace(host_id="H"))
-    status = finishing_status()
+    status = await finishing_status_async()
     assert status["active"] is False and status["idle"] is False
 
     release_hold.begin_finishing()
-    status = finishing_status()
+    status = await finishing_status_async()
     assert status == {
         "active": True,
         "owned_runs": 0,
+        "responsibilities": 0,
+        "socket_writes": 0,
+        "prompt_dispatches": 0,
         "pending_replies": 0,
         "idle": True,
     }
 
     register_finishing_counter("channel_turns", lambda: 2)
-    status = finishing_status()
+    status = await finishing_status_async()
     assert status["channel_turns"] == 2 and status["idle"] is False
 
     def broken() -> int:
         raise RuntimeError("cannot count")
 
     register_finishing_counter("channel_turns", broken)
-    status = finishing_status()
+    status = await finishing_status_async()
     assert status["channel_turns"] is None and status["idle"] is False
 
 
-def test_status_counts_owned_runs_and_reply_routes(factory, task_id, monkeypatch):
+@pytest.mark.asyncio
+async def test_status_counts_owned_runs_and_reply_routes(factory, task_id, monkeypatch):
     monkeypatch.setattr(task_event_bridge, "_bridge", SimpleNamespace(host_id="H"))
     release_hold.begin_finishing()
     with factory() as db, db.begin():
@@ -228,14 +238,14 @@ def test_status_counts_owned_runs_and_reply_routes(factory, task_id, monkeypatch
                 reply_origin="o",
             )
         )
-    status = finishing_status()
+    status = await finishing_status_async()
     assert status["pending_replies"] == 1 and status["idle"] is False
 
     with factory() as db, db.begin():
         db.query(TaskExecutionCommand).filter_by(command_id="start-1").update(
             {"status": "completed"}
         )
-    assert finishing_status()["idle"] is True
+    assert (await finishing_status_async())["idle"] is True
 
     monkeypatch.setattr(
         release_hold_module.background_task_manager
@@ -246,7 +256,7 @@ def test_status_counts_owned_runs_and_reply_routes(factory, task_id, monkeypatch
         "release_counts",
         lambda: {"live_executions": 1},
     )
-    status = finishing_status()
+    status = await finishing_status_async()
     assert status["owned_runs"] == 1 and status["idle"] is False
 
 
@@ -264,6 +274,7 @@ async def test_begin_finishing_keeps_the_command_dispatcher(monkeypatch):
     async def stop_channels(*, raise_errors: bool) -> None:
         stopped.append("channels")
 
+    monkeypatch.setattr(app_module, "get_shared_task_execution_enabled", lambda: True)
     monkeypatch.setattr(app_module, "_task_command_dispatcher_task", dispatcher)
     monkeypatch.setattr(transport, "stop_task_command_dispatcher", stop_dispatcher)
     for name in (
@@ -343,12 +354,7 @@ def test_nothing_changes_until_begin_finishing_is_called():
     assert release_hold.finishing is False
     assert release_hold.closed is False
     status = finishing_status()
-    assert status == {
-        "active": False,
-        "owned_runs": 0,
-        "pending_replies": 0,
-        "idle": False,
-    }
+    assert status == {"active": False, "pending_replies": 0, "idle": False}
     assert "finishing" not in release_hold.snapshot()
     assert release_hold_module.execution_status()["finishing"]["active"] is False
 

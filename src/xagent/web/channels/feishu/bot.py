@@ -1569,6 +1569,12 @@ class FeishuChannelManager:
     async def _start_bot_for_appid(
         self, app_id: str, app_secret: str, channel_id: int, channel_name: str
     ) -> None:
+        # Re-checked here, with no await before the registration below: a sync
+        # that passed the guard before begin_finishing() and then waited on
+        # configuration I/O must not open intake afterwards. A bot registered
+        # before the fence is in ``self.bots`` and is stopped by it.
+        if release_hold.finishing:
+            return
         if app_id not in self.bots:
             instance_id = app_id[:8] + "..." if len(app_id) > 8 else "unknown"
             bot = FeishuBotInstance(

@@ -3309,6 +3309,12 @@ class TelegramChannelManager:
         channel_id: Optional[int] = None,
         channel_name: Optional[str] = None,
     ) -> None:
+        # Re-checked here, with no await before the registration below: a sync
+        # that passed the guard before begin_finishing() and then waited on
+        # configuration I/O must not open intake afterwards. A bot registered
+        # before the fence is in ``self.bots`` and is stopped by it.
+        if release_hold.finishing:
+            return
         if token not in self.bots:
             instance_id = token[:8] + "..." if len(token) > 8 else "unknown"
             logger.info(f"Initializing Telegram channel {instance_id}...")

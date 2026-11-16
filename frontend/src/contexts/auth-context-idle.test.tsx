@@ -289,6 +289,69 @@ describe("IdleSessionManager revalidation", () => {
     await waitFor(() => expect(verifyCalls()).toHaveLength(1))
   })
 
+  it("keeps a socket notice that arrives right after a check and checks once the gap has passed", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    vi.mocked(apiRequest).mockImplementation(async url =>
+      String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy() }) : new Response(null, { status: 404 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+
+    // Two notices inside the gap are coalesced into one later check.
+    act(() => {
+      window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT))
+      window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT))
+    })
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(verifyCalls()).toHaveLength(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(16_000) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(2))
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+    expect(verifyCalls()).toHaveLength(2)
+  })
+
+  it("does not queue a later check for a wake event inside the gap", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    vi.mocked(apiRequest).mockImplementation(async url =>
+      String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy() }) : new Response(null, { status: 404 }))
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(17_000) })
+    expect(verifyCalls()).toHaveLength(1)
+  })
+
+  it("keeps a socket notice that arrives while a check is in flight", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    let answer: (response: Response) => void = () => undefined
+    vi.mocked(apiRequest).mockImplementation(async url => {
+      if (!String(url).endsWith("/api/auth/verify")) return new Response(null, { status: 404 })
+      if (verifyCalls().length === 1) return new Promise<Response>(resolve => { answer = resolve })
+      return json({ idle_session: idlePolicy() })
+    })
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+
+    act(() => { window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT)) })
+    await act(async () => { answer(json({ idle_session: idlePolicy() })) })
+    expect(verifyCalls()).toHaveLength(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(16_000) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(2))
+  })
+
   it("does not mistake background-tab timer throttling for a clock jump", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()

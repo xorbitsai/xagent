@@ -74,13 +74,20 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
 
     let inFlight = false
     let lastCheckAt = Number.NEGATIVE_INFINITY
+    // A socket notice that arrived while a check was running or too soon
+    // after one; the next tick checks once the gap allows it.
+    let socketNoticePending = false
     const revalidate = (requireEnforced: boolean) => {
       const record = getRecord()
       if (!record || (requireEnforced && !record.enforced)) return
       // A negative gap means the clock moved backwards: the gap no longer
       // says anything, so a fresh server answer is allowed.
       const sinceLastCheck = Date.now() - lastCheckAt
-      if (inFlight || (sinceLastCheck >= 0 && sinceLastCheck < REVALIDATE_MIN_GAP_MS)) return
+      if (inFlight || (sinceLastCheck >= 0 && sinceLastCheck < REVALIDATE_MIN_GAP_MS)) {
+        if (!requireEnforced) socketNoticePending = true
+        return
+      }
+      socketNoticePending = false
       inFlight = true
       lastCheckAt = Date.now()
       void revalidateIdleSession(sessionId).finally(() => { inFlight = false })
@@ -99,6 +106,7 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
       // they revalidate when they become visible again.
       if (jumped && document.visibilityState !== "hidden") revalidate(true)
       else checkDeadline()
+      if (socketNoticePending) revalidate(false)
     }
     const onWake = () => {
       if (document.visibilityState === "hidden") return

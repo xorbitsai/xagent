@@ -72,6 +72,7 @@ class ZhipuWebSearchTool(AbstractBaseTool):
             "Search the web using Zhipu Web Search API. "
             "Returns lightweight results with titles, links, and snippets by default. "
             "Use fetch_web_content to read one selected URL after search."
+            " Snippets are often enough for a simple question; fetch at most one or two pages, and only when they are not."
         )
 
     @property

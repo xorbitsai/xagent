@@ -402,6 +402,7 @@ describe("session widget voice call wiring", () => {
     expect(app.stopTask).toHaveBeenCalledTimes(interrupted ? 1 : 0)
   })
 
+  type Held = { delivery?: boolean; reset?: boolean; locked?: boolean; phase?: string }
   it.each([
     { label: "active and connected", status: "active", connected: true, sending: false, processing: false, task: "", busy: false, disabled: false },
     { label: "waiting", status: "waiting", connected: false, sending: false, processing: false, task: "", busy: true, disabled: false },
@@ -412,15 +413,49 @@ describe("session widget voice call wiring", () => {
     { label: "a question waiting", status: "active", connected: true, sending: false, processing: false, task: "waiting_for_user", busy: false, disabled: false },
     { label: "degraded", status: "degraded", connected: false, sending: false, processing: false, task: "", busy: true, disabled: true },
     { label: "terminal", status: "terminal", connected: false, sending: false, processing: false, task: "", busy: true, disabled: true },
-  ] as const)("derives busy and disabled when $label", ({ status: bridgeStatus, connected, sending, processing, task, busy, disabled }) => {
+    { label: "a message handed over from history", status: "active", connected: true, sending: false, processing: false, task: "", busy: true, disabled: false, held: { delivery: true } },
+    { label: "a new conversation being set up", status: "active", connected: true, sending: false, processing: false, task: "", busy: true, disabled: false, held: { reset: true, phase: "reset_requested" } },
+    { label: "a reload required", status: "active", connected: true, sending: false, processing: false, task: "", busy: false, disabled: true, held: { locked: true, phase: "reload_required" } },
+  ] as Array<{ label: string; status: WidgetSessionStatus; connected: boolean; sending: boolean; processing: boolean; task: string; busy: boolean; disabled: boolean; held?: Held }>)("derives busy and disabled when $label", ({ status: bridgeStatus, connected, sending, processing, task, busy, disabled, held }) => {
     app.state.taskId = 71
     renderPage()
     app.isConnected = connected
     app.isSendInFlight = sending
+    app.isMessageDeliveryPending = held?.delivery ?? false
+    app.isConversationResetPending = held?.reset ?? false
+    app.isSessionInteractionLocked = held?.locked ?? false
+    app.sessionConversationState = held?.phase ?? "unbound"
     app.state = { ...app.state, isProcessing: processing, currentTask: task ? { id: "71", status: task } : null }
     setBridge(bridgeStatus, bridgeStatus === "active" ? session({ voice: true }) : null)
     rerender()
     expect(voice.props).toMatchObject({ busy, disabled, waiting: task === "waiting_for_user" })
+  })
+
+  it("holds spoken words while a typed message's files are uploading", async () => {
+    app.state.taskId = 71
+    renderPage({ capabilities: { voice: true, fileUploads: { allowedExtensions: [".txt"], maxFileBytes: 1024, maxFilesPerMessage: 1 } } })
+    await openCall("panel")
+    bridge.value.ensureFreshSession.mockReturnValue(new Promise(() => undefined))
+    act(() => { void panel.onSend!("typed", {}, [new File(["x"], "a.txt")]).catch(() => undefined) })
+    expect(voice.props!.busy).toBe(true)
+    vi.useFakeTimers()
+    try {
+      act(() => voice.callbacks!.transcript("final", "Hello", 1))
+      await act(async () => { await vi.advanceTimersByTimeAsync(350) })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(app.sendMessage).not.toHaveBeenCalled()
+  })
+
+  it("holds spoken words while a message from history is handed over", () => {
+    renderPage({ capabilities: { voice: true, conversationHistory: true } })
+    app.sendMessage.mockReturnValue(new Promise(() => undefined))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+    fireEvent.click(screen.getByText("list-open"))
+    fireEvent.click(screen.getByText("view-continue"))
+    expect(voice.props!.busy).toBe(true)
   })
 })
 

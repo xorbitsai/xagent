@@ -384,11 +384,21 @@ function SessionConversationContent({
   if ((!voiceTransport || view.kind !== "chat") && voiceOpen) setVoiceOpen(false)
   const openVoiceCall = useCallback(() => setVoiceOpen(true), [])
   const voiceTaskStatus = state.currentTask?.status || ""
-  // A token refresh rebuilds the chat socket; meanwhile the words are held
-  // (busy) and the call goes on. Only a session that is down ends it.
-  const voiceBusy = state.isProcessing || isMessageDeliveryPending || !isConnected || isSendInFlight
+  // What holds a typed send on the start page: a reply or a send under way, a
+  // reset, a typed message's files still uploading, or a message handed over
+  // from history. Spoken words wait for the same, whichever view the call was
+  // opened from.
+  const sendHeld = state.isProcessing
+    || isConversationResetPending
+    || isMessageDeliveryPending
+    || isAttachmentBusy
+    || continueBusy
+  // Spoken words also wait while the chat socket is rebuilt (a token refresh),
+  // while a send is in flight and while the task runs; the call goes on
+  // meanwhile. It ends when the session is down or the page needs a reload.
+  const voiceBusy = sendHeld || !isConnected || isSendInFlight
     || WIDGET_VOICE_BUSY_TASK_STATUSES.includes(voiceTaskStatus)
-  const voiceDisabled = status === "degraded" || status === "terminal"
+  const voiceDisabled = status === "degraded" || status === "terminal" || isSessionInteractionLocked
   // Spoken words take the path typed ones take: the start page's send before
   // a conversation exists, the panel's send after, with the call's client
   // message id and the request id of the question this task is waiting on.
@@ -596,14 +606,7 @@ function SessionConversationContent({
                   prompts={agent.suggestedPrompts}
                   onSend={handleStartMessage}
                   sendPromptOnClick={true}
-                  isSending={
-                    state.isProcessing
-                    || isConversationResetPending
-                    || isMessageDeliveryPending
-                    || reloadRequired
-                    || isAttachmentBusy
-                    || continueBusy
-                  }
+                  isSending={sendHeld || reloadRequired}
                   files={attachments ? startFiles : []}
                   onFilesChange={attachments ? onStartFilesChange : () => undefined}
                   attachments={attachments}

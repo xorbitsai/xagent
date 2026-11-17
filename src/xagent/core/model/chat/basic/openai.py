@@ -2155,27 +2155,43 @@ class OpenAILLM(OpenAICompatibleLLM):
         Reasoning therefore follows the request's own ``thinking`` setting
         when there is one, and otherwise the model record's ``thinking_mode``
         ability: a record without it is sent with reasoning switched off. A
-        record with it keeps the server's default. Template switches already
-        present in ``extra_body`` are the caller's and are kept.
+        record with it keeps the server's default.
+
+        A request ``thinking`` setting overwrites both switches, so a retry
+        that disables thinking also replaces what an earlier pass set. Without
+        one, a switch the caller already put in ``extra_body`` is kept and
+        mirrored to the other name, so the pair never disagrees.
+
+        These switches only reach servers that render a chat template
+        (vLLM-style). The official DeepSeek API reads a top-level ``thinking``
+        field instead (see ``DeepSeekLLM``), so a record pointing this client
+        at that API leaves its reasoning unchanged.
         """
         _ = tools, response_format, output_config, is_streaming
         updated_extra_body = dict(extra_body)
         if not _is_deepseek_model_name(self.model_name):
             return updated_extra_body
 
+        template_kwargs = updated_extra_body.get("chat_template_kwargs")
+        merged = dict(template_kwargs) if isinstance(template_kwargs, dict) else {}
+        caller_values = [
+            merged[key] for key in _DEEPSEEK_TEMPLATE_THINKING_KEYS if key in merged
+        ]
+
         if thinking is not None:
             enabled = bool(
                 thinking.get("type") == "enabled" or thinking.get("enable", False)
             )
+        elif caller_values:
+            enabled = caller_values[0]
         elif self.supports_thinking_mode:
             return updated_extra_body
         else:
             enabled = False
 
-        template_kwargs = updated_extra_body.get("chat_template_kwargs")
-        merged = dict(template_kwargs) if isinstance(template_kwargs, dict) else {}
         for key in _DEEPSEEK_TEMPLATE_THINKING_KEYS:
-            merged.setdefault(key, enabled)
+            if thinking is not None or key not in merged:
+                merged[key] = enabled
         updated_extra_body["chat_template_kwargs"] = merged
         return updated_extra_body
 

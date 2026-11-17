@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 
 from xagent.core.agent.context.execution import ExecutionContext
 from xagent.core.agent.runtime import PatternRuntime
+from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
 from xagent.core.model.chat.basic.openai import (
@@ -320,6 +321,8 @@ class TestOpenAILLM:
             (["chat"], {"type": "enabled"}, True),
             (["chat"], {"enable": True}, True),
             (["chat"], {"enable": False}, False),
+            # The shape production callers pass (react decision, JSON retry).
+            (["chat", "thinking_mode"], {"type": "disabled", "enable": False}, False),
         ],
     )
     def test_deepseek_request_thinking_overrides_ability(
@@ -331,18 +334,34 @@ class TestOpenAILLM:
             "chat_template_kwargs": {"thinking": expected, "enable_thinking": expected}
         }
 
-    def test_deepseek_keeps_caller_template_switches(self):
+    def test_deepseek_request_thinking_overwrites_earlier_switches(self):
         llm = self._deepseek_llm(["chat"])
-        extra_body = {"chat_template_kwargs": {"thinking": True, "other": "x"}}
+        extra_body = {
+            "chat_template_kwargs": {"thinking": True, "enable_thinking": True}
+        }
+
+        assert self._deepseek_reasoning_body(
+            llm,
+            thinking={"type": "disabled", "enable": False},
+            extra_body=extra_body,
+        ) == {"chat_template_kwargs": {"thinking": False, "enable_thinking": False}}
+
+    @pytest.mark.parametrize("abilities", [["chat"], ["chat", "thinking_mode"]])
+    @pytest.mark.parametrize("caller_value", [True, False])
+    def test_deepseek_mirrors_a_single_caller_switch(self, abilities, caller_value):
+        llm = self._deepseek_llm(abilities)
+        extra_body = {"chat_template_kwargs": {"thinking": caller_value, "other": "x"}}
 
         assert self._deepseek_reasoning_body(llm, extra_body=extra_body) == {
             "chat_template_kwargs": {
-                "thinking": True,
+                "thinking": caller_value,
                 "other": "x",
-                "enable_thinking": False,
+                "enable_thinking": caller_value,
             }
         }
-        assert extra_body == {"chat_template_kwargs": {"thinking": True, "other": "x"}}
+        assert extra_body == {
+            "chat_template_kwargs": {"thinking": caller_value, "other": "x"}
+        }
 
     @pytest.mark.parametrize(
         ("model_name", "is_deepseek"),
@@ -381,6 +400,103 @@ class TestOpenAILLM:
         assert call_kwargs["extra_body"] == {
             "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
         }
+
+    @pytest.mark.asyncio
+    async def test_deepseek_stream_and_vision_send_reasoning_switch(
+        self, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = self._deepseek_llm(["chat", "tool_calling", "vision"])
+        switched_off = {
+            "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
+        }
+
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+        ]
+        stream_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert stream_kwargs["extra_body"] == switched_off
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.vision_chat([{"role": "user", "content": "Hi"}])
+        vision_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert vision_kwargs["extra_body"] == switched_off
+
+    @pytest.mark.asyncio
+    async def test_deepseek_json_retry_switches_reasoning_off(
+        self, mock_chat_completion, mocker
+    ):
+        """The non-JSON retry really goes out with reasoning off, even though
+        the first attempt asked for it and the retry reuses that body."""
+        non_json_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Not JSON at all.",
+                        tool_calls=None,
+                        reasoning_content="Thinking about the schema first.",
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+            model_dump=lambda: {"id": "deepseek-non-json"},
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            non_json_response,
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = self._deepseek_llm(["chat", "tool_calling", "thinking_mode"])
+
+        await llm.chat(
+            [{"role": "user", "content": "Answer in JSON"}],
+            response_format={"type": "json_object"},
+            thinking={"type": "enabled"},
+        )
+
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["extra_body"] == {
+            "chat_template_kwargs": {"thinking": True, "enable_thinking": True}
+        }
+        assert calls[1].kwargs["extra_body"] == {
+            "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
+        }
+
+    @pytest.mark.asyncio
+    async def test_azure_deepseek_deployment_sends_no_reasoning_switch(
+        self, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.azure_openai.AsyncAzureOpenAI",
+            return_value=mock_client,
+        )
+        llm = AzureOpenAILLM(
+            model_name="deepseek-r1",
+            azure_endpoint="https://test.openai.azure.com/",
+            api_key="k",
+            api_version="2024-08-01-preview",
+            abilities=["chat", "tool_calling"],
+        )
+
+        assert self._deepseek_reasoning_body(llm, extra_body={"a": 1}) == {"a": 1}
+        await llm.chat([{"role": "user", "content": "Hello"}])
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert "extra_body" not in call_kwargs
 
     def test_parse_stream_chunks_mixed_delta_emits_token_then_tool_call(self, llm):
         """A delta carrying text and tool-call fragments expands to a TOKEN

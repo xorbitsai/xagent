@@ -73,7 +73,7 @@ export function WidgetVoiceSetting({ load, save }: WidgetVoiceSettingProps) {
     } catch (error) {
       if (!mountedRef.current) return
       console.error(error)
-      toast.error(t("widget_voice_setting.save_failed"))
+      toast.error(error instanceof Error ? error.message : t("widget_voice_setting.save_failed"))
     } finally {
       if (mountedRef.current) setIsSaving(false)
     }

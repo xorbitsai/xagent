@@ -159,18 +159,28 @@ describe("WidgetVoiceSetting", () => {
   })
 
   it.each([
-    ["403", Object.assign(new Error("Access denied"), { status: 403 })],
-    ["404", Object.assign(new Error("Agent not found"), { status: 404 })],
-    ["500", Object.assign(new Error("Internal Server Error"), { status: 500 })],
-    ["network error", new TypeError("Failed to fetch")],
-  ])("rolls back when saving fails: %s", async (_name, failure) => {
+    [
+      "400",
+      Object.assign(new Error("Only active workforces can enable voice"), { status: 400 }),
+      "Only active workforces can enable voice",
+    ],
+    ["403", Object.assign(new Error("Access denied"), { status: 403 }), "Access denied"],
+    ["404", Object.assign(new Error("Agent not found"), { status: 404 }), "Agent not found"],
+    [
+      "500",
+      Object.assign(new Error("Internal Server Error"), { status: 500 }),
+      "Internal Server Error",
+    ],
+    ["network error", new TypeError("Failed to fetch"), "Failed to fetch"],
+    ["a rejection that is not an Error", "boom", copy.save_failed],
+  ])("keeps the stored value when saving fails: %s", async (_name, failure, message) => {
     const save = vi.fn().mockRejectedValue(failure)
     render(<WidgetVoiceSetting load={() => Promise.resolve(OFF)} save={save} />)
     await waitFor(() => expect(getSwitch()).toBeEnabled())
 
     fireEvent.click(getSwitch())
 
-    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(copy.save_failed))
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(message))
     expect(getSwitch()).toHaveAttribute("aria-checked", "false")
     expect(getSwitch()).toBeEnabled()
     expect(toastSuccessMock).not.toHaveBeenCalled()

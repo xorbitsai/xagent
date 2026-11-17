@@ -49,6 +49,18 @@ export type BuildPageExtensionProviderComponent =
 export type BuildAgentCardExtensionComponent =
   ComponentType<BuildAgentCardExtensionProps>
 
+/** What an avatar is drawn from. `agentId` names the Agent a persona stands
+ * for, when it stands for one: a distribution that lets people style an
+ * Agent's avatar looks the style up by it. The OSS avatar does not read it. */
+export interface AvatarPersona {
+  name: string
+  avatar?: string | null
+  agentId?: number | null
+}
+
+/** An avatar's own color as an [r, g, b] triple, each 0-255. */
+export type AvatarAccentColor = readonly [number, number, number]
+
 export interface AgentBuilderSettingsExtensionOptions {
   /** Undefined when creating an Agent. */
   agentId?: number
@@ -56,10 +68,30 @@ export interface AgentBuilderSettingsExtensionOptions {
   enabled: boolean
   /** True while an Agent save is in progress. */
   saving: boolean
+  /** The name as currently typed; an avatar drawn from it changes with it. */
+  agentName: string
+  /** The Agent's logo image, which is the one thing its avatar can be besides a drawn one. */
+  logo: AgentBuilderLogoControls
+}
+
+export interface AgentBuilderLogoControls {
+  /** Where the current logo can be shown (a chosen file's preview or the saved image), or null. */
+  src: string | null
+  /** Use this image as the logo; it is uploaded when the Agent is saved. */
+  select: (file: File) => void
+  /** Clear the logo, saved or just chosen. */
+  remove: () => void
 }
 
 export interface AgentBuilderSettingsExtension {
   panel?: ReactNode
+  /** Replaces the built-in logo upload at the top of the form in every state,
+   * read-only and loading included: while `enabled` is false return it with
+   * its control disabled instead of leaving it out, or the built-in logo
+   * upload would show in its place. A distribution that draws avatars shows
+   * the logo and its avatar as one control through it, driving the logo with
+   * `logo` from the options. */
+  avatarPanel?: ReactNode
   /** Immutable JSON settings to submit. Omit or return an empty object when clean. */
   changes?: Record<string, unknown>
   /** Acknowledge the submitted settings after a successful save. Keep newer edits dirty. */

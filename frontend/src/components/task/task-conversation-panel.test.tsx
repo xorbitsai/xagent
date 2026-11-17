@@ -27,6 +27,7 @@ const appState = vi.hoisted(() => ({
   steps: [],
 }))
 const realChatMessage = vi.hoisted(() => ({ enabled: false }))
+const personaAccentColorMock = vi.hoisted(() => vi.fn())
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const voiceProps = vi.hoisted(() => ({ current: null as null | {
@@ -146,6 +147,10 @@ vi.mock("dagre", () => {
   }
 })
 
+vi.mock("@/lib/avatar-style-extension", () => ({
+  usePersonaAccentColor: personaAccentColorMock,
+}))
+
 vi.mock("@/components/chat/ChatMessage", async () => {
   const actual = await vi.importActual<typeof import("@/components/chat/ChatMessage")>(
     "@/components/chat/ChatMessage",
@@ -164,6 +169,7 @@ vi.mock("@/components/chat/ChatMessage", async () => {
     interactionRequestId,
     interactions,
     failureTaskId,
+    agent,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -181,6 +187,7 @@ vi.mock("@/components/chat/ChatMessage", async () => {
     interactionRequestId?: string
     interactions?: unknown[]
     failureTaskId?: number | null
+    agent?: { name: string; avatar?: string | null }
   }) => (
     <div
       data-testid="chat-message"
@@ -195,6 +202,7 @@ vi.mock("@/components/chat/ChatMessage", async () => {
       data-request-id={interactionRequestId || ""}
       data-interactions={JSON.stringify(interactions || [])}
       data-failure-task-id={failureTaskId ?? ""}
+      data-agent={agent ? JSON.stringify(agent) : ""}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -319,6 +327,8 @@ describe("TaskConversationPanel", () => {
     cancelTaskAutoResumeMock.mockReset()
     toastErrorMock.mockReset()
     toastInfoMock.mockReset()
+    personaAccentColorMock.mockReset()
+    personaAccentColorMock.mockReturnValue(null)
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
@@ -647,6 +657,47 @@ describe("TaskConversationPanel", () => {
     appState.currentTask = { id: "42", status: "paused" }
     rerender(<TaskConversationPanel mode="page" />)
     expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("hands its agent to each message and tints the conversation with the avatar's color", () => {
+    const agent = { name: "Maya", avatar: null }
+    personaAccentColorMock.mockReturnValue([17, 78, 184])
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Find flights",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+
+    const { container } = render(<TaskConversationPanel mode="page" agent={agent} />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute("data-agent", JSON.stringify(agent))
+    const tinted = container.querySelector("[data-agent-accent]") as HTMLElement
+    expect(tinted).toBe(container.firstElementChild)
+    expect(tinted.style.getPropertyValue("--agent-accent")).toBe("rgb(17 78 184)")
+  })
+
+  it("keeps the theme colors when the agent's avatar has no color of its own", () => {
+    const { container } = render(
+      <TaskConversationPanel mode="page" agent={{ name: "Maya", avatar: "/avatars/maya.png" }} />,
+    )
+
+    expect(container.querySelector("[data-agent-accent]")).toBeNull()
+  })
+
+  it("names no agent and sets no accent unless the caller passes one", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Find flights",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+
+    const { container } = render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute("data-agent", "")
+    expect(container.querySelector("[data-agent-accent]")).toBeNull()
+    expect(personaAccentColorMock).toHaveBeenCalledWith(undefined)
   })
 
   it("marks user turns with the task's Local browser context", () => {

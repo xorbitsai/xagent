@@ -934,6 +934,7 @@ export function ChatInput({
     size: "icon" as const,
     className: cn(
       "h-8 w-8 rounded-lg transition-all duration-300",
+      !isDimmed && "agent-accent-surface",
       // opacity-50 and pointer-events-none repeat what Button's `disabled:`
       // styles give a natively disabled control, so the stop control -- which
       // uses aria-disabled to keep focus -- looks and behaves under the
@@ -1678,7 +1679,7 @@ export function ChatInput({
                   className={cn(
                     "h-8 w-8 rounded-lg transition-all duration-300",
                     voiceOffered && "motion-safe:animate-voice-pop",
-                    !canSubmit() && "bg-muted text-muted-foreground/50"
+                    canSubmit() ? "agent-accent-surface" : "bg-muted text-muted-foreground/50"
                   )}
                 >
                   {isInputBusy ? (

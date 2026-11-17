@@ -249,8 +249,9 @@ async def put_workforce_voice(
     target = await run_db_io_cancellation_safe(
         lambda: _read_workforce(caller, workforce_id, enabled)
     )
-    if target is None:
-        raise HTTPException(status_code=404, detail="Workforce widget not enabled")
+    # A write never reads ``None``: ``_read_workforce`` raises 404 for a
+    # workforce without a deployment row.
+    assert target is not None
     availability = (
         await resolve_widget_voice_availability(target.owner_user_id, request_db=db)
         if enabled

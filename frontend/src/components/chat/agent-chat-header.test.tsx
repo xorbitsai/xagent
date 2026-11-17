@@ -38,6 +38,12 @@ vi.mock("@/lib/agent-channel-extension", () => ({
   AgentChannelHeaderAction: ({ agent, onOpen }: { agent: { name: string; status: string }; onOpen: () => void }) => (
     <button type="button" onClick={onOpen}>{`channel-action ${agent.name} ${agent.status}`}</button>
   ),
+  AgentChannelProfileSection: ({ onOpenDeploy }: { onOpenDeploy: (view: string) => void }) => (
+    <>
+      <button type="button" onClick={() => onOpenDeploy("embed")}>profile-embed</button>
+      <button type="button" onClick={() => onOpenDeploy("webhook")}>profile-webhook</button>
+    </>
+  ),
 }))
 
 let savedProfile: Record<string, unknown>
@@ -329,6 +335,22 @@ describe("Agent profile editing", () => {
       fireEvent.click(screen.getByRole("button", { name: /More options for/ }))
       fireEvent.click(screen.getByRole("button", { name: "Deploy" }))
       expect(screen.getByTestId("deploy-dialog")).toHaveAttribute("data-view", "options")
+    })
+
+    it("opens the Deploy dialog on the chosen view from the profile section and closes the profile", async () => {
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      await openProfile()
+      fireEvent.click(screen.getByRole("button", { name: "profile-embed" }))
+      expect(screen.getByTestId("deploy-dialog")).toHaveAttribute("data-view", "embed")
+      expect(screen.queryByLabelText("Standing rules")).not.toBeInTheDocument()
+    })
+
+    it("opens routines, not the Deploy dialog, for the webhook view", async () => {
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      await openProfile()
+      fireEvent.click(screen.getByRole("button", { name: "profile-webhook" }))
+      expect(screen.queryByTestId("deploy-dialog")).not.toBeInTheDocument()
+      expect(screen.queryByLabelText("Standing rules")).not.toBeInTheDocument()
     })
   })
 })

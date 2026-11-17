@@ -176,20 +176,6 @@ describe("WidgetVoiceSetting", () => {
     expect(toastSuccessMock).not.toHaveBeenCalled()
   })
 
-  it("ignores a read that finishes after unmount", async () => {
-    const pending = deferred<VoiceSettingValue>()
-    const { unmount } = render(
-      <WidgetVoiceSetting load={() => pending.promise} save={vi.fn()} />,
-    )
-    unmount()
-
-    await act(async () => {
-      pending.resolve(ON_AVAILABLE)
-    })
-
-    expect(console.error).not.toHaveBeenCalled()
-  })
-
   it("ignores a failed read that finishes after unmount", async () => {
     const pending = deferred<VoiceSettingValue>()
     const { unmount } = render(

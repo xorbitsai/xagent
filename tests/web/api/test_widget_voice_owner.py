@@ -413,6 +413,87 @@ def test_workforce_voice_deployment_and_status_guards(
         assert _deployment_switch(workforce_id) is value
 
 
+def _lose_agent_ownership(agent_id: int) -> None:
+    _set_agent(agent_id, user_id=_user_id("carol"))
+
+
+def _delete_agent(agent_id: int) -> None:
+    db = _direct_db_session()
+    try:
+        db.delete(db.get(Agent, agent_id))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _lose_workforce_edit_right(workforce_id: int) -> None:
+    _set_workforce(workforce_id, owner_user_id=_user_id("carol"))
+
+
+def _delete_deployment(workforce_id: int) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Deployment).filter_by(
+            owner_type=DeploymentOwnerType.WORKFORCE.value, owner_id=workforce_id
+        ).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _workforce_deployment_count(workforce_id: int) -> int:
+    db = _direct_db_session()
+    try:
+        return (
+            db.query(Deployment)
+            .filter_by(
+                owner_type=DeploymentOwnerType.WORKFORCE.value, owner_id=workforce_id
+            )
+            .count()
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "entity, change, status",
+    [
+        ("agent", _lose_agent_ownership, 404),
+        ("agent", _delete_agent, 404),
+        ("workforce", _lose_workforce_edit_right, 403),
+        ("workforce", _delete_deployment, 404),
+    ],
+)
+def test_owner_put_checks_access_again_before_writing(
+    entity, change, status, monkeypatch
+) -> None:
+    """Access lost while the provider is being asked stops the write."""
+    _register("bob")
+    _register("carol")
+    path, read, _ = _agent_target(entity)
+    entity_id = int(path.split("/")[3])
+
+    async def resolve(owner_user_id, *, request_db):
+        change(entity_id)
+        return AVAILABLE
+
+    monkeypatch.setattr(
+        widget_voice_switch, "resolve_widget_voice_availability", resolve
+    )
+    response = client.put(path, headers=_login_as("bob"), json={"enabled": True})
+    assert response.status_code == status, response.text
+    if change is _delete_agent:
+        db = _direct_db_session()
+        try:
+            assert db.get(Agent, entity_id) is None
+        finally:
+            db.close()
+    elif change is _delete_deployment:
+        assert _workforce_deployment_count(entity_id) == 0
+    else:
+        assert read() is False
+
+
 # ----- the old owner entry points still do not take the switch -----
 # (see test_widget_voice_admin.py::test_owner_endpoints_leave_the_switch_off)
 

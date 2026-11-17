@@ -179,10 +179,10 @@ class FetchWebContentTool(AbstractBaseTool):
             trim_boilerplate=budget,
         )
         payload = result.as_dict()
-        if budget and result.success:
+        if budget and payload.get("success"):
             limit = fetch_args.max_chars or get_fetch_web_content_max_chars()
             text, end, total = slice_page_text(
-                result.content, fetch_args.start_char, limit
+                payload.get("content") or "", fetch_args.start_char, limit
             )
             payload["total_chars"] = total
             if fetch_args.start_char > 0 and fetch_args.start_char >= total:

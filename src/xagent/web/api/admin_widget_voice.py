@@ -1,11 +1,13 @@
 """Administrator switch for widget voice on an agent or a workforce.
 
-This is the only writer of ``agents.widget_voice_enabled`` and
-``deployments.widget_voice_enabled``: owners cannot turn widget voice on for
-their own widgets. ``available`` reports whether both of the deployment's voice
-models (speech recognition and speech synthesis) are usable for the entity's
-owner, so a switch that is on but has no
-effect can be explained.
+Writes ``agents.widget_voice_enabled`` and ``deployments.widget_voice_enabled``
+for any agent or workforce. Owners write the same columns for the ones they can
+edit through ``/api/agents/{id}/widget-voice`` and
+``/api/workforces/{id}/widget-voice``; the last write wins. ``available``
+reports whether both of the deployment's voice models (speech recognition and
+speech synthesis) are usable for the entity's owner, so a switch that is on but
+has no effect can be explained. Unlike the owner routes, these always ask the
+voice provider, whether the switch is on or off.
 """
 
 from __future__ import annotations

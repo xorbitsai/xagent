@@ -76,6 +76,13 @@ from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.execution_budget import budget_policy_provider
 from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
+from ..services.widget_voice_switch import (
+    OwnerCaller,
+    OwnerWidgetVoiceRequest,
+    OwnerWidgetVoiceResponse,
+    get_agent_voice,
+    put_agent_voice,
+)
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -1650,6 +1657,34 @@ async def rotate_agent_widget_key(
         logger.error(f"Failed to rotate widget key for agent {agent_id}: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_id}/widget-voice", response_model=OwnerWidgetVoiceResponse)
+async def get_agent_widget_voice(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OwnerWidgetVoiceResponse:
+    """Whether widget voice is on for this agent, and whether it can work.
+
+    Gated like agent editing. The voice provider is asked only while the switch
+    is on; ``available`` is ``None`` otherwise.
+    """
+    # Plain values first: the request session returns its connection next.
+    caller = OwnerCaller.of(current_user)
+    return await get_agent_voice(db, caller, agent_id)
+
+
+@router.put("/{agent_id}/widget-voice", response_model=OwnerWidgetVoiceResponse)
+async def put_agent_widget_voice(
+    agent_id: int,
+    request: OwnerWidgetVoiceRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OwnerWidgetVoiceResponse:
+    """Turn widget voice on or off for this agent."""
+    caller = OwnerCaller.of(current_user)
+    return await put_agent_voice(db, caller, agent_id, request.enabled)
 
 
 @router.post("/{agent_id}/logo", response_model=dict)

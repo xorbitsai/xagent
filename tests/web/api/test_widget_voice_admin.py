@@ -1,4 +1,5 @@
-"""Only the admin widget-voice API writes or returns the widget voice switch."""
+"""The widget voice switch is written only through the admin and owner voice
+routes; the other owner request and response shapes never carry it."""
 
 # Pytest fixture imports are intentionally shadowed by test parameters.
 # ruff: noqa: F811

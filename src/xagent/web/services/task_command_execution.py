@@ -1447,7 +1447,7 @@ def _task_waiting_for_user_sync(task_id: int) -> bool:
     """Whether the task row currently waits for user input."""
     with get_session_local()() as db:
         status = db.query(Task.status).filter(Task.id == task_id).scalar()
-    return status == TaskStatus.WAITING_FOR_USER
+    return bool(status == TaskStatus.WAITING_FOR_USER)
 
 
 async def handle_task_message(

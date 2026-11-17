@@ -111,6 +111,7 @@ from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
+from ...attachments import CLIENT_METADATA_KEY
 from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context import ExecutionContext
@@ -3166,7 +3167,7 @@ class ReActPattern(AgentPattern):
         waiting_message_count = int(
             self.waiting_for_user_request.get("message_count", 0)
         )
-        if len(getattr(context, "messages", [])) <= waiting_message_count:
+        if not self._has_answer_after(context, waiting_message_count):
             result = {
                 "success": False,
                 "status": "waiting_for_user",
@@ -3253,6 +3254,38 @@ class ReActPattern(AgentPattern):
         if self.memory_input_text is None:
             self.memory_input_text = str(memory_text or "") or None
 
+    def _is_stale_settle_message(self, message: Any) -> bool:
+        """Whether ``message`` settles an interaction this run is not waiting on.
+
+        A host settles a waiting interaction with a hidden user message that
+        names the tool's ``interaction_id`` (``task_interaction_settle``). It
+        only answers a pending request of the waiting batch that carries that
+        id; any other settle is a leftover of an earlier question and must
+        neither resume the run nor be taken as the answer to this one.
+        """
+        metadata = getattr(message, "metadata", None)
+        client = (
+            metadata.get(CLIENT_METADATA_KEY) if isinstance(metadata, dict) else None
+        )
+        settled_id = client.get("interaction_id") if isinstance(client, dict) else None
+        if not isinstance(settled_id, str):
+            return False
+        waiting_request = self.waiting_for_user_request or {}
+        requests = waiting_request.get("requests")
+        return not isinstance(requests, list) or all(
+            not isinstance(request, dict)
+            or str(request.get("interaction_id") or "") != settled_id
+            for request in requests
+        )
+
+    def _has_answer_after(self, context: Any, waiting_message_count: int) -> bool:
+        """Whether a message that can answer the waiting request follows it."""
+        messages = getattr(context, "messages", [])
+        return any(
+            not self._is_stale_settle_message(message)
+            for message in messages[waiting_message_count:]
+        )
+
     def _mark_latest_user_message_as_waiting_response(
         self,
         *,
@@ -3266,6 +3299,8 @@ class ReActPattern(AgentPattern):
         for index in range(after_message_count, len(messages)):
             message = messages[index]
             if getattr(message, "role", None) != "user":
+                continue
+            if self._is_stale_settle_message(message):
                 continue
             metadata = getattr(message, "metadata", None)
             metadata = dict(metadata) if isinstance(metadata, dict) else {}

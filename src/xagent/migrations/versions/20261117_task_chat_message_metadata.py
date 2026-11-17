@@ -4,14 +4,14 @@ Client-supplied metadata for a user message (for example ``{"hidden": true}``).
 Nullable; existing rows stay NULL.
 
 Revision ID: 20261117_chat_message_metadata
-Revises: 20261116_browser_idle_session
+Revises: 20261117_seed_chargebee_mcp_app
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "20261117_chat_message_metadata"
-down_revision = "20261116_browser_idle_session"
+down_revision = "20261117_seed_chargebee_mcp_app"
 branch_labels = None
 depends_on = None
 

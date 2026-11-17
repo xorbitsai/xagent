@@ -697,7 +697,12 @@ export function SessionAgentChatPage() {
   const readCurrentToken = useCallback(() => sessionTokenRef.current, [])
 
   // The page runs in the host page's iframe only, and widget.js adds voice=1
-  // where the host page granted the microphone.
+  // where the host page granted the microphone. voice=1 is an unsigned hint
+  // that any page can add to the URL itself. It only says the embedder
+  // delegated the microphone to this iframe and is not a permission: whether
+  // voice calls are offered is decided by the server (the voice capability of
+  // the session payload), and the voice endpoints check again on every
+  // request.
   const [voiceRequested] = useState(
     () => new URLSearchParams(window.location.search).get("voice") === "1",
   )

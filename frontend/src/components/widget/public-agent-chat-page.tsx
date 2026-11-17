@@ -52,6 +52,11 @@ type PublicAuthResult = {
 // A voice call is offered only to an embedded widget whose server said so,
 // and only where the page can use the microphone: as a top-level page, or in
 // an iframe the host page opted into voice for (widget.js then adds voice=1).
+// voice=1 is an unsigned hint that any page can add to the URL itself. It
+// only says the embedder delegated the microphone to this iframe and is not a
+// permission: whether voice calls are offered is decided by the server
+// (voice_enabled in the login response), and the voice endpoints check again
+// on every request.
 function widgetVoiceCallOffered(authMode: "widget" | "share", voiceEnabled: boolean | null | undefined): boolean {
   if (authMode !== "widget" || voiceEnabled !== true) return false
   let topLevel = false

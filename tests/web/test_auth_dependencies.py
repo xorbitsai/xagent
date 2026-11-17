@@ -674,7 +674,8 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             "web/api/websocket_auth.py",
             "_load_websocket_principal_sync",
             "get_user_from_websocket_token",
-            (),
+            # Browser idle rejection closes an open socket with its own code.
+            ("WebSocketSessionIdleRejected",),
         ),
         (
             websocket_file,

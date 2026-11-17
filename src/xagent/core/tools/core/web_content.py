@@ -18,6 +18,7 @@ from ...utils.egress_proxy import get_proxy_url as get_proxy_url
 from ...utils.egress_proxy import get_trusted_proxy_url as get_trusted_proxy_url
 from ...utils.public_network_proxy import PublicNetworkEgressProxy
 from ...utils.security import PrivateNetworkHostError, fetch_public_http_bytes
+from .search_result_pages import search_result_page_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ BOILERPLATE_TAGS = ("nav", "aside", "iframe", "dialog")
 # Page-level furniture. Inside a selected main region these are the headline,
 # byline and date of the article itself, so they are kept there.
 PAGE_FURNITURE_TAGS = ("header", "footer")
+ARTICLE_LIKE_TAGS = ["article", "main", "section"]
 BOILERPLATE_ROLES = frozenset({"navigation", "complementary"})
 PAGE_FURNITURE_ROLES = frozenset({"banner", "contentinfo"})
 # If trimming leaves less than this share of the page text, the page does not
@@ -104,6 +106,8 @@ class WebContentFetchResult:
     error: str | None = None
     assets: tuple[WebAssetReference, ...] = ()
     blocked_by_site: bool = False
+    # True when the fetch was refused by tool policy before any request.
+    blocked_by_policy: bool = False
 
     @property
     def success(self) -> bool:
@@ -127,6 +131,7 @@ class WebContentFetchResult:
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
             "blocked_by_site": self.blocked_by_site,
+            "blocked_by_policy": self.blocked_by_policy,
         }
 
 
@@ -225,6 +230,13 @@ class WebContentFetcher:
         asset_query: str | None = None,
         trim_boilerplate: bool = False,
     ) -> WebContentFetchResult:
+        # Before the log line below: a refused URL carries the search text.
+        refusal = search_result_page_refusal(url)
+        if refusal is not None:
+            return WebContentFetchResult(
+                url=url, content="", error=refusal, blocked_by_policy=True
+            )
+
         logger.info("Fetching webpage content from: %s", url)
 
         headers = {"User-Agent": DEFAULT_USER_AGENT}
@@ -488,10 +500,19 @@ def _select_main_region(soup: BeautifulSoup) -> Any:
 
 
 def _remove_boilerplate(soup: BeautifulSoup, *, page_level: bool) -> None:
-    tags = BOILERPLATE_TAGS + (PAGE_FURNITURE_TAGS if page_level else ())
+    tags = BOILERPLATE_TAGS
     roles = BOILERPLATE_ROLES | (PAGE_FURNITURE_ROLES if page_level else frozenset())
     for element in soup(list(tags)):
         element.decompose()
+    if page_level:
+        # Only the site's own header/footer: one inside an article or section
+        # carries its headline, byline and date.
+        for element in soup(list(PAGE_FURNITURE_TAGS)):
+            if (
+                not element.decomposed
+                and element.find_parent(ARTICLE_LIKE_TAGS) is None
+            ):
+                element.decompose()
     for element in soup.find_all(attrs={"role": True}):
         # An ancestor removed earlier in this loop clears its descendants.
         if element.decomposed:
@@ -514,7 +535,11 @@ def _trim_boilerplate(soup: BeautifulSoup) -> BeautifulSoup:
     if main is not None:
         trimmed = BeautifulSoup(str(main), "html.parser")
     _remove_boilerplate(trimmed, page_level=main is None)
-    if total and _text_length(trimmed) < total * MIN_TRIMMED_TEXT_SHARE:
+    if (
+        main is None
+        and total
+        and _text_length(trimmed) < total * MIN_TRIMMED_TEXT_SHARE
+    ):
         return soup
     return trimmed
 

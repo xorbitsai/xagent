@@ -246,3 +246,37 @@ def test_slice_prefers_paragraph_boundary_and_hard_cuts_without_one():
     assert slice_page_text("x" * 500, 0, 100) == ("x" * 100, 100, 500)
     assert slice_page_text("short", 0, 100) == ("short", 5, 5)
     assert slice_page_text("short", 99, 100) == ("", 5, 5)
+
+
+@pytest.mark.asyncio
+async def test_page_level_trim_keeps_headline_and_date_inside_articles():
+    body = (
+        "<html><body><header>SITE-HEADER</header>"
+        f"<article><header><h1>Post One</h1><time>2026-03-04</time></header><p>{LONG}</p></article>"
+        f"<article><header><h1>Post Two</h1><time>2026-03-05</time></header><p>{LONG}</p></article>"
+        "<footer>SITE-FOOTER</footer></body></html>"
+    )
+    result = await _fetch({}, body.encode())
+    for kept in ("Post One", "2026-03-04", "Post Two", "2026-03-05"):
+        assert kept in result["content"]
+    assert "SITE-HEADER" not in result["content"]
+    assert "SITE-FOOTER" not in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_selected_main_is_trimmed_even_beside_a_large_sidebar():
+    sidebar = "".join(f"<li>SIDEBAR-LINK-{i}</li>" for i in range(1500))
+    body = (
+        f"<html><body><aside><ul>{sidebar}</ul></aside>"
+        f"<main><p>MAIN-TEXT {LONG}</p></main></body></html>"
+    )
+    result = await _fetch({}, body.encode())
+    assert "MAIN-TEXT" in result["content"]
+    assert "SIDEBAR-LINK" not in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_empty_page_with_start_char_reports_past_the_end():
+    result = await _fetch({"start_char": 5}, b"<html><body></body></html>")
+    assert "past the end" in result["content"]
+    assert "End of page" not in result["content"]

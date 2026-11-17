@@ -183,6 +183,7 @@ class ToolRegistry:
                 browser_tools,
                 current_time_tool,
                 custom_api_factory,
+                find_app_connection_tool,
                 image_tool,
                 knowledge_tools,
                 mcp_tools,

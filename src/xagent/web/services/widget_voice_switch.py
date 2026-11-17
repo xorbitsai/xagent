@@ -3,6 +3,9 @@
 Whoever may edit an agent (``AgentStore.get_owned_agent``) or a workforce
 (``can_edit_workforce``) can read and write its widget voice switch here. The
 switch is the same column the administrator API writes: the last write wins.
+The request body (``WidgetVoiceSwitchRequest``), the target row view
+(``WidgetVoiceTarget``) and the write log (``log_switch_write``) are shared with
+the administrator routes.
 
 ``available`` reports whether both of the deployment's voice models are usable
 for the entity's owner, so a switch that is on but has no effect can be
@@ -94,6 +97,37 @@ def _checked(availability: WidgetVoiceAvailability) -> OwnerWidgetVoiceResponse:
     )
 
 
+def log_switch_write(
+    *,
+    set_by: Literal["owner", "administrator"],
+    id_key: Literal["agent_id", "workforce_id"],
+    entity_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+    enabled: bool,
+    previous: bool,
+    available: bool | None,
+) -> None:
+    """Log one write of the switch, with the value it replaced.
+
+    Owner and administrator writes log the same fields. ``available`` is
+    ``None`` when the voice provider was not asked (an owner turning the switch
+    off).
+    """
+    logger.info(
+        "Widget voice switch set by %s",
+        set_by,
+        extra={
+            id_key: entity_id,
+            "actor_user_id": actor_user_id,
+            "actor_is_admin": actor_is_admin,
+            "widget_voice_enabled": enabled,
+            "previous_widget_voice_enabled": previous,
+            "available": available,
+        },
+    )
+
+
 # ===== Agents =====
 
 
@@ -153,7 +187,16 @@ async def put_agent_voice(
     previous = await run_db_io_cancellation_safe(
         lambda: _write_agent(caller, agent_id, enabled)
     )
-    _log_write("agent_id", agent_id, caller, enabled, previous, availability)
+    log_switch_write(
+        set_by="owner",
+        id_key="agent_id",
+        entity_id=agent_id,
+        actor_user_id=caller.user_id,
+        actor_is_admin=caller.is_admin,
+        enabled=enabled,
+        previous=previous,
+        available=availability.available if availability is not None else None,
+    )
     return _checked(availability) if availability is not None else _off()
 
 
@@ -270,26 +313,14 @@ async def put_workforce_voice(
     previous = await run_db_io_cancellation_safe(
         lambda: _write_workforce(caller, workforce_id, enabled)
     )
-    _log_write("workforce_id", workforce_id, caller, enabled, previous, availability)
-    return _checked(availability) if availability is not None else _off()
-
-
-def _log_write(
-    id_key: str,
-    entity_id: int,
-    caller: OwnerCaller,
-    enabled: bool,
-    previous: bool,
-    availability: WidgetVoiceAvailability | None,
-) -> None:
-    logger.info(
-        "Widget voice switch set by owner",
-        extra={
-            id_key: entity_id,
-            "actor_user_id": caller.user_id,
-            "actor_is_admin": caller.is_admin,
-            "widget_voice_enabled": enabled,
-            "previous_widget_voice_enabled": previous,
-            "available": availability.available if availability else None,
-        },
+    log_switch_write(
+        set_by="owner",
+        id_key="workforce_id",
+        entity_id=workforce_id,
+        actor_user_id=caller.user_id,
+        actor_is_admin=caller.is_admin,
+        enabled=enabled,
+        previous=previous,
+        available=availability.available if availability is not None else None,
     )
+    return _checked(availability) if availability is not None else _off()

@@ -87,6 +87,21 @@ def requires_sandbox_mcp_connection(connection: Connection) -> bool:
     )
 
 
+async def ensure_sandbox_mcp_dependencies(
+    sandbox: Sandbox | _SandboxLeaseProviderLike,
+) -> None:
+    """Install the sandbox-side MCP dependencies once, ahead of a fan-out.
+
+    ``list_tools_in_sandbox`` does the same per server, inside that server's
+    wall-clock bound and under a per-sandbox lock. When servers load
+    concurrently on a fresh sandbox every one of them would spend part of its
+    bound waiting for the first install, so callers run this once first.
+    """
+    await SandboxDependencyManager.ensure_requirements(
+        resolve_primary_sandbox(sandbox), _SANDBOX_MCP_DEPENDENCIES
+    )
+
+
 async def list_tools_in_sandbox(
     sandbox: Sandbox | _SandboxLeaseProviderLike,
     connection: Connection,

@@ -908,6 +908,40 @@ describe("useWidgetSession capability parsing is per capability", () => {
   })
 })
 
+describe("useWidgetSession voice capability", () => {
+  const capabilitiesFor = (capabilities: unknown) => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ capabilities }))
+    expect(result.current.status).toBe("active")
+    return result.current.session?.capabilities
+  }
+
+  it.each([
+    ["voice true alone", { voice: true }, { voice: true }],
+    ["voice true next to conversation history", { voice: true, conversation_history: {} },
+      { voice: true, conversationHistory: true }],
+    ["voice false next to conversation history", { voice: false, conversation_history: {} },
+      { conversationHistory: true }],
+    ["voice as a string next to conversation history", { voice: "true", conversation_history: {} },
+      { conversationHistory: true }],
+    ["voice as a number next to conversation history", { voice: 1, conversation_history: {} },
+      { conversationHistory: true }],
+    ["voice as an object next to conversation history", { voice: { enabled: true }, conversation_history: {} },
+      { conversationHistory: true }],
+  ])("reads %s", (_label, capabilities, expected) => {
+    expect(capabilitiesFor(capabilities)).toStrictEqual(expected)
+  })
+
+  it.each([
+    ["voice false alone", { voice: false }],
+    ["voice null alone", { voice: null }],
+    ["voice missing", {}],
+    ["capabilities that are not an object", "voice"],
+  ])("reads %s as no capabilities", (_label, capabilities) => {
+    expect(capabilitiesFor(capabilities)).toBeUndefined()
+  })
+})
+
 describe("useWidgetSession upload coordination", () => {
   // Hooks rendered by earlier tests stay mounted and would answer the parent
   // messages dispatched here, so unmount them before and after each test.
@@ -1097,6 +1131,20 @@ describe("useWidgetSession upload coordination", () => {
 
       await expect(fresh).resolves.toMatchObject({ token: "st_renewed" })
       await expect(recovered).resolves.toMatchObject({ token: "st_renewed" })
+      expect(reconnectRequests(postMessage)).toHaveLength(1)
+    })
+
+    it("sends one reconnect_request for two callers rejected with the same token at once", async () => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      const first = result.current.refreshSession("st_session_token")
+      const second = result.current.refreshSession("st_session_token")
+      dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b", session_token: "st_renewed" }))
+
+      await expect(first).resolves.toMatchObject({ token: "st_renewed" })
+      await expect(second).resolves.toMatchObject({ token: "st_renewed" })
       expect(reconnectRequests(postMessage)).toHaveLength(1)
     })
 

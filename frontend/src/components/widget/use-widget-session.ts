@@ -37,6 +37,9 @@ export interface WidgetSessionCapabilities {
   // Present when the server lets this session read its earlier conversations
   // and continue from one.
   conversationHistory?: true
+  // Present when the server offers voice calls to this session (the
+  // advertised value is exactly `true`).
+  voice?: true
 }
 
 export interface WidgetSession {
@@ -135,10 +138,12 @@ export const parseCapabilities = (value: unknown): WidgetSessionCapabilities | u
   if (!isRecord(value)) return undefined
   const fileUploads = parseFileUploads(value.file_uploads)
   const conversationHistory = isRecord(value.conversation_history)
-  if (!fileUploads && !conversationHistory) return undefined
+  const voice = value.voice === true
+  if (!fileUploads && !conversationHistory && !voice) return undefined
   return {
     ...(fileUploads ? { fileUploads } : {}),
     ...(conversationHistory ? { conversationHistory: true as const } : {}),
+    ...(voice ? { voice: true as const } : {}),
   }
 }
 
@@ -153,7 +158,19 @@ const isProtocolMessage = (value: unknown): value is ProtocolMessage => {
     )
 }
 
+export const WIDGET_SESSION_VOICE_ASR_PATH = "/v1/external/chat/sessions/voice/asr"
+export const WIDGET_SESSION_VOICE_TTS_PATH = "/v1/external/chat/sessions/voice/tts"
+
 export function buildWidgetSessionWebSocketUrl(origin: string): string {
+  return sessionWebSocketUrl(origin, "/v1/external/chat/sessions/ws")
+}
+
+// The session's speech recognition socket, on the same origin as its chat socket.
+export function buildWidgetSessionVoiceAsrUrl(origin: string): string {
+  return sessionWebSocketUrl(origin, WIDGET_SESSION_VOICE_ASR_PATH)
+}
+
+function sessionWebSocketUrl(origin: string, pathname: string): string {
   const url = new URL(origin)
   if (url.protocol === "https:") {
     url.protocol = "wss:"
@@ -162,7 +179,7 @@ export function buildWidgetSessionWebSocketUrl(origin: string): string {
   } else {
     throw new Error("Widget Session requires an HTTP(S) origin")
   }
-  url.pathname = "/v1/external/chat/sessions/ws"
+  url.pathname = pathname
   url.search = ""
   url.hash = ""
   return url.toString()

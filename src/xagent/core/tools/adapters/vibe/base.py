@@ -66,6 +66,10 @@ INTRINSIC_TOOL_NAMES: frozenset[str] = (
     frozenset({"get_current_time", "validate_local_time"})
     | HOST_REGISTERED_INTRINSIC_TOOL_NAMES
 )
+# Admitted like an intrinsic tool, but only present when a host turns it on
+# (the tool creator returns nothing otherwise), so it is not part of the set
+# every selection is expected to carry.
+OPTIONAL_INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset({"show_result_card"})
 
 
 class ToolMetadata(BaseModel):

@@ -65,6 +65,7 @@ import json
 import logging
 import uuid
 from collections.abc import Iterable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -163,6 +164,11 @@ from ...result import (
     tool_result_requires_authentication,
     tool_result_succeeded,
     unwrap_final_answer_content,
+)
+from ...result_card import (
+    RESULT_CARD_TOOL_NAME,
+    RunDisplayContext,
+    bind_run_display_context,
 )
 from ...runtime import (
     DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
@@ -7044,8 +7050,11 @@ class ReActPattern(AgentPattern):
                 return result
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                with bind_tool_call_execution_context(
-                    self._mcp_gate_execution_context(tool_call, context, runtime)
+                with (
+                    bind_tool_call_execution_context(
+                        self._mcp_gate_execution_context(tool_call, context, runtime)
+                    ),
+                    self._bind_result_card_context(tool_call, tools, runtime),
                 ):
                     result = await runtime.run_tool_call(
                         lambda: self._execute_tool(tool_call, tools, context=context)
@@ -7225,6 +7234,32 @@ class ReActPattern(AgentPattern):
                 str(tool_call.get("step_id")) if tool_call.get("step_id") else None
             ),
             dag_step_id=str(dag_step_id) if dag_step_id else None,
+        )
+
+    def _bind_result_card_context(
+        self, tool_call: dict[str, Any], tools: list[Any], runtime: PatternRuntime
+    ) -> AbstractContextManager[None]:
+        """Give ``show_result_card`` the connectors this run has used.
+
+        Only the card tool's own call pays for the ledger walk. A connector
+        counts once one of its tools completed without a failure result; the
+        ledger is checkpointed, so a run resumed after a pause keeps them.
+        """
+        if tool_call.get("name") != RESULT_CARD_TOOL_NAME:
+            return nullcontext()
+        invoked: set[str] = set()
+        for record in self.tool_ledger.values():
+            if record.status != "completed" or not tool_result_succeeded(record.result):
+                continue
+            tool = self._match_tool(record.tool_name, tools)
+            source = getattr(getattr(tool, "metadata", None), "source_server", None)
+            if source:
+                invoked.add(str(source))
+        return bind_run_display_context(
+            RunDisplayContext(
+                invoked_connectors=frozenset(invoked),
+                send_message=runtime.send_message,
+            )
         )
 
     def _with_runtime_turn_id(

@@ -60,6 +60,7 @@ from .base import (
     AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
     BINDING_AUTHORIZED_CATEGORIES,
     INTRINSIC_TOOL_NAMES,
+    OPTIONAL_INTRINSIC_TOOL_NAMES,
 )
 
 logger = logging.getLogger(__name__)
@@ -776,7 +777,10 @@ class _SpecByCategories(ToolSelectionSpec):
             # This runs ahead of any injection-only scoping too, so an
             # unconfigured workforce-manager spec also gets it; harmless, as the
             # tool is read-only and grants no new capability.
-            if tool_name in INTRINSIC_TOOL_NAMES:
+            if (
+                tool_name in INTRINSIC_TOOL_NAMES
+                or tool_name in OPTIONAL_INTRINSIC_TOOL_NAMES
+            ):
                 names.add(tool_name)
                 continue
 

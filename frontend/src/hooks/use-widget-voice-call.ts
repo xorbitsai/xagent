@@ -10,6 +10,20 @@ import {
 import { VoiceTurns, type VoicePhase } from "@/lib/voice-conversation"
 import type { VoiceCall, VoiceReplyMessage } from "@/hooks/use-voice-call"
 
+/** Task states in which a widget page holds a call's spoken words back, as the signed-in call does. */
+export const WIDGET_VOICE_BUSY_TASK_STATUSES = ["running", "pending", "pause_requested", "resume_requested"]
+
+/**
+ * The request id of the question the conversation's own task is waiting on,
+ * which spoken words answer as typed ones do; undefined otherwise.
+ */
+export function widgetVoiceAnswerRequestId(
+  task: { id: string; status: string; waitingRequestId?: string } | null | undefined,
+  taskId: number | null,
+): string | undefined {
+  return task?.status === "waiting_for_user" && task.id === String(taskId) ? task.waitingRequestId : undefined
+}
+
 /** Which transport refusals a state-table row stands for. */
 type TransportMatch =
   | { kind: "asr_error"; codes: string[] }
@@ -38,8 +52,8 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 1, event: "call button pressed", result: "audio unlocked in the click, then the microphone, then recognition" },
   { row: 2, event: "call button pressed while busy", result: "error, try later, retryable" },
   { row: 3, event: "microphone refused or missing", result: "error naming the microphone, no backend request" },
-  { row: 4, event: "recognition closed 4003 (credential, voice switch or recheck refused)", result: "unavailable, not retryable",
-    match: [{ kind: "asr_close", codes: [4003] }], failure: "voice_unavailable" },
+  { row: 4, event: "recognition closed 4003, or Session 4403 (credential, voice switch or recheck refused)", result: "unavailable, not retryable",
+    match: [{ kind: "asr_close", codes: [4003, 4403] }], failure: "voice_unavailable" },
   { row: 5, event: "recognition refused as busy (error frame) or closed 1008 busy or rate limited", result: "busy, retryable",
     match: [
       { kind: "asr_error", codes: ["voice_busy"] },
@@ -63,10 +77,10 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 12, event: "sending the words failed", result: "call ends, fixed send-failed text, retryable" },
   { row: 13, event: "one sentence could not be synthesized", result: "call continues with a playback note",
     match: [{ kind: "tts_response", statuses: [400, 422, 500, 502, 504] }] },
-  { row: 14, event: "synthesis 401 / 403", result: "unavailable, not retryable",
+  { row: 14, event: "synthesis 401 / 403 (for a Session 401: when the request's one retry is refused too, the token's replacement failed, or a new conversation is being set up)", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [401, 403] }], failure: "voice_unavailable" },
-  { row: 15, event: "synthesis 402 (usage limit)", result: "unavailable, not retryable",
-    match: [{ kind: "tts_response", statuses: [402] }], failure: "voice_unavailable" },
+  { row: 15, event: "synthesis 402 (usage limit), or 404 (the session widget API switched off)", result: "unavailable, not retryable",
+    match: [{ kind: "tts_response", statuses: [402, 404] }], failure: "voice_unavailable" },
   { row: 16, event: "synthesis 503, or 400 with model_unavailable", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [503] }, { kind: "tts_response", statuses: [400], codes: ["model_unavailable"] }],
     failure: "voice_unavailable" },
@@ -77,6 +91,11 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 20, event: "task id changes from a number to anything else", result: "hang up and close the bar" },
   { row: 21, event: "start pressed again during a call", result: "ignored" },
   { row: 22, event: "voice switched off during a call", result: "server closes recognition within 30 s, error (row 4)" },
+  { row: 23, event: "Session recognition closed 4401 (token refused, or the session is gone)", result: "error, retryable; in an ordinary conversation the page replaces the refused token, once for that token",
+    match: [{ kind: "asr_close", codes: [4401] }], failure: "connection_failed" },
+  { row: 24, event: "Session recognition closed 4408 (the session expired)",
+    result: "unavailable, not retryable; the session page ends the session as expired, as it does when the chat socket is closed 4408",
+    match: [{ kind: "asr_close", codes: [4408] }], failure: "voice_unavailable" },
 ]
 
 function matches(match: TransportMatch, event: VoiceTransportEvent): boolean {

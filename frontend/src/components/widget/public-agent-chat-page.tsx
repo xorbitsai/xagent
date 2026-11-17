@@ -12,7 +12,7 @@ import { useWidgetOpenMessage, W_SEND_FAILED } from "@/hooks/use-widget-open-mes
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { VoiceCallStoreProvider } from "@/contexts/voice-call-store"
-import { classifyWidgetVoiceEvent } from "@/hooks/use-widget-voice-call"
+import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES, widgetVoiceAnswerRequestId } from "@/hooks/use-widget-voice-call"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
@@ -52,14 +52,17 @@ type PublicAuthResult = {
 // A voice call is offered only to an embedded widget whose server said so,
 // and only where the page can use the microphone: as a top-level page, or in
 // an iframe the host page opted into voice for (widget.js then adds voice=1).
+// voice=1 is an unsigned hint that any page can add to the URL itself. It
+// only says the embedder delegated the microphone to this iframe and is not a
+// permission: whether voice calls are offered is decided by the server
+// (voice_enabled in the login response), and the voice endpoints check again
+// on every request.
 function widgetVoiceCallOffered(authMode: "widget" | "share", voiceEnabled: boolean | null | undefined): boolean {
   if (authMode !== "widget" || voiceEnabled !== true) return false
   let topLevel = false
   try { topLevel = window.self === window.top } catch { topLevel = false }
   return topLevel || new URLSearchParams(window.location.search).get("voice") === "1"
 }
-
-const WIDGET_VOICE_TASK_STATUSES_BUSY = ["running", "pending", "pause_requested", "resume_requested"]
 
 interface PublicConversationContentProps {
   authMode: "widget" | "share"
@@ -487,16 +490,13 @@ function PublicConversationContent({
   const voiceBusy = state.taskId === null
     ? isBootstrappingTask || isSendInFlight
     : state.isProcessing || isMessageDeliveryPending || !isConnected || isSendInFlight
-      || WIDGET_VOICE_TASK_STATUSES_BUSY.includes(taskStatus)
+      || WIDGET_VOICE_BUSY_TASK_STATUSES.includes(taskStatus)
   const voiceDisabled = state.taskId !== null && connectionPhase === "lost"
   // Spoken words are sent exactly as the composer sends typed ones: with the
   // call's client message id, and answering the question the task is waiting
   // on (the same request id the conversation panel hands the composer).
   const sendSpoken = useCallback((text: string, clientMessageId: string) => {
-    const task = state.currentTask
-    const requestId = task?.status === "waiting_for_user" && task.id === String(state.taskId)
-      ? task.waitingRequestId
-      : undefined
+    const requestId = widgetVoiceAnswerRequestId(state.currentTask, state.taskId)
     return handleSend(text, { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }, [])
   }, [handleSend, state.currentTask, state.taskId])
   const openVoiceCall = useCallback(() => setVoiceOpen(true), [])

@@ -65,7 +65,10 @@ function Harness(props: HarnessProps) {
 }
 const call = () => latest.call!
 
+const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices")
+const foundMediaDevices: Array<PropertyDescriptor | undefined> = []
 beforeEach(() => {
+  foundMediaDevices.push(Object.getOwnPropertyDescriptor(navigator, "mediaDevices"))
   order.length = 0
   Socket.instances = []
   latest.call = null
@@ -89,7 +92,11 @@ beforeEach(() => {
   })
   Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } })
 })
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.clearAllMocks() })
+afterEach(() => {
+  cleanup(); vi.unstubAllGlobals(); vi.clearAllMocks()
+  if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices)
+  else delete (navigator as { mediaDevices?: unknown }).mediaDevices
+})
 
 /** Open a call and let recognition start; returns the render and the socket. */
 async function connected(props: HarnessProps = {}) {
@@ -167,7 +174,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(Socket.instances).toHaveLength(0)
     expect(fetchMock).not.toHaveBeenCalled()
   },
-  4: closes([[4003, ""]], "unavailable", false),
+  4: closes([[4003, ""], [4403, ""], [4403, "Voice is not available for this chat"]], "unavailable", false),
   5: closes([[1008, "Voice is busy"], [1008, "Too many requests"]], "busy", true),
   6: errorFrames(["voice_budget_exhausted"], "temporarilyUnavailable", true),
   7: errorFrames(["voice_unavailable", "model_unavailable", "invalid_request"], "unavailable", false),
@@ -204,7 +211,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(Socket.instances[0].close).not.toHaveBeenCalled()
   },
   14: synthesis([401, 403], "unavailable", false),
-  15: synthesis([402], "unavailable", false),
+  15: synthesis([402, 404], "unavailable", false),
   16: synthesis([503], "unavailable", false),
   17: synthesis([429], "temporarilyUnavailable", true),
   18: async () => {
@@ -257,11 +264,17 @@ const scenarios: Record<number, () => Promise<void>> = {
     act(() => socket.onclose!({ code: 4003, reason: "" }))
     expectStopped("unavailable", false)
   },
+  // The Session page replaces the rejected token inside its transport; the
+  // call itself only ends retryable.
+  23: closes([[4401, ""]], "connectionEnded", true),
+  // The Session page ends the session as expired from its own close listener;
+  // the call itself ends unavailable, with nothing to retry.
+  24: closes([[4408, "Voice is unavailable"]], "unavailable", false),
 }
 
 describe("widget voice call state table", () => {
-  it("has one scenario for each of its 22 rows", () => {
-    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(22)
+  it("has one scenario for each of its 24 rows", () => {
+    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(24)
     expect(Object.keys(scenarios).map(Number)).toEqual(WIDGET_VOICE_CALL_STATES.map(row => row.row))
   })
 
@@ -412,5 +425,14 @@ describe("widget voice call around the conversation", () => {
     view.rerender(<Harness messages={[{ id: "a1", role: "assistant", content: "a".repeat(2500), isResult: true, status: "completed" }]} />)
     await waitFor(() => expect(requestTts).toHaveBeenCalledTimes(3))
     expect(requestTts.mock.calls.map(([text]) => (text as string).length)).toEqual([1000, 1000, 500])
+  })
+})
+
+// What each test found in navigator.mediaDevices before it replaced it. Every
+// test here replaces it, so the previous test's clean-up shows only here.
+describe("the test stubs", () => {
+  it("leave navigator.mediaDevices as they found it", () => {
+    expect(foundMediaDevices.length).toBeGreaterThan(1)
+    expect(foundMediaDevices).toEqual(foundMediaDevices.map(() => originalMediaDevices))
   })
 })

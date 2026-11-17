@@ -533,6 +533,18 @@ import {
 } from "@/hooks/use-websocket"
 import { ResendWaiters, mayResend, sendWithResend, type ResendOwnership } from "./chat-delivery-resend"
 import { deriveConnectionNotice, type ConnectionNotice } from "./connection-notice"
+import {
+  MESSAGE_QUEUE_LIMIT,
+  classifyQueuedSendFailure,
+  decideComposerSubmit,
+  initialMessageQueueState,
+  isBusyRefusal,
+  transitionMessageQueue,
+  type MessageQueueEvent,
+  type MessageQueueState,
+  type ObservedTaskState,
+} from "./session-message-queue"
+import { toast } from "@/components/ui/sonner"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, isInputReviewErrorCode, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
@@ -1693,12 +1705,14 @@ export interface AppState {
   // Current context-window usage from the latest LLM call, for the usage gauge.
   contextUsage: { tokens: number; threshold: number } | null
   sessionConversation: SessionConversationState
+  messageQueue: MessageQueueState
 }
 
 type AppAction =
   | { type: "SET_STREAM_RECOVERY"; payload: number | null }
   | { type: "RECONCILE_STREAM_OUTPUT"; payload: { runId: string; output: string; timestamp: string; interrupted: boolean } }
   | { type: "SESSION_CONVERSATION"; payload: SessionConversationAction }
+  | { type: "SET_MESSAGE_QUEUE"; payload: MessageQueueState }
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADOPT_SESSION_TASK"; payload: { taskId: number; task: Task } }
   | { type: "RESET_SESSION_CONVERSATION" }
@@ -1783,6 +1797,7 @@ export const createInitialState = (): AppState => ({
   isHistoryLoading: false,
   contextUsage: null,
   sessionConversation: { ...initialSessionConversationState },
+  messageQueue: initialMessageQueueState,
 })
 
 function settlementTargetMessageIndex(
@@ -1841,6 +1856,8 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
           action.payload,
         ),
       }
+    case "SET_MESSAGE_QUEUE":
+      return { ...state, messageQueue: action.payload }
     case "SET_HISTORY_LOADING":
       return { ...state, isHistoryLoading: action.payload }
 
@@ -2754,10 +2771,32 @@ export type SessionConversationAttachment = "pending" | "attached" | "unsupporte
 // Whether the Session server said, in the capabilities frame of the latest
 // connection that sent one, that it takes chat frames declared as new turns.
 // It is not reset when a connection drops: only the next capabilities frame
-// changes it, and "unknown" until one has arrived. The value is for display;
-// a send that carries a declaration also checks that the connection which
-// reported it is the current one.
+// changes it, and "unknown" until one has arrived. It is exposed for display,
+// and the message queue reads it to decide whether to hold and send queued
+// messages. A send that carries a declaration additionally requires
+// that the connection which reported "supported" is the current one, so this
+// value alone does not authorize a send.
 export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
+
+export interface SessionMessageQueueControls {
+  state: MessageQueueState
+  /**
+   * Runs `send` now, or holds `text` to be sent once the turn in progress has
+   * ended. Throws what `send` throws, and for a message that cannot be held a
+   * refusal the queue has already told the visitor about. A held message is
+   * later sent through the provider's own send function, not the `send`
+   * passed in here, carrying only its text, a message id and a new-turn
+   * declaration.
+   */
+  submit: (
+    text: string,
+    options: { hasFiles: boolean; clientMessageId?: string },
+    send: () => void | Promise<void>,
+  ) => Promise<"sent" | "queued">
+  continueSending: () => void
+  remove: (clientMessageId: string) => void
+  clear: () => void
+}
 
 interface AppContextType {
   state: AppState
@@ -2793,6 +2832,7 @@ interface AppContextType {
   sessionConversationState: SessionConversationState["phase"]
   sessionConversationAttachment: SessionConversationAttachment
   newTurnDelivery: NewTurnDeliveryCapability
+  messageQueue: SessionMessageQueueControls | null
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
   getFilePreviewUrl: (fileId: string) => string
@@ -2825,6 +2865,12 @@ export interface AppProviderTransportCapabilities {
   // explicitly asks for it gets a stop control, because only the delegated
   // session endpoint reads a stop frame at all.
   taskStop?: TransportCapabilityState
+  // Default-closed too: only a Session page that wants messages sent while a
+  // turn is running held and sent in order asks for it. It takes effect only
+  // on a connection whose Session server accepts declared new turns. A
+  // page is expected to keep it unchanged while the provider is mounted:
+  // nothing handles it being switched off while messages are held.
+  messageQueue?: TransportCapabilityState
 }
 
 export interface AppProviderTransportConfig {
@@ -3160,6 +3206,47 @@ export function AppProvider({
     newTurnDeliveryConnectionRef.current = connectionIdentity
     if (mountedRef.current) setNewTurnDelivery(next)
   }, [])
+
+  // The page asks for a queue, the transport is taskless, and the Session
+  // server said on this connection that it takes declared new turns. Without
+  // the last one every submit goes out exactly as before.
+  const messageQueueOffered =
+    transport?.capabilities?.messageQueue === "enabled"
+    && sessionTransport?.allowTasklessChat === true
+  const messageQueueOfferedRef = useRef(messageQueueOffered)
+  messageQueueOfferedRef.current = messageQueueOffered
+  const messageQueueActive = messageQueueOffered && newTurnDelivery === "supported"
+  // The same condition read from the refs, for code that runs across an await.
+  const isMessageQueueOn = useCallback(
+    () => messageQueueOfferedRef.current && newTurnDeliveryRef.current === "supported",
+    [],
+  )
+  const nextQueuedSeqRef = useRef(0)
+  const translateRef = useRef(t)
+  translateRef.current = t
+  const readObservedTaskState = useCallback((): ObservedTaskState => {
+    const taskId = sessionTaskIdRef.current
+    const entry = taskId === null ? undefined : taskStateVersionsRef.current.get(taskId)
+    return { version: entry?.version, status: entry?.status }
+  }, [])
+  // Every change to the queue goes through here, except that a confirmed new
+  // conversation drops the queue along with the rest of the reset state.
+  // Without a current server declaration only what ends or empties the queue
+  // gets through. It computes from
+  // stateRef, which dispatch updates synchronously, so two calls in a row each
+  // see the state the one before left.
+  const applyMessageQueue = useCallback((event: MessageQueueEvent) => {
+    if (!messageQueueOfferedRef.current) return
+    if (
+      newTurnDeliveryRef.current !== "supported"
+      && event.type !== "REMOVE" && event.type !== "CLEAR" && event.type !== "SUPPORT_LOST"
+    ) return
+    const current = stateRef.current.messageQueue
+    const { next, effect } = transitionMessageQueue(current, event)
+    if (next !== current) dispatch({ type: "SET_MESSAGE_QUEUE", payload: next })
+    if (effect === "send_failed") toast.error(translateRef.current("messageQueue.held.sendFailed"))
+    if (effect === "support_lost") toast.error(translateRef.current("messageQueue.supportLost"))
+  }, [dispatch])
 
   const rejectSessionResetFlight = useCallback(
     (
@@ -3538,10 +3625,12 @@ export function AppProvider({
             ? "declared"
             : "absent",
         })
+        const takesNewTurns = capabilities.includes("delivery_new_turn")
         writeNewTurnDelivery(
-          capabilities.includes("delivery_new_turn") ? "supported" : "unsupported",
+          takesNewTurns ? "supported" : "unsupported",
           sessionMessageOwner.connectionIdentity,
         )
+        if (!takesNewTurns) applyMessageQueue({ type: "SUPPORT_LOST" })
       }
       : undefined,
     onConnect: onConnect, // Pass the callback
@@ -7548,6 +7637,7 @@ export function AppProvider({
       for (const bufferedFrame of bufferedFrames) {
         handleSessionMessage(bufferedFrame, owner)
       }
+      applyMessageQueue({ type: "OBSERVE", observed: readObservedTaskState(), snapshot: false })
       return
     }
 
@@ -7587,6 +7677,11 @@ export function AppProvider({
     handleMessage(message, dispatch, stateRef.current, {
       skipHistory: true,
       filesDisabled,
+    })
+    applyMessageQueue({
+      type: "OBSERVE",
+      observed: readObservedTaskState(),
+      snapshot: message.type === "task_stream_snapshot",
     })
   }
 
@@ -7780,6 +7875,9 @@ export function AppProvider({
     }
 
     if (sessionTransport?.allowTasklessChat) {
+      // Read before anything below can wait: where the turn this send starts
+      // will be measured from.
+      const sinceVersion = readObservedTaskState().version
       if (!sessionDeliveryOwner) {
         throw new MessageDeliveryError(
           "Message not sent: the Session connection is not ready.",
@@ -7878,6 +7976,11 @@ export function AppProvider({
           })
           if (!transition.accepted) return
           activateSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
+        }
+        // Defensive, like the check in submitQueuedMessage: a new conversation
+        // is refused while this delivery is in flight.
+        if (sessionDeliveryOwner.deliveryGeneration === deliveryGenerationRef.current) {
+          applyMessageQueue({ type: "DELIVERY_ACCEPTED", clientMessageId, sinceVersion })
         }
         addOptimisticUserMessage(state.taskId)
       } catch (error) {
@@ -8306,6 +8409,7 @@ export function AppProvider({
       addOptimisticUserMessage(state.taskId)
     }
   }, [
+    applyMessageQueue,
     beginSessionMessageDelivery,
     beginSessionPreAdoptionBuffer,
     activateSessionPreAdoptionBuffer,
@@ -8314,6 +8418,7 @@ export function AppProvider({
     endSessionMessageDelivery,
     filesDisabled,
     queuePendingMessage,
+    readObservedTaskState,
     sendChatWithResend,
     sessionTransport,
     state.currentTask?.status,
@@ -8339,6 +8444,49 @@ export function AppProvider({
       if (mountedRef.current) setSendCallsInFlight(sendCallsInFlightRef.current)
     }
   }, [sendMessage])
+
+  const submitQueuedMessage = useCallback<SessionMessageQueueControls["submit"]>(async (text, options, send) => {
+    const queueOn = isMessageQueueOn()
+    const decision = decideComposerSubmit(stateRef.current.messageQueue, {
+      active: queueOn && sessionConversationRef.current.phase === "bound",
+      deliveryInFlight: messageDeliveryCountRef.current > 0,
+      hasFiles: options.hasFiles,
+    })
+    const refuse = (): never => {
+      toast.error(options.hasFiles
+        ? translateRef.current("messageQueue.filesNotQueued")
+        : translateRef.current("messageQueue.full", { count: MESSAGE_QUEUE_LIMIT }))
+      throw Object.assign(new Error("The message cannot be queued."), { notificationHandled: true })
+    }
+    const item = {
+      clientMessageId: options.clientMessageId || generateClientMessageId(),
+      text,
+      seq: nextQueuedSeqRef.current++,
+      status: "waiting" as const,
+    }
+    if (decision === "refuse_files" || decision === "refuse_full") refuse()
+    if (decision === "queue") {
+      applyMessageQueue({ type: "ENQUEUE", item })
+      return "queued"
+    }
+    const sinceVersion = readObservedTaskState().version
+    const generation = deliveryGenerationRef.current
+    try {
+      await send()
+      return "sent"
+    } catch (error) {
+      // A direct send refused only because a turn is running joins the queue,
+      // provided the queue is still on now: a capabilities frame that arrived
+      // during the send may have withdrawn it, and then the refusal goes back
+      // to the caller unchanged.
+      // The generation check is defensive: a new conversation is refused while
+      // a delivery is in flight, so it cannot have changed under this send.
+      if (!queueOn || !isMessageQueueOn() || !isBusyRefusal(error) || generation !== deliveryGenerationRef.current) throw error
+      if (options.hasFiles || stateRef.current.messageQueue.items.length >= MESSAGE_QUEUE_LIMIT) refuse()
+      applyMessageQueue({ type: "REQUEUE_REFUSED", item, sinceVersion })
+      return "queued"
+    }
+  }, [applyMessageQueue, isMessageQueueOn, readObservedTaskState])
 
   const startNewConversation = useCallback((): Promise<void> => {
     const existingReset = sessionResetFlightRef.current
@@ -8658,6 +8806,51 @@ export function AppProvider({
           ? "attached"
           : "pending"
 
+  // Sends the head of the queue once the turn it waited for has ended. The
+  // server decides on it: a refusal sends it back to waiting or stops the queue.
+  useEffect(() => {
+    const queued = stateRef.current.messageQueue
+    const head = queued.items[0]
+    if (
+      !messageQueueActive
+      || queued.phase.kind !== "ready"
+      || head?.status !== "waiting"
+      || !mountedRef.current
+      || !isConnected
+      || !sessionConnectionIdentityRef.current
+      || sessionConversationRef.current.phase !== "bound"
+      || sessionConversationAttachment === "pending"
+      || messageDeliveryCountRef.current !== 0
+      || newTurnDeliveryRef.current !== "supported"
+    ) return
+    applyMessageQueue({
+      type: "SEND_STARTED",
+      clientMessageId: head.clientMessageId,
+      sinceVersion: readObservedTaskState().version,
+    })
+    trackedSendMessage(head.text, { clientMessageId: head.clientMessageId, delivery: "new_turn" }).catch((error: unknown) => {
+      if (!mountedRef.current) return
+      const { verdict, replaceId } = classifyQueuedSendFailure(error)
+      applyMessageQueue({
+        type: "SEND_FAILED",
+        clientMessageId: head.clientMessageId,
+        verdict,
+        ...(replaceId ? { newClientMessageId: generateClientMessageId() } : {}),
+      })
+    })
+  }, [
+    applyMessageQueue,
+    isConnected,
+    messageDeliveryCount,
+    messageQueueActive,
+    readObservedTaskState,
+    sessionConnectionIdentity,
+    sessionConversationAttachment,
+    state.messageQueue,
+    state.sessionConversation.phase,
+    trackedSendMessage,
+  ])
+
   return (
     <AgentCardPresentationCapability.Provider value={agentCardsEnabled}>
       <LinksOpenInNewTabCapability.Provider value={linksOpenInNewTab}>
@@ -8694,6 +8887,15 @@ export function AppProvider({
           sessionConversationState: state.sessionConversation.phase,
           sessionConversationAttachment,
           newTurnDelivery,
+          messageQueue: messageQueueOffered
+            ? {
+              state: state.messageQueue,
+              submit: submitQueuedMessage,
+              continueSending: () => applyMessageQueue({ type: "CONTINUE" }),
+              remove: (clientMessageId) => applyMessageQueue({ type: "REMOVE", clientMessageId }),
+              clear: () => applyMessageQueue({ type: "CLEAR" }),
+            }
+            : null,
           setTaskId,
           requestStatus,
           getFilePreviewUrl,

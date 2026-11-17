@@ -45,6 +45,13 @@ const en = {
     autoResumeStoppedCancelled: "Automatic resume was cancelled. Click resume to continue.",
     autoResumeStoppedIneligible: "This task cannot resume automatically. Click resume to continue.",
   },
+  messageQueue: {
+    held: { sendFailed: "Some queued messages could not be sent." },
+    supportLost: "Queued messages can't be sent automatically right now. If one already appears in the conversation, it was sent.",
+    full: "You can queue up to {count} messages.",
+    filesNotQueued: "A message with files can't be queued. Send it after this response finishes.",
+    waitingAnswer: "Answer the question above and the queued messages will follow.",
+  },
   clientErrors: {
     executionQueueFull: "The team execution queue is full. Please retry shortly.",
     messageProcessingFailed: "The message could not be processed. Please try again.",

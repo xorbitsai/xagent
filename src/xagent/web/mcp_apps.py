@@ -337,7 +337,7 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     return "unconnectable"
 
 
-def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
+def _app_to_dict(app: "PublicMCPApp | CatalogRow") -> Dict[str, Any]:
     # One registry scan (not two - see the helper's own docstring) since
     # this runs per app on the connector-listing path.
     execution_fields, optional_oauth_scopes = (
@@ -442,18 +442,35 @@ def get_all_mcp_apps(
 
 
 @dataclass(frozen=True)
-class CatalogEntry:
-    """Session-independent copy of one catalog row.
+class CatalogRow:
+    """Plain copy of the ``PublicMCPApp`` columns ``_app_to_dict`` reads.
 
-    ``row`` is a transient (never session-attached) ``PublicMCPApp`` built from
-    copies of the stored columns, so it stays valid after the session that
-    loaded it is closed. The canonical ``_app_to_dict`` view is computed only
-    for the entries a lookup actually matches (it is the costly part).
+    Deliberately not a ``PublicMCPApp``: the model is only constructed where a
+    row is created (see ``test_production_association_creation_paths_share_the_
+    model_default``), and a copy that is never attached to a session stays valid
+    after the session that loaded it is closed.
     """
 
     app_id: str
+    name: str
+    description: str | None
+    icon: str | None
+    transport: str
+    provider_name: str | None
+    category: str | None
+    oauth_scopes: Any
+    launch_config: Any
+    is_visible_in_connector: bool
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    """One copied catalog row. The canonical ``_app_to_dict`` view is computed
+    only for the entries a lookup matches (it is the costly part)."""
+
+    app_id: str
     row_name: str
-    row: PublicMCPApp
+    row: CatalogRow
 
     def app(self) -> Dict[str, Any]:
         return _app_to_dict(self.row)
@@ -461,12 +478,22 @@ class CatalogEntry:
 
 def load_catalog_entries(db: Session) -> tuple[CatalogEntry, ...]:
     """Copy the whole catalog once (one query)."""
-    columns = [column.key for column in PublicMCPApp.__table__.columns]
     return tuple(
         CatalogEntry(
             str(app.app_id),
             str(app.name),
-            PublicMCPApp(**{key: deepcopy(getattr(app, key)) for key in columns}),
+            CatalogRow(
+                app_id=str(app.app_id),
+                name=str(app.name),
+                description=app.description,
+                icon=app.icon,
+                transport=app.transport,
+                provider_name=app.provider_name,
+                category=app.category,
+                oauth_scopes=deepcopy(app.oauth_scopes),
+                launch_config=deepcopy(app.launch_config),
+                is_visible_in_connector=bool(app.is_visible_in_connector),
+            ),
         )
         for app in db.query(PublicMCPApp).all()
     )

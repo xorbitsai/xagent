@@ -208,7 +208,10 @@ def _editable_workforce(
 ) -> Workforce:
     user = db.get(User, caller.user_id)
     if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
+        # The login check read this user; it is gone only if it was deleted
+        # since. 404, as the agent routes answer when the owned lookup finds
+        # nothing.
+        raise HTTPException(status_code=404, detail="User not found")
     workforce = db.get(Workforce, workforce_id)
     if workforce is None:
         raise HTTPException(status_code=404, detail="Workforce not found")

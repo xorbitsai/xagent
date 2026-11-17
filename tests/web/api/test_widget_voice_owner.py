@@ -494,6 +494,35 @@ def test_owner_put_checks_access_again_before_writing(
         assert read() is False
 
 
+@pytest.mark.parametrize(
+    "entity, detail", [("agent", "Agent not found"), ("workforce", "User not found")]
+)
+@pytest.mark.parametrize(
+    "method, value", [("get", None), ("put", True), ("put", False)]
+)
+def test_owner_voice_answers_404_when_the_caller_is_gone(
+    entity, detail, method, value, provider, monkeypatch
+) -> None:
+    """The caller's row deleted after the login check: 404 on both routes, the
+    provider is not asked, and nothing is written."""
+    _register("bob")
+    path, read, _ = _agent_target(entity)
+    headers = _login_as("bob")
+
+    def gone(cls, user):
+        return cls(user_id=999_999, is_admin=bool(user.is_admin))
+
+    monkeypatch.setattr(widget_voice_switch.OwnerCaller, "of", classmethod(gone))
+    if method == "get":
+        response = client.get(path, headers=headers)
+    else:
+        response = client.put(path, headers=headers, json={"enabled": value})
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == detail
+    assert provider.calls == []
+    assert read() is False
+
+
 # ----- the old owner entry points still do not take the switch -----
 # (see test_widget_voice_admin.py::test_owner_endpoints_leave_the_switch_off)
 

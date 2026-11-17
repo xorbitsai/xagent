@@ -109,3 +109,48 @@ export interface DeployAgentEmbedExtensionProps {
 
 export type DeployAgentEmbedExtensionComponent =
   ComponentType<DeployAgentEmbedExtensionProps>
+
+// Agent the channel extension acts on; a subset of the chat header's agent.
+// The header only renders its action once the agent details have loaded, and
+// the Deploy dialog receives the caller's agent, so these are real values.
+export interface AgentChannelAgent {
+  id: number
+  name: string
+  description: string
+  logo_url: string | null
+  status: string
+}
+
+// Extra deployment channel (for example a chat integration) offered by the
+// agent chat header and the Deploy dialog. The OSS default renders nothing.
+export interface AgentChannelExtensionProps {
+  agent: AgentChannelAgent
+}
+
+// Header action rendered next to Routines; `onOpen` opens the Deploy dialog
+// directly on the channel view.
+export interface AgentChannelHeaderActionProps extends AgentChannelExtensionProps {
+  onOpen: () => void
+}
+export type AgentChannelHeaderActionComponent =
+  ComponentType<AgentChannelHeaderActionProps>
+
+// Option card rendered first in the Deploy dialog's options grid.
+export interface AgentChannelOptionProps extends AgentChannelExtensionProps {
+  onOpen: () => void
+}
+export type AgentChannelOptionComponent = ComponentType<AgentChannelOptionProps>
+
+// Full replacement for the Deploy dialog's `DialogContent` while the channel
+// view is active. Contract:
+// - render its own `DialogContent` (or portal/overlay/content equivalent);
+// - include a `DialogTitle` and `DialogDescription`, so Radix does not warn and
+//   screen readers get a dialog name;
+// - own the back (`onBack`) and close (`onClose`) controls;
+// - own any deployment-config error UI it needs: the dialog's default
+//   `DeploymentConfigErrorAlert` is not rendered in this view.
+export interface AgentChannelViewProps extends AgentChannelExtensionProps {
+  onBack: () => void
+  onClose: () => void
+}
+export type AgentChannelViewComponent = ComponentType<AgentChannelViewProps>

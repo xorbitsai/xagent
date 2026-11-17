@@ -27,6 +27,7 @@ import {
   type DeploymentConfig,
 } from "@/lib/deployment-config"
 import { DeployAgentEmbedExtension } from "@/lib/deploy-agent-extension"
+import { AgentChannelOption, AgentChannelView } from "@/lib/agent-channel-extension"
 import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, rotateAgentWidgetKey, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 export interface Agent {
@@ -64,11 +65,14 @@ interface DeployAgentDialogProps {
   // so this dialog never nests its own Radix Dialog.
   onManageApiKey?: () => void
   onManageTriggers?: () => void
+  // "channel" opens the extension channel view (see lib/agent-channel-extension).
+  // Read on mount only: an always-mounted caller changing it later has no effect.
+  initialView?: "options" | "channel"
 }
 
-export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey, onManageTriggers }: DeployAgentDialogProps) {
+export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey, onManageTriggers, initialView = "options" }: DeployAgentDialogProps) {
   const { t } = useI18n()
-  const [activeView, setActiveView] = useState<"options" | "embed" | "api" | "share">("options")
+  const [activeView, setActiveView] = useState<"options" | "embed" | "api" | "share" | "channel">(initialView)
   const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
   const [copiedSnippet, setCopiedSnippet] = useState(false)
   const [copiedShareLink, setCopiedShareLink] = useState(false)
@@ -472,263 +476,277 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   return (
     <Dialog open={deployAgent !== null} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Rocket className="h-5 w-5" />
-            {t("deploy_agent.title") || "Deploy Agent"}
-          </DialogTitle>
-          <DialogDescription>{deployAgent?.name}</DialogDescription>
-        </DialogHeader>
+      {activeView === "channel" && deployAgent ? (
+        <AgentChannelView
+          agent={deployAgent}
+          onBack={() => setActiveView("options")}
+          onClose={() => handleOpenChange(false)}
+        />
+      ) : (
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Rocket className="h-5 w-5" />
+              {t("deploy_agent.title") || "Deploy Agent"}
+            </DialogTitle>
+            <DialogDescription>{deployAgent?.name}</DialogDescription>
+          </DialogHeader>
 
-        {deploymentConfigFailed && (
-          <DeploymentConfigErrorAlert onRetry={retryDeploymentConfig} />
-        )}
+          {deploymentConfigFailed && (
+            <DeploymentConfigErrorAlert onRetry={retryDeploymentConfig} />
+          )}
 
-        {activeView === "options" ? (
-          <div className="mt-6">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {deploymentOptions.map((option) => (
-                <Card
-                  key={option.id}
-                  className={option.className}
-                  onClick={option.onClick}
-                >
-                  <CardHeader>
-                    <div className={`h-10 w-10 rounded-lg ${option.iconBg} flex items-center justify-center mb-2`}>
-                      <option.icon className={`h-5 w-5 ${option.iconColor}`} />
-                    </div>
-                    <CardTitle className="text-base font-semibold">{option.title}</CardTitle>
-                    <CardDescription className="text-xs mt-1">
-                      {option.desc}
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <div className={`text-sm ${option.actionColor} font-medium flex items-center`}>
-                      {option.actionText} <ArrowRight className="h-4 w-4 ml-1" />
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-          </div>
-        ) : activeView === "api" ? (
-          <div className="mt-4 space-y-4">
-            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
-              <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
-            </div>
-
-            <div className="space-y-1">
-              <div className="font-medium">{t("deploy_agent.api_panel.title") || "Call this agent via REST API"}</div>
-              <div className="text-sm text-muted-foreground">
-                {t("deploy_agent.api_panel.desc") || "Submit a task to the agent. Poll GET /v1/chat/tasks/{id} for the result."}
+          {activeView === "options" ? (
+            <div className="mt-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {deployAgent && (
+                  <AgentChannelOption
+                    agent={deployAgent}
+                    onOpen={() => setActiveView("channel")}
+                  />
+                )}
+                {deploymentOptions.map((option) => (
+                  <Card
+                    key={option.id}
+                    className={option.className}
+                    onClick={option.onClick}
+                  >
+                    <CardHeader>
+                      <div className={`h-10 w-10 rounded-lg ${option.iconBg} flex items-center justify-center mb-2`}>
+                        <option.icon className={`h-5 w-5 ${option.iconColor}`} />
+                      </div>
+                      <CardTitle className="text-base font-semibold">{option.title}</CardTitle>
+                      <CardDescription className="text-xs mt-1">
+                        {option.desc}
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                      <div className={`text-sm ${option.actionColor} font-medium flex items-center`}>
+                        {option.actionText} <ArrowRight className="h-4 w-4 ml-1" />
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
               </div>
             </div>
+          ) : activeView === "api" ? (
+            <div className="mt-4 space-y-4">
+              <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
+                <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
+              </div>
 
-            <div className="flex gap-1 border-b">
-              {(["curl", "python"] as ApiSnippetTab[]).map((tab) => (
-                <button
-                  key={tab}
-                  type="button"
-                  onClick={() => setApiTab(tab)}
-                  className={`px-3 py-1.5 text-sm font-medium border-b-2 -mb-px transition-colors ${apiTab === tab ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"}`}
-                >
-                  {tab === "curl" ? "cURL" : "Python"}
-                </button>
-              ))}
-            </div>
-
-            <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group">
-              <pre className="whitespace-pre-wrap break-all text-muted-foreground max-h-80 overflow-auto">
-                {apiSnippetTarget.baseUrl ? apiSnippets[apiTab] : "…"}
-              </pre>
-              <Button
-                variant="secondary"
-                size="icon"
-                className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
-                onClick={handleCopyApiSnippet}
-                disabled={!apiSnippetTarget.baseUrl}
-                title={t("deploy_agent.api_panel.copy_btn") || "Copy"}
-              >
-                {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
-              </Button>
-            </div>
-
-            <div className="text-sm text-muted-foreground">
-              {t("deploy_agent.api_panel.key_hint") || "Replace YOUR_API_KEY with this agent's API key."}{" "}
-              <button
-                type="button"
-                className="text-primary hover:underline font-medium"
-                onClick={() => onManageApiKey?.()}
-              >
-                {t("deploy_agent.api_panel.manage_key") || "Manage API Key"}
-              </button>
-            </div>
-          </div>
-        ) : activeView === "embed" ? (
-          <div className="mt-4 space-y-6">
-            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
-              <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
-            </div>
-
-            <div className="space-y-4 border rounded-lg p-4">
-              <div className="flex items-center justify-between">
-                <div className="space-y-0.5">
-                  <Label className="text-base">{t("deploy_agent.access_control.widget_enabled") || "Widget Enabled"}</Label>
-                  <div className="text-sm text-muted-foreground">
-                    {t("deploy_agent.access_control.widget_enabled_desc") || "Allow this widget to be accessed externally."}
-                  </div>
+              <div className="space-y-1">
+                <div className="font-medium">{t("deploy_agent.api_panel.title") || "Call this agent via REST API"}</div>
+                <div className="text-sm text-muted-foreground">
+                  {t("deploy_agent.api_panel.desc") || "Submit a task to the agent. Poll GET /v1/chat/tasks/{id} for the result."}
                 </div>
-                <Switch
-                  checked={deployAgent?.widget_enabled}
-                  onCheckedChange={(checked) => void handleUpdateWidgetConfig({ widget_enabled: checked })}
-                  disabled={isUpdatingWidget}
-                />
               </div>
 
-              {deployAgent?.widget_enabled && (
-                <div className="space-y-3 pt-4 border-t">
+              <div className="flex gap-1 border-b">
+                {(["curl", "python"] as ApiSnippetTab[]).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    onClick={() => setApiTab(tab)}
+                    className={`px-3 py-1.5 text-sm font-medium border-b-2 -mb-px transition-colors ${apiTab === tab ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+                  >
+                    {tab === "curl" ? "cURL" : "Python"}
+                  </button>
+                ))}
+              </div>
+
+              <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group">
+                <pre className="whitespace-pre-wrap break-all text-muted-foreground max-h-80 overflow-auto">
+                  {apiSnippetTarget.baseUrl ? apiSnippets[apiTab] : "…"}
+                </pre>
+                <Button
+                  variant="secondary"
+                  size="icon"
+                  className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
+                  onClick={handleCopyApiSnippet}
+                  disabled={!apiSnippetTarget.baseUrl}
+                  title={t("deploy_agent.api_panel.copy_btn") || "Copy"}
+                >
+                  {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+                </Button>
+              </div>
+
+              <div className="text-sm text-muted-foreground">
+                {t("deploy_agent.api_panel.key_hint") || "Replace YOUR_API_KEY with this agent's API key."}{" "}
+                <button
+                  type="button"
+                  className="text-primary hover:underline font-medium"
+                  onClick={() => onManageApiKey?.()}
+                >
+                  {t("deploy_agent.api_panel.manage_key") || "Manage API Key"}
+                </button>
+              </div>
+            </div>
+          ) : activeView === "embed" ? (
+            <div className="mt-4 space-y-6">
+              <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
+                <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
+              </div>
+
+              <div className="space-y-4 border rounded-lg p-4">
+                <div className="flex items-center justify-between">
                   <div className="space-y-0.5">
-                    <Label className="text-base">{t("deploy_agent.access_control.allowed_domains") || "Allowed Domains"}</Label>
+                    <Label className="text-base">{t("deploy_agent.access_control.widget_enabled") || "Widget Enabled"}</Label>
                     <div className="text-sm text-muted-foreground">
-                      {t("deploy_agent.access_control.allowed_domains_desc") || "Restrict widget access to specific domains. Use * for any domain."}
+                      {t("deploy_agent.access_control.widget_enabled_desc") || "Allow this widget to be accessed externally."}
                     </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <Input
-                      placeholder={t("deploy_agent.access_control.domain_placeholder") || "e.g. example.com"}
-                      value={newDomain}
-                      onChange={(e) => setNewDomain(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && void handleAddDomain()}
-                      disabled={isUpdatingWidget}
-                      className="flex-1"
-                    />
-                    <Button onClick={() => void handleAddDomain()} disabled={isUpdatingWidget || !newDomain.trim()}>
-                      {t("deploy_agent.access_control.add_btn") || "Add"}
+                  <Switch
+                    checked={deployAgent?.widget_enabled}
+                    onCheckedChange={(checked) => void handleUpdateWidgetConfig({ widget_enabled: checked })}
+                    disabled={isUpdatingWidget}
+                  />
+                </div>
+
+                {deployAgent?.widget_enabled && (
+                  <div className="space-y-3 pt-4 border-t">
+                    <div className="space-y-0.5">
+                      <Label className="text-base">{t("deploy_agent.access_control.allowed_domains") || "Allowed Domains"}</Label>
+                      <div className="text-sm text-muted-foreground">
+                        {t("deploy_agent.access_control.allowed_domains_desc") || "Restrict widget access to specific domains. Use * for any domain."}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        placeholder={t("deploy_agent.access_control.domain_placeholder") || "e.g. example.com"}
+                        value={newDomain}
+                        onChange={(e) => setNewDomain(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && void handleAddDomain()}
+                        disabled={isUpdatingWidget}
+                        className="flex-1"
+                      />
+                      <Button onClick={() => void handleAddDomain()} disabled={isUpdatingWidget || !newDomain.trim()}>
+                        {t("deploy_agent.access_control.add_btn") || "Add"}
+                      </Button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {(deployAgent?.allowed_domains || []).map((domain) => (
+                        <Badge key={domain} variant="secondary" className="flex items-center gap-1 px-3 py-1 text-sm">
+                          {domain}
+                          <button
+                            onClick={() => handleRemoveDomain(domain)}
+                            disabled={isUpdatingWidget}
+                            className="text-muted-foreground hover:text-foreground"
+                          >
+                            ×
+                          </button>
+                        </Badge>
+                      ))}
+                      {(deployAgent?.allowed_domains || []).length === 0 && (
+                        <span className="text-sm text-muted-foreground italic">
+                          {t("deploy_agent.access_control.no_domains") || "No domains configured. Widget will block all requests unless * is added."}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <DeployAgentEmbedExtension agentId={agentId} widgetOrigin={widgetOrigin}>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="font-medium">{t("deploy_agent.embed_snippet.title") || "Embed Snippet"}</div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void handleRotateWidgetKey()}
+                      disabled={isRotatingWidgetKey || !widgetKey}
+                      title={t("deploy_agent.embed_snippet.rotate_key_btn") || "Rotate Widget Key"}
+                    >
+                      {isRotatingWidgetKey
+                        ? t("deploy_agent.embed_snippet.rotating_key") || "Rotating…"
+                        : t("deploy_agent.embed_snippet.rotate_key_btn") || "Rotate Key"}
                     </Button>
                   </div>
-                  <div className="flex flex-wrap gap-2">
-                    {(deployAgent?.allowed_domains || []).map((domain) => (
-                      <Badge key={domain} variant="secondary" className="flex items-center gap-1 px-3 py-1 text-sm">
-                        {domain}
-                        <button
-                          onClick={() => handleRemoveDomain(domain)}
-                          disabled={isUpdatingWidget}
-                          className="text-muted-foreground hover:text-foreground"
-                        >
-                          ×
-                        </button>
-                      </Badge>
-                    ))}
-                    {(deployAgent?.allowed_domains || []).length === 0 && (
-                      <span className="text-sm text-muted-foreground italic">
-                        {t("deploy_agent.access_control.no_domains") || "No domains configured. Widget will block all requests unless * is added."}
-                      </span>
-                    )}
+                  <div className="text-sm text-muted-foreground">
+                    {t("deploy_agent.embed_snippet.desc") || "Copy and paste this script tag into the <body> of your website."}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t("deploy_agent.embed_snippet.timezone_hint") || "Optional: add data-timezone=\"Australia/Perth\" (any IANA name) to the script tag to set the chat's time zone. Precedence: data-timezone → the visitor's browser time zone → UTC. If omitted or empty, the browser time zone is used; an unrecognized value falls back to UTC."}
+                  </div>
+                  <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
+                    <pre className="whitespace-pre-wrap break-all text-muted-foreground">
+                      {widgetKey && widgetOrigin
+                        ? buildWidgetSnippet(widgetKey, widgetOrigin)
+                        : "…"}
+                    </pre>
+                    <Button
+                      variant="secondary"
+                      size="icon"
+                      className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
+                      onClick={() => void handleCopySnippet()}
+                      disabled={!widgetKey || !widgetOrigin}
+                      title={t("deploy_agent.embed_snippet.copy_btn") || "Copy Snippet"}
+                    >
+                      {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+                    </Button>
                   </div>
                 </div>
-              )}
+              </DeployAgentEmbedExtension>
             </div>
-
-            <DeployAgentEmbedExtension agentId={agentId} widgetOrigin={widgetOrigin}>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="font-medium">{t("deploy_agent.embed_snippet.title") || "Embed Snippet"}</div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleRotateWidgetKey()}
-                    disabled={isRotatingWidgetKey || !widgetKey}
-                    title={t("deploy_agent.embed_snippet.rotate_key_btn") || "Rotate Widget Key"}
-                  >
-                    {isRotatingWidgetKey
-                      ? t("deploy_agent.embed_snippet.rotating_key") || "Rotating…"
-                      : t("deploy_agent.embed_snippet.rotate_key_btn") || "Rotate Key"}
-                  </Button>
-                </div>
-                <div className="text-sm text-muted-foreground">
-                  {t("deploy_agent.embed_snippet.desc") || "Copy and paste this script tag into the <body> of your website."}
-                </div>
-                <div className="text-xs text-muted-foreground">
-                  {t("deploy_agent.embed_snippet.timezone_hint") || "Optional: add data-timezone=\"Australia/Perth\" (any IANA name) to the script tag to set the chat's time zone. Precedence: data-timezone → the visitor's browser time zone → UTC. If omitted or empty, the browser time zone is used; an unrecognized value falls back to UTC."}
-                </div>
-                <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
-                  <pre className="whitespace-pre-wrap break-all text-muted-foreground">
-                    {widgetKey && widgetOrigin
-                      ? buildWidgetSnippet(widgetKey, widgetOrigin)
-                      : "…"}
-                  </pre>
-                  <Button
-                    variant="secondary"
-                    size="icon"
-                    className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
-                    onClick={() => void handleCopySnippet()}
-                    disabled={!widgetKey || !widgetOrigin}
-                    title={t("deploy_agent.embed_snippet.copy_btn") || "Copy Snippet"}
-                  >
-                    {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
-                  </Button>
-                </div>
-              </div>
-            </DeployAgentEmbedExtension>
-          </div>
-        ) : (
-          <div className="mt-4 space-y-6">
-            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
-              <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
-            </div>
-
-            <div className="space-y-4 border rounded-lg p-4">
-              <div className="space-y-1">
-                <div className="text-base font-medium">{t("deploy_agent.share_link.title") || "Share Link"}</div>
-                <div className="text-sm text-muted-foreground">
-                  {t("deploy_agent.share_link.desc") || "Generate a public page anyone can open to chat with this agent."}
-                </div>
+          ) : (
+            <div className="mt-4 space-y-6">
+              <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setActiveView("options")}>
+                <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
               </div>
 
-              {!isPublished ? (
-                <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
-                  {t("deploy_agent.share_link.publish_required") || "Please publish this agent before generating a share link."}
+              <div className="space-y-4 border rounded-lg p-4">
+                <div className="space-y-1">
+                  <div className="text-base font-medium">{t("deploy_agent.share_link.title") || "Share Link"}</div>
+                  <div className="text-sm text-muted-foreground">
+                    {t("deploy_agent.share_link.desc") || "Generate a public page anyone can open to chat with this agent."}
+                  </div>
                 </div>
-              ) : isLoadingShareLink ? (
-                <div className="pt-2 text-sm text-muted-foreground">
-                  {t("common.loading") || "Loading..."}
-                </div>
-              ) : shareEnabled ? (
-                <div className="space-y-4 pt-2">
-                  <div className="space-y-2">
-                    <Label className="text-sm">{t("deploy_agent.share_link.public_url") || "Public URL"}</Label>
+
+                {!isPublished ? (
+                  <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                    {t("deploy_agent.share_link.publish_required") || "Please publish this agent before generating a share link."}
+                  </div>
+                ) : isLoadingShareLink ? (
+                  <div className="pt-2 text-sm text-muted-foreground">
+                    {t("common.loading") || "Loading..."}
+                  </div>
+                ) : shareEnabled ? (
+                  <div className="space-y-4 pt-2">
+                    <div className="space-y-2">
+                      <Label className="text-sm">{t("deploy_agent.share_link.public_url") || "Public URL"}</Label>
+                      <div className="flex gap-2">
+                        <Input readOnly value={shareUrl} className="flex-1" />
+                        <Button variant="secondary" onClick={() => void handleCopyShareLink()} disabled={isUpdatingShare || !shareUrl}>
+                          {copiedShareLink ? <Check className="h-4 w-4 mr-1 text-green-500" /> : <Copy className="h-4 w-4 mr-1" />}
+                          {t("common.copy") || "Copy"}
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      {t("deploy_agent.share_link.anyone_access") || "Anyone with this link can start a public chat with this agent."}
+                    </div>
                     <div className="flex gap-2">
-                      <Input readOnly value={shareUrl} className="flex-1" />
-                      <Button variant="secondary" onClick={() => void handleCopyShareLink()} disabled={isUpdatingShare || !shareUrl}>
-                        {copiedShareLink ? <Check className="h-4 w-4 mr-1 text-green-500" /> : <Copy className="h-4 w-4 mr-1" />}
-                        {t("common.copy") || "Copy"}
+                      <Button variant="outline" onClick={handleRotateShare} disabled={isUpdatingShare}>
+                        {t("deploy_agent.share_link.rotate_btn") || "Reset Link"}
+                      </Button>
+                      <Button variant="outline" onClick={handleDisableShare} disabled={isUpdatingShare}>
+                        {t("deploy_agent.share_link.disable_btn") || "Disable Link"}
                       </Button>
                     </div>
                   </div>
-                  <div className="text-xs text-muted-foreground">
-                    {t("deploy_agent.share_link.anyone_access") || "Anyone with this link can start a public chat with this agent."}
-                  </div>
-                  <div className="flex gap-2">
-                    <Button variant="outline" onClick={handleRotateShare} disabled={isUpdatingShare}>
-                      {t("deploy_agent.share_link.rotate_btn") || "Reset Link"}
-                    </Button>
-                    <Button variant="outline" onClick={handleDisableShare} disabled={isUpdatingShare}>
-                      {t("deploy_agent.share_link.disable_btn") || "Disable Link"}
+                ) : (
+                  <div className="pt-2">
+                    <Button onClick={handleEnableShare} disabled={isUpdatingShare}>
+                      {t("deploy_agent.share_link.generate_btn") || "Generate Link"}
                     </Button>
                   </div>
-                </div>
-              ) : (
-                <div className="pt-2">
-                  <Button onClick={handleEnableShare} disabled={isUpdatingShare}>
-                    {t("deploy_agent.share_link.generate_btn") || "Generate Link"}
-                  </Button>
-                </div>
-              )}
+                )}
+              </div>
             </div>
-          </div>
-        )}
-      </DialogContent>
+          )}
+        </DialogContent>
+      )}
     </Dialog >
   )
 }

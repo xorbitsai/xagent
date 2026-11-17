@@ -681,7 +681,7 @@ class APIClientCore:
             try:
                 probe = str(httpx.URL(url).copy_merge_params(probe_params))
             except Exception:
-                # Unparseable here: leave it to the request path's own handling.
+                # Unparsable here: leave it to the request path's own handling.
                 probe = url
         return search_result_page_refusal(probe)
 

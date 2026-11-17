@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe.api_tool import APITool
@@ -352,3 +353,61 @@ async def test_download_web_asset_switch_off_restores_old_behaviour(
     request.assert_awaited_once()
     assert result["blocked_by_policy"] is False
     assert "reached network" in result["error"]
+
+
+UNICODE_SEPARATOR_URLS = [
+    f"https://www.google\u3002com/search?q={SECRET}",
+    f"https://www.google\uff0ecom/search?q={SECRET}",
+    f"https://www.google\uff61com/search?q={SECRET}",
+    f"https://www.bing\u3002com/search?q={SECRET}",
+]
+
+
+@pytest.mark.parametrize("url", UNICODE_SEPARATOR_URLS)
+def test_matcher_sees_the_host_httpx_connects_to(url: str) -> None:
+    # httpx canonicalises these separators to "."; the matcher must too.
+    assert httpx.URL(url).host in {"www.google.com", "www.bing.com"}
+    assert is_search_result_page_url(url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", UNICODE_SEPARATOR_URLS)
+async def test_api_call_refuses_unicode_separator_host_without_params(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, url: str
+) -> None:
+    request = _api_client_without_network(monkeypatch)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await APITool().run_json_async({"url": url})
+
+    assert result["blocked_by_policy"] is True
+    assert result["status_code"] == 0
+    request.assert_not_called()
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_download_refuse_unicode_separator_host(
+    tmp_path: Path,
+) -> None:
+    url = UNICODE_SEPARATOR_URLS[0]
+    with patch(
+        "xagent.core.tools.core.web_content.fetch_public_http_bytes",
+        new=AsyncMock(side_effect=AssertionError("network request was made")),
+    ):
+        fetched = await WebContentFetcher().fetch(url)
+    tool = DownloadWebAssetTool(TaskWorkspace("serp-idna", base_dir=str(tmp_path)))
+    with patch(
+        "xagent.core.tools.adapters.vibe.download_web_asset.fetch_public_http_bytes",
+        new=AsyncMock(side_effect=AssertionError("network request was made")),
+    ):
+        downloaded = await tool.run_json_async({"url": url})
+
+    assert fetched.blocked_by_policy is True
+    assert downloaded["blocked_by_policy"] is True
+
+
+def test_unparsable_host_keeps_the_raw_host_match() -> None:
+    # httpx rejects a tab in the host, so it is never sent; staying strict is
+    # harmless and must not raise.
+    assert is_search_result_page_url(f"https://www.goog\tle.com/search?q={SECRET}")

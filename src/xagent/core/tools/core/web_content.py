@@ -18,6 +18,7 @@ from ...utils.egress_proxy import get_proxy_url as get_proxy_url
 from ...utils.egress_proxy import get_trusted_proxy_url as get_trusted_proxy_url
 from ...utils.public_network_proxy import PublicNetworkEgressProxy
 from ...utils.security import PrivateNetworkHostError, fetch_public_http_bytes
+from .search_result_pages import search_result_page_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,8 @@ class WebContentFetchResult:
     error: str | None = None
     assets: tuple[WebAssetReference, ...] = ()
     blocked_by_site: bool = False
+    # True when the fetch was refused by tool policy before any request.
+    blocked_by_policy: bool = False
 
     @property
     def success(self) -> bool:
@@ -107,6 +110,7 @@ class WebContentFetchResult:
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
             "blocked_by_site": self.blocked_by_site,
+            "blocked_by_policy": self.blocked_by_policy,
         }
 
 
@@ -204,6 +208,13 @@ class WebContentFetcher:
         include_assets: bool = False,
         asset_query: str | None = None,
     ) -> WebContentFetchResult:
+        # Before the log line below: a refused URL carries the search text.
+        refusal = search_result_page_refusal(url)
+        if refusal is not None:
+            return WebContentFetchResult(
+                url=url, content="", error=refusal, blocked_by_policy=True
+            )
+
         logger.info("Fetching webpage content from: %s", url)
 
         headers = {"User-Agent": DEFAULT_USER_AGENT}

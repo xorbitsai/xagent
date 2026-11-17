@@ -16,7 +16,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { VoiceCallStoreProvider } from "@/contexts/voice-call-store"
 import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import { useWidgetOpenMessage } from "@/hooks/use-widget-open-message"
-import { classifyWidgetVoiceEvent } from "@/hooks/use-widget-voice-call"
+import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES } from "@/hooks/use-widget-voice-call"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
 import { readSendErrorCode } from "@/components/chat/clarification-delivery"
 import {
@@ -76,9 +76,6 @@ type HistoryViewState =
   | { kind: "chat" }
   | { kind: "history_list" }
   | { kind: "history_view"; taskId: number; title: string }
-
-// Task states in which spoken words wait, as in the signed-in call.
-const VOICE_BUSY_TASK_STATUSES = ["running", "pending", "pause_requested", "resume_requested"]
 
 const isNotificationHandled = (error: unknown): boolean =>
   typeof error === "object" && error !== null
@@ -390,7 +387,7 @@ function SessionConversationContent({
   // A token refresh rebuilds the chat socket; meanwhile the words are held
   // (busy) and the call goes on. Only a session that is down ends it.
   const voiceBusy = state.isProcessing || isMessageDeliveryPending || !isConnected || isSendInFlight
-    || VOICE_BUSY_TASK_STATUSES.includes(voiceTaskStatus)
+    || WIDGET_VOICE_BUSY_TASK_STATUSES.includes(voiceTaskStatus)
   const voiceDisabled = status === "degraded" || status === "terminal"
   // Spoken words take the path typed ones take: the start page's send before
   // a conversation exists, the panel's send after, with the call's client

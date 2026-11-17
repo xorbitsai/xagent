@@ -10,6 +10,9 @@ import {
 import { VoiceTurns, type VoicePhase } from "@/lib/voice-conversation"
 import type { VoiceCall, VoiceReplyMessage } from "@/hooks/use-voice-call"
 
+/** Task states in which a widget page holds a call's spoken words back, as the signed-in call does. */
+export const WIDGET_VOICE_BUSY_TASK_STATUSES = ["running", "pending", "pause_requested", "resume_requested"]
+
 /** Which transport refusals a state-table row stands for. */
 type TransportMatch =
   | { kind: "asr_error"; codes: string[] }

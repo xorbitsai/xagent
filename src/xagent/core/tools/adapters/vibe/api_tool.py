@@ -65,6 +65,13 @@ class APICallResult(BaseModel):
     headers: Dict[str, str] = Field(description="Response headers")
     body: Any = Field(description="Response body (parsed JSON or text)")
     error: Optional[str] = Field(default=None, description="Error message if failed")
+    blocked_by_policy: bool = Field(
+        default=False,
+        description=(
+            "True when the request was refused by tool policy before being sent "
+            "(for example a search-engine result page); use web_search instead"
+        ),
+    )
 
 
 class APITool(AbstractBaseTool):
@@ -87,6 +94,7 @@ class APITool(AbstractBaseTool):
         Authentication types: 'bearer' (Bearer token), 'basic' (Basic auth), 'api_key' (X-API-Key header), 'api_key_query' (API key in query params).
         Returns parsed JSON response or text content with status code and headers.
         Useful for integrating with public external services, APIs, and webhooks.
+        Never use this tool to query a search engine (Google, Bing, DuckDuckGo, Baidu and similar result pages); such requests are refused. web_search is the only way to search; if it returns nothing, report that to the user instead of searching another way.
         Private, loopback, metadata-service and credential-in-URL destinations are rejected.
         Use auth_type/auth_token or headers for credentials, not URL userinfo.
         This tool has no stored credential for any external service. A 401/403 from a host with its own dedicated MCP connector (e.g. HubSpot, Slack, GitHub) comes back with a hint to use that connector's tools instead - pass your own credential via auth_type/auth_token, a header, or a query parameter if you have one."""

@@ -18,7 +18,7 @@ from .deepseek_tool_protocol import (
     reasoning_field_names,
     restore_deepseek_reasoning_content,
 )
-from .openai import OpenAILLM, _openai_error_body, field_content
+from .openai import OpenAICompatibleLLM, OpenAILLM, _openai_error_body, field_content
 
 logger = logging.getLogger(__name__)
 
@@ -1220,3 +1220,20 @@ class OpenRouterLLM(OpenAILLM):
 
         updated_extra_body.pop("enable_thinking", None)
         return updated_extra_body
+
+    def _apply_provider_reasoning_effort(
+        self,
+        completion_params: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> None:
+        """Set no ``reasoning_effort``, as before ``OpenAILLM`` gained one.
+
+        ``OpenAILLM`` lowers GLM-5.3 reasoning effort for generic
+        OpenAI-compatible servers. OpenRouter controls reasoning through its own
+        ``reasoning`` field (see ``_prepare_provider_reasoning_extra_body``), so
+        it keeps the base behavior.
+        """
+        OpenAICompatibleLLM._apply_provider_reasoning_effort(
+            self, completion_params, thinking=thinking
+        )

@@ -21,6 +21,7 @@ from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
+from xagent.core.model.chat.basic.dashscope import DashScopeLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
@@ -29,6 +30,7 @@ from xagent.core.model.chat.basic.openai import (
     _provider_failure_kind,
     field_content,
 )
+from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import (
     MODEL_PROVIDER_FAILURE_KINDS,
@@ -497,6 +499,236 @@ class TestOpenAILLM:
 
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert "extra_body" not in call_kwargs
+
+    @staticmethod
+    def _glm_effort(llm, *, thinking=None, completion_params=None):
+        params = dict(completion_params or {})
+        llm._apply_provider_reasoning_effort(params, thinking=thinking)
+        return params.get("reasoning_effort")
+
+    def test_glm53_without_thinking_ability_lowers_reasoning_effort(self):
+        llm = self._deepseek_llm(["chat", "tool_calling"], model_name="glm-5.3")
+
+        assert self._glm_effort(llm) == "low"
+
+    def test_glm53_with_thinking_ability_keeps_server_default(self):
+        llm = self._deepseek_llm(["chat", "thinking_mode"], model_name="glm-5.3")
+
+        assert self._glm_effort(llm) is None
+
+    @pytest.mark.parametrize(
+        ("abilities", "thinking", "expected"),
+        [
+            (["chat", "thinking_mode"], {"type": "disabled"}, "low"),
+            # The shape production callers pass (react decision, JSON retry).
+            (["chat", "thinking_mode"], {"type": "disabled", "enable": False}, "low"),
+            (["chat"], {"type": "enabled"}, None),
+            (["chat"], {"enable": True}, None),
+        ],
+    )
+    def test_glm53_request_thinking_overrides_ability(
+        self, abilities, thinking, expected
+    ):
+        llm = self._deepseek_llm(abilities, model_name="glm-5.3")
+
+        assert self._glm_effort(llm, thinking=thinking) == expected
+
+    @pytest.mark.parametrize(
+        ("thinking", "caller_effort", "expected"),
+        [
+            # No request setting: the caller's value is kept as is.
+            (None, "high", "high"),
+            # Disabling thinking lowers a higher caller value to the floor ...
+            ({"type": "disabled"}, "high", "low"),
+            # ... but never raises one already at or below it, such as the
+            # "none" the rejected-parameter degrade writes.
+            ({"type": "disabled"}, "none", "none"),
+            ({"type": "enabled"}, "medium", "medium"),
+        ],
+    )
+    def test_glm53_respects_existing_reasoning_effort(
+        self, thinking, caller_effort, expected
+    ):
+        llm = self._deepseek_llm(["chat"], model_name="glm-5.3")
+
+        assert (
+            self._glm_effort(
+                llm,
+                thinking=thinking,
+                completion_params={"reasoning_effort": caller_effort},
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("model_name", "is_glm53"),
+        [
+            ("glm-5.3", True),
+            ("glm-5.3-flash", True),
+            ("zai-org/GLM-5.3", True),
+            ("glm-5.2", False),
+            ("zai.glm-5", False),
+            ("deepseek-v4.1-flash", False),
+        ],
+    )
+    def test_reasoning_effort_applies_to_glm53_names_only(self, model_name, is_glm53):
+        llm = self._deepseek_llm(["chat"], model_name=model_name)
+
+        assert (self._glm_effort(llm) == "low") is is_glm53
+
+    def test_glm53_sends_no_deepseek_template_switch(self):
+        llm = self._deepseek_llm(["chat"], model_name="glm-5.3")
+
+        assert self._deepseek_reasoning_body(llm, extra_body={"a": 1}) == {"a": 1}
+
+    def test_deepseek_gets_no_reasoning_effort(self):
+        llm = self._deepseek_llm(["chat"])
+
+        assert self._glm_effort(llm) is None
+
+    @pytest.mark.asyncio
+    async def test_glm53_chat_stream_and_vision_send_low_effort(
+        self, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = self._deepseek_llm(
+            ["chat", "tool_calling", "vision"], model_name="glm-5.3"
+        )
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.chat([{"role": "user", "content": "Hello"}])
+        chat_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert chat_kwargs["reasoning_effort"] == "low"
+        assert "extra_body" not in chat_kwargs
+
+        mock_client.chat.completions.create.return_value = _empty_stream()
+        _ = [
+            chunk
+            async for chunk in llm.stream_chat([{"role": "user", "content": "Hi"}])
+        ]
+        stream_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert stream_kwargs["reasoning_effort"] == "low"
+
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        await llm.vision_chat([{"role": "user", "content": "Hi"}])
+        vision_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert vision_kwargs["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_glm53_json_retry_lowers_reasoning_effort(
+        self, mock_chat_completion, mocker
+    ):
+        """A record with thinking keeps the server default on the first call;
+        the non-JSON retry, which disables thinking, goes out at ``low``."""
+        non_json_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Not JSON at all.",
+                        tool_calls=None,
+                        reasoning_content="Thinking about the schema first.",
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+            model_dump=lambda: {"id": "glm-non-json"},
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            non_json_response,
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = self._deepseek_llm(
+            ["chat", "tool_calling", "thinking_mode"], model_name="glm-5.3"
+        )
+
+        await llm.chat(
+            [{"role": "user", "content": "Answer in JSON"}],
+            response_format={"type": "json_object"},
+        )
+
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 2
+        assert "reasoning_effort" not in calls[0].kwargs
+        assert calls[1].kwargs["reasoning_effort"] == "low"
+
+    def test_subclasses_with_own_reasoning_control_send_no_effort(self):
+        azure = AzureOpenAILLM(
+            model_name="glm-5.3",
+            azure_endpoint="https://test.openai.azure.com/",
+            api_key="k",
+            api_version="2024-08-01-preview",
+            abilities=["chat"],
+        )
+        openrouter = OpenRouterLLM(
+            model_name="z-ai/glm-5.3-flash", api_key="k", abilities=["chat"]
+        )
+        dashscope = DashScopeLLM(
+            model_name="glm-5.3",
+            base_url="https://dashscope.example.test/v1",
+            api_key="k",
+            abilities=["chat"],
+        )
+
+        for llm in (azure, openrouter, dashscope):
+            assert self._glm_effort(llm) is None
+
+    @pytest.mark.asyncio
+    async def test_glm53_low_effort_yields_to_reasoning_effort_degrade(
+        self, mock_chat_completion, mocker
+    ):
+        """An endpoint that asks for ``reasoning_effort='none'`` with tools
+        gets ``none`` on the retry: ``low`` lives in the same top-level params
+        the degrade rewrites, not in ``extra_body`` that would override it."""
+        message = (
+            "reasoning is not supported with tools; set reasoning_effort to 'none'"
+        )
+        rejected = openai.BadRequestError(
+            f"Error code: 400 - {{'error': {{'message': \"{message}\"}}}}",
+            response=httpx.Response(
+                400,
+                request=httpx.Request(
+                    "POST", "https://example.test/v1/chat/completions"
+                ),
+            ),
+            body={"error": {"message": message, "param": "reasoning_effort"}},
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            rejected,
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = self._deepseek_llm(["chat", "tool_calling"], model_name="glm-5.3")
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        await llm.chat([{"role": "user", "content": "Hello"}], tools=tools)
+
+        calls = mock_client.chat.completions.create.call_args_list
+        assert len(calls) == 2
+        assert calls[0].kwargs["reasoning_effort"] == "low"
+        assert calls[1].kwargs["reasoning_effort"] == "none"
+        assert "extra_body" not in calls[1].kwargs
 
     def test_parse_stream_chunks_mixed_delta_emits_token_then_tool_call(self, llm):
         """A delta carrying text and tool-call fragments expands to a TOKEN

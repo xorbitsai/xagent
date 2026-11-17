@@ -66,6 +66,25 @@ def _is_deepseek_model_name(model_name: str) -> bool:
     return any(part.lower().startswith("deepseek") for part in slug.split("/"))
 
 
+# GLM-5.3 always reasons: it reads no on/off switch, rejects
+# ``reasoning_effort="none"``, and defaults to its highest effort. ``low`` is
+# the least reasoning it accepts.
+_GLM53_MIN_REASONING_EFFORT = "low"
+# Values already at or below that floor; a request that disables thinking
+# leaves them alone instead of raising them to ``low``.
+_AT_MOST_MIN_REASONING_EFFORTS = frozenset({"none", "minimal", "low"})
+
+
+def _is_glm53_model_name(model_name: str) -> bool:
+    """Whether a model name names GLM-5.3 (or a variant) on any path segment.
+
+    Covers bare names (``glm-5.3``, ``glm-5.3-flash``) and vendor-prefixed
+    ones (``zai-org/GLM-5.3``).
+    """
+    slug = model_name.strip().split(":", 1)[0]
+    return any(part.lower().startswith("glm-5.3") for part in slug.split("/"))
+
+
 # ``PROVIDER_STATE_METADATA_KEY`` now lives in ``chat.types`` (see there for
 # why); imported here so existing code and tests that import it from this
 # transport module keep working unchanged.
@@ -731,6 +750,21 @@ class OpenAICompatibleLLM(BaseLLM):
         _ = thinking, tools, response_format, output_config, is_streaming
         return dict(extra_body)
 
+    def _apply_provider_reasoning_effort(
+        self,
+        completion_params: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> None:
+        """Hook for subclasses to set a top-level ``reasoning_effort``.
+
+        Runs on ``completion_params`` rather than ``extra_body`` because the
+        rejected-parameter degrade rewrites ``completion_params`` and the SDK
+        lets ``extra_body`` override it: a value placed in ``extra_body``
+        would silently undo that degrade on the retry.
+        """
+        _ = completion_params, thinking
+
     async def chat(
         self,
         messages: List[Dict[str, str]],
@@ -817,6 +851,7 @@ class OpenAICompatibleLLM(BaseLLM):
             output_config=output_config,
             is_streaming=False,
         )
+        self._apply_provider_reasoning_effort(completion_params, thinking=thinking)
         built_response_format = response_format
 
         # Helper function to process response
@@ -1037,6 +1072,9 @@ class OpenAICompatibleLLM(BaseLLM):
                             output_config=output_config,
                             is_streaming=False,
                         )
+                        self._apply_provider_reasoning_effort(
+                            completion_params, thinking=retry_thinking
+                        )
                         built_response_format = response_format
                         response = await _make_api_call()
                         result = _process_response(
@@ -1186,6 +1224,7 @@ class OpenAICompatibleLLM(BaseLLM):
             output_config=output_config,
             is_streaming=False,
         )
+        self._apply_provider_reasoning_effort(completion_params, thinking=thinking)
 
         async def _make_api_call() -> Any:
             assert self._client is not None
@@ -1441,6 +1480,7 @@ class OpenAICompatibleLLM(BaseLLM):
             output_config=output_config,
             is_streaming=True,
         )
+        self._apply_provider_reasoning_effort(completion_params, thinking=thinking)
 
         try:
             # Create streaming response
@@ -2194,6 +2234,41 @@ class OpenAILLM(OpenAICompatibleLLM):
                 merged[key] = enabled
         updated_extra_body["chat_template_kwargs"] = merged
         return updated_extra_body
+
+    def _apply_provider_reasoning_effort(
+        self,
+        completion_params: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> None:
+        """Keep GLM-5.3 reasoning at its lowest effort unless it is wanted.
+
+        GLM-5.3 cannot turn reasoning off and defaults to its highest effort,
+        which on tool-calling turns can run for minutes. So the least it
+        accepts, ``low``, is sent when the request's own ``thinking`` setting
+        disables thinking, or when there is none and the model record lacks
+        the ``thinking_mode`` ability. A record with that ability, or a
+        request that enables thinking, keeps the server's default.
+
+        A ``reasoning_effort`` the caller already set is kept, except that a
+        request disabling thinking lowers it to ``low``; a value already at
+        or below ``low`` (such as ``none`` from the rejected-parameter
+        degrade) is never raised.
+        """
+        if not _is_glm53_model_name(self.model_name):
+            return
+
+        current = completion_params.get("reasoning_effort")
+        if thinking is not None:
+            enabled = bool(
+                thinking.get("type") == "enabled" or thinking.get("enable", False)
+            )
+            if enabled or current in _AT_MOST_MIN_REASONING_EFFORTS:
+                return
+        elif current is not None or self.supports_thinking_mode:
+            return
+
+        completion_params["reasoning_effort"] = _GLM53_MIN_REASONING_EFFORT
 
     def _apply_output_config(
         self,

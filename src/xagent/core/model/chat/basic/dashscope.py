@@ -3,7 +3,7 @@ import os
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from ..types import StreamChunk
-from .openai import OpenAILLM
+from .openai import OpenAICompatibleLLM, OpenAILLM
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,22 @@ class DashScopeLLM(OpenAILLM):
             updated_extra_body["enable_thinking"] = False
 
         return updated_extra_body
+
+    def _apply_provider_reasoning_effort(
+        self,
+        completion_params: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> None:
+        """Set no ``reasoning_effort``, as before ``OpenAILLM`` gained one.
+
+        ``OpenAILLM`` lowers GLM-5.3 reasoning effort for generic
+        OpenAI-compatible servers. DashScope controls reasoning through its own
+        ``enable_thinking`` field, so it keeps the base behavior.
+        """
+        OpenAICompatibleLLM._apply_provider_reasoning_effort(
+            self, completion_params, thinking=thinking
+        )
 
     @classmethod
     def _requires_thinking_disabled(

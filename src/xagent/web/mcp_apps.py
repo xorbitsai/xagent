@@ -1036,7 +1036,12 @@ def is_user_owned_server(db: Session, server_id: int) -> bool:
     )
 
 
-def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
+def get_app_for_mcp_server(
+    db: Session,
+    server: Any,
+    *,
+    snapshot: MCPAppSnapshot | None = None,
+) -> Dict[str, Any] | None:
     """Resolve a server's catalog app by stable identity when it is available.
 
     Unstamped rows predate ``auth.app_id`` and are resolved by the exact name
@@ -1057,6 +1062,9 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
         app_id = auth.get("app_id")
         if not isinstance(app_id, str) or not app_id:
             return None
+        if snapshot is not None:
+            matches = [a for a in snapshot.catalog_apps if a.app_id == app_id]
+            return _app_to_dict(matches[0]) if matches else None
         return get_app_by_id(db, app_id)
     name = str(getattr(server, "name", ""))
     if not name:
@@ -1079,7 +1087,7 @@ def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     # fails closed -- deletion keeps the credentials, listing and runtime
     # decline to name an app -- rather than acting on a coin flip. Only the
     # stamp settles it, which is what the branch above is for.
-    return _get_app_for_server_name(db, name)
+    return _get_app_for_server_name(db, name, snapshot=snapshot)
 
 
 def classify_actor_remote_oauth_server(

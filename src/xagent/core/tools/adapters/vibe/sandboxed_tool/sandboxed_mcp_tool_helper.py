@@ -20,6 +20,7 @@ from ....core.mcp.tools import (
     attach_raw_annotations,
 )
 from ..base import AbstractBaseTool
+from ..mcp_tool_allowlist import filter_tools_by_read_only_allowlist
 from .sandbox_config import SandboxConfig, set_instance_sandbox_config
 from .sandboxed_tool_wrapper import (
     SANDBOX_BASE_DEPENDENCIES,
@@ -194,7 +195,9 @@ async def load_sandboxed_mcp_tools(
     tool_builder: Callable[[MCPTool], AbstractBaseTool],
 ) -> SandboxedMCPLoadResult:
     """Load MCP tool metadata in sandbox and wrap built tools for sandboxed calls."""
-    mcp_tools = await list_tools_in_sandbox(sandbox, connection)
+    mcp_tools = filter_tools_by_read_only_allowlist(
+        await list_tools_in_sandbox(sandbox, connection), connection
+    )
     wrapped_tools: list[AbstractBaseTool] = []
     adapter_error_types: list[str] = []
     wrap_error_types: list[str] = []

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import (
     Any,
     Awaitable,
@@ -5657,6 +5657,9 @@ class WebToolConfig(BaseToolConfig):
         transport_config["concurrent_tools"] = list(
             getattr(server, "concurrent_tools", None) or []
         )
+        read_only_tools = self._catalog_read_only_tools(server)
+        if read_only_tools is not None:
+            transport_config["read_only_tools"] = read_only_tools
 
         # Add Docker-specific config if managed internally
         if server.managed == "internal":
@@ -5684,6 +5687,92 @@ class WebToolConfig(BaseToolConfig):
 
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
+
+    def _catalog_read_only_tools(self, server: Any) -> list[str] | None:
+        """Return the catalog app's ``launch_config["read_only_tools"]``.
+
+        ``None`` means "no allowlist": the loader keeps every tool. Catalog
+        connect stamps neither ``auth.app_id`` nor a marker on API-key and
+        keyless rows (they are identified by ``name == app_id``), so the app is
+        resolved with the canonical ``get_app_for_mcp_server``.
+
+        Failure direction, per row identity:
+
+        * A row that *claims* a catalog identity (``auth.app_id`` or an
+          ``auth.builtin_provenance`` marker) whose app cannot be resolved fails
+          closed: ``[]``, so it loads no tools rather than all of them. The
+          claimed identity is looked up by id, never by name, so the only way
+          to miss is a catalog app that no longer exists.
+        * An unstamped row resolves by name, and only when exactly one app
+          owns the name. Unresolved or ambiguous means "not provably a catalog
+          row": it stays unfiltered, like any custom server.
+        * A resolved app that declares no ``read_only_tools`` is unfiltered; a
+          declared value that is not a list is ``[]`` (fail closed).
+
+        Cost: the catalog table is read once per config instance (one query,
+        cached on the instance) and every server resolves in memory, so a
+        custom server adds no query of its own. The cache lives as long as the
+        instance, like the MCP config cache it feeds.
+        """
+        from ...builtin_identity import builtin_provenance_identity
+        from ...web.mcp_apps import MCPAppSnapshot, get_app_for_mcp_server
+        from ...web.models.public_mcp import PublicMCPApp
+
+        auth = getattr(server, "auth", None)
+        claimed_app_id: str | None = None
+        if isinstance(auth, Mapping):
+            if "app_id" in auth:
+                raw = auth.get("app_id")
+                claimed_app_id = raw if isinstance(raw, str) and raw else ""
+            elif "builtin_provenance" in auth:
+                identity = builtin_provenance_identity(auth.get("builtin_provenance"))
+                if identity is None:
+                    claimed_app_id = ""  # malformed marker: claims, cannot resolve
+                elif identity[0] == "xagent":
+                    claimed_app_id = identity[1]
+                # A marker from another registry is not a claim on this catalog.
+
+        snapshot = getattr(self, "_catalog_snapshot", None)
+        if snapshot is None:
+            snapshot = MCPAppSnapshot(
+                catalog_apps=tuple(self.db.query(PublicMCPApp).all()),
+                servers=(),
+                owner_mcpserver_ids=frozenset(),
+            )
+            self._catalog_snapshot = snapshot
+
+        if claimed_app_id is not None:
+            # Resolve by the claimed id only: a stamped row is never matched by
+            # name (``get_app_for_mcp_server`` does the same for ``app_id``).
+            lookup = SimpleNamespace(name=server.name, auth={"app_id": claimed_app_id})
+            app = (
+                get_app_for_mcp_server(self.db, lookup, snapshot=snapshot)
+                if claimed_app_id
+                else None
+            )
+            if app is None:
+                logger.warning(
+                    "MCP server '%s' claims a catalog identity that does not "
+                    "resolve; loading no tools",
+                    getattr(server, "name", "<unknown>"),
+                )
+                return []
+        else:
+            app = get_app_for_mcp_server(self.db, server, snapshot=snapshot)
+            if app is None:
+                return None
+
+        launch_config = app.get("launch_config")
+        declared = (
+            launch_config.get("read_only_tools")
+            if isinstance(launch_config, Mapping)
+            else None
+        )
+        if declared is None:
+            return None
+        if isinstance(declared, (list, tuple)):
+            return [str(name) for name in declared]
+        return []
 
     async def _load_mcp_server_config(
         self,

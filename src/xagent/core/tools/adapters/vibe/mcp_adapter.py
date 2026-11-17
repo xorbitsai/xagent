@@ -65,6 +65,7 @@ from ...core.mcp.sessions import (
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
+from .mcp_tool_allowlist import filter_tools_by_read_only_allowlist
 from .config import is_http_status_code
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -5511,6 +5512,11 @@ async def _load_direct_mcp_tools(
             ),
         )
 
+    # Applied to the listing, before any adapter is built, so a tool the
+    # operator did not allowlist is never reachable (see mcp_tool_allowlist).
+    mcp_tools = filter_tools_by_read_only_allowlist(
+        mcp_tools, connection, server_name=server_name
+    )
     adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
         issuer = issuers_by_tool.get(mcp_tool.name)

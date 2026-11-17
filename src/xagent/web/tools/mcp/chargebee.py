@@ -30,7 +30,7 @@ import re
 import socket
 import time
 from datetime import date, datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -73,6 +73,7 @@ MAX_LIMIT = 100
 DEFAULT_LIMIT = 10
 # A 429 is retried once, only when Chargebee names a short wait.
 MAX_RETRY_AFTER_SECONDS = 30
+_SECONDS_PER_DAY = 86400
 
 
 def _success(**payload: Any) -> str:
@@ -141,21 +142,24 @@ def _safe_text(value: Any) -> str:
 
     redact_sensitive_text matches credential-shaped text only, and a
     Chargebee key has no fixed shape, so the configured key is also removed
-    literally. URL query strings are dropped because list filters carry
-    customer data.
+    literally, first: redact_sensitive_text masks a credential-shaped value to
+    its last four characters, which the literal replace would then miss. URL
+    query strings are dropped because list filters carry customer data.
     """
-    text = redact_sensitive_text(str(value))
-    text = _URL_QUERY_PATTERN.sub(r"\1?<query redacted>", text)
+    text = str(value)
     key = (os.environ.get("CHARGEBEE_API_KEY") or "").strip()
     if key:
         text = text.replace(key, "[redacted]")
+    text = redact_sensitive_text(text)
+    text = _URL_QUERY_PATTERN.sub(r"\1?<query redacted>", text)
     return truncate_error_text(text)
 
 
 def _retry_after(response: requests.Response) -> int | None:
     """The wait Chargebee asked for, when it is short enough to honour."""
     value = (response.headers.get("Retry-After") or "").strip()
-    if not value.isdigit():
+    # isascii(): isdigit() also accepts characters such as "²" that int() refuses.
+    if not (value.isascii() and value.isdigit()):
         return None
     seconds = int(value)
     return seconds if 1 <= seconds <= MAX_RETRY_AFTER_SECONDS else None
@@ -257,17 +261,22 @@ def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     return body
 
 
-def _timestamp(value: str, field_name: str) -> int:
-    """Unix seconds for a date (midnight UTC) or a datetime with an offset.
+def _timestamp(value: str, field_name: str, bound: Literal["after", "before"]) -> int:
+    """The Unix seconds to send as a ``[after]`` or ``[before]`` filter.
 
-    Chargebee filters timestamps in Unix seconds. A datetime without an
-    offset is refused rather than guessed: the site's time zone is unknown.
+    Chargebee's bounds are exclusive. A bare date means the whole UTC day, so
+    it is moved one step out: ``[after]`` gets the second before that day and
+    ``[before]`` the start of the next one, and date_after=2026-11-01 with
+    date_before=2026-11-30 covers all of November. A datetime with an offset
+    is sent as given. One without an offset is refused rather than guessed:
+    the site's time zone is unknown.
     """
     text = value.strip() if isinstance(value, str) else ""
     try:
         if _BARE_DATE_PATTERN.match(text):
-            parsed = datetime.combine(date.fromisoformat(text), datetime.min.time())
-            return int(parsed.replace(tzinfo=timezone.utc).timestamp())
+            day = datetime.combine(date.fromisoformat(text), datetime.min.time())
+            start = int(day.replace(tzinfo=timezone.utc).timestamp())
+            return start - 1 if bound == "after" else start + _SECONDS_PER_DAY
         if "T" in text:
             parsed = datetime.fromisoformat(text)
             if parsed.tzinfo is not None:
@@ -275,17 +284,22 @@ def _timestamp(value: str, field_name: str) -> int:
     except ValueError:
         pass
     raise ValueError(
-        f"{field_name} must be a date such as 2026-11-01 (midnight UTC) or a "
-        "datetime with an offset such as 2026-11-01T09:00:00+08:00"
+        f"{field_name} must be a date such as 2026-11-01 (a whole UTC day) or "
+        "a datetime with an offset such as 2026-11-01T09:00:00+08:00"
     )
 
 
-def _range(
-    field: str, after: str | None, before: str | None, names: tuple[str, str]
-) -> dict[str, Any]:
+def _range(field: str, after: str | None, before: str | None) -> dict[str, Any]:
+    """The [after]/[before] filters on ``field``; the tool arguments are named
+    after it (created_at -> created_after, date -> date_after)."""
+    name = field.removesuffix("_at")
     return {
-        f"{field}[after]": _timestamp(after, names[0]) if after else None,
-        f"{field}[before]": _timestamp(before, names[1]) if before else None,
+        f"{field}[after]": _timestamp(after, f"{name}_after", "after")
+        if after
+        else None,
+        f"{field}[before]": _timestamp(before, f"{name}_before", "before")
+        if before
+        else None,
     }
 
 
@@ -322,13 +336,17 @@ def _success_with_capped_list(field: str, payload: dict[str, Any]) -> str:
     while len(response) > max_output_length and kept:
         kept = kept[: len(kept) // 2]
         response = _build(kept)
+    if len(response) > max_output_length:
+        # Even the ids do not fit (only under a very small configured limit):
+        # keep the envelope valid JSON and say how many were left out.
+        response = _success(
+            **{**payload, field: []}, truncated=True, omitted_count=len(items)
+        )
     return response
 
 
 def _list(
-    path: str,
     resource: str,
-    field: str,
     *,
     limit: int,
     offset: str | None,
@@ -341,6 +359,8 @@ def _list(
     sometimes with related objects beside it) and pages by an opaque
     ``next_offset``, absent on the last page.
     """
+    field = f"{resource}s"
+    path = f"/{field}"
     body = _get(
         path,
         {
@@ -370,8 +390,8 @@ def _list(
     )
 
 
-def _retrieve(collection: str, resource: str, resource_id: str, arg: str) -> str:
-    body = _get(f"/{collection}/{url_path_id(resource_id, arg)}")
+def _retrieve(resource: str, resource_id: str) -> str:
+    body = _get(f"/{resource}s/{url_path_id(resource_id, f'{resource}_id')}")
     item = body.get(resource)
     if not isinstance(item, dict):
         raise RuntimeError(f"Chargebee returned an unexpected {resource} response")
@@ -406,8 +426,9 @@ def chargebee_list_customers(
     List Chargebee customers.
 
     email, company: exact matches.
-    created_after, created_before: a date such as 2026-11-01 (midnight UTC) or
-        a datetime with an offset such as 2026-11-01T09:00:00+08:00.
+    created_after, created_before: a date such as 2026-11-01, which counts as
+        the whole day in UTC (both bounds include their day), or a datetime
+        with an offset such as 2026-11-01T09:00:00+08:00, which is exclusive.
     limit: entries per page, 1-100 (default 10).
     offset: the next_offset from the previous page, passed back unchanged;
         omit for the first page. has_more is false on the last page.
@@ -419,21 +440,14 @@ def chargebee_list_customers(
     return _run(
         "chargebee_list_customers",
         lambda: _list(
-            "/customers",
             "customer",
-            "customers",
             limit=limit,
             offset=offset,
             include_deleted=include_deleted,
             filters={
                 "email[is]": email,
                 "company[is]": company,
-                **_range(
-                    "created_at",
-                    created_after,
-                    created_before,
-                    ("created_after", "created_before"),
-                ),
+                **_range("created_at", created_after, created_before),
             },
         ),
     )
@@ -444,7 +458,7 @@ def chargebee_get_customer(customer_id: str) -> str:
     """Fetch one Chargebee customer by id."""
     return _run(
         "chargebee_get_customer",
-        lambda: _retrieve("customers", "customer", customer_id, "customer_id"),
+        lambda: _retrieve("customer", customer_id),
     )
 
 
@@ -468,8 +482,9 @@ def chargebee_list_subscriptions(
 
     customer_id: only this customer's subscriptions.
     status: one of future, in_trial, active, non_renewing, paused, cancelled.
-    created_after, created_before: a date such as 2026-11-01 (midnight UTC) or
-        a datetime with an offset such as 2026-11-01T09:00:00+08:00.
+    created_after, created_before: a date such as 2026-11-01, which counts as
+        the whole day in UTC (both bounds include their day), or a datetime
+        with an offset such as 2026-11-01T09:00:00+08:00, which is exclusive.
     limit: entries per page, 1-100 (default 10).
     offset: the next_offset from the previous page, passed back unchanged;
         omit for the first page. has_more is false on the last page.
@@ -481,21 +496,14 @@ def chargebee_list_subscriptions(
     return _run(
         "chargebee_list_subscriptions",
         lambda: _list(
-            "/subscriptions",
             "subscription",
-            "subscriptions",
             limit=limit,
             offset=offset,
             include_deleted=include_deleted,
             filters={
                 "customer_id[is]": customer_id,
                 "status[is]": status,
-                **_range(
-                    "created_at",
-                    created_after,
-                    created_before,
-                    ("created_after", "created_before"),
-                ),
+                **_range("created_at", created_after, created_before),
             },
         ),
     )
@@ -506,9 +514,7 @@ def chargebee_get_subscription(subscription_id: str) -> str:
     """Fetch one Chargebee subscription by id."""
     return _run(
         "chargebee_get_subscription",
-        lambda: _retrieve(
-            "subscriptions", "subscription", subscription_id, "subscription_id"
-        ),
+        lambda: _retrieve("subscription", subscription_id),
     )
 
 
@@ -536,9 +542,9 @@ def chargebee_list_invoices(
         uses consolidated invoicing; filter by customer_id there.
     status: one of paid, posted, payment_due, not_paid, voided, pending.
         Overdue invoices are payment_due or not_paid.
-    date_after, date_before: the invoice date, as a date such as 2026-11-01
-        (midnight UTC) or a datetime with an offset such as
-        2026-11-01T09:00:00+08:00.
+    date_after, date_before: the invoice date, as a date such as 2026-11-01, which counts as
+        the whole day in UTC (both bounds include their day), or a datetime
+        with an offset such as 2026-11-01T09:00:00+08:00, which is exclusive.
     limit: entries per page, 1-100 (default 10).
     offset: the next_offset from the previous page, passed back unchanged;
         omit for the first page. has_more is false on the last page.
@@ -550,9 +556,7 @@ def chargebee_list_invoices(
     return _run(
         "chargebee_list_invoices",
         lambda: _list(
-            "/invoices",
             "invoice",
-            "invoices",
             limit=limit,
             offset=offset,
             include_deleted=include_deleted,
@@ -560,9 +564,7 @@ def chargebee_list_invoices(
                 "customer_id[is]": customer_id,
                 "subscription_id[is]": subscription_id,
                 "status[is]": status,
-                **_range(
-                    "date", date_after, date_before, ("date_after", "date_before")
-                ),
+                **_range("date", date_after, date_before),
             },
         ),
     )
@@ -573,7 +575,7 @@ def chargebee_get_invoice(invoice_id: str) -> str:
     """Fetch one Chargebee invoice by id, with its line items."""
     return _run(
         "chargebee_get_invoice",
-        lambda: _retrieve("invoices", "invoice", invoice_id, "invoice_id"),
+        lambda: _retrieve("invoice", invoice_id),
     )
 
 
@@ -600,9 +602,9 @@ def chargebee_list_transactions(
         subscription.
     status: one of in_progress, success, voided, failure, timeout,
         needs_attention.
-    date_after, date_before: the transaction date, as a date such as
-        2026-11-01 (midnight UTC) or a datetime with an offset such as
-        2026-11-01T09:00:00+08:00.
+    date_after, date_before: the transaction date, as a date such as 2026-11-01, which counts as
+        the whole day in UTC (both bounds include their day), or a datetime
+        with an offset such as 2026-11-01T09:00:00+08:00, which is exclusive.
     limit: entries per page, 1-100 (default 10).
     offset: the next_offset from the previous page, passed back unchanged;
         omit for the first page. has_more is false on the last page.
@@ -614,9 +616,7 @@ def chargebee_list_transactions(
     return _run(
         "chargebee_list_transactions",
         lambda: _list(
-            "/transactions",
             "transaction",
-            "transactions",
             limit=limit,
             offset=offset,
             include_deleted=include_deleted,
@@ -624,9 +624,7 @@ def chargebee_list_transactions(
                 "customer_id[is]": customer_id,
                 "subscription_id[is]": subscription_id,
                 "status[is]": status,
-                **_range(
-                    "date", date_after, date_before, ("date_after", "date_before")
-                ),
+                **_range("date", date_after, date_before),
             },
         ),
     )
@@ -637,9 +635,7 @@ def chargebee_get_transaction(transaction_id: str) -> str:
     """Fetch one Chargebee transaction by id."""
     return _run(
         "chargebee_get_transaction",
-        lambda: _retrieve(
-            "transactions", "transaction", transaction_id, "transaction_id"
-        ),
+        lambda: _retrieve("transaction", transaction_id),
     )
 
 

@@ -13,7 +13,14 @@ from typing import Any
 import pytest
 
 from xagent.web.connector_checks.assertions import judge_result
-from xagent.web.connector_checks.declarations import ReadCheck
+from xagent.web.connector_checks.declarations import (
+    EachHasKeys,
+    HasKeys,
+    IsType,
+    Length,
+    ReadCheck,
+    StatusSuccess,
+)
 from xagent.web.connector_checks.registry import _TIER_2, CONNECTOR_CHECKS
 from xagent.web.tools.mcp import chargebee
 
@@ -84,5 +91,55 @@ def test_a_list_check_fails_on_an_error_envelope(
     monkeypatch: pytest.MonkeyPatch, check: ReadCheck
 ):
     output, _ = _run(monkeypatch, check, {"unexpected": []})
+    failure, _ = _judge(check, output)
+    assert failure is not None
+
+
+# Each list check, pinned exactly: dropping an assertion fails here.
+_PINS = {
+    "chargebee.list_subscriptions": ("subscriptions", ("id", "customer_id", "status")),
+    "chargebee.list_invoices": ("invoices", ("id", "customer_id", "status")),
+    "chargebee.list_transactions": (
+        "transactions",
+        ("id", "type", "currency_code"),
+    ),
+}
+
+
+@pytest.mark.parametrize("check_id", sorted(_PINS))
+def test_a_list_check_is_declared_exactly(check_id: str):
+    field, item_keys = _PINS[check_id]
+    check = next(c for c in _read_checks() if c.id == check_id)
+    assert check.tool == f"chargebee_list_{field}"
+    assert check.arguments == {"limit": 1}
+    assert check.assertions == (
+        StatusSuccess(),
+        HasKeys((), (field, "next_offset", "has_more", "truncated")),
+        IsType(("has_more",), "boolean"),
+        IsType((field,), "array"),
+        EachHasKeys((field,), item_keys),
+        Length((field,), max=1),
+    )
+
+
+@pytest.mark.parametrize("check_id", sorted(_PINS))
+def test_a_list_check_fails_on_an_entry_without_a_required_key(
+    monkeypatch: pytest.MonkeyPatch, check_id: str
+):
+    check = next(c for c in _read_checks() if c.id == check_id)
+    field = check.tool.removeprefix("chargebee_list_")
+    resource, item = next(iter(_ENTRIES[field].items()))
+    output, _ = _run(monkeypatch, check, {"list": [{resource: {"id": item["id"]}}]})
+    failure, _ = _judge(check, output)
+    assert failure is not None
+
+
+@pytest.mark.parametrize("check_id", sorted(_PINS))
+def test_a_list_check_fails_on_more_than_one_entry(
+    monkeypatch: pytest.MonkeyPatch, check_id: str
+):
+    check = next(c for c in _read_checks() if c.id == check_id)
+    field = check.tool.removeprefix("chargebee_list_")
+    output, _ = _run(monkeypatch, check, {"list": [_ENTRIES[field]] * 2})
     failure, _ = _judge(check, output)
     assert failure is not None

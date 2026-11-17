@@ -280,6 +280,25 @@ def test_error_text_never_carries_the_key(
     assert "test_cbkey123secret" not in str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "echo",
+    [
+        "api_key=test_cbkey123secret",
+        "Authorization: Basic test_cbkey123secret",
+        "token: test_cbkey123secret",
+    ],
+)
+def test_a_credential_shaped_echo_leaks_no_part_of_the_key(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None, echo: str
+):
+    """Generic redaction keeps the last four characters of a credential-shaped
+    value; the key has to be removed before it runs."""
+    _install(monkeypatch, _FakeResponse(status_code=500, text=f"upstream: {echo}"))
+    with pytest.raises(RuntimeError) as excinfo:
+        chargebee._get("/customers")
+    assert "cret" not in str(excinfo.value)
+
+
 def test_transport_error_text_is_redacted(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
@@ -346,7 +365,7 @@ def test_rate_limit_is_reported_after_the_one_retry(
     assert _no_real_sleep == [2]
 
 
-@pytest.mark.parametrize("retry_after", [None, "0", "120", "soon"])
+@pytest.mark.parametrize("retry_after", [None, "0", "120", "soon", "²"])
 def test_rate_limit_without_a_usable_wait_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
     configured_env: None,
@@ -380,22 +399,31 @@ def test_non_json_success_is_an_error(
 # ---------------------------------------------------------------------------
 
 
+_NOV_1 = 1793491200  # 2026-11-01T00:00:00Z
+_DAY = 86400
+
+
 @pytest.mark.parametrize(
-    "value, expected",
+    "value, bound, expected",
     [
-        ("2026-11-01", 1793491200),
-        ("2026-11-01T08:00:00+08:00", 1793491200),
-        ("2026-11-01T00:00:00Z", 1793491200),
+        # Chargebee's bounds are exclusive; a bare date includes its whole day.
+        ("2026-11-01", "after", _NOV_1 - 1),
+        ("2026-11-01", "before", _NOV_1 + _DAY),
+        # A datetime is sent as given.
+        ("2026-11-01T08:00:00+08:00", "after", _NOV_1),
+        ("2026-11-01T00:00:00Z", "before", _NOV_1),
     ],
 )
-def test_timestamp_accepts_a_date_or_an_offset_datetime(value: str, expected: int):
-    assert chargebee._timestamp(value, "date_after") == expected
+def test_timestamp_counts_a_bare_date_as_its_whole_day(
+    value: str, bound: str, expected: int
+):
+    assert chargebee._timestamp(value, "date_after", bound) == expected
 
 
 @pytest.mark.parametrize("value", ["2026-11-01T08:00:00", "yesterday", "1793491200"])
 def test_timestamp_rejects_ambiguous_values(value: str):
     with pytest.raises(ValueError, match="date_after"):
-        chargebee._timestamp(value, "date_after")
+        chargebee._timestamp(value, "date_after", "after")
 
 
 # ---------------------------------------------------------------------------
@@ -497,8 +525,9 @@ def test_list_customers_sends_filters_in_chargebee_operator_form(
     params = recorder.call["params"]
     assert params["email[is]"] == "a@example.com"
     assert params["company[is]"] == "Acme"
-    assert params["created_at[after]"] == 1793491200
-    assert params["created_at[before]"] == 1796083200
+    assert params["created_at[after]"] == _NOV_1 - 1
+    # 2026-12-01 counts as a whole day: up to the start of 12-02.
+    assert params["created_at[before]"] == 1796083200 + _DAY
 
 
 def test_list_subscriptions_filters_by_customer_and_status(
@@ -530,8 +559,8 @@ def test_invoice_and_transaction_lists_filter_by_date(
     assert params["customer_id[is]"] == "cust_1"
     assert params["subscription_id[is]"] == "sub_1"
     assert params["status[is]"] == "paid"
-    assert params["date[after]"] == 1793491200
-    assert params["date[before]"] == 1796083200
+    assert params["date[after]"] == _NOV_1 - 1
+    assert params["date[before]"] == 1796083200 + _DAY
 
 
 def test_list_tool_reports_a_bad_date_without_sending(
@@ -567,6 +596,20 @@ def test_list_halves_an_oversized_page(
     # The dropped entries are not on the next page; their ids are returned.
     assert result["omitted_ids"] == [f"c{n}" for n in range(kept, 20)]
     assert "smaller limit" in result["message"]
+
+
+def test_list_stays_valid_json_when_even_the_ids_do_not_fit(
+    monkeypatch: pytest.MonkeyPatch, configured_env: None
+):
+    monkeypatch.setattr(chargebee, "get_tool_max_output_length", lambda: 200)
+    entries = [{"customer": {"id": f"cust_{n:040d}"}} for n in range(20)]
+    _install(monkeypatch, _ok({"list": entries}))
+    raw = chargebee.chargebee_list_customers(limit=20)
+    result = _payload(raw)
+    assert len(raw) <= 200
+    assert result["customers"] == []
+    assert result["truncated"] is True
+    assert result["omitted_count"] == 20
 
 
 def test_list_names_a_record_too_large_to_return(

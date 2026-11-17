@@ -4465,6 +4465,7 @@ _AUTO_RESUME_INT_SETTINGS = [
 _AUTO_RESUME_BOOL_SETTINGS = [
     ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", True),
     ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled", True),
+    ("REFUSE_SEARCH_RESULT_FETCH", "get_refuse_search_result_fetch_enabled", True),
 ]
 
 

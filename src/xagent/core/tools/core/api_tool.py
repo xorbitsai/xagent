@@ -24,6 +24,7 @@ from ...utils.security import (
     redact_sensitive_text,
     redact_url_credentials_for_logging,
 )
+from .search_result_pages import search_result_page_refusal
 from .web_content import get_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -334,11 +335,28 @@ class APIClientCore:
 
         Returns:
             Dictionary with success status, status_code, headers, body, and
-            error. On a 401/403 response, also carries the internal-only
-            final_url/final_request_has_credential keys the adapter's
-            connector-domain hint uses (see _sanitize_final_url /
-            has_auth_credentials) - both are None on every other status.
+            error. A search-engine result-page URL is refused before any
+            request (status_code 0, ``blocked_by_policy`` True). On a 401/403
+            response, also carries the internal-only final_url/
+            final_request_has_credential keys the adapter's connector-domain
+            hint uses (see _sanitize_final_url / has_auth_credentials) - both
+            are None on every other status.
         """
+        # Before the first log line: a refused URL carries the search text, and
+        # the query may arrive through ``params`` rather than inside ``url``.
+        refusal = self._search_result_page_refusal(
+            url, params, auth_type, auth_token, api_key_param
+        )
+        if refusal is not None:
+            return {
+                "success": False,
+                "status_code": 0,
+                "headers": {},
+                "body": None,
+                "error": refusal,
+                "blocked_by_policy": True,
+            }
+
         logger.info(
             f"🌐 API Call: {method} "
             f"{redact_url_credentials_for_logging(url, redact_all_query_values=True)}"
@@ -639,6 +657,33 @@ class APIClientCore:
                     "final_url": final_url,
                     "final_request_has_credential": final_request_has_credential,
                 }
+
+    @staticmethod
+    def _search_result_page_refusal(
+        url: str,
+        params: Optional[Dict[str, Any]],
+        auth_type: Optional[str],
+        auth_token: Optional[str],
+        api_key_param: str,
+    ) -> Optional[str]:
+        """Refusal message when the request would load a search result page.
+
+        The URL is checked the way the request will be sent: with ``params``
+        (and an ``api_key_query`` credential) merged into its query string, so
+        ``url=https://engine.example/search`` plus ``params={"q": ...}`` is
+        judged like the combined URL.
+        """
+        probe_params: Dict[str, Any] = dict(params) if params else {}
+        if auth_type and auth_type.lower() == "api_key_query" and auth_token:
+            probe_params[api_key_param] = auth_token
+        probe = url
+        if probe_params:
+            try:
+                probe = str(httpx.URL(url).copy_merge_params(probe_params))
+            except Exception:
+                # Unparseable here: leave it to the request path's own handling.
+                probe = url
+        return search_result_page_refusal(probe)
 
     def _is_valid_url(self, url: str) -> bool:
         """Validate URL format and scheme"""

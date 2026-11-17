@@ -454,50 +454,55 @@ def test_unreachable_identity_endpoint_does_not_echo_the_error(monkeypatch):
 # ---------- login and callback -------------------------------------------------
 
 
+def seed_shopify_oauth(db) -> User:
+    """Add the user, the Shopify OAuth catalog row and the provider row."""
+    user = User(username="alice", password_hash="hash")
+    db.add(user)
+    # The catalog row ships in a later change; this stands in for it.
+    db.add(
+        PublicMCPApp(
+            app_id=TEST_APP_ID,
+            name="Shopify",
+            description="Shopify test app",
+            transport="oauth",
+            provider_name="shopify",
+            oauth_scopes=REQUIRED,
+            launch_config={
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.shopify"],
+                "env_mapping": {
+                    "SHOPIFY_ACCESS_TOKEN": "access_token",
+                    "SHOPIFY_STORE_DOMAIN": "instance_url",
+                },
+            },
+            is_visible_in_connector=True,
+        )
+    )
+    db.add(
+        OAuthProvider(
+            provider_name="shopify",
+            name="Shopify",
+            client_id=encrypt_value("client-id"),
+            client_secret=encrypt_value(CLIENT_SECRET),
+            auth_url="",
+            token_url="",
+            redirect_uri="https://xagent.example/api/auth/shopify/callback",
+            userinfo_url="",
+            default_scopes=[],
+        )
+    )
+    db.commit()
+    db.refresh(user)
+    return user
+
+
 @pytest.fixture()
 def shopify_db(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'shopify-oauth.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     with factory() as db:
-        user = User(username="alice", password_hash="hash")
-        db.add(user)
-        # The catalog row ships in a later change; this stands in for it.
-        db.add(
-            PublicMCPApp(
-                app_id=TEST_APP_ID,
-                name="Shopify",
-                description="Shopify test app",
-                transport="oauth",
-                provider_name="shopify",
-                oauth_scopes=REQUIRED,
-                launch_config={
-                    "command": "python",
-                    "args": ["-m", "xagent.web.tools.mcp.shopify"],
-                    "env_mapping": {
-                        "SHOPIFY_ACCESS_TOKEN": "access_token",
-                        "SHOPIFY_STORE_DOMAIN": "instance_url",
-                    },
-                },
-                is_visible_in_connector=True,
-            )
-        )
-        db.add(
-            OAuthProvider(
-                provider_name="shopify",
-                name="Shopify",
-                client_id=encrypt_value("client-id"),
-                client_secret=encrypt_value(CLIENT_SECRET),
-                auth_url="",
-                token_url="",
-                redirect_uri="https://xagent.example/api/auth/shopify/callback",
-                userinfo_url="",
-                default_scopes=[],
-            )
-        )
-        db.commit()
-        db.refresh(user)
-        yield db, user
+        yield db, seed_shopify_oauth(db)
     engine.dispose()
 
 
@@ -921,6 +926,8 @@ def test_a_store_connected_by_another_user_is_refused_before_the_exchange(
     held = _grant(db, bob)
     assert held is not None
     assert held.access_token == "held-access"
+    # The refusal releases the store at once.
+    assert _probe_store_lock(db) is True
 
 
 def test_the_owner_can_reconnect_their_store(shopify_db, monkeypatch):
@@ -1165,3 +1172,102 @@ def test_an_actor_refresh_locks_the_store_before_its_grant(shopify_db, monkeypat
         if s.startswith("update user_oauth set id = id")
     )
     assert store_lock < row_lock
+
+
+def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_db, monkeypatch):
+    """Two tool calls of one process resolve the same expired grant at once.
+    The store lock is waited for off the event loop: waiting on it there
+    would stop the loop, and with it the refresh that holds the lock."""
+    import asyncio
+
+    db, user = shopify_db
+    _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    posted: list = []
+
+    class SlowAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            posted.append(url)
+            await asyncio.sleep(0.2)
+            return _Response(
+                {
+                    "access_token": "rotated-access",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 3600,
+                }
+            )
+
+    monkeypatch.setattr(tool_config, "create_public_async_client", SlowAsyncClient)
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    async def resolve_twice():
+        config = tool_config.WebToolConfig(
+            db=None, request=None, db_factory=factory, user_id=user.id
+        )
+        return await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    config._resolve_legacy_oauth_access_token(
+                        provider_name="shopify", app_id=TEST_APP_ID
+                    )
+                    for _ in range(2)
+                )
+            ),
+            timeout=4,
+        )
+
+    resolutions = asyncio.run(resolve_twice())
+
+    assert [r.access_token for r in resolutions] == ["rotated-access"] * 2
+    # The second one waited and used the first one's token.
+    assert len(posted) == 1
+
+
+def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
+    shopify_db, monkeypatch
+):
+    """A reconnect replaces the grant row (delete, then insert under a new
+    id) while a refresh waits for the store; the refresh then uses the new
+    grant rather than reporting no connection."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    grant = _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    grant_id = grant.id
+    # Keeps SQLite from handing the replacement row the deleted row's id.
+    _held_grant(db, _other_user(db), store="other")
+    posted = _fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+
+    def lock_after_a_reconnect(session, **kwargs):
+        with sessionmaker(bind=db.get_bind())() as other:
+            other.delete(other.get(UserOAuth, grant_id))
+            other.flush()
+            other.add(
+                UserOAuth(
+                    user_id=user.id,
+                    provider=TEST_APP_ID,
+                    oauth_provider="shopify",
+                    access_token="reconnected-access",
+                    refresh_token="reconnected-refresh",
+                    instance_url="acme",
+                    provider_user_id=SHOP_GID,
+                    expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                )
+            )
+            other.commit()
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(
+        shopify_store_locks, "lock_shopify_store", lock_after_a_reconnect
+    )
+
+    resolution = _resolve_shopify(db, user.id)
+
+    assert resolution.access_token == "reconnected-access"
+    assert posted == []

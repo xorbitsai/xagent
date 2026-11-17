@@ -14,12 +14,16 @@ depends_on = None
 
 
 def upgrade() -> None:
-    if not sa.inspect(op.get_bind()).has_table("shopify_store_locks"):
-        op.create_table(
-            "shopify_store_locks",
-            sa.Column("provider", sa.String(50), primary_key=True, nullable=False),
-            sa.Column("store", sa.String(255), primary_key=True, nullable=False),
-        )
+    # Offline SQL generation cannot inspect: it emits the CREATE TABLE.
+    if not op.get_context().as_sql and sa.inspect(op.get_bind()).has_table(
+        "shopify_store_locks"
+    ):
+        return
+    op.create_table(
+        "shopify_store_locks",
+        sa.Column("provider", sa.String(50), primary_key=True, nullable=False),
+        sa.Column("store", sa.String(255), primary_key=True, nullable=False),
+    )
 
 
 def downgrade() -> None:

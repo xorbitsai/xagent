@@ -108,6 +108,7 @@ from ..services.tool_credentials import (
 from ..services import shopify_store_locks
 from ..services.shopify_store_locks import shopify_store_of
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
+from ..shopify_oauth import is_shopify_provider
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,9 @@ UNAVAILABLE_MCP_APP_SCOPED_GRANT_MESSAGE = (
 )
 _ACTOR_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
     tuple[int, int, str, str], asyncio.Lock
+] = WeakValueDictionary()
+_SHOPIFY_OAUTH_REFRESH_LOCKS: WeakValueDictionary[
+    tuple[int, int, str], asyncio.Lock
 ] = WeakValueDictionary()
 # This web-runtime allowlist is intentionally narrower than the adapter-layer
 # public summary allowlist. It accepts only credential/config resolution reasons
@@ -776,6 +780,16 @@ def _actor_oauth_refresh_lock(
     return lock
 
 
+def _shopify_oauth_refresh_lock(user_id: int, provider_name: str) -> asyncio.Lock:
+    """The in-process lock a user's own Shopify grant resolves under."""
+    key = (id(asyncio.get_running_loop()), user_id, provider_name.lower())
+    lock = _SHOPIFY_OAUTH_REFRESH_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SHOPIFY_OAUTH_REFRESH_LOCKS[key] = lock
+    return lock
+
+
 def _oauth_launch_config_mapping(
     launch_config: Any,
 ) -> Mapping[str, Any] | None:
@@ -1314,18 +1328,33 @@ def _lock_shopify_store_and_reread(
     Shopify retires a token refreshed or granted alongside another one for
     the same store, so refreshes and callbacks for a store take turns under
     the lock until this transaction ends. Whoever went first may have stored
-    a token that needs no refresh, or removed the grant, so the row is read
-    again after the wait; ``None`` means it is gone.
+    a token that needs no refresh, so the grant is read again after the wait.
+    A reconnect replaces the row under a new id, so a missing row is looked
+    up again in its owner's namespace; ``None`` means the grant is gone.
     """
     from ..models.user_oauth import UserOAuth
 
     store = shopify_store_of(provider_name, oauth_account.instance_url)
     if store is None:
         return oauth_account
+    user_id = int(oauth_account.user_id)
+    resource_owner_key = oauth_account.resource_owner_key
+    app_provider = str(oauth_account.provider)
     shopify_store_locks.lock_shopify_store(db, provider=str(provider_name), store=store)
-    return (
+    reread = (
         db.query(UserOAuth)
         .filter(UserOAuth.id == oauth_account.id)
+        .populate_existing()
+        .first()
+    )
+    if reread is not None:
+        return reread
+    return (
+        scoped_user_oauth_query(
+            db, user_id=user_id, resource_owner_key=resource_owner_key
+        )
+        .filter(UserOAuth.provider == app_provider)
+        .order_by(UserOAuth.id.desc())
         .populate_existing()
         .first()
     )
@@ -4872,6 +4901,8 @@ class WebToolConfig(BaseToolConfig):
                 actor_query.with_entities(UserOAuth.instance_url)
                 .order_by(UserOAuth.id.desc())
                 .first()
+                if isinstance(provider_name, str) and is_shopify_provider(provider_name)
+                else None
             )
             peeked_store = shopify_store_of(
                 provider_name, peeked.instance_url if peeked else None
@@ -4978,12 +5009,6 @@ class WebToolConfig(BaseToolConfig):
         resource_owner_key: str | None = None,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist one exact OAuth owner in an isolated transaction."""
-        from ...web.mcp_apps import (
-            oauth_grant_keys_rejected_by_app_scope,
-            restrict_to_app_scoped_oauth_grant,
-        )
-        from ...web.models.user_oauth import UserOAuth
-
         if self._user_id is None:
             return _LegacyOAuthTokenResolution(access_token=None)
         user_id = int(self._user_id)
@@ -4997,8 +5022,73 @@ class WebToolConfig(BaseToolConfig):
                 resource_owner_key=resource_owner_key,
                 user_id=user_id,
             )
+        session_factory = self._legacy_oauth_session_factory()
+        if isinstance(provider_name, str) and is_shopify_provider(provider_name):
+            return await self._resolve_ordinary_shopify_oauth_access_token(
+                session_factory=session_factory,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+            )
+        return await self._resolve_ordinary_oauth_access_token(
+            session_factory=session_factory,
+            provider_name=provider_name,
+            app_id=app_id,
+            app_info=app_info,
+            user_id=user_id,
+        )
 
-        oauth_db = self._new_legacy_oauth_session()
+    async def _resolve_ordinary_shopify_oauth_access_token(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: str,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve a user's own Shopify grant off the event loop.
+
+        Its refresh holds the store lock across the provider request, and a
+        second resolution waiting for that lock on the event loop would stop
+        the loop, and with it the refresh it waits for. So, like an actor
+        refresh, it runs on a worker thread behind an in-process lock.
+        """
+        from ..services.db_runtime import run_db_io_cancellation_safe
+
+        # Same-process waiters must not reserve a pooled connection while
+        # waiting.
+        async with _shopify_oauth_refresh_lock(user_id, provider_name):
+            return await run_db_io_cancellation_safe(
+                lambda: asyncio.run(
+                    self._resolve_ordinary_oauth_access_token(
+                        session_factory=session_factory,
+                        provider_name=provider_name,
+                        app_id=app_id,
+                        app_info=app_info,
+                        user_id=user_id,
+                    )
+                )
+            )
+
+    async def _resolve_ordinary_oauth_access_token(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: object,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve and persist the user's own grant in an isolated transaction."""
+        from ...web.mcp_apps import (
+            oauth_grant_keys_rejected_by_app_scope,
+            restrict_to_app_scoped_oauth_grant,
+        )
+        from ...web.models.user_oauth import UserOAuth
+
+        oauth_db = session_factory()
         try:
             shared_account = self._resolve_shared_google_oauth_account(
                 oauth_db,

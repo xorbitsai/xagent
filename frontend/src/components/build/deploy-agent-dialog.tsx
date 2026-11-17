@@ -27,6 +27,7 @@ import {
   type DeploymentConfig,
 } from "@/lib/deployment-config"
 import { DeployAgentEmbedExtension } from "@/lib/deploy-agent-extension"
+import { AGENT_CHANNEL_ENABLED, AgentChannelOption, AgentChannelView } from "@/lib/agent-channel-extension"
 import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, rotateAgentWidgetKey, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 export interface Agent {
@@ -64,11 +65,13 @@ interface DeployAgentDialogProps {
   // so this dialog never nests its own Radix Dialog.
   onManageApiKey?: () => void
   onManageTriggers?: () => void
+  // "channel" opens the extension channel view (see lib/agent-channel-extension).
+  initialView?: "options" | "channel"
 }
 
-export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey, onManageTriggers }: DeployAgentDialogProps) {
+export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey, onManageTriggers, initialView = "options" }: DeployAgentDialogProps) {
   const { t } = useI18n()
-  const [activeView, setActiveView] = useState<"options" | "embed" | "api" | "share">("options")
+  const [activeView, setActiveView] = useState<"options" | "embed" | "api" | "share" | "channel">(AGENT_CHANNEL_ENABLED ? initialView : "options")
   const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
   const [copiedSnippet, setCopiedSnippet] = useState(false)
   const [copiedShareLink, setCopiedShareLink] = useState(false)
@@ -472,6 +475,13 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   return (
     <Dialog open={deployAgent !== null} onOpenChange={handleOpenChange}>
+      {activeView === "channel" && deployAgent ? (
+        <AgentChannelView
+          agent={deployAgent}
+          onBack={() => setActiveView("options")}
+          onClose={() => handleOpenChange(false)}
+        />
+      ) : (
       <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
@@ -488,6 +498,12 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
         {activeView === "options" ? (
           <div className="mt-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {deployAgent && (
+                <AgentChannelOption
+                  agent={deployAgent}
+                          onOpen={() => setActiveView("channel")}
+                />
+              )}
               {deploymentOptions.map((option) => (
                 <Card
                   key={option.id}
@@ -729,6 +745,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
           </div>
         )}
       </DialogContent>
+      )}
     </Dialog >
   )
 }

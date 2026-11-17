@@ -21,6 +21,7 @@ import { AgentProfileDialog } from "@/components/chat/agent-profile-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useAuth } from "@/contexts/auth-context"
+import { AgentChannelHeaderAction } from "@/lib/agent-channel-extension"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
@@ -94,6 +95,7 @@ function AgentChatHeaderContent({
   const [menuOpen, setMenuOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const [deployOpen, setDeployOpen] = useState(false)
+  const [deployView, setDeployView] = useState<"options" | "channel">("options")
   const [routinesOpen, setRoutinesOpen] = useState(false)
   // Details that have been fetched or saved under this mounted identity; the
   // initial placeholder is not an agent worth reporting.
@@ -145,6 +147,10 @@ function AgentChatHeaderContent({
         <button onClick={() => setRoutinesOpen(true)} className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border px-3 text-[11.5px] font-medium hover:bg-muted">
           <CalendarClock className="h-3.5 w-3.5" /> {t("workspace.routines")}
         </button>
+        <AgentChannelHeaderAction
+          agent={agent}
+          onOpen={() => { setDeployView("channel"); setDeployOpen(true) }}
+        />
         {rightSlot}
         <Popover open={menuOpen} onOpenChange={setMenuOpen}>
           <PopoverTrigger asChild>
@@ -153,7 +159,7 @@ function AgentChatHeaderContent({
           <PopoverContent align="end" sideOffset={7} className="w-56 rounded-xl p-1.5 shadow-xl">
             <button onClick={() => openAction(() => setProfileOpen(true))} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm hover:bg-accent"><User className="h-4 w-4 text-muted-foreground" /> {t("workspace.profile")}</button>
             <button onClick={() => openAction(() => router.push(`/build/${agent.id}`))} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm hover:bg-accent"><Settings2 className="h-4 w-4 text-muted-foreground" /> {t("workspace.builderSettings")}</button>
-            <button onClick={() => openAction(() => setDeployOpen(true))} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm hover:bg-accent"><Rocket className="h-4 w-4 text-muted-foreground" /> {t("workspace.deploy")}</button>
+            <button onClick={() => openAction(() => { setDeployView("options"); setDeployOpen(true) })} className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm hover:bg-accent"><Rocket className="h-4 w-4 text-muted-foreground" /> {t("workspace.deploy")}</button>
           </PopoverContent>
         </Popover>
       </header>
@@ -178,6 +184,7 @@ function AgentChatHeaderContent({
       {deployOpen && (
         <DeployAgentDialog
           deployAgent={agent}
+          initialView={deployView}
           onClose={() => setDeployOpen(false)}
           onUpdate={(updated) => setAgent((current) => ({ ...current, ...updated }))}
           onManageApiKey={() => router.push(`/api-keys?agent=${agent.id}`)}

@@ -24,6 +24,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
 MAX_DISCOVERED_ASSETS = 50
+# Page furniture that carries no answer text. Dropped only when the caller asks
+# for a trimmed page (``trim_boilerplate``).
+BOILERPLATE_TAGS = ("nav", "header", "footer", "aside", "form", "iframe", "dialog")
+BOILERPLATE_ROLES = frozenset({"navigation", "banner", "contentinfo", "complementary"})
+# A <main>/<article> region is used instead of the whole page only when it holds
+# at least this much text; a short one is usually a widget, not the content.
+MIN_MAIN_REGION_CHARS = 400
+TRUNCATION_NOTICE = (
+    "\n\n[Page text truncated: showing the first {shown} of {total} characters. "
+    "Request more with max_chars only if the answer needs the rest.]"
+)
 # Statuses a site returns when it refuses an automated client rather than
 # because the page is missing or the fetcher failed.
 SITE_BLOCKED_STATUS_CODES = frozenset({401, 403, 429, 451})
@@ -84,6 +95,8 @@ class WebContentFetchResult:
     error: str | None = None
     assets: tuple[WebAssetReference, ...] = ()
     blocked_by_site: bool = False
+    truncated: bool = False
+    total_chars: int | None = None
 
     @property
     def success(self) -> bool:
@@ -107,6 +120,8 @@ class WebContentFetchResult:
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
             "blocked_by_site": self.blocked_by_site,
+            "truncated": self.truncated,
+            "total_chars": self.total_chars,
         }
 
 
@@ -203,6 +218,7 @@ class WebContentFetcher:
         *,
         include_assets: bool = False,
         asset_query: str | None = None,
+        trim_boilerplate: bool = False,
     ) -> WebContentFetchResult:
         logger.info("Fetching webpage content from: %s", url)
 
@@ -249,7 +265,9 @@ class WebContentFetcher:
                         discovered_assets,
                         asset_query=asset_query,
                     )
-                markdown = self._soup_to_markdown(soup, final_url)
+                markdown = self._soup_to_markdown(
+                    soup, final_url, trim_boilerplate=trim_boilerplate
+                )
 
                 return WebContentFetchResult(
                     url=final_url,
@@ -419,9 +437,14 @@ class WebContentFetcher:
         return ""
 
     @staticmethod
-    def _soup_to_markdown(soup: BeautifulSoup, base_url: str) -> str:
+    def _soup_to_markdown(
+        soup: BeautifulSoup, base_url: str, *, trim_boilerplate: bool = False
+    ) -> str:
         for element in soup(["script", "style", "noscript", "svg"]):
             element.decompose()
+
+        if trim_boilerplate:
+            soup = _trim_boilerplate(soup)
 
         for tag in soup.find_all("a"):
             if not hasattr(tag, "get") or not hasattr(tag, "__setitem__"):
@@ -440,6 +463,43 @@ class WebContentFetcher:
         return markdown
 
 
+def _trim_boilerplate(soup: BeautifulSoup) -> BeautifulSoup:
+    """Drop navigation and page furniture, keeping the main content region."""
+
+    main = (
+        soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
+    )
+    if (
+        main is not None
+        and len(main.get_text(" ", strip=True)) >= MIN_MAIN_REGION_CHARS
+    ):
+        soup = BeautifulSoup(str(main), "html.parser")
+    for element in soup(list(BOILERPLATE_TAGS)):
+        element.decompose()
+    for element in soup.find_all(attrs={"role": True}):
+        role = element.get("role")
+        if isinstance(role, str) and role.lower() in BOILERPLATE_ROLES:
+            element.decompose()
+    return soup
+
+
+def truncate_page_text(text: str, max_chars: int) -> tuple[str, bool]:
+    """Cut ``text`` to about ``max_chars``, preferring a paragraph or line break.
+
+    Returns the (possibly shortened) text and whether anything was cut. The
+    notice is not part of the returned text.
+    """
+
+    if len(text) <= max_chars:
+        return text, False
+    window = text[:max_chars]
+    for separator in ("\n\n", "\n"):
+        cut = window.rfind(separator)
+        if cut >= max_chars // 2:
+            return window[:cut].rstrip(), True
+    return window.rstrip(), True
+
+
 def _is_site_blocked_response(response: httpx.Response) -> bool:
     """Return whether an error response means the site refused automated access."""
 
@@ -456,6 +516,7 @@ async def fetch_web_content(
     *,
     include_assets: bool = False,
     asset_query: str | None = None,
+    trim_boilerplate: bool = False,
 ) -> WebContentFetchResult:
     """Fetch a webpage using the default proxy configuration."""
 
@@ -469,6 +530,7 @@ async def fetch_web_content(
         url,
         include_assets=include_assets,
         asset_query=asset_query,
+        trim_boilerplate=trim_boilerplate,
     )
 
 

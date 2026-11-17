@@ -380,6 +380,9 @@ MCP_PRIVATE_ENDPOINTS = "XAGENT_MCP_PRIVATE_ENDPOINTS"
 MCP_PRIVATE_CIDRS = "XAGENT_MCP_PRIVATE_CIDRS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+FETCH_WEB_CONTENT_BUDGET = "XAGENT_FETCH_WEB_CONTENT_BUDGET"
+FETCH_WEB_CONTENT_MAX_CHARS = "XAGENT_FETCH_WEB_CONTENT_MAX_CHARS"
+DEFAULT_FETCH_WEB_CONTENT_MAX_CHARS = 12_000
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
@@ -4864,6 +4867,25 @@ def get_tool_max_output_length() -> int:
         except ValueError:
             logger.warning("Invalid %s value: %s", TOOL_MAX_OUTPUT_LENGTH, env_str)
     return 50 * 1024
+
+
+def get_fetch_web_content_budget_enabled() -> bool:
+    """Whether ``fetch_web_content`` trims page boilerplate and caps its output.
+
+    On by default. Set ``XAGENT_FETCH_WEB_CONTENT_BUDGET=false`` to return the
+    full extracted page again (rollback switch).
+    """
+    return _get_bool_env(FETCH_WEB_CONTENT_BUDGET, True)
+
+
+def get_fetch_web_content_max_chars() -> int:
+    """Default character budget for one ``fetch_web_content`` result.
+
+    About 3k tokens. The model can ask for more per call with ``max_chars``.
+    """
+    return _get_positive_int_env(
+        FETCH_WEB_CONTENT_MAX_CHARS, DEFAULT_FETCH_WEB_CONTENT_MAX_CHARS, minimum=1_000
+    )
 
 
 def get_web_search_provider() -> str:

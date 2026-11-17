@@ -77,7 +77,8 @@ class ExaWebSearchTool(AbstractBaseTool):
             "Search the web using Exa AI-powered search. "
             "Returns lightweight results with titles and links by default. "
             "Set content_mode only when search-result highlights, text, or summaries "
-            "are needed; otherwise use fetch_web_content to read one selected URL. "
+            "are needed; otherwise use fetch_web_content to read one selected URL."
+            " Snippets are often enough for a simple question; fetch at most one or two pages, and only when they are not. "
             "Supports category filtering, domain filtering, text filtering, and date range filtering. "
             "Useful for finding current information, research, news, and company data."
         )

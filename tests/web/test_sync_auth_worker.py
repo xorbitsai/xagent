@@ -134,7 +134,6 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
         "create",
         "SELECT",
         "SELECT",  # The login's browser_sessions row (#3771).
-        "SELECT",  # The user, reloaded after the read snapshot ends.
         "SELECT",  # The enforcement leases, for the fence's condition.
         "UPDATE",  # The fence on browser_sessions, before users.
         "UPDATE",
@@ -462,6 +461,31 @@ async def test_refresh_loses_to_expiry_seen_by_another_worker(worker_db, monkeyp
         assert session.scalar(select(User.refresh_token)) == hash_refresh_token(
             tokens["refresh_token"]
         )
+
+
+@pytest.mark.asyncio
+async def test_refresh_racing_a_user_deletion_is_unauthorized(worker_db, monkeypatch):
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    factory, _, engine = worker_db
+    tokens = await auth.login(
+        auth.LoginRequest(username="worker", password="password123"), factory
+    )
+    original = auth._prepare_refresh_response
+
+    def prepare_then_delete(user, request):
+        response = original(user, request)  # The user still existed here.
+        with Session(engine) as other:
+            other.query(BrowserSession).delete()
+            other.query(User).delete()
+            other.commit()
+        return response
+
+    monkeypatch.setattr(auth, "_prepare_refresh_response", prepare_then_delete)
+    with pytest.raises(HTTPException) as caught:
+        await auth.refresh_token(
+            auth.RefreshTokenRequest(refresh_token=tokens["refresh_token"]), factory
+        )
+    assert caught.value.status_code == 401
 
 
 @pytest.mark.asyncio

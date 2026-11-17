@@ -81,6 +81,14 @@ _RETENTION = (
 _REQUEST_SID_ATTR = "_xagent_browser_session_id"
 
 
+@dataclass(frozen=True)
+class UserRole:
+    """A user's id and admin flag, read before a rollback expires the ORM row."""
+
+    id: int
+    is_admin: bool
+
+
 class BrowserSessionRejected(Exception):
     """The login is idle-expired, revoked, unknown or predates browser sessions."""
 
@@ -128,12 +136,13 @@ def request_session_claims(user: User) -> dict[str, str]:
 
 
 def _current_timeout(
-    user: User, recorded_admin: bool, policy: BrowserIdlePolicy
+    user: User | UserRole, recorded_admin: bool, policy: BrowserIdlePolicy
 ) -> timedelta:
     """This replica's threshold for the stricter of the recorded and current role.
 
     A demotion never moves a login onto a longer threshold before its next
-    activity records the new role, whether or not a lease covers its deadline.
+    activity or refresh records the new role, whether or not a lease covers its
+    deadline.
     """
     return min(
         timedelta(seconds=policy.timeout_seconds(role))
@@ -340,7 +349,7 @@ def _active_after(
 
 
 def _alive_condition(
-    db: Session, user: User, *, now: datetime, policy: BrowserIdlePolicy
+    db: Session, user: User | UserRole, *, now: datetime, policy: BrowserIdlePolicy
 ) -> Any | None:
     """SQL condition that the login has not expired, for conditional writes.
 
@@ -543,7 +552,7 @@ def check_browser_session(
 
 def fence_browser_session_for_refresh(
     db: Session,
-    user: User,
+    user: User | UserRole,
     sid: str,
     *,
     now: datetime | None = None,

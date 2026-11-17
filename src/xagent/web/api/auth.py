@@ -3008,6 +3008,9 @@ def _refresh_in_worker(
         presented_sid = token_browser_session_id(request.refresh_token)
         issued_sid = token_browser_session_id(response.refresh_token)
         previous_epoch = user.session_epoch
+        # Read before the rollback expires ``user``: reloading it would fail if
+        # the user were deleted meanwhile, and that refresh must stay a 401.
+        role = browser_idle.UserRole(id=int(user.id), is_admin=bool(user.is_admin))
         # End the read snapshot before competing for a write. In SQLite this
         # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
         # below, not the preceding SELECT, is the authority on token consumption.
@@ -3017,7 +3020,7 @@ def _refresh_in_worker(
         # Lock the login's row before users (same order as logout) and repeat
         # the idle and revocation checks, so expiry racing this refresh wins.
         if continues_login and not browser_idle.fence_browser_session_for_refresh(
-            session, user, str(issued_sid), now=now
+            session, role, str(issued_sid), now=now
         ):
             session.rollback()
             raise browser_idle.rejection_http_exception()

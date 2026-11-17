@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from .attachments import project_file_info_to_chip
+from .attachments import CLIENT_METADATA_KEY, project_file_info_to_chip
 from .result import extract_assistant_message
 from .trace import (
     get_display_user_message,
@@ -80,6 +80,9 @@ class TraceEventCallback:
                 message=display,
                 files=files,
                 turn_id=self._message_turn_id(self._latest_user_message(context)),
+                client_metadata=self._client_metadata_from(
+                    self._latest_user_message(context)
+                ),
             )
             # Mark the latest user message (if the runner added one) as
             # traced so a subsequent resume does not re-emit it.
@@ -147,6 +150,7 @@ class TraceEventCallback:
             message=bubble_text,
             files=resolved_files,
             turn_id=self._message_turn_id(message),
+            client_metadata=self._client_metadata_from(message),
         )
         self._mark_traced(context, message)
 
@@ -233,6 +237,7 @@ class TraceEventCallback:
         message: str,
         files: list[dict[str, Any]],
         turn_id: str | None = None,
+        client_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Emit a user-message trace event with a browser-safe payload.
 
@@ -265,6 +270,8 @@ class TraceEventCallback:
             # can show clickable file chips alongside the user's message.
             trace_data["files"] = safe_files
             trace_data["attachments"] = safe_files
+        if client_metadata:
+            trace_data["metadata"] = client_metadata
         execution_id = str(getattr(context, "execution_id", "") or "")
         await trace_user_message(tracer, execution_id, message, trace_data)
 
@@ -336,6 +343,7 @@ class TraceEventCallback:
                 message=bubble_text,
                 files=files,
                 turn_id=turn_id,
+                client_metadata=self._client_metadata_from(message),
             )
             self._mark_traced(context, message)
 
@@ -398,6 +406,14 @@ class TraceEventCallback:
             return None
         value = metadata.get(TURN_ID_KEY)
         return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _client_metadata_from(message: Any | None) -> dict[str, Any] | None:
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(CLIENT_METADATA_KEY)
+        return value if isinstance(value, dict) and value else None
 
     def _message_timestamp_iso(self, message: Any) -> str | None:
         ts = getattr(message, "timestamp", None)

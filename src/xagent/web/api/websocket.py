@@ -2544,6 +2544,7 @@ async def _enqueue_websocket_task_command(
     kind: TaskCommandKind,
     command_id: str | None = None,
     allow_missing_task: bool = False,
+    server_message_metadata: dict[str, Any] | None = None,
 ) -> EnqueuedTaskCommand | None:
     # A frame without an authenticated user is refused here and writes
     # nothing, so only an authenticated enqueue takes part in the retire
@@ -2562,6 +2563,20 @@ async def _enqueue_websocket_task_command(
         for key, value in message_data.items()
         if key not in {"user", "user_id"} and not key.startswith("_durable_")
     }
+    if "message_metadata" in payload:
+        # Message metadata (for example ``hidden``) is set only by server
+        # code through ``server_message_metadata``; a client frame carrying it
+        # is refused for the same reason as ``scope`` below.
+        raise ClientVisibleValidationError(
+            "Reserved field 'message_metadata' is not accepted from clients",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
+    # Clients have always been free to send a ``metadata`` object, and nothing
+    # reads it. It is dropped rather than refused so an existing client keeps
+    # working, and so arbitrary client JSON is never stored in the command row.
+    payload.pop("metadata", None)
+    if server_message_metadata is not None:
+        payload["message_metadata"] = dict(server_message_metadata)
     if "scope" in payload:
         # ``scope`` routes a durable command to a non-first-party execution
         # core (see ``command_execution_service._execute_durable_task_command``); only server-side
@@ -3548,6 +3563,9 @@ def _load_historical_stream_snapshot_sync(
                         # event shape emitted by the agent tracing callback.
                         data["files"] = row_attachments
                         data["attachments"] = row_attachments
+                    row_metadata = getattr(chat_message, "message_metadata", None)
+                    if isinstance(row_metadata, dict) and row_metadata:
+                        data["metadata"] = row_metadata
                 elif role == "assistant":
                     if not transcript.paired(chat_message.id) and (
                         content

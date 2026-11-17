@@ -109,6 +109,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from .message_metadata import is_hidden_message_metadata
 from .release_hold import release_hold
 from .sdk_task_cancel import sdk_cancel_result_fact, sdk_cancel_settlement_text
 from .task_auto_recovery import (
@@ -225,6 +226,10 @@ class TaskTurnPayload:
     # event for this user turn. Historical replay uses it to merge persisted
     # transcript rows with trace rows without collapsing repeated text.
     turn_id: str = field(default_factory=lambda: str(uuid4()))
+    # Client-supplied metadata for the user message (for example
+    # ``{"hidden": true}``): persisted with the transcript row and echoed on
+    # the user-message event; never interpreted here.
+    message_metadata: Optional[Dict[str, Any]] = None
 
     @property
     def for_agent(self) -> str:
@@ -1068,6 +1073,7 @@ def _persist_accepted_turn_no_commit(
         attachments=payload.attachments,
         turn_id=payload.turn_id,
         delivery_status=DELIVERY_PENDING,
+        message_metadata=payload.message_metadata,
     )
     if persisted_message is not None:
         db.flush()
@@ -1178,6 +1184,11 @@ def _accept_existing_event_input_sync(
                 "attachments": None,
                 "interactions": None,
                 "turn_id": payload.turn_id,
+                **(
+                    {"message_metadata": payload.message_metadata}
+                    if payload.message_metadata
+                    else {}
+                ),
             },
         )
         db.commit()
@@ -1339,7 +1350,6 @@ def _accept_turn_no_commit(
     else:
         values = {
             Task.status: TaskStatus.RUNNING,
-            Task.input: payload.transcript_message,
             Task.output: None,
             Task.completion_outcome: None,
             Task.error_message: None,
@@ -1349,6 +1359,9 @@ def _accept_turn_no_commit(
             Task.state_version: func.coalesce(Task.state_version, 0) + 1,
             Task.control_state: TaskControlState.RUNNING.value,
         }
+        if not is_hidden_message_metadata(payload.message_metadata):
+            # A hidden message must not replace the task's last visible input.
+            values[Task.input] = payload.transcript_message
         coordinator = current_task_coordinator(task_id)
         predicates = []
         if coordinator is not None:
@@ -1547,6 +1560,7 @@ def _claim_turn_no_commit(
             kind=kind.value,
             message=payload.transcript_message,
             execution_message=payload.execution_message,
+            message_metadata=payload.message_metadata,
             file_ids=list(payload.file_ids),
             before_message_id=accepted.before_message_id,
             timezone=clock_timezone,
@@ -2765,7 +2779,10 @@ def _schedule_bg(
                         lambda: resolve_execution_scope(task_id)
                     )
                     execution_context = _execution_context_with_turn_id(
-                        context, payload.turn_id, files=payload.attachments
+                        context,
+                        payload.turn_id,
+                        files=payload.attachments,
+                        message_metadata=payload.message_metadata,
                     )
                     # The agent's uploaded-file registration and the
                     # user_message trace read only ``file_info``. A shared
@@ -3364,10 +3381,13 @@ def _execution_context_with_turn_id(
     turn_id: str,
     *,
     files: Optional[List[Dict[str, Any]]] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     execution_context = dict(context or {})
     if turn_id:
         execution_context["turn_id"] = turn_id
+    if message_metadata:
+        execution_context["message_metadata"] = dict(message_metadata)
     # A resumed/retried turn may already carry its authoritative file batch.
     if files and not execution_context.get("files"):
         execution_context["files"] = [dict(file_info) for file_info in files]

@@ -54,6 +54,10 @@ from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
+from ..services.message_metadata import (
+    is_hidden_message_metadata,
+    is_hidden_user_event,
+)
 from ..services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
@@ -825,7 +829,9 @@ def _serialize_trace_events(db: Session, task_id: int) -> list[dict[str, Any]]:
         return []
     serialized: list[dict[str, Any]] = []
     for event, data in zip(events, decoded):
-        if is_audit_only_trace_data(data):
+        if is_audit_only_trace_data(data) or is_hidden_user_event(
+            str(event.event_type), data
+        ):
             continue
         event_type, public_data = normalize_public_trace_event(
             str(event.event_type), data
@@ -1323,8 +1329,15 @@ async def get_conversation_log_detail(
     if ui_source is None:
         raise HTTPException(status_code=404, detail="Conversation log not found")
 
+    # Hidden messages (a client's resume signal) are plumbing, not conversation.
     messages = (
-        list(task.chat_messages or []) if task.conversation_storage_version == 1 else []
+        [
+            message
+            for message in task.chat_messages or []
+            if not is_hidden_message_metadata(message.message_metadata)
+        ]
+        if task.conversation_storage_version == 1
+        else []
     )
     file_reference_records = load_assistant_file_reference_records(
         db,
@@ -1337,7 +1350,10 @@ async def get_conversation_log_detail(
         view = load_event_display_snapshot(db, int(task.id))
         transcript = []
         for message in view.messages:
+            if is_hidden_message_metadata(message.get("message_metadata")):
+                continue
             item = dict(message)
+            item.pop("message_metadata", None)
             if item["role"] == "assistant":
                 item["content"] = reconcile_assistant_file_references(
                     db,

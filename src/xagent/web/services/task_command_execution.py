@@ -149,6 +149,10 @@ from .managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from .message_metadata import (
+    is_hidden_message_metadata,
+    validate_server_message_metadata,
+)
 from .sdk_task_cancel import SDK_COMMAND_SCOPE, cancel_sdk_task_unserialized
 from .task_command_terminal_events import (
     TerminalTaskEventDraft,
@@ -823,6 +827,7 @@ def _claim_user_message_delivery_isolated(
     turn_id: str,
     expected_run_id: str | None,
     expected_status: TaskStatus,
+    message_metadata: dict[str, Any] | None = None,
 ) -> _UserMessageDeliverySnapshot:
     """Claim a live-control message in one worker-owned short Session."""
 
@@ -836,6 +841,7 @@ def _claim_user_message_delivery_isolated(
                     content=content,
                     attachments=attachments,
                     turn_id=turn_id,
+                    message_metadata=message_metadata,
                 )
             except IntegrityError:
                 db.rollback()
@@ -1120,6 +1126,7 @@ def _prepare_task_message_sync(
     durable_attempt_count: int,
     durable_target_run_id: str | None,
     pause_accepted: bool,
+    message_metadata: dict[str, Any] | None = None,
 ) -> _TaskMessagePreparation:
     """Authorize, normalize, and detach one task message off the event loop."""
 
@@ -1199,6 +1206,11 @@ def _prepare_task_message_sync(
 
         file_info_list: list[dict[str, Any]] = []
         execution_context = deepcopy(raw_context)
+        # Only the sanitized top-level field may carry message metadata; a
+        # client must not smuggle it in through the free-form context.
+        execution_context.pop("message_metadata", None)
+        if message_metadata:
+            execution_context["message_metadata"] = deepcopy(message_metadata)
         if files:
             file_ids = [
                 str(file_ref.get("file_id"))
@@ -1218,13 +1230,17 @@ def _prepare_task_message_sync(
                     missing_id,
                 )
         if task_created:
-            task_title = f"Chat: {user_message}"
+            # A hidden message is plumbing, never a title or description.
+            title_source = (
+                "" if is_hidden_message_metadata(message_metadata) else user_message
+            )
+            task_title = f"Chat: {title_source}" if title_source else "Untitled Task"
             if len(task_title) > 50:
                 task_title = task_title[:50] + "..."
             task = Task(
                 user_id=actor_user_id,
                 title=task_title,
-                description=user_message,
+                description=title_source,
                 status=TaskStatus.PENDING,
                 execution_mode=get_default_task_execution_mode(),
                 connector_runtime_selected_refs=[],
@@ -1287,6 +1303,7 @@ def _prepare_task_message_sync(
             attachments=deepcopy(persisted_attachments) or None,
             file_ids=tuple(str(file_info["file_id"]) for file_info in file_info_list),
             turn_id=turn_id,
+            message_metadata=deepcopy(message_metadata) if message_metadata else None,
         )
         claimed_created_turn = None
         existing_delivery_snapshot: _UserMessageDeliverySnapshot | None = None
@@ -1424,6 +1441,13 @@ async def handle_missing_task_message(
     """Serialize replacement-task creation for a deleted-task connection."""
     async with task_execution_controller.command(task_id):
         await handle_task_message(reply, task_id, message_data)
+
+
+def _task_waiting_for_user_sync(task_id: int) -> bool:
+    """Whether the task row currently waits for user input."""
+    with get_session_local()() as db:
+        status = db.query(Task.status).filter(Task.id == task_id).scalar()
+    return status == TaskStatus.WAITING_FOR_USER
 
 
 async def handle_task_message(
@@ -1751,6 +1775,17 @@ async def handle_task_message(
         raw_context = message_data.get("context", {})
         raw_files = message_data.get("files", [])
         user = message_data.get("user")
+        # Set only by server code (``task_interaction_settle``); a client frame
+        # that carries the key is refused before it is queued.
+        try:
+            message_metadata = validate_server_message_metadata(
+                message_data.get("message_metadata")
+            )
+        except ValueError as exc:
+            raise ClientVisibleValidationError(
+                "Invalid message metadata",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            ) from exc
         authorized_task_id: int | None = None
 
         if user is None:
@@ -1776,6 +1811,22 @@ async def handle_task_message(
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
+        if (message_metadata or {}).get("interaction_id") is not None:
+            # A settle answers one waiting interaction. If the task is no longer
+            # waiting (a real answer won the race, or it finished), applying it
+            # would inject a stray message into a running turn or start a new
+            # one, so it is dropped as an accepted no-op.
+            if not await run_db_io_cancellation_safe(
+                lambda: _task_waiting_for_user_sync(task_id)
+            ):
+                logger.info(
+                    "task %s: dropping settle for interaction %s; the task is "
+                    "not waiting for user input",
+                    task_id,
+                    (message_metadata or {}).get("interaction_id"),
+                )
+                await finish_delivery(True)
+                return
         pause_accepted = _is_task_pause_accepted(task_id)
         preparation = await run_db_io_cancellation_safe(
             lambda: _prepare_task_message_sync(
@@ -1792,6 +1843,7 @@ async def handle_task_message(
                 ),
                 durable_target_run_id=message_data.get("_durable_target_run_id"),
                 pause_accepted=pause_accepted,
+                message_metadata=message_metadata,
             )
         )
         routing = preparation.routing
@@ -2329,6 +2381,7 @@ async def handle_task_message(
                                 turn_id=turn_id,
                                 expected_run_id=routing.run_id,
                                 expected_status=task_status,
+                                message_metadata=message_metadata,
                             )
                         )
                     recovered_delivery = None
@@ -2407,6 +2460,7 @@ async def handle_task_message(
                                         execution_message=user_message_for_llm,
                                         display_message=display_user_message,
                                         files=display_file_refs,
+                                        message_metadata=message_metadata,
                                         turn_id=turn_id,
                                         request_interrupt=True,
                                         reason="new websocket user message",
@@ -2796,6 +2850,7 @@ async def handle_task_message(
                                     "execution_message": user_message_for_llm,
                                     "display_message": display_user_message,
                                     "files": display_file_refs,
+                                    "message_metadata": message_metadata,
                                     "turn_id": turn_id,
                                     # The pre-injection observation, carried
                                     # rather than re-read: the deferred path

@@ -11,7 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import String
 from sqlalchemy import cast as sql_cast
-from sqlalchemy import func, or_
+from sqlalchemy import false, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1098,7 +1098,14 @@ async def get_agent_preview_task(
         return None
     sample = (
         db.query(TaskChatMessage)
-        .filter(TaskChatMessage.task_id == task.id, TaskChatMessage.role == "user")
+        .filter(
+            TaskChatMessage.task_id == task.id,
+            TaskChatMessage.role == "user",
+            # A hidden resume signal is never the sample the user submitted.
+            func.coalesce(
+                TaskChatMessage.message_metadata["hidden"].as_boolean(), false()
+            ).is_(False),
+        )
         .order_by(TaskChatMessage.id.asc())
         .first()
     )

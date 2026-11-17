@@ -1,6 +1,9 @@
 """MCP tools registration using @register_tool decorator."""
 
+import hashlib
+import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any, List
 
 from ....utils.setup_metrics import mcp_setup
@@ -285,6 +288,49 @@ async def _finish_mcp_setup(
     return model_visible_mcp_tools(tools)
 
 
+# A rebuild of the same tool config shortly after a build (for example a host
+# installing per-turn tools and invalidating the agent) must not pay for a
+# second full MCP handshake round. The window is short so that tokens inside
+# the loaded tools cannot go stale across turns.
+_MCP_LOAD_REUSE_SECONDS = 60.0
+_MCP_LOAD_CACHE_ATTR = "_mcp_load_reuse_entry"
+
+
+def _mcp_load_reuse_key(
+    mcp_configs: List[dict[str, Any]],
+    sandbox: Any,
+    session_identities: Any,
+) -> str:
+    """Digest of everything the load depends on; never logged or persisted."""
+    payload = json.dumps(
+        [mcp_configs, sorted(map(str, session_identities or {}))],
+        sort_keys=True,
+        default=repr,
+    )
+    return hashlib.sha256(f"{id(sandbox)}|{payload}".encode()).hexdigest()
+
+
+def _reusable_mcp_load(config: Any, key: str) -> tuple[List[Any], Any] | None:
+    entry = getattr(config, _MCP_LOAD_CACHE_ATTR, None)
+    if not entry:
+        return None
+    stored_key, stored_at, tools, summary = entry
+    if stored_key != key or time.monotonic() - stored_at > _MCP_LOAD_REUSE_SECONDS:
+        return None
+    return list(tools), summary
+
+
+def _remember_mcp_load(config: Any, key: str, tools: List[Any], summary: Any) -> None:
+    try:
+        setattr(
+            config,
+            _MCP_LOAD_CACHE_ATTR,
+            (key, time.monotonic(), list(tools), summary),
+        )
+    except Exception:  # a config that rejects attributes just never reuses
+        logger.debug("MCP load reuse entry could not be stored", exc_info=True)
+
+
 @register_tool(categories={"mcp"}, selection_gate="mcp")
 @mcp_setup.measure()
 async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
@@ -419,9 +465,17 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 actor_stdio_session_identities=session_identities,
                 actor_stdio_session_consumer=session_consumer,
             )
-        tools = await ToolFactory._create_mcp_tools_from_configs(
-            mcp_configs, **create_kwargs
+        reuse_key = _mcp_load_reuse_key(
+            mcp_configs, create_kwargs["sandbox"], session_identities
         )
+        reused = _reusable_mcp_load(config, reuse_key)
+        if reused is not None:
+            tools, reused_summary = reused
+        else:
+            reused_summary = None
+            tools = await ToolFactory._create_mcp_tools_from_configs(
+                mcp_configs, **create_kwargs
+            )
     except ConnectorRuntimeError:
         summary = _build_mcp_load_summary(
             mcp_configs,
@@ -439,6 +493,10 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
             forced_failure_reason="loader_failed",
         )
     else:
-        summary = _build_mcp_load_summary(mcp_configs, tools)
+        if reused_summary is not None:
+            summary = reused_summary
+        else:
+            summary = _build_mcp_load_summary(mcp_configs, tools)
+            _remember_mcp_load(config, reuse_key, tools, summary)
 
     return await _finish_mcp_setup(config, summary, tools)

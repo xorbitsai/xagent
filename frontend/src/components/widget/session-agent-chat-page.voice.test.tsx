@@ -391,8 +391,14 @@ describe("session widget voice call across the session", () => {
     rerender()
     expect(screen.getByTestId("call")).toHaveTextContent("listening")
     expect(voice.props!.busy).toBe(true)
-    act(() => voice.callbacks!.transcript("final", "Hello", 1))
-    await new Promise(resolve => setTimeout(resolve, 350))
+    // Past the 300 ms a finished sentence waits before it is sent.
+    vi.useFakeTimers()
+    try {
+      act(() => voice.callbacks!.transcript("final", "Hello", 1))
+      await act(async () => { await vi.advanceTimersByTimeAsync(350) })
+    } finally {
+      vi.useRealTimers()
+    }
     expect(app.sendMessage).not.toHaveBeenCalled()
     app.isConnected = true
     setBridge("active", session({ voice: true }, "st_renewed"))

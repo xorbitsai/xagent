@@ -289,4 +289,50 @@ describe("idle session state bound to one login", () => {
     expect(await endExpiredAuthSession(second)).toEqual({ status: "cleared" })
     expect(readSessionEndNotice(localStorage)).toBe("session_expired")
   })
+
+  it("does not show the expiry notice after a deliberate sign-out", async () => {
+    const snapshot = await login({ idle_session: idle() })
+    // The logout request revokes the login first; a poll answered in that
+    // window ends the still-current login and writes the notice.
+    await endExpiredAuthSession(snapshot)
+    expect(readSessionEndNotice(localStorage)).toBe("session_expired")
+    await clearStoredAuth()
+    expect(readSessionEndNotice(localStorage)).toBeNull()
+  })
+
+  it("still commits a login when the optional idle record cannot be written", async () => {
+    const restore = failIdleWrites()
+    try {
+      await login({ idle_session: idle() })
+    } finally {
+      restore()
+    }
+    expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY)!).token).toBe("access")
+    expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
+  })
+
+  it("still commits a refresh when the optional idle record cannot be written", async () => {
+    // The server has already rotated the refresh token; losing it would sign the user out.
+    const snapshot = await login({ idle_session: idle() })
+    const restore = failIdleWrites()
+    try {
+      const result = await commitAuthSessionRefresh(snapshot, refreshBody({ idle_session: idle({ idle_expires_in: 1800 }) }))
+      expect(result.status).toBe("updated")
+    } finally {
+      restore()
+    }
+    expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY)!).refreshToken).toBe("refresh-2")
+    // A record that could not be updated is removed rather than left stale.
+    expect(localStorage.getItem(IDLE_SESSION_STORAGE_KEY)).toBeNull()
+  })
 })
+
+/** Makes writes of the idle record fail (for example a full storage quota). */
+function failIdleWrites(): () => void {
+  const original = localStorage.setItem.bind(localStorage)
+  const spy = vi.spyOn(localStorage, "setItem").mockImplementation((key: string, value: string) => {
+    if (key === IDLE_SESSION_STORAGE_KEY) throw new Error("quota")
+    original(key, value)
+  })
+  return () => spy.mockRestore()
+}

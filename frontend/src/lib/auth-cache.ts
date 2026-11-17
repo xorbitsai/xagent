@@ -1,6 +1,7 @@
 import {
   IDLE_SESSION_STORAGE_KEY, SESSION_END_NOTICE_KEY, markIdleActivityReported, parseIdleSession,
-  readIdleSessionRecord, writeIdleSessionRecord, writeSessionEndNotice, type IdleSessionRecord,
+  readIdleSessionRecord, writeIdleSessionRecord, writeSessionEndNotice, type IdleSessionPolicy, type IdleSessionRecord,
+  type SessionEndReason,
 } from "@/lib/idle-session"
 
 export const AUTH_CACHE_KEY = "auth_cache"
@@ -508,7 +509,7 @@ export async function createAuthSession(value: unknown, intent?: AuthLoginIntent
     replaceAuthLoginIntent(storage)
     const projection = writeNewSession(storage, payload, markAuthUpdated)
     const idle = parseIdleSession(value)
-    if (idle) writeIdleSessionRecord(storage, projection.snapshot.sessionId!, idle)
+    if (idle) writeIdleRecordBestEffort(storage, projection.snapshot.sessionId!, idle)
     storage.removeItem(SESSION_END_NOTICE_KEY)
     return { status: "created" as const, projection }
   })
@@ -574,8 +575,8 @@ export async function commitAuthSessionRefresh(captured: AuthSessionSnapshot, va
     const idle = parseIdleSession(value)
     if (result.status === "updated") {
       // A refresh without idle_session comes from a server without the feature.
-      if (idle) writeIdleSessionRecord(storage, result.projection.snapshot.sessionId!, idle)
-      else storage.removeItem(IDLE_SESSION_STORAGE_KEY)
+      if (idle) writeIdleRecordBestEffort(storage, result.projection.snapshot.sessionId!, idle)
+      else removeIdleRecordBestEffort(storage)
     }
     return result
   })
@@ -611,11 +612,15 @@ export async function updateAuthSessionUser(captured: AuthSessionSnapshot, next:
   })
   return result.status === "completed" ? result.value : unavailable(result.reason)
 }
-export async function clearAuthSessionIfCurrent(captured: AuthSessionSnapshot): Promise<AuthConditionalClearResult> {
+export async function clearAuthSessionIfCurrent(
+  captured: AuthSessionSnapshot,
+  options: { notice?: SessionEndReason } = {},
+): Promise<AuthConditionalClearResult> {
   const result = await withMutationLock(true, async ({ storage, markAuthUpdated }) => {
     const comparison = compareCredentialSession(captured)
     if (!isExactCredential(comparison)) return { status: "not_current" as const }
     storage.removeItem(AUTH_CACHE_KEY); storage.removeItem(IDLE_SESSION_STORAGE_KEY)
+    if (options.notice) writeSessionEndNotice(storage, options.notice)
     markAuthUpdated(); return { status: "cleared" as const }
   })
   return result.status === "completed" ? result.value : result
@@ -625,15 +630,20 @@ export async function clearAuthSessionIfCurrent(captured: AuthSessionSnapshot): 
  * exact login is cleared; a replacement login is left untouched and gets no
  * sign-in-again notice.
  */
-export async function endExpiredAuthSession(captured: AuthSessionSnapshot): Promise<AuthConditionalClearResult> {
-  const result = await withMutationLock(true, async ({ storage, markAuthUpdated }) => {
-    const comparison = compareCredentialSession(captured)
-    if (!isExactCredential(comparison)) return { status: "not_current" as const }
-    storage.removeItem(AUTH_CACHE_KEY); storage.removeItem(IDLE_SESSION_STORAGE_KEY)
-    writeSessionEndNotice(storage, "session_expired")
-    markAuthUpdated(); return { status: "cleared" as const }
-  })
-  return result.status === "completed" ? result.value : result
+export function endExpiredAuthSession(captured: AuthSessionSnapshot): Promise<AuthConditionalClearResult> {
+  return clearAuthSessionIfCurrent(captured, { notice: "session_expired" })
+}
+/**
+ * The idle record is optional metadata. A login or refresh is committed even
+ * when it cannot be written (for example a full storage quota): the server has
+ * already issued, or rotated, the credentials. A record that could not be
+ * updated is removed rather than left stale.
+ */
+function writeIdleRecordBestEffort(storage: AuthStorage, sessionId: string, idle: IdleSessionPolicy): void {
+  try { writeIdleSessionRecord(storage, sessionId, idle) } catch { removeIdleRecordBestEffort(storage) }
+}
+function removeIdleRecordBestEffort(storage: Pick<Storage, "removeItem">): void {
+  try { storage.removeItem(IDLE_SESSION_STORAGE_KEY) } catch { /* the next response replaces it */ }
 }
 /** The stored idle policy of the login that is current in this browser, if the server supplied one. */
 export function readCurrentIdleSession(): IdleSessionRecord | null {
@@ -704,6 +714,9 @@ export async function clearStoredAuth(): Promise<AuthLogoutResult> {
     } catch {
       credentialsCleared = false
     }
+    // A deliberate sign-out is not an expiry. A poll answered while the
+    // logout request revoked the login may have written the notice already.
+    try { storage.removeItem(SESSION_END_NOTICE_KEY) } catch { /* the notice expires on its own */ }
     for (const key of [LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY]) {
       try {
         storage.removeItem(key)

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { apiRequest, RequestNotSentError } from "@/lib/api-wrapper"
 import { AUTH_CACHE_KEY, readAuthSessionSnapshot, readCurrentIdleSession } from "@/lib/auth-cache"
@@ -48,10 +48,41 @@ describe("idle session client", () => {
     const isStillFresh = () => true
     await expect(reportIdleActivity("browser-login", isStillFresh)).resolves.toBe(true)
     expect(apiRequest).toHaveBeenCalledWith(
-      expect.stringMatching(/\/api\/auth\/activity$/), { method: "POST" }, readAuthSessionSnapshot(),
+      expect.stringMatching(/\/api\/auth\/activity$/), { method: "POST", signal: expect.any(AbortSignal) }, readAuthSessionSnapshot(),
       { shouldSend: isStillFresh },
     )
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1800)
+  })
+
+  describe("a request that hangs", () => {
+    // Resolves only when the request is aborted, like a half-open connection after wake.
+    const hang = (_url: string, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+    })
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it("gives up on an activity report after the timeout, so it can be retried", async () => {
+      login()
+      vi.mocked(apiRequest).mockImplementation(hang)
+      const result = reportIdleActivity("browser-login", alwaysFresh)
+      await vi.advanceTimersByTimeAsync(14_000)
+      let settled = false
+      void result.then(() => { settled = true })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(settled).toBe(false)
+      await vi.advanceTimersByTimeAsync(1_000)
+      await expect(result).resolves.toBe(false)
+    })
+
+    it("gives up on a verify after the timeout, leaving the session alone", async () => {
+      login()
+      vi.mocked(apiRequest).mockImplementation(hang)
+      const result = revalidateIdleSession("browser-login")
+      await vi.advanceTimersByTimeAsync(15_000)
+      await expect(result).resolves.toBeUndefined()
+      expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1000)
+    })
   })
 
   it("treats a report that was not sent because its input went stale as finished", async () => {
@@ -84,7 +115,7 @@ describe("idle session client", () => {
     vi.mocked(apiRequest).mockResolvedValue(new Response(idleBody(1500)))
     await revalidateIdleSession("browser-login")
     expect(apiRequest).toHaveBeenCalledWith(
-      expect.stringMatching(/\/api\/auth\/verify$/), { headers: { "X-Username": "alice" } }, readAuthSessionSnapshot(),
+      expect.stringMatching(/\/api\/auth\/verify$/), { headers: { "X-Username": "alice" }, signal: expect.any(AbortSignal) }, readAuthSessionSnapshot(),
     )
     expect(readCurrentIdleSession()?.idleExpiresIn).toBe(1500)
   })

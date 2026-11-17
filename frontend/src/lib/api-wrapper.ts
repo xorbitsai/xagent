@@ -165,13 +165,15 @@ function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
 /**
- * An idle-expired response ends the login it names: `session` is the exact
- * credential set of that login, so a replacement login is left alone.
+ * Ends the login the server reported idle-expired and goes to the login page.
+ * `session` is the exact credential set of that login, so a replacement login
+ * is left alone.
  */
+async function endExpiredLogin(session: AuthSessionSnapshot): Promise<void> {
+  if ((await endExpiredAuthSession(session)).status === "cleared") window.location.href = "/login"
+}
 async function endLoginIfIdleExpired(response: Response, session: AuthSessionSnapshot): Promise<Response> {
-  if (isIdleSessionExpiredResponse(response) && (await endExpiredAuthSession(session)).status === "cleared") {
-    window.location.href = "/login"
-  }
+  if (isIdleSessionExpiredResponse(response)) await endExpiredLogin(session)
   return response
 }
 export interface ApiRequestHooks {
@@ -209,7 +211,7 @@ export async function apiRequest(
   if (afterResponse.status !== "exact" && afterResponse.status !== "profile_advanced") return response
   if (isIdleSessionExpiredResponse(response)) {
     // Never refresh or replay: the server ended this login for inactivity.
-    if ((await endExpiredAuthSession(session)).status === "cleared") window.location.href = "/login"
+    await endExpiredLogin(session)
     return response
   }
   const errorType = response.headers.get("Error-Type")
@@ -229,7 +231,7 @@ export async function apiRequest(
       return response
     case "rejected":
       if (refreshed.reason === "session_expired") {
-        if ((await endExpiredAuthSession(session)).status === "cleared") window.location.href = "/login"
+        await endExpiredLogin(session)
         return response
       }
       if ((await clearAuthSessionIfCurrent(session)).status === "cleared") {

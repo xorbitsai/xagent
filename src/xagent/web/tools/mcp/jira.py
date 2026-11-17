@@ -104,6 +104,25 @@ def _clean_text_error(value: str, field_name: str, *, hint: str = "") -> str | N
     return None
 
 
+def _labels_error(labels: list[str], field_name: str) -> str | None:
+    """Return an _error(...) payload if any label is empty or contains
+    whitespace, else None -- callers do `if (err := _labels_error(...)):
+    return err`, like _clean_text_error.
+
+    Jira labels are single words: the API rejects a label with a space
+    (HTTP 400), so it is refused locally with a message that tells the
+    agent how to fix the value rather than surfacing Jira's opaque one.
+    """
+    for label in labels:
+        if not label or any(ch.isspace() for ch in label):
+            return _error(
+                f"{field_name} entries cannot be empty or contain whitespace "
+                f"(Jira labels are single words -- use '-' or '_' instead of "
+                f"spaces), got {label!r}"
+            )
+    return None
+
+
 def _path_segment(value: str) -> str:
     """Percent-encode a value for safe interpolation into a URL path
     segment (e.g. an issue key or cloud id), matching hubspot.py's
@@ -1744,6 +1763,7 @@ def jira_create_issue(
     issue_type: str = "Task",
     assignee_account_id: str = "",
     priority: str = "",
+    labels: list[str] | None = None,
 ) -> str:
     """
     Create a new issue.
@@ -1755,9 +1775,13 @@ def jira_create_issue(
     assignee_account_id: optional account id from jira_search_users.
     priority: optional priority name (e.g. "High", "Medium", "Low") -- must
     be one of the site's configured priorities.
+    labels: optional labels to set on the new issue (e.g. ["MVP"]). Each
+    label must be a single word -- Jira rejects spaces, so use "-" or "_".
     """
     try:
         if err := _clean_text_error(summary, "summary"):
+            return err
+        if labels and (err := _labels_error(labels, "labels")):
             return err
         fields: dict[str, Any] = {
             "project": {"key": project_key},
@@ -1770,6 +1794,8 @@ def jira_create_issue(
             fields["assignee"] = {"accountId": assignee_account_id}
         if priority:
             fields["priority"] = {"name": priority}
+        if labels:
+            fields["labels"] = labels
 
         result = _request(
             "POST", cloud_id, "/rest/api/2/issue", json_data={"fields": fields}
@@ -1791,6 +1817,8 @@ def jira_update_issue(
     description: str | None = None,
     assignee_account_id: str | None = None,
     priority: str | None = None,
+    add_labels: list[str] | None = None,
+    remove_labels: list[str] | None = None,
 ) -> str:
     """
     Update an existing issue. Only the fields explicitly provided are
@@ -1800,6 +1828,10 @@ def jira_update_issue(
     the issue -- pass an empty string to unassign it.
     priority: a priority name (e.g. "High") -- must be one of the site's
     configured priorities.
+    add_labels / remove_labels: labels to add to or remove from the issue
+    (e.g. add_labels=["MVP"]). Edited incrementally -- the issue's other
+    labels are kept, so there is no need to read its labels first. Each
+    label must be a single word -- Jira rejects spaces, so use "-" or "_".
     """
     try:
         fields: dict[str, Any] = {}
@@ -1824,15 +1856,28 @@ def jira_update_issue(
             ):
                 return err
             fields["priority"] = {"name": priority}
-        if not fields:
+        # Labels go through Jira's `update` verbs (add/remove) rather than
+        # `fields`, which would overwrite the whole label set and force the
+        # caller to read-modify-write.
+        label_ops: list[dict[str, str]] = []
+        for field_name, verb, values in (
+            ("add_labels", "add", add_labels),
+            ("remove_labels", "remove", remove_labels),
+        ):
+            if not values:
+                continue
+            if err := _labels_error(values, field_name):
+                return err
+            label_ops.extend({verb: label} for label in values)
+        if not fields and not label_ops:
             return _error("No fields provided to update")
 
-        _request(
-            "PUT",
-            cloud_id,
-            _issue_path(issue_key),
-            json_data={"fields": fields},
-        )
+        body: dict[str, Any] = {}
+        if fields:
+            body["fields"] = fields
+        if label_ops:
+            body["update"] = {"labels": label_ops}
+        _request("PUT", cloud_id, _issue_path(issue_key), json_data=body)
         return _success(issue_key=issue_key)
     except Exception as e:
         safe_message = _safe_text(e)

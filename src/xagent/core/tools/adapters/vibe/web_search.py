@@ -53,7 +53,9 @@ class WebSearchTool(AbstractBaseTool):
         return """Search the web for information using Google Search.
         Returns lightweight results with titles, links, and snippets by default.
         Set include_content=true only when every result needs page text; otherwise
-        use fetch_web_content to read one selected URL after search."""
+        use fetch_web_content to read one selected URL after search.
+        When reporting how information was found, name web_search for
+        searching and fetch_web_content for any pages that were read."""
 
     @property
     def tags(self) -> list[str]:

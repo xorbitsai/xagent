@@ -53,7 +53,9 @@ class BraveWebSearchTool(AbstractBaseTool):
             "Search the web for information using Brave Search. "
             "Returns lightweight results with titles, links, and snippets by default. "
             "Set include_content=true only when every result needs page content; "
-            "otherwise use fetch_web_content to read one selected URL."
+            "otherwise use fetch_web_content to read one selected URL. "
+            "When reporting how information was found, name web_search for "
+            "searching and fetch_web_content for any pages that were read."
         )
 
     @property

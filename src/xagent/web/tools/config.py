@@ -34,7 +34,7 @@ from typing import (
 from weakref import WeakValueDictionary
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import func, text
 
 from ...config import (
     get_google_restricted_scopes,
@@ -1349,11 +1349,16 @@ def _lock_shopify_store_and_reread(
     )
     if reread is not None:
         return reread
+    # Only a grant for the locked store: one for another store is not under
+    # this lock, and the next resolution locks that store instead.
     return (
         scoped_user_oauth_query(
             db, user_id=user_id, resource_owner_key=resource_owner_key
         )
-        .filter(UserOAuth.provider == app_provider)
+        .filter(
+            UserOAuth.provider == app_provider,
+            func.lower(UserOAuth.instance_url) == store.lower(),
+        )
         .order_by(UserOAuth.id.desc())
         .populate_existing()
         .first()

@@ -35,7 +35,9 @@ def lock_shopify_store(db: Session, *, provider: str, store: str) -> None:
     revocation fences, the insert comes first so the lock never depends on a
     row that may not exist yet: PostgreSQL makes a concurrent insert of the
     same key wait for the first one's commit, and SQLite's single writer
-    serializes the write statements outright.
+    serializes the write statements outright. On SQLite that means every
+    write waits while a store is locked, as it already does during an actor
+    refresh.
     """
     dialect = db.get_bind().dialect.name
     insert: Any

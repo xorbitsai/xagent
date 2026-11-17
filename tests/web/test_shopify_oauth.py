@@ -885,7 +885,7 @@ def _held_grant(
     user,
     *,
     store: str = "acme",
-    oauth_provider: str = "shopify",
+    oauth_provider: str | None = "shopify",
     access_token: str = "held-access",
     resource_owner_key: str | None = None,
     expires_in: timedelta = timedelta(hours=1),
@@ -952,6 +952,8 @@ def test_the_owner_can_reconnect_their_store(shopify_db, monkeypatch):
         pytest.param({"store": "other"}, id="another-store"),
         # A variant provider row is another Shopify app, with its own token.
         pytest.param({"oauth_provider": "shopify-acme"}, id="another-app"),
+        # A Composio-held grant records no issuer; its token is not ours.
+        pytest.param({"oauth_provider": None}, id="no-issuer"),
     ],
 )
 def test_a_store_not_held_by_a_live_grant_of_this_app_can_be_connected(
@@ -1228,12 +1230,21 @@ def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_db, monkeypat
     assert len(posted) == 1
 
 
+@pytest.mark.parametrize(
+    ("store", "expected_token"),
+    [
+        pytest.param("acme", "reconnected-access", id="same-store"),
+        # The new grant is not under the lock this refresh holds; the next
+        # resolution locks its store instead.
+        pytest.param("beta", None, id="another-store"),
+    ],
+)
 def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
-    shopify_db, monkeypatch
+    shopify_db, monkeypatch, store, expected_token
 ):
     """A reconnect replaces the grant row (delete, then insert under a new
     id) while a refresh waits for the store; the refresh then uses the new
-    grant rather than reporting no connection."""
+    grant of that store rather than reporting no connection."""
     from xagent.web.services import shopify_store_locks
 
     db, user = shopify_db
@@ -1255,9 +1266,11 @@ def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
                     oauth_provider="shopify",
                     access_token="reconnected-access",
                     refresh_token="reconnected-refresh",
-                    instance_url="acme",
+                    instance_url=store,
                     provider_user_id=SHOP_GID,
-                    expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                    # Expired, so only a refresh could make it usable.
+                    expires_at=datetime.now(timezone.utc)
+                    + timedelta(hours=1 if store == "acme" else -1),
                 )
             )
             other.commit()
@@ -1269,5 +1282,5 @@ def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
 
     resolution = _resolve_shopify(db, user.id)
 
-    assert resolution.access_token == "reconnected-access"
+    assert resolution.access_token == expected_token
     assert posted == []

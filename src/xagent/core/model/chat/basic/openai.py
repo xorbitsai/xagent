@@ -50,6 +50,22 @@ from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
 
+# Chat-template switches that turn DeepSeek reasoning off on vLLM-style
+# OpenAI-compatible servers. Different DeepSeek chat templates read different
+# names, so both are sent; servers whose template reads neither ignore them.
+_DEEPSEEK_TEMPLATE_THINKING_KEYS = ("thinking", "enable_thinking")
+
+
+def _is_deepseek_model_name(model_name: str) -> bool:
+    """Whether a model name names a DeepSeek model on any path segment.
+
+    Covers bare names (``deepseek-v4.1-flash``) and vendor-prefixed ones
+    (``deepseek-ai/DeepSeek-V3``, ``accounts/x/models/deepseek-v3``).
+    """
+    slug = model_name.strip().split(":", 1)[0]
+    return any(part.lower().startswith("deepseek") for part in slug.split("/"))
+
+
 # ``PROVIDER_STATE_METADATA_KEY`` now lives in ``chat.types`` (see there for
 # why); imported here so existing code and tests that import it from this
 # transport module keep working unchanged.
@@ -2121,6 +2137,47 @@ class OpenAILLM(OpenAICompatibleLLM):
             abilities=abilities,
             timeout_config=timeout_config,
         )
+
+    def _prepare_provider_reasoning_extra_body(
+        self,
+        *,
+        extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> Dict[str, Any]:
+        """Set DeepSeek reasoning explicitly through chat-template switches.
+
+        Servers hosting DeepSeek behind a generic OpenAI-compatible endpoint
+        (vLLM, Xinference) reason by default when the request says nothing.
+        Reasoning therefore follows the request's own ``thinking`` setting
+        when there is one, and otherwise the model record's ``thinking_mode``
+        ability: a record without it is sent with reasoning switched off. A
+        record with it keeps the server's default. Template switches already
+        present in ``extra_body`` are the caller's and are kept.
+        """
+        _ = tools, response_format, output_config, is_streaming
+        updated_extra_body = dict(extra_body)
+        if not _is_deepseek_model_name(self.model_name):
+            return updated_extra_body
+
+        if thinking is not None:
+            enabled = bool(
+                thinking.get("type") == "enabled" or thinking.get("enable", False)
+            )
+        elif self.supports_thinking_mode:
+            return updated_extra_body
+        else:
+            enabled = False
+
+        template_kwargs = updated_extra_body.get("chat_template_kwargs")
+        merged = dict(template_kwargs) if isinstance(template_kwargs, dict) else {}
+        for key in _DEEPSEEK_TEMPLATE_THINKING_KEYS:
+            merged.setdefault(key, enabled)
+        updated_extra_body["chat_template_kwargs"] = merged
+        return updated_extra_body
 
     def _apply_output_config(
         self,

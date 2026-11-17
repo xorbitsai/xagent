@@ -281,6 +281,107 @@ class TestOpenAILLM:
             is_streaming=True,
         ) == {"trace_id": "abc"}
 
+    @staticmethod
+    def _deepseek_reasoning_body(llm, *, thinking=None, extra_body=None):
+        return llm._prepare_provider_reasoning_extra_body(
+            extra_body=extra_body or {},
+            thinking=thinking,
+            tools=None,
+            response_format=None,
+            output_config=None,
+            is_streaming=False,
+        )
+
+    @staticmethod
+    def _deepseek_llm(abilities, model_name="deepseek-v4.1-flash"):
+        return OpenAILLM(
+            model_name=model_name,
+            api_key="k",
+            base_url="https://example.test/v1",
+            abilities=abilities,
+        )
+
+    def test_deepseek_without_thinking_ability_switches_reasoning_off(self):
+        llm = self._deepseek_llm(["chat", "tool_calling"])
+
+        assert self._deepseek_reasoning_body(llm) == {
+            "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
+        }
+
+    def test_deepseek_with_thinking_ability_keeps_server_default(self):
+        llm = self._deepseek_llm(["chat", "tool_calling", "thinking_mode"])
+
+        assert self._deepseek_reasoning_body(llm, extra_body={"a": 1}) == {"a": 1}
+
+    @pytest.mark.parametrize(
+        ("abilities", "thinking", "expected"),
+        [
+            (["chat", "thinking_mode"], {"type": "disabled"}, False),
+            (["chat"], {"type": "enabled"}, True),
+            (["chat"], {"enable": True}, True),
+            (["chat"], {"enable": False}, False),
+        ],
+    )
+    def test_deepseek_request_thinking_overrides_ability(
+        self, abilities, thinking, expected
+    ):
+        llm = self._deepseek_llm(abilities)
+
+        assert self._deepseek_reasoning_body(llm, thinking=thinking) == {
+            "chat_template_kwargs": {"thinking": expected, "enable_thinking": expected}
+        }
+
+    def test_deepseek_keeps_caller_template_switches(self):
+        llm = self._deepseek_llm(["chat"])
+        extra_body = {"chat_template_kwargs": {"thinking": True, "other": "x"}}
+
+        assert self._deepseek_reasoning_body(llm, extra_body=extra_body) == {
+            "chat_template_kwargs": {
+                "thinking": True,
+                "other": "x",
+                "enable_thinking": False,
+            }
+        }
+        assert extra_body == {"chat_template_kwargs": {"thinking": True, "other": "x"}}
+
+    @pytest.mark.parametrize(
+        ("model_name", "is_deepseek"),
+        [
+            ("deepseek-v4.1-flash", True),
+            ("deepseek-ai/DeepSeek-V3", True),
+            ("accounts/fireworks/models/deepseek-v3:latest", True),
+            ("glm-5.3", False),
+            ("gpt-4o-mini", False),
+        ],
+    )
+    def test_reasoning_switch_applies_to_deepseek_names_only(
+        self, model_name, is_deepseek
+    ):
+        llm = self._deepseek_llm(["chat"], model_name=model_name)
+
+        body = self._deepseek_reasoning_body(llm)
+
+        assert ("chat_template_kwargs" in body) is is_deepseek
+
+    @pytest.mark.asyncio
+    async def test_deepseek_chat_sends_reasoning_switch(
+        self, mock_chat_completion, mocker
+    ):
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_chat_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = self._deepseek_llm(["chat", "tool_calling"])
+
+        await llm.chat([{"role": "user", "content": "Hello"}])
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["extra_body"] == {
+            "chat_template_kwargs": {"thinking": False, "enable_thinking": False}
+        }
+
     def test_parse_stream_chunks_mixed_delta_emits_token_then_tool_call(self, llm):
         """A delta carrying text and tool-call fragments expands to a TOKEN
         followed by a TOOL_CALL snapshot, with the finish marker on the last

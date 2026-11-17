@@ -90,7 +90,10 @@ export class VoiceTurns {
     caption: (text: string) => void
     error: (error: unknown) => void
     playbackError: (error: unknown) => void
-  }) {}
+  }, private options: {
+    /** Longest text sent in one synthesis request (characters). */
+    maxChunk?: number
+  } = {}) {}
 
   activity(active: boolean) {
     if (this.stopped || this.muted) return
@@ -190,7 +193,8 @@ export class VoiceTurns {
       const chunk = sentence || (reply.complete ? rest : "")
       if (!chunk) break
       // Each synthesis request stays within the transport's text limit.
-      for (let index = 0; index < chunk.length; index += 4000) this.queue.push(chunk.slice(index, index + 4000))
+      const limit = this.options.maxChunk ?? 4000
+      for (let index = 0; index < chunk.length; index += limit) this.queue.push(chunk.slice(index, index + limit))
       consumed += chunk
       rest = rest.slice(chunk.length)
     }

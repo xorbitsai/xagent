@@ -692,6 +692,14 @@ describe("AppProvider websocket message routing", () => {
     localStorage.clear()
   })
 
+  it.each(["connected", "reconnecting", "lost"])("exposes the socket's connection phase (%s)", (phase) => {
+    wsHarness.connectionPhase = phase
+    let seen: string | undefined
+    function PhaseProbe() { seen = useApp().connectionPhase; return null }
+    render(<AppProvider token="token"><PhaseProbe /></AppProvider>)
+    expect(seen).toBe(phase)
+  })
+
   it.each([false, true])("clears pending connection callbacks on unmount (history expired: %s)", (expireHistory) => {
     const timeoutSpy = vi.spyOn(globalThis, "setTimeout")
     const clearSpy = vi.spyOn(globalThis, "clearTimeout")

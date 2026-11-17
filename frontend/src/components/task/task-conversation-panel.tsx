@@ -39,6 +39,10 @@ export type TaskConversationPanelMode = "page" | "embedded-preview"
 
 interface TaskConversationPanelProps {
   voiceConversationEnabled?: boolean
+  // Opens a voice call that runs outside this panel (the composer then works
+  // in its "provided" voice mode). It does not mount the signed-in call that
+  // `voiceConversationEnabled` controls.
+  onProvidedVoiceConversation?: () => void
   mode: TaskConversationPanelMode
   className?: string
   showTaskActions?: boolean
@@ -302,6 +306,7 @@ export function TaskConversationPanel({
   onAttachmentFilesChange,
   onAgentExecutionClick,
   voiceConversationEnabled = false,
+  onProvidedVoiceConversation,
 }: TaskConversationPanelProps) {
   const {
     state,
@@ -1246,7 +1251,9 @@ export function TaskConversationPanel({
               onRetryAttachment={onRetryAttachment}
               attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
-              onVoiceConversation={voiceConversationEnabled && taskControlsEnabled ? () => setVoiceOpen(true) : undefined}
+              onVoiceConversation={onProvidedVoiceConversation
+                ?? (voiceConversationEnabled && taskControlsEnabled ? () => setVoiceOpen(true) : undefined)}
+              voiceConversationSource={onProvidedVoiceConversation ? "provided" : "account"}
               voiceConversationDisabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
               hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}

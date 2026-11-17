@@ -306,3 +306,27 @@ describe("audio format and activity", () => {
     expect(speechText('{"action":"final_answer","action_input":"Hello."}')).toBe("Hello.")
   })
 })
+
+describe("synthesis chunk limit", () => {
+  it.each([
+    { label: "the default", maxChunk: undefined, limit: 4000 },
+    { label: "a 1000-character limit", maxChunk: 1000, limit: 1000 },
+  ])("splits an unpunctuated reply at $label", async ({ maxChunk, limit }) => {
+    vi.useFakeTimers()
+    const actions = {
+      send: vi.fn().mockResolvedValue(undefined), interrupt: vi.fn(), stopAudio: vi.fn(),
+      speak: vi.fn().mockResolvedValue(undefined), phase: vi.fn(), caption: vi.fn(), error: vi.fn(), playbackError: vi.fn(),
+    }
+    const turns = maxChunk === undefined ? new VoiceTurns(actions) : new VoiceTurns(actions, { maxChunk })
+    turns.transcript("final", "Read it", 0)
+    await vi.advanceTimersByTimeAsync(300)
+    const text = "a".repeat(9500)
+    turns.reply({ id: "answer", text, complete: true })
+    await vi.advanceTimersByTimeAsync(0)
+    const spoken = actions.speak.mock.calls.map(([chunk]) => chunk as string)
+    expect(spoken.join("")).toBe(text)
+    expect(spoken.length).toBe(Math.ceil(text.length / limit))
+    for (const chunk of spoken) expect(chunk.length).toBeLessThanOrEqual(limit)
+    turns.stop()
+  })
+})

@@ -3,6 +3,7 @@
 import React, { useCallback, useMemo, useRef, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
+import { WidgetVoiceConversation } from "@/components/chat/widget-voice-conversation"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import {
@@ -12,14 +13,17 @@ import {
   useApp,
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
+import { VoiceCallStoreProvider } from "@/contexts/voice-call-store"
 import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import { useWidgetOpenMessage } from "@/hooks/use-widget-open-message"
+import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES, widgetVoiceAnswerRequestId } from "@/hooks/use-widget-voice-call"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
 import { readSendErrorCode } from "@/components/chat/clarification-delivery"
 import {
   clientErrorTranslationKey,
   type ClientErrorCode,
 } from "@/lib/client-errors"
+import type { VoiceAudioTransport } from "@/lib/voice-audio"
 import type { WidgetSessionHistoryAuth } from "@/lib/widget-session-history"
 import {
   toAttachments,
@@ -27,7 +31,9 @@ import {
   type SessionUploadControls,
 } from "./use-session-attachments"
 import {
+  buildWidgetSessionVoiceAsrUrl,
   buildWidgetSessionWebSocketUrl,
+  WIDGET_SESSION_VOICE_TTS_PATH,
   useWidgetSession,
   type WidgetSessionAgent,
   type WidgetSessionStatus,
@@ -64,6 +70,22 @@ const getSessionTerminalPresentation = (code: string | null): SessionTerminalPre
   code ? SESSION_TERMINAL_PRESENTATION[code] ?? "unavailable" : "unavailable"
 )
 
+type SessionConversationPhase = ReturnType<typeof useApp>["sessionConversationState"]
+
+// Whether a refused session token may be replaced in this conversation phase.
+// A replacement rebuilds the chat connection: while a conversation is being
+// replaced, or once the page needs a reload, that would cost the visitor the
+// new conversation, so the token the page holds is used as it is.
+const tokenReplaceableIn = (phase: SessionConversationPhase): boolean =>
+  phase === "unbound" || phase === "bound"
+
+// What one open call bar has had refused of its session tokens, each with the
+// single replacement asked for it. A retry stays in the same call; closing the
+// bar and calling again starts a new record.
+interface VoiceCallTokenUse {
+  replaced: Map<string, Promise<string>>
+}
+
 // What the area below the header shows. The chat stays mounted underneath the
 // other two, so a half-typed message is still there on the way back.
 type HistoryViewState =
@@ -95,6 +117,10 @@ interface SessionConversationContentProps {
   historyAvailable: boolean
   // The token of the session the page holds right now, or null while it has none.
   readCurrentToken: () => string | null
+  // Whether a voice call is offered to this session (voice=1 and the server's voice capability).
+  voiceOffered: boolean
+  // Ends the session as expired when the voice recognition socket is closed with 4408.
+  onSessionExpired: () => void
 }
 
 function SessionConversationContent({
@@ -108,6 +134,8 @@ function SessionConversationContent({
   uploads,
   historyAvailable,
   readCurrentToken,
+  voiceOffered,
+  onSessionExpired,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -121,6 +149,9 @@ function SessionConversationContent({
     isSessionInteractionLocked,
     sessionConversationState,
     sessionConversationAttachment,
+    isSendInFlight,
+    canStopTask,
+    stopTask,
   } = useApp()
   const { t } = useI18n()
   const conversationEstablished = state.taskId !== null
@@ -314,18 +345,18 @@ function SessionConversationContent({
   })
 
   // History reads use the token policy of the phase the conversation is in at
-  // the moment of each request: before a conversation is replaced, the token
-  // is refreshed when needed and retried once after a rejection; while one is
-  // being replaced, a refresh would rebuild the connection and cost the
-  // visitor the new conversation, so the current token is used as it is.
+  // the moment of each request (tokenReplaceableIn): before a conversation is
+  // replaced, the token is refreshed when needed and retried once after a
+  // rejection; while one is being replaced, a refresh would rebuild the
+  // connection and cost the visitor the new conversation, so the current token
+  // is used as it is. A voice call's refused tokens follow the same rule.
   // The phase is recorded while rendering, not in an effect: a list or view
   // mounting in this commit reads it from its own effect, and a child's
   // effects run before this component's.
   const phaseRef = useRef(sessionConversationState)
   phaseRef.current = sessionConversationState
   const getHistoryAuth = useCallback((): WidgetSessionHistoryAuth => {
-    const phase = phaseRef.current
-    if (phase === "unbound" || phase === "bound") {
+    if (tokenReplaceableIn(phaseRef.current)) {
       return {
         getToken: () => uploads.ensureFreshSession().then((session) => session.token),
         refreshToken: (rejectedToken) => (
@@ -362,8 +393,188 @@ function SessionConversationContent({
   }
   const unauthorizedHistoryNotice = sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"
 
+  const voiceCallRef = useRef<VoiceCallTokenUse>({ replaced: new Map() })
+  // Replaces a token the session voice endpoints refused, only in a phase that
+  // allows it and at most once for that token in this call: a second refusal of
+  // the same token, as when two sentences are refused together or a retry
+  // offers it again, shares that replacement. Resolves with the new token; null
+  // when the phase allows none. The phase is read when the refusal arrives.
+  const replaceRefused = useCallback((call: VoiceCallTokenUse, refused: string): Promise<string> | null => {
+    if (!tokenReplaceableIn(phaseRef.current)) return null
+    const asked = call.replaced.get(refused)
+    if (asked) return asked
+    const renewed = uploads.refreshSession(refused).then((session) => session.token)
+    renewed.catch(() => undefined)
+    call.replaced.set(refused, renewed)
+    return renewed
+  }, [uploads])
+  // The transport is fixed when a call starts, so the phase and the token are
+  // read again at each request or handshake, never held here.
+  const voiceTransport = useMemo<VoiceAudioTransport | undefined>(() => {
+    if (!voiceOffered) return undefined
+    const currentToken = () => {
+      const token = readCurrentToken()
+      if (token === null) throw new Error("The session has no token")
+      return token
+    }
+    const synthesize = (token: string, text: string, signal: AbortSignal) => fetch(
+      `${window.location.origin}${WIDGET_SESSION_VOICE_TTS_PATH}`,
+      {
+        method: "POST",
+        signal,
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      },
+    )
+    // The token for a synthesis request. While a refresh is under way the page
+    // holds none: the request waits for the next session's chat socket to open,
+    // asking for nothing itself, up to the bridge's deadline. A sentence given
+    // up meanwhile (the visitor talked over it or hung up) stops waiting at
+    // once.
+    const tokenForSynthesis = async (signal: AbortSignal): Promise<string> => {
+      const held = readCurrentToken()
+      if (held !== null) return held
+      const abandoned = () => new DOMException("Aborted", "AbortError")
+      if (signal.aborted) throw abandoned()
+      let onAbort!: () => void
+      const aborted = new Promise<never>((_, reject) => {
+        onAbort = () => reject(abandoned())
+        signal.addEventListener("abort", onAbort, { once: true })
+      })
+      try {
+        await Promise.race([uploads.waitForOpenConnection(), aborted])
+      } finally {
+        signal.removeEventListener("abort", onAbort)
+      }
+      return currentToken()
+    }
+    return {
+      // The token offered the way the chat socket offers it; the server binds
+      // the connection to the session, so a later token change leaves it open.
+      openAsrSocket: () => {
+        const call = voiceCallRef.current
+        const token = currentToken()
+        const socket = new WebSocket(
+          buildWidgetSessionVoiceAsrUrl(window.location.origin),
+          [SESSION_PROTOCOL, `xagent-session-token.${token}`],
+        )
+        // What a close says about the session, not the call, is acted on here;
+        // classify below only reads what it means for the call. A socket the
+        // call closes itself closes with 1000 or 1005, so these codes come
+        // from the server. 4408: the session has expired, and the page ends it
+        // as a chat socket closed with 4408 does. 4401: the handshake token
+        // was refused, and it is replaced where replaceRefused allows, so the
+        // visitor's retry offers the new one.
+        socket.addEventListener("close", (event) => {
+          if (event.code === 4408) onSessionExpired()
+          else if (event.code === 4401) void replaceRefused(call, token)
+        })
+        return socket
+      },
+      startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
+      // The token the page holds at the time of the request, or the next one
+      // when it holds none. Only a 401 is retried, once, with the token
+      // replaceRefused gives; a 401 it gives none for, a second 401, or a
+      // failed replacement is handed back as the refusal. A sentence already
+      // abandoned (the call ended, or the visitor talked over it) neither
+      // replaces the token, which would rebuild the chat socket, nor retries:
+      // its 401 is handed back as it is.
+      requestTts: async (text, signal) => {
+        const call = voiceCallRef.current
+        const token = await tokenForSynthesis(signal)
+        const response = await synthesize(token, text, signal)
+        if (response.status !== 401 || signal.aborted) return response
+        const renewal = replaceRefused(call, token)
+        if (!renewal) return response
+        let renewed: string
+        try {
+          renewed = await renewal
+        } catch {
+          return response
+        }
+        if (signal.aborted) return response
+        await response.body?.cancel()
+        return synthesize(renewed, text, signal)
+      },
+      classify: classifyWidgetVoiceEvent,
+    }
+  }, [voiceOffered, readCurrentToken, replaceRefused, uploads, onSessionExpired])
+
+  // A call opened by the visitor's click. Without a transport no call is
+  // offered, and an open call is dropped so a later offer never starts one
+  // without a click. History hides the chat and the call bar with it, so
+  // whatever opens it also hangs up: the visitor could not reach the hang-up
+  // control while the microphone stays live, and coming back to the chat
+  // starts no call until the visitor asks for one again.
+  const [voiceOpen, setVoiceOpen] = useState(false)
+  if ((!voiceTransport || view.kind !== "chat") && voiceOpen) setVoiceOpen(false)
+  // Recorded while rendering, as phaseRef is: a click reads the bar as last
+  // rendered. Pressing start while a call is open changes nothing.
+  const voiceOpenRef = useRef(voiceOpen)
+  voiceOpenRef.current = voiceOpen
+  const openVoiceCall = useCallback(() => {
+    if (!voiceOpenRef.current) voiceCallRef.current = { replaced: new Map() }
+    setVoiceOpen(true)
+  }, [])
+  const voiceTaskStatus = state.currentTask?.status || ""
+  // What holds a typed send on the start page: a reply or a send under way, a
+  // reset, a typed message's files still uploading, or a message handed over
+  // from history. Spoken words wait for the same, whichever view the call was
+  // opened from.
+  const sendHeld = state.isProcessing
+    || isConversationResetPending
+    || isMessageDeliveryPending
+    || isAttachmentBusy
+    || continueBusy
+  // Spoken words also wait while the chat socket is rebuilt (a token refresh),
+  // while a send is in flight and while the task runs; the call goes on
+  // meanwhile. It ends when the session is down or the page needs a reload.
+  const voiceBusy = sendHeld || !isConnected || isSendInFlight
+    || WIDGET_VOICE_BUSY_TASK_STATUSES.includes(voiceTaskStatus)
+  const voiceDisabled = status === "degraded" || status === "terminal" || isSessionInteractionLocked
+  // Spoken words take the path typed ones take: the start page's send before
+  // a conversation exists, the panel's send after, with the call's client
+  // message id and the request id of the question this task is waiting on.
+  const sendSpoken = useCallback((text: string, clientMessageId: string) => {
+    const requestId = widgetVoiceAnswerRequestId(state.currentTask, state.taskId)
+    const config = { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }
+    return conversationEstablished
+      ? sendWithAttachments(text, config, [])
+      : handleStartMessage(text, [], config)
+  }, [conversationEstablished, handleStartMessage, sendWithAttachments, state.currentTask, state.taskId])
+  // Talking over a reply stops the run when the stop control could.
+  const interruptSpoken = useCallback(() => {
+    if (!canStopTask) return false
+    stopTask()
+    return true
+  }, [canStopTask, stopTask])
+  const voiceOffer = voiceTransport
+    ? { onVoiceConversation: openVoiceCall, voiceConversationSource: "provided" as const }
+    : {}
+  // The call lives above every view of the page, so it outlasts a switch
+  // between the start page and the panel and sees the session go down.
+  const withVoiceCall = (node: React.ReactNode) => (
+    <VoiceCallStoreProvider>
+      {voiceTransport ? (
+        <WidgetVoiceConversation
+          transport={voiceTransport}
+          taskId={state.taskId}
+          messages={state.messages}
+          busy={voiceBusy}
+          waiting={voiceTaskStatus === "waiting_for_user"}
+          disabled={voiceDisabled}
+          onSend={sendSpoken}
+          onInterrupt={interruptSpoken}
+          open={voiceOpen}
+          onOpenChange={setVoiceOpen}
+        />
+      ) : null}
+      {node}
+    </VoiceCallStoreProvider>
+  )
+
   if (status === "waiting" || (status === "refreshing" && !agent)) {
-    return (
+    return withVoiceCall(
       <div className="flex h-screen items-center justify-center bg-background">
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <Loader2 className="h-5 w-5 animate-spin" />
@@ -378,7 +589,7 @@ function SessionConversationContent({
   if (status === "degraded" || status === "terminal" || !agent) {
     const isExpired = status !== "degraded"
       && getSessionTerminalPresentation(terminalCode) === "expired"
-    return (
+    return withVoiceCall(
       <div className="flex h-screen items-center justify-center bg-background p-6">
         <div className="max-w-md text-center">
           <h1 className="text-lg font-semibold">
@@ -404,7 +615,7 @@ function SessionConversationContent({
     || isMessageDeliveryPending
     || isAttachmentBusy
 
-  return (
+  return withVoiceCall(
     <div className="flex h-screen flex-col bg-background">
       <header className="flex-none border-b bg-card p-4 text-card-foreground shadow-sm">
         <div className="flex items-center gap-3">
@@ -517,6 +728,7 @@ function SessionConversationContent({
               attachmentsBusy={isAttachmentBusy || continueBusy}
               attachmentFiles={attachments ? panelFiles : []}
               onAttachmentFilesChange={attachments ? onPanelFilesChange : undefined}
+              {...(voiceTransport ? { onProvidedVoiceConversation: openVoiceCall } : {})}
             />
           ) : (
             <div className="h-full overflow-y-auto">
@@ -527,14 +739,7 @@ function SessionConversationContent({
                   prompts={agent.suggestedPrompts}
                   onSend={handleStartMessage}
                   sendPromptOnClick={true}
-                  isSending={
-                    state.isProcessing
-                    || isConversationResetPending
-                    || isMessageDeliveryPending
-                    || reloadRequired
-                    || isAttachmentBusy
-                    || continueBusy
-                  }
+                  isSending={sendHeld || reloadRequired}
                   files={attachments ? startFiles : []}
                   onFilesChange={attachments ? onStartFilesChange : () => undefined}
                   attachments={attachments}
@@ -547,6 +752,7 @@ function SessionConversationContent({
                   deferFileUpload={true}
                   filesDisabled={filesDisabled}
                   voiceInputEnabled={voiceInputEnabled}
+                  {...voiceOffer}
                   autoFocus={view.kind === "chat"}
                   inputMinHeightClass="min-h-[44px]"
                 />
@@ -619,6 +825,26 @@ export function SessionAgentChatPage() {
   const sessionTokenRef = useRef<string | null>(null)
   sessionTokenRef.current = bridge.session?.token ?? null
   const readCurrentToken = useCallback(() => sessionTokenRef.current, [])
+
+  // The page runs in the host page's iframe only, and widget.js adds voice=1
+  // where the host page granted the microphone. voice=1 is an unsigned hint
+  // that any page can add to the URL itself. It only says the embedder
+  // delegated the microphone to this iframe and is not a permission: whether
+  // voice calls are offered is decided by the server (the voice capability of
+  // the session payload), and the voice endpoints check again on every
+  // request.
+  const [voiceRequested] = useState(
+    () => new URLSearchParams(window.location.search).get("voice") === "1",
+  )
+  // Held across a refresh like the capabilities above, and kept once the
+  // session is down, so an open call sees the session end instead of
+  // disappearing with the flag.
+  const advertisedVoice = bridge.session?.capabilities?.voice === true
+  const [heldVoice, setHeldVoice] = useState(advertisedVoice)
+  if (bridge.session && heldVoice !== advertisedVoice) {
+    setHeldVoice(advertisedVoice)
+  }
+  const voiceOffered = voiceRequested && (bridge.session ? advertisedVoice : heldVoice)
   const uploads = useMemo<SessionUploadControls>(() => ({
     ensureFreshSession: bridge.ensureFreshSession,
     refreshSession: bridge.refreshSession,
@@ -691,6 +917,8 @@ export function SessionAgentChatPage() {
         uploads={uploads}
         historyAvailable={historyAvailable}
         readCurrentToken={readCurrentToken}
+        voiceOffered={voiceOffered}
+        onSessionExpired={bridge.handleSessionExpired}
       />
     </AppProvider>
   )

@@ -1,11 +1,11 @@
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from openai import AsyncAzureOpenAI
 
 from ...public_http import create_owned_async_sdk_client
 from ..timeout_config import TimeoutConfig
-from .openai import OpenAILLM
+from .openai import OpenAICompatibleLLM, OpenAILLM
 
 
 class _ApiKeyOnlyAsyncAzureOpenAI(AsyncAzureOpenAI):
@@ -122,6 +122,33 @@ class AzureOpenAILLM(OpenAILLM):
             timeout=timeout,
             abilities=abilities,
             timeout_config=timeout_config,
+        )
+
+    def _prepare_provider_reasoning_extra_body(
+        self,
+        *,
+        extra_body: Dict[str, Any],
+        thinking: Optional[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Dict[str, Any]],
+        output_config: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> Dict[str, Any]:
+        """Send no reasoning payload, as before ``OpenAILLM`` gained one.
+
+        ``OpenAILLM`` adds DeepSeek chat-template switches for vLLM-style
+        servers. Azure deployments are not confirmed to accept that field,
+        and a rejected ``extra_body`` field has no degrade-and-retry path, so
+        Azure keeps the base behavior.
+        """
+        return OpenAICompatibleLLM._prepare_provider_reasoning_extra_body(
+            self,
+            extra_body=extra_body,
+            thinking=thinking,
+            tools=tools,
+            response_format=response_format,
+            output_config=output_config,
+            is_streaming=is_streaming,
         )
 
     def _ensure_client(self) -> None:

@@ -280,6 +280,7 @@ export default defineConfig({
       "src/components/widget/public-agent-chat-page.voice.test.tsx",
       "src/components/widget/session-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.integration.test.tsx",
+      "src/components/widget/session-agent-chat-page.voice.test.tsx",
       "src/components/widget/use-history-continue.test.tsx",
       "src/components/widget/use-session-attachments.test.tsx",
       "src/components/widget/use-session-open-message.test.tsx",

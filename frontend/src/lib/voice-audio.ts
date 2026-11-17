@@ -269,7 +269,10 @@ export class VoiceAudio {
     const controller = new AbortController()
     this.synthesis = controller
     const signal = controller.signal
-    // A synthesis request is billable; never automatically replay a failed POST.
+    // A synthesis request is billable; never automatically replay a failed
+    // POST. The one exception is an injected transport whose request was
+    // refused with 401 for its token, which happens before any synthesis
+    // starts: it may replay the request once with the token that replaced it.
     const response = await this.transport.requestTts(text, signal)
     if (!response.ok || !response.body) {
       // An injected transport may explain the refusal in a fixed JSON code.

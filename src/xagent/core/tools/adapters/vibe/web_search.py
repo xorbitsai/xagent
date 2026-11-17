@@ -55,7 +55,9 @@ class WebSearchTool(AbstractBaseTool):
         Set include_content=true only when every result needs page text; otherwise
         use fetch_web_content to read one selected URL after search.
         Snippets are often enough for a simple question; fetch at most one or
-        two pages, and only when they are not."""
+        two pages, and only when they are not.
+        When reporting how information was found, name web_search for
+        searching and fetch_web_content for pages fetched with it."""
 
     @property
     def tags(self) -> list[str]:

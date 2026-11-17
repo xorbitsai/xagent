@@ -737,7 +737,10 @@ class TestToolsAvailableAPI:
 
     def test_get_available_tools_marks_always_available_tools(self) -> None:
         from xagent.core.agent.context.skill_tool import LOAD_SKILL_TOOL_NAME
-        from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES
+        from xagent.core.tools.adapters.vibe.base import (
+            HOST_REGISTERED_INTRINSIC_TOOL_NAMES,
+            INTRINSIC_TOOL_NAMES,
+        )
 
         response = client.get(
             "/api/tools/available",
@@ -747,7 +750,8 @@ class TestToolsAvailableAPI:
         assert response.status_code == 200
         data = response.json()
         marked = {t["name"] for t in data["tools"] if t["always_available"]}
-        assert marked == INTRINSIC_TOOL_NAMES
+        # No host hook is registered, so host-registered tools are not listed.
+        assert marked == INTRINSIC_TOOL_NAMES - HOST_REGISTERED_INTRINSIC_TOOL_NAMES
         assert data["skill_loader_tool"] == LOAD_SKILL_TOOL_NAME
 
     def test_get_available_tools_requires_auth(self):

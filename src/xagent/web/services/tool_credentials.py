@@ -14,8 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from ...config import get_tool_credentials_encryption_key
-from ...core.tools.connector_resolver import (  # noqa: F401 - re-exported hook setters
-    has_connector_resolver_hook,
+from ...core.tools.connector_resolver import (  # noqa: F401 - re-exported hook setter
     set_connector_resolver_hook,
 )
 from ...core.tools.core.sql_tool import (

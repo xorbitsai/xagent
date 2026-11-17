@@ -5,6 +5,15 @@ their credentials live. A host that supports "connect an app from chat"
 registers one :class:`ConnectorResolver`; with none registered the
 ``find_app_connection`` tool is not offered at all.
 
+Who is asking: ``user_id`` is the task *owner*. Widget, shared-link and channel
+runs execute as the owner, so the resolver cannot tell the owner from a guest by
+``user_id`` alone. The tool refuses the public ``widget`` and ``shared_link``
+task sources itself, but a channel run reports the same ``task_source`` as the
+owner's own chat. A resolver must therefore treat ``task_source`` and
+``task_id`` as part of the request and refuse any run it cannot attribute to the
+owner acting for themselves, both in ``resolve`` and in ``connection_state``.
+No separate actor identity is available to tools.
+
 Secret handling contract: nothing here carries a secret. A
 :class:`ConnectorResolution` ``connector`` payload is display data only
 (name, route, field labels, steps). The credential itself travels from the
@@ -20,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol
 
 ResolutionStatus = Literal["connected", "needs_connection", "not_found"]
 ConnectionStatus = Literal["connected", "skipped", "pending"]
@@ -63,13 +72,17 @@ class ConnectorConnectionState:
     result: Mapping[str, Any] | None = None
 
 
-@runtime_checkable
 class ConnectorResolver(Protocol):
     async def resolve(self, request: ConnectorResolveRequest) -> ConnectorResolution:
         """Resolve ``request.app_name`` for the requesting user."""
 
     async def connection_state(
-        self, *, interaction_id: str, user_id: int | None, task_id: str | None
+        self,
+        *,
+        interaction_id: str,
+        user_id: int | None,
+        task_id: str | None,
+        task_source: str | None,
     ) -> ConnectorConnectionState | None:
         """Return the stored state of ``interaction_id``, or ``None`` if unknown."""
 
@@ -86,7 +99,3 @@ def set_connector_resolver_hook(resolver: ConnectorResolver | None) -> None:
 
 def get_connector_resolver_hook() -> ConnectorResolver | None:
     return _resolver
-
-
-def has_connector_resolver_hook() -> bool:
-    return _resolver is not None

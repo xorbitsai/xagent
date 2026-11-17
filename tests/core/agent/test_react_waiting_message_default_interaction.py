@@ -818,3 +818,34 @@ def test_the_flag_cannot_turn_a_model_facing_type_into_a_widget() -> None:
 
     assert not is_live_widget({"type": "text_input", "live_widget": True})
     assert "connect_connector" not in INTERACTION_TYPES
+
+
+@pytest.mark.asyncio
+async def test_a_live_widget_beside_an_unanswerable_sibling_still_gets_the_field() -> (
+    None
+):
+    """In one batch the lists merge: the sibling tool's unanswerable entry must
+    not lose its answer box because another tool brought a live widget."""
+
+    pattern = ReActPattern(max_iterations=2)
+    runtime = PatternRuntime(execution_id="exec-mixed-batch")
+    context = ExecutionContext()
+    context.add_user_message("Ask")
+    sibling = {"type": "connect_apps", "field": "apps", "label": "Connect an app"}
+
+    await pattern._pause_for_tool_results(
+        waiting_pairs=[
+            (
+                {"id": "call_a", "name": "find_app_connection"},
+                {"message": "Connect it", "interactions": [_LIVE_WIDGET]},
+            ),
+            (
+                {"id": "call_b", "name": "tool_b"},
+                {"message": "Pick", "interactions": [sibling]},
+            ),
+        ],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert _published_interactions(runtime) == [_LIVE_WIDGET, sibling, DEFAULT_FIELD]

@@ -329,7 +329,7 @@
   // which the chat page reads at login or from the session payload, and which
   // the voice endpoints check again on every request.
   var embedVoiceRaw = (scriptTag.getAttribute('data-voice') || '').trim().toLowerCase();
-  var embedVoice = embedVoiceRaw !== 'false' && (embedVoiceRaw === '' || embedVoiceRaw === 'true');
+  var embedVoice = embedVoiceRaw === '' || embedVoiceRaw === 'true';
   if (embedVoiceRaw && embedVoiceRaw !== 'true' && embedVoiceRaw !== 'false') {
     console.warn('Xagent Widget: data-voice must be "true" or "false"; treating it as "false", so this page offers no voice calls.');
   }

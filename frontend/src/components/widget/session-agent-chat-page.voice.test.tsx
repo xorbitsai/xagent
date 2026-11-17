@@ -342,13 +342,25 @@ describe("session widget voice call transport", () => {
     expect(bridge.value.refreshSession).toHaveBeenCalledExactlyOnceWith(TOKEN)
   })
 
-  it("fails a sentence, not the call, while the page holds no token", async () => {
+  it("does not open recognition while the page holds no token", async () => {
     renderPage()
     const transport = await openCall()
     setBridge("refreshing", null)
     rerender()
-    await expect(transport.requestTts("Hello", new AbortController().signal)).rejects.toThrow()
     expect(() => transport.openAsrSocket()).toThrow()
+  })
+
+  it("stops waiting for the token when the sentence is given up", async () => {
+    renderPage()
+    const transport = await openCall()
+    setBridge("refreshing", null)
+    rerender()
+    bridge.value.waitForOpenConnection.mockReturnValue(new Promise(() => undefined))
+    const controller = new AbortController()
+    const request = transport.requestTts("Hello", controller.signal)
+    controller.abort()
+    await expect(request).rejects.toMatchObject({ name: "AbortError" })
+    await expect(transport.requestTts("Again", controller.signal)).rejects.toMatchObject({ name: "AbortError" })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -483,6 +495,65 @@ describe("session widget voice call across the session", () => {
     await waitFor(() => expect(app.sendMessage).toHaveBeenCalledWith("Hello", { clientMessageId: expect.any(String) }, []))
     expect(voice.audios[0].close).not.toHaveBeenCalled()
     expect(voice.audios).toHaveLength(1)
+  })
+
+  describe("with a reply due while the token is refreshed", () => {
+    const audioHeaders = { "X-Audio-Format": "pcm", "X-Audio-Sample-Rate": "24000" }
+    // The visitor's words go out, then the session is refreshed and the reply arrives.
+    async function replyDuringRefresh() {
+      useRealAudio()
+      renderPage()
+      await openRealCall("start")
+      act(() => {
+        socketInstances[0].onmessage!({ data: JSON.stringify({ type: "final", text: "Hello", segment_id: 1 }) })
+      })
+      await waitFor(() => expect(app.sendMessage).toHaveBeenCalled())
+      let release!: () => void
+      let fail!: (error: Error) => void
+      bridge.value.waitForOpenConnection.mockReturnValue(new Promise<void>((resolve, reject) => { release = resolve; fail = reject }))
+      app.isConnected = false
+      setBridge("refreshing", null)
+      app.state = {
+        ...app.state,
+        messages: [{ id: "a1", role: "assistant", content: "Hi there.", isResult: true, status: "completed" }] as never,
+      }
+      rerender()
+      return { release: () => release(), fail: (error: Error) => fail(error) }
+    }
+    const reconnect = () => {
+      app.isConnected = true
+      setBridge("active", session({ voice: true }, "st_renewed"))
+      rerender()
+    }
+
+    it("speaks the sentence with the new token, and the call goes on", async () => {
+      const { release } = await replyDuringRefresh()
+      await waitFor(() => expect(bridge.value.waitForOpenConnection).toHaveBeenCalled())
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(bridge.value.refreshSession).not.toHaveBeenCalled()
+      expect(bridge.value.ensureFreshSession).not.toHaveBeenCalled()
+      expect(bridge.value.requestReconnect).not.toHaveBeenCalled()
+      fetchMock.mockResolvedValue(new Response(new Uint8Array(0), { headers: audioHeaders }))
+      reconnect()
+      release()
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+      expect(authorizations()).toEqual(["Bearer st_renewed"])
+      await waitFor(() => expect(screen.getByTestId("call")).toHaveTextContent("listening"))
+      expect(screen.queryByTestId("note")).toBeNull()
+      expect(screen.queryByTestId("alert")).toBeNull()
+      expect(stopTrack).not.toHaveBeenCalled()
+    })
+
+    it("skips the sentence with a note, and the call goes on, when no token comes in time", async () => {
+      const { fail } = await replyDuringRefresh()
+      await waitFor(() => expect(bridge.value.waitForOpenConnection).toHaveBeenCalled())
+      fail(new Error("timed out"))
+      await waitFor(() => expect(screen.getByTestId("note")).toHaveTextContent("voiceConversation.widget.playbackFailed"))
+      expect(screen.getByTestId("call")).not.toHaveTextContent("none")
+      expect(screen.queryByTestId("alert")).toBeNull()
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(stopTrack).not.toHaveBeenCalled()
+    })
   })
 
   it.each(["terminal", "degraded"] as const)("hangs up when the session turns %s", async ending => {

@@ -422,6 +422,24 @@ function SessionConversationContent({
         body: JSON.stringify({ text }),
       },
     )
+    // The token for a synthesis request. While a refresh is under way the page
+    // holds none: the request waits for the next session's chat socket to open,
+    // asking for nothing itself, up to the bridge's deadline. A sentence given
+    // up meanwhile (the visitor talked over it or hung up) stops waiting at
+    // once.
+    const tokenForSynthesis = async (signal: AbortSignal): Promise<string> => {
+      const held = readCurrentToken()
+      if (held !== null) return held
+      const abandoned = () => new DOMException("Aborted", "AbortError")
+      if (signal.aborted) throw abandoned()
+      await Promise.race([
+        uploads.waitForOpenConnection(),
+        new Promise<never>((_, reject) => {
+          signal.addEventListener("abort", () => reject(abandoned()), { once: true })
+        }),
+      ])
+      return currentToken()
+    }
     return {
       // The token offered the way the chat socket offers it; the server binds
       // the connection to the session, so a later token change leaves it open.
@@ -443,15 +461,16 @@ function SessionConversationContent({
         return socket
       },
       startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
-      // The token the page holds at the time of the request. Only a 401 is
-      // retried, once, with the token replaceRefused gives; a 401 it gives
-      // none for, a second 401, or a failed replacement is handed back as the
-      // refusal. A sentence already abandoned (the call ended, or the visitor
-      // talked over it) neither replaces the token, which would rebuild the
-      // chat socket, nor retries: its 401 is handed back as it is.
+      // The token the page holds at the time of the request, or the next one
+      // when it holds none. Only a 401 is retried, once, with the token
+      // replaceRefused gives; a 401 it gives none for, a second 401, or a
+      // failed replacement is handed back as the refusal. A sentence already
+      // abandoned (the call ended, or the visitor talked over it) neither
+      // replaces the token, which would rebuild the chat socket, nor retries:
+      // its 401 is handed back as it is.
       requestTts: async (text, signal) => {
         const call = voiceCallRef.current
-        const token = currentToken()
+        const token = await tokenForSynthesis(signal)
         const response = await synthesize(token, text, signal)
         if (response.status !== 401 || signal.aborted) return response
         const renewal = replaceRefused(call, token)
@@ -468,7 +487,7 @@ function SessionConversationContent({
       },
       classify: classifyWidgetVoiceEvent,
     }
-  }, [voiceOffered, readCurrentToken, replaceRefused])
+  }, [voiceOffered, readCurrentToken, replaceRefused, uploads])
 
   // A call opened by the visitor's click. Without a transport no call is
   // offered, and an open call is dropped so a later offer never starts one

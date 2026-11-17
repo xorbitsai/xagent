@@ -55,6 +55,7 @@ from ...config import (
 from ...core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
 )
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE
 from ...core.agent.trace import TraceEvent, TraceHandler
 from ...core.execution_scope import (
     ExecutionScope,
@@ -3617,6 +3618,13 @@ def _load_historical_stream_snapshot_sync(
                     }
                     if isinstance(interactions, list):
                         data["metadata"] = {"interactions": interactions}
+                    elif (
+                        chat_message.message_type == RESULT_CARD_MESSAGE_TYPE
+                        and assistant_ancillary_is_safe
+                        and isinstance(chat_message.message_metadata, dict)
+                    ):
+                        data["metadata"] = chat_message.message_metadata
+                        data["message_type"] = RESULT_CARD_MESSAGE_TYPE
                     # Failure and refusal provenance affect chat rendering.
                     # Historical questions must not re-arm the response UI.
                     if chat_message.message_type in {

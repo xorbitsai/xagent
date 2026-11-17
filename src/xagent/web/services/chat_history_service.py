@@ -765,6 +765,7 @@ def persist_assistant_message_no_commit(
     content_is_reconciled: bool = False,
     source_event_id: Optional[str] = None,
     execution_event_id: Optional[str] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
 
@@ -803,6 +804,7 @@ def persist_assistant_message_no_commit(
         set_committed_value(existing, "content", normalized_content)
         set_committed_value(existing, "interactions", interactions)
         set_committed_value(existing, "attachments", None)
+        set_committed_value(existing, "message_metadata", message_metadata or None)
         return existing
     if not normalized_content:
         return None
@@ -817,6 +819,7 @@ def persist_assistant_message_no_commit(
         attachments=None,
         source_event_id=source_event_id,
         execution_event_id=execution_event_id,
+        message_metadata=message_metadata or None,
     )
     if execution_event_id is not None:
         db.add(message)

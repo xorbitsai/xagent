@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ...core.agent.result_card import RESULT_CARD_DISPLAY, RESULT_CARD_MESSAGE_TYPE
 from ...core.agent.trace import normalize_llm_trace_payload
 from ..models.task import Task
 from ..models.task_execution_event import TaskExecutionEvent
@@ -210,6 +211,7 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
     data = event_data(event)
     if is_audit_only_trace_data(data) or is_agent_checkpoint_data(data):
         return None
+    card_metadata: dict[str, Any] | None = None
     if event.kind in {"input_accepted", "assistant_message"}:
         role = "user" if event.kind == "input_accepted" else "assistant"
         content = data.get("content")
@@ -244,6 +246,24 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
             raise _invalid(event, "invalid question")
         interactions = (metadata or {}).get("interactions")
         attachments = data.get("attachments")
+    elif (
+        event.kind == "agent_message"
+        and data.get("visible") is not False
+        and isinstance(data.get("message"), str)
+        and data["message"]
+        and isinstance(data.get("metadata"), dict)
+        and data["metadata"].get("display") == RESULT_CARD_DISPLAY
+        and isinstance(data["metadata"].get("result_card"), dict)
+    ):
+        # A display card is a persisted assistant message that asks nothing.
+        role, message_type = "assistant", RESULT_CARD_MESSAGE_TYPE
+        content = data["message"]
+        interactions = None
+        attachments = None
+        card_metadata = {
+            "display": RESULT_CARD_DISPLAY,
+            "result_card": data["metadata"]["result_card"],
+        }
     else:
         return None
     return {
@@ -255,7 +275,9 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
         "attachments": attachments if isinstance(attachments, list) else [],
         "turn_id": event.turn_id,
         "created_at": event.occurred_at,
-        "message_metadata": (
+        "message_metadata": card_metadata
+        if card_metadata is not None
+        else (
             data.get("message_metadata")
             if isinstance(data.get("message_metadata"), dict)
             else None

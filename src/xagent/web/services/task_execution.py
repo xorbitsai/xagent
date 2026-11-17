@@ -73,6 +73,10 @@ from ...core.agent.checkpoint import (
     CheckpointUnavailableError,
 )
 from ...core.agent.interruption import InterruptionReason
+from ...core.agent.result_card import (
+    RESULT_CARD_DISPLAY,
+    RESULT_CARD_MESSAGE_TYPE,
+)
 from ...core.agent.runner import (
     InjectionDisposition,
     UserMessageInjectionOutcome,
@@ -1036,6 +1040,23 @@ def _persist_agent_outbound_event(
                     turn_id=turn_id,
                 )
 
+        elif _is_result_card_event_data(data):
+            task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
+            task_user_id = _task_user_id(task) if task else None
+            message = str(data.get("message") or "")
+            if task and task_user_id is not None and message:
+                persist_assistant_message_no_commit(
+                    db,
+                    task_id=task_id,
+                    user_id=task_user_id,
+                    content=message,
+                    message_type=RESULT_CARD_MESSAGE_TYPE,
+                    message_metadata=_result_card_message_metadata(data),
+                    source_event_id=str(trace_event.event_id),
+                    execution_event_id=execution_event_id,
+                    turn_id=turn_id,
+                )
+
         if authoritative:
             from .task_event_display import convert_display_event
 
@@ -1061,9 +1082,31 @@ def _persist_agent_outbound_event(
         db.close()
 
 
+def _is_result_card_event_data(data: Dict[str, Any]) -> bool:
+    metadata = data.get("metadata")
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("display") == RESULT_CARD_DISPLAY
+        and isinstance(metadata.get("result_card"), dict)
+    )
+
+
+def _result_card_message_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The part of an outbound card event kept on its transcript row."""
+    metadata = cast(Dict[str, Any], data["metadata"])
+    return {
+        "display": RESULT_CARD_DISPLAY,
+        "result_card": metadata["result_card"],
+    }
+
+
 def _agent_outbound_event_type(payload: Dict[str, Any]) -> str:
     message_type = str(payload.get("message_type") or "info")
-    if bool(payload.get("expect_response")) or message_type == "question":
+    if (
+        bool(payload.get("expect_response"))
+        or message_type == "question"
+        or message_type == RESULT_CARD_MESSAGE_TYPE
+    ):
         return "agent_message"
     return "agent_progress"
 

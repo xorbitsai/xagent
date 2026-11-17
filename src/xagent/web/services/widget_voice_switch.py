@@ -82,14 +82,13 @@ class WidgetVoiceTarget:
 
 
 def _off() -> OwnerWidgetVoiceResponse:
-    return OwnerWidgetVoiceResponse(enabled=False, available=None, reason=None)
+    return OwnerWidgetVoiceResponse(enabled=False)
 
 
-def _checked(
-    enabled: bool, availability: WidgetVoiceAvailability
-) -> OwnerWidgetVoiceResponse:
+def _checked(availability: WidgetVoiceAvailability) -> OwnerWidgetVoiceResponse:
+    """The answer for a switch that is on, once the voice provider was asked."""
     return OwnerWidgetVoiceResponse(
-        enabled=enabled,
+        enabled=True,
         available=availability.available,
         reason=cast(Any, availability.reason),
     )
@@ -138,7 +137,7 @@ async def get_agent_voice(
     availability = await resolve_widget_voice_availability(
         target.owner_user_id, request_db=db
     )
-    return _checked(True, availability)
+    return _checked(availability)
 
 
 async def put_agent_voice(
@@ -155,7 +154,7 @@ async def put_agent_voice(
         lambda: _write_agent(caller, agent_id, enabled)
     )
     _log_write("agent_id", agent_id, caller, enabled, previous, availability)
-    return _checked(True, availability) if availability is not None else _off()
+    return _checked(availability) if availability is not None else _off()
 
 
 # ===== Workforces =====
@@ -199,18 +198,29 @@ def _guard_write(
     return deployment
 
 
-def _read_workforce(
-    caller: OwnerCaller, workforce_id: int, write_value: bool | None
-) -> WidgetVoiceTarget | None:
+def _read_workforce(caller: OwnerCaller, workforce_id: int) -> WidgetVoiceTarget | None:
     """The workforce's owner and switch, or ``None`` when it has no deployment
-    row (reads only; a write to such a workforce is a 404)."""
+    row."""
     with get_session_local()() as db:
         workforce = _editable_workforce(db, caller, workforce_id)
         deployment = _deployment(db, workforce_id)
-        if write_value is not None:
-            _guard_write(workforce, deployment, write_value)
         if deployment is None:
             return None
+        return WidgetVoiceTarget(
+            int(cast(Any, workforce.owner_user_id)),
+            bool(deployment.widget_voice_enabled),
+        )
+
+
+def _check_workforce_write(
+    caller: OwnerCaller, workforce_id: int, enabled: bool
+) -> WidgetVoiceTarget:
+    """The workforce's owner and switch, once a write of ``enabled`` is
+    allowed: 404 without a deployment row (a write never creates one), 400 when
+    turning voice on for a workforce that is not active."""
+    with get_session_local()() as db:
+        workforce = _editable_workforce(db, caller, workforce_id)
+        deployment = _guard_write(workforce, _deployment(db, workforce_id), enabled)
         return WidgetVoiceTarget(
             int(cast(Any, workforce.owner_user_id)),
             bool(deployment.widget_voice_enabled),
@@ -235,14 +245,14 @@ async def get_workforce_voice(
 ) -> OwnerWidgetVoiceResponse:
     release_request_connection(db)
     target = await run_db_io_cancellation_safe(
-        lambda: _read_workforce(caller, workforce_id, None)
+        lambda: _read_workforce(caller, workforce_id)
     )
     if target is None or not target.enabled:
         return _off()
     availability = await resolve_widget_voice_availability(
         target.owner_user_id, request_db=db
     )
-    return _checked(True, availability)
+    return _checked(availability)
 
 
 async def put_workforce_voice(
@@ -250,11 +260,8 @@ async def put_workforce_voice(
 ) -> OwnerWidgetVoiceResponse:
     release_request_connection(db)
     target = await run_db_io_cancellation_safe(
-        lambda: _read_workforce(caller, workforce_id, enabled)
+        lambda: _check_workforce_write(caller, workforce_id, enabled)
     )
-    # A write never reads ``None``: ``_read_workforce`` raises 404 for a
-    # workforce without a deployment row.
-    assert target is not None
     availability = (
         await resolve_widget_voice_availability(target.owner_user_id, request_db=db)
         if enabled
@@ -264,7 +271,7 @@ async def put_workforce_voice(
         lambda: _write_workforce(caller, workforce_id, enabled)
     )
     _log_write("workforce_id", workforce_id, caller, enabled, previous, availability)
-    return _checked(True, availability) if availability is not None else _off()
+    return _checked(availability) if availability is not None else _off()
 
 
 def _log_write(

@@ -5,6 +5,12 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  # An approval starts the full run of a pull request that has only had the
+  # quick one; see "Decide what this run covers" in the changes job. So does
+  # dismissing a review, which can approve a pull request without a new
+  # approval. Any other review starts a run whose jobs are all skipped.
+  pull_request_review:
+    types: [submitted, dismissed]
   # No `push` trigger: the merge queue already ran this workflow on the exact
   # commit it moves main to. main-push-check.yml calls it, through
   # workflow_call, for a push that did not come through the queue.
@@ -23,8 +29,11 @@ env:
   DEEPDOC_TIKTOKEN_CACHE_DIR: ${{ github.workspace }}/.cache/deepdoc/tiktoken_cache
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # An approval shares its pull request's group but cancels nothing: it waits
+  # for the run in flight, and a later push still cancels it. Any other review
+  # gets a group of its own, so its run, which does nothing, cancels nothing.
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request_review' && github.event.review.state != 'approved') && format('review-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request_review' }}
 
 jobs:
   # Which halves of the tree this change touches. Consumed by the jobs below as
@@ -36,15 +45,23 @@ jobs:
     # The merge queue allows 60 minutes for a check to respond. A hung API call
     # must not eat that budget.
     timeout-minutes: 5
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # A review starts this workflow only to run it fully on an approval.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')
     permissions:
       contents: read
+      # Whether an approval's head already has a full verdict.
+      checks: read
       # paths-filter defaults its `token` input to github.token, and any
       # non-empty token sends it down the pulls.listFiles API path rather than
       # git diff. Without this scope that call is a 403, the step throws, and
       # every pull request fails here. Fail-closed, but total -- do not drop it.
       pull-requests: read
     outputs:
+      # 'true' for a full run, 'false' for the quick run of a pull request
+      # that is not approved yet. See "Decide what this run covers".
+      full: ${{ steps.scope.outputs.full }}
       # Non-pull_request events (merge_group, workflow_dispatch)
       # never filter. The merge queue is the last gate before main and has to
       # behave exactly as it did before this job existed, which also makes it
@@ -69,6 +86,82 @@ jobs:
         || steps.filter.outputs.frontend != 'false' }}
 
     steps:
+      # The organization shares 60 standard runners across every repository,
+      # and a full round of this workflow takes about 28 of them. A pull
+      # request that is not approved yet therefore runs only pre-commit, and
+      # its summary check is named `CI Quick Summary`. The required
+      # `CI Summary` check exists only on a head that had a full run, so branch
+      # protection itself keeps an untested head out of the merge queue. The
+      # full run starts when the pull request is approved, and for every
+      # commit pushed after that. Merge groups, pushes and manual runs are
+      # always full. See docs/branch-protection.md "Quick runs before approval".
+      # First step, and it always writes the output. Only an explicit 'true'
+      # runs the full jobs and names the summary `CI Summary`.
+      - name: Decide what this run covers
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          VERDICT_CHECK: CI Summary
+        run: |
+          full=true
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" || "${GITHUB_EVENT_NAME}" == "pull_request_review" ]]; then
+            # An approval starts this run before the decision it changes can
+            # always be read back, and a quick run here would leave an approved
+            # pull request without its required check: ask a few times.
+            attempts=1
+            if [[ "${GITHUB_EVENT_NAME}" == "pull_request_review" ]]; then
+              attempts=5
+            fi
+            for ((attempt = 1; attempt <= attempts; attempt++)); do
+              # shellcheck disable=SC2016 # GraphQL variables, not shell ones
+              if ! decision="$(gh api graphql \
+                -f query='query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) { reviewDecision }
+                  }
+                }' \
+                -f owner="${REPO%%/*}" -f name="${REPO#*/}" -F number="${PR_NUMBER}" \
+                --jq '.data.repository.pullRequest.reviewDecision // "NONE"')"; then
+                # Unknown: test everything rather than leave an approved pull
+                # request without its required check.
+                echo "::warning::could not read the review decision; running the full CI"
+                full=true
+                break
+              fi
+              echo "Review decision: ${decision}"
+              if [[ "${decision}" == "APPROVED" ]]; then
+                full=true
+                break
+              fi
+              full=false
+              if ((attempt < attempts)); then
+                sleep 3
+              fi
+            done
+            # A second approval of a head that already has its verdict, passed
+            # or failed, does not repeat the full run. A failed lookup repeats
+            # it rather than leave the head without one. This run's own checks
+            # do not count: re-running it after a failure must run it again.
+            if [[ "${GITHUB_EVENT_NAME}" == "pull_request_review" && "${full}" == "true" ]] &&
+              verdicts="$(gh api --method GET "repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+                -f check_name="${VERDICT_CHECK}" -f per_page=100 \
+                --jq '[.check_runs[]
+                       | select(.app.slug == "github-actions" and .status == "completed")
+                       | select(.conclusion == "success" or .conclusion == "failure")
+                       | select((.details_url // "") | contains("/runs/" + env.GITHUB_RUN_ID + "/") | not)]
+                      | length')" &&
+              [[ "${verdicts}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "${HEAD_SHA:0:9} already has a full verdict; not repeating it"
+              full=false
+            fi
+          fi
+          echo "full=${full}" >> "$GITHUB_OUTPUT"
+          echo "Full CI: ${full}"
+
       # No checkout: on pull_request the action reads the changed file list from
       # the API, so this job never materialises the branch's code.
       - name: Filter changed paths
@@ -119,7 +212,11 @@ jobs:
   prepare-deepdoc-cache:
     name: Prepare Deepdoc Cache
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changes
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     outputs:
       cache-hit: ${{ steps.deepdoc-cache.outputs.cache-hit }}
 
@@ -249,7 +346,11 @@ jobs:
   pre-commit:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # The one check a quick run makes. A review that is not an approval runs
+    # nothing.
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')
 
     steps:
       - name: Checkout code
@@ -335,7 +436,10 @@ jobs:
     # balanced on test count; see tests/shared/ci_shard_plugin.py). Hung tests
     # are cut by pytest-timeout (300 s per test), not by this limit.
     timeout-minutes: 30
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     needs: [changes, pre-commit]
     strategy:
       fail-fast: false
@@ -467,7 +571,10 @@ jobs:
     # Python behavior; migrate that environment separately from feature PRs.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     needs: [changes, prepare-deepdoc-cache, pre-commit]
     strategy:
       fail-fast: false
@@ -659,7 +766,10 @@ jobs:
   pytest-slow:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     needs: [changes, prepare-deepdoc-cache, pre-commit]
 
     steps:
@@ -799,7 +909,10 @@ jobs:
     name: Pytest Milvus (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     needs: [changes, pre-commit]
     strategy:
       fail-fast: false
@@ -898,7 +1011,10 @@ jobs:
   e2e:
     name: e2e (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     needs: [changes, pre-commit]
     timeout-minutes: 45
     strategy:
@@ -1012,7 +1128,10 @@ jobs:
 
   frontend-build:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     needs: changes
 
     steps:
@@ -1151,7 +1270,11 @@ jobs:
     name: LanceDB Memory Compatibility (${{ matrix.lancedb }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: changes
+    # Full runs only; see "Decide what this run covers".
+    if: >-
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      needs.changes.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1177,9 +1300,14 @@ jobs:
           tests/core/memory/test_storage_admission_matrix.py -q
 
   ci-summary:
-    name: CI Summary
+    # `CI Summary` is the required check. On a pull request only a full run
+    # may report it: a quick run, and a run skipped before it decided, report
+    # under another name. A skipped check counts as passed, so the name is
+    # what keeps an untested head out of the queue. Every other event is a
+    # full run and keeps the name even when the changes job failed.
+    name: ${{ (needs.changes.outputs.full == 'true' || (github.event_name != 'pull_request' && github.event_name != 'pull_request_review')) && 'CI Summary' || 'CI Quick Summary' }}
     runs-on: ubuntu-latest
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')
     needs:
       - changes
       - prepare-deepdoc-cache
@@ -1199,11 +1327,18 @@ jobs:
           set -e
 
           failed=0
+          # A quick run must have skipped these, and a full run passed them.
+          full="${{ needs.changes.outputs.full }}"
+          full_only=" prepare-deepdoc-cache pytest-fast pytest-fast-deepdoc pytest-slow pytest-milvus e2e frontend-build lancedb-memory-compatibility "
           check_job() {
             local name="$1"
             local result="$2"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name finished with result: $result"
+            local expected=success
+            if [ "$full" != "true" ] && [[ "$full_only" == *" $name "* ]]; then
+              expected=skipped
+            fi
+            if [ "$result" != "$expected" ]; then
+              echo "::error::$name finished with result: $result (expected $expected)"
               failed=1
             fi
           }
@@ -1236,5 +1371,6 @@ jobs:
 
           check_flag "code" "${{ needs.changes.outputs.code }}"
           check_flag "frontend" "${{ needs.changes.outputs.frontend }}"
+          check_flag "full" "${{ needs.changes.outputs.full }}"
 
           exit "$failed"

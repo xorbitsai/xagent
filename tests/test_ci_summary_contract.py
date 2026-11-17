@@ -5,8 +5,11 @@ job to branch protection as a success, so the summary can only stay fail-closed
 while two properties hold:
 
 1. every job it gathers is also named in its ``check_job`` list, and
-2. none of those jobs is ever skipped, which is why their conditions live on
-   their steps rather than on the job.
+2. none of those jobs is ever skipped in a run that reports `CI Summary`,
+   which is why their path conditions live on their steps rather than on the
+   job. The one job-level condition allowed is the quick run of an
+   unapproved pull request, which reports `CI Quick Summary` instead (see
+   ``tests/test_ci_quick_run_contract.py``).
 
 Both are prose in ``docs/branch-protection.md``. This module turns them into
 something that fails. See that document's "Required contexts must be summary
@@ -45,6 +48,27 @@ SKIP_SENTINEL_PREFIX = "Skip"
 
 DRAFT_GUARD = (
     "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
+)
+# A review that is not an approval runs nothing.
+APPROVAL_GUARD = (
+    "github.event_name != 'pull_request_review'"
+    " || github.event.review.state == 'approved' || github.event.action == 'dismissed'"
+)
+FULL_GUARD = "needs.changes.outputs.full == 'true'"
+
+# The jobs a quick run skips. Everything else CI Summary gathers runs in every
+# run: `changes` decides, and pre-commit is the quick run's one check.
+FULL_ONLY_JOBS = frozenset(
+    {
+        "prepare-deepdoc-cache",
+        "pytest-fast",
+        "pytest-fast-deepdoc",
+        "pytest-slow",
+        "pytest-milvus",
+        "e2e",
+        "frontend-build",
+        "lancedb-memory-compatibility",
+    }
 )
 
 # Jobs whose steps are gated on the `changes` job, and the output each one
@@ -213,17 +237,26 @@ def test_summary_gathers_every_job_it_checks(jobs: dict, summary: dict) -> None:
 
 
 def test_gathered_jobs_are_never_skipped(summary: dict, jobs: dict) -> None:
-    """No gathered job may carry a condition beyond the draft guard.
+    """No gathered job may carry a condition beyond the allowed ones.
 
-    Any other job-level `if:` makes the job skippable, and a skipped required
-    job reports success to branch protection. Conditions belong on the steps.
+    Any other job-level `if:` makes the job skippable in a run that reports
+    `CI Summary`, and a skipped required job reports success to branch
+    protection. Path conditions belong on the steps. The full-only jobs may
+    skip, but only on `full`, which also renames the summary to
+    `CI Quick Summary` (tests/test_ci_quick_run_contract.py).
     """
     for name in summary["needs"]:
-        condition = _normalise(jobs[name].get("if", DRAFT_GUARD))
-        assert condition == _normalise(DRAFT_GUARD), (
-            f"job '{name}' carries a job-level condition: {condition!r}. "
-            "A gathered job that can be skipped reports success to branch "
-            "protection -- gate its steps instead. See "
+        condition = _normalise(jobs[name].get("if", ""))
+        if name in FULL_ONLY_JOBS:
+            expected = f"({DRAFT_GUARD}) && {FULL_GUARD}"
+            needs = jobs[name]["needs"]
+            assert "changes" in ([needs] if isinstance(needs, str) else needs), name
+        else:
+            expected = f"({DRAFT_GUARD}) && ({APPROVAL_GUARD})"
+        assert condition == _normalise(expected), (
+            f"job '{name}' carries an unexpected job-level condition: "
+            f"{condition!r}. A gathered job that can be skipped reports success "
+            "to branch protection -- gate its steps instead. See "
             "docs/branch-protection.md 'Gate at the step, not at the job'."
         )
 
@@ -235,9 +268,10 @@ def test_summary_rejects_a_non_literal_changes_output(summary: dict) -> None:
     """
     script = summary["steps"][0]["run"]
     checked = set(re.findall(r'check_flag "([^"]+)"', script))
-    assert checked == set(GATED_JOBS.values()), (
-        "every output the gated jobs read must be asserted to be a literal "
-        f"true/false; missing: {sorted(set(GATED_JOBS.values()) - checked)}"
+    expected = set(GATED_JOBS.values()) | {"full"}
+    assert checked == expected, (
+        "every output the gathered jobs read must be asserted to be a literal "
+        f"true/false; missing: {sorted(expected - checked)}"
     )
 
 

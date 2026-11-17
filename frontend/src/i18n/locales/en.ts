@@ -60,6 +60,7 @@ const en = {
     messageAcceptancePending: "Message acceptance is still being reconciled. Please retry shortly.",
     taskUnavailable: "Task is no longer available.",
     taskBusy: "Task is currently busy; please wait for the previous turn to finish before sending another message.",
+    interactionResponseRequired: "This conversation is waiting on a question above; answer it to continue.",
     workforceUnavailable: "This workforce conversation can no longer accept messages; please start a new conversation.",
     workforceArchived: "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce.",
     messageAttachmentCorrupt: "A stored file for this message failed its integrity check and must be re-uploaded.",

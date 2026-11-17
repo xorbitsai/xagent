@@ -441,6 +441,9 @@ const taskEventMatchesControlState = (
 type TaskStateVersionEntry = {
   version: number
   runId?: string | null
+  // The status the frame at this version reported; kept across a same-version
+  // frame of the same run that reports none.
+  status?: TaskStatus
 }
 
 const canAcceptTaskControlVersion = (
@@ -472,7 +475,7 @@ const canAcceptTaskControlVersion = (
   return true
 }
 
-const acceptTaskControlVersion = (
+export const acceptTaskControlVersion = (
   message: WebSocketMessage,
   envelope: TaskControlEnvelope,
   versions: Map<number, TaskStateVersionEntry>,
@@ -481,10 +484,16 @@ const acceptTaskControlVersion = (
   if (!envelope.isStateEvent || envelope.taskId === undefined) return true
   if (envelope.stateVersion === undefined) return true
 
+  const known = versions.get(envelope.taskId)
+  const status = envelope.status
+    ?? (known?.version === envelope.stateVersion && known.runId === envelope.runId
+      ? known.status
+      : undefined)
   versions.delete(envelope.taskId)
   versions.set(envelope.taskId, {
     version: envelope.stateVersion,
     runId: envelope.runId,
+    ...(status ? { status } : {}),
   })
   if (versions.size > MAX_TRACKED_TASK_STATE_VERSIONS) {
     const oldestTaskId = versions.keys().next().value
@@ -2742,6 +2751,14 @@ interface SendMessageOptions {
 // not announce it. Every other case is "pending", including no Session.
 export type SessionConversationAttachment = "pending" | "attached" | "unsupported"
 
+// Whether the Session server said, in the capabilities frame of the latest
+// connection that sent one, that it takes chat frames declared as new turns.
+// It is not reset when a connection drops: only the next capabilities frame
+// changes it, and "unknown" until one has arrived. The value is for display;
+// a send that carries a declaration also checks that the connection which
+// reported it is the current one.
+export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
+
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
@@ -2775,6 +2792,7 @@ interface AppContextType {
   isSessionInteractionLocked: boolean
   sessionConversationState: SessionConversationState["phase"]
   sessionConversationAttachment: SessionConversationAttachment
+  newTurnDelivery: NewTurnDeliveryCapability
   setTaskId: (taskId: number | null, options?: { navigate?: boolean }) => void
   requestStatus: () => void
   getFilePreviewUrl: (fileId: string) => string
@@ -3124,6 +3142,23 @@ export function AppProvider({
   const writeSessionAttachment = useCallback((next: SessionAttachmentRecord) => {
     sessionAttachmentRef.current = next
     if (mountedRef.current) setSessionAttachment(next)
+  }, [])
+
+  // Written only from the capabilities frame of the current Session socket.
+  // The connection ref records which connection's frame wrote the value, so a
+  // send can tell a value reported by the current connection from one left
+  // over from an earlier connection.
+  const newTurnDeliveryRef = useRef<NewTurnDeliveryCapability>("unknown")
+  const newTurnDeliveryConnectionRef = useRef<string | null>(null)
+  const [newTurnDelivery, setNewTurnDelivery] =
+    useState<NewTurnDeliveryCapability>("unknown")
+  const writeNewTurnDelivery = useCallback((
+    next: NewTurnDeliveryCapability,
+    connectionIdentity: string,
+  ) => {
+    newTurnDeliveryRef.current = next
+    newTurnDeliveryConnectionRef.current = connectionIdentity
+    if (mountedRef.current) setNewTurnDelivery(next)
   }, [])
 
   const rejectSessionResetFlight = useCallback(
@@ -3503,6 +3538,10 @@ export function AppProvider({
             ? "declared"
             : "absent",
         })
+        writeNewTurnDelivery(
+          capabilities.includes("delivery_new_turn") ? "supported" : "unsupported",
+          sessionMessageOwner.connectionIdentity,
+        )
       }
       : undefined,
     onConnect: onConnect, // Pass the callback
@@ -7620,6 +7659,7 @@ export function AppProvider({
         : ''
     const clientMessageId = requestedClientMessageId || generateClientMessageId()
     const requestId = typeof config?.metadata?.request_id === 'string'
+      && config.metadata.request_id
       ? config.metadata.request_id
       : undefined
     // The earlier conversation a new one continues from. Only the Session
@@ -7631,6 +7671,29 @@ export function AppProvider({
     }
     if (sourceTaskId !== undefined && !sessionTransport?.allowTasklessChat) {
       throw new MessageDeliveryError("A conversation source is not supported for this connection.", "not_sent")
+    }
+    // Marks the message a new turn instead of a possible answer to a pending
+    // question. Only the Session window's chat frame carries it.
+    const delivery: unknown = config?.delivery
+    if (delivery !== undefined && delivery !== "new_turn") {
+      throw new MessageDeliveryError("Message not sent: the delivery declaration is not valid.", "not_sent")
+    }
+    if (delivery !== undefined && !sessionTransport?.allowTasklessChat) {
+      throw new MessageDeliveryError("A delivery declaration is not supported for this connection.", "not_sent")
+    }
+    if (delivery !== undefined && requestId !== undefined) {
+      throw new MessageDeliveryError("A delivery declaration cannot accompany an answer to a request.", "not_sent")
+    }
+    // A server that does not take the declaration ignores it and may take the
+    // message as an answer, so a send carries it only when the current
+    // connection announced it. A resend after a lost connection reuses these
+    // arguments on the next connection before its capabilities frame arrives.
+    if (
+      delivery !== undefined
+      && (newTurnDeliveryRef.current !== "supported"
+        || newTurnDeliveryConnectionRef.current !== sessionConnectionIdentityRef.current)
+    ) {
+      throw new MessageDeliveryError("Message not sent: this connection does not take a delivery declaration.", "not_sent")
     }
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current
@@ -7781,10 +7844,13 @@ export function AppProvider({
         })
       }
       const fileIds = uploadedFiles.map(file => file.fileId)
-      // A send without a source passes the same five arguments as always.
-      const chatArgs: Parameters<typeof sendChatMessage> = sourceTaskId === undefined
-        ? [message, files, config?.force, clientMessageId, requestId]
-        : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
+      // A send with neither a source nor a declaration passes the same five
+      // arguments as always.
+      const chatArgs: Parameters<typeof sendChatMessage> = delivery !== undefined
+        ? [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId, delivery]
+        : sourceTaskId === undefined
+          ? [message, files, config?.force, clientMessageId, requestId]
+          : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
       beginSessionMessageDelivery()
       try {
         await sendChatWithResend(
@@ -8627,6 +8693,7 @@ export function AppProvider({
             state.sessionConversation.phase === "reload_required",
           sessionConversationState: state.sessionConversation.phase,
           sessionConversationAttachment,
+          newTurnDelivery,
           setTaskId,
           requestStatus,
           getFilePreviewUrl,

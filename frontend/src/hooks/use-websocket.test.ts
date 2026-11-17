@@ -2845,12 +2845,19 @@ describe("useWebSocket normalized connections", () => {
     const socket = MockWebSocket.instances[0]
     socket.protocol = "xagent-session-v1"
     act(() => socket.open())
-    act(() => socket.triggerClose(code))
+    vi.useFakeTimers()
+    try {
+      act(() => socket.triggerClose(code))
+      // Past the longest first reconnect delay (base delay plus jitter).
+      await act(async () => { vi.advanceTimersByTime(2 * RECONNECT_BASE_DELAY_MS) })
 
-    expect(revalidate).toHaveBeenCalledOnce()
-    expect(result.current.connectionError).not.toBeNull()
-    expect(MockWebSocket.instances).toHaveLength(1)
-    window.removeEventListener(AUTH_REVALIDATE_EVENT, revalidate)
+      expect(revalidate).toHaveBeenCalledOnce()
+      expect(result.current.connectionError).not.toBeNull()
+      expect(MockWebSocket.instances).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+      window.removeEventListener(AUTH_REVALIDATE_EVENT, revalidate)
+    }
   })
 
   it("leaves the browser login alone when a socket with its own credentials closes with 4010", async () => {

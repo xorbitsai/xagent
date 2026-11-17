@@ -61,10 +61,12 @@ describe("idle activity reporting", () => {
     reporter.stop()
   })
 
-  it("ignores events that were not produced by the user", () => {
+  it("ignores events that were not produced by the user", async () => {
     expect(isUserActivityEvent(new KeyboardEvent("keydown"))).toBe(false)
     const { reporter, report, fire } = setup(record(), { isUserEvent: isUserActivityEvent })
     fire("keydown")
+    // A report would only be sent after the report-time write.
+    await vi.advanceTimersByTimeAsync(0)
     expect(report).not.toHaveBeenCalled()
     reporter.stop()
   })

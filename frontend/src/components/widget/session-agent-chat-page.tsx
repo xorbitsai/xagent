@@ -345,10 +345,11 @@ function SessionConversationContent({
   })
 
   // History reads use the token policy of the phase the conversation is in at
-  // the moment of each request (tokenReplaceableIn): before a conversation is replaced, the token
-  // is refreshed when needed and retried once after a rejection; while one is
-  // being replaced, a refresh would rebuild the connection and cost the
-  // visitor the new conversation, so the current token is used as it is.
+  // the moment of each request (tokenReplaceableIn): before a conversation is
+  // replaced, the token is refreshed when needed and retried once after a
+  // rejection; while one is being replaced, a refresh would rebuild the
+  // connection and cost the visitor the new conversation, so the current token
+  // is used as it is. A voice call's refused tokens follow the same rule.
   // The phase is recorded while rendering, not in an effect: a list or view
   // mounting in this commit reads it from its own effect, and a child's
   // effects run before this component's.

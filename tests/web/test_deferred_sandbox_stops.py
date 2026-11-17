@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from xagent.sandbox.base import SandboxNotFoundError
+from xagent.sandbox.base import SandboxNotFoundError, SandboxRecoveryRequiredError
 from xagent.web import app as app_module
 from xagent.web.sandbox_manager import SandboxManager, bounded_quiesce
 
@@ -53,13 +53,17 @@ async def _defer_all(service: _Service) -> SandboxManager:
 
 @pytest.fixture(autouse=True)
 async def _reset_tasks():
+    async def reset() -> None:
+        for attr in ("_sandbox_deferred_stops_task", "_sandbox_warmup_task"):
+            task = getattr(app_module, attr)
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            setattr(app_module, attr, None)
+
+    await reset()  # another module's test may have left a task behind
     yield
-    for attr in ("_sandbox_deferred_stops_task", "_sandbox_warmup_task"):
-        task = getattr(app_module, attr)
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        setattr(app_module, attr, None)
+    await reset()
 
 
 @pytest.mark.asyncio
@@ -116,7 +120,7 @@ async def test_failed_stop_blocks_reuse_and_requeues_the_name() -> None:
     manager = await _defer_all(service)
     service.fail.add("task::1")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(SandboxRecoveryRequiredError):
         await manager._reconcile_sandbox(
             "task",
             "1",
@@ -195,3 +199,38 @@ async def test_malformed_timeout_fails_boot_before_standby_begins(monkeypatch) -
         await app_module.startup_event()
 
     assert begun == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reuse_stop_keeps_the_name_queued() -> None:
+    service = _Service(NAMES)
+    manager = await _defer_all(service)
+
+    async def cancelled(name: str, *, timeout: float) -> None:
+        raise asyncio.CancelledError
+
+    service.stop_existing = cancelled  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await manager._reconcile_sandbox(
+            "task",
+            "1",
+            "task::1",
+            "task::1",
+            None,
+            None,  # type: ignore[arg-type]
+        )
+    assert "task::1" in manager._deferred_stops
+
+
+@pytest.mark.asyncio
+async def test_drain_stops_an_unparsable_name_and_logs_it(caplog) -> None:
+    service = _Service(["__warmup__"])
+    manager = await _defer_all(service)
+    assert manager._deferred_stops == {"__warmup__"}
+
+    with caplog.at_level(logging.WARNING):
+        await manager.drain_deferred_stops()
+
+    assert service.stopped == ["__warmup__"]
+    assert manager._deferred_stops == set()
+    assert any("__warmup__" in r.getMessage() for r in caplog.records)

@@ -143,10 +143,11 @@ def no_idle_sweep(monkeypatch) -> None:
 @pytest.fixture(autouse=True)
 def _reset_warmup_task():
     yield
-    task = app_module._sandbox_warmup_task
-    if task is not None and not task.done():
-        task.cancel()
-    app_module._sandbox_warmup_task = None
+    for attr in ("_sandbox_warmup_task", "_sandbox_deferred_stops_task"):
+        task = getattr(app_module, attr)
+        if task is not None and not task.done():
+            task.cancel()
+        setattr(app_module, attr, None)
 
 
 @pytest.mark.asyncio
@@ -215,9 +216,14 @@ async def test_cleanup_budget_stops_issuing_stops_but_never_cuts_an_issued_one(
     await asyncio.wait_for(app_module._start_sandbox_runtime(manager), 5)
 
     # The first stop was issued before the budget ran out and ran to completion;
-    # nothing was cancelled mid-stop, and no further stop was issued.
-    assert service.issued == ["a"]
+    # nothing was cancelled mid-stop, and the startup issued no further stop.
+    assert service.issued[0] == "a"
     assert service.finished == ["a"]
+    # The skipped containers are handed to the background task, not dropped.
+    deferred_task = app_module._sandbox_deferred_stops_task
+    assert deferred_task is not None
+    await asyncio.wait_for(deferred_task, 5)
+    assert service.finished == ["a", "b", "c"]
     task = app_module._sandbox_warmup_task
     assert task is not None  # the step went on to schedule the warmup
     await asyncio.wait_for(task, 2)

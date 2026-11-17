@@ -1598,11 +1598,18 @@ class SandboxManager:
             )
         except SandboxNotFoundError:
             return
-        except Exception as exc:
+        except BaseException as exc:
+            # Also on cancel: the named-lock acquire and the inspection ahead of
+            # the shielded stop are cancellable, and the container may still
+            # run the previous generation.
             self._deferred_stops.add(name)
+            if not isinstance(exc, Exception):
+                raise
             logger.error("Failed to stop deferred sandbox %s: %s", name, exc)
             if raise_on_failure:
-                raise
+                raise SandboxRecoveryRequiredError(
+                    f"Failed to stop deferred sandbox {name!r} before reuse: {exc}"
+                ) from exc
 
     async def drain_deferred_stops(self) -> None:
         """Stop the containers the startup quiesce deferred (background task)."""
@@ -1614,7 +1621,13 @@ class SandboxManager:
                 lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
                 base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
             except (TypeError, ValueError):
-                self._deferred_stops.discard(name)
+                # No lifecycle key to lock (for example a leftover warmup
+                # container): stop it directly.
+                logger.warning(
+                    "Stopping deferred sandbox without a lifecycle: %s", name
+                )
+                await self._stop_deferred_locked(name)
+                stopped += name not in self._deferred_stops
                 continue
             async with self._lifecycle_locked(base_name):
                 if name in self._deferred_stops:

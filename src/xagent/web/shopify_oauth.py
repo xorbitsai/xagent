@@ -174,12 +174,12 @@ def verify_shopify_launch(
             "timestamp_stale",
             "This link from Shopify has expired. Open the app from Shopify again.",
         )
-    label, dot, suffix = params.get("shop", "").strip().lower().partition(".")
+    label, _, suffix = params.get("shop", "").strip().lower().partition(".")
     try:
         account = normalize_oauth_account(label)
     except OAuthAccountError:
         account = None
-    if account is None or not dot or suffix != SHOPIFY_HOST_SUFFIX:
+    if account is None or suffix != SHOPIFY_HOST_SUFFIX:
         raise ShopifyOAuthError(
             "shop_invalid", "Shopify's request did not name a store."
         )

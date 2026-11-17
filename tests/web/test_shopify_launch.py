@@ -52,6 +52,11 @@ def test_the_store_host_is_read_case_insensitively():
     assert _verify(_signed(_launch_params(shop="Acme.MyShopify.com"))) == "acme"
 
 
+def test_a_launch_slightly_ahead_of_our_clock_verifies():
+    # Shopify's clock may run a little ahead of ours.
+    assert _verify(_signed(_launch_params(timestamp=str(NOW + 60)))) == "acme"
+
+
 def test_a_launch_within_the_allowed_age_verifies():
     assert (
         _verify(_signed(_launch_params()), now=NOW + SHOPIFY_LAUNCH_MAX_AGE_SECONDS)

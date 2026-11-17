@@ -330,23 +330,30 @@ def pending_rows(
         return pending
     for row in iter_rows(conn, table, collection_filter(report.name), WRITE_COLUMNS):
         key = chunk_key(row)
-        reason = skip_reason(
-            SearchableChunk(
-                doc_id=key[0],
-                chunk_id=key[1],
-                text=str(row.get("text") or ""),
-                user_id=_owner(row.get("user_id")),
-            )
-        )
-        if reason is None and key not in core:
-            reason = (
-                SKIP_NO_CORE_CHUNK if key[0] in core_docs else SKIP_NO_CORE_DOCUMENT
-            )
+        reason = row_skip_reason(row, core, core_docs)
         if reason:
             report.skipped[reason] = report.skipped.get(reason, 0) + 1
         elif key not in have:
             pending.setdefault(key[0], []).append(row)
     return pending
+
+
+def row_skip_reason(
+    row: Dict[str, Any], core: Set[Tuple[str, str]], core_docs: Set[str]
+) -> Optional[str]:
+    """Why a source row cannot be written to a target; None for a writable one."""
+    key = chunk_key(row)
+    reason = skip_reason(
+        SearchableChunk(
+            doc_id=key[0],
+            chunk_id=key[1],
+            text=str(row.get("text") or ""),
+            user_id=_owner(row.get("user_id")),
+        )
+    )
+    if reason is None and key not in core:
+        reason = SKIP_NO_CORE_CHUNK if key[0] in core_docs else SKIP_NO_CORE_DOCUMENT
+    return reason
 
 
 def warm_document(

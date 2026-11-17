@@ -11,7 +11,22 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pyarrow as pa
 import pytest
 
-import tests.migrations.test_embedding_migration_embed as warm
+from tests.migrations.embedding_migration_shared import (
+    SOURCE,
+    TARGET,
+    VECTOR,
+    VENDOR_TARGET,
+    _Adapter,
+    _retype_owner,
+    _rows,
+    _save_collection,
+    _seed_core,
+    _seed_target,
+    _src,
+    _target,
+    _versions,
+    _write,
+)
 from xagent.core.tools.core.RAG_tools.core.exceptions import CollectionMigratingError
 from xagent.core.tools.core.RAG_tools.management import embedding_switch
 from xagent.core.tools.core.RAG_tools.management import migration_state as ms
@@ -22,21 +37,15 @@ from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
 from xagent.migrations.embedding import scope
 from xagent.migrations.embedding import switch as mod
 
-hub = warm.hub
-index_calls = warm.index_calls
-adapter = warm.adapter
+pytestmark = pytest.mark.usefixtures("hub", "index_calls")
 
-SOURCE, TARGET, VECTOR = warm.SOURCE, warm.TARGET, warm.VECTOR
-VENDOR_TARGET = warm.VENDOR_TARGET
 OTHER_RUN = f"{mod.HOLDER}:{'0' * 12}"
-_Adapter = warm._Adapter
 REAL_CREATE_INDEX = LanceDBVectorIndexStore.create_index
-_src, _write, _rows, _target = warm._src, warm._write, warm._rows, warm._target
 
 
 def _seed(chunks: Dict[str, List[str]], *, name: str = "kb") -> None:
-    warm._save_collection(name)
-    warm._seed_core(chunks, collection=name)
+    _save_collection(name)
+    _seed_core(chunks, collection=name)
     _write([_src(c, d) for d, ids in chunks.items() for c in ids], collection=name)
 
 
@@ -127,6 +136,22 @@ def _killed(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
     )
 
 
+def _source_scans(monkeypatch: pytest.MonkeyPatch) -> List[bool]:
+    """Every pass over the source table, as whether ``kb`` was frozen during it."""
+    from xagent.migrations.embedding import embed
+
+    scans: List[bool] = []
+
+    def _counted(conn: Any, table: str, *args: Any, **kwargs: Any) -> Any:
+        if table == scope.source_table(SOURCE):
+            scans.append(ms.read_migration_state("kb").state == ms.FROZEN)
+        return scope.iter_rows(conn, table, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "iter_rows", _counted)
+    monkeypatch.setattr(embed, "iter_rows", _counted)
+    return scans
+
+
 # --- switched ---
 
 
@@ -134,7 +159,7 @@ def _killed(monkeypatch: pytest.MonkeyPatch) -> Callable[[], None]:
 def test_a_partial_warm_up_is_completed_and_the_collection_switched(
     adapter: _Adapter, hub: Any, target: str
 ) -> None:
-    warm._seed_target(hub, target, writer=True)
+    _seed_target(hub, target, writer=True)
     _seed({"d1": ["c1", "c2", "c3"]})
     _write([_src("c1")], model=target, vector=list(VECTOR))
     _write([_src("gone")], model=target, vector=list(VECTOR))
@@ -155,7 +180,7 @@ def test_after_the_switch_search_reads_the_target_and_ingestion_writes_it(
         run_document_search,
     )
 
-    warm._seed_target(hub, target, writer=True)
+    _seed_target(hub, target, writer=True)
     _seed({"d1": ["c1", "c2"], "d2": ["c3"]})
 
     def _search(kind: str = "dense", query: str = "text c1") -> List[str]:
@@ -206,8 +231,37 @@ def test_duplicate_target_rows_of_one_chunk_are_replaced_by_one(
     table.add(table.to_arrow())
     assert len(_held()) == 2
 
-    assert _run().outcome == "switched"
+    report = _run()
+
+    assert (report.outcome, report.stale, report.removed) == ("switched", 2, 2)
+    assert "1 rows to embed, 2 to delete; wrote 1; deleted 2" in mod.describe(report)
     _assert_switched()
+
+
+def test_a_delete_that_raises_keeps_the_rows_already_deleted(
+    adapter: _Adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed({"d1": ["c1"], "d2": ["c2"]})
+    rows = [_src("c1", text="old"), _src("c2", "d2", text="old")]
+    _write(rows, model=TARGET, vector=list(VECTOR))
+    table_type = type(scope.connection().open_table(scope.source_table(TARGET)))
+    real_delete = table_type.delete
+
+    def _second_document_fails(self: Any, where: str, *args: Any, **kw: Any) -> Any:
+        if "doc_id = 'd2'" in where:
+            raise OSError("delete failed")
+        return real_delete(self, where, *args, **kw)
+
+    monkeypatch.setattr(table_type, "delete", _second_document_fails)
+    report = _run()
+
+    assert (report.outcome, report.removed, report.error) == (
+        None,
+        1,
+        "OSError: delete failed",
+    )
+    assert "deleted 1" in mod.describe(report)
+    assert (_binding(), _state().state) == (SOURCE, ms.IDLE)
 
 
 def test_the_comparison_keeps_a_digest_and_a_flag_per_row_not_the_vector(
@@ -316,17 +370,17 @@ def test_a_target_row_differing_in_a_copied_field_is_written_again(
 def test_an_already_switched_collection_takes_no_window(adapter: _Adapter) -> None:
     _seed({"d1": ["c1"]})
     assert _run().outcome == "switched"
-    before = warm._versions()
+    before = _versions()
     adapter.calls.clear()
 
     report = _run()
 
     assert (report.outcome, report.ok) == ("already-switched", True)
-    assert (warm._versions(), adapter.calls) == (before, [])
+    assert (_versions(), adapter.calls) == (before, [])
 
 
 def test_an_empty_bound_collection_is_switched(adapter: _Adapter) -> None:
-    warm._save_collection()
+    _save_collection()
 
     assert _run().outcome == "switched"
     assert (_binding(), _state().state) == (TARGET, ms.IDLE)
@@ -342,16 +396,16 @@ def test_an_unusable_source_row_refuses_without_freezing(
     _seed({"d1": ["c1"]})
     if case == "no-owner":
         _write([_src("c2", user_id=None)])
-        warm._seed_core({"d1": ["c1", "c2"]})
+        _seed_core({"d1": ["c1", "c2"]})
     else:
         _write([_src("c2", "d1" if case == "no-core-chunk" else "d9")])
-    before = warm._versions()
+    before = _versions()
 
     report = _run()
 
     assert report.refused == "unusable-source-rows"
     assert report.skipped == {case: 1}
-    assert (warm._versions(), adapter.calls) == (before, [])
+    assert (_versions(), adapter.calls) == (before, [])
     _never_frozen()
     _assert_untouched()
 
@@ -375,13 +429,13 @@ def test_a_source_row_the_write_would_reject_refuses_without_freezing(
         table.update(where="chunk_id = 'c1'", values_sql={field: "NULL"})
     else:
         table.update(where="chunk_id = 'c1'", values={field: raw})
-    before = warm._versions()
+    before = _versions()
 
     report = _run()
 
     assert report.refused == "unusable-source-rows"
     assert report.skipped == {"unwritable": 1}
-    assert (warm._versions(), adapter.calls) == (before, [])
+    assert (_versions(), adapter.calls) == (before, [])
     _never_frozen()
     _assert_untouched()
 
@@ -389,12 +443,12 @@ def test_a_source_row_the_write_would_reject_refuses_without_freezing(
 def test_more_than_max_fill_refuses_without_freezing(adapter: _Adapter) -> None:
     _seed({"d1": ["c1", "c2", "c3"]})
     _write([_src("gone")], model=TARGET, vector=list(VECTOR))
-    before = warm._versions()
+    before = _versions()
 
     report = _run(max_fill=3)
 
     assert (report.refused, report.pending, report.stale) == ("over-max-fill", 3, 1)
-    assert (warm._versions(), adapter.calls) == (before, [])
+    assert (_versions(), adapter.calls) == (before, [])
     _never_frozen()
     assert _run(max_fill=4).outcome == "switched"
 
@@ -454,7 +508,8 @@ def test_a_frozen_collection_already_on_the_target_reports_its_binding(
 
     line = mod.describe(report)
     assert report.refused == "frozen" and f"bound to {TARGET}" in line
-    assert "rerun with --take-over" in line and "source model" not in line
+    assert "rerun with --collection kb --take-over" in line
+    assert "source model" not in line
     assert (_binding(), _state().state) == (TARGET, ms.FROZEN)
 
 
@@ -465,10 +520,10 @@ def test_a_collection_another_run_switched_meanwhile_reports_its_binding(
     original = mod.open_window
     inner: List[mod.SwitchReport] = []
 
-    def _other_run_first(report: Any, take_over: bool) -> Any:
+    def _other_run_first(report: Any) -> Any:
         monkeypatch.setattr(mod, "open_window", original)
         inner.extend(mod.switch(TARGET, collections=["kb"], drain_timeout=0.5))
-        return original(report, take_over)
+        return original(report)
 
     monkeypatch.setattr(mod, "open_window", _other_run_first)
 
@@ -477,6 +532,25 @@ def test_a_collection_another_run_switched_meanwhile_reports_its_binding(
     assert (inner[0].outcome, outer.refused) == ("switched", "scope-changed")
     assert mod.describe(outer).endswith(f"bound to {TARGET}")
     _assert_switched()
+
+
+def test_over_max_fill_made_only_of_rows_to_delete_says_so_on_its_line(
+    adapter: _Adapter, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed({"d1": ["c1"]})
+    extra = [_src("x1"), _src("x2"), _src("x3")]
+    _write([_src("c1")] + extra, model=TARGET, vector=list(VECTOR))
+
+    with caplog.at_level(logging.INFO, logger=mod.__name__):
+        report = _run(max_fill=2)
+
+    assert (report.refused, report.pending, report.stale) == ("over-max-fill", 0, 3)
+    assert (
+        "refused (over-max-fill: 0 to embed + 3 to delete > 2; raise --max-fill)"
+        in mod.describe(report)
+    )
+    assert "Switch done: refused (over-max-fill): 1 (kb)" in caplog.text
+    _never_frozen()
 
 
 # --- inside the window ---
@@ -518,7 +592,7 @@ def test_a_write_admitted_before_the_freeze_landing_in_the_drain_is_switched(
 
     def _writer_finishes(name: str, **kwargs: Any) -> Any:
         assert _state().state == ms.FROZEN
-        warm._seed_core({"d1": ["c1", "late"]})
+        _seed_core({"d1": ["c1", "late"]})
         _write([_src("late")])
         write_leases.release_leases([lease])
         return write_leases.wait_for_no_leases(name, **kwargs)
@@ -856,7 +930,7 @@ def test_a_collection_name_the_write_path_would_strip_is_skipped(
 def test_the_real_index_call_runs_on_the_writer_table_inside_the_window(
     adapter: _Adapter, hub: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    writer = warm._seed_target(hub, VENDOR_TARGET, writer=True)
+    writer = _seed_target(hub, VENDOR_TARGET, writer=True)
     [once] = [t for t in scope.own_tables(VENDOR_TARGET) if t != writer]
     _seed({"d1": ["c1", "c2"]})
     states: List[str] = []
@@ -874,6 +948,17 @@ def test_the_real_index_call_runs_on_the_writer_table_inside_the_window(
     assert conn.open_table(writer).list_indices()
     assert conn.open_table(once).list_indices() == []
     _assert_switched(target=VENDOR_TARGET)
+
+
+def test_a_switched_collection_reads_the_source_once_per_plan_and_once_to_compare(
+    adapter: _Adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed({"d1": ["c1"], "d2": ["c2"]})
+    scans = _source_scans(monkeypatch)
+
+    assert _run().outcome == "switched"
+    assert scans == [False, True, True]
+    _assert_switched()
 
 
 # --- resuming a killed run ---
@@ -925,7 +1010,7 @@ def test_a_failed_unfreeze_is_reported_and_resumable(
     assert "LEFT FROZEN" in caplog.text and "--take-over" in caplog.text
     assert (_binding(), _state().state) == (TARGET, ms.FROZEN)
     monkeypatch.setattr(mod, "release_migration_window", ms.release_migration_window)
-    assert mod.main(["--model", TARGET, "--take-over"]) == 0
+    assert mod.main(["--model", TARGET, "--collection", "kb", "--take-over"]) == 0
     _assert_switched()
 
 
@@ -955,8 +1040,11 @@ def test_a_claim_that_raised_is_reported_left_frozen_only_if_it_froze(
     report = _run()
     line = mod.describe(report)
 
-    assert (calls, report.error, adapter.calls) == ([name], "OSError: store hiccup", [])
-    assert _binding() == SOURCE
+    if fails == "held-elsewhere":
+        assert (calls, report.refused, report.error) == ([], "frozen", None)
+    else:
+        assert (calls, report.error) == ([name], "OSError: store hiccup")
+    assert (_binding(), adapter.calls) == (SOURCE, [])
     if fails == "read-back":
         assert "LEFT FROZEN (still frozen by this run)" in line
         assert _state().state == ms.FROZEN
@@ -994,7 +1082,7 @@ def test_a_take_over_that_raised_is_reported_left_frozen_only_if_it_took_the_row
     else:
         monkeypatch.setattr(mod, "take_over_migration_window", _raise)
 
-    assert mod.main(["--model", TARGET, "--take-over"]) == 1
+    assert mod.main(["--model", TARGET, "--collection", "kb", "--take-over"]) == 1
     report = _run(take_over=True)
     line = mod.describe(report)
     took = fails == "fence"
@@ -1056,12 +1144,17 @@ def test_only_a_collection_that_tried_a_window_reads_its_row_at_the_end(
 ) -> None:
     _seed({"d1": ["c1"]})
     _seed({"e1": ["x1", "x2"]}, name="kb3")
-    warm._save_collection("kb2", model_id=None, dimension=None)
+    _save_collection("kb2", model_id=None, dimension=None)
 
-    def _unreadable(name: str) -> Any:
-        raise OSError("store down")
+    reads: List[str] = []
 
-    monkeypatch.setattr(mod, "read_migration_state", _unreadable)
+    def _unreadable_after_the_first_read(name: str) -> Any:
+        reads.append(name)
+        if reads.count(name) > 1:
+            raise OSError("store down")
+        return ms.read_migration_state(name)
+
+    monkeypatch.setattr(mod, "read_migration_state", _unreadable_after_the_first_read)
     reports = {r.name: r for r in mod.switch(TARGET, max_fill=1, drain_timeout=0.5)}
 
     assert (reports["kb"].outcome, reports["kb"].ok) == ("switched", False)
@@ -1070,6 +1163,71 @@ def test_only_a_collection_that_tried_a_window_reads_its_row_at_the_end(
     assert reports["kb3"].refused == "over-max-fill"
     assert reports["kb2"].skip_reason == "unbound"
     assert reports["kb3"].left_frozen is None and reports["kb2"].left_frozen is None
+    assert sorted(reads) == ["kb", "kb", "kb3"]
+
+
+def test_a_state_unreadable_before_planning_fails_the_collection_untouched(
+    adapter: _Adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed({"d1": ["c1"]})
+    scans = _source_scans(monkeypatch)
+
+    def _down(name: str) -> Any:
+        raise OSError("store down")
+
+    monkeypatch.setattr(mod, "read_migration_state", _down)
+    report = _run()
+
+    assert (report.error, report.tried_window) == ("OSError: store down", False)
+    assert (report.left_frozen, scans, adapter.calls) == (None, [], [])
+    assert _binding() == SOURCE
+    _never_frozen()
+
+
+@pytest.mark.parametrize("take_over", [False, True])
+def test_a_collection_a_dead_run_froze_is_planned_only_after_a_take_over(
+    adapter: _Adapter, monkeypatch: pytest.MonkeyPatch, take_over: bool
+) -> None:
+    _seed({"d1": ["c1", "c2"]})
+    dead = ms.claim_migration_window("kb", holder=OTHER_RUN)
+    scans = _source_scans(monkeypatch)
+
+    report = _run(max_fill=1, take_over=take_over)
+    line = mod.describe(report)
+
+    assert (_binding(), adapter.calls, report.written) == (SOURCE, [], 0)
+    assert "LEFT FROZEN" not in line and report.left_frozen is None
+    if take_over:
+        assert report.refused == "over-max-fill" and scans == [True]
+        assert (
+            "refused (over-max-fill: 2 to embed + 0 to delete > 1; run the warm-up, "
+            "or raise --max-fill)" in line
+        )
+        assert (_state().state, _state().owner) == (ms.IDLE, None)
+    else:
+        assert report.refused == "frozen" and scans == []
+        assert "refused (frozen by a run that holds or left the window;" in line
+        assert (_state().state, _state().owner) == (ms.FROZEN, dead.owner)
+
+
+def test_a_row_frozen_after_the_read_before_planning_is_not_taken_over(
+    adapter: _Adapter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed({"d1": ["c1"]})
+    others: List[Any] = []
+
+    def _frozen_right_after(name: str) -> Any:
+        state = ms.read_migration_state(name)
+        if not others:
+            others.append(ms.claim_migration_window(name, holder=OTHER_RUN))
+        return state
+
+    monkeypatch.setattr(mod, "read_migration_state", _frozen_right_after)
+    report = _run(take_over=True)
+
+    assert (report.refused, report.left_frozen, adapter.calls) == ("frozen", None, [])
+    assert (_state().owner, _binding()) == (others[0].owner, SOURCE)
+    embedding_switch._held_state(others[0])
 
 
 # --- the run ---
@@ -1080,13 +1238,13 @@ def test_a_missing_target_table_never_starts(
     adapter: _Adapter, hub: Any, caplog: pytest.LogCaptureFixture, target: str
 ) -> None:
     _seed({"d1": ["c1"]})
-    writer = warm._seed_target(hub, target, writer=False)
-    before = warm._versions()
+    writer = _seed_target(hub, target, writer=False)
+    before = _versions()
 
     assert mod.main(["--model", target, "--collection", "kb"]) == 2
 
     assert f"{writer} does not exist; this command writes only" in caplog.text
-    assert (warm._versions(), adapter.calls) == (before, [])
+    assert (_versions(), adapter.calls) == (before, [])
     _never_frozen()
 
 
@@ -1094,13 +1252,13 @@ def test_a_target_table_the_write_path_would_convert_never_starts(
     adapter: _Adapter, caplog: pytest.LogCaptureFixture
 ) -> None:
     _seed({"d1": ["c1"]})
-    writer = warm._retype_owner(pa.string())
-    before = warm._versions()
+    writer = _retype_owner(pa.string())
+    before = _versions()
 
     assert mod.main(["--model", TARGET, "--collection", "kb"]) == 2
 
     assert f"{writer} stores user_id as string, a type the write path" in caplog.text
-    assert (warm._versions(), adapter.calls) == (before, [])
+    assert (_versions(), adapter.calls) == (before, [])
     _never_frozen()
 
 
@@ -1116,7 +1274,7 @@ def test_a_target_table_gone_inside_the_window_unfreezes_and_stops_the_run(
 ) -> None:
     _seed({"d1": ["c1"]})
     _seed({"e1": ["x1"]}, name="kb3")
-    writer = warm._seed_target(hub, target, writer=True)
+    writer = _seed_target(hub, target, writer=True)
     adapter.before_encode = lambda _texts: scope.connection().drop_table(writer)
     if release == "release-fails":
 
@@ -1141,7 +1299,7 @@ def test_a_target_table_gone_inside_the_window_unfreezes_and_stops_the_run(
 
 
 def _other_engine(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
-    warm._save_collection(name)
+    _save_collection(name)
     real = scope.collection_engine
     monkeypatch.setattr(
         scope,
@@ -1156,13 +1314,13 @@ def test_exit_codes_follow_the_outcome(
     assert mod.main(["--model", TARGET]) == 1
 
     _seed({"d1": ["c1"]})
-    warm._save_collection("kb2", model_id=None, dimension=None)
+    _save_collection("kb2", model_id=None, dimension=None)
     _other_engine(monkeypatch, "kbm")
     assert mod.main(["--model", TARGET]) == 0
     assert mod.main(["--model", TARGET]) == 0
     assert _binding("kbm") == SOURCE
 
-    warm._save_collection("kb4", dimension=None)
+    _save_collection("kb4", dimension=None)
     assert mod.main(["--model", TARGET, "--collection", "kb4"]) == 1
 
     _seed({"e1": ["x1", "x2"]}, name="kb3")
@@ -1177,9 +1335,9 @@ def test_the_run_ends_with_a_summary_per_outcome(
     adapter: _Adapter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed({"d1": ["c1"]})
-    warm._save_collection("kb2", model_id=None, dimension=None)
+    _save_collection("kb2", model_id=None, dimension=None)
     _other_engine(monkeypatch, "kbm")
-    warm._save_collection("kb4", dimension=None)
+    _save_collection("kb4", dimension=None)
     _seed({"e1": ["x1", "x2"]}, name="kb3")
 
     with caplog.at_level(logging.INFO, logger=mod.__name__):
@@ -1250,10 +1408,16 @@ def test_help_states_outcomes_reasons_and_how_to_resume(
     for phrase in (
         "does not change the binding of a collection it does not report as switched",
         "every report line but a skipped one ends with the binding",
-        "over-max-fill (run the warm-up first)",
+        "over-max-fill (run the warm-up, or raise --max-fill; the warm-up embeds the "
+        "writable source rows whose key the target does not hold with a vector it "
+        "wrote and can use, and touches no other target row: not one without a "
+        "source row, not one that differs only in a copied field)",
+        "The time a collection stays frozen grows with its rows even when nothing "
+        "needs filling; --max-fill bounds only the writes",
+        "--take-over applies only to the collections named with --collection",
         "unusable-source-rows",
         "writers-still-active",
-        "rerunning with --take-over",
+        "rerunning with --collection NAME --take-over",
         "0 nothing was refused, failed, left frozen or lost its window, and every "
         "skipped collection was unbound, no-metadata or other-engine",
         "1 a collection was refused, failed, left frozen, lost its window, or skipped "
@@ -1271,3 +1435,41 @@ def test_help_states_outcomes_reasons_and_how_to_resume(
         "2 the run never started, including when the target's table does not exist",
     ):
         assert phrase in text, phrase
+
+
+def test_take_over_without_a_named_collection_never_starts(
+    adapter: _Adapter, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed({"d1": ["c1"]})
+    dead = ms.claim_migration_window("kb", holder=OTHER_RUN)
+
+    assert mod.main(["--model", TARGET, "--take-over"]) == 2
+
+    assert "Switch did not start: --take-over applies only with --collection" in (
+        caplog.text
+    )
+    assert (_state().owner, _binding(), adapter.calls) == (dead.owner, SOURCE, [])
+    with pytest.raises(scope.MigrationCliError):
+        mod.switch(TARGET, collections=[], take_over=True)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--rate-limit", "-1"],
+        ["--rate-limit", "inf"],
+        ["--drain-timeout", "-1"],
+        ["--max-fill", "-1"],
+    ],
+)
+def test_an_invalid_number_never_starts(
+    adapter: _Adapter, monkeypatch: pytest.MonkeyPatch, args: List[str]
+) -> None:
+    _seed({"d1": ["c1"]})
+    started: List[Any] = []
+    monkeypatch.setattr(mod, "start_run", lambda *a, **k: started.append(a))
+
+    assert mod.main(["--model", TARGET, *args]) == 2
+
+    assert (started, adapter.calls, _binding()) == ([], [], SOURCE)
+    _never_frozen()

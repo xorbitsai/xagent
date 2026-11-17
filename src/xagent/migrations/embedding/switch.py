@@ -14,6 +14,7 @@ import itertools
 import json
 import logging
 import math
+import shlex
 import sys
 import time
 import uuid
@@ -47,12 +48,13 @@ from xagent.core.tools.core.RAG_tools.utils.string_utils import escape_lancedb_s
 from xagent.migrations.embedding.embed import (
     FAILED_INDEX_STATUSES,
     SKIP_NAME_NOT_STRIPPED,
+    WRITE_COLUMNS,
     CollectionReport,
     Target,
     TargetTableMissing,
     index_target,
-    pending_rows,
     record,
+    row_skip_reason,
     source_metadata,
     start_run,
     write_rows,
@@ -62,12 +64,14 @@ from xagent.migrations.embedding.scope import (
     SKIP_OTHER_ENGINE,
     SKIP_TARGET_IS_SOURCE,
     SKIP_UNBOUND,
+    MigrationCliError,
     MissingCollectionError,
     _owner,
     _usable_vector,
     chunk_key,
     collection_filter,
     collection_info,
+    core_chunk_pairs,
     holds_rows,
     iter_rows,
     precompute_eligibility,
@@ -83,8 +87,8 @@ SWITCHED = "switched"
 ALREADY_SWITCHED = "already-switched"
 REFUSED_FROZEN = "frozen"
 FROZEN_ADVICE = (
-    "frozen by a run that holds or left the window; rerun with --take-over if "
-    "that run is gone"
+    "frozen by a run that holds or left the window; rerun with --collection {name} "
+    "--take-over if that run is gone"
 )
 FLIP_ATTEMPTS = 5
 COPIED = ("text", "metadata", "chunk_hash", "parse_hash", "user_id")
@@ -108,6 +112,7 @@ class SwitchReport(CollectionReport):
     window_lost: Optional[str] = None
     holder: str = HOLDER
     tried_window: bool = False
+    max_fill: int = 0
 
     @property
     def ok(self) -> bool:
@@ -126,13 +131,15 @@ def switch(
     take_over: bool = False,
 ) -> List[SwitchReport]:
     """Switch each collection in turn; only a missing target table stops the run."""
+    if take_over and not collections:
+        raise MigrationCliError("--take-over applies only with --collection")
     target, conn, names = start_run(
         model_id, collections=collections, dry_run=False, rate_limit=rate_limit
     )
     reports: List[SwitchReport] = []
     holder = f"{HOLDER}:{uuid.uuid4().hex[:12]}"
     for name in names:
-        report = SwitchReport(name=name, holder=holder)
+        report = SwitchReport(name=name, holder=holder, max_fill=max_fill)
         reports.append(report)
         try:
             switch_collection(report, target, conn, max_fill, drain_timeout, take_over)
@@ -175,8 +182,14 @@ def switch_collection(
         report.skip_reason = checked.reason
         return
     report.source_model_id = checked.model_id
-    plan(report, target, conn, max_fill)
-    window = open_window(report, take_over)
+    state = read_migration_state(name)
+    if state.state == FROZEN and not take_over:
+        raise Refused(REFUSED_FROZEN)
+    if state.state == FROZEN:
+        window = take_over_window(report, state)
+    else:
+        plan(report, target, conn, max_fill)
+        window = open_window(report)
     try:
         fill_and_flip(report, window, target, conn, max_fill, drain_timeout)
     except MissingCollectionError as exc:
@@ -195,15 +208,12 @@ def finish_already_switched(report: SwitchReport, take_over_frozen: bool) -> Non
     report.outcome = ALREADY_SWITCHED
 
 
-def open_window(report: SwitchReport, take_over_frozen: bool) -> MigrationWindow:
+def open_window(report: SwitchReport) -> MigrationWindow:
     report.tried_window = True
     try:
         return claim_migration_window(report.name, holder=report.holder)
     except CollectionMigratingError:
-        state = read_migration_state(report.name)
-        if not take_over_frozen or state.state != FROZEN:
-            raise Refused(REFUSED_FROZEN) from None
-    return take_over_window(report, state)
+        raise Refused(REFUSED_FROZEN) from None
 
 
 def take_over_window(report: SwitchReport, state: Any) -> MigrationWindow:
@@ -256,7 +266,7 @@ def fill_and_flip(
         raise Refused("scope-changed")
     stale, pending = plan(report, target, conn, max_fill)
     still_held = functools.partial(_held_state, window)
-    report.removed = delete_rows(name, stale, target.model_id, conn, still_held)
+    delete_rows(report, stale, target.model_id, conn, still_held)
     for doc_id in sorted(pending):
         write_rows(report, pending[doc_id], target, conn, before_write=still_held)
     table = source_table(target.model_id)
@@ -274,15 +284,28 @@ def fill_and_flip(
 
 def plan(
     report: SwitchReport, target: Target, conn: Any, max_fill: int
-) -> Tuple[List[Key], Dict[str, List[Dict[str, Any]]]]:
-    """Target rows to delete and source rows to embed, or why the collection is refused."""
+) -> Tuple[Dict[Key, int], Dict[str, List[Dict[str, Any]]]]:
+    """Target rows to delete per key and source rows to embed, or why it is refused."""
     assert report.source_model_id is not None
-    source, held = read_both(report, target, conn)
+    held = read_rows(conn, source_table(target.model_id), report.name, target)
+    core = core_chunk_pairs(report.name, conn=conn) or set()
+    core_docs = {doc_id for doc_id, _ in core}
+    source: Rows = {}
+    pending: Dict[str, List[Dict[str, Any]]] = {}
+    table = source_table(report.source_model_id)
+    for row in scan(conn, table, report.name, WRITE_COLUMNS):
+        key, entry = chunk_key(row), (fingerprint(row), True)
+        source.setdefault(key, []).append(entry)
+        reason = row_skip_reason(row, core, core_docs)
+        if reason:
+            report.skipped[reason] = report.skipped.get(reason, 0) + 1
+        elif not matches(held.get(key, []), [entry]):
+            pending.setdefault(key[0], []).append(row)
     if any(len(rows) > 1 for rows in source.values()):
         raise Refused("duplicate-source-rows")
-    good = {key for key, rows in held.items() if matches(rows, source.get(key))}
-    stale = sorted(set(held) - good)
-    pending = pending_rows(report, report.source_model_id, good, conn)
+    stale = {
+        k: len(rows) for k, rows in held.items() if not matches(rows, source.get(k))
+    }
     for row in (row for rows in pending.values() for row in rows):
         try:
             record(row, target.model_id)
@@ -290,7 +313,7 @@ def plan(
             report.skipped["unwritable"] = report.skipped.get("unwritable", 0) + 1
     if report.skipped:
         raise Refused("unusable-source-rows")
-    report.stale = len(stale)
+    report.stale = sum(stale.values())
     report.pending = sum(len(rows) for rows in pending.values())
     if report.stale + report.pending > max_fill:
         raise Refused("over-max-fill")
@@ -307,18 +330,21 @@ def read_both(report: SwitchReport, target: Target, conn: Any) -> Tuple[Rows, Ro
 def read_rows(conn: Any, table: str, collection: str, target: Optional[Target]) -> Rows:
     """Per key, a digest per row and, for ``target``, a usable flag; no vector kept."""
     found: Rows = {}
-    if table not in table_names(conn):
-        return found
     columns = ["doc_id", "chunk_id", *COPIED]
     if target is not None:
         columns += ["vector", "model"]
-    for row in iter_rows(conn, table, collection_filter(collection), columns):
+    for row in scan(conn, table, collection, columns):
         usable = target is None or (
             written_by(row, target.model_id)
             and _usable_vector(row.get("vector"), target.dimension)
         )
         found.setdefault(chunk_key(row), []).append((fingerprint(row), usable))
     return found
+
+
+def scan(conn: Any, table: str, collection: str, columns: Sequence[str]) -> Any:
+    if table in table_names(conn):
+        yield from iter_rows(conn, table, collection_filter(collection), list(columns))
 
 
 def fingerprint(row: Dict[str, Any]) -> bytes:
@@ -341,22 +367,27 @@ def matches(held: List[Entry], source: Optional[List[Entry]]) -> bool:
 
 
 def delete_rows(
-    collection: str, keys: List[Key], model_id: str, conn: Any, check: Callable[[], Any]
-) -> int:
-    if not keys:
-        return 0
+    report: SwitchReport,
+    stale: Dict[Key, int],
+    model_id: str,
+    conn: Any,
+    check: Callable[[], Any],
+) -> None:
+    if not stale:
+        return
     opened = conn.open_table(source_table(model_id))
     try:
-        for doc_id, group in itertools.groupby(sorted(keys), key=lambda key: key[0]):
-            ids = ", ".join(f"'{escape_lancedb_string(c)}'" for _, c in group)
+        for doc_id, group in itertools.groupby(sorted(stale), key=lambda key: key[0]):
+            keys = list(group)
+            ids = ", ".join(f"'{escape_lancedb_string(c)}'" for _, c in keys)
             check()
             opened.delete(
-                f"{collection_filter(collection)} AND doc_id = "
+                f"{collection_filter(report.name)} AND doc_id = "
                 f"'{escape_lancedb_string(doc_id)}' AND chunk_id IN ({ids})"
             )
+            report.removed += sum(stale[key] for key in keys)
     finally:
         _safe_close_table(opened)
-    return len(keys)
 
 
 def compare(report: SwitchReport, target: Target, conn: Any) -> Optional[str]:
@@ -399,16 +430,28 @@ def describe(report: SwitchReport) -> str:
     if report.outcome:
         parts.append(report.outcome)
     if report.refused:
-        frozen = report.refused == REFUSED_FROZEN
-        parts.append(f"refused ({FROZEN_ADVICE if frozen else report.refused})")
+        parts.append(f"refused ({refusal(report)})")
     if report.error:
         parts.append(f"failed: {report.error}")
     if report.window_lost:
         parts.append(f"window lost: {report.window_lost}")
     if report.left_frozen:
-        parts.append(f"LEFT FROZEN ({report.left_frozen}); resume with --take-over")
+        resume = f"--collection {shlex.quote(report.name)} --take-over"
+        parts.append(f"LEFT FROZEN ({report.left_frozen}); resume with {resume}")
     parts.append(binding_of(report.name))
     return f"{report.name}: " + "; ".join(parts)
+
+
+def refusal(report: SwitchReport) -> str:
+    if report.refused == REFUSED_FROZEN:
+        return FROZEN_ADVICE.format(name=shlex.quote(report.name))
+    if report.refused == "over-max-fill":
+        advice = "run the warm-up, or raise" if report.pending else "raise"
+        return (
+            f"over-max-fill: {report.pending} to embed + {report.stale} to delete > "
+            f"{report.max_fill}; {advice} --max-fill"
+        )
+    return str(report.refused)
 
 
 def binding_of(name: str) -> str:
@@ -453,18 +496,23 @@ rows; build the target's indexes when it holds rows of the collection; compare
 row by row and, only when the target holds exactly one equal row per source
 row, bind the collection to the target and unfreeze it. Ingestion into a frozen
 collection is refused or deferred meanwhile. Source rows are never deleted;
-nothing is rolled back.
+nothing is rolled back. The time a collection stays frozen grows with its rows
+even when nothing needs filling; --max-fill bounds only the writes.
 
 This run does not change the binding of a collection it does not report as
 switched; every report line but a skipped one ends with the binding read when
 it was written. Refused reasons: frozen (by a run that holds or left the
-window), over-max-fill (run the warm-up first), unusable-source-rows (a source
-row without a core chunk row, owner, text, hash, or with metadata that is not a
-JSON object), duplicate-source-rows, writers-still-active, scope-changed
-(binding or tables changed between the count and the re-read under the freeze,
-including a collection another run switched meanwhile). Skipped ones are out of
-scope (unbound, other-engine, name-not-stripped, no-metadata, ...); one already
-bound to the target is already-switched. A summary per outcome ends the run.
+window), over-max-fill (run the warm-up, or raise --max-fill; the warm-up
+embeds the writable source rows whose key the target does not hold with a
+vector it wrote and can use, and touches no other target row: not one without
+a source row, not one that differs only in a copied field),
+unusable-source-rows (a source row without a core chunk row, owner, text, hash,
+or with metadata that is not a JSON object), duplicate-source-rows,
+writers-still-active, scope-changed (binding or tables changed between the
+count and the re-read under the freeze, including a collection another run
+switched meanwhile). Skipped ones are out of scope (unbound, other-engine,
+name-not-stripped, no-metadata, ...); one already bound to the target is
+already-switched. A summary per outcome ends the run.
 
 The target model's table must exist (ingesting into a collection bound to the
 target creates it) with an integer user_id column, or the run never starts. It
@@ -473,9 +521,11 @@ with its binding unchanged and the run stops.
 
 A collection still frozen by this run when its line is written is reported LEFT
 FROZEN; it, or one a killed run left frozen, is resumed by rerunning with
---take-over, which states that the run holding it is gone. "window lost": the
-unfreeze did not find the row as this run last wrote it, and it is not frozen
-by this run; rerun (already-switched if the binding moved).
+--collection NAME --take-over, which states that the run holding it is gone.
+"window lost": the unfreeze did not find the row as this run last wrote it, and
+it is not frozen by this run; rerun (already-switched if the binding moved).
+--take-over applies only to the collections named with --collection; one it
+takes over is counted under the freeze, not before.
 
 Exit codes: 0 nothing was refused, failed, left frozen or lost its window, and
 every skipped collection was unbound, no-metadata or other-engine; 1 a
@@ -528,7 +578,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--take-over",
         action="store_true",
-        help="Take over a collection frozen by a run that is gone",
+        help="Take over the named collections if frozen by a run that is gone; "
+        "requires --collection",
     )
     args = parser.parse_args(argv)
     numbers = (args.rate_limit, args.drain_timeout)

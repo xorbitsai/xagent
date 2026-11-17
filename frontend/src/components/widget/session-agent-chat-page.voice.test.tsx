@@ -596,7 +596,7 @@ describe("session widget voice call and a refused handshake token", () => {
     expect(bridge.value.refreshSession).toHaveBeenCalledTimes(1)
   })
 
-  it("ends the call as unavailable when synthesis is switched off (404)", async () => {
+  it("ends the call as unavailable when the session widget API is switched off (404)", async () => {
     renderPage()
     const transport = await openCall()
     fetchMock.mockResolvedValue(status(404))

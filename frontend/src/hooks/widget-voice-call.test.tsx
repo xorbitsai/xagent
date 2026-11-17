@@ -167,7 +167,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(Socket.instances).toHaveLength(0)
     expect(fetchMock).not.toHaveBeenCalled()
   },
-  4: closes([[4003, ""]], "unavailable", false),
+  4: closes([[4003, ""], [4403, ""], [4403, "Voice is not available for this chat"]], "unavailable", false),
   5: closes([[1008, "Voice is busy"], [1008, "Too many requests"]], "busy", true),
   6: errorFrames(["voice_budget_exhausted"], "temporarilyUnavailable", true),
   7: errorFrames(["voice_unavailable", "model_unavailable", "invalid_request"], "unavailable", false),
@@ -181,7 +181,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     act(() => { Socket.instances[0].onerror!(); Socket.instances[0].onclose?.({ code: 1006, reason: "" }) })
     expectStopped("connectionEnded", true)
   },
-  9: closes([[1012, "Service restart"]], "connectionEnded", true),
+  9: closes([[1012, "Service restart"], [4408, "Voice is unavailable"]], "connectionEnded", true),
   10: errorFrames(["standalone_usage_refused"], "unavailable", false),
   11: async () => {
     await errorFrames(["session_timeout"], "sessionTimeout", true)()
@@ -204,7 +204,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     expect(Socket.instances[0].close).not.toHaveBeenCalled()
   },
   14: synthesis([401, 403], "unavailable", false),
-  15: synthesis([402], "unavailable", false),
+  15: synthesis([402, 404], "unavailable", false),
   16: synthesis([503], "unavailable", false),
   17: synthesis([429], "temporarilyUnavailable", true),
   18: async () => {

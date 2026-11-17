@@ -284,6 +284,8 @@ _trigger_dispatcher_task: asyncio.Task[Any] | None = None
 _task_command_dispatcher_task: asyncio.Task[Any] | None = None
 _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
 _sandbox_warmup_task: asyncio.Task[None] | None = None
+_sandbox_deferred_stops_task: asyncio.Task[None] | None = None
+SANDBOX_DEFERRED_STOPS_TASK_NAME = "sandbox-deferred-stops"
 SANDBOX_WARMUP_TASK_NAME = "sandbox-warmup"
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
@@ -2719,6 +2721,15 @@ async def _run_sandbox_warmup(sandbox_mgr: Any) -> None:
             logger.exception("Sandbox warmup failed")
 
 
+async def _run_deferred_sandbox_stops(sandbox_mgr: Any) -> None:
+    try:
+        await sandbox_mgr.drain_deferred_stops()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Deferred sandbox stops failed")
+
+
 async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
     # cleanup() quiesce can be awaited inline for minutes with no logs.
     # Time each sub-phase so the next slow start names the exact one; the
@@ -2730,12 +2741,23 @@ async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
     # quiesce gets a budget after which it issues no further stops. It is a
     # limit on scheduling more cleanup, never a cancel: abandoning an issued
     # stop would release its same-name lock while the daemon call still runs.
-    # A container left running is reconciled on first use on backends that
-    # reconcile specs; the legacy cleanup for those that do not ignores the
-    # budget and must finish (or fail activation at the step bound).
+    # A container left running keeps the previous generation's exec
+    # processes, so the deferred names are stopped by a background task after
+    # activation (and by the first reconcile that would reuse one, whichever
+    # comes first). The legacy cleanup, for backends that do not reconcile,
+    # ignores the budget and must finish (or fail activation at the step
+    # bound).
     with _startup_phase("sandbox cleanup"):
         with bounded_quiesce(get_sandbox_startup_cleanup_timeout_seconds()):
             await sandbox_mgr.cleanup()
+
+    global _sandbox_deferred_stops_task
+    deferred = getattr(sandbox_mgr, "_deferred_stops", None)
+    if isinstance(deferred, set) and deferred:
+        _sandbox_deferred_stops_task = asyncio.create_task(
+            _run_deferred_sandbox_stops(sandbox_mgr)
+        )
+        _sandbox_deferred_stops_task.set_name(SANDBOX_DEFERRED_STOPS_TASK_NAME)
 
     # The image warmup only pre-pulls and pre-creates; nothing waits on it, so it
     # runs after admission opens instead of inside the activation budget.
@@ -2886,7 +2908,8 @@ async def _stop_runtime_loops(*, keep_command_dispatcher: bool = False) -> None:
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
         _sandbox_idle_sweep_task, \
-        _sandbox_warmup_task
+        _sandbox_warmup_task, \
+        _sandbox_deferred_stops_task
 
     # The temp-file walk runs in a thread a task cancel cannot stop; its stop
     # event is what ends it (see ``start_temp_file_cleanup_task``).
@@ -2915,6 +2938,15 @@ async def _stop_runtime_loops(*, keep_command_dispatcher: bool = False) -> None:
         with suppress(asyncio.CancelledError):
             await _sandbox_idle_sweep_task
     _sandbox_idle_sweep_task = None
+
+    if (
+        _sandbox_deferred_stops_task is not None
+        and not _sandbox_deferred_stops_task.done()
+    ):
+        _sandbox_deferred_stops_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sandbox_deferred_stops_task
+    _sandbox_deferred_stops_task = None
 
     if _sandbox_warmup_task is not None and not _sandbox_warmup_task.done():
         _sandbox_warmup_task.cancel()
@@ -3052,9 +3084,13 @@ async def startup_event() -> None:
     from ..config import (
         get_standby_enabled,
         get_task_execution_role,
+        validate_activation_timeouts,
         validate_task_execution_host_config,
     )
 
+    # Strict getters read again at activation: a malformed value must stop the
+    # boot here, not fail every activation after the old generation retired.
+    validate_activation_timeouts()
     if get_standby_enabled():
         standby.begin()
         standby.on_failure(_abort_standby_activation)

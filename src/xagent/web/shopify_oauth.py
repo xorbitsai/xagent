@@ -22,9 +22,11 @@ import hashlib
 import hmac
 import logging
 import re
+import time
 from collections.abc import Iterable
 
 from ..core.utils import public_requests as requests
+from .oauth_account_hosts import OAuthAccountError, normalize_oauth_account
 from .oauth_provider_quirks import matches_provider_family
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,11 @@ SHOPIFY_REQUIRED_SCOPES = frozenset(
     {"write_products", "write_orders", "read_customers"}
 )
 SHOPIFY_API_VERSION = "2026-07"
+# How long a signed app-URL request stays usable. Shopify sends the browser
+# there straight after the install or the merchant's click, so minutes are
+# plenty; a small allowance covers clocks that run ahead of Shopify's.
+SHOPIFY_LAUNCH_MAX_AGE_SECONDS = 300
+_LAUNCH_CLOCK_SKEW_SECONDS = 60
 
 _SHOP_GID_PREFIX = "gid://shopify/Shop/"
 _SCOPE_SEPARATOR = re.compile(r"[\s,]+")
@@ -77,10 +84,10 @@ def _escape_hmac_part(text: str, *extra: str) -> str:
     return escaped
 
 
-def verify_shopify_callback(
-    query_items: Iterable[tuple[str, str]], *, client_secret: str, bound_account: str
-) -> None:
-    """Check the callback's signature, then that it names the bound store.
+def _verified_params(
+    query_items: Iterable[tuple[str, str]], *, client_secret: str, request: str
+) -> dict[str, str]:
+    """Return the query parameters once Shopify's ``hmac`` over them verifies.
 
     Shopify signs the decoded query parameters other than ``hmac``, sorted by
     key and joined as ``key=value`` pairs with ``&``, using HMAC-SHA256 with
@@ -99,7 +106,7 @@ def verify_shopify_callback(
     received = params.pop("hmac", "").strip().lower()
     if not received:
         raise ShopifyOAuthError(
-            "hmac_missing", "Shopify's callback was not signed. Please try again."
+            "hmac_missing", f"Shopify's {request} was not signed. Please try again."
         )
     message = "&".join(
         sorted(
@@ -113,8 +120,18 @@ def verify_shopify_callback(
     if repeated or not hmac.compare_digest(expected.encode(), received.encode()):
         raise ShopifyOAuthError(
             "hmac_invalid",
-            "Shopify's callback signature did not verify. Please try again.",
+            f"Shopify's {request} signature did not verify. Please try again.",
         )
+    return params
+
+
+def verify_shopify_callback(
+    query_items: Iterable[tuple[str, str]], *, client_secret: str, bound_account: str
+) -> None:
+    """Check the callback's signature, then that it names the bound store."""
+    params = _verified_params(
+        query_items, client_secret=client_secret, request="callback"
+    )
     # Trusted only now that the signature covers it.
     shop = params.get("shop", "").strip().lower()
     if shop != _store_host(bound_account):
@@ -123,6 +140,50 @@ def verify_shopify_callback(
             "Shopify approved a different store than the one you entered. "
             "Connect again and approve access on that store.",
         )
+
+
+def verify_shopify_launch(
+    query_items: Iterable[tuple[str, str]],
+    *,
+    client_secret: str,
+    now: float | None = None,
+) -> str:
+    """Check a request Shopify sent to the app URL; return its store label.
+
+    After an install, and whenever the merchant opens the app, Shopify sends
+    the browser to the app URL with ``shop``, ``timestamp`` and ``host``
+    signed the same way as the OAuth callback, and with no ``state`` of ours.
+    The install flow starts OAuth on the store named here, so the store comes
+    only from the signed ``shop``, which must be a single label directly under
+    ``myshopify.com``. Nothing here is single-use, so a signed URL older than
+    ``SHOPIFY_LAUNCH_MAX_AGE_SECONDS`` (or from the future, past a small clock
+    allowance) is refused rather than accepted for good.
+    """
+    params = _verified_params(
+        query_items, client_secret=client_secret, request="request"
+    )
+    try:
+        timestamp = int(params.get("timestamp", ""))
+    except ValueError:
+        raise ShopifyOAuthError(
+            "timestamp_invalid", "Shopify's request carried no usable time."
+        ) from None
+    age = (time.time() if now is None else now) - timestamp
+    if not -_LAUNCH_CLOCK_SKEW_SECONDS <= age <= SHOPIFY_LAUNCH_MAX_AGE_SECONDS:
+        raise ShopifyOAuthError(
+            "timestamp_stale",
+            "This link from Shopify has expired. Open the app from Shopify again.",
+        )
+    label, dot, suffix = params.get("shop", "").strip().lower().partition(".")
+    try:
+        account = normalize_oauth_account(label)
+    except OAuthAccountError:
+        account = None
+    if account is None or not dot or suffix != SHOPIFY_HOST_SUFFIX:
+        raise ShopifyOAuthError(
+            "shop_invalid", "Shopify's request did not name a store."
+        )
+    return account
 
 
 def require_shopify_scopes(scope: object) -> str:

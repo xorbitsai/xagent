@@ -5349,7 +5349,7 @@ def test_validate_activation_timeouts_accepts_defaults(monkeypatch):
 
 
 class TestFetchWebContentBudgetConfig:
-    @pytest.mark.parametrize("value", ["", "  ", "tru", "maybe"])
+    @pytest.mark.parametrize("value", ["", "  ", "yess", "maybe"])
     def test_blank_or_mistyped_value_keeps_the_default_on(self, monkeypatch, value):
         monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_BUDGET", value)
         assert config.get_fetch_web_content_budget_enabled() is True

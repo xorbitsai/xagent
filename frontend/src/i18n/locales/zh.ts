@@ -45,6 +45,13 @@ const zh = {
     autoResumeStoppedCancelled: "自动恢复已取消，可点击“继续”恢复执行。",
     autoResumeStoppedIneligible: "此任务无法自动恢复，可点击“继续”恢复执行。",
   },
+  messageQueue: {
+    held: { sendFailed: "有排队的消息没能发出。" },
+    supportLost: "排队的消息暂时不能自动发出。如果某条已经出现在对话里，说明它已经发出了，不用再发。",
+    full: "最多只能排队 {count} 条消息。",
+    filesNotQueued: "带附件的消息不能排队，请等这一轮回答结束后再发送。",
+    waitingAnswer: "回答上面的问题后，排队的消息会接着发出。",
+  },
   clientErrors: {
     executionQueueFull: "团队执行队列已满，请稍后重试。",
     messageProcessingFailed: "消息处理失败，请重试。",

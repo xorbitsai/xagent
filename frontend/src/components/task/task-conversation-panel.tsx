@@ -336,6 +336,7 @@ export function TaskConversationPanel({
     isSessionInteractionLocked,
     connectionNotice,
     isConnected,
+    messageQueue,
   } = useApp()
   const accentAttributes = useAgentAccentAttributes(agent)
   const fileAccess = useFileAccess()
@@ -420,7 +421,18 @@ export function TaskConversationPanel({
 
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
     const outboundFiles = filesBlocked ? [] : (filesToSend || selectedFiles)
-    await (onSend ?? sendMessage)(message, config, outboundFiles)
+    if (messageQueue) {
+      // A message held for the turn in progress carries no files and leaves
+      // the selection alone.
+      const outcome = await messageQueue.submit(
+        message,
+        { hasFiles: outboundFiles.length > 0, clientMessageId: config?.clientMessageId },
+        () => (onSend ?? sendMessage)(message, config, outboundFiles),
+      )
+      if (outcome === "queued") return
+    } else {
+      await (onSend ?? sendMessage)(message, config, outboundFiles)
+    }
     // Only the files this send carried leave the selection: files added while
     // it was in flight, and in session mode files kept hidden while uploads
     // are not offered, stay.

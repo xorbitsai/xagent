@@ -92,6 +92,7 @@ from .sandboxed_tool.chrome_session import (
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     SandboxedMCPLoadResult,
     list_tools_in_sandbox,
+    ensure_sandbox_mcp_dependencies,
     load_sandboxed_mcp_tools,
     requires_sandbox_mcp_connection,
     should_sandbox_mcp_connection,
@@ -5893,6 +5894,19 @@ async def load_mcp_tools_as_agent_tools(
             )
             return agent_tools, loaded_servers, failures
         return agent_tools, loaded_servers, failures
+
+    if sandbox is not None and any(
+        should_sandbox_mcp_connection(c) for c in connection_map.values()
+    ):
+        # Once, before the fan-out: otherwise every concurrent sandboxed
+        # server waits for the first install inside its own bound. A failure
+        # here is retried, and reported, by the per-server path.
+        try:
+            await ensure_sandbox_mcp_dependencies(sandbox)
+        except Exception as e:
+            logger.warning(
+                "Sandbox MCP dependency preparation failed (%s)", type(e).__name__
+            )
 
     semaphore = asyncio.Semaphore(_MCP_SERVER_LOAD_CONCURRENCY)
 

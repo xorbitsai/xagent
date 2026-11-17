@@ -69,3 +69,38 @@ async def test_results_keep_connection_order_when_later_servers_finish_first(
     assert result.loaded_servers == ("a", "c")
     assert [f.server_name for f in result.failures] == ["b"]
     assert result.failures[0].phase is MCPFailurePhase.SESSION_START
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_sandbox_dependencies_are_ensured_once_before_the_fan_out(monkeypatch):
+    events: list[str] = []
+
+    async def fake_ensure(sandbox):
+        events.append("ensure")
+        await asyncio.sleep(0.05)
+
+    async def fake_load_sandboxed(connection, sandbox, tool_builder):
+        events.append("load")
+        return mcp_adapter_module.SandboxedMCPLoadResult(
+            tools=(object(),), adapter_error_types=(), wrap_error_types=()
+        )
+
+    monkeypatch.setattr(
+        mcp_adapter_module, "ensure_sandbox_mcp_dependencies", fake_ensure
+    )
+    monkeypatch.setattr(
+        mcp_adapter_module, "load_sandboxed_mcp_tools", fake_load_sandboxed
+    )
+    monkeypatch.setattr(
+        mcp_adapter_module, "should_sandbox_mcp_connection", lambda c: True
+    )
+
+    await load_mcp_tools_as_agent_tools(
+        {n: {"transport": "stdio", "command": "x"} for n in ("a", "b", "c")},
+        sandbox=object(),
+    )
+
+    assert events[0] == "ensure"
+    assert events.count("ensure") == 1
+    assert events.count("load") == 3

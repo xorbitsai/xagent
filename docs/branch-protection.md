@@ -195,15 +195,18 @@ The required contexts are therefore the two summary jobs:
 
 Both declare `if: always()` and fail unless every job they gather reports
 `success` -- a gathered job that is `skipped`, `failure` or `cancelled` fails
-the summary. **`always()` is load-bearing.** Removing it looks harmless and
+the summary. The one exception is the quick run of a pull request that is not
+approved yet, which reports under a different name; see "Quick runs before
+approval" below. **`always()` is load-bearing.** Removing it looks harmless and
 silently restores the hole, which is why it carries a comment in the workflow
 saying so.
 
 ### Gate at the step, not at the job
 
-Failing on `skipped` only works because **no gathered job is ever skipped**.
-`Test SQLite Migrations` and `Test PostgreSQL Migrations` carry no job-level
-`if:` at all. When `detect-migration-changes` reports `should-test=false`, the
+Failing on `skipped` only works because **no gathered job is ever skipped in a
+run that reports a required name**. `Test SQLite Migrations` and
+`Test PostgreSQL Migrations` carry no job-level `if:` other than the full-run
+condition described in "Quick runs before approval". When `detect-migration-changes` reports `should-test=false`, the
 jobs still run; it is their *steps* that are gated, and the job reports
 `success` in a few seconds. A PR that touches no migration still gets a green
 `Migrations Summary` -- this page's own PR is an example.
@@ -247,7 +250,7 @@ The `frontend` filter names `.gitignore` because hatchling honours it when selec
 
 `tests/test_ci_summary_contract.py` holds all of the above as tests: that
 `needs` and `check_job` name the same set of jobs, that no gathered job carries
-a condition beyond the draft guard, that both outputs fall back to running
+a condition beyond the draft guard and the quick-run conditions, that both outputs fall back to running
 everything on a truncated or missing file count, that the `frontend` filter still
 covers whatever `pyproject` points `readme` at, and that the paths-filter action
 stays pinned to its reviewed commit.
@@ -270,6 +273,46 @@ gate on a mutable tag.
 
 Each of these assertions was confirmed to fail against a deliberately broken
 workflow before being committed.
+
+### Quick runs before approval
+
+The organization shares one pool of 60 standard runners, and a full round of
+`ci.yml` alone takes about 28 of them. Most of that went to commits nobody had
+approved yet, so both workflows now run in one of two shapes:
+
+| run | when | what runs | summary reports as |
+| --- | --- | --- | --- |
+| quick | a pull request whose `reviewDecision` is not `APPROVED` | `changes` and `pre-commit`; `detect-migration-changes` | `CI Quick Summary`, `Migrations Quick Summary` |
+| full | an approved pull request, every commit pushed after the approval, `merge_group`, `push`, `workflow_dispatch` | everything | `CI Summary`, `Migrations Summary` |
+
+The full-only jobs are skipped **at the job level** in a quick run -- on
+purpose, against the rule above, because a job whose steps are gated still
+starts and still waits for a runner, and the runner queue is what this saves.
+It stays fail-closed because of the name: a skipped job reports success, but
+the quick summary never carries a required context. A head that had only quick
+runs has no `CI Summary` or `Migrations Summary` at all, so branch protection
+keeps it out of the merge queue until a full run reports.
+
+How the shape is decided (the `Decide what this run covers` step, identical in
+both workflows):
+
+- It reads the pull request's `reviewDecision`. If that cannot be read, the run
+  is full: an approved pull request must never be left without its required
+  checks.
+- Approving starts the full run through `pull_request_review`. The decision can
+  lag the review that changed it, so an approval run asks up to five times.
+- A second approval of a head that already has a completed required check,
+  passed or failed, does not repeat the full run.
+- A review that is not an approval starts a run whose jobs are all skipped.
+  In `ci.yml` it has a concurrency group of its own, and an approval shares the
+  pull request's group without cancelling the run in flight.
+
+Both summaries also reject a `full` output that is not a literal `true` or
+`false`, and a quick run that ran a full-only job. For a branch in this
+repository, starting `Pull Request Checks` manually gives the full results
+before approval; that run is a full run of the same head and counts. A branch
+in a fork gets them when the pull request is approved. `tests/test_ci_quick_run_contract.py`
+holds these properties as tests.
 
 ### Two contract tests own ci.yml
 

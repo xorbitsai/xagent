@@ -26,7 +26,7 @@ const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
   "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/background-jobs.test.ts src/lib/team-sharing-sanitizers.test.ts src/lib/oauth-account.test.ts src/lib/oauth-connect-account.test.ts src/lib/oauth-connect.test.ts src/lib/oauth-launch.test.ts"
 const ciSummaryCondition =
-  "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
+  "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')"
 const frontendSummaryCheckCommand =
   'check_job "frontend-build" "${{ needs[\'frontend-build\'].result }}"'
 // The single condition the frontend-build steps are allowed to carry. The rule
@@ -38,11 +38,19 @@ const frontendGateCondition = "needs.changes.outputs.frontend == 'true'"
 const ciSummaryFailurePropagationCommands = [
   "set -e",
   "failed=0",
+  // A quick run (see docs/branch-protection.md "Quick runs before approval")
+  // must have skipped the full-only jobs; a full run must have passed them.
+  'full="${{ needs.changes.outputs.full }}"',
+  'full_only=" prepare-deepdoc-cache pytest-fast pytest-fast-deepdoc pytest-slow pytest-milvus e2e frontend-build lancedb-memory-compatibility "',
   "check_job() {",
   'local name="$1"',
   'local result="$2"',
-  'if [ "$result" != "success" ]; then',
-  'echo "::error::$name finished with result: $result"',
+  "local expected=success",
+  'if [ "$full" != "true" ] && [[ "$full_only" == *" $name "* ]]; then',
+  "expected=skipped",
+  "fi",
+  'if [ "$result" != "$expected" ]; then',
+  'echo "::error::$name finished with result: $result (expected $expected)"',
   "failed=1",
   "fi",
   "}",
@@ -72,6 +80,7 @@ const ciSummaryFailurePropagationCommands = [
   "}",
   'check_flag "code" "${{ needs.changes.outputs.code }}"',
   'check_flag "frontend" "${{ needs.changes.outputs.frontend }}"',
+  'check_flag "full" "${{ needs.changes.outputs.full }}"',
   'exit "$failed"',
 ] as const
 const requiredFrontendSteps = [
@@ -694,7 +703,7 @@ describe("frontend CI test manifest", () => {
   it("rejects a no-op summary function", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      '          check_job() {\n            local name="$1"\n            local result="$2"\n            if [ "$result" != "success" ]; then\n              echo "::error::$name finished with result: $result"\n              failed=1\n            fi\n          }\n',
+      '          check_job() {\n            local name="$1"\n            local result="$2"\n            local expected=success\n            if [ "$full" != "true" ] && [[ "$full_only" == *" $name "* ]]; then\n              expected=skipped\n            fi\n            if [ "$result" != "$expected" ]; then\n              echo "::error::$name finished with result: $result (expected $expected)"\n              failed=1\n            fi\n          }\n',
       "          check_job() {\n            :\n          }\n",
       "check_job function body",
     )
@@ -707,8 +716,8 @@ describe("frontend CI test manifest", () => {
   it("rejects an inverted summary result condition", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      'if [ "$result" != "success" ]; then',
-      'if [ "$result" = "success" ]; then',
+      'if [ "$result" != "$expected" ]; then',
+      'if [ "$result" = "$expected" ]; then',
       "check_job result condition",
     )
 
@@ -1415,13 +1424,17 @@ describe("frontend CI test manifest", () => {
   it.each([
     [
       "missing always()",
-      "if: github.event_name != 'pull_request' || github.event.pull_request.draft == false",
+      "if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')",
+    ],
+    [
+      "missing the approval guard",
+      "if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)",
     ],
     ["a different condition", "if: always()"],
   ])("rejects ci-summary with %s", (_, replacement) => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)",
+      "if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')",
       replacement,
       "ci-summary if policy",
     )

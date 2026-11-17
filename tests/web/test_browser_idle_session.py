@@ -8,15 +8,18 @@ wall-clock idle time.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from importlib import import_module
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from tests.web import test_auth_api as auth_tests
 from tests.web.test_auth_api import test_db as test_db
@@ -32,6 +35,7 @@ from xagent.web.auth_config import (
     validate_auth_config,
 )
 from xagent.web.auth_sessions import hash_refresh_token, user_session_claims
+from xagent.web.models import database
 from xagent.web.models.browser_session import BrowserIdleEnforcement, BrowserSession
 from xagent.web.models.user import User
 
@@ -807,6 +811,70 @@ def test_the_heartbeat_renews_the_lease_only_while_enabled(monkeypatch, on):
     assert _row(_sid(member)).recorded_admin is on
 
 
+def test_a_failing_sweep_tick_is_logged_and_retried(monkeypatch, caplog):
+    _switch(monkeypatch, False)  # The heartbeat does nothing; only the sweep runs.
+    monkeypatch.setattr(browser_idle, "SWEEP_INTERVAL_SECONDS", 0.01)
+    calls = 0
+    retried = threading.Event()
+
+    def sweep(db, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database unavailable")
+        retried.set()
+        return 0, 0
+
+    monkeypatch.setattr(browser_idle, "sweep_browser_sessions", sweep)
+
+    async def until_retried():
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            browser_idle.run_browser_session_sweep_loop(
+                auth_tests.TestingSessionLocal, stop_event=stop
+            )
+        )
+        deadline = time.monotonic() + 10
+        while not retried.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        stop.set()
+        await task
+
+    with caplog.at_level(logging.ERROR, logger=browser_idle.logger.name):
+        asyncio.run(until_retried())
+    assert retried.is_set()
+    assert "Browser idle session sweep failed" in caplog.text
+
+
+def test_the_sweep_task_starts_once_and_stops_on_its_event(monkeypatch):
+    web_app = import_module("xagent.web.app")
+    started = []
+
+    async def loop(session_factory, *, stop_event):
+        started.append(session_factory)
+        await stop_event.wait()
+
+    monkeypatch.setattr(browser_idle, "run_browser_session_sweep_loop", loop)
+    monkeypatch.setattr(database, "get_session_local", lambda: "session factory")
+    # Past the guard that keeps other tests from starting the loop.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    app = FastAPI()
+
+    async def start_twice_then_stop():
+        task = web_app.start_browser_session_sweep_task(app)
+        assert task is not None
+        assert web_app.start_browser_session_sweep_task(app) is task
+        await asyncio.sleep(0)
+        await web_app.stop_browser_session_sweep_task(app)
+        return task
+
+    task = asyncio.run(start_twice_then_stop())
+    # Stopped by its event, not cancelled.
+    assert task.done() and not task.cancelled()
+    assert started == ["session factory"]
+    assert app.state.browser_session_sweep_task is None
+
+
 def test_sweep_uses_each_users_server_side_threshold(enforced):
     _users()
     member = _login("member")
@@ -984,8 +1052,9 @@ def test_activity_write_is_fenced_against_concurrent_expiry(monkeypatch, enforce
     assert _as_utc(_row(_sid(tokens)).last_activity_at) == idle_since
 
 
-# The refresh UPDATE's own fence is exercised with a second worker on SQLite
-# and PostgreSQL in test_sync_auth_worker.py.
+# The refresh UPDATE's own fence is exercised with a second worker on SQLite in
+# test_sync_auth_worker.py, and on PostgreSQL when XAGENT_TEST_AUTH_DATABASE_URL
+# is set.
 
 
 # --- Logout ---------------------------------------------------------------------
@@ -1260,6 +1329,31 @@ def test_connected_websocket_closes_with_the_idle_code(monkeypatch, enforced):
             message = socket.portal.call(asyncio.wait_for, socket._send_rx.receive(), 5)
             assert message["type"] == "websocket.close"
             assert message["code"] == 4010
+
+
+def test_websocket_handshake_with_an_idle_login_keeps_the_existing_close(
+    monkeypatch, enforced
+):
+    """Rejected before accept, like any invalid token; 4010 is for open sockets."""
+    _users()
+    tokens = _login()
+    _idle_for(tokens, 31)
+    progress_manager = MagicMock()
+    monkeypatch.setattr(progress_ws, "get_progress_manager", lambda: progress_manager)
+    app = FastAPI()
+    app.include_router(progress_ws.progress_ws_router)
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            with client.websocket_connect(
+                "/ws/progress/task",
+                subprotocols=[
+                    "xagent-auth-v1",
+                    f"xagent-auth-token.{tokens['access_token']}",
+                ],
+            ):
+                pass
+    assert closed.value.code == 1008
+    progress_manager.get_task_progress.assert_not_called()
 
 
 # --- Review on #3782: stale reads, bounded pool, coalescing, countdown ------------

@@ -29,6 +29,7 @@ class BrowserSession(Base):  # type: ignore[no-any-unimported]
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    # Audit only: when the login started. No code path reads it.
     created_at = Column(DateTime(timezone=True), nullable=False)
     # Moves only on login and explicit activity reports, never on refresh.
     last_activity_at = Column(DateTime(timezone=True), nullable=False)
@@ -37,6 +38,8 @@ class BrowserSession(Base):  # type: ignore[no-any-unimported]
     # Once set, every credential carrying this sid is rejected, whether or not
     # the idle policy is currently enabled.
     revoked_at = Column(DateTime(timezone=True), nullable=True)
+    # Audit only: why the login ended ("logout" or "idle"). No code path
+    # reads it; rejection depends on revoked_at alone.
     revoked_reason = Column(String(16), nullable=True)
     # The user's platform-admin role at the last login, activity or refresh.
     # With the policy off, expiry is judged by the stricter of this and the

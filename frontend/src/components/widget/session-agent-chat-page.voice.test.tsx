@@ -41,6 +41,8 @@ const voice = vi.hoisted(() => ({
   transport: null as null | VoiceAudioTransport,
   callbacks: null as null | { transcript: (type: "partial" | "final", text: string, id?: number) => void },
   audios: [] as Array<{ close: ReturnType<typeof vi.fn> }>,
+  // Runs the real VoiceAudio, so a test can see the microphone tracks stop.
+  real: false,
 }))
 
 vi.mock("./use-widget-session", async () => ({
@@ -71,15 +73,36 @@ vi.mock("@/contexts/app-context-chat", () => ({
   }),
 }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
-vi.mock("@/lib/voice-audio", async () => ({
-  ...await vi.importActual<typeof import("@/lib/voice-audio")>("@/lib/voice-audio"),
+vi.mock("@/lib/voice-audio", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/voice-audio")>("@/lib/voice-audio")
+  return {
+  ...actual,
   createWidgetVoiceAudio: (transport: VoiceAudioTransport, callbacks: typeof voice.callbacks) => {
     voice.transport = transport
     voice.callbacks = callbacks
+    if (voice.real) return actual.createWidgetVoiceAudio(transport, callbacks as Parameters<typeof actual.createWidgetVoiceAudio>[1])
     const audio = { start: vi.fn().mockResolvedValue(undefined), close: vi.fn(), stopAudio: vi.fn(), speak: vi.fn(), level: () => 0, muted: false }
     voice.audios.push(audio)
     return audio
   },
+  }
+})
+vi.mock("@/lib/voice-vad", () => ({ createVoiceVad: vi.fn(async () => ({ process: vi.fn(), destroy: vi.fn().mockResolvedValue(undefined) })) }))
+vi.mock("./widget-history-list", () => ({
+  WidgetHistoryList: (props: { onOpen: (id: number, title: string) => void; onBack: () => void }) => (
+    <div data-testid="history-list">
+      <button type="button" onClick={() => props.onOpen(7, "Earlier chat")}>list-open</button>
+      <button type="button" onClick={props.onBack}>list-back</button>
+    </div>
+  ),
+}))
+vi.mock("./widget-history-view", () => ({
+  WidgetHistoryView: (props: { onContinue: (message: string, id: number) => void; onBack: () => void }) => (
+    <div data-testid="history-view">
+      <button type="button" onClick={() => props.onContinue("a follow-up", 7)}>view-continue</button>
+      <button type="button" onClick={props.onBack}>view-back</button>
+    </div>
+  ),
 }))
 vi.mock("@/components/chat/widget-voice-conversation", async () => {
   const actual = await vi.importActual<typeof import("@/components/chat/widget-voice-conversation")>("@/components/chat/widget-voice-conversation")
@@ -125,7 +148,19 @@ const rerender = () => act(() => { bridge.rerender?.(value => value + 1) })
 const voiceRequests = () => fetchMock.mock.calls.map(([url]) => String(url)).filter(url => url.includes("/voice/"))
 const fetchMock = vi.fn()
 const sockets: Array<[string, string[]]> = []
-class FakeSocket { constructor(url: string, protocols: string[]) { sockets.push([url, protocols]) } }
+const socketInstances: FakeSocket[] = []
+class FakeSocket {
+  static OPEN = 1
+  readyState = 1
+  bufferedAmount = 0
+  onopen: (() => void) | null = null
+  onmessage: ((event: { data: string }) => void) | null = null
+  onclose: ((event: { code: number; reason: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  send = vi.fn()
+  close = vi.fn()
+  constructor(url: string, protocols: string[]) { sockets.push([url, protocols]); socketInstances.push(this) }
+}
 const status = (code: number) => new Response(null, { status: code })
 const ttsUrl = `${window.location.origin}/v1/external/chat/sessions/voice/tts`
 
@@ -150,8 +185,9 @@ beforeEach(() => {
   app.sendMessage.mockReset().mockResolvedValue(undefined)
   bridge.value.refreshSession.mockReset()
   bridge.value.ensureFreshSession.mockReset()
-  voice.props = null; voice.transport = null; voice.audios = []
+  voice.props = null; voice.transport = null; voice.audios = []; voice.real = false
   sockets.length = 0
+  socketInstances.length = 0
   fetchMock.mockReset().mockResolvedValue(status(200))
   vi.stubGlobal("fetch", fetchMock)
   vi.stubGlobal("WebSocket", FakeSocket)
@@ -420,5 +456,115 @@ describe("session widget voice call across the session", () => {
     rerender()
     expect(screen.getByTestId("call")).toHaveTextContent("none")
     expect(voice.audios).toHaveLength(1)
+  })
+})
+
+describe("session widget voice call and abandoned sentences", () => {
+  it("neither refreshes nor retries when the sentence was abandoned before its 401 arrived", async () => {
+    renderPage()
+    const transport = await openCall()
+    const controller = new AbortController()
+    fetchMock.mockImplementationOnce(async () => { controller.abort(); return status(401) })
+    expect((await transport.requestTts("Hello", controller.signal)).status).toBe(401)
+    expect(bridge.value.refreshSession).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not retry when the sentence was abandoned while the token was replaced", async () => {
+    renderPage()
+    const transport = await openCall()
+    const controller = new AbortController()
+    fetchMock.mockResolvedValue(status(401))
+    bridge.value.refreshSession.mockImplementation(async () => {
+      controller.abort()
+      return session({ voice: true }, "st_renewed")
+    })
+    expect((await transport.requestTts("Hello", controller.signal)).status).toBe(401)
+    expect(bridge.value.refreshSession).toHaveBeenCalledExactlyOnceWith(TOKEN)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("session widget voice call and history", () => {
+  const stopTrack = vi.fn()
+  class Context {
+    state = "running"
+    sampleRate = 48000
+    currentTime = 0
+    destination = {}
+    resume = vi.fn().mockResolvedValue(undefined)
+    close = vi.fn().mockResolvedValue(undefined)
+    audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) }
+    createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() })
+    createAnalyser = () => ({ fftSize: 0, connect: vi.fn(), disconnect: vi.fn(), getFloatTimeDomainData: vi.fn() })
+    createGain = () => ({ gain: { value: 0 }, connect: vi.fn(), disconnect: vi.fn() })
+  }
+
+  beforeEach(() => {
+    voice.real = true
+    stopTrack.mockReset()
+    vi.stubGlobal("AudioContext", Context)
+    vi.stubGlobal("AudioWorkletNode", class {
+      port = { onmessage: null }
+      connect = () => ({ connect: vi.fn() })
+      disconnect = vi.fn()
+    })
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack, enabled: true }] })) },
+    })
+  })
+
+  const historyCapabilities = { voice: true, conversationHistory: true }
+  async function callOnPanel() {
+    app.state.taskId = 71
+    renderPage({ capabilities: historyCapabilities })
+    fireEvent.click(screen.getByText("voice:panel"))
+    await waitFor(() => expect(socketInstances).toHaveLength(1))
+    await act(async () => {
+      socketInstances[0].onopen!()
+      socketInstances[0].onmessage!({ data: JSON.stringify({ type: "session_started" }) })
+    })
+    await waitFor(() => expect(screen.getByTestId("call")).toHaveTextContent("listening"))
+  }
+  const openHistory = () => {
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.history.menuLabel" }))
+  }
+
+  it("hangs up and stops the microphone when the history list opens", async () => {
+    await callOnPanel()
+    openHistory()
+    expect(screen.getByTestId("history-list")).toBeInTheDocument()
+    await waitFor(() => expect(stopTrack).toHaveBeenCalled())
+    expect(socketInstances[0].close).toHaveBeenCalled()
+    expect(screen.getByTestId("call")).toHaveTextContent("none")
+    expect(voice.props!.open).toBe(false)
+  })
+
+  it("stays hung up through an earlier conversation and back, until the visitor calls again", async () => {
+    await callOnPanel()
+    openHistory()
+    fireEvent.click(screen.getByText("list-open"))
+    expect(screen.getByTestId("history-view")).toBeInTheDocument()
+    await waitFor(() => expect(stopTrack).toHaveBeenCalled())
+    fireEvent.click(screen.getByText("view-back"))
+    fireEvent.click(screen.getByText("list-back"))
+    expect(screen.queryByTestId("history-list")).toBeNull()
+    expect(screen.getByTestId("call")).toHaveTextContent("none")
+    expect(socketInstances).toHaveLength(1)
+    fireEvent.click(screen.getByText("voice:panel"))
+    await waitFor(() => expect(socketInstances).toHaveLength(2))
+  })
+
+  it("stays hung up when a message is continued from an earlier conversation", async () => {
+    await callOnPanel()
+    openHistory()
+    fireEvent.click(screen.getByText("list-open"))
+    fireEvent.click(screen.getByText("view-continue"))
+    expect(screen.queryByTestId("history-view")).toBeNull()
+    await waitFor(() => expect(stopTrack).toHaveBeenCalled())
+    expect(screen.getByTestId("call")).toHaveTextContent("none")
+    expect(socketInstances).toHaveLength(1)
   })
 })

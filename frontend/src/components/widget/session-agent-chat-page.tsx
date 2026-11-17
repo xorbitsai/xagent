@@ -379,9 +379,12 @@ function SessionConversationContent({
 
   // A call opened by the visitor's click. Without a transport no call is
   // offered, and an open call is dropped so a later offer never starts one
-  // without a click.
+  // without a click. History hides the chat and the call bar with it, so
+  // whatever opens it also hangs up: the visitor could not reach the hang-up
+  // control while the microphone stays live, and coming back to the chat
+  // starts no call until the visitor asks for one again.
   const [voiceOpen, setVoiceOpen] = useState(false)
-  if (!voiceTransport && voiceOpen) setVoiceOpen(false)
+  if ((!voiceTransport || view.kind !== "chat") && voiceOpen) setVoiceOpen(false)
   const openVoiceCall = useCallback(() => setVoiceOpen(true), [])
   const voiceTaskStatus = state.currentTask?.status || ""
   // A token refresh rebuilds the chat socket; meanwhile the words are held
@@ -734,17 +737,21 @@ export function SessionAgentChatPage() {
       startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
       // The token the page holds at the time of the request. Only a 401 is
       // retried, once, with the token that replaces the rejected one; a
-      // second 401, or no new token, is handed back as the refusal.
+      // second 401, or no new token, is handed back as the refusal. A
+      // sentence already abandoned (the call ended, or the visitor talked
+      // over it) neither replaces the token, which would rebuild the chat
+      // socket, nor retries: its 401 is handed back as it is.
       requestTts: async (text, signal) => {
         const token = currentToken()
         const response = await synthesize(token, text, signal)
-        if (response.status !== 401) return response
+        if (response.status !== 401 || signal.aborted) return response
         let renewed: string
         try {
           renewed = (await refreshSession(token)).token
         } catch {
           return response
         }
+        if (signal.aborted) return response
         await response.body?.cancel()
         return synthesize(renewed, text, signal)
       },

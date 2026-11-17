@@ -158,7 +158,7 @@ const isProtocolMessage = (value: unknown): value is ProtocolMessage => {
     )
 }
 
-export const WIDGET_SESSION_VOICE_ASR_PATH = "/v1/external/chat/sessions/voice/asr"
+const WIDGET_SESSION_VOICE_ASR_PATH = "/v1/external/chat/sessions/voice/asr"
 export const WIDGET_SESSION_VOICE_TTS_PATH = "/v1/external/chat/sessions/voice/tts"
 
 export function buildWidgetSessionWebSocketUrl(origin: string): string {

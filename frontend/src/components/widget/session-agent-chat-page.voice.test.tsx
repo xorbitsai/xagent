@@ -501,7 +501,7 @@ describe("session widget voice call across the session", () => {
     const audioHeaders = { "X-Audio-Format": "pcm", "X-Audio-Sample-Rate": "24000" }
     // The visitor's words go out, then the session is refreshed and the reply arrives.
     async function replyDuringRefresh() {
-      useRealAudio()
+      stubRealAudio()
       renderPage()
       await openRealCall("start")
       act(() => {
@@ -654,7 +654,7 @@ class Context {
 }
 // Runs the real call audio over a stubbed microphone and audio context, so a
 // test sees what the visitor would: the call bar, its notes and the tracks.
-function useRealAudio() {
+function stubRealAudio() {
   voice.real = true
   stopTrack.mockReset()
   vi.stubGlobal("AudioContext", Context)
@@ -680,7 +680,7 @@ async function openRealCall(where: "start" | "panel") {
 }
 
 describe("session widget voice call and history", () => {
-  beforeEach(useRealAudio)
+  beforeEach(stubRealAudio)
 
   const historyCapabilities = { voice: true, conversationHistory: true }
   async function callOnPanel() {
@@ -747,7 +747,7 @@ describe("session widget voice call and a refused token", () => {
   const handshakeToken = (index: number) => sockets[index][1][1]
 
   it("ends the session as expired when recognition is closed with 4408", async () => {
-    useRealAudio()
+    stubRealAudio()
     app.state.taskId = 71
     renderPage()
     await openRealCall("panel")
@@ -773,7 +773,7 @@ describe("session widget voice call and a refused token", () => {
   })
 
   it("replaces a refused handshake token once for that token, and a new token again", async () => {
-    useRealAudio()
+    stubRealAudio()
     renderPage()
     bridge.value.refreshSession.mockResolvedValue(session({ voice: true }, "st_renewed"))
     await openRealCall("start")
@@ -815,7 +815,7 @@ describe("session widget voice call and a refused token", () => {
   })
 
   it("asks once for a token that cannot be replaced, and each refusal ends the call retryable", async () => {
-    useRealAudio()
+    stubRealAudio()
     renderPage()
     bridge.value.refreshSession.mockRejectedValue(new Error("session unavailable"))
     await openRealCall("start")
@@ -890,7 +890,7 @@ describe("session widget voice call and a refused token", () => {
   })
 
   it("ends the call as unavailable, with no retry, when the session widget API is switched off (404)", async () => {
-    useRealAudio()
+    stubRealAudio()
     renderPage()
     await openRealCall("start")
     act(() => {

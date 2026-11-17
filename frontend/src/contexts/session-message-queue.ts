@@ -20,6 +20,8 @@ export interface ObservedTaskState {
   status: TaskStatus | undefined
 }
 
+export type HeldReason = "turn_failed" | "turn_paused" | "send_failed"
+
 export type MessageQueuePhase =
   | { kind: "idle" }
   // The turn in progress has not been seen to end. `since` is the observed
@@ -32,7 +34,7 @@ export type MessageQueuePhase =
   | { kind: "ready" }
   | { kind: "sending"; clientMessageId: string; since: number | undefined }
   // Nothing goes out until the visitor presses continue.
-  | { kind: "held"; reason: "turn_failed" | "turn_paused" | "send_failed" }
+  | { kind: "held"; reason: HeldReason }
 
 export interface MessageQueueState {
   items: QueuedMessage[]
@@ -86,7 +88,7 @@ export type MessageQueueEffect = null | "send_failed" | "support_lost"
 
 const IDLE: MessageQueuePhase = { kind: "idle" }
 const READY: MessageQueuePhase = { kind: "ready" }
-const held = (reason: "turn_failed" | "turn_paused" | "send_failed"): MessageQueuePhase => ({ kind: "held", reason })
+const held = (reason: HeldReason): MessageQueuePhase => ({ kind: "held", reason })
 
 // Moves a waiting queue on once the awaited turn has been seen to end. A
 // snapshot that finds the task able to take a new turn while nothing newer than
@@ -94,7 +96,8 @@ const held = (reason: "turn_failed" | "turn_paused" | "send_failed"): MessageQue
 // That is how a start the task process never took up, a turn that ended without
 // a frame, and a refusal during a turn's wind-down are found. It needs a
 // snapshot, a known start, an unchanged version, an appendable status and a
-// waiting head.
+// waiting head, and it is skipped while the head was refused until a question
+// is answered: that wait ends with the turn the answer starts.
 function settle(state: MessageQueueState, snapshot: boolean): MessageQueueState {
   const { phase, items, observed } = state
   if (phase.kind !== "waiting") return state
@@ -111,6 +114,7 @@ function settle(state: MessageQueueState, snapshot: boolean): MessageQueueState 
     && observed.status !== undefined
     && APPENDABLE.has(observed.status)
     && items[0]?.status === "waiting"
+    && !phase.answerRequired
   return retry ? { ...state, phase: READY } : state
 }
 
@@ -165,7 +169,7 @@ export function transitionMessageQueue(
     case "REQUEUE_REFUSED": {
       const at = items.findIndex(other => other.seq > event.item.seq)
       const inserted = { ...state, items: at < 0 ? [...items, event.item] : [...items.slice(0, at), event.item, ...items.slice(at)] }
-      return to(phase.kind === "idle" ? enterWaiting(inserted, event.sinceVersion) : inserted)
+      return to(phase.kind === "idle" || phase.kind === "ready" ? enterWaiting(inserted, event.sinceVersion) : inserted)
     }
     case "SEND_STARTED":
       if (phase.kind !== "ready" || items[0]?.clientMessageId !== event.clientMessageId) return to(state)

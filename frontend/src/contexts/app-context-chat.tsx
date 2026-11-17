@@ -2783,7 +2783,10 @@ export interface SessionMessageQueueControls {
   /**
    * Runs `send` now, or holds `text` to be sent once the turn in progress has
    * ended. Throws what `send` throws, and for a message that cannot be held a
-   * refusal the queue has already told the visitor about.
+   * refusal the queue has already told the visitor about. A held message is
+   * later sent through the provider's own send function, not the `send`
+   * passed in here, carrying only its text, a message id and a new-turn
+   * declaration.
    */
   submit: (
     text: string,
@@ -2864,7 +2867,9 @@ export interface AppProviderTransportCapabilities {
   taskStop?: TransportCapabilityState
   // Default-closed too: only a Session page that wants messages sent while a
   // turn is running held and sent in order asks for it. It takes effect only
-  // on a connection whose Session server accepts declared new turns.
+  // on a connection whose Session server accepts declared new turns. A
+  // page is expected to keep it unchanged while the provider is mounted:
+  // nothing handles it being switched off while messages are held.
   messageQueue?: TransportCapabilityState
 }
 
@@ -3211,6 +3216,11 @@ export function AppProvider({
   const messageQueueOfferedRef = useRef(messageQueueOffered)
   messageQueueOfferedRef.current = messageQueueOffered
   const messageQueueActive = messageQueueOffered && newTurnDelivery === "supported"
+  // The same condition read from the refs, for code that runs across an await.
+  const isMessageQueueOn = useCallback(
+    () => messageQueueOfferedRef.current && newTurnDeliveryRef.current === "supported",
+    [],
+  )
   const nextQueuedSeqRef = useRef(0)
   const translateRef = useRef(t)
   translateRef.current = t
@@ -8436,26 +8446,25 @@ export function AppProvider({
   }, [sendMessage])
 
   const submitQueuedMessage = useCallback<SessionMessageQueueControls["submit"]>(async (text, options, send) => {
-    const queueOn = messageQueueOfferedRef.current && newTurnDeliveryRef.current === "supported"
+    const queueOn = isMessageQueueOn()
     const decision = decideComposerSubmit(stateRef.current.messageQueue, {
       active: queueOn && sessionConversationRef.current.phase === "bound",
       deliveryInFlight: messageDeliveryCountRef.current > 0,
       hasFiles: options.hasFiles,
     })
-    const refuse = (message: string) => {
-      toast.error(message)
+    const refuse = (): never => {
+      toast.error(options.hasFiles
+        ? translateRef.current("messageQueue.filesNotQueued")
+        : translateRef.current("messageQueue.full", { count: MESSAGE_QUEUE_LIMIT }))
       throw Object.assign(new Error("The message cannot be queued."), { notificationHandled: true })
     }
-    const refusal = () => options.hasFiles
-      ? refuse(translateRef.current("messageQueue.filesNotQueued"))
-      : refuse(translateRef.current("messageQueue.full", { count: MESSAGE_QUEUE_LIMIT }))
     const item = {
       clientMessageId: options.clientMessageId || generateClientMessageId(),
       text,
       seq: nextQueuedSeqRef.current++,
       status: "waiting" as const,
     }
-    if (decision === "refuse_files" || decision === "refuse_full") refusal()
+    if (decision === "refuse_files" || decision === "refuse_full") refuse()
     if (decision === "queue") {
       applyMessageQueue({ type: "ENQUEUE", item })
       return "queued"
@@ -8466,15 +8475,18 @@ export function AppProvider({
       await send()
       return "sent"
     } catch (error) {
-      // A direct send refused only because a turn is running joins the queue.
+      // A direct send refused only because a turn is running joins the queue,
+      // provided the queue is still on now: a capabilities frame that arrived
+      // during the send may have withdrawn it, and then the refusal goes back
+      // to the caller unchanged.
       // The generation check is defensive: a new conversation is refused while
       // a delivery is in flight, so it cannot have changed under this send.
-      if (!queueOn || !isBusyRefusal(error) || generation !== deliveryGenerationRef.current) throw error
-      if (options.hasFiles || stateRef.current.messageQueue.items.length >= MESSAGE_QUEUE_LIMIT) refusal()
+      if (!queueOn || !isMessageQueueOn() || !isBusyRefusal(error) || generation !== deliveryGenerationRef.current) throw error
+      if (options.hasFiles || stateRef.current.messageQueue.items.length >= MESSAGE_QUEUE_LIMIT) refuse()
       applyMessageQueue({ type: "REQUEUE_REFUSED", item, sinceVersion })
       return "queued"
     }
-  }, [applyMessageQueue, readObservedTaskState])
+  }, [applyMessageQueue, isMessageQueueOn, readObservedTaskState])
 
   const startNewConversation = useCallback((): Promise<void> => {
     const existingReset = sessionResetFlightRef.current

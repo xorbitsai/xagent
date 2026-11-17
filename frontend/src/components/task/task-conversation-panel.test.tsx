@@ -54,6 +54,7 @@ const appControls = vi.hoisted(() => ({
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
   connectionNotice: null as "reconnecting" | "lost" | null,
+  messageQueue: null as null | { submit: (...args: any[]) => Promise<"sent" | "queued"> },
 }))
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -100,6 +101,7 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
     isMessageDeliveryPending: appControls.isMessageDeliveryPending,
     isSessionInteractionLocked: appControls.isSessionInteractionLocked,
     connectionNotice: appControls.connectionNotice,
+    messageQueue: appControls.messageQueue,
   }),
 }))
 
@@ -337,6 +339,7 @@ describe("TaskConversationPanel", () => {
     appControls.isMessageDeliveryPending = false
     appControls.isSessionInteractionLocked = false
     appControls.connectionNotice = null
+    appControls.messageQueue = null
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
@@ -357,6 +360,32 @@ describe("TaskConversationPanel", () => {
     appState.isProcessing = false
     appState.isHistoryLoading = false
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
+  })
+
+  describe("a send through the message queue", () => {
+    it.each([
+      ["sent", true, 1],
+      ["queued", false, 0],
+      ["refused", false, 0],
+    ])("a submit that was %s: file leaves the selection %s, send callback calls %s", async (outcome, removed, sends) => {
+      const submit = vi.fn(async (_text: string, _options: unknown, send: () => Promise<void>) => {
+        if (outcome === "refused") throw new Error("refused")
+        if (outcome === "sent") await send()
+        return outcome as "sent" | "queued"
+      })
+      appControls.messageQueue = { submit }
+      render(<TaskConversationPanel mode="page" />)
+      fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+      let result: unknown
+      await act(async () => {
+        result = await Promise.resolve(chatInputProps.current!.onSend("send draft", { clientMessageId: "m1" }))
+          .then(() => "returned", (error: unknown) => error)
+      })
+      expect(result).toEqual(outcome === "refused" ? new Error("refused") : "returned")
+      expect(submit).toHaveBeenCalledWith("send draft", { hasFiles: true, clientMessageId: "m1" }, expect.any(Function))
+      expect(sendMessageMock).toHaveBeenCalledTimes(sends)
+      expect(chatInputProps.current?.files).toHaveLength(removed ? 0 : 1)
+    })
   })
 
   it("labels the file manager icon button", () => {

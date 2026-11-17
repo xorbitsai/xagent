@@ -14004,6 +14004,18 @@ describe("session message queue", () => {
       expect(toasts()).toEqual(['messageQueue.full:{"count":5}'])
     })
 
+    it("a direct send refused as busy is not held when the connection stops taking new turns during the send", async () => {
+      const { server } = await mount({ status: "running", version: 3 })
+      server.ackGate = deferred<void>()
+      const first = submit("A")
+      await act(async () => {})
+      act(() => socket()?.onConnectionCapabilities?.(["heartbeat", "conversation_attached"]))
+      server.ackGate.resolve()
+      expect(await first).toMatchObject({ disposition: "rejected", errorCode: "task_busy" })
+      expect(queue().items).toEqual([])
+      expect(toasts()).toEqual([])
+    })
+
     it("a direct send refused for any other reason throws as it is and is not held", async () => {
       const { server } = await mount()
       server.refuseDirect = () => new MessageDeliveryError("gone", "rejected", { errorCode: "task_unavailable" })

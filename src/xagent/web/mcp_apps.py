@@ -8,8 +8,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from types import SimpleNamespace
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -414,32 +413,6 @@ class MCPAppSnapshot:
     owner_mcpserver_ids: frozenset[int]
 
 
-def load_detached_catalog_snapshot(db: Session) -> MCPAppSnapshot:
-    """Catalog-only snapshot that stays valid after ``db`` is closed.
-
-    ``load_mcp_app_snapshot`` keeps live ORM rows, which become detached (and
-    raise on attribute access) once the owning session is rolled back or
-    closed. A caller that caches the snapshot beyond one session use takes this
-    form instead: every row is a plain copy of the table columns, which is all
-    the resolvers read (``_app_to_dict``, name matching). ``servers`` and
-    ``owner_mcpserver_ids`` are empty; only the catalog is projected.
-    """
-    columns = [column.key for column in PublicMCPApp.__table__.columns]
-    return MCPAppSnapshot(
-        catalog_apps=tuple(
-            cast(
-                PublicMCPApp,
-                SimpleNamespace(
-                    **{key: deepcopy(getattr(row, key)) for key in columns}
-                ),
-            )
-            for row in db.query(PublicMCPApp).all()
-        ),
-        servers=(),
-        owner_mcpserver_ids=frozenset(),
-    )
-
-
 def load_mcp_app_snapshot(db: Session) -> MCPAppSnapshot:
     """Load the catalog and server rows once for one validation projection."""
     from .models.mcp import MCPServer, UserMCPServer
@@ -466,6 +439,56 @@ def get_all_mcp_apps(
         snapshot.catalog_apps if snapshot is not None else db.query(PublicMCPApp).all()
     )
     return [_app_to_dict(app) for app in apps]
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    """Session-independent copy of one catalog row.
+
+    ``row`` is a transient (never session-attached) ``PublicMCPApp`` built from
+    copies of the stored columns, so it stays valid after the session that
+    loaded it is closed. The canonical ``_app_to_dict`` view is computed only
+    for the entries a lookup actually matches (it is the costly part).
+    """
+
+    app_id: str
+    row_name: str
+    row: PublicMCPApp
+
+    def app(self) -> Dict[str, Any]:
+        return _app_to_dict(self.row)
+
+
+def load_catalog_entries(db: Session) -> tuple[CatalogEntry, ...]:
+    """Copy the whole catalog once (one query)."""
+    columns = [column.key for column in PublicMCPApp.__table__.columns]
+    return tuple(
+        CatalogEntry(
+            str(app.app_id),
+            str(app.name),
+            PublicMCPApp(**{key: deepcopy(getattr(app, key)) for key in columns}),
+        )
+        for app in db.query(PublicMCPApp).all()
+    )
+
+
+def match_catalog_entries(
+    entries: Iterable[CatalogEntry], *, app_id: str | None = None, name: str = ""
+) -> list[CatalogEntry]:
+    """Entries owning ``app_id``, or (without one) the name, one per ``app_id``.
+
+    The name rule is that of ``_get_app_for_server_name``: a row matches when
+    the name equals its ``app_id`` or its stored name.
+    """
+    matches: dict[str, CatalogEntry] = {}
+    for entry in entries:
+        if (
+            entry.app_id == app_id
+            if app_id is not None
+            else name in (entry.app_id, entry.row_name)
+        ):
+            matches.setdefault(entry.app_id, entry)
+    return list(matches.values())
 
 
 def get_app_by_id(db: Session, app_id: str) -> Dict[str, Any] | None:
@@ -1063,12 +1086,7 @@ def is_user_owned_server(db: Session, server_id: int) -> bool:
     )
 
 
-def get_app_for_mcp_server(
-    db: Session,
-    server: Any,
-    *,
-    snapshot: MCPAppSnapshot | None = None,
-) -> Dict[str, Any] | None:
+def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
     """Resolve a server's catalog app by stable identity when it is available.
 
     Unstamped rows predate ``auth.app_id`` and are resolved by the exact name
@@ -1089,9 +1107,6 @@ def get_app_for_mcp_server(
         app_id = auth.get("app_id")
         if not isinstance(app_id, str) or not app_id:
             return None
-        if snapshot is not None:
-            matches = [a for a in snapshot.catalog_apps if a.app_id == app_id]
-            return _app_to_dict(matches[0]) if matches else None
         return get_app_by_id(db, app_id)
     name = str(getattr(server, "name", ""))
     if not name:
@@ -1114,7 +1129,7 @@ def get_app_for_mcp_server(
     # fails closed -- deletion keeps the credentials, listing and runtime
     # decline to name an app -- rather than acting on a coin flip. Only the
     # stamp settles it, which is what the branch above is for.
-    return _get_app_for_server_name(db, name, snapshot=snapshot)
+    return _get_app_for_server_name(db, name)
 
 
 def classify_actor_remote_oauth_server(

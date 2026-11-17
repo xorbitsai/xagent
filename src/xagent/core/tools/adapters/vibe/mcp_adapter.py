@@ -82,7 +82,10 @@ from .connector_runtime import (
 from .mcp_approval_gate import gate_mcp_tools
 from .mcp_error_envelope import is_error_envelope, speaks_error_envelope
 from .mcp_result_integrity import MCPResultIntegrityGuard
-from .mcp_tool_allowlist import filter_tools_by_read_only_allowlist
+from .mcp_tool_allowlist import (
+    filter_tools_by_read_only_allowlist,
+    read_only_tool_names,
+)
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
@@ -5108,6 +5111,7 @@ async def load_execution_scoped_chrome_tools(
     except BaseException:
         await pool.close_shielded(scope)
         raise
+    mcp_tools = filter_tools_by_read_only_allowlist(mcp_tools, connection)
 
     concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
     tools: list[AbstractBaseTool] = []
@@ -5514,9 +5518,17 @@ async def _load_direct_mcp_tools(
 
     # Applied to the listing, before any adapter is built, so a tool the
     # operator did not allowlist is never reachable (see mcp_tool_allowlist).
-    mcp_tools = filter_tools_by_read_only_allowlist(
-        mcp_tools, connection, server_name=server_name
-    )
+    listed_tool_names = {mcp_tool.name for mcp_tool in mcp_tools}
+    mcp_tools = filter_tools_by_read_only_allowlist(mcp_tools, connection)
+    if read_only_tool_names(connection) is not None:
+        # The host calls an issuing tool itself, so a binding is kept only when
+        # its issuer is allowlisted too; otherwise the allowlist would not hold.
+        kept_tool_names = {mcp_tool.name for mcp_tool in mcp_tools}
+        bindings_by_tool = {
+            tool_name: binding
+            for tool_name, binding in bindings_by_tool.items()
+            if binding.issuing_tool_name in kept_tool_names
+        }
     adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
         issuer = issuers_by_tool.get(mcp_tool.name)
@@ -5568,7 +5580,6 @@ async def _load_direct_mcp_tools(
             )
             continue
 
-    listed_tool_names = {mcp_tool.name for mcp_tool in mcp_tools}
     for issuing_tool_name in issuers_by_tool:
         if issuing_tool_name not in listed_tool_names:
             logger.warning(

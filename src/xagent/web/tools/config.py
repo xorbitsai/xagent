@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 from typing import (
     Any,
     Awaitable,
@@ -2037,6 +2037,10 @@ def _filter_excluded_media_models(
     return kept, replacement
 
 
+class _CatalogIdentityUnresolved(Exception):
+    """A server claims a catalog app that cannot be resolved to exactly one."""
+
+
 class WebToolConfig(BaseToolConfig):
     """Web-specific tool configuration that loads from database."""
 
@@ -2259,6 +2263,9 @@ class WebToolConfig(BaseToolConfig):
         self._cached_music_models: Optional[Dict[str, Any]] = None
         self._cached_music_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
+        # Catalog projection for one MCP config-load pass (see
+        # ``_catalog_entries_for_pass``); reset at the start of every pass.
+        self._catalog_entries: tuple[Any, ...] | None = None
         self._mcp_hook_token_cache_expires_at: datetime | None = None
         self._mcp_hook_token_cache_uncacheable = False
         self._mcp_hook_generation_at_load: int | None = None
@@ -2599,6 +2606,7 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_hook_token_cache_uncacheable = False
         self._mcp_hook_generation_at_load = current_generation
         self._mcp_hook_resolution_failed = False
+        self._catalog_entries = None
 
     def _store_mcp_config_cache_if_cacheable(
         self, configs: List[Dict[str, Any]]
@@ -5073,6 +5081,9 @@ class WebToolConfig(BaseToolConfig):
             actor_catalog_app_info is not None
             and actor_catalog_app_info.get("auth_type") == "builtin_oauth"
         )
+        # The catalog app resolved on the way, so the allowlist lookup agrees
+        # with it instead of resolving the row a second time.
+        resolved_catalog_app: Mapping[str, Any] | None = actor_catalog_app_info
         if actor_builtin_invalid:
             policy_diagnostic = {
                 "code": actor_builtin_invalid_reason,
@@ -5155,6 +5166,7 @@ class WebToolConfig(BaseToolConfig):
                 if actor_catalog_app_info is not None
                 else get_app_for_mcp_server(self.db, server)
             )
+            resolved_catalog_app = app_info
             if app_info is None:
                 logger.warning(
                     "OAuth MCP server '%s' has no matching catalog app",
@@ -5657,9 +5669,18 @@ class WebToolConfig(BaseToolConfig):
         transport_config["concurrent_tools"] = list(
             getattr(server, "concurrent_tools", None) or []
         )
-        read_only_tools = self._catalog_read_only_tools(server)
-        if read_only_tools is not None:
-            transport_config["read_only_tools"] = read_only_tools
+        try:
+            transport_config.update(
+                self._catalog_read_only_tools(server, resolved_catalog_app)
+            )
+        except _CatalogIdentityUnresolved:
+            logger.warning(
+                "MCP server '%s' claims a catalog identity that does not resolve",
+                getattr(server, "name", "<unknown>"),
+            )
+            return self._build_unavailable_mcp_config(
+                server=server, reason="catalog_app_not_found"
+            )
 
         # Add Docker-specific config if managed internally
         if server.managed == "internal":
@@ -5688,92 +5709,92 @@ class WebToolConfig(BaseToolConfig):
         logger.debug(f"Loaded MCP server config: {server.name} ({server.transport})")
         return config
 
-    def _catalog_read_only_tools(self, server: Any) -> list[str] | None:
-        """Return the catalog app's ``launch_config["read_only_tools"]``.
+    def _catalog_entries_for_pass(self) -> tuple[Any, ...] | None:
+        """The catalog projection for this config-load pass, or ``None`` w/o a db.
 
-        ``None`` means "no allowlist": the loader keeps every tool. Catalog
-        connect stamps neither ``auth.app_id`` nor a marker on API-key and
-        keyless rows (they are identified by ``name == app_id``), so the app is
-        resolved with the canonical ``get_app_for_mcp_server``.
+        Read once (one query) on first use and dropped by
+        ``_reset_mcp_config_load_cache_state``, which starts every load pass, so
+        an admin's allowlist change or app deletion is seen on the next load.
+        Copies, not session-bound ORM rows: the session behind ``self.db`` can be
+        closed between passes.
+        """
+        if self.db is None:
+            return None
+        if self._catalog_entries is None:
+            from ...web.mcp_apps import load_catalog_entries
 
-        Failure direction, per row identity:
+            self._catalog_entries = load_catalog_entries(self.db)
+        return self._catalog_entries
+
+    def _catalog_read_only_tools(
+        self, server: Any, resolved_app: Mapping[str, Any] | None = None
+    ) -> Dict[str, Any]:
+        """Return ``{"read_only_tools": <declared>}`` for the server's catalog app.
+
+        ``{}`` means no allowlist is declared and the loader keeps every tool.
+        The declared value is passed through untouched (the loader parses it, see
+        ``mcp_tool_allowlist``); a key present with null is therefore declared.
+        Raises ``_CatalogIdentityUnresolved`` when the row cannot be tied to a
+        catalog app safely (see below); the builder reports it as unavailable.
+
+        ``resolved_app`` is the app the builder already resolved (OAuth branch,
+        actor catalog); when given it is used as is. Otherwise, per row identity:
 
         * A row that *claims* a catalog identity (``auth.app_id`` or an
-          ``auth.builtin_provenance`` marker) whose app cannot be resolved fails
-          closed: ``[]``, so it loads no tools rather than all of them. The
-          claimed identity is looked up by id, never by name, so the only way
-          to miss is a catalog app that no longer exists.
-        * An unstamped row resolves by name, and only when exactly one app
-          owns the name. Unresolved or ambiguous means "not provably a catalog
-          row": it stays unfiltered, like any custom server.
-        * A resolved app without a ``read_only_tools`` key is unfiltered. A key that
-          is present with null or any non-list value is ``[]`` (fail closed).
+          ``auth.builtin_provenance`` marker of the ``xagent`` registry) is looked
+          up by that id only. If the app is gone the row is unresolved. ``auth``
+          is caller-editable on custom servers and no cheaper evidence exists,
+          so a custom server carrying a stray ``app_id`` is reported unavailable
+          too; that only affects the caller's own server.
+        * An unstamped row (API-key and keyless catalog connect stamp nothing)
+          matches by name. No match is a plain custom server: unfiltered. More
+          than one app owning the name is unresolved when any of them declares
+          an allowlist, and unfiltered otherwise.
 
-        Cost: the catalog table is read once per config instance (one query,
-        cached on the instance) and every server resolves in memory, so a
-        custom server adds no query of its own. The cache lives as long as the
-        instance, like the MCP config cache it feeds.
+        Without a database there is no catalog to consult: unfiltered.
         """
         from ...builtin_identity import builtin_provenance_identity
-        from ...web.mcp_apps import (
-            get_app_for_mcp_server,
-            load_detached_catalog_snapshot,
-        )
+        from ...web.mcp_apps import match_catalog_entries
 
-        auth = getattr(server, "auth", None)
-        claimed_app_id: str | None = None
-        if isinstance(auth, Mapping):
-            if "app_id" in auth:
-                raw = auth.get("app_id")
-                claimed_app_id = raw if isinstance(raw, str) and raw else ""
-            elif "builtin_provenance" in auth:
-                identity = builtin_provenance_identity(auth.get("builtin_provenance"))
-                if identity is None:
-                    claimed_app_id = ""  # malformed marker: claims, cannot resolve
-                elif identity[0] == "xagent":
-                    claimed_app_id = identity[1]
-                # A marker from another registry is not a claim on this catalog.
-
-        snapshot = getattr(self, "_catalog_snapshot", None)
-        if snapshot is None:
-            # Plain copies, not ORM rows: this is cached on the instance, and
-            # the session behind ``self.db`` can be rolled back and closed
-            # between builds, which detaches live rows.
-            snapshot = load_detached_catalog_snapshot(self.db)
-            self._catalog_snapshot = snapshot
-
-        if claimed_app_id is not None:
-            # Resolve by the claimed id only: a stamped row is never matched by
-            # name (``get_app_for_mcp_server`` does the same for ``app_id``).
-            lookup = SimpleNamespace(name=server.name, auth={"app_id": claimed_app_id})
-            app = (
-                get_app_for_mcp_server(self.db, lookup, snapshot=snapshot)
-                if claimed_app_id
-                else None
-            )
-            if app is None:
-                logger.warning(
-                    "MCP server '%s' claims a catalog identity that does not "
-                    "resolve; loading no tools",
-                    getattr(server, "name", "<unknown>"),
-                )
-                return []
-        else:
-            app = get_app_for_mcp_server(self.db, server, snapshot=snapshot)
-            if app is None:
-                return None
+        app: Mapping[str, Any] | None = resolved_app
+        if app is None:
+            entries = self._catalog_entries_for_pass()
+            if entries is None:
+                return {}
+            auth = getattr(server, "auth", None)
+            claimed: str | None = None
+            if isinstance(auth, Mapping):
+                if "app_id" in auth:
+                    raw = auth.get("app_id")
+                    claimed = raw if isinstance(raw, str) else ""
+                elif "builtin_provenance" in auth:
+                    identity = builtin_provenance_identity(
+                        auth.get("builtin_provenance")
+                    )
+                    if identity is None:
+                        claimed = ""  # malformed marker: claims, cannot resolve
+                    elif identity[0] == "xagent":
+                        claimed = identity[1]
+                    # A marker from another registry is not a claim here.
+            if claimed is not None:
+                matches = match_catalog_entries(entries, app_id=claimed)
+                if not matches:
+                    raise _CatalogIdentityUnresolved
+            else:
+                matches = match_catalog_entries(entries, name=str(server.name))
+                if len(matches) > 1 and any(
+                    "read_only_tools" in (m.app().get("launch_config") or {})
+                    for m in matches
+                ):
+                    raise _CatalogIdentityUnresolved
+                if len(matches) != 1:
+                    return {}
+            app = matches[0].app()
 
         launch_config = app.get("launch_config")
-        if not isinstance(launch_config, Mapping) or (
-            "read_only_tools" not in launch_config
-        ):
-            return None  # key absent: no allowlist declared
-        # Present means declared: an explicit null is a malformed declaration
-        # and fails closed like any other non-list value.
-        declared = launch_config["read_only_tools"]
-        if isinstance(declared, (list, tuple)):
-            return [str(name) for name in declared]
-        return []
+        if isinstance(launch_config, Mapping) and "read_only_tools" in launch_config:
+            return {"read_only_tools": launch_config["read_only_tools"]}
+        return {}
 
     async def _load_mcp_server_config(
         self,

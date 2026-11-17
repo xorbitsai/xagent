@@ -45,8 +45,8 @@ from ..services.task_agent_execution import load_agent_execution_detail
 from ..services.triggers import unregister_deleted_trigger_bindings
 from ..services.widget_voice_switch import (
     OwnerCaller,
-    OwnerWidgetVoiceRequest,
     OwnerWidgetVoiceResponse,
+    WidgetVoiceSwitchRequest,
     get_workforce_voice,
     put_workforce_voice,
 )
@@ -1160,7 +1160,7 @@ async def get_workforce_widget_voice(
 @router.put("/{workforce_id}/widget-voice", response_model=OwnerWidgetVoiceResponse)
 async def put_workforce_widget_voice(
     workforce_id: int,
-    request: OwnerWidgetVoiceRequest,
+    request: WidgetVoiceSwitchRequest,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> OwnerWidgetVoiceResponse:

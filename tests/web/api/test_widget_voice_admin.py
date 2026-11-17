@@ -25,6 +25,7 @@ from xagent.web.schemas import v1 as v1_schemas
 from xagent.web.services import agent_management
 from xagent.web.services.agent_store import _AGENT_UPDATE_FIELDS
 from xagent.web.services.widget_voice import WidgetVoiceAvailability
+from xagent.web.services.widget_voice_switch import WidgetVoiceTarget
 
 from .conftest import (
     _admin_headers,
@@ -335,9 +336,9 @@ def test_admin_put_writes_nothing_when_the_target_disappears(
 async def test_admin_target_refuses_a_request_session_with_uncommitted_work() -> None:
     reads: list[int] = []
 
-    def read() -> admin_widget_voice._Target:
+    def read() -> WidgetVoiceTarget:
         reads.append(1)
-        return admin_widget_voice._Target(1, False)
+        return WidgetVoiceTarget(1, False)
 
     db = _direct_db_session()
     try:

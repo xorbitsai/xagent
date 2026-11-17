@@ -45,7 +45,7 @@ from .workforce_access import can_edit_workforce
 logger = logging.getLogger(__name__)
 
 
-class OwnerWidgetVoiceRequest(BaseModel):
+class WidgetVoiceSwitchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     enabled: bool
@@ -73,8 +73,9 @@ class OwnerCaller:
 
 
 @dataclass(frozen=True)
-class _Target:
-    """What a route needs from the target row, detached from its session."""
+class WidgetVoiceTarget:
+    """What the owner and administrator switch routes need from the target row,
+    detached from its session."""
 
     owner_user_id: int
     enabled: bool
@@ -109,10 +110,12 @@ def _owned_agent(
     return agent
 
 
-def _read_agent(caller: OwnerCaller, agent_id: int) -> _Target:
+def _read_agent(caller: OwnerCaller, agent_id: int) -> WidgetVoiceTarget:
     with get_session_local()() as db:
         agent = _owned_agent(db, caller, agent_id)
-        return _Target(int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled))
+        return WidgetVoiceTarget(
+            int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled)
+        )
 
 
 def _write_agent(caller: OwnerCaller, agent_id: int, enabled: bool) -> bool:
@@ -198,7 +201,7 @@ def _guard_write(
 
 def _read_workforce(
     caller: OwnerCaller, workforce_id: int, write_value: bool | None
-) -> _Target | None:
+) -> WidgetVoiceTarget | None:
     """The workforce's owner and switch, or ``None`` when it has no deployment
     row (reads only; a write to such a workforce is a 404)."""
     with get_session_local()() as db:
@@ -208,7 +211,7 @@ def _read_workforce(
             _guard_write(workforce, deployment, write_value)
         if deployment is None:
             return None
-        return _Target(
+        return WidgetVoiceTarget(
             int(cast(Any, workforce.owner_user_id)),
             bool(deployment.widget_voice_enabled),
         )

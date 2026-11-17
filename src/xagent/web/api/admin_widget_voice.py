@@ -13,11 +13,10 @@ voice provider, whether the switch is on or off.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent
@@ -32,15 +31,10 @@ from ..services.widget_voice import (
     release_request_connection,
     resolve_widget_voice_availability,
 )
+from ..services.widget_voice_switch import WidgetVoiceSwitchRequest, WidgetVoiceTarget
 from .admin_memory_embedding_authority import require_admin
 
 router = APIRouter(prefix="/api/admin/widget-voice", tags=["admin-widget-voice"])
-
-
-class WidgetVoiceSwitchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    enabled: bool
 
 
 class WidgetVoiceSwitchResponse(BaseModel):
@@ -81,18 +75,12 @@ def _workforce_deployment(
     return workforce, deployment
 
 
-@dataclass(frozen=True)
-class _Target:
-    """What the switch routes need from the target row, detached from its session."""
-
-    owner_user_id: int
-    enabled: bool
-
-
-def _read_agent(agent_id: int) -> _Target:
+def _read_agent(agent_id: int) -> WidgetVoiceTarget:
     with get_session_local()() as db:
         agent = _agent(db, agent_id)
-        return _Target(int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled))
+        return WidgetVoiceTarget(
+            int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled)
+        )
 
 
 def _write_agent(agent_id: int, enabled: bool) -> None:
@@ -102,10 +90,10 @@ def _write_agent(agent_id: int, enabled: bool) -> None:
         db.commit()
 
 
-def _read_workforce(workforce_id: int) -> _Target:
+def _read_workforce(workforce_id: int) -> WidgetVoiceTarget:
     with get_session_local()() as db:
         workforce, deployment = _workforce_deployment(db, workforce_id)
-        return _Target(
+        return WidgetVoiceTarget(
             int(cast(Any, workforce.owner_user_id)),
             bool(deployment.widget_voice_enabled),
         )
@@ -118,7 +106,9 @@ def _write_workforce(workforce_id: int, enabled: bool) -> None:
         db.commit()
 
 
-async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
+async def _target(
+    db: Session, read: Callable[[], WidgetVoiceTarget]
+) -> WidgetVoiceTarget:
     """Read the target in a short session of its own.
 
     ``db`` is the request session the admin check ran on; its connection goes
@@ -129,7 +119,9 @@ async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
     return await run_db_io_cancellation_safe(read)
 
 
-async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchResponse:
+async def _get(
+    db: Session, read: Callable[[], WidgetVoiceTarget]
+) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
     availability = await resolve_widget_voice_availability(
         target.owner_user_id, request_db=db
@@ -139,7 +131,7 @@ async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchRes
 
 async def _put(
     db: Session,
-    read: Callable[[], _Target],
+    read: Callable[[], WidgetVoiceTarget],
     write: Callable[[], None],
     enabled: bool,
 ) -> WidgetVoiceSwitchResponse:

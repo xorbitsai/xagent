@@ -78,8 +78,8 @@ from ..services.execution_budget import budget_policy_provider
 from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
 from ..services.widget_voice_switch import (
     OwnerCaller,
-    OwnerWidgetVoiceRequest,
     OwnerWidgetVoiceResponse,
+    WidgetVoiceSwitchRequest,
     get_agent_voice,
     put_agent_voice,
 )
@@ -1678,7 +1678,7 @@ async def get_agent_widget_voice(
 @router.put("/{agent_id}/widget-voice", response_model=OwnerWidgetVoiceResponse)
 async def put_agent_widget_voice(
     agent_id: int,
-    request: OwnerWidgetVoiceRequest,
+    request: WidgetVoiceSwitchRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> OwnerWidgetVoiceResponse:

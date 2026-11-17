@@ -34,6 +34,13 @@ describe("pageMayUseMicrophone", () => {
     expect(pageMayUseMicrophone()).toBe(expected)
   })
 
+  it("prefers document.permissionsPolicy over document.featurePolicy when both exist", () => {
+    Object.defineProperty(window, "isSecureContext", { configurable: true, value: true })
+    define("permissionsPolicy", allow(true))
+    define("featurePolicy", allow(false))
+    expect(pageMayUseMicrophone()).toBe(true)
+  })
+
   it.each([
     { label: "false", value: false },
     { label: "missing", value: undefined },

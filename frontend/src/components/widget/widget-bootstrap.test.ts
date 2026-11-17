@@ -88,6 +88,7 @@ describe("widget bootstrap", () => {
       // [label, data-voice value, microphone delegated, expects an invalid-value warning]
       ["missing", undefined, true, false],
       ["empty", "", true, false],
+      ["whitespace only", "   ", true, false],
       ["true", "true", true, false],
       ["padded upper-case TRUE", " TRUE ", true, false],
       ["false", "false", false, false],

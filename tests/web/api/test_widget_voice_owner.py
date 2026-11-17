@@ -19,7 +19,7 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce
-from xagent.web.services import agent_team_scope, widget_voice_switch
+from xagent.web.services import agent_team_scope, widget_voice, widget_voice_switch
 from xagent.web.services.agent_team_scope import AgentTeamScope
 from xagent.web.services.widget_voice import WidgetVoiceAvailability
 
@@ -562,19 +562,20 @@ def test_owner_voice_uses_plain_user_values(
         headers = bob if caller == "owner" else admin
         read = lambda: _deployment_switch(workforce_id)  # noqa: E731
 
-    real_release = widget_voice_switch.release_request_connection
+    real_release = widget_voice.release_db_connection_if_clean
 
-    def release_then_poison(db) -> None:
-        real_release(db)
+    def release_then_poison(db):
+        released = real_release(db)
 
         def refuse(*_args, **_kwargs):
             raise AssertionError("request session used after its connection was freed")
 
         for name in ("execute", "query", "get", "scalars", "scalar", "connection"):
             setattr(db, name, refuse)
+        return released
 
     monkeypatch.setattr(
-        widget_voice_switch, "release_request_connection", release_then_poison
+        widget_voice, "release_db_connection_if_clean", release_then_poison
     )
     response = client.put(path, headers=headers, json={"enabled": True})
     assert response.status_code == 200, response.text

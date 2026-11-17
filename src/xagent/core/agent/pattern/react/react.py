@@ -91,6 +91,7 @@ from ....tools.adapters.vibe.interaction_types import (
     OPTIONS_REQUIRED_GUIDANCE,
     SUGGESTED_VALUE_GUIDANCE,
     degrade_options_less_pickers,
+    is_live_widget,
     lacks_required_options,
 )
 from ....tools.adapters.vibe.mcp_approval_gate import (
@@ -5284,6 +5285,7 @@ class ReActPattern(AgentPattern):
         interactions: list[dict[str, Any]],
         metadata: dict[str, Any],
         visible: bool = True,
+        allow_live_widgets: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Publish a message that suspends the run, and return what it carried.
 
@@ -5303,7 +5305,14 @@ class ReActPattern(AgentPattern):
         """
 
         published = list(interactions)
-        if not any(_is_answerable(item) for item in published):
+        # ``allow_live_widgets`` is passed only for tool-authored interactions:
+        # a tool's own widget (``live_widget``) is the control the user acts on,
+        # so no text box is added beside it. Model-authored questions never
+        # pass it, so the guarantee above is unchanged for them.
+        if not any(
+            _is_answerable(item) or (allow_live_widgets and is_live_widget(item))
+            for item in published
+        ):
             appended = dict(DEFAULT_WAITING_INTERACTION)
             appended["field"] = _unique_field(
                 str(appended["field"]),
@@ -5639,6 +5648,7 @@ class ReActPattern(AgentPattern):
             message=message,
             message_type=message_type,
             interactions=interactions,
+            allow_live_widgets=True,
             metadata={
                 "tool_calls": [
                     self._tool_message_source(

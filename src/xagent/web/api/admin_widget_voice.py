@@ -1,21 +1,28 @@
 """Administrator switch for widget voice on an agent or a workforce.
 
-This is the only writer of ``agents.widget_voice_enabled`` and
-``deployments.widget_voice_enabled``: owners cannot turn widget voice on for
-their own widgets. ``available`` reports whether both of the deployment's voice
-models (speech recognition and speech synthesis) are usable for the entity's
-owner, so a switch that is on but has no
-effect can be explained.
+Writes ``agents.widget_voice_enabled`` and ``deployments.widget_voice_enabled``
+for any agent or workforce. Owners write the same columns for the ones they can
+edit through ``/api/agents/{id}/widget-voice`` and
+``/api/workforces/{id}/widget-voice``; the last write wins. ``available``
+reports whether both of the deployment's voice models (speech recognition and
+speech synthesis) are usable for the entity's owner, so a switch that is on but
+has no effect can be explained. Unlike the owner routes, these always ask the
+voice provider, whether the switch is on or off.
+
+The request body, the target row view and the write log are the owner routes'
+(``services.widget_voice_switch``): each write logs the same fields. Unlike an
+owner write, an administrator write takes no row lock, because it does not
+depend on the value it replaces, and it may turn voice on for a workforce that
+is not active, so the switch can be set before the workforce is activated.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..models.agent import Agent
@@ -30,15 +37,14 @@ from ..services.widget_voice import (
     release_request_connection,
     resolve_widget_voice_availability,
 )
+from ..services.widget_voice_switch import (
+    WidgetVoiceSwitchRequest,
+    WidgetVoiceTarget,
+    log_switch_write,
+)
 from .admin_memory_embedding_authority import require_admin
 
 router = APIRouter(prefix="/api/admin/widget-voice", tags=["admin-widget-voice"])
-
-
-class WidgetVoiceSwitchRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    enabled: bool
 
 
 class WidgetVoiceSwitchResponse(BaseModel):
@@ -79,44 +85,46 @@ def _workforce_deployment(
     return workforce, deployment
 
 
-@dataclass(frozen=True)
-class _Target:
-    """What the switch routes need from the target row, detached from its session."""
-
-    owner_user_id: int
-    enabled: bool
-
-
-def _read_agent(agent_id: int) -> _Target:
+def _read_agent(agent_id: int) -> WidgetVoiceTarget:
     with get_session_local()() as db:
         agent = _agent(db, agent_id)
-        return _Target(int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled))
+        return WidgetVoiceTarget(
+            int(cast(Any, agent.user_id)), bool(agent.widget_voice_enabled)
+        )
 
 
-def _write_agent(agent_id: int, enabled: bool) -> None:
+def _write_agent(agent_id: int, enabled: bool) -> bool:
+    """Write the switch; return the value read just before it (no row lock)."""
     with get_session_local()() as db:
         agent = _agent(db, agent_id)
+        previous = bool(agent.widget_voice_enabled)
         cast(Any, agent).widget_voice_enabled = enabled
         db.commit()
+        return previous
 
 
-def _read_workforce(workforce_id: int) -> _Target:
+def _read_workforce(workforce_id: int) -> WidgetVoiceTarget:
     with get_session_local()() as db:
         workforce, deployment = _workforce_deployment(db, workforce_id)
-        return _Target(
+        return WidgetVoiceTarget(
             int(cast(Any, workforce.owner_user_id)),
             bool(deployment.widget_voice_enabled),
         )
 
 
-def _write_workforce(workforce_id: int, enabled: bool) -> None:
+def _write_workforce(workforce_id: int, enabled: bool) -> bool:
+    """Write the switch; return the value read just before it (no row lock)."""
     with get_session_local()() as db:
         _, deployment = _workforce_deployment(db, workforce_id)
+        previous = bool(deployment.widget_voice_enabled)
         cast(Any, deployment).widget_voice_enabled = enabled
         db.commit()
+        return previous
 
 
-async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
+async def _target(
+    db: Session, read: Callable[[], WidgetVoiceTarget]
+) -> WidgetVoiceTarget:
     """Read the target in a short session of its own.
 
     ``db`` is the request session the admin check ran on; its connection goes
@@ -127,7 +135,9 @@ async def _target(db: Session, read: Callable[[], _Target]) -> _Target:
     return await run_db_io_cancellation_safe(read)
 
 
-async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchResponse:
+async def _get(
+    db: Session, read: Callable[[], WidgetVoiceTarget]
+) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
     availability = await resolve_widget_voice_availability(
         target.owner_user_id, request_db=db
@@ -137,9 +147,13 @@ async def _get(db: Session, read: Callable[[], _Target]) -> WidgetVoiceSwitchRes
 
 async def _put(
     db: Session,
-    read: Callable[[], _Target],
-    write: Callable[[], None],
+    read: Callable[[], WidgetVoiceTarget],
+    write: Callable[[], bool],
     enabled: bool,
+    *,
+    actor_user_id: int,
+    id_key: Literal["agent_id", "workforce_id"],
+    entity_id: int,
 ) -> WidgetVoiceSwitchResponse:
     target = await _target(db, read)
     # Resolve before writing: a lookup that raises leaves the switch as it was.
@@ -150,7 +164,17 @@ async def _put(
     # owner does not matter to the write: the switch belongs to the row, not to
     # its owner. ``available`` in the response describes the owner read before
     # the lookup.
-    await run_db_io_cancellation_safe(write)
+    previous = await run_db_io_cancellation_safe(write)
+    log_switch_write(
+        set_by="administrator",
+        id_key=id_key,
+        entity_id=entity_id,
+        actor_user_id=actor_user_id,
+        actor_is_admin=True,
+        enabled=enabled,
+        previous=previous,
+        available=availability.available,
+    )
     return _response(enabled, availability)
 
 
@@ -167,14 +191,19 @@ async def get_agent_widget_voice(
 async def put_agent_widget_voice(
     agent_id: int,
     request: WidgetVoiceSwitchRequest,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> WidgetVoiceSwitchResponse:
+    # Plain value first: the request session returns its connection next.
+    actor_user_id = int(cast(Any, admin.id))
     return await _put(
         db,
         lambda: _read_agent(agent_id),
         lambda: _write_agent(agent_id, request.enabled),
         request.enabled,
+        actor_user_id=actor_user_id,
+        id_key="agent_id",
+        entity_id=agent_id,
     )
 
 
@@ -191,12 +220,17 @@ async def get_workforce_widget_voice(
 async def put_workforce_widget_voice(
     workforce_id: int,
     request: WidgetVoiceSwitchRequest,
-    _admin: User = Depends(require_admin),
+    admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> WidgetVoiceSwitchResponse:
+    # Plain value first: the request session returns its connection next.
+    actor_user_id = int(cast(Any, admin.id))
     return await _put(
         db,
         lambda: _read_workforce(workforce_id),
         lambda: _write_workforce(workforce_id, request.enabled),
         request.enabled,
+        actor_user_id=actor_user_id,
+        id_key="workforce_id",
+        entity_id=workforce_id,
     )

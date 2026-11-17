@@ -4291,6 +4291,21 @@ const zh = {
     create_key: "创建 Key",
     no_keys: "还没有 API Key。"
   },
+  widget_voice_setting: {
+    title: "语音通话",
+    description: "允许访客在这个聊天窗里语音通话。",
+    unavailable_not_configured: "语音已打开，但当前部署没有配置语音模型，访客暂时看不到通话按钮。请联系平台支持。",
+    unavailable_models: "语音已打开，但语音服务当前不可用，访客暂时看不到通话按钮。请联系平台支持。",
+    requirements_note: "访客要看到通话按钮，你的网站和本聊天服务都需要使用 https。如果你的网页本身被放在另一个框架（iframe）里，那个框架也要允许麦克风。在网站或外层框架禁止麦克风的页面上，Chrome 和 Edge 不显示按钮；Safari 和 Firefox 会显示按钮，通话时提示无法使用麦克风。",
+    refresh_note: "已经打开着的网页刷新后生效。",
+    opt_out_note: "语音通话由「语音通话」开关控制。某个页面不想要语音，在该页面的 script 标签上加 data-voice=\"false\"。",
+    loading: "读取中…",
+    load_failed: "无法读取语音设置。",
+    retry: "重试",
+    saved: "语音设置已更新",
+    save_failed: "语音设置保存失败，请重试。",
+    toggle_label: "在这个聊天窗里提供语音通话"
+  },
   api_key: {
     title: "API Key",
     subtitle: "SDK / REST API 凭证",

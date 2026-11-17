@@ -191,6 +191,12 @@ const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDe
 const status = (code: number) => new Response(null, { status: code })
 const ttsUrl = `${window.location.origin}/v1/external/chat/sessions/voice/tts`
 
+// jsdom has no window.isSecureContext, which pageMayUseMicrophone() reads.
+const secureContextDescriptor = Object.getOwnPropertyDescriptor(window, "isSecureContext")
+function setSecureContext(value: boolean) {
+  Object.defineProperty(window, "isSecureContext", { configurable: true, value })
+}
+
 function renderPage(options: { capabilities?: unknown; voiceParam?: boolean } = {}) {
   const { voiceParam = true } = options
   window.history.replaceState({}, "", voiceParam ? "/widget/session?voice=1" : "/widget/session")
@@ -225,10 +231,13 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock)
   vi.stubGlobal("WebSocket", FakeSocket)
   vi.stubGlobal("parent", { postMessage: vi.fn() })
+  setSecureContext(true)
 })
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  if (secureContextDescriptor) Object.defineProperty(window, "isSecureContext", secureContextDescriptor)
+  else delete (window as { isSecureContext?: unknown }).isSecureContext
   if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices)
   else delete (navigator as { mediaDevices?: unknown }).mediaDevices
   window.history.replaceState({}, "", "/")
@@ -236,18 +245,43 @@ afterEach(() => {
 
 describe("session widget voice call offer", () => {
   it.each([
-    { label: "voice on, voice=1", capabilities: { voice: true }, voiceParam: true, shown: true },
-    { label: "voice on, no voice=1", capabilities: { voice: true }, voiceParam: false, shown: false },
-    { label: "voice off, voice=1", capabilities: { voice: false }, voiceParam: true, shown: false },
-    { label: "voice off, no voice=1", capabilities: { voice: false }, voiceParam: false, shown: false },
-    { label: "voice missing, voice=1", capabilities: undefined, voiceParam: true, shown: false },
-    { label: "voice not a boolean, voice=1", capabilities: { voice: "true" }, voiceParam: true, shown: false },
-  ])("offers the call only when it may: $label", ({ capabilities, voiceParam, shown }) => {
+    { label: "voice on, voice=1", capabilities: { voice: true }, voiceParam: true, secure: true, shown: true },
+    { label: "voice on, no voice=1", capabilities: { voice: true }, voiceParam: false, secure: true, shown: false },
+    { label: "voice off, voice=1", capabilities: { voice: false }, voiceParam: true, secure: true, shown: false },
+    { label: "voice off, no voice=1", capabilities: { voice: false }, voiceParam: false, secure: true, shown: false },
+    { label: "voice missing, voice=1", capabilities: undefined, voiceParam: true, secure: true, shown: false },
+    { label: "voice not a boolean, voice=1", capabilities: { voice: "true" }, voiceParam: true, secure: true, shown: false },
+    { label: "voice on, voice=1, page not secure", capabilities: { voice: true }, voiceParam: true, secure: false, shown: false },
+  ])("offers the call only when it may: $label", ({ capabilities, voiceParam, secure, shown }) => {
+    setSecureContext(secure)
     renderPage({ capabilities, voiceParam })
     expect(screen.queryByText("voice:start") !== null).toBe(shown)
     expect(voice.props !== null).toBe(shown)
     expect(voiceRequests()).toEqual([])
     expect(sockets).toEqual([])
+  })
+
+  it("hides the call where a permissions policy denies the microphone", () => {
+    const policy = { allowsFeature: vi.fn(() => false) }
+    Object.defineProperty(document, "featurePolicy", { configurable: true, value: policy })
+    try {
+      renderPage()
+      expect(policy.allowsFeature).toHaveBeenCalledWith("microphone")
+      expect(screen.queryByText("voice:start")).toBeNull()
+      expect(voice.props).toBeNull()
+    } finally {
+      delete (document as { featurePolicy?: unknown }).featurePolicy
+    }
+  })
+
+  it("shows the call when a later session payload offers voice, without remounting the page", () => {
+    renderPage({ capabilities: { voice: false } })
+    const start = screen.getByTestId("start")
+    expect(screen.queryByText("voice:start")).toBeNull()
+    setBridge("active", session({ voice: true }))
+    rerender()
+    expect(screen.getByText("voice:start")).toBeInTheDocument()
+    expect(screen.getByTestId("start")).toBe(start)
   })
 
   it("keeps the offer while the token is refreshed", () => {

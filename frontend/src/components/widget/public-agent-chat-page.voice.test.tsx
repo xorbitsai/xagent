@@ -94,6 +94,16 @@ const auth = (extra: Record<string, unknown>) => ({
 })
 const json = (payload: unknown) => new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } })
 
+// jsdom has no window.isSecureContext, which pageMayUseMicrophone() reads.
+const secureContextDescriptor = Object.getOwnPropertyDescriptor(window, "isSecureContext")
+function setSecureContext(value: boolean) {
+  Object.defineProperty(window, "isSecureContext", { configurable: true, value })
+}
+function restoreSecureContext() {
+  if (secureContextDescriptor) Object.defineProperty(window, "isSecureContext", secureContextDescriptor)
+  else delete (window as { isSecureContext?: unknown }).isSecureContext
+}
+
 function setFrame({ topLevel, voiceParam }: { topLevel: boolean; voiceParam: boolean }) {
   Object.defineProperty(window, "top", { configurable: true, value: topLevel ? window : {} })
   window.history.replaceState({}, "", voiceParam ? "/widget/chat?voice=1" : "/widget/chat")
@@ -123,10 +133,12 @@ beforeEach(() => {
   postToParent.mockImplementation(answerPromptContext)
   vi.stubGlobal("parent", { postMessage: postToParent })
   setFrame({ topLevel: false, voiceParam: true })
+  setSecureContext(true)
 })
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  restoreSecureContext()
   fetchMock.mockReset(); postToParent.mockReset()
   Object.defineProperty(window, "top", { configurable: true, value: window })
   window.history.replaceState({}, "", "/")
@@ -134,18 +146,34 @@ afterEach(() => {
 
 describe("widget voice call offer", () => {
   it.each([
-    { label: "voice on, iframe with voice=1", voiceEnabled: true, topLevel: false, voiceParam: true, shown: true },
-    { label: "voice on, iframe without voice=1", voiceEnabled: true, topLevel: false, voiceParam: false, shown: false },
-    { label: "voice off, iframe with voice=1", voiceEnabled: false, topLevel: false, voiceParam: true, shown: false },
-    { label: "voice off, iframe without voice=1", voiceEnabled: false, topLevel: false, voiceParam: false, shown: false },
-    { label: "voice on, top-level page", voiceEnabled: true, topLevel: true, voiceParam: false, shown: true },
-    { label: "voice flag missing, top-level page", voiceEnabled: undefined, topLevel: true, voiceParam: false, shown: false },
-  ])("offers the call only when it may: $label", async ({ voiceEnabled, topLevel, voiceParam, shown }) => {
+    { label: "voice on, iframe with voice=1", voiceEnabled: true, topLevel: false, voiceParam: true, secure: true, shown: true },
+    { label: "voice on, iframe without voice=1", voiceEnabled: true, topLevel: false, voiceParam: false, secure: true, shown: false },
+    { label: "voice off, iframe with voice=1", voiceEnabled: false, topLevel: false, voiceParam: true, secure: true, shown: false },
+    { label: "voice off, iframe without voice=1", voiceEnabled: false, topLevel: false, voiceParam: false, secure: true, shown: false },
+    { label: "voice on, top-level page", voiceEnabled: true, topLevel: true, voiceParam: false, secure: true, shown: true },
+    { label: "voice flag missing, top-level page", voiceEnabled: undefined, topLevel: true, voiceParam: false, secure: true, shown: false },
+    { label: "voice on, iframe with voice=1, page not secure", voiceEnabled: true, topLevel: false, voiceParam: true, secure: false, shown: false },
+    { label: "voice on, top-level page, page not secure", voiceEnabled: true, topLevel: true, voiceParam: false, secure: false, shown: false },
+  ])("offers the call only when it may: $label", async ({ voiceEnabled, topLevel, voiceParam, secure, shown }) => {
     setFrame({ topLevel, voiceParam })
+    setSecureContext(secure)
     await renderPage(voiceEnabled === undefined ? {} : { voice_enabled: voiceEnabled })
     expect(screen.queryByText("voice:start") !== null).toBe(shown)
     expect(voice.props !== null).toBe(shown)
     expect(fetchMock.mock.calls.map(([url]) => String(url)).filter(url => url.includes("/voice/"))).toEqual([])
+  })
+
+  it("hides the call where a permissions policy denies the microphone", async () => {
+    const policy = { allowsFeature: vi.fn(() => false) }
+    Object.defineProperty(document, "featurePolicy", { configurable: true, value: policy })
+    try {
+      await renderPage({ voice_enabled: true })
+      expect(policy.allowsFeature).toHaveBeenCalledWith("microphone")
+      expect(screen.queryByText("voice:start")).toBeNull()
+      expect(voice.props).toBeNull()
+    } finally {
+      delete (document as { featurePolicy?: unknown }).featurePolicy
+    }
   })
 
   it("never offers the call on a share link", async () => {

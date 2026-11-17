@@ -4298,6 +4298,21 @@ Build when you need.`,
     create_key: "Create key",
     no_keys: "No API keys yet."
   },
+  widget_voice_setting: {
+    title: "Voice calls",
+    description: "Let visitors talk by voice in this chat widget.",
+    unavailable_not_configured: "Voice is on, but this deployment has no voice models configured, so visitors do not see the call button yet. Contact platform support.",
+    unavailable_models: "Voice is on, but the voice service is not available right now, so visitors do not see the call button yet. Contact platform support.",
+    requirements_note: "Visitors see the call button when your website and this chat service both use https. If your page is itself shown inside another frame, that frame must also allow the microphone. Chrome and Edge hide the button where the website or its parent frame blocks the microphone; Safari and Firefox show it, and the call then says the microphone could not be used.",
+    refresh_note: "Pages that are already open pick up the change when they are reloaded.",
+    opt_out_note: "Voice calls follow the Voice calls switch. To keep voice off on a particular page, add data-voice=\"false\" to the script tag on that page.",
+    loading: "Loading…",
+    load_failed: "Could not load the voice setting.",
+    retry: "Retry",
+    saved: "Voice setting updated",
+    save_failed: "Could not save the voice setting. Try again.",
+    toggle_label: "Offer voice calls in this chat widget"
+  },
   api_key: {
     title: "API Key",
     subtitle: "SDK / REST API credential",

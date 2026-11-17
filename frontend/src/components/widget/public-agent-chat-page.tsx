@@ -18,6 +18,7 @@ import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { clientErrorTranslationKey } from "@/lib/client-errors"
 import { notifySendFailure } from "@/lib/send-failure-notice"
+import { pageMayUseMicrophone } from "@/lib/widget-microphone"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import { requestPromptContext } from "@/lib/widget-parent-message"
 import {
@@ -49,11 +50,12 @@ type PublicAuthResult = {
   voice_enabled?: boolean | null
 }
 
-// A voice call is offered only to an embedded widget whose server said so,
-// and only where the page can use the microphone: as a top-level page, or in
-// an iframe the host page opted into voice for (widget.js then adds voice=1).
-// voice=1 is an unsigned hint that any page can add to the URL itself. It
-// only says the embedder delegated the microphone to this iframe and is not a
+// A voice call is offered only to an embedded widget whose server said so, and
+// only where the page can use the microphone: as a top-level page, or in an
+// iframe widget.js delegated the microphone to (it adds voice=1 unless the
+// site set data-voice="false"), and only where pageMayUseMicrophone() finds
+// the page secure and not blocked by a permissions policy. voice=1 is an
+// unsigned hint that any page can add to the URL itself and is not a
 // permission: whether voice calls are offered is decided by the server
 // (voice_enabled in the login response), and the voice endpoints check again
 // on every request.
@@ -61,7 +63,8 @@ function widgetVoiceCallOffered(authMode: "widget" | "share", voiceEnabled: bool
   if (authMode !== "widget" || voiceEnabled !== true) return false
   let topLevel = false
   try { topLevel = window.self === window.top } catch { topLevel = false }
-  return topLevel || new URLSearchParams(window.location.search).get("voice") === "1"
+  const delegated = topLevel || new URLSearchParams(window.location.search).get("voice") === "1"
+  return delegated && pageMayUseMicrophone()
 }
 
 interface PublicConversationContentProps {

@@ -7,6 +7,7 @@ import {
   parseApiResponse,
 } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import type { WidgetVoiceSetting } from "@/lib/agent-widget-config"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import type {
   WorkforceAgentOption,
@@ -483,6 +484,31 @@ export async function updateWorkforceWidgetConfig(
   })
   if (!response.ok) {
     throw await parseApiError(response, "Failed to update workforce widget config")
+  }
+  return response.json()
+}
+
+export async function getWorkforceWidgetVoice(
+  workforceId: number | string,
+): Promise<WidgetVoiceSetting> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget-voice`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce widget voice setting")
+  }
+  return response.json()
+}
+
+export async function setWorkforceWidgetVoice(
+  workforceId: number | string,
+  enabled: boolean,
+): Promise<WidgetVoiceSetting> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget-voice`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify({ enabled }),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce widget voice setting")
   }
   return response.json()
 }

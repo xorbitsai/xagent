@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
@@ -246,6 +246,74 @@ describe("AgentBuilder host settings", () => {
       expect(update).toBeEnabled()
     })
     expect(publish).toBeDisabled()
+  })
+
+  it("keeps the built-in logo upload when the extension brings no avatar panel", async () => {
+    installApi(["basic_tools"])
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    expect(await screen.findByText("builds.configForm.logo.label")).toBeInTheDocument()
+  })
+
+  it("lets an avatar panel stand in for the logo upload and drive the logo", async () => {
+    installApi(["basic_tools"])
+    const created: string[] = []
+    const revoked: string[] = []
+    const originalCreate = URL.createObjectURL
+    const originalRevoke = URL.revokeObjectURL
+    URL.createObjectURL = () => { const url = `blob:preview-${created.length}`; created.push(url); return url }
+    URL.revokeObjectURL = (url: string) => { revoked.push(url) }
+    try {
+      useBuilderSettingsMock.mockReturnValue({ avatarPanel: <div>Avatar panel</div> })
+      render(<AgentBuilder agentId={AGENT_ID} />)
+
+      await screen.findByText("Avatar panel")
+      expect(screen.queryByText("builds.configForm.logo.label")).toBeNull()
+      const options = () => useBuilderSettingsMock.mock.lastCall![0]
+      await waitFor(() => expect(options()).toMatchObject({ agentName: "Legacy Agent", logo: { src: null } }))
+      const update = screen.getByRole("button", { name: "builds.editor.header.update" })
+      await waitFor(() => expect(update).toBeDisabled())
+
+      act(() => options().logo.select(new File(["x"], "logo.png", { type: "image/png" })))
+      await waitFor(() => expect(options().logo.src).toBe("blob:preview-0"))
+      expect(update).toBeEnabled()
+
+      // Choosing another image drops the first one's preview.
+      act(() => options().logo.select(new File(["y"], "other.png", { type: "image/png" })))
+      await waitFor(() => expect(options().logo.src).toBe("blob:preview-1"))
+      expect(revoked).toEqual(["blob:preview-0"])
+
+      act(() => options().logo.remove())
+      await waitFor(() => expect(options().logo.src).toBeNull())
+      expect(revoked).toEqual(["blob:preview-0", "blob:preview-1"])
+    } finally {
+      URL.createObjectURL = originalCreate
+      URL.revokeObjectURL = originalRevoke
+    }
+  })
+
+  it("sends the logo the avatar panel chose with the Agent save", async () => {
+    installApi(["basic_tools"])
+    const originalCreate = URL.createObjectURL
+    URL.createObjectURL = () => "blob:preview"
+    try {
+      useBuilderSettingsMock.mockReturnValue({ avatarPanel: <div>Avatar panel</div> })
+      render(<AgentBuilder agentId={AGENT_ID} />)
+      await screen.findByText("Avatar panel")
+      const options = () => useBuilderSettingsMock.mock.lastCall![0]
+
+      act(() => options().logo.select(new File(["x"], "logo.png", { type: "image/png" })))
+      const update = screen.getByRole("button", { name: "builds.editor.header.update" })
+      await waitFor(() => expect(update).toBeEnabled())
+      fireEvent.click(update)
+
+      await waitFor(() => {
+        const put = apiRequestMock.mock.calls.find(([, requestOptions]) => requestOptions?.method === "PUT")
+        expect(JSON.parse(put?.[1].body).logo_base64).toMatch(/^data:image\/png;base64,/)
+      })
+    } finally {
+      URL.createObjectURL = originalCreate
+    }
   })
 
   it("keeps the settings dirty when the save is rejected", async () => {

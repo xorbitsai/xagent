@@ -1,6 +1,6 @@
 "use client"
 
-import React, { Suspense, useCallback, useEffect, useRef, useState } from "react"
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, PanelRight } from "lucide-react"
 import { useParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
@@ -12,7 +12,7 @@ import { ProgressPanel, type ProgressStepView } from "@/components/task/progress
 import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { cn } from "@/lib/utils"
+import { cn, getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
 
 export interface SessionCheckWatch {
   viewed: number | null // the task this view checks; null while no view is on
@@ -233,6 +233,18 @@ function TaskDetailContent() {
   // across those unrelated refreshes.
   const progressEndedAt = isDagFinished ? state.currentTask?.dagTerminatedAt : undefined
 
+  // The same agent the header above names, so the avatar beside a working
+  // turn and the conversation's tint match it.
+  const agentId = state.currentTask?.agentId
+  const agentName = agentId ? state.currentTask?.agentName : undefined
+  const agentLogoUrl = state.currentTask?.agentLogoUrl
+  const conversationAgent = useMemo(
+    () => agentName
+      ? { name: agentName, avatar: resolveAgentLogoUrl(agentLogoUrl ?? null, getApiUrl()), agentId }
+      : undefined,
+    [agentId, agentName, agentLogoUrl],
+  )
+
   return (
     <div className="h-full flex flex-col md:flex-row bg-background">
       <div className="flex-1 min-w-0 min-h-0 flex flex-col">
@@ -270,7 +282,7 @@ function TaskDetailContent() {
           </div>
         ) : null}
         <div className="flex-1 min-h-0 relative">
-          <TaskConversationPanel mode="page" voiceConversationEnabled onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
+          <TaskConversationPanel mode="page" voiceConversationEnabled agent={conversationAgent} onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
             if (state.taskId) {
               closeFilePreview()
               setAgentExecution({ taskId: state.taskId, selection })

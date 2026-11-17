@@ -9,6 +9,7 @@ import type { SessionAttachmentsConfig } from "@/contexts/app-context-chat";
 import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
+import { useAgentAccentAttributes } from "@/lib/agent-accent";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useVoiceCallView } from "@/contexts/voice-call-store";
 import { VoiceOrb } from "./voice-call-ui";
@@ -173,20 +174,26 @@ export function ChatStartScreen({
   const voiceCall = useVoiceCallView();
   const voiceHero = Boolean(voiceCall && (voiceConversationSource === "provided" || voiceInputEnabled) && onVoiceConversation);
 
+  // One object for the hero avatar and the tint, so the two cannot disagree.
+  const leadPersona = leadAgent
+    ? { name: leadAgent.name, avatar: resolveTeammateAvatar(leadAgent), agentId: leadAgent.id }
+    : undefined;
+  const accentAttributes = useAgentAccentAttributes(leadPersona);
+
   return (
-    <div className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center">
+    <div
+      {...accentAttributes}
+      className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center"
+    >
       {voiceHero && voiceCall ? (
         // About the height of the logo and title it replaces, so nothing jumps.
         <div className="mb-2 flex h-[92px] items-center justify-center" data-testid="voice-orb-hero">
           <VoiceOrb call={voiceCall} className="h-[68px] w-[68px]" />
         </div>
-      ) : leadAgent ? (
+      ) : leadAgent && leadPersona ? (
         <div className="w-full max-w-[680px] mx-auto flex items-center gap-4 mb-6 text-left">
           <PersonaAvatar
-            persona={{
-              name: leadAgent.name,
-              avatar: resolveTeammateAvatar(leadAgent),
-            }}
+            persona={leadPersona}
             sizeClassName="h-16 w-16"
             textClassName="text-xl"
             className="rounded-[22px] shrink-0"
@@ -357,7 +364,7 @@ export function ChatStartScreen({
                         }`}
                       >
                         <PersonaAvatar
-                          persona={{ name: agent.name, avatar: avatarUrl }}
+                          persona={{ name: agent.name, avatar: avatarUrl, agentId: agent.id }}
                           sizeClassName="h-[34px] w-[34px]"
                           textClassName="text-[11px]"
                           className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}

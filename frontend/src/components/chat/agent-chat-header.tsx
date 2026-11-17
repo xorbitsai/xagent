@@ -115,7 +115,7 @@ function AgentChatHeaderContent({
             <ArrowLeft className="h-4 w-4" />
           </button>
         )}
-        <PersonaAvatar persona={{ name: agent.name, avatar }} sizeClassName="h-8 w-8" textClassName="text-xs" decorative />
+        <PersonaAvatar persona={{ name: agent.name, avatar, agentId }} sizeClassName="h-8 w-8" textClassName="text-xs" decorative />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <b className="truncate text-[13px] font-semibold">{agent.name}</b>

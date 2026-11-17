@@ -835,6 +835,50 @@ describe("ChatMessage Session file capability", () => {
     expect(container.querySelectorAll(".dot")).toHaveLength(dots)
   })
 
+  it("shows no avatar beside the status line unless the caller names the agent", () => {
+    const { container } = render(<ChatMessage role="assistant" content={null} taskStatus="running" />)
+
+    expect(container.querySelector("img")).toBeNull()
+  })
+
+  it.each([
+    ["running", null, true],
+    ["running", "reconnecting", true],
+    ["running", "lost", false],
+    ["paused", null, false],
+    ["waiting_for_user", null, false],
+  ] as const)("shows the agent's avatar while %s with notice %s, thinking: %s", (taskStatus, notice, thinking) => {
+    const { container } = render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus={taskStatus}
+        connectionNotice={notice}
+        agent={{ name: "Maya", avatar: "/avatars/maya.png" }}
+      />,
+    )
+
+    const avatar = container.querySelector("img")
+    expect(avatar).toHaveAttribute("src", "/avatars/maya.png")
+    // The status text beside it already says what is happening.
+    expect(avatar).toHaveAttribute("alt", "")
+    expect(avatar?.classList.contains("motion-safe:animate-pulse")).toBe(thinking)
+  })
+
+  it("leaves the agent's avatar off a turn that already has its answer", () => {
+    const { container } = render(
+      <ChatMessage role="assistant" content="Here you go." agent={{ name: "Maya", avatar: "/avatars/maya.png" }} />,
+    )
+
+    expect(container.querySelector('img[src="/avatars/maya.png"]')).toBeNull()
+  })
+
+  it("marks the user's bubble as a surface the agent accent can tint", () => {
+    render(<ChatMessage role="user" content="Find flights" />)
+
+    expect(screen.getByText("Find flights").closest(".agent-accent-surface")).toHaveClass("bg-secondary")
+  })
+
   it("ignores the app connection notice when the caller does not pass one", () => {
     // The agent builder streams over its own socket while sharing AppProvider.
     appContextMock.connectionNotice = "lost"

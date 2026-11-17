@@ -17,3 +17,11 @@ it("keeps a disabled entry discoverable by mouse and keyboard with its exact req
   fireEvent.focus(button.parentElement!)
   expect(await screen.findByRole("tooltip")).toHaveTextContent("voiceConversation.needsAsr")
 })
+it("takes the agent accent as the composer's action only while it can start a call", () => {
+  const { rerender } = render(<VoiceModeButton iconOnly onClick={vi.fn()} />)
+  expect(screen.getByRole("button", { name: "voiceConversation.open" })).toHaveClass("agent-accent-surface")
+  rerender(<VoiceModeButton iconOnly disabled onClick={vi.fn()} />)
+  expect(screen.getByRole("button", { name: "voiceConversation.open" })).not.toHaveClass("agent-accent-surface")
+  rerender(<VoiceModeButton onClick={vi.fn()} />)
+  expect(screen.getByRole("button", { name: "voiceConversation.open" })).not.toHaveClass("agent-accent-surface")
+})

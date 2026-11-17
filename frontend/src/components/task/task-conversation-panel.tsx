@@ -32,6 +32,8 @@ import {
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
+import { useAgentAccentAttributes } from "@/lib/agent-accent"
+import type { AvatarPersona } from "@/components/templates/persona-avatar"
 import { useVoiceCallView } from "@/contexts/voice-call-store"
 import { VoiceOrb } from "@/components/chat/voice-call-ui"
 
@@ -79,6 +81,10 @@ interface TaskConversationPanelProps {
   // adds or removes one, and once a send has completed.
   onAttachmentFilesChange?: (files: File[]) => void
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
+  // The agent this conversation is with, for a caller that presents it as a
+  // chat with that agent: its avatar stands beside the status line while it
+  // works, and its color (when its avatar has one) tints the conversation.
+  agent?: AvatarPersona
 }
 
 type CombinedItem = {
@@ -307,6 +313,7 @@ export function TaskConversationPanel({
   onAgentExecutionClick,
   voiceConversationEnabled = false,
   onProvidedVoiceConversation,
+  agent,
 }: TaskConversationPanelProps) {
   const {
     state,
@@ -330,6 +337,7 @@ export function TaskConversationPanel({
     connectionNotice,
     isConnected,
   } = useApp()
+  const accentAttributes = useAgentAccentAttributes(agent)
   const fileAccess = useFileAccess()
   const { t, locale } = useI18n()
   const [files, setFiles] = useState<File[]>([])
@@ -988,6 +996,7 @@ export function TaskConversationPanel({
   return (
     <div
       ref={containerRef}
+      {...accentAttributes}
       className={cn(
         "h-full bg-background relative transition-all flex overflow-hidden",
         anyPreviewOpen ? "flex-row items-stretch" : "flex-col",
@@ -1106,6 +1115,7 @@ export function TaskConversationPanel({
                           failureReferenceItemIds.has(item.id) ? state.taskId : undefined
                         }
                         connectionNotice={connectionNotice}
+                        agent={agent}
                       />
                     )
                   })}
@@ -1133,6 +1143,7 @@ export function TaskConversationPanel({
                           : undefined
                       }
                       connectionNotice={connectionNotice}
+                      agent={agent}
                     />
                   )}
                 </>

@@ -785,11 +785,40 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setTaskId(record.taskId, { navigate: false })
   }, [closeFilePreview, setTaskId])
 
+  const selectLogo = (file: File) => {
+    setLogoFile(file)
+    setLogoRemoved(false)
+  }
+
+  const removeLogo = () => {
+    setLogoFile(null)
+    setLogoUrl(null)
+    setLogoRemoved(true)
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""
+    }
+  }
+
+  // A chosen file's preview lives only as long as the file is the logo.
+  const [logoFilePreview, setLogoFilePreview] = useState<string | null>(null)
+  useEffect(() => {
+    if (!logoFile) {
+      setLogoFilePreview(null)
+      return
+    }
+    const url = URL.createObjectURL(logoFile)
+    setLogoFilePreview(url)
+    return () => URL.revokeObjectURL(url)
+  }, [logoFile])
+  const logoSrc = logoFile ? logoFilePreview : logoUrl ? `${getApiUrl()}${logoUrl}` : null
+
   const loadedAgentId = originalData?.id
   const builderSettings = useAgentBuilderSettingsExtension({
     agentId: localAgentId ? Number(localAgentId) : undefined,
     enabled: !readOnly && (!localAgentId || String(loadedAgentId) === localAgentId),
     saving: isCreating,
+    agentName: name,
+    logo: { src: logoSrc, select: selectLogo, remove: removeLogo },
   })
   // previewConfigKey reads the model seed and the MCP list; opening a record
   // before either lands would have it invalidated straight away. This waits
@@ -1326,20 +1355,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   }
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setLogoFile(e.target.files[0])
-      setLogoRemoved(false)
-    }
+    if (e.target.files && e.target.files[0]) selectLogo(e.target.files[0])
   }
 
   const handleRemoveLogo = (e: React.MouseEvent) => {
     e.stopPropagation()
-    setLogoFile(null)
-    setLogoUrl(null)
-    setLogoRemoved(true)
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ""
-    }
+    removeLogo()
   }
 
   const fileToBase64 = (file: File): Promise<string> => {
@@ -2181,7 +2202,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
       <fieldset disabled={readOnly} className={viewMode === "flow" ? "hidden" : "contents"}>
       <div className="space-y-6">
-        {/* Logo Upload */}
+        {/* Logo Upload: a distribution's avatar panel stands in for it. */}
+        {builderSettings.avatarPanel ?? (
         <div className="space-y-2">
           <Label>{t("builds.configForm.logo.label")}</Label>
           <div className="flex items-center gap-4">
@@ -2218,6 +2240,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             />
           </div>
         </div>
+        )}
 
         {/* Name */}
         <div className="space-y-2">

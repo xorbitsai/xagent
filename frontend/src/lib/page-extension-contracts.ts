@@ -56,10 +56,27 @@ export interface AgentBuilderSettingsExtensionOptions {
   enabled: boolean
   /** True while an Agent save is in progress. */
   saving: boolean
+  /** The name as currently typed; an avatar drawn from it changes with it. */
+  agentName: string
+  /** The Agent's logo image, which is the one thing its avatar can be besides a drawn one. */
+  logo: AgentBuilderLogoControls
+}
+
+export interface AgentBuilderLogoControls {
+  /** Where the current logo can be shown (a chosen file's preview or the saved image), or null. */
+  src: string | null
+  /** Use this image as the logo; it is uploaded when the Agent is saved. */
+  select: (file: File) => void
+  /** Clear the logo, saved or just chosen. */
+  remove: () => void
 }
 
 export interface AgentBuilderSettingsExtension {
   panel?: ReactNode
+  /** Replaces the built-in logo upload at the top of the form. A distribution
+   * that draws avatars shows the logo and its avatar as one control through it,
+   * driving the logo with `logo` from the options. */
+  avatarPanel?: ReactNode
   /** Immutable JSON settings to submit. Omit or return an empty object when clean. */
   changes?: Record<string, unknown>
   /** Acknowledge the submitted settings after a successful save. Keep newer edits dirty. */

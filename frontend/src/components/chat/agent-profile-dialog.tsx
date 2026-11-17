@@ -148,7 +148,7 @@ function AgentProfileDialogContent({ agent, avatar, onClose, onSaved, children }
         showCloseButton={!saving}
       >
         <div className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-4 pr-12">
-          <PersonaAvatar persona={{ name: profile.name, avatar }} sizeClassName="h-10 w-10" textClassName="text-sm" decorative />
+          <PersonaAvatar persona={{ name: profile.name, avatar, agentId: profile.id }} sizeClassName="h-10 w-10" textClassName="text-sm" decorative />
           <div>
             <DialogTitle className="text-lg font-semibold">{t("agentProfile.title", { name: profile.name })}</DialogTitle>
             <DialogDescription className="text-xs">{t("agentProfile.subtitle")}</DialogDescription>

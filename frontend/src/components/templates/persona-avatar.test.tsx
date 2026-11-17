@@ -1,8 +1,8 @@
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, renderHook, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
-import { PersonaAvatar } from "./persona-avatar"
+import { PersonaAvatar, usePersonaAccentColor } from "./persona-avatar"
 
 afterEach(cleanup)
 
@@ -56,5 +56,45 @@ describe("PersonaAvatar", () => {
     )
 
     expect(screen.getByText("M")).toHaveStyle({ boxShadow: "0 0 0 2px red" })
+  })
+
+  it("pulses an image avatar only while thinking", () => {
+    const persona = { name: "Maya", avatar: "/avatars/maya.png" }
+    const { rerender } = render(<PersonaAvatar persona={persona} sizeClassName="h-8 w-8" thinking />)
+
+    expect(screen.getByRole("img", { name: "Maya" })).toHaveClass("motion-safe:animate-pulse")
+
+    rerender(<PersonaAvatar persona={persona} sizeClassName="h-8 w-8" />)
+
+    expect(screen.getByRole("img", { name: "Maya" })).not.toHaveClass("motion-safe:animate-pulse")
+  })
+
+  it("pulses the fallback initial only while thinking", () => {
+    const { rerender } = render(<PersonaAvatar persona={{ name: "Maya" }} sizeClassName="h-8 w-8" thinking />)
+
+    expect(screen.getByText("M")).toHaveClass("motion-safe:animate-pulse")
+
+    rerender(<PersonaAvatar persona={{ name: "Maya" }} sizeClassName="h-8 w-8" />)
+
+    expect(screen.getByText("M")).not.toHaveClass("motion-safe:animate-pulse")
+  })
+})
+
+describe("usePersonaAccentColor", () => {
+  it("reports no color for an uploaded image, a neutral initial or no persona", () => {
+    expect(renderHook(() => usePersonaAccentColor({ name: "Maya", avatar: "/avatars/maya.png" })).result.current).toBeNull()
+    expect(renderHook(() => usePersonaAccentColor({ name: "Maya" })).result.current).toBeNull()
+    expect(renderHook(() => usePersonaAccentColor(undefined)).result.current).toBeNull()
+  })
+})
+
+describe("PersonaAvatar for an agent", () => {
+  it("draws the same avatar whatever agent it stands for", () => {
+    const { container, rerender } = render(<PersonaAvatar persona={{ name: "Maya" }} sizeClassName="h-8 w-8" />)
+    const plain = container.innerHTML
+
+    rerender(<PersonaAvatar persona={{ name: "Maya", agentId: 7 }} sizeClassName="h-8 w-8" />)
+
+    expect(container.innerHTML).toBe(plain)
   })
 })

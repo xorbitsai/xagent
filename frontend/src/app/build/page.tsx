@@ -737,7 +737,7 @@ function BuildsPageContent() {
                   >
                     <div className="flex flex-col items-start gap-3">
                       <PersonaAvatar
-                        persona={{ name: agent.name, avatar: resolvedLogoUrl || template?.persona?.avatar }}
+                        persona={{ name: agent.name, avatar: resolvedLogoUrl || template?.persona?.avatar, agentId: agent.id }}
                         sizeClassName="h-20 w-20"
                         textClassName="text-2xl"
                         className="rounded-[22px] shadow-[0_0_0_4px_var(--card),0_0_0_6px_hsl(var(--primary)/0.15)]"

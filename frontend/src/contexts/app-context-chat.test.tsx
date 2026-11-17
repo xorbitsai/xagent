@@ -166,6 +166,7 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   VERSIONED_TASK_EVENT_TYPES,
+  acceptTaskControlVersion,
   createInitialState,
   extractTaskControlEnvelope,
   initialSessionStop,
@@ -6339,6 +6340,51 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  describe("a delivery declaration on a send", () => {
+    const mount = (transport: "session" | "task") => {
+      render(transport === "session"
+        ? <AppProvider token="token" transport={makeSessionTransport()}><SessionControlsProbe /></AppProvider>
+        : <AppProvider token="token"><SeedRunningTask /><SessionControlsProbe /></AppProvider>)
+      act(() => webSocketOptions.current?.onConnect?.())
+    }
+    const send = (config: Record<string, unknown>) => act(async () => getSessionControls()
+      .sendMessage("continue", config)
+      .then(() => "ok", (error: unknown) => error))
+
+    it("passes a new-turn declaration to the chat frame on the Session transport", async () => {
+      mount("session")
+
+      expect(await send({ clientMessageId: "declared", delivery: "new_turn" })).toBe("ok")
+      expect(await send({ clientMessageId: "declared-source", delivery: "new_turn", sourceTaskId: 101 })).toBe("ok")
+
+      expect(sendChatMessageMock.mock.calls).toEqual([
+        ["continue", undefined, undefined, "declared", undefined, undefined, undefined, "new_turn"],
+        ["continue", undefined, undefined, "declared-source", undefined, undefined, 101, "new_turn"],
+      ])
+    })
+
+    it("refuses an unknown declaration, and any declaration off the Session transport, before sending", async () => {
+      mount("session")
+      expect(await send({ clientMessageId: "unknown", delivery: "inject" })).toMatchObject({
+        message: "Message not sent: the delivery declaration is not valid.",
+        disposition: "not_sent",
+      })
+      expect(await send({
+        clientMessageId: "answer", delivery: "new_turn", metadata: { request_id: "req-1" },
+      })).toMatchObject({
+        message: "A delivery declaration cannot accompany an answer to a request.",
+        disposition: "not_sent",
+      })
+      cleanup()
+      mount("task")
+      expect(await send({ clientMessageId: "task", delivery: "new_turn" })).toMatchObject({
+        message: "A delivery declaration is not supported for this connection.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+  })
+
   describe("a conversation source on a send", () => {
     const SOURCES = [
       ["no source", undefined],
@@ -9640,6 +9686,39 @@ describe("session conversation attachment", () => {
       act(() => socket()?.onConnectionCapabilities?.(["heartbeat"]))
 
       expect(attachment()).toBe("unsupported")
+    })
+
+    it("the new-turn capability is read from the current connection and survives a drop", () => {
+      const newTurnDelivery = () => getSessionControls().newTurnDelivery
+      const NEW_TURN_CAPABILITIES = [...ATTACH_CAPABILITIES, "delivery_new_turn"]
+      const view = render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      expect(newTurnDelivery()).toBe("unknown")
+
+      act(() => socket()?.onConnectionCapabilities?.(NEW_TURN_CAPABILITIES))
+      expect(newTurnDelivery()).toBe("supported")
+
+      // A drop does not reset it; only the next capabilities frame changes it.
+      wsHarness.isConnected = false
+      view.rerender(tree(makeSessionTransport()))
+      expect(newTurnDelivery()).toBe("supported")
+
+      wsHarness.isConnected = true
+      view.rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+      act(() => socket()?.onConnect?.())
+      expect(newTurnDelivery()).toBe("supported")
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(newTurnDelivery()).toBe("unsupported")
+    })
+
+    it("ignores a capabilities frame from a socket that is no longer current", () => {
+      const view = render(tree(makeSessionTransport()))
+      const previousOnCapabilities = socket()?.onConnectionCapabilities
+      act(() => socket()?.onConnect?.())
+      view.rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+
+      act(() => previousOnCapabilities?.([...ATTACH_CAPABILITIES, "delivery_new_turn"]))
+      expect(getSessionControls().newTurnDelivery).toBe("unknown")
     })
 
     it("returns to pending once the connection drops", () => {
@@ -13365,5 +13444,49 @@ describe("sends in flight", () => {
     await delivery
     expect(renders[renders.length - 1]).toEqual({ taskId: 77, inFlight: false })
     expect(failure).toMatchObject({ disposition: "not_sent" })
+  })
+})
+
+describe("the task state version gate", () => {
+  const frame = (
+    type: string,
+    fields: Partial<TestWebSocketMessage> = {},
+  ): TestWebSocketMessage => ({ type, timestamp: "2026-11-17T00:00:00Z", task_id: 5, ...fields })
+  const accept = (
+    versions: Map<number, { version: number; runId?: string | null; status?: string }>,
+    message: TestWebSocketMessage,
+  ) => acceptTaskControlVersion(
+    message as Parameters<typeof acceptTaskControlVersion>[0],
+    extractTaskControlEnvelope(message as Parameters<typeof extractTaskControlEnvelope>[0]),
+    versions as Parameters<typeof acceptTaskControlVersion>[2],
+  )
+
+  it("the version gate records the status of an accepted versioned frame and keeps it only across the same version", () => {
+    const versions = new Map<number, { version: number; runId?: string | null; status?: string }>()
+
+    // A frame with a status records it with its version.
+    expect(accept(versions, frame("task_completed", { state_version: 2, status: "completed" }))).toBe(true)
+    expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A replayed task_info at the same version that reports no status keeps
+    // the recorded status. Defensive: a frame carrying a version normally
+    // carries its status too, and dropping a known status would only lose
+    // information.
+    expect(accept(versions, taskInfoMessage(5, { state_version: 2, status: undefined }))).toBe(true)
+    expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A frame the gate drops as older writes nothing.
+    expect(accept(versions, frame("task_error", { state_version: 1, status: "failed" }))).toBe(false)
+    expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A newer frame that reports no status does not inherit the older one.
+    expect(accept(versions, frame("task_resumed", { state_version: 3 }))).toBe(true)
+    expect(versions.get(5)?.version).toBe(3)
+    expect(versions.get(5)?.status).toBeUndefined()
+
+    // An unversioned error frame writes nothing, even with a status.
+    expect(accept(versions, frame("agent_error", { status: "failed" }))).toBe(true)
+    expect(versions.get(5)?.version).toBe(3)
+    expect(versions.get(5)?.status).toBeUndefined()
   })
 })

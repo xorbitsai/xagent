@@ -3573,6 +3573,56 @@ describe("useWebSocket normalized connections", () => {
     })
   })
 
+  describe("chat frames with a delivery declaration", () => {
+    const openSocket = async () => {
+      const hook = renderHook(() => useWebSocket({ connection: sessionConnection() }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      socket.protocol = "xagent-session-v1"
+      act(() => socket.open())
+      return { ...hook, socket }
+    }
+    const sentFrame = (socket: MockWebSocket, index = 0) =>
+      JSON.parse(socket.send.mock.calls[index][0] as string) as Record<string, unknown>
+
+    it("a declared new turn travels on the chat frame and a pending-question refusal maps to its code", async () => {
+      const { result, socket } = await openSocket()
+
+      const plain = result.current.sendChatMessage("plain", undefined, false, "msg-plain")
+      expect(sentFrame(socket, 0)).not.toHaveProperty("delivery")
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-plain" }))
+      await plain
+
+      const declared = result.current.sendChatMessage(
+        "declared", undefined, false, "msg-declared", undefined, undefined, undefined, "new_turn",
+      )
+      expect(sentFrame(socket, 1)).toMatchObject({
+        message: "declared",
+        client_message_id: "msg-declared",
+        delivery: "new_turn",
+      })
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-declared" }))
+      await declared
+
+      const refusal = async (id: string, frame: Record<string, unknown>) => {
+        const sent = result.current.sendChatMessage(
+          "queued", undefined, false, id, undefined, undefined, undefined, "new_turn",
+        )
+        const outcome = sent.then(() => null, (error: unknown) => error)
+        act(() => socket.receive({ type: "message_rejected", client_message_id: id, ...frame }))
+        return outcome
+      }
+
+      expect(await refusal("m-answer", {
+        rejection_outcome: "not_accepted", error_code: "interaction_response_required",
+      })).toMatchObject({
+        errorCode: "interaction_response_required",
+        disposition: "rejected",
+        message: "This conversation is waiting on a question above; answer it to continue.",
+      })
+    })
+  })
+
   it("rejects a coded unsuccessful 2xx batch upload before sending chat", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

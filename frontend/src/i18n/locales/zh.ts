@@ -60,6 +60,7 @@ const zh = {
     messageAcceptancePending: "消息接收状态仍在确认中，请稍后重试。",
     taskUnavailable: "任务已不可用。",
     taskBusy: "任务正忙，请等待上一轮完成后再发送消息。",
+    interactionResponseRequired: "对话正在等你回答上面的问题，回答后才能继续。",
     workforceUnavailable: "此 Workforce 对话已无法接收新消息，请开始新对话。",
     workforceArchived: "此 Workforce 已归档。请先取消归档并重新发布，再开始新对话；或选择一个活跃的 Workforce。",
     messageAttachmentCorrupt: "此消息使用的已存储文件完整性校验失败，请重新上传。",

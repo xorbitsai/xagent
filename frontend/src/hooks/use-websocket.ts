@@ -148,6 +148,10 @@ export interface ChatMessageFileIds {
   maxFileIds?: number
 }
 
+// The only delivery declaration a chat frame can carry: the message starts a
+// new turn and is never taken as the answer to a pending question.
+export type ChatDelivery = "new_turn"
+
 export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
 
 interface MessageDeliveryErrorOptions {
@@ -1669,6 +1673,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     // The earlier conversation a new one continues from; the same on every
     // attempt of one send.
     sourceTaskId?: number,
+    // Declares the frame a new message that is never taken as the answer to a
+    // pending question. The same on every attempt of one send.
+    chatDelivery?: ChatDelivery,
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
     const owner = socketOwnerRef.current
@@ -1798,6 +1805,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ...(requestId ? { request_id: requestId } : {}),
         ...(fileIds ? { file_ids: [...fileIds] } : {}),
         ...(sourceTaskId !== undefined ? { source_task_id: sourceTaskId } : {}),
+        ...(chatDelivery ? { delivery: chatDelivery } : {}),
         ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }

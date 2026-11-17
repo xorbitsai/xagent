@@ -101,7 +101,10 @@ class FetchWebContentTool(AbstractBaseTool):
             "Never use this tool to load a search engine's result page (Google, "
             "Bing, DuckDuckGo, Baidu and similar); such URLs are refused. "
             "web_search is the only way to search; if it returns nothing, report "
-            "that to the user instead of searching another way."
+            "that to the user instead of searching another way. "
+            "When reporting how information was found, name fetch_web_content "
+            "for pages fetched with it, and name the search tool you actually "
+            "called for searching."
         )
 
     @property

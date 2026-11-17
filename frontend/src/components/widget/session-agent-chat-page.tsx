@@ -119,6 +119,8 @@ interface SessionConversationContentProps {
   readCurrentToken: () => string | null
   // Whether a voice call is offered to this session (voice=1 and the server's voice capability).
   voiceOffered: boolean
+  // Ends the session as expired when the voice recognition socket is closed with 4408.
+  onSessionExpired: () => void
 }
 
 function SessionConversationContent({
@@ -133,6 +135,7 @@ function SessionConversationContent({
   historyAvailable,
   readCurrentToken,
   voiceOffered,
+  onSessionExpired,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -452,11 +455,14 @@ function SessionConversationContent({
         )
         // What a close says about the session, not the call, is acted on here;
         // classify below only reads what it means for the call. A socket the
-        // call closes itself closes with 1000 or 1005, so 4401 comes from the
-        // server: the handshake token was refused, and it is replaced where
-        // replaceRefused allows, so the visitor's retry offers the new one.
+        // call closes itself closes with 1000 or 1005, so these codes come
+        // from the server. 4408: the session has expired, and the page ends it
+        // as a chat socket closed with 4408 does. 4401: the handshake token
+        // was refused, and it is replaced where replaceRefused allows, so the
+        // visitor's retry offers the new one.
         socket.addEventListener("close", (event) => {
-          if (event.code === 4401) void replaceRefused(call, token)
+          if (event.code === 4408) onSessionExpired()
+          else if (event.code === 4401) void replaceRefused(call, token)
         })
         return socket
       },
@@ -487,7 +493,7 @@ function SessionConversationContent({
       },
       classify: classifyWidgetVoiceEvent,
     }
-  }, [voiceOffered, readCurrentToken, replaceRefused, uploads])
+  }, [voiceOffered, readCurrentToken, replaceRefused, uploads, onSessionExpired])
 
   // A call opened by the visitor's click. Without a transport no call is
   // offered, and an open call is dropped so a later offer never starts one
@@ -907,6 +913,7 @@ export function SessionAgentChatPage() {
         historyAvailable={historyAvailable}
         readCurrentToken={readCurrentToken}
         voiceOffered={voiceOffered}
+        onSessionExpired={bridge.handleSessionExpired}
       />
     </AppProvider>
   )

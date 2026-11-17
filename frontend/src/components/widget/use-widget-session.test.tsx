@@ -1309,3 +1309,37 @@ describe("useWidgetSession upload coordination", () => {
     })
   })
 })
+
+describe("useWidgetSession handleSessionExpired", () => {
+  // Hooks rendered by earlier tests stay mounted and would answer the parent
+  // messages dispatched here, so unmount them before and after each test.
+  beforeEach(() => cleanup())
+  afterEach(() => cleanup())
+
+  const ended = (hook: { status: string; terminalCode: string | null; session: unknown; agent: unknown }) => ({
+    status: hook.status, terminalCode: hook.terminalCode, session: hook.session, agent: hook.agent,
+  })
+
+  it("ends the session as a chat socket closed with 4408 does, and stops everything waiting on it", async () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const expired = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    const waiting = expired.result.current.waitForOpenConnection().then(() => null, (error: unknown) => error)
+    postMessage.mockClear()
+
+    act(() => expired.result.current.handleSessionExpired())
+
+    const viaVoice = ended(expired.result.current)
+    expect(viaVoice).toEqual({ status: "terminal", terminalCode: "ws_4408", session: null, agent: null })
+    expect(await waiting).toMatchObject({ errorCode: "connection_not_ready" })
+    dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b", session_token: "st_after" }))
+    expect(ended(expired.result.current)).toEqual(viaVoice)
+    expect(postMessage.mock.calls.filter(([message]) => (message as { type?: string } | null)?.type === "reconnect_request")).toHaveLength(0)
+    expired.unmount()
+
+    const closed = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    act(() => { closed.result.current.handleConnectionClose(new CloseEvent("close", { code: 4408 })) })
+    expect(ended(closed.result.current)).toEqual(viaVoice)
+  })
+})

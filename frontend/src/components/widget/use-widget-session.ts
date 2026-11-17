@@ -379,6 +379,14 @@ export function useWidgetSession() {
     transitionTerminal("unexpected_error")
   }, [isActiveConnection, requestReconnect, transitionTerminal])
 
+  // Ends the session as expired when a connection other than the chat socket,
+  // the voice recognition socket, is closed with 4408: the chat socket may not
+  // report the expiry until later. The page then shows what a chat socket
+  // closed with 4408 leads to.
+  const handleSessionExpired = useCallback(() => {
+    transitionTerminal("ws_4408")
+  }, [transitionTerminal])
+
   const newWaiter = useCallback(<T,>(
     resolve: (value: T) => void,
     reject: (error: Error) => void,
@@ -602,6 +610,7 @@ export function useWidgetSession() {
     handleConnectionOpen,
     handleConnectionClose,
     handleConnectionFailure,
+    handleSessionExpired,
     ensureFreshSession,
     refreshSession,
     waitForOpenConnection,

@@ -188,7 +188,7 @@ const scenarios: Record<number, () => Promise<void>> = {
     act(() => { Socket.instances[0].onerror!(); Socket.instances[0].onclose?.({ code: 1006, reason: "" }) })
     expectStopped("connectionEnded", true)
   },
-  9: closes([[1012, "Service restart"], [4408, "Voice is unavailable"]], "connectionEnded", true),
+  9: closes([[1012, "Service restart"]], "connectionEnded", true),
   10: errorFrames(["standalone_usage_refused"], "unavailable", false),
   11: async () => {
     await errorFrames(["session_timeout"], "sessionTimeout", true)()
@@ -267,11 +267,14 @@ const scenarios: Record<number, () => Promise<void>> = {
   // The Session page replaces the rejected token inside its transport; the
   // call itself only ends retryable.
   23: closes([[4401, ""]], "connectionEnded", true),
+  // The Session page ends the session as expired from its own close listener;
+  // the call itself ends unavailable, with nothing to retry.
+  24: closes([[4408, "Voice is unavailable"]], "unavailable", false),
 }
 
 describe("widget voice call state table", () => {
-  it("has one scenario for each of its 23 rows", () => {
-    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(23)
+  it("has one scenario for each of its 24 rows", () => {
+    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(24)
     expect(Object.keys(scenarios).map(Number)).toEqual(WIDGET_VOICE_CALL_STATES.map(row => row.row))
   })
 

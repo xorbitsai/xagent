@@ -366,7 +366,7 @@ describe("session widget voice call transport", () => {
 
   it.each([
     { label: "recognition closed 4403", event: { kind: "asr_close", code: 4403, reason: "" }, failure: "voice_unavailable" },
-    { label: "recognition closed 4408", event: { kind: "asr_close", code: 4408, reason: "" }, failure: "connection_failed" },
+    { label: "recognition closed 4408", event: { kind: "asr_close", code: 4408, reason: "" }, failure: "voice_unavailable" },
     { label: "synthesis 403", event: { kind: "tts_response", status: 403, code: undefined }, failure: "voice_unavailable" },
     { label: "synthesis 401 after the retry", event: { kind: "tts_response", status: 401, code: undefined }, failure: "voice_unavailable" },
   ] satisfies Array<{ label: string; event: VoiceTransportEvent; failure: string }>)("reads $label as the state table does", async ({ event, failure }) => {
@@ -745,6 +745,26 @@ describe("session widget voice call and a refused token", () => {
   }
   const retryButton = () => screen.getByRole("button", { name: "retry" })
   const handshakeToken = (index: number) => sockets[index][1][1]
+
+  it("ends the session as expired when recognition is closed with 4408", async () => {
+    useRealAudio()
+    app.state.taskId = 71
+    renderPage()
+    await openRealCall("panel")
+    act(() => socketInstances[0].serverClose(4408))
+    expect(bridge.value.handleSessionExpired).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(screen.getByTestId("alert")).toHaveTextContent("voiceConversation.widget.unavailable"))
+    expect(screen.queryByText("retry")).toBeNull()
+    expect(stopTrack).toHaveBeenCalled()
+    expect(bridge.value.refreshSession).not.toHaveBeenCalled()
+
+    // The bridge then reports what a chat socket closed with 4408 leads to.
+    setBridge("terminal", null, "ws_4408")
+    rerender()
+    expect(screen.getByText("widgetSession.expired.title")).toBeInTheDocument()
+    expect(voice.props!.disabled).toBe(true)
+    expect(socketInstances).toHaveLength(1)
+  })
 
   it("reads a refused handshake only by what it means for the call", async () => {
     renderPage()

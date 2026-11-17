@@ -65,8 +65,8 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
     match: [{ kind: "asr_error", codes: ["voice_unavailable", "model_unavailable", "invalid_request"] }], failure: "voice_unavailable" },
   { row: 8, event: "recognition failed 1011 / 1006, or the handshake was refused", result: "error, retryable",
     match: [{ kind: "asr_error", codes: ["stream_failed"] }, { kind: "asr_close", codes: [1011, 1006] }], failure: "connection_failed" },
-  { row: 9, event: "recognition closed 1012 (server restart), or Session 4408 (the session expired, which the session page ends on its own)", result: "error, retryable",
-    match: [{ kind: "asr_close", codes: [1012, 4408] }], failure: "connection_failed" },
+  { row: 9, event: "recognition closed 1012 (server restart)", result: "error, retryable",
+    match: [{ kind: "asr_close", codes: [1012] }], failure: "connection_failed" },
   { row: 10, event: "usage limit reached", result: "unavailable, not retryable, no quota detail",
     match: [{ kind: "asr_error", codes: ["standalone_usage_refused"] }], failure: "voice_unavailable" },
   { row: 11, event: "600 second limit reached, or a write timeout (close 1000 \"Speech session timed out\")", result: "timed out, retryable",
@@ -93,6 +93,9 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 22, event: "voice switched off during a call", result: "server closes recognition within 30 s, error (row 4)" },
   { row: 23, event: "Session recognition closed 4401 (token refused, or the session is gone)", result: "error, retryable; in an ordinary conversation the page replaces the refused token, once for that token",
     match: [{ kind: "asr_close", codes: [4401] }], failure: "connection_failed" },
+  { row: 24, event: "Session recognition closed 4408 (the session expired)",
+    result: "unavailable, not retryable; the session page ends the session as expired, as it does when the chat socket is closed 4408",
+    match: [{ kind: "asr_close", codes: [4408] }], failure: "voice_unavailable" },
 ]
 
 function matches(match: TransportMatch, event: VoiceTransportEvent): boolean {

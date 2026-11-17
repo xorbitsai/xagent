@@ -1,6 +1,7 @@
 import { useMemo, type CSSProperties } from "react";
 
-import { usePersonaAccentColor, type AvatarPersona } from "@/components/templates/persona-avatar";
+import { usePersonaAccentColor } from "@/lib/avatar-style-extension";
+import type { AvatarPersona } from "@/lib/page-extension-contracts";
 
 type Rgb = readonly [number, number, number];
 

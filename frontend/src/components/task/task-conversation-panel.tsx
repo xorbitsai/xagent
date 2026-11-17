@@ -33,7 +33,7 @@ import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timelin
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
 import { useAgentAccentAttributes } from "@/lib/agent-accent"
-import type { AvatarPersona } from "@/components/templates/persona-avatar"
+import type { AvatarPersona } from "@/lib/page-extension-contracts"
 import { useVoiceCallView } from "@/contexts/voice-call-store"
 import { VoiceOrb } from "@/components/chat/voice-call-ui"
 

@@ -56,6 +56,7 @@ import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Switch } from "@/components/ui/switch"
 import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { toAgentPersona } from "@/lib/agent-persona"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { SettingsDialog, type SettingsDialogTab } from "@/components/settings/settings-dialog"
 import { toast } from "@/components/ui/sonner"
@@ -400,7 +401,7 @@ function RoutinesDialog({
             <div className="space-y-2">
               {items.map((entry) => (
                 <div key={`${entry.agent.id}:${entry.trigger.id}`} className="flex items-center gap-3 rounded-xl border border-border p-3">
-                  <PersonaAvatar persona={{ name: entry.agent.name, avatar: resolveAgentLogoUrl(entry.agent.logo_url ?? null, getApiUrl()), agentId: entry.agent.id }} sizeClassName="h-9 w-9" textClassName="text-xs" decorative />
+                  <PersonaAvatar persona={toAgentPersona(entry.agent, resolveAgentLogoUrl(entry.agent.logo_url ?? null, getApiUrl()))} sizeClassName="h-9 w-9" textClassName="text-xs" decorative />
                   <div className="min-w-0 flex-1">
                     <b className="block truncate text-sm font-semibold">{entry.trigger.name}</b>
                     <span className="block truncate text-xs text-muted-foreground">{entry.agent.name}{entry.trigger.next_run_at ? ` · ${new Date(entry.trigger.next_run_at).toLocaleString()}` : ""}</span>
@@ -853,7 +854,7 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
                       className={cn("group flex items-start gap-2.5 rounded-xl px-2.5 py-2 transition-colors", active ? "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]" : "hover:bg-[#f0f0f3]", isOpening && "pointer-events-none opacity-70")}
                     >
                       <span className={cn("relative mt-0.5 rounded-full ring-1 ring-offset-2 ring-offset-[#f8f8fa]", presence.ring)}>
-                        <PersonaAvatar persona={{ name: agent.name, avatar: getAgentAvatar(agent), agentId: agent.id }} sizeClassName="h-8 w-8" textClassName="text-[11px]" decorative />
+                        <PersonaAvatar persona={toAgentPersona(agent, getAgentAvatar(agent))} sizeClassName="h-8 w-8" textClassName="text-[11px]" decorative />
                         <i className={cn("absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#f8f8fa]", presence.dot)} />
                       </span>
                       <span className="min-w-0 flex-1">
@@ -880,7 +881,7 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
                   return (
                     <div key={task.task_id} className="group flex items-center rounded-xl hover:bg-[#f0f0f3]">
                     <Link href={`/task/${task.task_id}`} className={cn("flex min-w-0 flex-1 items-start gap-2.5 rounded-xl px-2.5 py-2 hover:bg-[#f0f0f3]", active && "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]")}>
-                      <PersonaAvatar persona={{ name: task.agent_name || branding.appName, avatar: taskAvatar, agentId: task.agent_id }} sizeClassName="h-7 w-7" textClassName="text-[10px]" decorative />
+                      <PersonaAvatar persona={toAgentPersona({ id: task.agent_id, name: task.agent_name || branding.appName }, taskAvatar)} sizeClassName="h-7 w-7" textClassName="text-[10px]" decorative />
                       <span className="min-w-0 flex-1"><span className="flex items-center gap-2"><b className="truncate text-xs font-semibold">{task.title || t("workspace.untitledTask")}</b><time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.created_at, locale, t)}</time></span><span className="mt-0.5 flex items-center gap-1.5 truncate text-[10.5px] text-muted-foreground">{task.agent_name || branding.appName}{compactChannelName && <span title={getChannelTooltip(task.channel_name!, task.channel_type)} className="inline-flex items-center gap-1 rounded border border-border px-1"><ChannelTypeIcon channelType={task.channel_type} />{compactChannelName}</span>}</span></span>
                     </Link>
                     <Popover open={taskMenuId === String(task.task_id)} onOpenChange={(open) => setTaskMenuId(open ? String(task.task_id) : null)}>

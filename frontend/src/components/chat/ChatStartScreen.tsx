@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
 import {
   ChatInput,
@@ -10,6 +10,7 @@ import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { useAgentAccentAttributes } from "@/lib/agent-accent";
+import { toAgentPersona } from "@/lib/agent-persona";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useVoiceCallView } from "@/contexts/voice-call-store";
 import { VoiceOrb } from "./voice-call-ui";
@@ -175,9 +176,10 @@ export function ChatStartScreen({
   const voiceHero = Boolean(voiceCall && (voiceConversationSource === "provided" || voiceInputEnabled) && onVoiceConversation);
 
   // One object for the hero avatar and the tint, so the two cannot disagree.
-  const leadPersona = leadAgent
-    ? { name: leadAgent.name, avatar: resolveTeammateAvatar(leadAgent), agentId: leadAgent.id }
-    : undefined;
+  const leadPersona = useMemo(
+    () => (leadAgent ? toAgentPersona(leadAgent, resolveTeammateAvatar(leadAgent)) : undefined),
+    [leadAgent],
+  );
   const accentAttributes = useAgentAccentAttributes(leadPersona);
 
   return (
@@ -364,7 +366,7 @@ export function ChatStartScreen({
                         }`}
                       >
                         <PersonaAvatar
-                          persona={{ name: agent.name, avatar: avatarUrl, agentId: agent.id }}
+                          persona={toAgentPersona(agent, avatarUrl)}
                           sizeClassName="h-[34px] w-[34px]"
                           textClassName="text-[11px]"
                           className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}

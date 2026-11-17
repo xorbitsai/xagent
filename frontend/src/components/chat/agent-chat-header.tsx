@@ -15,6 +15,8 @@ import {
 import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
 import { DeployAgentDialog, type Agent as DeployAgent } from "@/components/build/deploy-agent-dialog"
 import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { toAgentPersona } from "@/lib/agent-persona"
+import type { AvatarPersona } from "@/lib/page-extension-contracts"
 import { AgentProfileDialog } from "@/components/chat/agent-profile-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -37,6 +39,10 @@ interface AgentChatHeaderProps {
   logoUrl?: string | null
   showBack?: boolean
   rightSlot?: ReactNode
+  /** Called with the agent as this header shows it: once its details are
+   * fetched, and again after the profile dialog saves a rename or a new logo.
+   * Not called with the route hints, which this header deliberately ignores. */
+  onAgentChange?: (agent: AvatarPersona) => void
 }
 
 function normalizeAgent(value: unknown, agentId: number): AgentDetails {
@@ -76,6 +82,7 @@ function AgentChatHeaderContent({
   agentId,
   showBack = false,
   rightSlot,
+  onAgentChange,
 }: AgentChatHeaderProps) {
   const { t } = useI18n()
   const router = useRouter()
@@ -88,18 +95,30 @@ function AgentChatHeaderContent({
   const [profileOpen, setProfileOpen] = useState(false)
   const [deployOpen, setDeployOpen] = useState(false)
   const [routinesOpen, setRoutinesOpen] = useState(false)
+  // Details that have been fetched or saved under this mounted identity; the
+  // initial placeholder is not an agent worth reporting.
+  const [detailsKnown, setDetailsKnown] = useState(false)
 
   useEffect(() => {
     let cancelled = false
     const version = detailVersion.current
     apiRequest(`${getApiUrl()}/api/agents/${agentId}`)
       .then(async (response) => response.ok ? response.json() : null)
-      .then((data) => { if (!cancelled && version === detailVersion.current && data) setAgent(normalizeAgent(data, agentId)) })
+      .then((data) => {
+        if (cancelled || version !== detailVersion.current || !data) return
+        setAgent(normalizeAgent(data, agentId))
+        setDetailsKnown(true)
+      })
       .catch(() => undefined)
     return () => { cancelled = true }
   }, [agentId])
 
   const avatar = useMemo(() => resolveAgentLogoUrl(agent.logo_url ?? null, getApiUrl()), [agent.logo_url])
+  const onAgentChangeRef = useRef(onAgentChange)
+  onAgentChangeRef.current = onAgentChange
+  useEffect(() => {
+    if (detailsKnown) onAgentChangeRef.current?.(toAgentPersona({ id: agentId, name: agent.name }, avatar))
+  }, [detailsKnown, agentId, agent.name, avatar])
   const statusLabel = t(agent.status === "published" ? "workspace.ready" : "workspace.draft")
 
   const openAction = (action: () => void) => {
@@ -115,7 +134,7 @@ function AgentChatHeaderContent({
             <ArrowLeft className="h-4 w-4" />
           </button>
         )}
-        <PersonaAvatar persona={{ name: agent.name, avatar, agentId }} sizeClassName="h-8 w-8" textClassName="text-xs" decorative />
+        <PersonaAvatar persona={toAgentPersona({ id: agentId, name: agent.name }, avatar)} sizeClassName="h-8 w-8" textClassName="text-xs" decorative />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <b className="truncate text-[13px] font-semibold">{agent.name}</b>
@@ -147,6 +166,7 @@ function AgentChatHeaderContent({
           onSaved={(updated) => {
             detailVersion.current += 1
             setAgent(normalizeAgent(updated, agentId))
+            setDetailsKnown(true)
             dispatch({ type: "TRIGGER_TASK_UPDATE" })
           }}
         >

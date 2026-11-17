@@ -785,32 +785,51 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     setTaskId(record.taskId, { navigate: false })
   }, [closeFilePreview, setTaskId])
 
-  const selectLogo = (file: File) => {
+  // A chosen file's preview URL is created when the file is chosen and released
+  // when it is replaced, removed or saved, so the preview is there in the same
+  // commit as the file and never outlives it.
+  const [logoPreview, setLogoPreview] = useState<{ file: File; url: string } | null>(null)
+  const logoPreviewUrlRef = useRef<string | null>(null)
+  const releaseLogoPreview = useCallback(() => {
+    if (logoPreviewUrlRef.current) URL.revokeObjectURL(logoPreviewUrlRef.current)
+    logoPreviewUrlRef.current = null
+  }, [])
+
+  const selectLogo = useCallback((file: File) => {
+    releaseLogoPreview()
+    const url = URL.createObjectURL(file)
+    logoPreviewUrlRef.current = url
+    setLogoPreview({ file, url })
     setLogoFile(file)
     setLogoRemoved(false)
-  }
+  }, [releaseLogoPreview])
 
-  const removeLogo = () => {
+  const removeLogo = useCallback(() => {
+    releaseLogoPreview()
+    setLogoPreview(null)
     setLogoFile(null)
     setLogoUrl(null)
     setLogoRemoved(true)
     if (fileInputRef.current) {
       fileInputRef.current.value = ""
     }
-  }
+  }, [releaseLogoPreview])
 
-  // A chosen file's preview lives only as long as the file is the logo.
-  const [logoFilePreview, setLogoFilePreview] = useState<string | null>(null)
+  // A save clears the chosen file without going through removeLogo.
   useEffect(() => {
-    if (!logoFile) {
-      setLogoFilePreview(null)
-      return
-    }
-    const url = URL.createObjectURL(logoFile)
-    setLogoFilePreview(url)
-    return () => URL.revokeObjectURL(url)
-  }, [logoFile])
-  const logoSrc = logoFile ? logoFilePreview : logoUrl ? `${getApiUrl()}${logoUrl}` : null
+    if (logoFile) return
+    releaseLogoPreview()
+    setLogoPreview(null)
+  }, [logoFile, releaseLogoPreview])
+  useEffect(() => releaseLogoPreview, [releaseLogoPreview])
+
+  const logoSrc = logoFile
+    ? (logoPreview?.file === logoFile ? logoPreview.url : null)
+    : logoUrl ? `${getApiUrl()}${logoUrl}` : null
+  const logoControls = useMemo(
+    () => ({ src: logoSrc, select: selectLogo, remove: removeLogo }),
+    [logoSrc, selectLogo, removeLogo],
+  )
 
   const loadedAgentId = originalData?.id
   const builderSettings = useAgentBuilderSettingsExtension({
@@ -818,7 +837,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     enabled: !readOnly && (!localAgentId || String(loadedAgentId) === localAgentId),
     saving: isCreating,
     agentName: name,
-    logo: { src: logoSrc, select: selectLogo, remove: removeLogo },
+    logo: logoControls,
   })
   // previewConfigKey reads the model seed and the MCP list; opening a record
   // before either lands would have it invalidated straight away. This waits
@@ -2212,10 +2231,8 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                 className={`h-16 w-16 rounded-lg border border-dashed border-muted-foreground/50 flex items-center justify-center bg-background overflow-hidden transition-colors ${readOnly ? "cursor-default" : "cursor-pointer hover:bg-muted/50"}`}
                 onClick={readOnly ? undefined : () => fileInputRef.current?.click()}
               >
-                {logoFile ? (
-                  <img src={URL.createObjectURL(logoFile)} alt="Logo" className="h-full w-full object-cover" />
-                ) : logoUrl ? (
-                  <img src={`${getApiUrl()}${logoUrl}`} alt="Logo" className="h-full w-full object-cover" />
+                {logoSrc ? (
+                  <img src={logoSrc} alt="Logo" className="h-full w-full object-cover" />
                 ) : (
                   <Upload className="h-6 w-6 text-muted-foreground" />
                 )}

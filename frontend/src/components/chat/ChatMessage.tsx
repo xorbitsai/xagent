@@ -31,7 +31,8 @@ import {
   type TaskRuntimeMessageMetadataExtensionProps,
 } from "@/lib/task-runtime-ui-extension";
 import { getAgentTaskHref } from "@/lib/agent-ui-access";
-import { PersonaAvatar, type AvatarPersona } from "@/components/templates/persona-avatar";
+import { PersonaAvatar } from "@/components/templates/persona-avatar";
+import type { AvatarPersona } from "@/lib/page-extension-contracts";
 
 const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
 const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
@@ -122,12 +123,10 @@ export interface ChatMessageProps {
   connectionNotice?: ConnectionNotice;
   // The agent this conversation is with. When set, its avatar stands beside
   // the status line of a turn that has no answer yet.
-  agent?: ChatMessageAgent;
+  agent?: AvatarPersona;
 }
 
-type ChatMessageAgent = AvatarPersona;
-
-function GeneratingIndicator({ latestTitle, taskStatus, connectionNotice, agent }: { latestTitle?: string, taskStatus?: string, connectionNotice: ConnectionNotice, agent?: ChatMessageAgent }) {
+function GeneratingIndicator({ latestTitle, taskStatus, connectionNotice, agent }: { latestTitle?: string, taskStatus?: string, connectionNotice: ConnectionNotice, agent?: AvatarPersona }) {
   const { t } = useI18n();
 
   // Paused, waiting and completed turns show no activity, so a connection

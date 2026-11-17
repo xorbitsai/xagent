@@ -3,6 +3,7 @@
 import React, { useEffect, useRef, useState, type ReactNode } from "react"
 import { Loader2 } from "lucide-react"
 import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { toAgentPersona } from "@/lib/agent-persona"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog"
 import { toast } from "@/components/ui/sonner"
@@ -148,7 +149,7 @@ function AgentProfileDialogContent({ agent, avatar, onClose, onSaved, children }
         showCloseButton={!saving}
       >
         <div className="flex shrink-0 items-center gap-3 border-b border-border px-5 py-4 pr-12">
-          <PersonaAvatar persona={{ name: profile.name, avatar, agentId: profile.id }} sizeClassName="h-10 w-10" textClassName="text-sm" decorative />
+          <PersonaAvatar persona={toAgentPersona(profile, avatar)} sizeClassName="h-10 w-10" textClassName="text-sm" decorative />
           <div>
             <DialogTitle className="text-lg font-semibold">{t("agentProfile.title", { name: profile.name })}</DialogTitle>
             <DialogDescription className="text-xs">{t("agentProfile.subtitle")}</DialogDescription>

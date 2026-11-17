@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const localeState = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
+const accentColor = vi.hoisted(() => ({ value: null as null | readonly [number, number, number], seen: [] as unknown[] }))
 
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -37,6 +38,14 @@ vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
   return { ...actual, getApiUrl: () => "http://api.local" }
 })
+
+vi.mock("@/lib/avatar-style-extension", () => ({
+  usePersonaAccentColor: (persona: unknown) => {
+    accentColor.seen.push(persona)
+    // Like the real hook: no persona, no color.
+    return persona ? accentColor.value : null
+  },
+}))
 
 vi.mock("@/lib/branding", () => ({
   getBrandingFromEnv: () => ({ appName: "Xagent" }),
@@ -72,6 +81,8 @@ afterEach(() => {
   vi.restoreAllMocks()
   chatInputProps.current = null
   localeState.value = "en"
+  accentColor.value = null
+  accentColor.seen.length = 0
 })
 
 describe("ChatStartScreen agents section", () => {
@@ -187,6 +198,32 @@ describe("ChatStartScreen agents section", () => {
     )
     // The plain (no-lead) description only renders in the fallback header.
     expect(screen.queryByText("Some description")).toBeNull()
+  })
+
+  it("tints the screen with the selected teammate's avatar color, and not otherwise", () => {
+    accentColor.value = [17, 78, 184]
+    const maya = { id: 7, name: "Maya" }
+    const { container, rerender } = render(
+      <ChatStartScreen title="Describe the goal" agents={[maya]} selectedAgents={[maya]} onSend={vi.fn()} />
+    )
+
+    const wrapper = container.firstElementChild as HTMLElement
+    expect(wrapper).toHaveAttribute("data-agent-accent")
+    expect(wrapper.style.getPropertyValue("--agent-accent")).toBe("rgb(17 78 184)")
+    // The color is asked for the teammate, by id, as the one persona the hero also shows.
+    expect(accentColor.seen.at(-1)).toEqual({ name: "Maya", avatar: null, agentId: 7 })
+
+    accentColor.value = null
+    rerender(<ChatStartScreen title="Describe the goal" agents={[maya]} selectedAgents={[maya]} onSend={vi.fn()} />)
+    expect(container.firstElementChild).not.toHaveAttribute("data-agent-accent")
+  })
+
+  it("is not tinted while nobody is selected", () => {
+    accentColor.value = [17, 78, 184]
+    const { container } = renderScreen([{ id: 7, name: "Maya" }])
+
+    expect(container.firstElementChild).not.toHaveAttribute("data-agent-accent")
+    expect(accentColor.seen.at(-1)).toBeUndefined()
   })
 
   it("keeps the plain header when nobody is selected", () => {

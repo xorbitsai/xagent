@@ -1,14 +1,6 @@
 import React from "react";
 import { cn } from "@/lib/utils";
-
-/** What an avatar is drawn from. `agentId` names the Agent a persona stands
- * for, when it stands for one: a distribution that lets people style an
- * Agent's avatar looks the style up by it. Nothing here reads it. */
-export interface AvatarPersona {
-  name: string;
-  avatar?: string | null;
-  agentId?: number | string | null;
-}
+import type { AvatarPersona } from "@/lib/page-extension-contracts";
 
 interface PersonaAvatarProps {
   /** Only `name` and `avatar` are read - narrower than the full
@@ -32,22 +24,6 @@ interface PersonaAvatarProps {
   /** Set while this persona is working on a reply, so the avatar reads as
    * busy rather than idle. */
   thinking?: boolean;
-}
-
-/** The color a persona's avatar is drawn in, as an RGB triple, or null when
- * the avatar has no color of its own. Here an avatar is an uploaded image or
- * a neutral initial, so there never is one. A distribution that draws colored
- * avatars replaces this module and reports the color, and a conversation with
- * that agent is then tinted to match (see `useAgentAccentAttributes`). It is a
- * hook so that a color that is only known later, such as one fetched after the
- * first render, can still reach the conversation.
- *
- * A replacement must keep every export of this module and accept `thinking`. */
-export function usePersonaAccentColor(
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- part of the contract a replacement implements
-  persona: AvatarPersona | null | undefined,
-): readonly [number, number, number] | null {
-  return null;
 }
 
 /** A persona's circular avatar image, falling back to its first initial on a

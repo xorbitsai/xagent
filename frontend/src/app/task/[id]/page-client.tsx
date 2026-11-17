@@ -1,6 +1,6 @@
 "use client"
 
-import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import React, { Suspense, useCallback, useEffect, useRef, useState } from "react"
 import { Loader2, PanelRight } from "lucide-react"
 import { useParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
@@ -12,7 +12,8 @@ import { ProgressPanel, type ProgressStepView } from "@/components/task/progress
 import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { cn, getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
+import { cn } from "@/lib/utils"
+import type { AvatarPersona } from "@/lib/page-extension-contracts"
 
 export interface SessionCheckWatch {
   viewed: number | null // the task this view checks; null while no view is on
@@ -233,17 +234,19 @@ function TaskDetailContent() {
   // across those unrelated refreshes.
   const progressEndedAt = isDagFinished ? state.currentTask?.dagTerminatedAt : undefined
 
-  // The same agent the header above names, so the avatar beside a working
-  // turn and the conversation's tint match it.
-  const agentId = state.currentTask?.agentId
-  const agentName = agentId ? state.currentTask?.agentName : undefined
-  const agentLogoUrl = state.currentTask?.agentLogoUrl
-  const conversationAgent = useMemo(
-    () => agentName
-      ? { name: agentName, avatar: resolveAgentLogoUrl(agentLogoUrl ?? null, getApiUrl()), agentId }
-      : undefined,
-    [agentId, agentName, agentLogoUrl],
-  )
+  // The agent exactly as the header above shows it (fetched, and updated by a
+  // profile save), not the task's own hints, so the avatar beside a working
+  // turn and the conversation's tint never disagree with the header. Details
+  // reported for another agent are not used.
+  const [headerAgent, setHeaderAgent] = useState<AvatarPersona | null>(null)
+  const currentAgentId = state.currentTask?.agentId
+  const conversationAgent = headerAgent && headerAgent.agentId === currentAgentId ? headerAgent : undefined
+  const handleHeaderAgentChange = useCallback((next: AvatarPersona) => {
+    setHeaderAgent((previous) =>
+      previous && previous.agentId === next.agentId && previous.name === next.name && previous.avatar === next.avatar
+        ? previous
+        : next)
+  }, [])
 
   return (
     <div className="h-full flex flex-col md:flex-row bg-background">
@@ -253,6 +256,7 @@ function TaskDetailContent() {
             agentId={state.currentTask.agentId}
             name={state.currentTask.agentName}
             logoUrl={state.currentTask.agentLogoUrl}
+            onAgentChange={handleHeaderAgentChange}
             showBack
             rightSlot={state.dagExecution ? (
               <Button

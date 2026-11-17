@@ -147,8 +147,7 @@ vi.mock("dagre", () => {
   }
 })
 
-vi.mock("@/components/templates/persona-avatar", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/components/templates/persona-avatar")>()),
+vi.mock("@/lib/avatar-style-extension", () => ({
   usePersonaAccentColor: personaAccentColorMock,
 }))
 

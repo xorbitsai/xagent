@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const personaAccentColorMock = vi.hoisted(() => vi.fn())
 
-vi.mock("@/components/templates/persona-avatar", () => ({
+vi.mock("@/lib/avatar-style-extension", () => ({
   usePersonaAccentColor: personaAccentColorMock,
 }))
 

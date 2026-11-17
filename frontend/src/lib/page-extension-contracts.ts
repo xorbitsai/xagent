@@ -49,6 +49,18 @@ export type BuildPageExtensionProviderComponent =
 export type BuildAgentCardExtensionComponent =
   ComponentType<BuildAgentCardExtensionProps>
 
+/** What an avatar is drawn from. `agentId` names the Agent a persona stands
+ * for, when it stands for one: a distribution that lets people style an
+ * Agent's avatar looks the style up by it. The OSS avatar does not read it. */
+export interface AvatarPersona {
+  name: string
+  avatar?: string | null
+  agentId?: number | null
+}
+
+/** An avatar's own color as an [r, g, b] triple, each 0-255. */
+export type AvatarAccentColor = readonly [number, number, number]
+
 export interface AgentBuilderSettingsExtensionOptions {
   /** Undefined when creating an Agent. */
   agentId?: number
@@ -73,9 +85,12 @@ export interface AgentBuilderLogoControls {
 
 export interface AgentBuilderSettingsExtension {
   panel?: ReactNode
-  /** Replaces the built-in logo upload at the top of the form. A distribution
-   * that draws avatars shows the logo and its avatar as one control through it,
-   * driving the logo with `logo` from the options. */
+  /** Replaces the built-in logo upload at the top of the form in every state,
+   * read-only and loading included: while `enabled` is false return it with
+   * its control disabled instead of leaving it out, or the built-in logo
+   * upload would show in its place. A distribution that draws avatars shows
+   * the logo and its avatar as one control through it, driving the logo with
+   * `logo` from the options. */
   avatarPanel?: ReactNode
   /** Immutable JSON settings to submit. Omit or return an empty object when clean. */
   changes?: Record<string, unknown>

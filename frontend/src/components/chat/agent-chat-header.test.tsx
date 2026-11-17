@@ -134,6 +134,43 @@ describe("Agent profile editing", () => {
     expect(screen.getByLabelText("Standing rules")).toHaveValue("Ask before sending refunds.")
   })
 
+  it("reports the agent it fetched, not the route hints, and none before the fetch lands", async () => {
+    let finish!: (response: Response) => void
+    mocks.request.mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve }))
+    const onAgentChange = vi.fn()
+    render(<AgentChatHeader agentId={7} name="Hint name" logoUrl="/uploads/hint.png" onAgentChange={onAgentChange} />)
+
+    expect(onAgentChange).not.toHaveBeenCalled()
+    await act(async () => finish(Response.json({ ...savedProfile, name: "Ben", logo_url: "/uploads/agent_logos/ben.png" })))
+
+    await waitFor(() => expect(onAgentChange).toHaveBeenCalledOnce())
+    expect(onAgentChange).toHaveBeenCalledWith({ name: "Ben", avatar: expect.stringMatching(/\/uploads\/agent_logos\/ben\.png$/), agentId: 7 })
+  })
+
+  it("reports a rename and a new logo that the profile dialog saved", async () => {
+    const onAgentChange = vi.fn()
+    render(<AgentChatHeader agentId={7} name="Ben" onAgentChange={onAgentChange} />)
+    await waitFor(() => expect(onAgentChange).toHaveBeenCalledOnce())
+    await openProfile()
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Ben Support" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onAgentChange).toHaveBeenLastCalledWith(expect.objectContaining({ name: "Ben Support", agentId: 7 })))
+  })
+
+  it("reports once per change, not on every render", async () => {
+    const onAgentChange = vi.fn()
+    const view = render(<AgentChatHeader agentId={7} name="Ben" onAgentChange={onAgentChange} />)
+    await waitFor(() => expect(onAgentChange).toHaveBeenCalledOnce())
+
+    // A parent that passes a fresh callback each render must not cause a report each time.
+    view.rerender(<AgentChatHeader agentId={7} name="Ben" onAgentChange={(agent) => onAgentChange(agent)} />)
+    view.rerender(<AgentChatHeader agentId={7} name="Ben" onAgentChange={(agent) => onAgentChange(agent)} />)
+
+    expect(onAgentChange).toHaveBeenCalledOnce()
+  })
+
   it("discards edits on cancel and does not submit empty names or rules", async () => {
     render(<AgentChatHeader agentId={7} name="Ben" />)
     await openProfile()

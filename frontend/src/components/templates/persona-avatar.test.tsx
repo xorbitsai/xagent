@@ -1,8 +1,8 @@
 import React from "react"
-import { cleanup, render, renderHook, screen } from "@testing-library/react"
+import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest"
 
-import { PersonaAvatar, usePersonaAccentColor } from "./persona-avatar"
+import { PersonaAvatar } from "./persona-avatar"
 
 afterEach(cleanup)
 
@@ -77,14 +77,6 @@ describe("PersonaAvatar", () => {
     rerender(<PersonaAvatar persona={{ name: "Maya" }} sizeClassName="h-8 w-8" />)
 
     expect(screen.getByText("M")).not.toHaveClass("motion-safe:animate-pulse")
-  })
-})
-
-describe("usePersonaAccentColor", () => {
-  it("reports no color for an uploaded image, a neutral initial or no persona", () => {
-    expect(renderHook(() => usePersonaAccentColor({ name: "Maya", avatar: "/avatars/maya.png" })).result.current).toBeNull()
-    expect(renderHook(() => usePersonaAccentColor({ name: "Maya" })).result.current).toBeNull()
-    expect(renderHook(() => usePersonaAccentColor(undefined)).result.current).toBeNull()
   })
 })
 

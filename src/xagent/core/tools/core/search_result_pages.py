@@ -48,7 +48,7 @@ def _host(pattern: str) -> re.Pattern[str]:
 
 _RULES: tuple[_Rule, ...] = (
     # Google: google.<tld>/search (images, news and shopping use tbm= on it).
-    _Rule(_host(rf"(?:www\.)?google\.{_CC_TLD}"), frozenset({"/search"})),
+    _Rule(_host(rf"(?:www\.|encrypted\.)?google\.{_CC_TLD}"), frozenset({"/search"})),
     # Bing, including regional and global.bing.com subdomains.
     _Rule(
         _host(r"(?:[a-z0-9-]+\.)?bing\.com"),
@@ -65,8 +65,10 @@ _RULES: tuple[_Rule, ...] = (
         frozenset({"q"}),
     ),
     # Yahoo, including country subdomains such as uk.search.yahoo.com.
-    _Rule(_host(r"(?:[a-z]{2}\.)?search\.yahoo\.com"), frozenset({"/search"})),
-    _Rule(_host(rf"(?:www\.)?yandex\.{_CC_TLD}"), frozenset({"/search"})),
+    _Rule(
+        _host(r"(?:[a-z]{2}\.)?search\.yahoo\.(?:com|co\.jp)"), frozenset({"/search"})
+    ),
+    _Rule(_host(rf"(?:www\.)?(?:yandex\.{_CC_TLD}|ya\.ru)"), frozenset({"/search"})),
     _Rule(_host(r"(?:www\.|m\.)?baidu\.com"), frozenset({"/s", "/baidu"})),
     _Rule(
         _host(r"search\.brave\.com"),
@@ -82,7 +84,7 @@ _RULES: tuple[_Rule, ...] = (
         frozenset({"/web", "/sogou", "/weixin"}),
     ),
     _Rule(_host(r"(?:www\.|m\.)?so\.com"), frozenset({"/s"})),
-    _Rule(_host(r"search\.naver\.com"), None),
+    _Rule(_host(r"(?:m\.)?search\.naver\.com"), None),
 )
 
 
@@ -105,7 +107,8 @@ def search_result_page_host(url: str) -> str | None:
     if not hostname or parts.scheme.lower() not in {"http", "https"}:
         return None
     hostname = hostname.rstrip(".").lower()
-    path = _normalise_path(parts.path)
+    # Every rule path is lowercase; servers treat /Search like /search.
+    path = _normalise_path(parts.path).lower()
     for rule in _RULES:
         if not rule.host.fullmatch(hostname):
             continue

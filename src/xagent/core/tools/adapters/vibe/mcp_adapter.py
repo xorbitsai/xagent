@@ -91,8 +91,8 @@ from .sandboxed_tool.chrome_session import (
 )
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     SandboxedMCPLoadResult,
-    list_tools_in_sandbox,
     ensure_sandbox_mcp_dependencies,
+    list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
     requires_sandbox_mcp_connection,
     should_sandbox_mcp_connection,

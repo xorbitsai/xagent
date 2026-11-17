@@ -246,6 +246,17 @@ const en = {
     agentFilterLabel: "Agent filter",
     agentFilterAll: "All agents",
     untitled: "Untitled conversation",
+    activeFromLabel: "Active from",
+    activeToLabel: "Active until",
+    clearTime: "Clear",
+    timeRangeInvalid: "The start time must be earlier than the end time.",
+    export: "Export CSV",
+    exporting: "Exporting...",
+    exportFailed: "Failed to export conversation logs.",
+    exportTooManyRows:
+      "Too many conversations to export. The limit is {limit} rows; narrow the filters and try again.",
+    exportTooLargeFile:
+      "The export file is too large. The limit is {limitMb} MB; narrow the filters and try again.",
     sources: {
       all: "All",
       widget: "Widget",

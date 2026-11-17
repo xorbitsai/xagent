@@ -92,7 +92,8 @@ class FetchWebContentTool(AbstractBaseTool):
             "returned assets preserve official page URLs; pass the chosen URL to "
             "download_web_asset instead of recreating it with api_call/write_file. "
             "When reporting how information was found, name fetch_web_content "
-            "for pages that were read, alongside web_search for searching."
+            "for pages fetched with it, and name the search tool you actually "
+            "called for searching."
         )
 
     @property

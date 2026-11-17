@@ -55,7 +55,7 @@ class BraveWebSearchTool(AbstractBaseTool):
             "Set include_content=true only when every result needs page content; "
             "otherwise use fetch_web_content to read one selected URL. "
             "When reporting how information was found, name web_search for "
-            "searching and fetch_web_content for any pages that were read."
+            "searching and fetch_web_content for pages fetched with it."
         )
 
     @property

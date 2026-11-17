@@ -436,12 +436,16 @@ function SessionConversationContent({
       if (held !== null) return held
       const abandoned = () => new DOMException("Aborted", "AbortError")
       if (signal.aborted) throw abandoned()
-      await Promise.race([
-        uploads.waitForOpenConnection(),
-        new Promise<never>((_, reject) => {
-          signal.addEventListener("abort", () => reject(abandoned()), { once: true })
-        }),
-      ])
+      let onAbort!: () => void
+      const aborted = new Promise<never>((_, reject) => {
+        onAbort = () => reject(abandoned())
+        signal.addEventListener("abort", onAbort, { once: true })
+      })
+      try {
+        await Promise.race([uploads.waitForOpenConnection(), aborted])
+      } finally {
+        signal.removeEventListener("abort", onAbort)
+      }
       return currentToken()
     }
     return {

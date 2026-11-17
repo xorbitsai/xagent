@@ -77,7 +77,7 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 12, event: "sending the words failed", result: "call ends, fixed send-failed text, retryable" },
   { row: 13, event: "one sentence could not be synthesized", result: "call continues with a playback note",
     match: [{ kind: "tts_response", statuses: [400, 422, 500, 502, 504] }] },
-  { row: 14, event: "synthesis 401 / 403 (a Session 401 only after one token replacement)", result: "unavailable, not retryable",
+  { row: 14, event: "synthesis 401 / 403 (for a Session 401: when the request's one retry is refused too, the token's replacement failed, or a new conversation is being set up)", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [401, 403] }], failure: "voice_unavailable" },
   { row: 15, event: "synthesis 402 (usage limit), or 404 (the session widget API switched off)", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [402, 404] }], failure: "voice_unavailable" },
@@ -91,7 +91,7 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 20, event: "task id changes from a number to anything else", result: "hang up and close the bar" },
   { row: 21, event: "start pressed again during a call", result: "ignored" },
   { row: 22, event: "voice switched off during a call", result: "server closes recognition within 30 s, error (row 4)" },
-  { row: 23, event: "Session recognition closed 4401 (token refused, or the session is gone)", result: "error, retryable; the page replaces the refused token once",
+  { row: 23, event: "Session recognition closed 4401 (token refused, or the session is gone)", result: "error, retryable; in an ordinary conversation the page replaces the refused token, once for that token",
     match: [{ kind: "asr_close", codes: [4401] }], failure: "connection_failed" },
 ]
 

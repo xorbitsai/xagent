@@ -70,6 +70,22 @@ const getSessionTerminalPresentation = (code: string | null): SessionTerminalPre
   code ? SESSION_TERMINAL_PRESENTATION[code] ?? "unavailable" : "unavailable"
 )
 
+type SessionConversationPhase = ReturnType<typeof useApp>["sessionConversationState"]
+
+// Whether a refused session token may be replaced in this conversation phase.
+// A replacement rebuilds the chat connection: while a conversation is being
+// replaced, or once the page needs a reload, that would cost the visitor the
+// new conversation, so the token the page holds is used as it is.
+const tokenReplaceableIn = (phase: SessionConversationPhase): boolean =>
+  phase === "unbound" || phase === "bound"
+
+// What one open call bar has had refused of its session tokens, each with the
+// single replacement asked for it. A retry stays in the same call; closing the
+// bar and calling again starts a new record.
+interface VoiceCallTokenUse {
+  replaced: Map<string, Promise<string>>
+}
+
 // What the area below the header shows. The chat stays mounted underneath the
 // other two, so a half-typed message is still there on the way back.
 type HistoryViewState =
@@ -101,8 +117,8 @@ interface SessionConversationContentProps {
   historyAvailable: boolean
   // The token of the session the page holds right now, or null while it has none.
   readCurrentToken: () => string | null
-  // Present only while a voice call is offered to this session.
-  voiceTransport?: VoiceAudioTransport
+  // Whether a voice call is offered to this session (voice=1 and the server's voice capability).
+  voiceOffered: boolean
 }
 
 function SessionConversationContent({
@@ -116,7 +132,7 @@ function SessionConversationContent({
   uploads,
   historyAvailable,
   readCurrentToken,
-  voiceTransport,
+  voiceOffered,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -326,7 +342,7 @@ function SessionConversationContent({
   })
 
   // History reads use the token policy of the phase the conversation is in at
-  // the moment of each request: before a conversation is replaced, the token
+  // the moment of each request (tokenReplaceableIn): before a conversation is replaced, the token
   // is refreshed when needed and retried once after a rejection; while one is
   // being replaced, a refresh would rebuild the connection and cost the
   // visitor the new conversation, so the current token is used as it is.
@@ -336,8 +352,7 @@ function SessionConversationContent({
   const phaseRef = useRef(sessionConversationState)
   phaseRef.current = sessionConversationState
   const getHistoryAuth = useCallback((): WidgetSessionHistoryAuth => {
-    const phase = phaseRef.current
-    if (phase === "unbound" || phase === "bound") {
+    if (tokenReplaceableIn(phaseRef.current)) {
       return {
         getToken: () => uploads.ensureFreshSession().then((session) => session.token),
         refreshToken: (rejectedToken) => (
@@ -374,6 +389,87 @@ function SessionConversationContent({
   }
   const unauthorizedHistoryNotice = sessionConversationState === "replacement_ready" ? "refreshToLoad" : "tryLater"
 
+  const voiceCallRef = useRef<VoiceCallTokenUse>({ replaced: new Map() })
+  // Replaces a token the session voice endpoints refused, only in a phase that
+  // allows it and at most once for that token in this call: a second refusal of
+  // the same token, as when two sentences are refused together or a retry
+  // offers it again, shares that replacement. Resolves with the new token; null
+  // when the phase allows none. The phase is read when the refusal arrives.
+  const replaceRefused = useCallback((call: VoiceCallTokenUse, refused: string): Promise<string> | null => {
+    if (!tokenReplaceableIn(phaseRef.current)) return null
+    const asked = call.replaced.get(refused)
+    if (asked) return asked
+    const renewed = uploads.refreshSession(refused).then((session) => session.token)
+    renewed.catch(() => undefined)
+    call.replaced.set(refused, renewed)
+    return renewed
+  }, [uploads])
+  // The transport is fixed when a call starts, so the phase and the token are
+  // read again at each request or handshake, never held here.
+  const voiceTransport = useMemo<VoiceAudioTransport | undefined>(() => {
+    if (!voiceOffered) return undefined
+    const currentToken = () => {
+      const token = readCurrentToken()
+      if (token === null) throw new Error("The session has no token")
+      return token
+    }
+    const synthesize = (token: string, text: string, signal: AbortSignal) => fetch(
+      `${window.location.origin}${WIDGET_SESSION_VOICE_TTS_PATH}`,
+      {
+        method: "POST",
+        signal,
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      },
+    )
+    return {
+      // The token offered the way the chat socket offers it; the server binds
+      // the connection to the session, so a later token change leaves it open.
+      openAsrSocket: () => {
+        const call = voiceCallRef.current
+        const token = currentToken()
+        const socket = new WebSocket(
+          buildWidgetSessionVoiceAsrUrl(window.location.origin),
+          [SESSION_PROTOCOL, `xagent-session-token.${token}`],
+        )
+        // What a close says about the session, not the call, is acted on here;
+        // classify below only reads what it means for the call. A socket the
+        // call closes itself closes with 1000 or 1005, so 4401 comes from the
+        // server: the handshake token was refused, and it is replaced where
+        // replaceRefused allows, so the visitor's retry offers the new one.
+        socket.addEventListener("close", (event) => {
+          if (event.code === 4401) void replaceRefused(call, token)
+        })
+        return socket
+      },
+      startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
+      // The token the page holds at the time of the request. Only a 401 is
+      // retried, once, with the token replaceRefused gives; a 401 it gives
+      // none for, a second 401, or a failed replacement is handed back as the
+      // refusal. A sentence already abandoned (the call ended, or the visitor
+      // talked over it) neither replaces the token, which would rebuild the
+      // chat socket, nor retries: its 401 is handed back as it is.
+      requestTts: async (text, signal) => {
+        const call = voiceCallRef.current
+        const token = currentToken()
+        const response = await synthesize(token, text, signal)
+        if (response.status !== 401 || signal.aborted) return response
+        const renewal = replaceRefused(call, token)
+        if (!renewal) return response
+        let renewed: string
+        try {
+          renewed = await renewal
+        } catch {
+          return response
+        }
+        if (signal.aborted) return response
+        await response.body?.cancel()
+        return synthesize(renewed, text, signal)
+      },
+      classify: classifyWidgetVoiceEvent,
+    }
+  }, [voiceOffered, readCurrentToken, replaceRefused])
+
   // A call opened by the visitor's click. Without a transport no call is
   // offered, and an open call is dropped so a later offer never starts one
   // without a click. History hides the chat and the call bar with it, so
@@ -382,7 +478,14 @@ function SessionConversationContent({
   // starts no call until the visitor asks for one again.
   const [voiceOpen, setVoiceOpen] = useState(false)
   if ((!voiceTransport || view.kind !== "chat") && voiceOpen) setVoiceOpen(false)
-  const openVoiceCall = useCallback(() => setVoiceOpen(true), [])
+  // Recorded while rendering, as phaseRef is: a click reads the bar as last
+  // rendered. Pressing start while a call is open changes nothing.
+  const voiceOpenRef = useRef(voiceOpen)
+  voiceOpenRef.current = voiceOpen
+  const openVoiceCall = useCallback(() => {
+    if (!voiceOpenRef.current) voiceCallRef.current = { replaced: new Map() }
+    setVoiceOpen(true)
+  }, [])
   const voiceTaskStatus = state.currentTask?.status || ""
   // What holds a typed send on the start page: a reply or a send under way, a
   // reset, a typed message's files still uploading, or a message handed over
@@ -712,72 +815,6 @@ export function SessionAgentChatPage() {
     setHeldVoice(advertisedVoice)
   }
   const voiceOffered = voiceRequested && (bridge.session ? advertisedVoice : heldVoice)
-  const refreshSession = bridge.refreshSession
-  const voiceTransport = useMemo<VoiceAudioTransport | undefined>(() => {
-    if (!voiceOffered) return undefined
-    const currentToken = () => {
-      const token = readCurrentToken()
-      if (token === null) throw new Error("The session has no token")
-      return token
-    }
-    const synthesize = (token: string, text: string, signal: AbortSignal) => fetch(
-      `${window.location.origin}${WIDGET_SESSION_VOICE_TTS_PATH}`,
-      {
-        method: "POST",
-        signal,
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      },
-    )
-    // The token the latest recognition handshake offered, until a refusal of
-    // it has been handled.
-    let handshakeToken: string | null = null
-    return {
-      // The token offered the way the chat socket offers it; the server binds
-      // the connection to the session, so a later token change leaves it open.
-      openAsrSocket: () => {
-        const token = currentToken()
-        handshakeToken = token
-        return new WebSocket(
-          buildWidgetSessionVoiceAsrUrl(window.location.origin),
-          [SESSION_PROTOCOL, `xagent-session-token.${token}`],
-        )
-      },
-      startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
-      // The token the page holds at the time of the request. Only a 401 is
-      // retried, once, with the token that replaces the rejected one; a
-      // second 401, or no new token, is handed back as the refusal. A
-      // sentence already abandoned (the call ended, or the visitor talked
-      // over it) neither replaces the token, which would rebuild the chat
-      // socket, nor retries: its 401 is handed back as it is.
-      requestTts: async (text, signal) => {
-        const token = currentToken()
-        const response = await synthesize(token, text, signal)
-        if (response.status !== 401 || signal.aborted) return response
-        let renewed: string
-        try {
-          renewed = (await refreshSession(token)).token
-        } catch {
-          return response
-        }
-        if (signal.aborted) return response
-        await response.body?.cancel()
-        return synthesize(renewed, text, signal)
-      },
-      // A handshake refused for its token (4401) ends the call retryable, as
-      // the state table reads it; the refused token is replaced once, so the
-      // visitor's retry offers the new one. A failed replacement is not
-      // repeated: a session that is really gone ends through the bridge.
-      classify: (event) => {
-        if (event.kind === "asr_close" && event.code === 4401 && handshakeToken !== null) {
-          const refused = handshakeToken
-          handshakeToken = null
-          void refreshSession(refused).catch(() => undefined)
-        }
-        return classifyWidgetVoiceEvent(event)
-      },
-    }
-  }, [readCurrentToken, refreshSession, voiceOffered])
   const uploads = useMemo<SessionUploadControls>(() => ({
     ensureFreshSession: bridge.ensureFreshSession,
     refreshSession: bridge.refreshSession,
@@ -850,7 +887,7 @@ export function SessionAgentChatPage() {
         uploads={uploads}
         historyAvailable={historyAvailable}
         readCurrentToken={readCurrentToken}
-        voiceTransport={voiceTransport}
+        voiceOffered={voiceOffered}
       />
     </AppProvider>
   )

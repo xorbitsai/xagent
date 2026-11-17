@@ -1737,6 +1737,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         throw deliveryError("Message not sent: the conversation source is not valid.", "not_sent")
       }
     }
+    // The server closes the connection on a frame whose delivery declaration
+    // is unknown or arrives together with a request id, and only a taskless
+    // Session connection takes one, so those frames are refused here first.
+    if (chatDelivery !== undefined) {
+      if (connection.chatTaskIdMode !== "omit") {
+        throw deliveryError("A delivery declaration is not supported for this connection.", "not_sent")
+      }
+      if (requestId) {
+        throw deliveryError("A delivery declaration cannot accompany an answer to a request.", "not_sent")
+      }
+      if (chatDelivery !== "new_turn") {
+        throw deliveryError("Message not sent: the delivery declaration is not valid.", "not_sent")
+      }
+    }
 
     const currentTaskId = connection.taskId
     const currentDeliveryGeneration = deliveryGenerationRef.current

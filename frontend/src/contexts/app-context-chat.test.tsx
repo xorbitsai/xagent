@@ -6351,8 +6351,13 @@ describe("AppProvider websocket message routing", () => {
       .sendMessage("continue", config)
       .then(() => "ok", (error: unknown) => error))
 
+    const announce = (capabilities: readonly string[]) =>
+      act(() => webSocketOptions.current?.onConnectionCapabilities?.(capabilities))
+    const NEW_TURN_CAPABILITIES = ["heartbeat", "conversation_attached", "delivery_new_turn"]
+
     it("passes a new-turn declaration to the chat frame on the Session transport", async () => {
       mount("session")
+      announce(NEW_TURN_CAPABILITIES)
 
       expect(await send({ clientMessageId: "declared", delivery: "new_turn" })).toBe("ok")
       expect(await send({ clientMessageId: "declared-source", delivery: "new_turn", sourceTaskId: 101 })).toBe("ok")
@@ -6361,6 +6366,86 @@ describe("AppProvider websocket message routing", () => {
         ["continue", undefined, undefined, "declared", undefined, undefined, undefined, "new_turn"],
         ["continue", undefined, undefined, "declared-source", undefined, undefined, 101, "new_turn"],
       ])
+    })
+
+    it("passes a declaration together with uploaded files", async () => {
+      const transport = makeSessionTransport()
+      const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
+      render(
+        <AppProvider
+          token="token"
+          transport={{ ...transport, session: { ...transport.session, attachments: { accept: ".pdf", maxFiles: 3, maxFileBytes: 1024 } } }}
+        >
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      announce(NEW_TURN_CAPABILITIES)
+
+      await act(async () => {
+        await getSessionControls().sendMessage(
+          "continue",
+          { clientMessageId: "both", delivery: "new_turn" },
+          [],
+          { uploadedFiles: [{ kind: "uploaded", fileId, name: "a.pdf", size: 1, type: "application/pdf" }] },
+        )
+      })
+
+      expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+        "continue", [], undefined, "both", undefined, { fileIds: [fileId], maxFileIds: 3 }, undefined, "new_turn",
+      )
+    })
+
+    it("treats an empty request id as no request id", async () => {
+      mount("session")
+      announce(NEW_TURN_CAPABILITIES)
+
+      expect(await send({
+        clientMessageId: "blank", delivery: "new_turn", metadata: { request_id: "" },
+      })).toBe("ok")
+
+      expect(sendChatMessageMock.mock.calls.at(-1)?.[4]).toBeUndefined()
+      expect(sendChatMessageMock.mock.calls.at(-1)?.[7]).toBe("new_turn")
+    })
+
+    it.each([
+      ["no capabilities frame has arrived", null],
+      ["the capabilities frame does not list the capability", ["heartbeat", "conversation_attached"]],
+    ])("refuses a declaration when %s", async (_name, capabilities) => {
+      mount("session")
+      if (capabilities) announce(capabilities)
+
+      expect(await send({ clientMessageId: "undeclared", delivery: "new_turn" })).toMatchObject({
+        message: "Message not sent: this connection does not take a delivery declaration.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("refuses a declaration on a new connection until its own capabilities frame arrives, though the previous one announced it", async () => {
+      const tree = (identity: string) => (
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      const { rerender } = render(tree("session-one"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      announce(NEW_TURN_CAPABILITIES)
+      expect(getSessionControls().newTurnDelivery).toBe("supported")
+
+      rerender(tree("session-two"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      expect(getSessionControls().newTurnDelivery).toBe("supported")
+
+      expect(await send({ clientMessageId: "stale", delivery: "new_turn" })).toMatchObject({
+        message: "Message not sent: this connection does not take a delivery declaration.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+
+      announce(NEW_TURN_CAPABILITIES)
+      expect(await send({ clientMessageId: "fresh", delivery: "new_turn" })).toBe("ok")
+      expect(sendChatMessageMock.mock.calls.at(-1)?.[7]).toBe("new_turn")
     })
 
     it("refuses an unknown declaration, and any declaration off the Session transport, before sending", async () => {
@@ -13478,6 +13563,11 @@ describe("the task state version gate", () => {
     // A frame the gate drops as older writes nothing.
     expect(accept(versions, frame("task_error", { state_version: 1, status: "failed" }))).toBe(false)
     expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A same-version frame of another run does not inherit the status either.
+    expect(accept(versions, frame("task_started", { state_version: 2, run_id: "r2" }))).toBe(true)
+    expect(versions.get(5)).toMatchObject({ version: 2, runId: "r2" })
+    expect(versions.get(5)?.status).toBeUndefined()
 
     // A newer frame that reports no status does not inherit the older one.
     expect(accept(versions, frame("task_resumed", { state_version: 3 }))).toBe(true)

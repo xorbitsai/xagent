@@ -12,6 +12,7 @@ import {
   RECONNECT_MAX_DELAY_MS,
   classifyClose,
   reconnectDelayMs,
+  type ChatDelivery,
   type ConnectionPhaseFacts,
   type WebSocketConnection,
   deriveConnectionPhase,
@@ -3621,6 +3622,68 @@ describe("useWebSocket normalized connections", () => {
         message: "This conversation is waiting on a question above; answer it to continue.",
       })
     })
+  })
+
+  describe("chat frames checked against their delivery declaration", () => {
+    const DELIVERY_REFUSALS = {
+      connection: "A delivery declaration is not supported for this connection.",
+      request: "A delivery declaration cannot accompany an answer to a request.",
+      value: "Message not sent: the delivery declaration is not valid.",
+    } as const
+    const DELIVERIES = [undefined, "new_turn", "inject"] as const
+    const CONNECTIONS = ["omit", "required"] as const
+    const REQUEST_IDS = [undefined, "request-1"] as const
+    const CASES = DELIVERIES.flatMap((delivery) => CONNECTIONS.flatMap((mode) => (
+      REQUEST_IDS.map((requestId) => [delivery, mode, requestId] as const)
+    )))
+
+    // The refusal a frame shape meets first, in the order the checks run.
+    const expectedRefusal = (
+      delivery: (typeof DELIVERIES)[number],
+      mode: "omit" | "required",
+      requestId: string | undefined,
+    ): string | null => {
+      if (delivery === undefined) return null
+      if (mode !== "omit") return DELIVERY_REFUSALS.connection
+      if (requestId) return DELIVERY_REFUSALS.request
+      if (delivery !== "new_turn") return DELIVERY_REFUSALS.value
+      return null
+    }
+
+    it.each(CASES)(
+      "handles delivery %s on a %s connection with request id %s",
+      async (delivery, mode, requestId) => {
+        const hook = mode === "omit"
+          ? renderHook(() => useWebSocket({ connection: sessionConnection() }))
+          : renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 7 }))
+        await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+        const socket = MockWebSocket.instances[0]
+        if (mode === "omit") socket.protocol = "xagent-session-v1"
+        act(() => socket.open())
+        const refusal = expectedRefusal(delivery, mode, requestId)
+
+        const sent = hook.result.current.sendChatMessage(
+          "continue", undefined, false, "msg-delivery", requestId, undefined, undefined,
+          delivery as ChatDelivery | undefined,
+        )
+
+        if (refusal) {
+          const outcome = sent.then(() => "delivered", (error: unknown) => error)
+          // Checked before awaiting: a frame that went out would wait for an ack.
+          await act(async () => {})
+          expect(socket.send).not.toHaveBeenCalled()
+          expect(await outcome).toMatchObject({ message: refusal, disposition: "not_sent" })
+          return
+        }
+
+        expect(socket.send).toHaveBeenCalledTimes(1)
+        const frame = JSON.parse(socket.send.mock.calls[0][0] as string) as Record<string, unknown>
+        if (delivery === undefined) expect(frame).not.toHaveProperty("delivery")
+        else expect(frame.delivery).toBe("new_turn")
+        act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-delivery" }))
+        await sent
+      },
+    )
   })
 
   it("rejects a coded unsuccessful 2xx batch upload before sending chat", async () => {

@@ -442,7 +442,7 @@ type TaskStateVersionEntry = {
   version: number
   runId?: string | null
   // The status the frame at this version reported; kept across a same-version
-  // frame that reports none.
+  // frame of the same run that reports none.
   status?: TaskStatus
 }
 
@@ -486,7 +486,9 @@ export const acceptTaskControlVersion = (
 
   const known = versions.get(envelope.taskId)
   const status = envelope.status
-    ?? (known?.version === envelope.stateVersion ? known.status : undefined)
+    ?? (known?.version === envelope.stateVersion && known.runId === envelope.runId
+      ? known.status
+      : undefined)
   versions.delete(envelope.taskId)
   versions.set(envelope.taskId, {
     version: envelope.stateVersion,
@@ -2752,7 +2754,9 @@ export type SessionConversationAttachment = "pending" | "attached" | "unsupporte
 // Whether the Session server said, in the capabilities frame of the latest
 // connection that sent one, that it takes chat frames declared as new turns.
 // It is not reset when a connection drops: only the next capabilities frame
-// changes it, and "unknown" until one has arrived.
+// changes it, and "unknown" until one has arrived. The value is for display;
+// a send that carries a declaration also checks that the connection which
+// reported it is the current one.
 export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
 
 interface AppContextType {
@@ -3141,11 +3145,19 @@ export function AppProvider({
   }, [])
 
   // Written only from the capabilities frame of the current Session socket.
+  // The connection ref records which connection's frame wrote the value, so a
+  // send can tell a value reported by the current connection from one left
+  // over from an earlier connection.
   const newTurnDeliveryRef = useRef<NewTurnDeliveryCapability>("unknown")
+  const newTurnDeliveryConnectionRef = useRef<string | null>(null)
   const [newTurnDelivery, setNewTurnDelivery] =
     useState<NewTurnDeliveryCapability>("unknown")
-  const writeNewTurnDelivery = useCallback((next: NewTurnDeliveryCapability) => {
+  const writeNewTurnDelivery = useCallback((
+    next: NewTurnDeliveryCapability,
+    connectionIdentity: string,
+  ) => {
     newTurnDeliveryRef.current = next
+    newTurnDeliveryConnectionRef.current = connectionIdentity
     if (mountedRef.current) setNewTurnDelivery(next)
   }, [])
 
@@ -3528,6 +3540,7 @@ export function AppProvider({
         })
         writeNewTurnDelivery(
           capabilities.includes("delivery_new_turn") ? "supported" : "unsupported",
+          sessionMessageOwner.connectionIdentity,
         )
       }
       : undefined,
@@ -7646,6 +7659,7 @@ export function AppProvider({
         : ''
     const clientMessageId = requestedClientMessageId || generateClientMessageId()
     const requestId = typeof config?.metadata?.request_id === 'string'
+      && config.metadata.request_id
       ? config.metadata.request_id
       : undefined
     // The earlier conversation a new one continues from. Only the Session
@@ -7669,6 +7683,17 @@ export function AppProvider({
     }
     if (delivery !== undefined && requestId !== undefined) {
       throw new MessageDeliveryError("A delivery declaration cannot accompany an answer to a request.", "not_sent")
+    }
+    // A server that does not take the declaration ignores it and may take the
+    // message as an answer, so a send carries it only when the current
+    // connection announced it. A resend after a lost connection reuses these
+    // arguments on the next connection before its capabilities frame arrives.
+    if (
+      delivery !== undefined
+      && (newTurnDeliveryRef.current !== "supported"
+        || newTurnDeliveryConnectionRef.current !== sessionConnectionIdentityRef.current)
+    ) {
+      throw new MessageDeliveryError("Message not sent: this connection does not take a delivery declaration.", "not_sent")
     }
     const sessionDeliveryOwner =
       sessionTransport && sessionConnectionIdentityRef.current

@@ -12,7 +12,9 @@ import hmac
 import pytest
 from starlette.datastructures import QueryParams
 
+from xagent.web import shopify_oauth
 from xagent.web.shopify_oauth import (
+    SHOPIFY_LAUNCH_CLOCK_SKEW_SECONDS,
     SHOPIFY_LAUNCH_MAX_AGE_SECONDS,
     ShopifyOAuthError,
     verify_shopify_launch,
@@ -54,7 +56,22 @@ def test_the_store_host_is_read_case_insensitively():
 
 def test_a_launch_slightly_ahead_of_our_clock_verifies():
     # Shopify's clock may run a little ahead of ours.
-    assert _verify(_signed(_launch_params(timestamp=str(NOW + 60)))) == "acme"
+    ahead = NOW + SHOPIFY_LAUNCH_CLOCK_SKEW_SECONDS
+    assert _verify(_signed(_launch_params(timestamp=str(ahead)))) == "acme"
+
+
+def test_the_current_time_is_read_when_none_is_given(monkeypatch):
+    monkeypatch.setattr(shopify_oauth.time, "time", lambda: NOW + 1)
+    params = _launch_params()
+
+    assert verify_shopify_launch(_signed(params), client_secret=CLIENT_SECRET) == "acme"
+
+    monkeypatch.setattr(
+        shopify_oauth.time, "time", lambda: NOW + SHOPIFY_LAUNCH_MAX_AGE_SECONDS + 1
+    )
+    with pytest.raises(ShopifyOAuthError) as caught:
+        verify_shopify_launch(_signed(params), client_secret=CLIENT_SECRET)
+    assert caught.value.reason == "timestamp_stale"
 
 
 def test_a_launch_within_the_allowed_age_verifies():
@@ -127,9 +144,37 @@ def test_a_launch_within_the_allowed_age_verifies():
             id="too-old",
         ),
         pytest.param(
-            _signed(_launch_params(timestamp=str(NOW + 120))),
-            "timestamp_stale",
+            _signed(
+                _launch_params(
+                    timestamp=str(NOW + SHOPIFY_LAUNCH_CLOCK_SKEW_SECONDS + 1)
+                )
+            ),
+            "timestamp_future",
             id="from-the-future",
+        ),
+        *(
+            pytest.param(
+                _signed(_launch_params(timestamp=value)), "timestamp_invalid", id=case
+            )
+            for case, value in [
+                ("padded", f" {NOW} "),
+                ("underscored", f"{NOW:_}"),
+                ("signed", f"+{NOW}"),
+                (
+                    "non-ascii-digits",
+                    str(NOW).translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")),
+                ),
+                # Beyond float range: subtracting it from the clock overflows.
+                ("too-long", "9" * 400),
+            ]
+        ),
+        *(
+            pytest.param(
+                _signed(_launch_params(**{key: "value"})),
+                "not_a_launch",
+                id=f"with-{key}",
+            )
+            for key in ("code", "state")
         ),
     ],
 )

@@ -2,7 +2,7 @@
 
 oauth_account_hosts.py derives Shopify's authorize and token endpoints from
 the store label bound in the signed OAuth state. generic_oauth_callback calls
-the three checks here, which are specific to Shopify:
+three of the checks here, which are specific to Shopify:
 
 - ``verify_shopify_callback``: Shopify signs every callback query with the
   app's client secret (``hmac``) and names the store that approved it
@@ -16,6 +16,10 @@ the three checks here, which are specific to Shopify:
   offline token, and the Admin API authenticates with
   ``X-Shopify-Access-Token`` rather than a Bearer header, so the shop's
   GraphQL id becomes the grant's identity.
+
+The fourth, ``verify_shopify_launch``, is for the request Shopify sends to
+the app URL after an install or when the merchant opens the app; Toby's
+Shopify install flow (xagent-saas) takes the store to authorize on from it.
 """
 
 import hashlib
@@ -45,7 +49,7 @@ SHOPIFY_API_VERSION = "2026-07"
 # there straight after the install or the merchant's click, so minutes are
 # plenty; a small allowance covers clocks that run ahead of Shopify's.
 SHOPIFY_LAUNCH_MAX_AGE_SECONDS = 300
-_LAUNCH_CLOCK_SKEW_SECONDS = 60
+SHOPIFY_LAUNCH_CLOCK_SKEW_SECONDS = 60
 
 _SHOP_GID_PREFIX = "gid://shopify/Shop/"
 _SCOPE_SEPARATOR = re.compile(r"[\s,]+")
@@ -56,9 +60,9 @@ _IDENTITY_QUERY = "{ shop { id myshopifyDomain } }"
 
 
 class ShopifyOAuthError(ValueError):
-    """A Shopify callback step failed.
+    """A Shopify callback or app-URL check failed.
 
-    ``reason`` is a code-shaped value for the callback rejection log;
+    ``reason`` is a code-shaped value for the rejection log;
     ``message`` is safe to show the merchant and never contains a token.
     """
 
@@ -162,14 +166,31 @@ def verify_shopify_launch(
     params = _verified_params(
         query_items, client_secret=client_secret, request="request"
     )
-    try:
-        timestamp = int(params.get("timestamp", ""))
-    except ValueError:
+    # An OAuth callback is signed the same way; keep the two entry points
+    # apart rather than accept one as the other.
+    if "code" in params or "state" in params:
+        raise ShopifyOAuthError(
+            "not_a_launch", "This is not a request to open the app. Please try again."
+        )
+    raw_timestamp = params.get("timestamp", "")
+    # ASCII digits only: int() would also take spaces, "_", a sign or other
+    # scripts' digits, and a value too long for a float overflows below.
+    if (
+        not (raw_timestamp.isascii() and raw_timestamp.isdigit())
+        or len(raw_timestamp) > 12
+    ):
         raise ShopifyOAuthError(
             "timestamp_invalid", "Shopify's request carried no usable time."
-        ) from None
-    age = (time.time() if now is None else now) - timestamp
-    if not -_LAUNCH_CLOCK_SKEW_SECONDS <= age <= SHOPIFY_LAUNCH_MAX_AGE_SECONDS:
+        )
+    age = (time.time() if now is None else now) - int(raw_timestamp)
+    if age < -SHOPIFY_LAUNCH_CLOCK_SKEW_SECONDS:
+        # Our clock is behind Shopify's; telling the merchant the link expired
+        # would send them round the same failure again.
+        raise ShopifyOAuthError(
+            "timestamp_future",
+            "Shopify's request could not be checked right now. Please try again later.",
+        )
+    if age > SHOPIFY_LAUNCH_MAX_AGE_SECONDS:
         raise ShopifyOAuthError(
             "timestamp_stale",
             "This link from Shopify has expired. Open the app from Shopify again.",

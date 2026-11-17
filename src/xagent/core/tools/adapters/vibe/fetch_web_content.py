@@ -57,6 +57,13 @@ class FetchWebContentResult(BaseModel):
             "401/403/429/451 or a bot challenge); do not retry the URL"
         ),
     )
+    blocked_by_policy: bool = Field(
+        default=False,
+        description=(
+            "True when the URL was refused by tool policy (for example a "
+            "search-engine result page); use web_search instead"
+        ),
+    )
     assets: list[WebAssetReferenceResult] = Field(
         default_factory=list,
         description=(
@@ -90,7 +97,11 @@ class FetchWebContentTool(AbstractBaseTool):
             "discover sources. When the task needs a logo or other exact web "
             "asset, set include_assets=true and usually asset_query='logo'. The "
             "returned assets preserve official page URLs; pass the chosen URL to "
-            "download_web_asset instead of recreating it with api_call/write_file."
+            "download_web_asset instead of recreating it with api_call/write_file. "
+            "Never use this tool to load a search engine's result page (Google, "
+            "Bing, DuckDuckGo, Baidu and similar); such URLs are refused. "
+            "web_search is the only way to search; if it returns nothing, report "
+            "that to the user instead of searching another way."
         )
 
     @property

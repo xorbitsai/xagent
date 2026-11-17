@@ -79,6 +79,7 @@ TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
 TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
 SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
+REFUSE_SEARCH_RESULT_FETCH = "XAGENT_REFUSE_SEARCH_RESULT_FETCH"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
@@ -703,6 +704,21 @@ def get_task_auto_resume_enabled() -> bool:
     """
 
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_refuse_search_result_fetch_enabled() -> bool:
+    """Whether page-fetch tools refuse search-engine result-page URLs.
+
+    On, ``fetch_web_content`` and ``download_web_asset`` return an error for
+    such URLs without making a request and tell the model to use
+    ``web_search``. The switch exists only to roll the refusal back.
+
+    Priority:
+        1. XAGENT_REFUSE_SEARCH_RESULT_FETCH environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(REFUSE_SEARCH_RESULT_FETCH, True)
 
 
 def get_shutdown_handoff_enabled() -> bool:

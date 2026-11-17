@@ -382,21 +382,26 @@ def test_owner_put_rejects_bad_bodies(entity, body, provider) -> None:
     assert provider.calls == []
 
 
-@pytest.mark.parametrize("has_row", [True, False])
+@pytest.mark.parametrize("row", ["widget on", "widget off", "none"])
 @pytest.mark.parametrize("status", ["active", "archived"])
 @pytest.mark.parametrize("value", [True, False])
 def test_workforce_voice_deployment_and_status_guards(
-    has_row, status, value, provider
+    row, status, value, provider
 ) -> None:
+    """A write needs a deployment row (never created here); turning voice on
+    needs an active workforce. A row whose widget is turned off still takes the
+    value."""
     admin = _admin_headers()
-    if has_row:
-        workforce_id = _new_workforce("Guarded workforce")
-    else:
+    if row == "none":
         workforce_id = _create_workforce("Guarded no row", publish=False)
+    else:
+        workforce_id = _new_workforce("Guarded workforce")
+        if row == "widget off":
+            _set_deployment(workforce_id, widget_enabled=False)
     _set_workforce(workforce_id, status=status)
     path = f"/api/workforces/{workforce_id}/widget-voice"
     response = client.put(path, headers=admin, json={"enabled": value})
-    if not has_row:
+    if row == "none":
         assert response.status_code == 404, response.text
         db = _direct_db_session()
         try:
@@ -410,6 +415,7 @@ def test_workforce_voice_deployment_and_status_guards(
         assert _deployment_switch(workforce_id) is False
     else:
         assert response.status_code == 200, response.text
+        assert response.json()["enabled"] is value
         assert _deployment_switch(workforce_id) is value
 
 

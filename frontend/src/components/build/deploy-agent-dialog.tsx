@@ -27,7 +27,8 @@ import {
   type DeploymentConfig,
 } from "@/lib/deployment-config"
 import { DeployAgentEmbedExtension } from "@/lib/deploy-agent-extension"
-import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, rotateAgentWidgetKey, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
+import { buildWidgetSnippet, fetchAgentWidgetKey, getAgentWidgetVoice, isValidAllowedDomain, normalizeAllowedDomain, rotateAgentWidgetKey, setAgentWidgetVoice, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
+import { WidgetVoiceSetting } from "@/components/build/widget-voice-setting"
 
 export interface Agent {
   id: number
@@ -631,6 +632,13 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
             </div>
 
             <DeployAgentEmbedExtension agentId={agentId} widgetOrigin={widgetOrigin}>
+              {deployAgent?.widget_enabled && (
+                <WidgetVoiceSetting
+                  key={agentId}
+                  load={() => getAgentWidgetVoice(agentId)}
+                  save={(enabled) => setAgentWidgetVoice(agentId, enabled)}
+                />
+              )}
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="font-medium">{t("deploy_agent.embed_snippet.title") || "Embed Snippet"}</div>
@@ -652,6 +660,11 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
                 <div className="text-xs text-muted-foreground">
                   {t("deploy_agent.embed_snippet.timezone_hint") || "Optional: add data-timezone=\"Australia/Perth\" (any IANA name) to the script tag to set the chat's time zone. Precedence: data-timezone → the visitor's browser time zone → UTC. If omitted or empty, the browser time zone is used; an unrecognized value falls back to UTC."}
                 </div>
+                {deployAgent?.widget_enabled && (
+                  <div className="text-xs text-muted-foreground">
+                    {t("widget_voice_setting.opt_out_note")}
+                  </div>
+                )}
                 <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                   <pre className="whitespace-pre-wrap break-all text-muted-foreground">
                     {widgetKey && widgetOrigin

@@ -94,3 +94,40 @@ export async function rotateAgentWidgetKey(
   }
   return response.json()
 }
+
+export type WidgetVoiceUnavailableReason =
+  | "voice_models_not_configured"
+  | "voice_models_unavailable"
+
+// `available` and `reason` are null while the switch is off: nothing was
+// checked, which is not the same as "unavailable".
+export interface WidgetVoiceSetting {
+  enabled: boolean
+  available: boolean | null
+  reason: WidgetVoiceUnavailableReason | null
+}
+
+export async function getAgentWidgetVoice(
+  agentId: number | string,
+): Promise<WidgetVoiceSetting> {
+  const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/widget-voice`)
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, "Failed to load widget voice setting")
+  }
+  return response.json()
+}
+
+export async function setAgentWidgetVoice(
+  agentId: number | string,
+  enabled: boolean,
+): Promise<WidgetVoiceSetting> {
+  const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/widget-voice`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  })
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, "Failed to update widget voice setting")
+  }
+  return response.json()
+}

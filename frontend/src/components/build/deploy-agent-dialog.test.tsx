@@ -111,6 +111,11 @@ describe("DeployAgentDialog regional targets", () => {
           }),
         )
       }
+      if (url.endsWith("/api/agents/7/widget-voice")) {
+        return Promise.resolve(
+          jsonResponse({ enabled: false, available: null, reason: null }),
+        )
+      }
       if (url.endsWith("/api/agents/7/share-link")) {
         return Promise.resolve(
           jsonResponse({
@@ -266,6 +271,63 @@ describe("DeployAgentDialog regional targets", () => {
     expect(slot).toHaveAttribute("data-agent-id", "7")
     expect(slot).toContainElement(
       screen.getByTitle("deploy_agent.embed_snippet.copy_btn"),
+    )
+  })
+
+  it("places the voice switch above the snippet when the widget is enabled", async () => {
+    render(
+      <DeployAgentDialog
+        deployAgent={AGENT}
+        onClose={vi.fn()}
+        onUpdate={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("deploy_agent.options.embed.title"))
+    const slot = await screen.findByTestId("embed-extension")
+    const voiceSwitch = await screen.findByRole("switch", {
+      name: "widget_voice_setting.toggle_label",
+    })
+    await waitFor(() => expect(voiceSwitch).toBeEnabled())
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "https://configured-api.example.test/api/agents/7/widget-voice",
+    )
+    expect(slot).toContainElement(voiceSwitch)
+    const snippetTitle = screen.getByText("deploy_agent.embed_snippet.title")
+    expect(
+      voiceSwitch.compareDocumentPosition(snippetTitle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+    const optOutNote = screen.getByText("widget_voice_setting.opt_out_note")
+    expect(slot).toContainElement(optOutNote)
+    expect(
+      snippetTitle.compareDocumentPosition(optOutNote) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it("shows neither the voice switch nor its snippet note when the widget is disabled", async () => {
+    render(
+      <DeployAgentDialog
+        deployAgent={{ ...AGENT, widget_enabled: false }}
+        onClose={vi.fn()}
+        onUpdate={vi.fn()}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("deploy_agent.options.embed.title"))
+    await screen.findByTestId("embed-extension")
+    await screen.findByTitle("deploy_agent.embed_snippet.copy_btn")
+
+    expect(
+      screen.queryByRole("switch", { name: "widget_voice_setting.toggle_label" }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("widget_voice_setting.opt_out_note"),
+    ).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/widget-voice"),
     )
   })
 

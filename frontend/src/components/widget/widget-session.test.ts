@@ -226,7 +226,7 @@ describe("widget session mode", () => {
 
     runWidget({ "data-encrypted-context": GRANT, "data-timezone": "Australia/Perth" })
 
-    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session?timezone=Australia%2FPerth`)
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session?voice=1&timezone=Australia%2FPerth`)
   })
 
   it("appends data-timezone to the guest iframe URL that already has a query", async () => {
@@ -245,7 +245,7 @@ describe("widget session mode", () => {
 
     runWidget({ "data-encrypted-context": GRANT, "data-timezone": "   " })
 
-    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session?voice=1`)
   })
 
   it("still loads the session iframe when data-timezone is malformed", () => {
@@ -255,7 +255,7 @@ describe("widget session mode", () => {
     // back to a plain iframe URL rather than never assigning src.
     runWidget({ "data-encrypted-context": GRANT, "data-timezone": "\uD800" })
 
-    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session?voice=1`)
   })
 
   it("still loads the guest iframe when data-timezone is malformed", async () => {
@@ -275,7 +275,7 @@ describe("widget session mode", () => {
 
     runWidget({ "data-encrypted-context": GRANT })
 
-    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session?voice=1`)
     // Two MutationObservers now exist in session mode: the widget's own
     // panel-removal teardown (armed before mode.attach runs) and this
     // controller's iframe-connectivity one, both on document.documentElement

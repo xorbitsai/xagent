@@ -319,19 +319,19 @@
     return appendParam(url, 'timezone', encoded);
   }
 
-  // Voice calls are opt-in per embedding site: only data-voice="true" (after
-  // trim and lowercase) delegates the microphone to the chat iframe and marks
-  // its URL with voice=1. Any other value, or none, leaves both unchanged; a
-  // non-empty value that is neither "true" nor "false" also logs a warning.
-  // voice=1 is an unsigned hint that any page can add to the URL itself. It
-  // only says the embedder delegated the microphone and is not a permission:
-  // whether voice calls are offered is decided by the server (the
-  // widget_voice_enabled switch on the agent or deployment, re-checked on
-  // every voice request).
+  // The microphone is delegated to the chat iframe, and its URL marked with
+  // voice=1, unless the site sets data-voice="false". "true", an empty value,
+  // or no attribute all delegate it; any other value is treated as "false" and
+  // logs a warning. voice=1 is an unsigned hint that any page can add to the
+  // URL itself: it only says this script delegated the microphone. Whether
+  // voice calls are offered is decided by the server (the voice switch of the
+  // agent, workforce or grant, and whether the voice models are available),
+  // which the chat page reads at login or from the session payload, and which
+  // the voice endpoints check again on every request.
   var embedVoiceRaw = (scriptTag.getAttribute('data-voice') || '').trim().toLowerCase();
-  var embedVoice = embedVoiceRaw === 'true';
+  var embedVoice = embedVoiceRaw !== 'false' && (embedVoiceRaw === '' || embedVoiceRaw === 'true');
   if (embedVoiceRaw && embedVoiceRaw !== 'true' && embedVoiceRaw !== 'false') {
-    console.warn('Xagent Widget: data-voice must be "true" or "false"; ignoring it.');
+    console.warn('Xagent Widget: data-voice must be "true" or "false"; treating it as "false", so this page offers no voice calls.');
   }
 
   function withVoice(url) {
@@ -643,9 +643,9 @@
   // each powerful feature here. clipboard-write: without it the chat's copy
   // buttons could only rely on the legacy execCommand fallback. microphone:
   // needed for voice calls. Delegating it only lets the chat page request the
-  // microphone; the visitor still has to agree in the browser's permission
-  // prompt. It is therefore delegated only when the site explicitly declares
-  // data-voice="true" and is never granted by default.
+  // microphone, which it does only after the visitor starts a call, and the
+  // visitor still has to agree in the browser's permission prompt. It is
+  // delegated unless the site sets data-voice="false".
   iframe.setAttribute('allow', embedVoice ? 'clipboard-write; microphone' : 'clipboard-write');
   panel.appendChild(iframe);
 

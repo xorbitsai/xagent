@@ -236,9 +236,73 @@ def _web_config():
 )
 def test_host_fences_discard_the_reuse_entry(fence) -> None:
     config = _web_config()
-    mcp_tools._remember_mcp_load(config, "key", [], MCPToolLoadSummary())
+    mcp_tools._remember_mcp_load(
+        config, "key", [], MCPToolLoadSummary(), generation=0, mcp_configs=[]
+    )
     assert getattr(config, mcp_tools._MCP_LOAD_CACHE_ATTR)
 
     assert fence(config) is True
 
     assert not getattr(config, mcp_tools._MCP_LOAD_CACHE_ATTR, None)
+
+
+@pytest.mark.asyncio
+async def test_fence_firing_mid_load_is_not_undone_by_the_finishing_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _Config(SERVERS)
+    calls = 0
+
+    async def loader_that_gets_fenced(mcp_configs, **kwargs):
+        nonlocal calls
+        calls += 1
+        mcp_tools.discard_mcp_load_reuse(config)  # a fence fires mid-load
+        return [_LoadedTool()]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(loader_that_gets_fenced),
+    )
+
+    await mcp_tools.create_mcp_tools(config)
+    await mcp_tools.create_mcp_tools(config)
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_config_declared_unavailable_server_does_not_block_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _Config(
+        [
+            *SERVERS,
+            {
+                "name": "Drive",
+                "config": {"unavailable": True, "reason": "oauth_token_required"},
+            },
+        ]
+    )
+    calls = 0
+
+    async def loader_with_declared_placeholder(mcp_configs, **kwargs):
+        nonlocal calls
+        calls += 1
+        return [
+            _LoadedTool(),
+            UnavailableMCPTool(
+                server_name="Drive", server_id=2, reason="oauth_token_required"
+            ),
+        ]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(loader_with_declared_placeholder),
+    )
+
+    await mcp_tools.create_mcp_tools(config)
+    await mcp_tools.create_mcp_tools(config)
+
+    assert calls == 1

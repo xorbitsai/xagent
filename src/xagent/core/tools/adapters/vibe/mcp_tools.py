@@ -326,9 +326,21 @@ def _mcp_load_reuse_key(
     return hashlib.sha256(f"{id(sandbox)}|{payload}".encode()).hexdigest()
 
 
+_MCP_LOAD_GENERATION_ATTR = "_mcp_load_reuse_generation"
+
+
+def _reuse_generation(config: Any) -> int:
+    return getattr(config, _MCP_LOAD_GENERATION_ATTR, 0)
+
+
 def discard_mcp_load_reuse(config: Any) -> None:
-    """Forget the MCP load a config remembered for reuse, if any."""
+    """Forget the MCP load a config remembered for reuse, if any.
+
+    Also bumps a generation, so a load that was already in flight when a fence
+    fired cannot write its (now stale) result back afterwards.
+    """
     try:
+        setattr(config, _MCP_LOAD_GENERATION_ATTR, _reuse_generation(config) + 1)
         setattr(config, _MCP_LOAD_CACHE_ATTR, None)
     except Exception:  # a config that rejects attributes never reuses
         logger.debug("MCP load reuse entry could not be cleared", exc_info=True)
@@ -349,12 +361,39 @@ def _reusable_mcp_load(config: Any, key: str | None) -> tuple[List[Any], Any] | 
     return None
 
 
+def _declared_unavailable_names(mcp_configs: List[dict[str, Any]]) -> set[str]:
+    """Servers the config itself declares unavailable (for example OAuth not
+    connected). They are part of the key, so they do not need a retry."""
+    from .selection_spec import normalize_mcp_server_name
+
+    return {
+        normalize_mcp_server_name(cfg.get("name", ""))
+        for cfg in mcp_configs
+        if isinstance(cfg.get("config"), dict) and cfg["config"].get("unavailable")
+    }
+
+
 def _remember_mcp_load(
-    config: Any, key: str | None, tools: List[Any], summary: Any
+    config: Any,
+    key: str | None,
+    tools: List[Any],
+    summary: Any,
+    *,
+    generation: int,
+    mcp_configs: List[dict[str, Any]],
 ) -> None:
-    # Only a clean load is worth replaying: a failed server must be retried
-    # and a required-policy failure must not outlive the outage.
-    if key is None or summary.failures:
+    from .selection_spec import normalize_mcp_server_name
+
+    if key is None or generation != _reuse_generation(config):
+        return  # a fence fired while the load was in flight
+    # Only a load without real failures is worth replaying: a failed server
+    # must be retried and a required-policy failure must not outlive the
+    # outage. A server the config declares unavailable is not a load failure.
+    declared = _declared_unavailable_names(mcp_configs)
+    if any(
+        normalize_mcp_server_name(failure.server_name) not in declared
+        for failure in summary.failures
+    ):
         return
     try:
         setattr(config, _MCP_LOAD_CACHE_ATTR, (key, _clock(), list(tools), summary))
@@ -496,6 +535,7 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 actor_stdio_session_identities=session_identities,
                 actor_stdio_session_consumer=session_consumer,
             )
+        reuse_generation = _reuse_generation(config)
         reuse_key = _mcp_load_reuse_key(
             mcp_configs, create_kwargs["sandbox"], session_identities
         )
@@ -528,6 +568,13 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
             summary = reused[1]
         else:
             summary = _build_mcp_load_summary(mcp_configs, tools)
-            _remember_mcp_load(config, reuse_key, tools, summary)
+            _remember_mcp_load(
+                config,
+                reuse_key,
+                tools,
+                summary,
+                generation=reuse_generation,
+                mcp_configs=mcp_configs,
+            )
 
     return await _finish_mcp_setup(config, summary, tools)

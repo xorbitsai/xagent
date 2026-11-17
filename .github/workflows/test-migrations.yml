@@ -205,10 +205,11 @@ on:
   pull_request:
     branches: [main]
   # An approval starts the migration tests of a pull request that has only had
-  # the quick run; see "Decide what this run covers". Any other review starts
-  # a run whose jobs are all skipped.
+  # the quick run; see "Decide what this run covers". So does dismissing a
+  # review, which can approve a pull request without a new approval. Any other
+  # review starts a run whose jobs are all skipped.
   pull_request_review:
-    types: [submitted]
+    types: [submitted, dismissed]
   # Required by the merge queue: without this the two required contexts below
   # are never reported on a merge group, its entries time out, and every merge
   # stalls. Harmless before a queue exists -- merge_group simply never fires.
@@ -224,7 +225,7 @@ jobs:
     name: Detect migration changes
     runs-on: ubuntu-latest
     # A review starts this workflow only to run it fully on an approval.
-    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved'
+    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed'
     permissions:
       contents: read
       # The review decision, and whether an approval's head already has a
@@ -287,13 +288,15 @@ jobs:
             done
             # A second approval of a head that already has its verdict, passed
             # or failed, does not repeat the full run. A failed lookup repeats
-            # it rather than leave the head without one.
+            # it rather than leave the head without one. This run's own checks
+            # do not count: re-running it after a failure must run it again.
             if [[ "${GITHUB_EVENT_NAME}" == "pull_request_review" && "${full}" == "true" ]] &&
               verdicts="$(gh api --method GET "repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
                 -f check_name="${VERDICT_CHECK}" -f per_page=100 \
                 --jq '[.check_runs[]
                        | select(.app.slug == "github-actions" and .status == "completed")
-                       | select(.conclusion == "success" or .conclusion == "failure")]
+                       | select(.conclusion == "success" or .conclusion == "failure")
+                       | select((.details_url // "") | contains("/runs/" + env.GITHUB_RUN_ID + "/") | not)]
                       | length')" &&
               [[ "${verdicts}" =~ ^[1-9][0-9]*$ ]]; then
               echo "${HEAD_SHA:0:9} already has a full verdict; not repeating it"
@@ -1272,7 +1275,7 @@ jobs:
     # go through with neither migration job having run. The individual job names
     # cannot be required contexts for the same reason; this one can, because it
     # always runs and turns every non-success into an explicit failure.
-    if: always() && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')
+    if: always() && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')
     needs:
       - detect-migration-changes
       - test-sqlite-migrations

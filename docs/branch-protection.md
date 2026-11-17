@@ -299,8 +299,10 @@ both workflows):
 - It reads the pull request's `reviewDecision`. If that cannot be read, the run
   is full: an approved pull request must never be left without its required
   checks.
-- Approving starts the full run through `pull_request_review`. The decision can
-  lag the review that changed it, so an approval run asks up to five times.
+- Approving starts the full run through `pull_request_review`. So does
+  dismissing a review, which can leave a pull request approved without a new
+  approval. The decision can lag the review that changed it, so a review run
+  asks up to five times.
 - A second approval of a head that already has a completed required check,
   passed or failed, does not repeat the full run.
 - A review that is not an approval starts a run whose jobs are all skipped.

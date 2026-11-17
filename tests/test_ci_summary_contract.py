@@ -52,7 +52,7 @@ DRAFT_GUARD = (
 # A review that is not an approval runs nothing.
 APPROVAL_GUARD = (
     "github.event_name != 'pull_request_review'"
-    " || github.event.review.state == 'approved'"
+    " || github.event.review.state == 'approved' || github.event.action == 'dismissed'"
 )
 FULL_GUARD = "needs.changes.outputs.full == 'true'"
 

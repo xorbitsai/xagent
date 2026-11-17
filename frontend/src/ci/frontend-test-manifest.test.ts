@@ -26,7 +26,7 @@ const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
   "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/background-jobs.test.ts src/lib/team-sharing-sanitizers.test.ts src/lib/oauth-account.test.ts src/lib/oauth-connect-account.test.ts src/lib/oauth-connect.test.ts src/lib/oauth-launch.test.ts"
 const ciSummaryCondition =
-  "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')"
+  "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')"
 const frontendSummaryCheckCommand =
   'check_job "frontend-build" "${{ needs[\'frontend-build\'].result }}"'
 // The single condition the frontend-build steps are allowed to carry. The rule
@@ -1424,7 +1424,7 @@ describe("frontend CI test manifest", () => {
   it.each([
     [
       "missing always()",
-      "if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')",
+      "if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')",
     ],
     [
       "missing the approval guard",
@@ -1434,7 +1434,7 @@ describe("frontend CI test manifest", () => {
   ])("rejects ci-summary with %s", (_, replacement) => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved')",
+      "if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')",
       replacement,
       "ci-summary if policy",
     )

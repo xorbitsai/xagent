@@ -9,8 +9,10 @@ docs/branch-protection.md "Quick runs before approval".
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -49,7 +51,7 @@ WORKFLOW_CASES = {
 }
 APPROVAL_GUARD = (
     "github.event_name != 'pull_request_review'"
-    " || github.event.review.state == 'approved'"
+    " || github.event.review.state == 'approved' || github.event.action == 'dismissed'"
 )
 PR_EVENTS = ("pull_request", "pull_request_review")
 OTHER_EVENTS = ("push", "merge_group", "workflow_dispatch")
@@ -78,23 +80,48 @@ def _scope_step(name: str) -> dict:
     return steps[0]
 
 
+THIS_RUN = 7
+
+
 def _scope(
-    tmp_path: Path, event: str, gh: str, verdicts: str = "0", workflow: str = "ci.yml"
+    tmp_path: Path,
+    event: str,
+    gh: str,
+    verdicts: list[tuple[str, str, str | None, int]] | str = (),
+    workflow: str = "ci.yml",
 ) -> tuple[str, int]:
     """Run a scope step with `gh` as its stand-in; count its review lookups.
 
-    `verdicts` is what the lookup of earlier verdict check runs answers;
-    "fail" makes it fail.
+    `verdicts` are the required check's runs on the head as (app, status,
+    conclusion, workflow run id), filtered by the step's own `--jq`; "fail"
+    makes that lookup fail. This run's id is THIS_RUN.
     """
     step = _scope_step(workflow)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     called = tmp_path / "called"
-    answer = "exit 1" if verdicts == "fail" else f"echo {verdicts}"
+    checks = tmp_path / "checks.json"
+    if verdicts != "fail":
+        runs = [
+            {
+                "app": {"slug": app},
+                "status": status,
+                "conclusion": conclusion,
+                "details_url": "https://github.com/xorbitsai/xagent"
+                f"/actions/runs/{run_id}/job/1",
+            }
+            for app, status, conclusion, run_id in verdicts
+        ]
+        checks.write_text(json.dumps({"check_runs": runs}), encoding="utf-8")
+    answer = (
+        "exit 1"
+        if verdicts == "fail"
+        else f'while [ "$1" != "--jq" ]; do shift; done; exec jq -r "$2" "{checks}"'
+    )
     fake = bin_dir / "gh"
     fake.write_text(
         "#!/bin/bash\n"
-        f'if [[ "$*" == *check-runs* ]]; then {answer}; exit; fi\n'
+        f'if [[ "$*" == *check-runs* ]]; then {answer}; fi\n'
         f'echo call >> "{called}"\n{gh}\n',
         encoding="utf-8",
     )
@@ -113,6 +140,7 @@ def _scope(
             "REPO": "xorbitsai/xagent",
             "PR_NUMBER": "3853",
             "HEAD_SHA": "0123456789abcdef0123456789abcdef01234567",
+            "GITHUB_RUN_ID": str(THIS_RUN),
             "VERDICT_CHECK": step["env"]["VERDICT_CHECK"],
         },
         capture_output=True,
@@ -164,7 +192,15 @@ def test_an_unreadable_review_decision_runs_the_full_ci(tmp_path, event):
     assert _scope(tmp_path, event, "exit 1") == ("full=true", 1)
 
 
-def test_a_second_approval_does_not_repeat_the_full_run(tmp_path):
+needs_jq = pytest.mark.skipif(
+    not shutil.which("jq"), reason="the step's filter needs jq"
+)
+
+
+@needs_jq
+@pytest.mark.parametrize("conclusion", ["success", "failure"])
+def test_a_second_approval_does_not_repeat_the_full_run(tmp_path, conclusion):
+    earlier = [("github-actions", "completed", conclusion, 3)]
     for workflow in WORKFLOW_CASES:
         work = tmp_path / workflow
         work.mkdir()
@@ -172,25 +208,51 @@ def test_a_second_approval_does_not_repeat_the_full_run(tmp_path):
             work,
             "pull_request_review",
             "echo APPROVED",
-            verdicts="1",
+            verdicts=earlier,
             workflow=workflow,
         ) == ("full=false", 1)
     # A push after the approval gets its full run whatever the old head had.
     (tmp_path / "push").mkdir()
-    assert _scope(tmp_path / "push", "pull_request", "echo APPROVED", verdicts="1") == (
-        "full=true",
-        1,
-    )
-
-
-@pytest.mark.parametrize("verdicts", ["0", "fail", "", "x"])
-def test_an_approval_without_a_known_verdict_runs_the_full_ci(tmp_path, verdicts):
     assert _scope(
-        tmp_path, "pull_request_review", "echo APPROVED", verdicts=verdicts
+        tmp_path / "push", "pull_request", "echo APPROVED", verdicts=earlier
     ) == (
         "full=true",
         1,
     )
+
+
+@needs_jq
+@pytest.mark.parametrize("workflow", sorted(WORKFLOW_CASES))
+def test_re_running_a_failed_approval_run_runs_it_fully_again(tmp_path, workflow):
+    # "Re-run all jobs" keeps the run id; its first attempt's failed verdict
+    # must not turn the re-run into a quick one.
+    own = [("github-actions", "completed", "failure", THIS_RUN)]
+    assert _scope(
+        tmp_path,
+        "pull_request_review",
+        "echo APPROVED",
+        verdicts=own,
+        workflow=workflow,
+    ) == ("full=true", 1)
+
+
+@needs_jq
+@pytest.mark.parametrize(
+    "verdicts",
+    [
+        [],
+        "fail",
+        [("github-actions", "in_progress", None, 3)],
+        [("github-actions", "completed", "cancelled", 3)],
+        [("github-actions", "completed", "skipped", 3)],
+        [("someone-else", "completed", "success", 3)],
+    ],
+    ids=["none", "unreadable", "in-progress", "cancelled", "skipped", "other-app"],
+)
+def test_an_approval_without_a_known_verdict_runs_the_full_ci(tmp_path, verdicts):
+    assert _scope(
+        tmp_path, "pull_request_review", "echo APPROVED", verdicts=verdicts
+    ) == ("full=true", 1)
 
 
 @pytest.mark.parametrize("event", OTHER_EVENTS)
@@ -202,7 +264,10 @@ def test_merge_groups_pushes_and_manual_runs_are_always_full(tmp_path, event):
 def test_only_an_approval_starts_a_review_run(name):
     workflow = _workflow(name)
     decider, summary, *_ = WORKFLOW_CASES[name]
-    assert workflow["on"]["pull_request_review"] == {"types": ["submitted"]}
+    # A dismissal can approve a pull request without a new approval.
+    assert workflow["on"]["pull_request_review"] == {
+        "types": ["submitted", "dismissed"]
+    }
     jobs = workflow["jobs"]
     assert APPROVAL_GUARD in _normalise(jobs[decider]["if"])
     assert APPROVAL_GUARD in _normalise(jobs[summary]["if"])

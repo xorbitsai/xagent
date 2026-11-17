@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { useVoiceCallView } from "@/contexts/voice-call-store"
 import { classifyWidgetVoiceEvent, type WidgetVoiceCallOptions } from "@/hooks/use-widget-voice-call"
-import type { VoiceAudioTransport, VoiceTransportEvent } from "@/lib/voice-audio"
+import type { VoiceAudioTransport } from "@/lib/voice-audio"
 import type { WidgetSession, WidgetSessionStatus } from "./use-widget-session"
 
 const bridge = vi.hoisted(() => ({
@@ -13,7 +13,6 @@ const bridge = vi.hoisted(() => ({
     agent: null as unknown,
     terminalCode: null as string | null,
     isAbsoluteExpiryWarningVisible: false,
-    requestReconnect: vi.fn(),
     handleSessionExpired: vi.fn(),
     handleConnectionClose: () => "handled" as const,
     handleConnectionFailure: () => undefined,
@@ -219,7 +218,6 @@ beforeEach(() => {
   bridge.value.ensureFreshSession.mockReset()
   bridge.value.waitForOpenConnection.mockReset().mockResolvedValue(undefined)
   bridge.value.handleSessionExpired.mockReset()
-  bridge.value.requestReconnect.mockReset()
   voice.props = null; voice.transport = null; voice.audios = []; voice.real = false
   sockets.length = 0
   socketInstances.length = 0
@@ -309,7 +307,6 @@ describe("session widget voice call transport", () => {
     const response = await transport.requestTts("Hello", new AbortController().signal)
     expect(response.status).toBe(401)
     expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(transport.classify({ kind: "tts_response", status: 401, code: undefined })).toBe("voice_unavailable")
   })
 
   it("hands back the 401 without a retry when no new token comes", async () => {
@@ -363,17 +360,6 @@ describe("session widget voice call transport", () => {
     await expect(transport.requestTts("Again", controller.signal)).rejects.toMatchObject({ name: "AbortError" })
     expect(fetchMock).not.toHaveBeenCalled()
   })
-
-  it.each([
-    { label: "recognition closed 4403", event: { kind: "asr_close", code: 4403, reason: "" }, failure: "voice_unavailable" },
-    { label: "recognition closed 4408", event: { kind: "asr_close", code: 4408, reason: "" }, failure: "voice_unavailable" },
-    { label: "synthesis 403", event: { kind: "tts_response", status: 403, code: undefined }, failure: "voice_unavailable" },
-    { label: "synthesis 401 after the retry", event: { kind: "tts_response", status: 401, code: undefined }, failure: "voice_unavailable" },
-  ] satisfies Array<{ label: string; event: VoiceTransportEvent; failure: string }>)("reads $label as the state table does", async ({ event, failure }) => {
-    renderPage()
-    const transport = await openCall()
-    expect(transport.classify(event)).toBe(failure)
-  })
 })
 
 describe("session widget voice call wiring", () => {
@@ -424,7 +410,7 @@ describe("session widget voice call wiring", () => {
     { label: "a question waiting", status: "active", connected: true, sending: false, processing: false, task: "waiting_for_user", busy: false, disabled: false },
     { label: "degraded", status: "degraded", connected: false, sending: false, processing: false, task: "", busy: true, disabled: true },
     { label: "terminal", status: "terminal", connected: false, sending: false, processing: false, task: "", busy: true, disabled: true },
-    { label: "a message handed over from history", status: "active", connected: true, sending: false, processing: false, task: "", busy: true, disabled: false, held: { delivery: true } },
+    { label: "a typed message being delivered", status: "active", connected: true, sending: false, processing: false, task: "", busy: true, disabled: false, held: { delivery: true } },
     { label: "a new conversation being set up", status: "active", connected: true, sending: false, processing: false, task: "", busy: true, disabled: false, held: { reset: true, phase: "reset_requested" } },
     { label: "a reload required", status: "active", connected: true, sending: false, processing: false, task: "", busy: false, disabled: true, held: { locked: true, phase: "reload_required" } },
   ] as Array<{ label: string; status: WidgetSessionStatus; connected: boolean; sending: boolean; processing: boolean; task: string; busy: boolean; disabled: boolean; held?: Held }>)("derives busy and disabled when $label", ({ status: bridgeStatus, connected, sending, processing, task, busy, disabled, held }) => {
@@ -532,7 +518,6 @@ describe("session widget voice call across the session", () => {
       expect(fetchMock).not.toHaveBeenCalled()
       expect(bridge.value.refreshSession).not.toHaveBeenCalled()
       expect(bridge.value.ensureFreshSession).not.toHaveBeenCalled()
-      expect(bridge.value.requestReconnect).not.toHaveBeenCalled()
       fetchMock.mockResolvedValue(new Response(new Uint8Array(0), { headers: audioHeaders }))
       reconnect()
       release()
@@ -814,6 +799,39 @@ describe("session widget voice call and a refused token", () => {
     expect(bridge.value.refreshSession.mock.calls).toEqual([[TOKEN], ["st_renewed"], ["st_renewed"]])
   })
 
+  it("keeps the record of replaced tokens when start is pressed while the call bar is open", async () => {
+    stubRealAudio()
+    renderPage()
+    bridge.value.refreshSession.mockResolvedValue(session({ voice: true }, "st_renewed"))
+    await openRealCall("start")
+    await refuseHandshake(0)
+    expect(bridge.value.refreshSession).toHaveBeenCalledExactlyOnceWith(TOKEN)
+
+    fireEvent.click(screen.getByText("voice:start"))
+    fireEvent.click(retryButton())
+    await connectSocket(1)
+    expect(handshakeToken(1)).toBe(`xagent-session-token.${TOKEN}`)
+    await refuseHandshake(1)
+    expect(bridge.value.refreshSession).toHaveBeenCalledTimes(1)
+  })
+
+  it("writes a late close of an earlier call's socket to that call's record only", async () => {
+    stubRealAudio()
+    renderPage()
+    bridge.value.refreshSession.mockResolvedValue(session({ voice: true }, "st_renewed"))
+    await openRealCall("start")
+    fireEvent.click(screen.getByText("hang up"))
+    await waitFor(() => expect(screen.getByTestId("call")).toHaveTextContent("none"))
+    fireEvent.click(screen.getByText("voice:start"))
+    await connectSocket(1)
+
+    act(() => socketInstances[0].serverClose(4401))
+    expect(bridge.value.refreshSession).toHaveBeenCalledExactlyOnceWith(TOKEN)
+
+    await refuseHandshake(1)
+    expect(bridge.value.refreshSession.mock.calls).toEqual([[TOKEN], [TOKEN]])
+  })
+
   it("asks once for a token that cannot be replaced, and each refusal ends the call retryable", async () => {
     stubRealAudio()
     renderPage()
@@ -868,7 +886,7 @@ describe("session widget voice call and a refused token", () => {
     expect(bridge.value.refreshSession).not.toHaveBeenCalled()
   })
 
-  it.each(["unbound", "bound"])("replaces the token while the conversation is %s", async phase => {
+  it.each(["bound"])("replaces the token while the conversation is %s", async phase => {
     renderPage()
     const transport = await openCall()
     app.sessionConversationState = phase

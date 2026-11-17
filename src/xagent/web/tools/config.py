@@ -5706,8 +5706,8 @@ class WebToolConfig(BaseToolConfig):
         * An unstamped row resolves by name, and only when exactly one app
           owns the name. Unresolved or ambiguous means "not provably a catalog
           row": it stays unfiltered, like any custom server.
-        * A resolved app that declares no ``read_only_tools`` is unfiltered; a
-          declared value that is not a list is ``[]`` (fail closed).
+        * A resolved app without a ``read_only_tools`` key is unfiltered. A key that
+          is present with null or any non-list value is ``[]`` (fail closed).
 
         Cost: the catalog table is read once per config instance (one query,
         cached on the instance) and every server resolves in memory, so a
@@ -5715,8 +5715,10 @@ class WebToolConfig(BaseToolConfig):
         instance, like the MCP config cache it feeds.
         """
         from ...builtin_identity import builtin_provenance_identity
-        from ...web.mcp_apps import MCPAppSnapshot, get_app_for_mcp_server
-        from ...web.models.public_mcp import PublicMCPApp
+        from ...web.mcp_apps import (
+            get_app_for_mcp_server,
+            load_detached_catalog_snapshot,
+        )
 
         auth = getattr(server, "auth", None)
         claimed_app_id: str | None = None
@@ -5734,11 +5736,10 @@ class WebToolConfig(BaseToolConfig):
 
         snapshot = getattr(self, "_catalog_snapshot", None)
         if snapshot is None:
-            snapshot = MCPAppSnapshot(
-                catalog_apps=tuple(self.db.query(PublicMCPApp).all()),
-                servers=(),
-                owner_mcpserver_ids=frozenset(),
-            )
+            # Plain copies, not ORM rows: this is cached on the instance, and
+            # the session behind ``self.db`` can be rolled back and closed
+            # between builds, which detaches live rows.
+            snapshot = load_detached_catalog_snapshot(self.db)
             self._catalog_snapshot = snapshot
 
         if claimed_app_id is not None:
@@ -5763,13 +5764,13 @@ class WebToolConfig(BaseToolConfig):
                 return None
 
         launch_config = app.get("launch_config")
-        declared = (
-            launch_config.get("read_only_tools")
-            if isinstance(launch_config, Mapping)
-            else None
-        )
-        if declared is None:
-            return None
+        if not isinstance(launch_config, Mapping) or (
+            "read_only_tools" not in launch_config
+        ):
+            return None  # key absent: no allowlist declared
+        # Present means declared: an explicit null is a malformed declaration
+        # and fails closed like any other non-list value.
+        declared = launch_config["read_only_tools"]
         if isinstance(declared, (list, tuple)):
             return [str(name) for name in declared]
         return []

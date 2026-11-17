@@ -27,17 +27,21 @@ def _tool(name: str):
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, None),
         (["a", " b ", "", 3], frozenset({"a", "b"})),
         ("a, b,,", frozenset({"a", "b"})),
         ([], frozenset()),
         ({"a": 1}, frozenset()),  # malformed -> fail closed
+        (None, frozenset()),  # present null -> fail closed
         (7, frozenset()),
     ],
 )
 def test_read_only_tool_names(value, expected):
-    connection = {} if value is None else {READ_ONLY_TOOLS_KEY: value}
-    assert read_only_tool_names(connection) == expected
+    assert read_only_tool_names({READ_ONLY_TOOLS_KEY: value}) == expected
+
+
+def test_absent_key_is_unrestricted_but_explicit_null_fails_closed():
+    assert read_only_tool_names({}) is None
+    assert read_only_tool_names({READ_ONLY_TOOLS_KEY: None}) == frozenset()
 
 
 def test_absent_key_keeps_every_tool():
@@ -256,3 +260,30 @@ def test_provenance_marker_from_another_registry_is_not_a_claim(catalog_db):
         auth={"builtin_provenance": {"registry": "other", "app_id": "gone"}},
     )
     assert _lookup(catalog_db, server) is None
+
+
+def test_explicit_null_in_launch_config_fails_closed(catalog_db):
+    from xagent.web.models.public_mcp import PublicMCPApp
+
+    row = catalog_db.query(PublicMCPApp).filter_by(app_id="cosmos").one()
+    row.launch_config = {**row.launch_config, "read_only_tools": None}
+    catalog_db.commit()
+    assert _lookup(catalog_db, SimpleNamespace(name="cosmos", auth=None)) == []
+
+
+def test_cached_snapshot_survives_session_close_and_rollback(catalog_db):
+    """The snapshot is cached on the config instance; the session behind it can
+    be rolled back and closed between builds, which detaches live ORM rows."""
+    from xagent.web.tools.config import WebToolConfig
+
+    stub = SimpleNamespace(db=catalog_db)
+    custom = SimpleNamespace(name="my-own-server", auth=None)
+    connected = SimpleNamespace(name="cosmos", auth=None)
+    assert WebToolConfig._catalog_read_only_tools(stub, connected) == ["query_items"]
+
+    catalog_db.rollback()
+    catalog_db.close()  # detaches every row loaded through the session
+
+    # A name lookup scans every cached app, so a retained ORM row would raise.
+    assert WebToolConfig._catalog_read_only_tools(stub, custom) is None
+    assert WebToolConfig._catalog_read_only_tools(stub, connected) == ["query_items"]

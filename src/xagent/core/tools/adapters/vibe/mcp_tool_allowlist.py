@@ -7,11 +7,12 @@ that set in the connection under :data:`READ_ONLY_TOOLS_KEY`.
 
 Contract
 --------
-* Key absent or ``None``: no filtering. Existing servers are unaffected.
+* Key absent: no filtering. Existing servers are unaffected.
 * A list (or a comma-separated string) of raw MCP tool names: only exactly
   those tools are loaded; every other tool the server lists is dropped before
   an adapter is built. An empty list therefore loads nothing.
-* Any other value is malformed and fails closed, like an empty list.
+* Any other value, including an explicit ``None``, is malformed and fails
+  closed, like an empty list.
 
 The filter runs on the tool listing, before any adapter exists, so the direct
 and the sandboxed loading paths share it and the model can never be handed a
@@ -34,9 +35,9 @@ _ToolT = TypeVar("_ToolT")
 def read_only_tool_names(connection: Mapping[str, Any]) -> frozenset[str] | None:
     """Return the allowed raw tool names, or ``None`` when unrestricted."""
 
-    value = connection.get(READ_ONLY_TOOLS_KEY)
-    if value is None:
+    if READ_ONLY_TOOLS_KEY not in connection:
         return None
+    value = connection[READ_ONLY_TOOLS_KEY]
     if isinstance(value, str):
         return frozenset(item.strip() for item in value.split(",") if item.strip())
     if isinstance(value, (list, tuple, set, frozenset)):

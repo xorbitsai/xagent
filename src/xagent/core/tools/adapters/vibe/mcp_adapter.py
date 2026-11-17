@@ -65,7 +65,6 @@ from ...core.mcp.sessions import (
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
-from .mcp_tool_allowlist import filter_tools_by_read_only_allowlist
 from .config import is_http_status_code
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -83,6 +82,7 @@ from .connector_runtime import (
 from .mcp_approval_gate import gate_mcp_tools
 from .mcp_error_envelope import is_error_envelope, speaks_error_envelope
 from .mcp_result_integrity import MCPResultIntegrityGuard
+from .mcp_tool_allowlist import filter_tools_by_read_only_allowlist
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,

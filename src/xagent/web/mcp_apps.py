@@ -8,7 +8,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List
+from types import SimpleNamespace
+from typing import Any, Dict, List, cast
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -411,6 +412,32 @@ class MCPAppSnapshot:
     catalog_apps: tuple[PublicMCPApp, ...]
     servers: tuple[Any, ...]
     owner_mcpserver_ids: frozenset[int]
+
+
+def load_detached_catalog_snapshot(db: Session) -> MCPAppSnapshot:
+    """Catalog-only snapshot that stays valid after ``db`` is closed.
+
+    ``load_mcp_app_snapshot`` keeps live ORM rows, which become detached (and
+    raise on attribute access) once the owning session is rolled back or
+    closed. A caller that caches the snapshot beyond one session use takes this
+    form instead: every row is a plain copy of the table columns, which is all
+    the resolvers read (``_app_to_dict``, name matching). ``servers`` and
+    ``owner_mcpserver_ids`` are empty; only the catalog is projected.
+    """
+    columns = [column.key for column in PublicMCPApp.__table__.columns]
+    return MCPAppSnapshot(
+        catalog_apps=tuple(
+            cast(
+                PublicMCPApp,
+                SimpleNamespace(
+                    **{key: deepcopy(getattr(row, key)) for key in columns}
+                ),
+            )
+            for row in db.query(PublicMCPApp).all()
+        ),
+        servers=(),
+        owner_mcpserver_ids=frozenset(),
+    )
 
 
 def load_mcp_app_snapshot(db: Session) -> MCPAppSnapshot:

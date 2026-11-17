@@ -65,8 +65,8 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
     match: [{ kind: "tts_response", statuses: [400, 422, 500, 502, 504] }] },
   { row: 14, event: "synthesis 401 / 403", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [401, 403] }], failure: "voice_unavailable" },
-  { row: 15, event: "synthesis 402 (usage limit)", result: "unavailable, not retryable",
-    match: [{ kind: "tts_response", statuses: [402] }], failure: "voice_unavailable" },
+  { row: 15, event: "synthesis 402 (usage limit), or 404 (the session widget API switched off)", result: "unavailable, not retryable",
+    match: [{ kind: "tts_response", statuses: [402, 404] }], failure: "voice_unavailable" },
   { row: 16, event: "synthesis 503, or 400 with model_unavailable", result: "unavailable, not retryable",
     match: [{ kind: "tts_response", statuses: [503] }, { kind: "tts_response", statuses: [400], codes: ["model_unavailable"] }],
     failure: "voice_unavailable" },
@@ -77,6 +77,8 @@ export const WIDGET_VOICE_CALL_STATES: readonly WidgetVoiceStateRow[] = [
   { row: 20, event: "task id changes from a number to anything else", result: "hang up and close the bar" },
   { row: 21, event: "start pressed again during a call", result: "ignored" },
   { row: 22, event: "voice switched off during a call", result: "server closes recognition within 30 s, error (row 4)" },
+  { row: 23, event: "Session recognition handshake closed 4401 (token refused)", result: "error, retryable; the page replaces the refused token",
+    match: [{ kind: "asr_close", codes: [4401] }], failure: "connection_failed" },
 ]
 
 function matches(match: TransportMatch, event: VoiceTransportEvent): boolean {

@@ -568,3 +568,40 @@ describe("session widget voice call and history", () => {
     expect(socketInstances).toHaveLength(1)
   })
 })
+
+describe("session widget voice call and a refused handshake token", () => {
+  const rejected = { kind: "asr_close", code: 4401, reason: "" } as const
+
+  it("replaces the rejected handshake token once and ends retryable, so a retry uses the new token", async () => {
+    renderPage()
+    const transport = await openCall()
+    bridge.value.refreshSession.mockResolvedValue(session({ voice: true }, "st_renewed"))
+    transport.openAsrSocket()
+    expect(transport.classify(rejected)).toBe("connection_failed")
+    expect(bridge.value.refreshSession).toHaveBeenCalledExactlyOnceWith(TOKEN)
+    setBridge("active", session({ voice: true }, "st_renewed"))
+    rerender()
+    transport.openAsrSocket()
+    expect(sockets.map(([, protocols]) => protocols[1])).toEqual([`xagent-session-token.${TOKEN}`, "xagent-session-token.st_renewed"])
+  })
+
+  it("ends retryable without asking again when the token cannot be replaced", async () => {
+    renderPage()
+    const transport = await openCall()
+    bridge.value.refreshSession.mockRejectedValue(new Error("session unavailable"))
+    transport.openAsrSocket()
+    expect(transport.classify(rejected)).toBe("connection_failed")
+    await act(async () => { await Promise.resolve() })
+    expect(transport.classify(rejected)).toBe("connection_failed")
+    expect(bridge.value.refreshSession).toHaveBeenCalledTimes(1)
+  })
+
+  it("ends the call as unavailable when synthesis is switched off (404)", async () => {
+    renderPage()
+    const transport = await openCall()
+    fetchMock.mockResolvedValue(status(404))
+    expect((await transport.requestTts("Hello", new AbortController().signal)).status).toBe(404)
+    expect(transport.classify({ kind: "tts_response", status: 404, code: undefined })).toBe("voice_unavailable")
+    expect(bridge.value.refreshSession).not.toHaveBeenCalled()
+  })
+})

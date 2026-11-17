@@ -257,11 +257,14 @@ const scenarios: Record<number, () => Promise<void>> = {
     act(() => socket.onclose!({ code: 4003, reason: "" }))
     expectStopped("unavailable", false)
   },
+  // The Session page replaces the rejected token inside its transport; the
+  // call itself only ends retryable.
+  23: closes([[4401, ""]], "connectionEnded", true),
 }
 
 describe("widget voice call state table", () => {
-  it("has one scenario for each of its 22 rows", () => {
-    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(22)
+  it("has one scenario for each of its 23 rows", () => {
+    expect(WIDGET_VOICE_CALL_STATES).toHaveLength(23)
     expect(Object.keys(scenarios).map(Number)).toEqual(WIDGET_VOICE_CALL_STATES.map(row => row.row))
   })
 

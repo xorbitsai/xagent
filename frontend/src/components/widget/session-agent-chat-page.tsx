@@ -727,13 +727,20 @@ export function SessionAgentChatPage() {
         body: JSON.stringify({ text }),
       },
     )
+    // The token the latest recognition handshake offered, until a refusal of
+    // it has been handled.
+    let handshakeToken: string | null = null
     return {
       // The token offered the way the chat socket offers it; the server binds
       // the connection to the session, so a later token change leaves it open.
-      openAsrSocket: () => new WebSocket(
-        buildWidgetSessionVoiceAsrUrl(window.location.origin),
-        [SESSION_PROTOCOL, `xagent-session-token.${currentToken()}`],
-      ),
+      openAsrSocket: () => {
+        const token = currentToken()
+        handshakeToken = token
+        return new WebSocket(
+          buildWidgetSessionVoiceAsrUrl(window.location.origin),
+          [SESSION_PROTOCOL, `xagent-session-token.${token}`],
+        )
+      },
       startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
       // The token the page holds at the time of the request. Only a 401 is
       // retried, once, with the token that replaces the rejected one; a
@@ -755,7 +762,18 @@ export function SessionAgentChatPage() {
         await response.body?.cancel()
         return synthesize(renewed, text, signal)
       },
-      classify: classifyWidgetVoiceEvent,
+      // A handshake refused for its token (4401) ends the call retryable, as
+      // the state table reads it; the refused token is replaced once, so the
+      // visitor's retry offers the new one. A failed replacement is not
+      // repeated: a session that is really gone ends through the bridge.
+      classify: (event) => {
+        if (event.kind === "asr_close" && event.code === 4401 && handshakeToken !== null) {
+          const refused = handshakeToken
+          handshakeToken = null
+          void refreshSession(refused).catch(() => undefined)
+        }
+        return classifyWidgetVoiceEvent(event)
+      },
     }
   }, [readCurrentToken, refreshSession, voiceOffered])
   const uploads = useMemo<SessionUploadControls>(() => ({

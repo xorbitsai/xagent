@@ -309,3 +309,22 @@ def test_a_result_card_message_is_displayed_in_the_list_count() -> None:
         db.commit()
     (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
     assert listed["message_count"] == 2
+
+
+def test_public_steps_skip_a_result_card_message() -> None:
+    """SDK readers get no step for a card: it is not a question and has no step type."""
+    steps = map_trace_events_to_public_steps(
+        [
+            _event(
+                "agent_message",
+                {
+                    "message": "Open deals",
+                    "message_type": "result_card",
+                    "expect_response": False,
+                    "metadata": {"display": "result_card"},
+                },
+            ),
+            _event("ai_message", {"content": "done"}),
+        ]
+    )
+    assert [s["data"]["content"] for s in steps] == ["done"]

@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import httpx
+
 from ....config import get_refuse_search_result_fetch_enabled
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,22 @@ def _normalise_path(path: str) -> str:
     return "/" if cleaned in {"", "."} else cleaned.replace("//", "/")
 
 
+def _request_host(url: str, fallback: str) -> str:
+    """The host an HTTP client would actually connect to for ``url``.
+
+    ``httpx`` canonicalises the hostname when it builds a request (Unicode
+    full stops such as U+3002 become ``.``, IDNA mapping is applied), so
+    matching the raw spelling would miss a URL the client sends to a search
+    engine. A URL httpx cannot parse is never sent by it; keep the raw host
+    for those so the check stays at least as strict as before.
+    """
+
+    try:
+        return httpx.URL(url).host or fallback
+    except Exception:
+        return fallback
+
+
 def search_result_page_host(url: str) -> str | None:
     """Return the host when ``url`` is a search-engine result page, else None."""
 
@@ -106,7 +124,7 @@ def search_result_page_host(url: str) -> str | None:
         return None
     if not hostname or parts.scheme.lower() not in {"http", "https"}:
         return None
-    hostname = hostname.rstrip(".").lower()
+    hostname = _request_host(url.strip(), hostname).rstrip(".").lower()
     # Every rule path is lowercase; servers treat /Search like /search.
     path = _normalise_path(parts.path).lower()
     for rule in _RULES:

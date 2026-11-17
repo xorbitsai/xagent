@@ -45,6 +45,13 @@ const en = {
     autoResumeStoppedCancelled: "Automatic resume was cancelled. Click resume to continue.",
     autoResumeStoppedIneligible: "This task cannot resume automatically. Click resume to continue.",
   },
+  messageQueue: {
+    held: { sendFailed: "Some queued messages could not be sent." },
+    supportLost: "Queued messages can't be sent automatically right now. If one already appears in the conversation, it was sent.",
+    full: "You can queue up to {count} messages.",
+    filesNotQueued: "A message with files can't be queued. Send it after this response finishes.",
+    waitingAnswer: "Answer the question above and the queued messages will follow.",
+  },
   clientErrors: {
     executionQueueFull: "The team execution queue is full. Please retry shortly.",
     messageProcessingFailed: "The message could not be processed. Please try again.",
@@ -60,6 +67,7 @@ const en = {
     messageAcceptancePending: "Message acceptance is still being reconciled. Please retry shortly.",
     taskUnavailable: "Task is no longer available.",
     taskBusy: "Task is currently busy; please wait for the previous turn to finish before sending another message.",
+    interactionResponseRequired: "This conversation is waiting on a question above; answer it to continue.",
     workforceUnavailable: "This workforce conversation can no longer accept messages; please start a new conversation.",
     workforceArchived: "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce.",
     messageAttachmentCorrupt: "A stored file for this message failed its integrity check and must be re-uploaded.",

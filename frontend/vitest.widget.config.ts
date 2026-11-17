@@ -57,6 +57,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/widget-session-history.ts",
         "src/lib/widget-session-upload.ts",
         "src/contexts/presentation-capabilities.tsx",
+        "src/contexts/session-message-queue.ts",
         "src/app/settings/page.tsx",
         "src/components/layout/sidebar.tsx",
         "src/components/pages/login.tsx",
@@ -153,6 +154,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/contexts/presentation-capabilities.tsx": {
           statements: 100, branches: 100, functions: 100, lines: 100,
+        },
+        "src/contexts/session-message-queue.ts": {
+          statements: 90, branches: 85, functions: 95, lines: 90,
         },
         "src/contexts/file-access-context.tsx": {
           statements: 85, branches: 75, functions: 85, lines: 85,
@@ -289,6 +293,7 @@ export default defineConfig({
       "src/contexts/auth-context.test.tsx",
       "src/contexts/connector-runtime-dialog-context.test.tsx",
       "src/contexts/file-access-context.test.tsx",
+      "src/contexts/session-message-queue.test.ts",
       "src/hooks/use-file-mention.test.tsx",
       "src/hooks/use-websocket.test.ts",
       "src/hooks/use-widget-initial-message.test.tsx",

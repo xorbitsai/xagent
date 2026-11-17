@@ -27,6 +27,7 @@ const appState = vi.hoisted(() => ({
   steps: [],
 }))
 const realChatMessage = vi.hoisted(() => ({ enabled: false }))
+const personaAccentColorMock = vi.hoisted(() => vi.fn())
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const voiceProps = vi.hoisted(() => ({ current: null as null | {
@@ -53,6 +54,7 @@ const appControls = vi.hoisted(() => ({
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
   connectionNotice: null as "reconnecting" | "lost" | null,
+  messageQueue: null as null | { submit: (...args: any[]) => Promise<"sent" | "queued"> },
 }))
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -99,6 +101,7 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
     isMessageDeliveryPending: appControls.isMessageDeliveryPending,
     isSessionInteractionLocked: appControls.isSessionInteractionLocked,
     connectionNotice: appControls.connectionNotice,
+    messageQueue: appControls.messageQueue,
   }),
 }))
 
@@ -146,6 +149,10 @@ vi.mock("dagre", () => {
   }
 })
 
+vi.mock("@/lib/avatar-style-extension", () => ({
+  usePersonaAccentColor: personaAccentColorMock,
+}))
+
 vi.mock("@/components/chat/ChatMessage", async () => {
   const actual = await vi.importActual<typeof import("@/components/chat/ChatMessage")>(
     "@/components/chat/ChatMessage",
@@ -164,6 +171,7 @@ vi.mock("@/components/chat/ChatMessage", async () => {
     interactionRequestId,
     interactions,
     failureTaskId,
+    agent,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -181,6 +189,7 @@ vi.mock("@/components/chat/ChatMessage", async () => {
     interactionRequestId?: string
     interactions?: unknown[]
     failureTaskId?: number | null
+    agent?: { name: string; avatar?: string | null }
   }) => (
     <div
       data-testid="chat-message"
@@ -195,6 +204,7 @@ vi.mock("@/components/chat/ChatMessage", async () => {
       data-request-id={interactionRequestId || ""}
       data-interactions={JSON.stringify(interactions || [])}
       data-failure-task-id={failureTaskId ?? ""}
+      data-agent={agent ? JSON.stringify(agent) : ""}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -319,6 +329,8 @@ describe("TaskConversationPanel", () => {
     cancelTaskAutoResumeMock.mockReset()
     toastErrorMock.mockReset()
     toastInfoMock.mockReset()
+    personaAccentColorMock.mockReset()
+    personaAccentColorMock.mockReturnValue(null)
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
@@ -327,6 +339,7 @@ describe("TaskConversationPanel", () => {
     appControls.isMessageDeliveryPending = false
     appControls.isSessionInteractionLocked = false
     appControls.connectionNotice = null
+    appControls.messageQueue = null
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
@@ -347,6 +360,32 @@ describe("TaskConversationPanel", () => {
     appState.isProcessing = false
     appState.isHistoryLoading = false
     appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
+  })
+
+  describe("a send through the message queue", () => {
+    it.each([
+      ["sent", true, 1],
+      ["queued", false, 0],
+      ["refused", false, 0],
+    ])("a submit that was %s: file leaves the selection %s, send callback calls %s", async (outcome, removed, sends) => {
+      const submit = vi.fn(async (_text: string, _options: unknown, send: () => Promise<void>) => {
+        if (outcome === "refused") throw new Error("refused")
+        if (outcome === "sent") await send()
+        return outcome as "sent" | "queued"
+      })
+      appControls.messageQueue = { submit }
+      render(<TaskConversationPanel mode="page" />)
+      fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+      let result: unknown
+      await act(async () => {
+        result = await Promise.resolve(chatInputProps.current!.onSend("send draft", { clientMessageId: "m1" }))
+          .then(() => "returned", (error: unknown) => error)
+      })
+      expect(result).toEqual(outcome === "refused" ? new Error("refused") : "returned")
+      expect(submit).toHaveBeenCalledWith("send draft", { hasFiles: true, clientMessageId: "m1" }, expect.any(Function))
+      expect(sendMessageMock).toHaveBeenCalledTimes(sends)
+      expect(chatInputProps.current?.files).toHaveLength(removed ? 0 : 1)
+    })
   })
 
   it("labels the file manager icon button", () => {
@@ -647,6 +686,47 @@ describe("TaskConversationPanel", () => {
     appState.currentTask = { id: "42", status: "paused" }
     rerender(<TaskConversationPanel mode="page" />)
     expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("hands its agent to each message and tints the conversation with the avatar's color", () => {
+    const agent = { name: "Maya", avatar: null }
+    personaAccentColorMock.mockReturnValue([17, 78, 184])
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Find flights",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+
+    const { container } = render(<TaskConversationPanel mode="page" agent={agent} />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute("data-agent", JSON.stringify(agent))
+    const tinted = container.querySelector("[data-agent-accent]") as HTMLElement
+    expect(tinted).toBe(container.firstElementChild)
+    expect(tinted.style.getPropertyValue("--agent-accent")).toBe("rgb(17 78 184)")
+  })
+
+  it("keeps the theme colors when the agent's avatar has no color of its own", () => {
+    const { container } = render(
+      <TaskConversationPanel mode="page" agent={{ name: "Maya", avatar: "/avatars/maya.png" }} />,
+    )
+
+    expect(container.querySelector("[data-agent-accent]")).toBeNull()
+  })
+
+  it("names no agent and sets no accent unless the caller passes one", () => {
+    appState.messages = [{
+      id: "user-1",
+      role: "user",
+      content: "Find flights",
+      timestamp: "2026-08-07T07:00:00Z",
+    }]
+
+    const { container } = render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByTestId("chat-message")).toHaveAttribute("data-agent", "")
+    expect(container.querySelector("[data-agent-accent]")).toBeNull()
+    expect(personaAccentColorMock).toHaveBeenCalledWith(undefined)
   })
 
   it("marks user turns with the task's Local browser context", () => {

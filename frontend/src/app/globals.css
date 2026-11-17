@@ -520,6 +520,27 @@ button[data-radix-collection-item] {
   width: auto !important;
 }
 
+/* Agent accent: a conversation wrapped in [data-agent-accent] (see
+   agentAccentAttributes) tints these elements with its agent's color. Without
+   the wrapper they keep the theme colors their own classes give them. */
+[data-agent-accent] .agent-accent-surface {
+  background-color: var(--agent-accent);
+  color: #fff;
+}
+
+[data-agent-accent] button.agent-accent-surface:hover {
+  background-color: var(--agent-accent);
+  filter: brightness(0.92);
+}
+
+[data-agent-accent] .agent-accent-fade {
+  background-image: linear-gradient(to top, var(--agent-accent), transparent);
+}
+
+[data-agent-accent] .agent-accent-inset {
+  background-color: hsl(var(--background));
+}
+
 /* Orbit animation for planning loading state */
 @keyframes orbit {
   0% {

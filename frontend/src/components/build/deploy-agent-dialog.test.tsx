@@ -60,6 +60,27 @@ vi.mock("@/lib/deploy-agent-extension", () => ({
   ),
 }))
 
+vi.mock("@/lib/agent-channel-extension", () => ({
+  AgentChannelOption: ({ agent, onOpen }: { agent: { name: string }; onOpen: () => void }) => (
+    <button type="button" onClick={onOpen}>{`channel-option ${agent.name}`}</button>
+  ),
+  AgentChannelView: ({
+    agent,
+    onBack,
+    onClose,
+  }: {
+    agent: { name: string }
+    onBack: () => void
+    onClose: () => void
+  }) => (
+    <div data-testid="channel-view">
+      {agent.name}
+      <button type="button" onClick={onBack}>channel-back</button>
+      <button type="button" onClick={onClose}>channel-close</button>
+    </div>
+  ),
+}))
+
 import { __resetDeploymentConfigCache } from "@/lib/deployment-config"
 import { DeployAgentDialog, type Agent } from "./deploy-agent-dialog"
 
@@ -397,6 +418,51 @@ describe("DeployAgentDialog regional targets", () => {
       expect(copyToClipboardMock).toHaveBeenCalledWith(
         "https://cloud.example.test/change-region?region=sg&next=%2Fshare%2Fregional-share",
       )
+    })
+  })
+
+  describe("channel extension", () => {
+    const renderDialog = (props: Partial<React.ComponentProps<typeof DeployAgentDialog>> = {}) =>
+      render(
+        <DeployAgentDialog
+          deployAgent={AGENT}
+          onClose={vi.fn()}
+          onUpdate={vi.fn()}
+          {...props}
+        />,
+      )
+
+    it("opens on the options grid by default, with the channel option first", () => {
+      renderDialog()
+      expect(screen.queryByTestId("channel-view")).not.toBeInTheDocument()
+      const option = screen.getByText("channel-option Regional agent")
+      expect(
+        option.compareDocumentPosition(screen.getByText("deploy_agent.options.embed.title"))
+          & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+    })
+
+    it("opens directly on the channel view with initialView=channel and no default content", () => {
+      renderDialog({ initialView: "channel" })
+      expect(screen.getByTestId("channel-view")).toHaveTextContent("Regional agent")
+      expect(screen.queryByText("deploy_agent.options.embed.title")).not.toBeInTheDocument()
+    })
+
+    it("enters the channel view from the option and returns to the options on back", () => {
+      renderDialog()
+      fireEvent.click(screen.getByText("channel-option Regional agent"))
+      expect(screen.getByTestId("channel-view")).toBeInTheDocument()
+      expect(screen.queryByText("deploy_agent.options.embed.title")).not.toBeInTheDocument()
+      fireEvent.click(screen.getByText("channel-back"))
+      expect(screen.queryByTestId("channel-view")).not.toBeInTheDocument()
+      expect(screen.getByText("deploy_agent.options.embed.title")).toBeInTheDocument()
+    })
+
+    it("closes through the view's onClose", () => {
+      const onClose = vi.fn()
+      renderDialog({ initialView: "channel", onClose })
+      fireEvent.click(screen.getByText("channel-close"))
+      expect(onClose).toHaveBeenCalledTimes(1)
     })
   })
 })

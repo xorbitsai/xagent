@@ -13,6 +13,7 @@ import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn } from "@/lib/utils"
+import type { AvatarPersona } from "@/lib/page-extension-contracts"
 
 export interface SessionCheckWatch {
   viewed: number | null // the task this view checks; null while no view is on
@@ -233,6 +234,20 @@ function TaskDetailContent() {
   // across those unrelated refreshes.
   const progressEndedAt = isDagFinished ? state.currentTask?.dagTerminatedAt : undefined
 
+  // The agent exactly as the header above shows it (fetched, and updated by a
+  // profile save), not the task's own hints, so the avatar beside a working
+  // turn and the conversation's tint never disagree with the header. Details
+  // reported for another agent are not used.
+  const [headerAgent, setHeaderAgent] = useState<AvatarPersona | null>(null)
+  const currentAgentId = state.currentTask?.agentId
+  const conversationAgent = headerAgent && headerAgent.agentId === currentAgentId ? headerAgent : undefined
+  const handleHeaderAgentChange = useCallback((next: AvatarPersona) => {
+    setHeaderAgent((previous) =>
+      previous && previous.agentId === next.agentId && previous.name === next.name && previous.avatar === next.avatar
+        ? previous
+        : next)
+  }, [])
+
   return (
     <div className="h-full flex flex-col md:flex-row bg-background">
       <div className="flex-1 min-w-0 min-h-0 flex flex-col">
@@ -241,6 +256,7 @@ function TaskDetailContent() {
             agentId={state.currentTask.agentId}
             name={state.currentTask.agentName}
             logoUrl={state.currentTask.agentLogoUrl}
+            onAgentChange={handleHeaderAgentChange}
             showBack
             rightSlot={state.dagExecution ? (
               <Button
@@ -270,7 +286,7 @@ function TaskDetailContent() {
           </div>
         ) : null}
         <div className="flex-1 min-h-0 relative">
-          <TaskConversationPanel mode="page" voiceConversationEnabled onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
+          <TaskConversationPanel mode="page" voiceConversationEnabled agent={conversationAgent} onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
             if (state.taskId) {
               closeFilePreview()
               setAgentExecution({ taskId: state.taskId, selection })

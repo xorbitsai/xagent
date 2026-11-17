@@ -2501,6 +2501,17 @@ class WebToolConfig(BaseToolConfig):
             ability="generate",
         )
 
+    def _discard_cached_mcp_configs(self) -> None:
+        """Drop the cached MCP configs and any MCP load reused on top of them.
+
+        The loaded tools are only valid for the configs they were built from,
+        so every fence that forces a fresh config read forces a fresh load too.
+        """
+        from ...core.tools.adapters.vibe.mcp_tools import discard_mcp_load_reuse
+
+        self._cached_mcp_configs = None
+        discard_mcp_load_reuse(self)
+
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database."""
         if self._user_id is None:
@@ -2518,7 +2529,7 @@ class WebToolConfig(BaseToolConfig):
             # Once rejected, an executable config cache must not become valid
             # again merely because a refresh updated generation/expiry metadata
             # before failing.
-            self._cached_mcp_configs = None
+            self._discard_cached_mcp_configs()
 
         configs = await self._load_mcp_server_configs()
         self._store_mcp_config_cache_if_cacheable(configs)
@@ -2604,7 +2615,7 @@ class WebToolConfig(BaseToolConfig):
         self, configs: List[Dict[str, Any]]
     ) -> None:
         if self._mcp_hook_resolution_failed or self._mcp_hook_token_cache_uncacheable:
-            self._cached_mcp_configs = None
+            self._discard_cached_mcp_configs()
             return
         self._cached_mcp_configs = configs
 
@@ -2667,7 +2678,7 @@ class WebToolConfig(BaseToolConfig):
             return False
         self._connector_runtime_turn_id = normalized_turn_id
         self._connector_runtime_view = None
-        self._cached_mcp_configs = None
+        self._discard_cached_mcp_configs()
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
         return True
@@ -2680,7 +2691,7 @@ class WebToolConfig(BaseToolConfig):
         if self._mcp_actor_execution_identity == identity:
             return False
         self._mcp_actor_execution_identity = identity
-        self._cached_mcp_configs = None
+        self._discard_cached_mcp_configs()
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
         return True
@@ -2717,7 +2728,7 @@ class WebToolConfig(BaseToolConfig):
         ):
             return False
         self._execution_scope = scope
-        self._cached_mcp_configs = None
+        self._discard_cached_mcp_configs()
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
         return True

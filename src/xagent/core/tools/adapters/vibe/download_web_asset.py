@@ -24,6 +24,10 @@ from ...core.web_content import (
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 
+class SearchResultPageRefused(ValueError):
+    """The URL is a search-engine result page, refused before any request."""
+
+
 class DownloadWebAssetArgs(BaseModel):
     url: str = Field(
         description=(
@@ -50,6 +54,7 @@ class DownloadWebAssetResult(BaseModel):
     file_ref: dict[str, Any] | None = None
     markdown_link: str | None = None
     error: str | None = None
+    blocked_by_policy: bool = False
 
 
 class DownloadWebAssetTool(AbstractBaseTool):
@@ -78,7 +83,8 @@ class DownloadWebAssetTool(AbstractBaseTool):
             "known URL and register it in the current workspace. Use this after "
             "fetch_web_content(include_assets=true) discovers an official logo or "
             "brand image. It returns a trusted FileRef, so do not reproduce the "
-            "asset through api_call plus write_file."
+            "asset through api_call plus write_file. Search-engine result pages are "
+            "refused; web_search is the only way to search."
         )
 
     @property
@@ -121,6 +127,13 @@ class DownloadWebAssetTool(AbstractBaseTool):
                 file_ref=file_ref,
                 markdown_link=file_ref["markdown_link"],
             ).model_dump()
+        except SearchResultPageRefused as exc:
+            return DownloadWebAssetResult(
+                success=False,
+                source_url=download_args.url,
+                error=str(exc),
+                blocked_by_policy=True,
+            ).model_dump()
         except Exception as exc:
             return DownloadWebAssetResult(
                 success=False,
@@ -131,7 +144,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
     async def _download(self, url: str) -> tuple[bytes, str, str]:
         refusal = search_result_page_refusal(url)
         if refusal is not None:
-            raise ValueError(refusal)
+            raise SearchResultPageRefused(refusal)
         proxy_url = get_trusted_proxy_url()
         async with public_fetch_client(proxy_url, timeout=30) as client:
             response = await fetch_public_http_bytes(

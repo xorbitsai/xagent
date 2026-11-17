@@ -15,9 +15,21 @@ vi.mock("next/navigation", () => ({
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: ({ onAgentExecutionClick }: { onAgentExecutionClick?: (selection: { workerTaskId: string; agentName: string; status: "running" }) => void }) => (
-    <button data-testid="conversation-panel" disabled={!onAgentExecutionClick} onClick={() => onAgentExecutionClick?.({ workerTaskId: "child-one", agentName: "Researcher", status: "running" })}>Open child</button>
+  TaskConversationPanel: ({ onAgentExecutionClick, agent }: { onAgentExecutionClick?: (selection: { workerTaskId: string; agentName: string; status: "running" }) => void; agent?: { name: string; avatar?: string | null; agentId?: number | null } }) => (
+    <button data-testid="conversation-panel" data-agent={agent ? JSON.stringify(agent) : ""} disabled={!onAgentExecutionClick} onClick={() => onAgentExecutionClick?.({ workerTaskId: "child-one", agentName: "Researcher", status: "running" })}>Open child</button>
   ),
+}))
+
+const header = vi.hoisted(() => ({
+  report: null as null | ((agent: { name: string; avatar?: string | null; agentId?: number | null }) => void),
+  renders: [] as Array<{ agentId: number; name?: string | null; logoUrl?: string | null }>,
+}))
+vi.mock("@/components/chat/agent-chat-header", () => ({
+  AgentChatHeader: ({ agentId, name, logoUrl, onAgentChange }: { agentId: number; name?: string | null; logoUrl?: string | null; onAgentChange?: typeof header.report }) => {
+    header.report = onAgentChange ?? null
+    header.renders.push({ agentId, name, logoUrl })
+    return <div data-testid="agent-header" />
+  },
 }))
 
 vi.mock("@/components/task/task-agent-execution-drawer", () => ({
@@ -71,6 +83,8 @@ function renderPage() {
 
 afterEach(() => {
   cleanup()
+  header.report = null
+  header.renders.length = 0
   navigation.params = { id: "1" }
   navigation.push.mockReset()
   app.setTaskId.mockReset()
@@ -382,5 +396,86 @@ describe("TaskDetailPage child inspector", () => {
     app.state = baseState({ taskId: 2 })
     rerender(<I18nProvider initialLocale="en"><TaskDetailPage /></I18nProvider>)
     expect(screen.queryByTestId("child-drawer")).not.toBeInTheDocument()
+  })
+})
+
+describe("TaskDetailPage conversation agent", () => {
+  const withAgent = (agentId: number | undefined, hints: { agentName?: string; agentLogoUrl?: string } = {}) => {
+    app.state = baseState()
+    Object.assign(app.state.currentTask!, { agentId, ...hints })
+  }
+  const panelAgent = () => {
+    const raw = screen.getByTestId("conversation-panel").getAttribute("data-agent")
+    return raw ? JSON.parse(raw) : null
+  }
+  const report = (agent: { name: string; avatar?: string | null; agentId?: number | null }) => act(() => header.report!(agent))
+  const page = () => <I18nProvider initialLocale="en"><TaskDetailPage /></I18nProvider>
+
+  it("has no agent for the conversation until the header has fetched one, and never uses the task's own hints", () => {
+    withAgent(7, { agentName: "Hint name", agentLogoUrl: "/uploads/hint.png" })
+    renderPage()
+
+    expect(screen.getByTestId("agent-header")).toBeInTheDocument()
+    expect(header.renders.at(-1)).toMatchObject({ agentId: 7, name: "Hint name", logoUrl: "/uploads/hint.png" })
+    expect(panelAgent()).toBeNull()
+  })
+
+  it("hands the conversation exactly the agent the header reports", () => {
+    withAgent(7, { agentName: "Hint name", agentLogoUrl: "/uploads/hint.png" })
+    renderPage()
+
+    report({ name: "Ben", avatar: "http://api.local/uploads/ben.png", agentId: 7 })
+
+    expect(panelAgent()).toEqual({ name: "Ben", avatar: "http://api.local/uploads/ben.png", agentId: 7 })
+  })
+
+  it("follows a rename and a removed logo that the header reports", () => {
+    withAgent(7)
+    renderPage()
+    report({ name: "Ben", avatar: "http://api.local/uploads/ben.png", agentId: 7 })
+
+    report({ name: "Ben Support", avatar: null, agentId: 7 })
+
+    expect(panelAgent()).toEqual({ name: "Ben Support", avatar: null, agentId: 7 })
+  })
+
+  it("keeps the same object while the header reports the same agent again", () => {
+    withAgent(7)
+    renderPage()
+    report({ name: "Ben", avatar: null, agentId: 7 })
+    const before = screen.getByTestId("conversation-panel").getAttribute("data-agent")
+
+    report({ name: "Ben", avatar: null, agentId: 7 })
+
+    expect(screen.getByTestId("conversation-panel").getAttribute("data-agent")).toBe(before)
+  })
+
+  it("ignores a report for an agent other than the task's", () => {
+    withAgent(7)
+    renderPage()
+
+    report({ name: "Someone else", avatar: null, agentId: 9 })
+
+    expect(panelAgent()).toBeNull()
+  })
+
+  it("drops the previous agent when the task moves to another one", () => {
+    withAgent(7)
+    const { rerender } = renderPage()
+    report({ name: "Ben", avatar: null, agentId: 7 })
+    expect(panelAgent()).toMatchObject({ name: "Ben" })
+
+    withAgent(8)
+    rerender(page())
+
+    expect(panelAgent()).toBeNull()
+  })
+
+  it("renders no header, and gives the conversation no agent, for a task without one", () => {
+    withAgent(undefined)
+    renderPage()
+
+    expect(screen.queryByTestId("agent-header")).toBeNull()
+    expect(panelAgent()).toBeNull()
   })
 })

@@ -91,6 +91,7 @@ from .sandboxed_tool.chrome_session import (
 )
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     SandboxedMCPLoadResult,
+    ensure_sandbox_mcp_dependencies,
     list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
     requires_sandbox_mcp_connection,
@@ -5594,6 +5595,9 @@ async def _load_direct_mcp_tools(
 # abandoned load's cleanup would be dropped mid-flight. Tasks remove
 # themselves on completion.
 _active_load_tasks: "set[asyncio.Task[Any]]" = set()
+
+# Upper bound on MCP servers loaded at the same time within one tool build.
+_MCP_SERVER_LOAD_CONCURRENCY = 8
 _BoundedLoadResult = TypeVar("_BoundedLoadResult")
 
 
@@ -5705,7 +5709,14 @@ async def load_mcp_tools_as_agent_tools(
     failures: list[MCPServerLoadFailure] = []
     timeout_seconds = _root_config.get_mcp_tool_init_timeout_seconds()
 
-    for server_name, connection in connection_map.items():
+    async def _load_one_server(
+        server_name: str, connection: Connection
+    ) -> "tuple[list[AbstractBaseTool], list[str], list[MCPServerLoadFailure]]":
+        # Per-server accumulators so servers can load concurrently and be
+        # merged back in ``connection_map`` order.
+        agent_tools: list[AbstractBaseTool] = []
+        loaded_servers: list[str] = []
+        failures: list[MCPServerLoadFailure] = []
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
             sandbox_required = should_sandbox_mcp_connection(connection)
@@ -5786,7 +5797,7 @@ async def load_mcp_tools_as_agent_tools(
                             error_type=error_type,
                         )
                     )
-                    continue
+                    return agent_tools, loaded_servers, failures
 
                 server_tools = sandbox_result.tools
                 if sandbox_result.adapter_error_types:
@@ -5881,7 +5892,40 @@ async def load_mcp_tools_as_agent_tools(
                     error_type=error_type,
                 )
             )
-            continue
+            return agent_tools, loaded_servers, failures
+        return agent_tools, loaded_servers, failures
+
+    if sandbox is not None and any(
+        should_sandbox_mcp_connection(c) for c in connection_map.values()
+    ):
+        # Once, before the fan-out: otherwise every concurrent sandboxed
+        # server waits for the first install inside its own bound. A failure
+        # here is retried, and reported, by the per-server path.
+        try:
+            await ensure_sandbox_mcp_dependencies(sandbox)
+        except Exception as e:
+            logger.warning(
+                "Sandbox MCP dependency preparation failed (%s)", type(e).__name__
+            )
+
+    semaphore = asyncio.Semaphore(_MCP_SERVER_LOAD_CONCURRENCY)
+
+    async def _load_bounded(
+        server_name: str, connection: Connection
+    ) -> "tuple[list[AbstractBaseTool], list[str], list[MCPServerLoadFailure]]":
+        async with semaphore:
+            return await _load_one_server(server_name, connection)
+
+    # Each server already loads in its own task with its own transport and
+    # wall-clock bound (``_load_server_tools_bounded``), so loading them
+    # concurrently is safe; results are merged in the original order.
+    per_server = await asyncio.gather(
+        *(_load_bounded(name, conn) for name, conn in connection_map.items())
+    )
+    for server_tools_, servers_, failures_ in per_server:
+        agent_tools.extend(server_tools_)
+        loaded_servers.extend(servers_)
+        failures.extend(failures_)
 
     logger.info(
         "Loaded %d MCP tools from %d servers with %d server failures",

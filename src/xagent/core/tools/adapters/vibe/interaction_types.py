@@ -79,6 +79,32 @@ DEFAULT_WAITING_INTERACTION: Mapping[str, object] = MappingProxyType(
     }
 )
 
+# Key a *tool-authored* interaction sets to declare it is a live widget the user
+# acts on directly (e.g. a connect card), not a question to answer in text.
+# ReAct then does not append ``DEFAULT_WAITING_INTERACTION`` for it. It is only
+# honoured on the tool-waiting path; a model-authored ``ask_user_question``
+# cannot use it, so a model cannot hide the answer box by setting it.
+LIVE_WIDGET_KEY = "live_widget"
+
+
+def is_live_widget(interaction: object) -> bool:
+    """Whether a tool-authored interaction declares itself a live widget.
+
+    Requires a non-empty string ``type`` that is not one of the
+    ``ask_user_question`` types, so the flag cannot turn a model-facing type
+    into a field-less prompt.
+    """
+
+    if not isinstance(interaction, Mapping):
+        return False
+    interaction_type = interaction.get("type")
+    return (
+        interaction.get(LIVE_WIDGET_KEY) is True
+        and isinstance(interaction_type, str)
+        and bool(interaction_type)
+        and interaction_type not in INTERACTION_TYPES
+    )
+
 
 def lacks_required_options(interaction: Mapping[str, object]) -> bool:
     """Whether this is a pick-from-a-list control with nothing to pick.

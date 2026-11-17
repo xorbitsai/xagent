@@ -113,6 +113,7 @@ class CustomApiToolResult(BaseModel):
     error: Optional[str] = Field(default=None, description="Error message if any")
     is_error: bool = False
     failure_code: Literal["authentication_required"] | None = None
+    blocked_by_policy: bool = False
 
 
 class CustomApiTool(AbstractBaseTool):
@@ -351,6 +352,10 @@ class CustomApiTool(AbstractBaseTool):
                 body=result.get("body"),
                 error=result.get("error"),
             )
+            if result.get("blocked_by_policy"):
+                # Set only for a refusal, so other results keep their shape
+                # (the result is dumped with exclude_unset=True).
+                response.blocked_by_policy = True
             # Only attribute a real 401 to this connection when the caller
             # has not changed its origin or credentials. A 403 or response
             # text alone is not an authentication signal.

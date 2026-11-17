@@ -45,6 +45,13 @@ const zh = {
     autoResumeStoppedCancelled: "自动恢复已取消，可点击“继续”恢复执行。",
     autoResumeStoppedIneligible: "此任务无法自动恢复，可点击“继续”恢复执行。",
   },
+  messageQueue: {
+    held: { sendFailed: "有排队的消息没能发出。" },
+    supportLost: "排队的消息暂时不能自动发出。如果某条已经出现在对话里，说明它已经发出了，不用再发。",
+    full: "最多只能排队 {count} 条消息。",
+    filesNotQueued: "带附件的消息不能排队，请等这一轮回答结束后再发送。",
+    waitingAnswer: "回答上面的问题后，排队的消息会接着发出。",
+  },
   clientErrors: {
     executionQueueFull: "团队执行队列已满，请稍后重试。",
     messageProcessingFailed: "消息处理失败，请重试。",
@@ -60,6 +67,7 @@ const zh = {
     messageAcceptancePending: "消息接收状态仍在确认中，请稍后重试。",
     taskUnavailable: "任务已不可用。",
     taskBusy: "任务正忙，请等待上一轮完成后再发送消息。",
+    interactionResponseRequired: "对话正在等你回答上面的问题，回答后才能继续。",
     workforceUnavailable: "此 Workforce 对话已无法接收新消息，请开始新对话。",
     workforceArchived: "此 Workforce 已归档。请先取消归档并重新发布，再开始新对话；或选择一个活跃的 Workforce。",
     messageAttachmentCorrupt: "此消息使用的已存储文件完整性校验失败，请重新上传。",

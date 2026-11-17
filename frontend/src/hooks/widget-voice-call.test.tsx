@@ -65,7 +65,10 @@ function Harness(props: HarnessProps) {
 }
 const call = () => latest.call!
 
+const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices")
+const foundMediaDevices: Array<PropertyDescriptor | undefined> = []
 beforeEach(() => {
+  foundMediaDevices.push(Object.getOwnPropertyDescriptor(navigator, "mediaDevices"))
   order.length = 0
   Socket.instances = []
   latest.call = null
@@ -89,7 +92,11 @@ beforeEach(() => {
   })
   Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } })
 })
-afterEach(() => { cleanup(); vi.unstubAllGlobals(); vi.clearAllMocks() })
+afterEach(() => {
+  cleanup(); vi.unstubAllGlobals(); vi.clearAllMocks()
+  if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices)
+  else delete (navigator as { mediaDevices?: unknown }).mediaDevices
+})
 
 /** Open a call and let recognition start; returns the render and the socket. */
 async function connected(props: HarnessProps = {}) {
@@ -415,5 +422,14 @@ describe("widget voice call around the conversation", () => {
     view.rerender(<Harness messages={[{ id: "a1", role: "assistant", content: "a".repeat(2500), isResult: true, status: "completed" }]} />)
     await waitFor(() => expect(requestTts).toHaveBeenCalledTimes(3))
     expect(requestTts.mock.calls.map(([text]) => (text as string).length)).toEqual([1000, 1000, 500])
+  })
+})
+
+// What each test found in navigator.mediaDevices before it replaced it. Every
+// test here replaces it, so the previous test's clean-up shows only here.
+describe("the test stubs", () => {
+  it("leave navigator.mediaDevices as they found it", () => {
+    expect(foundMediaDevices.length).toBeGreaterThan(1)
+    expect(foundMediaDevices).toEqual(foundMediaDevices.map(() => originalMediaDevices))
   })
 })

@@ -13,7 +13,8 @@ const bridge = vi.hoisted(() => ({
     agent: null as unknown,
     terminalCode: null as string | null,
     isAbsoluteExpiryWarningVisible: false,
-    requestReconnect: () => undefined,
+    requestReconnect: vi.fn(),
+    handleSessionExpired: vi.fn(),
     handleConnectionClose: () => "handled" as const,
     handleConnectionFailure: () => undefined,
     handleConnectionOpen: () => undefined,
@@ -32,9 +33,17 @@ const app = vi.hoisted(() => ({
   },
   isConnected: true,
   isSendInFlight: false,
+  isConversationResetPending: false,
+  isMessageDeliveryPending: false,
+  isSessionInteractionLocked: false,
+  sessionConversationState: "unbound" as string,
   canStopTask: false,
   stopTask: vi.fn(),
   sendMessage: vi.fn(),
+}))
+// The send handler the task panel was given, as the composer would call it.
+const panel = vi.hoisted(() => ({
+  onSend: null as null | ((text: string, config: Record<string, unknown>, files: File[]) => Promise<void>),
 }))
 const voice = vi.hoisted(() => ({
   props: null as null | WidgetVoiceCallOptions,
@@ -65,11 +74,11 @@ vi.mock("@/contexts/app-context-chat", () => ({
     stopTask: app.stopTask,
     sendMessage: app.sendMessage,
     startNewConversation: vi.fn(() => Promise.resolve()),
-    isConversationResetPending: false,
-    isMessageDeliveryPending: false,
-    sessionConversationState: "unbound",
+    isConversationResetPending: app.isConversationResetPending,
+    isMessageDeliveryPending: app.isMessageDeliveryPending,
+    sessionConversationState: app.sessionConversationState,
     sessionConversationAttachment: "attached",
-    isSessionInteractionLocked: false,
+    isSessionInteractionLocked: app.isSessionInteractionLocked,
   }),
 }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
@@ -121,6 +130,10 @@ function Composer({ where, open }: { where: string; open?: () => void }) {
     <div data-testid={where}>
       {open && <button onClick={open}>voice:{where}</button>}
       <span data-testid="call">{call ? call.phase : "none"}</span>
+      {call?.alert && <span data-testid="alert">{call.alert}</span>}
+      {call?.note && <span data-testid="note">{call.note}</span>}
+      {call?.retryable && <button disabled={call.retryDisabled} onClick={call.retry}>retry</button>}
+      {call && <button onClick={call.end}>hang up</button>}
     </div>
   )
 }
@@ -130,7 +143,10 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
   ),
 }))
 vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: (props: Opener) => <Composer where="panel" open={props.onProvidedVoiceConversation} />,
+  TaskConversationPanel: (props: Opener & { onSend?: typeof panel.onSend }) => {
+    panel.onSend = props.onSend ?? null
+    return <Composer where="panel" open={props.onProvidedVoiceConversation} />
+  },
 }))
 
 import { SessionAgentChatPage } from "./session-agent-chat-page"
@@ -141,8 +157,8 @@ const session = (capabilities: unknown, token = TOKEN): WidgetSession => ({
   token, tokenExpiresAt: "2026-11-14T01:00:00.000Z", absoluteExpiresAt: "2026-11-14T02:00:00.000Z",
   generation: 1, agent, ...(capabilities === undefined ? {} : { capabilities: capabilities as WidgetSession["capabilities"] }),
 })
-function setBridge(status: WidgetSessionStatus, next: WidgetSession | null) {
-  bridge.value = { ...bridge.value, status, session: next, agent: status === "terminal" ? null : agent }
+function setBridge(status: WidgetSessionStatus, next: WidgetSession | null, terminalCode: string | null = null) {
+  bridge.value = { ...bridge.value, status, session: next, terminalCode, agent: status === "terminal" ? null : agent }
 }
 const rerender = () => act(() => { bridge.rerender?.(value => value + 1) })
 const voiceRequests = () => fetchMock.mock.calls.map(([url]) => String(url)).filter(url => url.includes("/voice/"))
@@ -157,10 +173,21 @@ class FakeSocket {
   onmessage: ((event: { data: string }) => void) | null = null
   onclose: ((event: { code: number; reason: string }) => void) | null = null
   onerror: (() => void) | null = null
+  closeListeners: Array<(event: { code: number; reason: string }) => void> = []
+  addEventListener(type: string, listener: (event: { code: number; reason: string }) => void) {
+    if (type === "close") this.closeListeners.push(listener)
+  }
+  // Listeners run in the order they were added, then the onclose property, as a browser does.
+  serverClose(code: number, reason = "") {
+    const event = { code, reason }
+    this.closeListeners.forEach(listener => listener(event))
+    this.onclose?.(event)
+  }
   send = vi.fn()
   close = vi.fn()
   constructor(url: string, protocols: string[]) { sockets.push([url, protocols]); socketInstances.push(this) }
 }
+const originalMediaDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices")
 const status = (code: number) => new Response(null, { status: code })
 const ttsUrl = `${window.location.origin}/v1/external/chat/sessions/voice/tts`
 
@@ -180,11 +207,18 @@ beforeEach(() => {
   app.state = { taskId: null, currentTask: null, isProcessing: false, messages: [] }
   app.isConnected = true
   app.isSendInFlight = false
+  app.isConversationResetPending = false
+  app.isMessageDeliveryPending = false
+  app.isSessionInteractionLocked = false
+  app.sessionConversationState = "unbound"
   app.canStopTask = false
   app.stopTask.mockReset()
   app.sendMessage.mockReset().mockResolvedValue(undefined)
   bridge.value.refreshSession.mockReset()
   bridge.value.ensureFreshSession.mockReset()
+  bridge.value.waitForOpenConnection.mockReset().mockResolvedValue(undefined)
+  bridge.value.handleSessionExpired.mockReset()
+  bridge.value.requestReconnect.mockReset()
   voice.props = null; voice.transport = null; voice.audios = []; voice.real = false
   sockets.length = 0
   socketInstances.length = 0
@@ -196,6 +230,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.unstubAllGlobals()
+  if (originalMediaDevices) Object.defineProperty(navigator, "mediaDevices", originalMediaDevices)
+  else delete (navigator as { mediaDevices?: unknown }).mediaDevices
   window.history.replaceState({}, "", "/")
 })
 
@@ -349,6 +385,13 @@ describe("session widget voice call wiring", () => {
     expect(app.sendMessage).toHaveBeenCalledExactlyOnceWith("hello", { clientMessageId: "voice-id" }, [])
   })
 
+  it("shows the start page's failure line when the first spoken message cannot be sent", async () => {
+    renderPage()
+    app.sendMessage.mockRejectedValue(new Error("boom"))
+    await act(async () => { await voice.props!.onSend("hello", "voice-id").catch(() => undefined) })
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
+  })
+
   it.each([
     { label: "a stop is possible", canStop: true, interrupted: true },
     { label: "no stop is possible", canStop: false, interrupted: false },
@@ -491,47 +534,54 @@ describe("session widget voice call and abandoned sentences", () => {
   })
 })
 
-describe("session widget voice call and history", () => {
-  const stopTrack = vi.fn()
-  class Context {
-    state = "running"
-    sampleRate = 48000
-    currentTime = 0
-    destination = {}
-    resume = vi.fn().mockResolvedValue(undefined)
-    close = vi.fn().mockResolvedValue(undefined)
-    audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) }
-    createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() })
-    createAnalyser = () => ({ fftSize: 0, connect: vi.fn(), disconnect: vi.fn(), getFloatTimeDomainData: vi.fn() })
-    createGain = () => ({ gain: { value: 0 }, connect: vi.fn(), disconnect: vi.fn() })
-  }
-
-  beforeEach(() => {
-    voice.real = true
-    stopTrack.mockReset()
-    vi.stubGlobal("AudioContext", Context)
-    vi.stubGlobal("AudioWorkletNode", class {
-      port = { onmessage: null }
-      connect = () => ({ connect: vi.fn() })
-      disconnect = vi.fn()
-    })
-    Object.defineProperty(navigator, "mediaDevices", {
-      configurable: true,
-      value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack, enabled: true }] })) },
-    })
+const stopTrack = vi.fn()
+class Context {
+  state = "running"
+  sampleRate = 48000
+  currentTime = 0
+  destination = {}
+  resume = vi.fn().mockResolvedValue(undefined)
+  close = vi.fn().mockResolvedValue(undefined)
+  audioWorklet = { addModule: vi.fn().mockResolvedValue(undefined) }
+  createMediaStreamSource = () => ({ connect: vi.fn(), disconnect: vi.fn() })
+  createAnalyser = () => ({ fftSize: 0, connect: vi.fn(), disconnect: vi.fn(), getFloatTimeDomainData: vi.fn() })
+  createGain = () => ({ gain: { value: 0 }, connect: vi.fn(), disconnect: vi.fn() })
+}
+// Runs the real call audio over a stubbed microphone and audio context, so a
+// test sees what the visitor would: the call bar, its notes and the tracks.
+function useRealAudio() {
+  voice.real = true
+  stopTrack.mockReset()
+  vi.stubGlobal("AudioContext", Context)
+  vi.stubGlobal("AudioWorkletNode", class {
+    port = { onmessage: null }
+    connect = () => ({ connect: vi.fn() })
+    disconnect = vi.fn()
   })
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: vi.fn(async () => ({ getTracks: () => [{ stop: stopTrack, enabled: true }] })) },
+  })
+}
+// Opens a call from the start page or the panel and brings it to listening.
+async function openRealCall(where: "start" | "panel") {
+  fireEvent.click(screen.getByText(`voice:${where}`))
+  await waitFor(() => expect(socketInstances).toHaveLength(1))
+  await act(async () => {
+    socketInstances[0].onopen!()
+    socketInstances[0].onmessage!({ data: JSON.stringify({ type: "session_started" }) })
+  })
+  await waitFor(() => expect(screen.getByTestId("call")).toHaveTextContent("listening"))
+}
+
+describe("session widget voice call and history", () => {
+  beforeEach(useRealAudio)
 
   const historyCapabilities = { voice: true, conversationHistory: true }
   async function callOnPanel() {
     app.state.taskId = 71
     renderPage({ capabilities: historyCapabilities })
-    fireEvent.click(screen.getByText("voice:panel"))
-    await waitFor(() => expect(socketInstances).toHaveLength(1))
-    await act(async () => {
-      socketInstances[0].onopen!()
-      socketInstances[0].onmessage!({ data: JSON.stringify({ type: "session_started" }) })
-    })
-    await waitFor(() => expect(screen.getByTestId("call")).toHaveTextContent("listening"))
+    await openRealCall("panel")
   }
   const openHistory = () => {
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
@@ -602,12 +652,29 @@ describe("session widget voice call and a refused handshake token", () => {
     expect(bridge.value.refreshSession).toHaveBeenCalledTimes(1)
   })
 
-  it("ends the call as unavailable when the session widget API is switched off (404)", async () => {
+  it("ends the call as unavailable, with no retry, when the session widget API is switched off (404)", async () => {
+    useRealAudio()
     renderPage()
-    const transport = await openCall()
+    await openRealCall("start")
+    act(() => {
+      socketInstances[0].onmessage!({ data: JSON.stringify({ type: "final", text: "Hello", segment_id: 1 }) })
+    })
+    await waitFor(() => expect(app.sendMessage).toHaveBeenCalled())
+    app.state = {
+      ...app.state,
+      messages: [{ id: "a1", role: "assistant", content: "Hi there.", isResult: true, status: "completed" }] as never,
+    }
     fetchMock.mockResolvedValue(status(404))
-    expect((await transport.requestTts("Hello", new AbortController().signal)).status).toBe(404)
-    expect(transport.classify({ kind: "tts_response", status: 404, code: undefined })).toBe("voice_unavailable")
+    rerender()
+    await waitFor(() => expect(screen.getByTestId("alert")).toHaveTextContent("voiceConversation.widget.unavailable"))
+    expect(screen.queryByText("retry")).toBeNull()
+    expect(stopTrack).toHaveBeenCalled()
     expect(bridge.value.refreshSession).not.toHaveBeenCalled()
+  })
+})
+
+describe("the test stubs", () => {
+  it("leave navigator.mediaDevices as they found it", () => {
+    expect(Object.getOwnPropertyDescriptor(navigator, "mediaDevices")).toEqual(originalMediaDevices)
   })
 })

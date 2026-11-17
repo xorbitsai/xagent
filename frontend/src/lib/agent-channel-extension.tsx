@@ -6,8 +6,6 @@ import type {
 
 // Extension point for an extra deployment channel. The OSS build has none, so
 // every piece renders nothing and the Deploy dialog never enters the view.
-export const AGENT_CHANNEL_ENABLED = false
-
 export const AgentChannelHeaderAction: AgentChannelHeaderActionComponent = () => null
 
 export const AgentChannelOption: AgentChannelOptionComponent = () => null

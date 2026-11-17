@@ -111,6 +111,8 @@ export type DeployAgentEmbedExtensionComponent =
   ComponentType<DeployAgentEmbedExtensionProps>
 
 // Agent the channel extension acts on; a subset of the chat header's agent.
+// The header only renders its action once the agent details have loaded, and
+// the Deploy dialog receives the caller's agent, so these are real values.
 export interface AgentChannelAgent {
   id: number
   name: string
@@ -140,7 +142,13 @@ export interface AgentChannelOptionProps extends AgentChannelExtensionProps {
 export type AgentChannelOptionComponent = ComponentType<AgentChannelOptionProps>
 
 // Full replacement for the Deploy dialog's `DialogContent` while the channel
-// view is active. It must render its own `DialogContent`.
+// view is active. Contract:
+// - render its own `DialogContent` (or portal/overlay/content equivalent);
+// - include a `DialogTitle` and `DialogDescription`, so Radix does not warn and
+//   screen readers get a dialog name;
+// - own the back (`onBack`) and close (`onClose`) controls;
+// - own any deployment-config error UI it needs: the dialog's default
+//   `DeploymentConfigErrorAlert` is not rendered in this view.
 export interface AgentChannelViewProps extends AgentChannelExtensionProps {
   onBack: () => void
   onClose: () => void

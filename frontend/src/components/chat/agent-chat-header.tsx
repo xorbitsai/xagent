@@ -98,7 +98,7 @@ function AgentChatHeaderContent({
   const [deployView, setDeployView] = useState<"options" | "channel">("options")
   const [routinesOpen, setRoutinesOpen] = useState(false)
   // Details that have been fetched or saved under this mounted identity; the
-  // initial placeholder is not an agent worth reporting.
+  // initial placeholder is not an agent worth reporting (or offering to extensions).
   const [detailsKnown, setDetailsKnown] = useState(false)
 
   useEffect(() => {
@@ -147,10 +147,12 @@ function AgentChatHeaderContent({
         <button onClick={() => setRoutinesOpen(true)} className="inline-flex h-8 items-center gap-1.5 rounded-full border border-border px-3 text-[11.5px] font-medium hover:bg-muted">
           <CalendarClock className="h-3.5 w-3.5" /> {t("workspace.routines")}
         </button>
-        <AgentChannelHeaderAction
-          agent={agent}
-          onOpen={() => { setDeployView("channel"); setDeployOpen(true) }}
-        />
+        {detailsKnown && (
+          <AgentChannelHeaderAction
+            agent={agent}
+            onOpen={() => { setDeployView("channel"); setDeployOpen(true) }}
+          />
+        )}
         {rightSlot}
         <Popover open={menuOpen} onOpenChange={setMenuOpen}>
           <PopoverTrigger asChild>

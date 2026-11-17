@@ -856,3 +856,312 @@ async def test_refresh_rotates_on_the_stored_store(shopify_db, monkeypatch):
     assert grant.access_token == "rotated-access"
     assert grant.refresh_token == "rotated-refresh"
     assert grant.instance_url == "acme"
+
+
+# ---------- one grant per store ------------------------------------------------
+#
+# Shopify keeps one current offline token per app and store: a new grant
+# retires the store's other refresh tokens, and a grant and a refresh running
+# together retire each other's result. So a store connected by one owner
+# refuses everyone else before the code exchange, and the exchange and every
+# refresh for a store take the same per-store lock.
+
+
+def _other_user(db, username: str = "bob") -> User:
+    other = User(username=username, password_hash="hash")
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    return other
+
+
+def _held_grant(
+    db,
+    user,
+    *,
+    store: str = "acme",
+    oauth_provider: str = "shopify",
+    access_token: str = "held-access",
+    resource_owner_key: str | None = None,
+    expires_in: timedelta = timedelta(hours=1),
+) -> UserOAuth:
+    grant = UserOAuth(
+        user_id=user.id,
+        provider=TEST_APP_ID,
+        oauth_provider=oauth_provider,
+        resource_owner_key=resource_owner_key,
+        access_token=access_token,
+        refresh_token="held-refresh",
+        instance_url=store,
+        provider_user_id=SHOP_GID,
+        expires_at=datetime.now(timezone.utc) + expires_in,
+    )
+    db.add(grant)
+    db.commit()
+    return grant
+
+
+def test_a_store_connected_by_another_user_is_refused_before_the_exchange(
+    shopify_db, monkeypatch
+):
+    db, user = shopify_db
+    bob = _other_user(db)
+    _held_grant(db, bob)
+    calls = _mock_shopify_http(monkeypatch)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 409
+    assert b"already connected by another user" in response.body
+    assert b"bob" not in response.body
+    # Refused before the exchange: no new grant retires bob's token.
+    assert calls == []
+    assert _grant(db, user) is None
+    db.expire_all()
+    held = _grant(db, bob)
+    assert held is not None
+    assert held.access_token == "held-access"
+
+
+def test_the_owner_can_reconnect_their_store(shopify_db, monkeypatch):
+    db, user = shopify_db
+    _held_grant(db, user, access_token="old-access")
+    _mock_shopify_http(monkeypatch)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 200
+    db.expire_all()
+    grant = _grant(db, user)
+    assert grant is not None
+    assert grant.access_token == "shpat-access"
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        # Disconnecting deletes the grant; a dead refresh token clears it.
+        pytest.param({"access_token": ""}, id="cleared-after-failed-refresh"),
+        pytest.param({"store": "other"}, id="another-store"),
+        # A variant provider row is another Shopify app, with its own token.
+        pytest.param({"oauth_provider": "shopify-acme"}, id="another-app"),
+    ],
+)
+def test_a_store_not_held_by_a_live_grant_of_this_app_can_be_connected(
+    shopify_db, monkeypatch, held
+):
+    db, user = shopify_db
+    _held_grant(db, _other_user(db), **held)
+    _mock_shopify_http(monkeypatch)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 200
+    assert _grant(db, user) is not None
+
+
+def test_another_owner_of_the_same_account_holds_the_store_too(shopify_db):
+    """An actor (e.g. a Toby member) and the account's own connection are
+    separate owners with separate tokens, so either one holds the store
+    against the other."""
+    from xagent.web.services.shopify_store_locks import (
+        shopify_store_held_by_another_owner,
+    )
+
+    db, user = shopify_db
+    _held_grant(db, user, resource_owner_key="toby:w1:u1")
+
+    def held_against(resource_owner_key):
+        return shopify_store_held_by_another_owner(
+            db,
+            provider="shopify",
+            store="acme",
+            user_id=user.id,
+            resource_owner_key=resource_owner_key,
+        )
+
+    assert held_against(None) is True
+    assert held_against("toby:w1:u2") is True
+    assert held_against("toby:w1:u1") is False
+
+
+def _probe_store_lock(db) -> bool:
+    """Whether another connection could take the store lock right now."""
+    from sqlalchemy.exc import OperationalError
+
+    from xagent.web.services.shopify_store_locks import lock_shopify_store
+
+    engine = create_engine(db.get_bind().url, connect_args={"timeout": 0.1})
+    try:
+        with sessionmaker(bind=engine)() as other:
+            try:
+                lock_shopify_store(other, provider="shopify", store="acme")
+            except OperationalError:
+                return False
+            other.rollback()
+            return True
+    finally:
+        engine.dispose()
+
+
+def test_the_store_stays_locked_through_the_code_exchange(shopify_db, monkeypatch):
+    """A second callback (or a refresh) for the store waits until this one has
+    stored its grant, so it then sees the store as held."""
+    db, user = shopify_db
+    calls = _mock_shopify_http(monkeypatch)
+    fake_post = auth_api.requests.post
+    lock_free_during_exchange: list[bool] = []
+
+    def exchange_while_probing(url, **kwargs):
+        if url == TOKEN_URL:
+            lock_free_during_exchange.append(_probe_store_lock(db))
+        return fake_post(url, **kwargs)
+
+    monkeypatch.setattr(auth_api.requests, "post", exchange_while_probing)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 200
+    assert [url for url, _kwargs in calls][0] == TOKEN_URL
+    assert lock_free_during_exchange == [False]
+    # Released with the callback's commit.
+    assert _probe_store_lock(db) is True
+
+
+def _resolve_shopify(db, user_id: int):
+    import asyncio
+
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    config = tool_config.WebToolConfig(
+        db=None, request=None, db_factory=factory, user_id=user_id
+    )
+    return asyncio.run(
+        config._resolve_legacy_oauth_access_token(
+            provider_name="shopify", app_id=TEST_APP_ID
+        )
+    )
+
+
+def _fake_refresh_client(monkeypatch, on_post=None) -> list:
+    posted: list = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            posted.append((url, kwargs))
+            if on_post is not None:
+                on_post()
+            return _Response(
+                {
+                    "access_token": "rotated-access",
+                    "refresh_token": "rotated-refresh",
+                    "expires_in": 3600,
+                }
+            )
+
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
+    return posted
+
+
+def test_a_refresh_holds_the_store_lock(shopify_db, monkeypatch):
+    db, user = shopify_db
+    _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    lock_free_during_refresh: list[bool] = []
+    posted = _fake_refresh_client(
+        monkeypatch,
+        on_post=lambda: lock_free_during_refresh.append(_probe_store_lock(db)),
+    )
+
+    resolution = _resolve_shopify(db, user.id)
+
+    assert resolution.access_token == "rotated-access"
+    assert len(posted) == 1
+    assert lock_free_during_refresh == [False]
+
+
+def test_a_refresh_that_waited_for_the_store_uses_the_newer_token(
+    shopify_db, monkeypatch
+):
+    """Another request refreshed (or the owner reconnected) while this one
+    waited for the store lock: the stored token is current, so refreshing
+    again would only retire it."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    grant = _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    grant_id = grant.id
+    posted = _fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+
+    def lock_after_another_refresh(session, **kwargs):
+        factory = sessionmaker(bind=db.get_bind())
+        with factory() as other:
+            row = other.get(UserOAuth, grant_id)
+            row.access_token = "newer-access"
+            row.refresh_token = "newer-refresh"
+            row.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+            other.commit()
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(
+        shopify_store_locks, "lock_shopify_store", lock_after_another_refresh
+    )
+
+    resolution = _resolve_shopify(db, user.id)
+
+    assert resolution.access_token == "newer-access"
+    assert posted == []
+
+
+def test_an_actor_refresh_locks_the_store_before_its_grant(shopify_db, monkeypatch):
+    """The callback locks the store, then replaces the actor's grant row; an
+    actor refresh that locked the row first and then waited for the store
+    would deadlock with it on PostgreSQL. The SQL order shows the refresh
+    takes them the same way round."""
+    import asyncio
+
+    from sqlalchemy import event
+
+    db, user = shopify_db
+    _held_grant(
+        db, user, resource_owner_key="toby:w1:u1", expires_in=-timedelta(minutes=1)
+    )
+    posted = _fake_refresh_client(monkeypatch)
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(" ".join(statement.split()).lower())
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        config = tool_config.WebToolConfig(
+            db=None, request=None, db_factory=factory, user_id=user.id
+        )
+        resolution = asyncio.run(
+            config._resolve_legacy_oauth_access_token(
+                provider_name="shopify",
+                app_id=TEST_APP_ID,
+                resource_owner_key="toby:w1:u1",
+            )
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert resolution.access_token == "rotated-access"
+    assert len(posted) == 1
+    store_lock = next(
+        i for i, s in enumerate(statements) if "into shopify_store_locks" in s
+    )
+    row_lock = next(
+        i
+        for i, s in enumerate(statements)
+        if s.startswith("update user_oauth set id = id")
+    )
+    assert store_lock < row_lock

@@ -13,6 +13,17 @@ import type { VoiceCall, VoiceReplyMessage } from "@/hooks/use-voice-call"
 /** Task states in which a widget page holds a call's spoken words back, as the signed-in call does. */
 export const WIDGET_VOICE_BUSY_TASK_STATUSES = ["running", "pending", "pause_requested", "resume_requested"]
 
+/**
+ * The request id of the question the conversation's own task is waiting on,
+ * which spoken words answer as typed ones do; undefined otherwise.
+ */
+export function widgetVoiceAnswerRequestId(
+  task: { id: string; status: string; waitingRequestId?: string } | null | undefined,
+  taskId: number | null,
+): string | undefined {
+  return task?.status === "waiting_for_user" && task.id === String(taskId) ? task.waitingRequestId : undefined
+}
+
 /** Which transport refusals a state-table row stands for. */
 type TransportMatch =
   | { kind: "asr_error"; codes: string[] }

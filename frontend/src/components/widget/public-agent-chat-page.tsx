@@ -12,7 +12,7 @@ import { useWidgetOpenMessage, W_SEND_FAILED } from "@/hooks/use-widget-open-mes
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { VoiceCallStoreProvider } from "@/contexts/voice-call-store"
-import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES } from "@/hooks/use-widget-voice-call"
+import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES, widgetVoiceAnswerRequestId } from "@/hooks/use-widget-voice-call"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
@@ -496,10 +496,7 @@ function PublicConversationContent({
   // call's client message id, and answering the question the task is waiting
   // on (the same request id the conversation panel hands the composer).
   const sendSpoken = useCallback((text: string, clientMessageId: string) => {
-    const task = state.currentTask
-    const requestId = task?.status === "waiting_for_user" && task.id === String(state.taskId)
-      ? task.waitingRequestId
-      : undefined
+    const requestId = widgetVoiceAnswerRequestId(state.currentTask, state.taskId)
     return handleSend(text, { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }, [])
   }, [handleSend, state.currentTask, state.taskId])
   const openVoiceCall = useCallback(() => setVoiceOpen(true), [])

@@ -16,7 +16,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { VoiceCallStoreProvider } from "@/contexts/voice-call-store"
 import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import { useWidgetOpenMessage } from "@/hooks/use-widget-open-message"
-import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES } from "@/hooks/use-widget-voice-call"
+import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES, widgetVoiceAnswerRequestId } from "@/hooks/use-widget-voice-call"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
 import { readSendErrorCode } from "@/components/chat/clarification-delivery"
 import {
@@ -393,10 +393,7 @@ function SessionConversationContent({
   // a conversation exists, the panel's send after, with the call's client
   // message id and the request id of the question this task is waiting on.
   const sendSpoken = useCallback((text: string, clientMessageId: string) => {
-    const task = state.currentTask
-    const requestId = task?.status === "waiting_for_user" && task.id === String(state.taskId)
-      ? task.waitingRequestId
-      : undefined
+    const requestId = widgetVoiceAnswerRequestId(state.currentTask, state.taskId)
     const config = { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }
     return conversationEstablished
       ? sendWithAttachments(text, config, [])

@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe.api_tool import APITool
+from xagent.core.tools.adapters.vibe.api_tool_adapter import CustomApiTool
 from xagent.core.tools.adapters.vibe.download_web_asset import DownloadWebAssetTool
 from xagent.core.tools.adapters.vibe.fetch_web_content import FetchWebContentTool
 from xagent.core.tools.core.api_tool import APIClientCore
@@ -411,3 +412,23 @@ def test_unparsable_host_keeps_the_raw_host_match() -> None:
     # httpx rejects a tab in the host, so it is never sent; staying strict is
     # harmless and must not raise.
     assert is_search_result_page_url(f"https://www.goog\tle.com/search?q={SECRET}")
+
+
+@pytest.mark.asyncio
+async def test_custom_api_tool_reports_the_policy_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _api_client_without_network(monkeypatch)
+    tool = CustomApiTool(
+        name="custom_search",
+        description="fixture",
+        env={},
+        url="https://www.google.com/search",
+    )
+
+    result = await tool.run_json_async({"params": {"q": SECRET}})
+
+    assert result["success"] is False
+    assert result["error"] == SEARCH_RESULT_PAGE_REFUSAL
+    assert result["blocked_by_policy"] is True
+    request.assert_not_called()

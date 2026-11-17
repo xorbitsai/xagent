@@ -665,6 +665,11 @@ class SandboxManager:
         # reconciliation route only). See the class docstring's destruction
         # matrix for exactly which paths do (and do not) touch this.
         self._reconcile_budget: dict[str, int] = {}
+        # Names of still-running containers a budgeted startup quiesce left
+        # alone. Each is stopped exactly once, under its lifecycle lock, either
+        # by the post-activation drain or by the first reconcile that would
+        # reuse it, so no container keeps the previous generation's processes.
+        self._deferred_stops: set[str] = set()
         # Cached result of ``await service.supports_runtime_spec()``: None
         # until the first caller resolves it (see ``_resolve_backend_probe``).
         # The app-startup readiness step resolves this eagerly in a later
@@ -1574,6 +1579,69 @@ class SandboxManager:
 
     # --- Spec-reconciliation route (backends with supports_runtime_spec()) ---
 
+    async def _stop_deferred_locked(
+        self, name: str, *, raise_on_failure: bool = False
+    ) -> None:
+        """Stop a quiesce-deferred container once; the caller holds its lock.
+
+        The claim is taken before the stop, so the drain and a reconcile never
+        both stop one container, and a name recreated later is never stopped by
+        a stale entry. A failed stop re-queues the name; a reuse path raises so
+        it never adopts a container still running the old generation.
+        """
+        if name not in self._deferred_stops:
+            return
+        self._deferred_stops.discard(name)
+        try:
+            await self._service.stop_existing(
+                name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+            )
+        except SandboxNotFoundError:
+            return
+        except BaseException as exc:
+            # Also on cancel: the named-lock acquire and the inspection ahead of
+            # the shielded stop are cancellable, and the container may still
+            # run the previous generation.
+            self._deferred_stops.add(name)
+            if not isinstance(exc, Exception):
+                raise
+            logger.error("Failed to stop deferred sandbox %s: %s", name, exc)
+            if raise_on_failure:
+                raise SandboxRecoveryRequiredError(
+                    f"Failed to stop deferred sandbox {name!r} before reuse: {exc}"
+                ) from exc
+
+    async def drain_deferred_stops(self) -> None:
+        """Stop the containers the startup quiesce deferred (background task)."""
+        started = time.monotonic()
+        names = sorted(self._deferred_stops)
+        stopped = 0
+        for name in names:
+            try:
+                lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+                base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+            except (TypeError, ValueError):
+                # No lifecycle key to lock (for example a leftover warmup
+                # container): stop it directly.
+                logger.warning(
+                    "Stopping deferred sandbox without a lifecycle: %s", name
+                )
+                await self._stop_deferred_locked(name)
+                stopped += name not in self._deferred_stops
+                continue
+            async with self._lifecycle_locked(base_name):
+                if name in self._deferred_stops:
+                    await self._stop_deferred_locked(name)
+                    stopped += name not in self._deferred_stops
+        logger.info(
+            "Deferred sandbox stops finished: queued=%d stopped=%d "
+            "remaining=%d took=%.2fs",
+            len(names),
+            stopped,
+            len(self._deferred_stops),
+            time.monotonic() - started,
+        )
+
     async def _reconcile_sandbox(
         self,
         lifecycle_type: str,
@@ -1590,6 +1658,9 @@ class SandboxManager:
         Caller already holds ``_lifecycle_locked(base_name)`` and has
         already ruled out an in-process spec-cache hit.
         """
+        # A container the startup quiesce deferred still runs the previous
+        # generation's processes: stop it before it can be reused as-is.
+        await self._stop_deferred_locked(sandbox_name, raise_on_failure=True)
         inspection = await self._service.inspect(sandbox_name)
         if inspection is None:
             return await self._reconcile_create(
@@ -2643,6 +2714,7 @@ class SandboxManager:
             budget = _QUIESCE_BUDGET_SECONDS.get()
             deadline = None if budget is None else quiesce_started + budget
             deferred = 0
+            deferred_names: list[str] = []
             list_failed = False
             try:
                 sandboxes = await self._service.list_sandboxes()
@@ -2667,10 +2739,13 @@ class SandboxManager:
                     continue
                 running += 1
                 if deadline is not None and time.monotonic() >= deadline:
-                    # Out of budget: issue no further stop. The container stays
-                    # running and the next use reconciles it (this backend
-                    # reconciles specs); a stop already issued is never cut.
+                    # Out of budget: issue no further stop, and never cut one
+                    # already issued. The name is handed to the post-activation
+                    # drain; a reuse before then stops it first (see
+                    # ``_stop_deferred_locked``).
                     deferred += 1
+                    deferred_names.append(sb.name)
+                    self._deferred_stops.add(sb.name)
                     continue
                 stop_started = time.monotonic()
                 try:
@@ -2688,13 +2763,20 @@ class SandboxManager:
                     stop_seconds += time.monotonic() - stop_started
 
         finally:
-            # Also on cancel (startup bounds this call): stale process-local
+            # Also on cancel (the step bound can cut this call): stale process-local
             # state must never survive a quiesce that was cut short.
             self._cache.clear()
             self._config_cache.clear()
             self._lease_providers.clear()
             self._activity.clear()
             self._reconcile_budget.clear()
+        if deferred_names:
+            logger.warning(
+                "Sandbox quiesce budget spent; %d running sandbox(es) will be "
+                "stopped in the background after activation: %s",
+                len(deferred_names),
+                ", ".join(deferred_names),
+            )
         # One summary line per quiesce: stops are serial and each rides the full
         # stop timeout, so stop_time grows with the running count and dominates
         # startup.

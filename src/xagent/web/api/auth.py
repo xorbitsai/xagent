@@ -37,7 +37,7 @@ from pydantic import (
 )
 from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 from starlette.responses import JSONResponse
 
 from ...builtin_identity import owned_catalog_marker
@@ -67,6 +67,7 @@ from ...core.runtime_performance import (
 )
 from ...core.utils.api_key import verify_dummy
 from ...core.utils.security import host_matches_suffix
+from .. import browser_idle
 from .. import jwt_codec as jwt
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -84,6 +85,7 @@ from ..auth_sessions import (
     new_session_epoch,
     refresh_token_lookup_values,
     refresh_token_matches,
+    token_browser_session_id,
     user_session_claims,
 )
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
@@ -1490,6 +1492,8 @@ def create_refresh_token(data: Dict[str, Any]) -> str:
     # unbounded UTF-8 claim to keep the signed token within VARCHAR(255).
     # Access tokens retain sub; verification still accepts existing refresh JWTs.
     to_encode = {"user_id": data["user_id"]}
+    if "sid" in data:
+        to_encode["sid"] = data["sid"]
     expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     # Rotation must change the stored value even within one JWT timestamp second.
     to_encode.update(
@@ -1722,6 +1726,8 @@ class RefreshTokenResponse(BaseModel):
     refresh_token: Annotated[StrictStr, Field(min_length=1)]
     expires_in: Annotated[StrictInt, Field(gt=0)]
     refresh_expires_in: Annotated[StrictInt, Field(gt=0)]
+    # See docs/browser-idle-timeout.md; absent from older servers.
+    idle_session: Optional[Dict[str, Any]] = None
 
     @field_validator("access_token", "refresh_token")
     @classmethod
@@ -2125,7 +2131,13 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
     if needs_password_rehash(str(user.password_hash)):
         setattr(user, "password_hash", hash_password(request.password))
     with observe_duration("xagent.auth.login.token_creation.duration"):
-        identity = user_session_claims(user)
+        # Every login is a new browser session; commit_refresh_credentials
+        # makes it current from the refresh token's sid claim.
+        sid = browser_idle.new_browser_session_id()
+        identity = {
+            **user_session_claims(user),
+            **browser_idle.browser_session_claims(sid),
+        }
         access_token = create_access_token(
             data=identity,
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -2148,6 +2160,9 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
         "user_id": user.id,
+        "idle_session": browser_idle.idle_session_fields(
+            user, sid, last_activity_at=browser_idle.utcnow(), db=object_session(user)
+        ),
     }
 
 
@@ -2946,7 +2961,18 @@ def _prepare_refresh_response(
         now = now.replace(tzinfo=None)
     if expires < now:
         raise HTTPException(status_code=401, detail="Refresh token has expired")
-    identity = user_session_claims(user)
+    # Raises BrowserSessionRejected for an idle-expired login. Refresh never
+    # moves the idle deadline; the new tokens keep the login's sid.
+    db = object_session(user)
+    if db is None:
+        raise RuntimeError("refresh needs the user loaded in a database session")
+    sid, last_activity = browser_idle.check_browser_session(
+        db, user, token_browser_session_id(request.refresh_token)
+    )
+    identity = {
+        **user_session_claims(user),
+        **browser_idle.browser_session_claims(sid),
+    }
     access_token = create_access_token(
         data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
@@ -2958,6 +2984,12 @@ def _prepare_refresh_response(
         refresh_token=new_token,
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         refresh_expires_in=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        idle_session=browser_idle.idle_session_fields(
+            user,
+            sid,
+            last_activity_at=last_activity or browser_idle.utcnow(),
+            db=db,
+        ),
     )
 
 
@@ -2968,14 +3000,30 @@ def _refresh_in_worker(
 ) -> RefreshTokenResponse:
     with session_factory() as session:
         user = session.query(User).filter(User.id == user_id).first()
-        response = _prepare_refresh_response(user, request)
+        try:
+            response = _prepare_refresh_response(user, request)
+        except browser_idle.BrowserSessionRejected:
+            raise browser_idle.rejection_http_exception() from None
         assert user is not None
+        presented_sid = token_browser_session_id(request.refresh_token)
+        issued_sid = token_browser_session_id(response.refresh_token)
         previous_epoch = user.session_epoch
+        # Read before the rollback expires ``user``: reloading it would fail if
+        # the user were deleted meanwhile, and that refresh must stay a 401.
+        role = browser_idle.UserRole(id=int(user.id), is_admin=bool(user.is_admin))
         # End the read snapshot before competing for a write. In SQLite this
         # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
         # below, not the preceding SELECT, is the authority on token consumption.
         session.rollback()
         now = datetime.now(timezone.utc)
+        continues_login = issued_sid is not None and issued_sid == presented_sid
+        # Lock the login's row before users (same order as logout) and repeat
+        # the idle and revocation checks, so expiry racing this refresh wins.
+        if continues_login and not browser_idle.fence_browser_session_for_refresh(
+            session, role, str(issued_sid), now=now
+        ):
+            session.rollback()
+            raise browser_idle.rejection_http_exception()
         changed = (
             session.query(User)
             .filter(
@@ -2991,12 +3039,16 @@ def _refresh_in_worker(
                     User.refresh_token: hash_refresh_token(response.refresh_token),
                     User.refresh_token_expires_at: now
                     + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+                    User.browser_session_id: issued_sid,
                 },
                 synchronize_session=False,
             )
         )
         if changed != 1:
             raise HTTPException(status_code=401, detail="Invalid refresh token")
+        if issued_sid is not None and not continues_login:
+            # A pre-release login moving onto a browser session (policy off).
+            browser_idle.add_browser_session(session, int(user_id), issued_sid, now=now)
         session.commit()
         return response
 
@@ -3027,27 +3079,53 @@ async def refresh_token(
 
 
 @auth_router.post("/logout")
-async def logout(
+def logout(
     request: Optional[LogoutRequest] = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Revoke the user's rotating refresh session at logout."""
-    # A stale tab must not revoke a newer session that replaced its refresh
-    # token. Omitting the body preserves the endpoint's legacy revoke-all
-    # behavior for API clients that only send the access token.
-    if (
-        request is not None
-        and request.refresh_token is not None
-        and not refresh_token_matches(
-            getattr(user, "refresh_token", None), request.refresh_token
+    # With the idle policy on, this login's sid is revoked so its remaining
+    # access tokens stop too; it never names another login. Its row is locked
+    # before users, the same order refresh uses.
+    sid = browser_idle.request_session_id(user)
+    if sid is not None and browser_idle.get_browser_idle_policy().enabled:
+        browser_idle.revoke_browser_session(
+            db, sid, reason="logout", user_id=int(user.id)
         )
-    ):
-        return {"success": True, "message": "Logged out successfully"}
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
+    presented = request.refresh_token if request is not None else None
+    _clear_refresh_token_at_logout(db, user, sid=sid, presented=presented)
     db.commit()
     return {"success": True, "message": "Logged out successfully"}
+
+
+def _clear_refresh_token_at_logout(
+    db: Session, user: User, *, sid: str | None, presented: str | None
+) -> None:
+    """Clear the stored refresh token only if this logout owns it.
+
+    The ownership test is part of the UPDATE, so a newer login committed in
+    the meantime keeps its token:
+
+    - a presented refresh token must match the stored one (a stale tab never
+      revokes a newer login), and the stored value must still be the one that
+      was matched;
+    - without one, an access token's ``sid`` must hold the refresh token;
+    - an access token without ``sid`` (issued before browser sessions) keeps
+      the legacy revoke-all behaviour, which cannot tell logins apart.
+    """
+    stored = getattr(user, "refresh_token", None)
+    query = db.query(User).filter(User.id == user.id, User.refresh_token.isnot(None))
+    if presented is not None:
+        if not refresh_token_matches(stored, presented):
+            return
+        query = query.filter(User.refresh_token == stored)
+    elif sid is not None:
+        query = query.filter(User.browser_session_id == sid)
+    query.update(
+        {User.refresh_token: None, User.refresh_token_expires_at: None},
+        synchronize_session=False,
+    )
 
 
 @auth_router.get("/check")
@@ -3057,14 +3135,45 @@ async def check_auth() -> Dict[str, Any]:
 
 
 @auth_router.get("/verify")
-async def verify_current_token(
+def verify_current_token(
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    """Verify current token validity"""
+    """Verify current token validity without counting as user activity."""
+    sid = browser_idle.request_session_id(current_user)
     return {
         "success": True,
         "message": "Token is valid",
         "user": serialize_auth_user(current_user),
+        "idle_session": browser_idle.idle_session_fields(
+            current_user,
+            sid,
+            last_activity_at=browser_idle.last_activity(db, current_user, sid),
+            db=db,
+        ),
+    }
+
+
+@auth_router.post("/activity")
+def report_browser_activity(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Record a user-initiated interaction for the idle policy.
+
+    Only this endpoint and login move the idle deadline. Frequent reports are
+    coalesced server-side and still return 200.
+    """
+    sid = browser_idle.request_session_id(current_user)
+    try:
+        last_activity = browser_idle.record_activity(db, current_user, sid)
+    except browser_idle.BrowserSessionRejected:
+        raise browser_idle.rejection_http_exception() from None
+    return {
+        "success": True,
+        "idle_session": browser_idle.idle_session_fields(
+            current_user, sid, last_activity_at=last_activity, db=db
+        ),
     }
 
 
@@ -7036,6 +7145,7 @@ def redeem_oauth_launch(
         user is None
         or user.username != payload.get("sub")
         or not matches_user_session(user, payload)
+        or browser_idle.session_rejected(db, user, payload)
     ):
         raise HTTPException(
             401,
@@ -7211,6 +7321,7 @@ def start_oauth_authorization(
     ticket = create_access_token(
         {
             **user_session_claims(user),
+            **browser_idle.request_session_claims(user),
             "type": "oauth_launch",
             "provider": provider,
             "jti": secrets.token_urlsafe(24),

@@ -5300,3 +5300,49 @@ def test_ws_restart_close_window(value, expected, monkeypatch):
     if value is not None:
         monkeypatch.setenv("XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS", value)
     assert get_ws_restart_close_window_seconds() == expected
+
+
+_ACTIVATION_TIMEOUTS = [
+    ("XAGENT_STANDBY_STEP_TIMEOUT_SECONDS", "get_standby_step_timeout_seconds", 60.0),
+    (
+        "XAGENT_SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS",
+        "get_sandbox_startup_cleanup_timeout_seconds",
+        20.0,
+    ),
+    (
+        "XAGENT_TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS",
+        "get_task_event_bridge_start_timeout_seconds",
+        30.0,
+    ),
+]
+
+
+@pytest.mark.parametrize("env,getter,default", _ACTIVATION_TIMEOUTS)
+def test_activation_timeouts_default_override_and_blank(
+    monkeypatch, env, getter, default
+):
+    fn = getattr(config, getter)
+    monkeypatch.delenv(env, raising=False)
+    assert fn() == default
+    monkeypatch.setenv(env, "  ")
+    assert fn() == default
+    monkeypatch.setenv(env, "2.5")
+    assert fn() == 2.5
+
+
+@pytest.mark.parametrize("env,getter,default", _ACTIVATION_TIMEOUTS)
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "garbage"])
+def test_activation_timeouts_reject_invalid_values(
+    monkeypatch, env, getter, default, value
+):
+    monkeypatch.setenv(env, value)
+    with pytest.raises(ValueError, match=env):
+        getattr(config, getter)()
+    with pytest.raises(ValueError, match=env):
+        config.validate_activation_timeouts()
+
+
+def test_validate_activation_timeouts_accepts_defaults(monkeypatch):
+    for env, _, _ in _ACTIVATION_TIMEOUTS:
+        monkeypatch.delenv(env, raising=False)
+    config.validate_activation_timeouts()

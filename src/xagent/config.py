@@ -79,6 +79,7 @@ TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
 TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
 SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
+REFUSE_SEARCH_RESULT_FETCH = "XAGENT_REFUSE_SEARCH_RESULT_FETCH"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
@@ -705,6 +706,21 @@ def get_task_auto_resume_enabled() -> bool:
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
 
 
+def get_refuse_search_result_fetch_enabled() -> bool:
+    """Whether page-fetch tools refuse search-engine result-page URLs.
+
+    On, ``fetch_web_content`` and ``download_web_asset`` return an error for
+    such URLs without making a request and tell the model to use
+    ``web_search``. The switch exists only to roll the refusal back.
+
+    Priority:
+        1. XAGENT_REFUSE_SEARCH_RESULT_FETCH environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(REFUSE_SEARCH_RESULT_FETCH, True)
+
+
 def get_shutdown_handoff_enabled() -> bool:
     """Whether a shutdown hands eligible running tasks to lease recovery.
 
@@ -1329,8 +1345,6 @@ def get_shared_task_execution_enabled() -> bool:
 
 def _positive_seconds_env(name: str, default: float) -> float:
     """A strictly positive, finite number of seconds; a bad value fails closed."""
-    import math
-
     raw = os.getenv(name, "").strip()
     if not raw:
         return default
@@ -1355,7 +1369,8 @@ def get_standby_step_timeout_seconds() -> float:
 def get_sandbox_startup_cleanup_timeout_seconds() -> float:
     """Budget after which the startup quiesce issues no further stops.
 
-    Never cancels a stop already issued; see ``bounded_quiesce``.
+    Never cancels a stop already issued; see ``bounded_quiesce``. Containers
+    deferred by it are stopped in the background after activation.
     """
     return _positive_seconds_env(SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS, 20.0)
 
@@ -1363,6 +1378,17 @@ def get_sandbox_startup_cleanup_timeout_seconds() -> float:
 def get_task_event_bridge_start_timeout_seconds() -> float:
     """How long the task event bridge may retry Redis before start fails."""
     return _positive_seconds_env(TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS, 30.0)
+
+
+def validate_activation_timeouts() -> None:
+    """Fail at boot on a malformed activation timeout.
+
+    The three getters are strict and otherwise read only at activation time, by
+    which point the host may already have retired the serving generation.
+    """
+    get_standby_step_timeout_seconds()
+    get_sandbox_startup_cleanup_timeout_seconds()
+    get_task_event_bridge_start_timeout_seconds()
 
 
 def get_standby_enabled() -> bool:

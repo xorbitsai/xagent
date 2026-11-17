@@ -14,6 +14,7 @@ from ....file_ref import build_workspace_file_ref
 from ....utils.security import fetch_public_http_bytes
 from ....utils.svg import validate_svg_bytes
 from ....workspace import TaskWorkspace
+from ...core.search_result_pages import search_result_page_refusal
 from ...core.web_content import (
     DEFAULT_MAX_CONTENT_BYTES,
     DEFAULT_USER_AGENT,
@@ -128,6 +129,9 @@ class DownloadWebAssetTool(AbstractBaseTool):
             ).model_dump()
 
     async def _download(self, url: str) -> tuple[bytes, str, str]:
+        refusal = search_result_page_refusal(url)
+        if refusal is not None:
+            raise ValueError(refusal)
         proxy_url = get_trusted_proxy_url()
         async with public_fetch_client(proxy_url, timeout=30) as client:
             response = await fetch_public_http_bytes(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any, Mapping, Type
 
 from pydantic import BaseModel, Field
@@ -11,7 +10,12 @@ from .....config import (
     get_fetch_web_content_budget_enabled,
     get_fetch_web_content_max_chars,
 )
-from ...core.web_content import TRUNCATION_NOTICE, fetch_web_content, truncate_page_text
+from ...core.web_content import (
+    FINAL_SLICE_NOTICE,
+    TRUNCATION_NOTICE,
+    fetch_web_content,
+    slice_page_text,
+)
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 
@@ -39,9 +43,16 @@ class FetchWebContentArgs(BaseModel):
         ge=1000,
         le=50000,
         description=(
-            "Maximum characters of page text to return. Defaults to a small "
-            "budget (about 3k tokens) that is enough to answer most questions; "
-            "raise it only when the part you need was cut off."
+            "Maximum characters of page text to return in this call. Leave it "
+            "unset for the default budget, which is enough for most questions."
+        ),
+    )
+    start_char: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Character offset to start reading from. When a page was cut, the "
+            "notice at the end of its text gives the start_char that continues it."
         ),
     )
 
@@ -75,11 +86,11 @@ class FetchWebContentResult(BaseModel):
     )
     truncated: bool = Field(
         default=False,
-        description="True when the page text was cut to the character budget",
+        description="True when more page text remains after this result",
     )
     total_chars: int | None = Field(
         default=None,
-        description="Length of the full page text before it was cut, when known",
+        description="Length of the full page text, set when the budget applied",
     )
     assets: list[WebAssetReferenceResult] = Field(
         default_factory=list,
@@ -113,11 +124,22 @@ class FetchWebContentTool(AbstractBaseTool):
             "retrieving page content; use web_search first when you need to "
             "discover sources. Search snippets often already answer simple "
             "questions: fetch only when they do not, and read at most one or two "
-            "pages. The returned text is capped (see max_chars); a cut page says "
-            "so. When the task needs a logo or other exact web "
+            "pages. "
+            + self._budget_description()
+            + "When the task needs a logo or other exact web "
             "asset, set include_assets=true and usually asset_query='logo'. The "
             "returned assets preserve official page URLs; pass the chosen URL to "
             "download_web_asset instead of recreating it with api_call/write_file."
+        )
+
+    @staticmethod
+    def _budget_description() -> str:
+        if not get_fetch_web_content_budget_enabled():
+            return "The full page text is returned. "
+        return (
+            f"The returned text is capped at {get_fetch_web_content_max_chars()} "
+            "characters per call; a cut page says so and gives the start_char "
+            "to continue from. "
         )
 
     @property
@@ -142,17 +164,23 @@ class FetchWebContentTool(AbstractBaseTool):
             asset_query=fetch_args.asset_query,
             trim_boilerplate=budget,
         )
+        payload = result.as_dict()
         if budget and result.success:
             limit = fetch_args.max_chars or get_fetch_web_content_max_chars()
-            text, cut = truncate_page_text(result.content, limit)
-            if cut:
-                result = replace(
-                    result,
-                    content=text
-                    + TRUNCATION_NOTICE.format(
-                        shown=len(text), total=len(result.content)
-                    ),
-                    truncated=True,
-                    total_chars=len(result.content),
+            text, end, total = slice_page_text(
+                result.content, fetch_args.start_char, limit
+            )
+            payload["total_chars"] = total
+            if fetch_args.start_char >= total > 0:
+                text = f"[start_char is past the end of the page ({total} characters).]"
+            elif end < total:
+                text += TRUNCATION_NOTICE.format(
+                    start=fetch_args.start_char, end=end, total=total
                 )
-        return FetchWebContentResult.model_validate(result.as_dict()).model_dump()
+            elif fetch_args.start_char > 0:
+                text += FINAL_SLICE_NOTICE.format(
+                    start=fetch_args.start_char, end=end, total=total
+                )
+            payload["content"] = text
+            payload["truncated"] = end < total
+        return FetchWebContentResult.model_validate(payload).model_dump()

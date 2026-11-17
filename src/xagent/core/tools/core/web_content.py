@@ -26,15 +26,24 @@ DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
 MAX_DISCOVERED_ASSETS = 50
 # Page furniture that carries no answer text. Dropped only when the caller asks
 # for a trimmed page (``trim_boilerplate``).
-BOILERPLATE_TAGS = ("nav", "header", "footer", "aside", "form", "iframe", "dialog")
-BOILERPLATE_ROLES = frozenset({"navigation", "banner", "contentinfo", "complementary"})
+BOILERPLATE_TAGS = ("nav", "aside", "iframe", "dialog")
+# Page-level furniture. Inside a selected main region these are the headline,
+# byline and date of the article itself, so they are kept there.
+PAGE_FURNITURE_TAGS = ("header", "footer")
+BOILERPLATE_ROLES = frozenset({"navigation", "complementary"})
+PAGE_FURNITURE_ROLES = frozenset({"banner", "contentinfo"})
+# If trimming leaves less than this share of the page text, the page does not
+# have the usual shape (for example a body wrapped in one element we would
+# strip), so the untrimmed page is returned instead of an empty one.
+MIN_TRIMMED_TEXT_SHARE = 0.2
 # A <main>/<article> region is used instead of the whole page only when it holds
 # at least this much text; a short one is usually a widget, not the content.
 MIN_MAIN_REGION_CHARS = 400
 TRUNCATION_NOTICE = (
-    "\n\n[Page text truncated: showing the first {shown} of {total} characters. "
-    "Request more with max_chars only if the answer needs the rest.]"
+    "\n\n[Page text cut: showing characters {start}-{end} of {total}. "
+    "To read on, call again with start_char={end}.]"
 )
+FINAL_SLICE_NOTICE = "\n\n[End of page: showing characters {start}-{end} of {total}.]"
 # Statuses a site returns when it refuses an automated client rather than
 # because the page is missing or the fetcher failed.
 SITE_BLOCKED_STATUS_CODES = frozenset({401, 403, 429, 451})
@@ -95,8 +104,6 @@ class WebContentFetchResult:
     error: str | None = None
     assets: tuple[WebAssetReference, ...] = ()
     blocked_by_site: bool = False
-    truncated: bool = False
-    total_chars: int | None = None
 
     @property
     def success(self) -> bool:
@@ -120,8 +127,6 @@ class WebContentFetchResult:
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
             "blocked_by_site": self.blocked_by_site,
-            "truncated": self.truncated,
-            "total_chars": self.total_chars,
         }
 
 
@@ -463,41 +468,75 @@ class WebContentFetcher:
         return markdown
 
 
-def _trim_boilerplate(soup: BeautifulSoup) -> BeautifulSoup:
-    """Drop navigation and page furniture, keeping the main content region."""
+def _text_length(node: Any) -> int:
+    return len(node.get_text(" ", strip=True))
 
-    main = (
-        soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
+
+def _select_main_region(soup: BeautifulSoup) -> Any:
+    """First of <main>, a lone <article>, role=main holding real text."""
+
+    articles = soup.find_all("article")
+    candidates = (
+        soup.find("main"),
+        articles[0] if len(articles) == 1 else None,
+        soup.find(attrs={"role": "main"}),
     )
-    if (
-        main is not None
-        and len(main.get_text(" ", strip=True)) >= MIN_MAIN_REGION_CHARS
-    ):
-        soup = BeautifulSoup(str(main), "html.parser")
-    for element in soup(list(BOILERPLATE_TAGS)):
+    for candidate in candidates:
+        if candidate is not None and _text_length(candidate) >= MIN_MAIN_REGION_CHARS:
+            return candidate
+    return None
+
+
+def _remove_boilerplate(soup: BeautifulSoup, *, page_level: bool) -> None:
+    tags = BOILERPLATE_TAGS + (PAGE_FURNITURE_TAGS if page_level else ())
+    roles = BOILERPLATE_ROLES | (PAGE_FURNITURE_ROLES if page_level else frozenset())
+    for element in soup(list(tags)):
         element.decompose()
     for element in soup.find_all(attrs={"role": True}):
+        # An ancestor removed earlier in this loop clears its descendants.
+        if element.decomposed:
+            continue
         role = element.get("role")
-        if isinstance(role, str) and role.lower() in BOILERPLATE_ROLES:
+        if isinstance(role, str) and role.lower() in roles:
             element.decompose()
-    return soup
 
 
-def truncate_page_text(text: str, max_chars: int) -> tuple[str, bool]:
-    """Cut ``text`` to about ``max_chars``, preferring a paragraph or line break.
+def _trim_boilerplate(soup: BeautifulSoup) -> BeautifulSoup:
+    """Drop navigation and page furniture, keeping the main content region.
 
-    Returns the (possibly shortened) text and whether anything was cut. The
-    notice is not part of the returned text.
+    Works on a copy. Returns the original page when trimming would leave less
+    than ``MIN_TRIMMED_TEXT_SHARE`` of its text.
     """
 
-    if len(text) <= max_chars:
-        return text, False
-    window = text[:max_chars]
+    total = _text_length(soup)
+    trimmed = BeautifulSoup(str(soup), "html.parser")
+    main = _select_main_region(trimmed)
+    if main is not None:
+        trimmed = BeautifulSoup(str(main), "html.parser")
+    _remove_boilerplate(trimmed, page_level=main is None)
+    if total and _text_length(trimmed) < total * MIN_TRIMMED_TEXT_SHARE:
+        return soup
+    return trimmed
+
+
+def slice_page_text(text: str, start: int, max_chars: int) -> tuple[str, int, int]:
+    """Return ``text[start:end]`` with ``end`` at a paragraph or line break.
+
+    ``end`` is at most ``start + max_chars`` and is the offset to resume from.
+    When the rest of the text fits, ``end == len(text)``.
+    """
+
+    total = len(text)
+    start = min(max(0, start), total)
+    end = start + max_chars
+    if end >= total:
+        return text[start:].strip(), total, total
     for separator in ("\n\n", "\n"):
-        cut = window.rfind(separator)
-        if cut >= max_chars // 2:
-            return window[:cut].rstrip(), True
-    return window.rstrip(), True
+        cut = text.rfind(separator, start + max_chars // 2, end)
+        if cut != -1:
+            end = cut + len(separator)
+            break
+    return text[start:end].strip(), end, total
 
 
 def _is_site_blocked_response(response: httpx.Response) -> bool:

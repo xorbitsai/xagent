@@ -5346,3 +5346,24 @@ def test_validate_activation_timeouts_accepts_defaults(monkeypatch):
     for env, _, _ in _ACTIVATION_TIMEOUTS:
         monkeypatch.delenv(env, raising=False)
     config.validate_activation_timeouts()
+
+
+class TestFetchWebContentBudgetConfig:
+    @pytest.mark.parametrize("value", ["", "  ", "ture", "maybe"])
+    def test_blank_or_mistyped_value_keeps_the_default_on(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_BUDGET", value)
+        assert config.get_fetch_web_content_budget_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "off"])
+    def test_explicit_false_turns_it_off(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_BUDGET", value)
+        assert config.get_fetch_web_content_budget_enabled() is False
+
+    def test_max_chars_default_and_bounds(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_FETCH_WEB_CONTENT_MAX_CHARS", raising=False)
+        assert config.get_fetch_web_content_max_chars() == 12_000
+        monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_MAX_CHARS", "20000")
+        assert config.get_fetch_web_content_max_chars() == 20_000
+        for bad in ("abc", "999", "-5"):
+            monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_MAX_CHARS", bad)
+            assert config.get_fetch_web_content_max_chars() == 12_000

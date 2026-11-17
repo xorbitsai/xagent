@@ -4875,7 +4875,7 @@ def get_fetch_web_content_budget_enabled() -> bool:
     On by default. Set ``XAGENT_FETCH_WEB_CONTENT_BUDGET=false`` to return the
     full extracted page again (rollback switch).
     """
-    return _get_bool_env(FETCH_WEB_CONTENT_BUDGET, True)
+    return _get_strict_bool_env(FETCH_WEB_CONTENT_BUDGET, True)
 
 
 def get_fetch_web_content_max_chars() -> int:

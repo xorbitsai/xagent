@@ -105,6 +105,8 @@ from ..services.tool_credentials import (
     resolve_tool_credential,
     unresolved_tool_policy_allowlist,
 )
+from ..services import shopify_store_locks
+from ..services.shopify_store_locks import shopify_store_of
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 
 logger = logging.getLogger(__name__)
@@ -1302,6 +1304,31 @@ def send_oauth_refresh_request(
     if request.method == "GET":
         return client.get(request.url, timeout=10.0, **request.kwargs)
     return client.post(request.url, timeout=10.0, **request.kwargs)
+
+
+def _lock_shopify_store_and_reread(
+    db: Any, oauth_account: Any, provider_name: object
+) -> Any:
+    """Take the grant's Shopify store lock, then reread the grant.
+
+    Shopify retires a token refreshed or granted alongside another one for
+    the same store, so refreshes and callbacks for a store take turns under
+    the lock until this transaction ends. Whoever went first may have stored
+    a token that needs no refresh, or removed the grant, so the row is read
+    again after the wait; ``None`` means it is gone.
+    """
+    from ..models.user_oauth import UserOAuth
+
+    store = shopify_store_of(provider_name, oauth_account.instance_url)
+    if store is None:
+        return oauth_account
+    shopify_store_locks.lock_shopify_store(db, provider=str(provider_name), store=store)
+    return (
+        db.query(UserOAuth)
+        .filter(UserOAuth.id == oauth_account.id)
+        .populate_existing()
+        .first()
+    )
 
 
 async def refresh_oauth_token_if_needed(
@@ -4386,6 +4413,16 @@ class WebToolConfig(BaseToolConfig):
             return _LegacyOAuthTokenResolution(
                 access_token=None, credential_present=True
             )
+        # A Shopify grant is reread under its store lock (see the helper).
+        oauth_account = _lock_shopify_store_and_reread(
+            oauth_db, oauth_account, provider_name
+        )
+        if not oauth_account:
+            return _LegacyOAuthTokenResolution(access_token=None)
+        if not oauth_account.access_token:
+            return _LegacyOAuthTokenResolution(
+                access_token=None, credential_present=True
+            )
 
         logger.info(
             "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
@@ -4827,6 +4864,22 @@ class WebToolConfig(BaseToolConfig):
                 user_id=user_id,
                 resource_owner_key=resource_owner_key,
             ).filter(UserOAuth.provider == app_id)
+            # A Shopify grant's store is locked before its row, the order the
+            # callback takes them in (store, then the replaced row), so the
+            # two never wait on each other. Only the store column is read
+            # here: a loaded row would not be refreshed by the locking read.
+            peeked = (
+                actor_query.with_entities(UserOAuth.instance_url)
+                .order_by(UserOAuth.id.desc())
+                .first()
+            )
+            peeked_store = shopify_store_of(
+                provider_name, peeked.instance_url if peeked else None
+            )
+            if peeked_store is not None:
+                shopify_store_locks.lock_shopify_store(
+                    oauth_db, provider=str(provider_name), store=peeked_store
+                )
             if oauth_db.get_bind().dialect.name == "sqlite":
                 oauth_db.execute(
                     text(

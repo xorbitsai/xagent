@@ -146,6 +146,10 @@ from ..services.oauth_revocation_fences import (
     open_oauth_revocation_fence,
 )
 from ..services.oauth_state_claims import claim_oauth_state
+from ..services.shopify_store_locks import (
+    lock_shopify_store,
+    shopify_store_held_by_another_owner,
+)
 from ..services.trigger_rate_limit import remote_ip_from_request
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
@@ -5685,6 +5689,31 @@ def generic_oauth_callback(
                 return _oauth_popup_feedback_response(
                     "Cannot connect Shopify", html.escape(exc.message)
                 )
+            # One live grant per store: a new grant would retire the current
+            # owner's token. Locked until this callback commits, so a refresh
+            # or another callback for the store waits for the stored grant.
+            lock_shopify_store(db, provider=provider, store=bound_account)
+            if shopify_store_held_by_another_owner(
+                db,
+                provider=provider,
+                store=bound_account,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            ):
+                db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "store_connected_elsewhere",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
+                response = _oauth_popup_feedback_response(
+                    "Cannot connect Shopify",
+                    "This Shopify store is already connected by another user. "
+                    "To connect it yourself, ask them to disconnect it first.",
+                )
+                response.status_code = 409
+                return response
 
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 

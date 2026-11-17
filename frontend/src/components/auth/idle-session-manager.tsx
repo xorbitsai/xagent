@@ -28,11 +28,17 @@ const DEADLINE_GRACE_MS = 1_500
 /** Warning lead time: a UI constant, not policy. Halved thresholds keep very short test policies usable. */
 const WARNING_LEAD_MS = 2 * 60 * 1000
 
+function warningLeadMs(record: IdleSessionRecord): number {
+  return Math.min(WARNING_LEAD_MS, record.idleTimeoutSeconds * 1000 / 2)
+}
+
 function warningSecondsLeft(record: IdleSessionRecord | null): number | null {
   if (!record?.enforced) return null
   const remaining = idleRemainingMs(record)
-  const lead = Math.min(WARNING_LEAD_MS, record.idleTimeoutSeconds * 1000 / 2)
-  return remaining > 0 && remaining <= lead ? Math.ceil(remaining / 1000) : null
+  // At the deadline the warning stays at 0:00 until the server answers: the
+  // check runs a little later, and if it fails (offline, 5xx) the page must
+  // not look normal while the login has most likely expired.
+  return remaining <= warningLeadMs(record) ? Math.max(0, Math.ceil(remaining / 1000)) : null
 }
 
 function formatCountdown(seconds: number): string {
@@ -42,9 +48,9 @@ function formatCountdown(seconds: number): string {
 /**
  * Browser side of the server idle-session policy for one login: reports
  * deliberate user input, and asks the server (verify, which is not activity)
- * when the deadline seems to have passed, after the device wakes, comes
- * back online or regains the user's attention, and when a socket says the
- * session ended. It never signs the user out on its own clock; the server's
+ * when the deadline seems to have passed, when the device wakes, comes
+ * back online or regains the user's attention near the deadline, and when a
+ * socket says the session ended. It never signs the user out on its own clock; the server's
  * answer does. Shows an accessible warning before the deadline. Renders
  * nothing for servers without idle support.
  */
@@ -62,6 +68,8 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
     }
     const reporter = startIdleActivityReporter({
       target: window,
+      // Explicit on purpose: tests replace this module export to treat jsdom's
+      // untrusted events as user input.
       isUserEvent: isUserActivityEvent,
       getRecord,
       markReported: async () => {
@@ -77,6 +85,10 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
     // A socket notice that arrived while a check was running or too soon
     // after one; the next tick checks once the gap allows it.
     let socketNoticePending = false
+    // The clock moved backwards while the tab was hidden: the local deadline
+    // now looks further away than it is, so the next wake asks the server
+    // even far from the deadline.
+    let rolledBackWhileHidden = false
     const revalidate = (requireEnforced: boolean) => {
       const record = getRecord()
       if (!record || (requireEnforced && !record.enforced)) return
@@ -88,6 +100,7 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
         return
       }
       socketNoticePending = false
+      rolledBackWhileHidden = false
       inFlight = true
       lastCheckAt = Date.now()
       void revalidateIdleSession(sessionId).finally(() => { inFlight = false })
@@ -100,16 +113,26 @@ export function IdleSessionManager({ sessionId, onSignOut }: { sessionId: string
     let lastTick = Date.now()
     const tick = () => {
       const now = Date.now()
-      const jumped = now < lastTick || now - lastTick > DEADLINE_TICK_MS + CLOCK_JUMP_TOLERANCE_MS
+      const rolledBack = now < lastTick
+      const jumped = rolledBack || now - lastTick > DEADLINE_TICK_MS + CLOCK_JUMP_TOLERANCE_MS
       lastTick = now
-      // Hidden tabs have throttled timers, so a long gap there is expected;
-      // they revalidate when they become visible again.
-      if (jumped && document.visibilityState !== "hidden") revalidate(true)
+      // Hidden tabs have throttled timers, so a long forward gap there is
+      // expected and already counted by the wall-clock countdown. A backward
+      // jump is remembered for the next wake.
+      const hidden = document.visibilityState === "hidden"
+      if (jumped && hidden && rolledBack) rolledBackWhileHidden = true
+      if (jumped && !hidden) revalidate(true)
       else checkDeadline()
       if (socketNoticePending) revalidate(false)
     }
     const onWake = () => {
       if (document.visibilityState === "hidden") return
+      // The countdown uses wall-clock time, so it already counts a sleep. Far
+      // from the deadline (an ordinary user's one-year threshold, say) the
+      // server has nothing new to say, so only ask near or past it.
+      const record = getRecord()
+      if (!record) return
+      if (!rolledBackWhileHidden && idleRemainingMs(record) > warningLeadMs(record)) return
       revalidate(true)
     }
     // A closed socket is a server statement about this login, enforced or not.

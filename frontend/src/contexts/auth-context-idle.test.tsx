@@ -65,6 +65,12 @@ function CheckProbe() {
   </>
 }
 
+/** Seconds left on a record inside the 2-minute warning lead, where wake events verify. */
+const NEAR_DEADLINE_S = 60
+
+/** Lets pending promise chains and short timers run before a negative assertion. */
+const settle = () => act(async () => { await new Promise(resolve => setTimeout(resolve, 20)) })
+
 const json = (body: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" }, ...init })
 
@@ -86,6 +92,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.useRealTimers()
+  vi.unstubAllGlobals()
   Reflect.deleteProperty(document, "visibilityState")
 })
 
@@ -140,6 +147,8 @@ describe("AuthProvider activity reporting", () => {
     await screen.findByText("token")
     fireEvent.keyDown(window, { key: "a" })
     fireEvent.pointerDown(window)
+    // A report would only be sent after the report-time write, so wait for it.
+    await settle()
     expect(activityCalls()).toHaveLength(0)
   })
 
@@ -149,6 +158,7 @@ describe("AuthProvider activity reporting", () => {
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await screen.findByText("token")
     fireEvent.keyDown(window, { key: "a" })
+    await settle()
     expect(activityCalls()).toHaveLength(0)
   })
 
@@ -159,6 +169,7 @@ describe("AuthProvider activity reporting", () => {
     await screen.findByText("token")
     unmount()
     fireEvent.keyDown(window, { key: "a" })
+    await settle()
     expect(activityCalls()).toHaveLength(0)
   })
 })
@@ -209,25 +220,30 @@ describe("IdleSessionManager revalidation", () => {
 
   it("waits until the server's own deadline has passed before asking", async () => {
     // idle_expires_in is rounded down, so the local deadline can be up to a second early.
-    vi.useFakeTimers({ shouldAdvanceTime: true })
+    // A pinned clock: real render time must not move the deadline.
+    vi.useFakeTimers({ toFake: ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "Date"] })
     writeAuthCache()
     writeIdleRecord({ idleExpiresIn: 0 })
     render(<AuthProvider><CheckProbe /></AuthProvider>)
-    await screen.findByText("token")
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    expect(screen.getByTestId("token")).toHaveTextContent("token")
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
     expect(verifyCalls()).toHaveLength(0)
     await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
     expect(verifyCalls()).toHaveLength(1)
   })
 
-  it("does not sign out when the server cannot confirm the session", async () => {
+  it("does not sign out when the server cannot confirm the session, and keeps the warning at 0:00", async () => {
     writeAuthCache()
     writeIdleRecord({ idleExpiresIn: 0, observedAt: Date.now() - 5_000 })
     vi.mocked(apiRequest).mockImplementation(async () => new Response(null, { status: 503 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await waitFor(() => expect(verifyCalls().length).toBeGreaterThan(0))
+    await settle()
     expect(screen.getByTestId("token")).toHaveTextContent("token")
     expect(readCurrentIdleSession()).not.toBeNull()
+    // The page must not look normal while the login has most likely expired.
+    expect(screen.getByRole("alertdialog")).toBeInTheDocument()
   })
 
   it("does not turn a server outage at the deadline into a request loop", async () => {
@@ -257,9 +273,9 @@ describe("IdleSessionManager revalidation", () => {
     ["the page becomes visible", () => document.dispatchEvent(new Event("visibilitychange"))],
     ["the window regains focus", () => window.dispatchEvent(new Event("focus"))],
     ["the browser comes back online", () => window.dispatchEvent(new Event("online"))],
-  ])("revalidates before continuing when %s", async (_, wake) => {
+  ])("revalidates before continuing when %s near the deadline", async (_, wake) => {
     writeAuthCache()
-    writeIdleRecord()
+    writeIdleRecord({ idleExpiresIn: NEAR_DEADLINE_S })
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await screen.findByText("token")
     expect(verifyCalls()).toHaveLength(0)
@@ -267,9 +283,26 @@ describe("IdleSessionManager revalidation", () => {
     await waitFor(() => expect(verifyCalls()).toHaveLength(1))
   })
 
+  it.each([
+    ["an administrator far from the deadline", { idleExpiresIn: 1700 }],
+    ["an ordinary user with a one-year threshold", { idleTimeoutSeconds: 31_536_000, idleExpiresIn: 31_536_000 }],
+  ])("does not ask the server on wake for %s", async (_, overrides) => {
+    writeAuthCache()
+    writeIdleRecord(overrides)
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"))
+      window.dispatchEvent(new Event("focus"))
+      window.dispatchEvent(new Event("online"))
+    })
+    await settle()
+    expect(verifyCalls()).toHaveLength(0)
+  })
+
   it("sends one check for a burst of wake events", async () => {
     writeAuthCache()
-    writeIdleRecord()
+    writeIdleRecord({ idleExpiresIn: NEAR_DEADLINE_S })
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await screen.findByText("token")
     act(() => {
@@ -292,7 +325,7 @@ describe("IdleSessionManager revalidation", () => {
   it("keeps a socket notice that arrives right after a check and checks once the gap has passed", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()
-    writeIdleRecord()
+    writeIdleRecord({ idleExpiresIn: NEAR_DEADLINE_S })
     vi.mocked(apiRequest).mockImplementation(async url =>
       String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy() }) : new Response(null, { status: 404 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
@@ -317,9 +350,10 @@ describe("IdleSessionManager revalidation", () => {
   it("does not queue a later check for a wake event inside the gap", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()
-    writeIdleRecord()
+    writeIdleRecord({ idleExpiresIn: NEAR_DEADLINE_S })
+    // The server answer keeps the deadline near, so only the gap holds the second wake back.
     vi.mocked(apiRequest).mockImplementation(async url =>
-      String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy() }) : new Response(null, { status: 404 }))
+      String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy({ idle_expires_in: NEAR_DEADLINE_S }) }) : new Response(null, { status: 404 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
     await screen.findByText("token")
     act(() => { window.dispatchEvent(new Event("focus")) })
@@ -332,7 +366,7 @@ describe("IdleSessionManager revalidation", () => {
   it("keeps a socket notice that arrives while a check is in flight", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()
-    writeIdleRecord()
+    writeIdleRecord({ idleExpiresIn: NEAR_DEADLINE_S })
     let answer: (response: Response) => void = () => undefined
     vi.mocked(apiRequest).mockImplementation(async url => {
       if (!String(url).endsWith("/api/auth/verify")) return new Response(null, { status: 404 })
@@ -365,10 +399,43 @@ describe("IdleSessionManager revalidation", () => {
     expect(verifyCalls()).toHaveLength(0)
   })
 
-  it("asks the server after the device clock moves backwards, even right after a check", async () => {
+  it("asks the server on return to a tab whose clock moved backwards while it was hidden, even far from the deadline", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     writeAuthCache()
     writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    let visibility = "hidden"
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility })
+    // The rollback makes the local deadline look further away than it is.
+    vi.setSystemTime(Date.now() - 10 * 60_000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    expect(verifyCalls()).toHaveLength(0)
+    visibility = "visible"
+    act(() => { document.dispatchEvent(new Event("visibilitychange")) })
+    await waitFor(() => expect(verifyCalls()).toHaveLength(1))
+  })
+
+  it("does not ask the server on return to a hidden tab whose timers were only throttled", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord()
+    render(<AuthProvider><CheckProbe /></AuthProvider>)
+    await screen.findByText("token")
+    let visibility = "hidden"
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => visibility })
+    vi.setSystemTime(Date.now() + 60_000)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+    visibility = "visible"
+    act(() => { document.dispatchEvent(new Event("visibilitychange")) })
+    await settle()
+    expect(verifyCalls()).toHaveLength(0)
+  })
+
+  it("asks the server after the device clock moves backwards, even right after a check", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    writeAuthCache()
+    writeIdleRecord({ idleExpiresIn: NEAR_DEADLINE_S })
     vi.mocked(apiRequest).mockImplementation(async url =>
       String(url).endsWith("/api/auth/verify") ? json({ idle_session: idlePolicy({ idle_expires_in: 1500 }) }) : new Response(null, { status: 404 }))
     render(<AuthProvider><CheckProbe /></AuthProvider>)
@@ -432,7 +499,6 @@ describe("IdleSessionManager expiry warning", () => {
     await screen.findByRole("alertdialog")
     fireEvent.click(screen.getByRole("button", { name: "session_idle.sign_out" }))
     await waitFor(() => expect(screen.getByTestId("token")).toHaveTextContent("none"))
-    vi.unstubAllGlobals()
   })
 
   it.each([

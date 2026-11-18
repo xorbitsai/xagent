@@ -1,14 +1,14 @@
 """Lock one Shopify store's token grants and refreshes against each other.
 
 Revision ID: 20261117_shopify_store_locks
-Revises: 20261116_browser_idle_session
+Revises: 20261116_shopify_oauth
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "20261117_shopify_store_locks"
-down_revision = "20261116_browser_idle_session"
+down_revision = "20261116_shopify_oauth"
 branch_labels = None
 depends_on = None
 

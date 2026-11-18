@@ -33,11 +33,12 @@ response is capped as a whole against ``get_tool_max_output_length()``, so the
 paging fields at its end survive the platform's output filter.
 """
 
+import functools
 import json
 import logging
 import os
 import re
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from itertools import islice
 from typing import Any
@@ -118,6 +119,25 @@ MAX_NAME_CHARS = 255
 MAX_ITEM_ID_BYTES = 1023
 MAX_OMITTED_IDS = 50
 
+# Output budget. The platform cuts any longer tool result blindly (and appends a
+# marker), which would leave malformed JSON and no cursor, so no return of this
+# module may exceed ``get_tool_max_output_length()``. That budget can be set as
+# low as MIN_OUTPUT_BUDGET (4 KiB); every size below is derived from it:
+#   * the outgoing continuation token is limited at the source to
+#     CONTINUATION_TOKEN_LIMIT_KB (``continuation_token_limit`` on
+#     ``query_items``, in KB, 1 is the smallest positive value) = 1,024 bytes;
+#   * as JSON text a token character costs at most 2 characters (a quote or
+#     backslash is escaped), so it takes at most WORST_CASE_TOKEN_CHARS;
+#   * the rest of an empty-items envelope is two names (255 characters, 2 each
+#     at worst) and about 300 characters of fixed keys, so
+#     2048 + 1020 + 300 < 4096 (asserted by a test with worst-case inputs).
+# Anything that still does not fit becomes the fixed ``response_too_large``
+# envelope below, itself well under 512 characters.
+MIN_OUTPUT_BUDGET = 4096
+CONTINUATION_TOKEN_LIMIT_KB = 1
+WORST_CASE_TOKEN_CHARS = 2 * 1024 * CONTINUATION_TOKEN_LIMIT_KB
+MAX_RETRY_AFTER_CHARS = 20
+
 _REQUEST_CHARGE_HEADER = "x-ms-request-charge"
 _RETRY_AFTER_HEADER = "x-ms-retry-after-ms"
 _KEY_AUTH_DISABLED_MARKER = "local authorization is disabled"
@@ -140,6 +160,36 @@ def _error(error_code: str, message: str, **extra: Any) -> str:
         {"status": "error", "error_code": error_code, "message": message, **extra},
         ensure_ascii=False,
     )
+
+
+def _too_large() -> str:
+    """The fixed, bounded failure for a response that cannot fit the budget."""
+    return _error(
+        "response_too_large",
+        "The result, with its paging cursor, does not fit the output size limit. "
+        "Select fewer fields, add a filter or a partition_key, or lower "
+        "max_item_count; repeating the same call will not help.",
+    )
+
+
+def _budget() -> int:
+    return max(64, get_tool_max_output_length())
+
+
+def _bounded_output(tool: Callable[..., str]) -> Callable[..., str]:
+    """Last gate of every tool: no string longer than the budget is returned.
+
+    Every return site (success, capped helpers, ``_map_error``) passes here, so
+    an oversized result can only ever become the fixed ``response_too_large``
+    envelope, never JSON cut mid-string by the platform's output filter.
+    """
+
+    @functools.wraps(tool)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        response = tool(*args, **kwargs)
+        return response if len(response) <= _budget() else _too_large()
+
+    return wrapper
 
 
 def _env(name: str) -> str:
@@ -357,7 +407,11 @@ def _map_error(exc: Exception, target: str, not_found: str) -> str:
                 "Cosmos DB throttled the request (429): the container's "
                 "throughput is exhausted. Retry later or lower the page size.",
                 http_status=429,
-                **({"retry_after_ms": retry_after} if retry_after else {}),
+                **(
+                    {"retry_after_ms": str(retry_after)[:MAX_RETRY_AFTER_CHARS]}
+                    if retry_after
+                    else {}
+                ),
             )
         if status == 400:
             details = _query_error_details(exc)
@@ -412,26 +466,40 @@ def _success_with_capped_list(
     The platform's output filter slices an oversized response blindly, which
     would drop the paging fields that follow the list, so the cap covers the
     entire JSON. Halved entries belong to the page already fetched and are not
-    on the next page: their ids are returned (``omitted_ids``) so a caller can
-    still fetch each one, even when one record alone is larger than the limit.
-    The paging fields (``continuation_token``, ``has_more``) always survive,
-    and the token already points past the page, so a retry makes progress.
+    on the next page: their ids are returned (``omitted_ids``, within a quarter
+    of the budget) so a caller can still fetch each one, even when one record
+    alone is larger than the limit. The token already points past the page, so
+    a retry makes progress. When even the empty-items envelope does not fit,
+    the ids and the message are dropped; if it still does not fit,
+    ``_bounded_output`` replaces it with the fixed ``response_too_large``
+    envelope (never an oversized one).
     """
-    max_output_length = max(64, get_tool_max_output_length())
+    budget = _budget()
     items = payload[field]
     rest = {k: v for k, v in payload.items() if k != "truncated"}
     already_truncated = bool(payload.get("truncated"))
+
+    def omitted_ids(omitted: list[Any]) -> list[Any]:
+        ids: list[Any] = []
+        used = 0
+        for item in omitted[:MAX_OMITTED_IDS]:
+            if not (isinstance(item, dict) and "id" in item):
+                continue
+            used += len(json.dumps(item["id"], ensure_ascii=False)) + 2
+            if used > budget // 4:
+                break
+            ids.append(item["id"])
+        return ids
 
     def build(kept: list[Any]) -> str:
         if len(kept) == len(items):
             return _success(**rest, truncated=already_truncated)
         omitted = items[len(kept) :]
-        ids = [i["id"] for i in omitted if isinstance(i, dict) and "id" in i]
         return _success(
             **{**rest, field: kept},
             truncated=True,
             omitted_count=len(omitted),
-            omitted_ids=ids[:MAX_OMITTED_IDS],
+            omitted_ids=omitted_ids(omitted),
             message=hint
             or (
                 f"Returned {len(kept)} of {len(items)} {field}; the rest did not "
@@ -443,16 +511,15 @@ def _success_with_capped_list(
 
     kept = items
     response = build(kept)
-    while len(response) > max_output_length and kept:
+    while len(response) > budget and kept:
         kept = kept[: len(kept) // 2]
         response = build(kept)
-    if len(response) > max_output_length:
-        # Even the envelope plus ids does not fit (a very small configured
-        # limit): keep it valid JSON and say how many were left out.
+    if len(response) > budget:
+        # Only the envelope is left: drop the ids and the message.
         response = _success(
             **{**rest, field: []}, truncated=True, omitted_count=len(items)
         )
-    return response
+    return response  # still over budget only for _bounded_output to replace
 
 
 def _parameters(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -504,6 +571,7 @@ def _bounded(iterable: Iterable[Any]) -> tuple[list[Any], bool]:
 
 
 @mcp.tool(annotations=READ_ONLY)
+@_bounded_output
 def cosmos_list_databases() -> str:
     """
     List the databases of the connected Cosmos DB account (account-wide; the
@@ -535,6 +603,7 @@ def cosmos_list_databases() -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
+@_bounded_output
 def cosmos_list_containers() -> str:
     """
     List the containers of the configured database with their partition key
@@ -580,6 +649,7 @@ def cosmos_list_containers() -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
+@_bounded_output
 def cosmos_query_container(
     container: str,
     query: str,
@@ -655,6 +725,8 @@ def cosmos_query_container(
                 "max_item_count": page_size,
                 "response_hook": record_charge,
                 "timeout": TOTAL_TIMEOUT_SECONDS,
+                # Bound the token we hand back (see the budget note above).
+                "continuation_token_limit": CONTINUATION_TOKEN_LIMIT_KB,
             }
             if partition_key is None:
                 query_kwargs["enable_cross_partition_query"] = True
@@ -698,6 +770,7 @@ def cosmos_query_container(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@_bounded_output
 def cosmos_read_item(
     container: str,
     id: str,

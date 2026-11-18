@@ -529,6 +529,136 @@ def test_read_item_is_capped_as_a_whole(client, monkeypatch):
     assert result["database"] == "appdb" and result["container"] == "c"
 
 
+def test_query_asks_the_service_to_bound_the_continuation_token(client):
+    run("cosmos_query_container", container="c", query="SELECT * FROM c")
+    assert (
+        client.last.query_kwargs["continuation_token_limit"]
+        == cosmos.CONTINUATION_TOKEN_LIMIT_KB
+        == 1
+    )
+
+
+def test_budget_constants_cannot_drift_apart():
+    """A token bounded to the limit, in the worst JSON escaping, plus the
+    worst empty-items envelope must fit the smallest supported budget."""
+    assert (
+        cosmos.WORST_CASE_TOKEN_CHARS == 2 * 1024 * cosmos.CONTINUATION_TOKEN_LIMIT_KB
+    )
+    names = 2 * 2 * cosmos.MAX_NAME_CHARS
+    assert cosmos.WORST_CASE_TOKEN_CHARS + names + 300 < cosmos.MIN_OUTPUT_BUDGET
+    assert len(cosmos._too_large()) < 512
+
+
+def test_long_token_with_a_4k_budget_stays_valid_json_and_keeps_the_cursor(
+    client, monkeypatch
+):
+    """The reviewer's case: a token that nearly fills a 4 KiB budget."""
+    _limit(monkeypatch, 4096)
+    token = '"' * (
+        1024 * cosmos.CONTINUATION_TOKEN_LIMIT_KB
+    )  # the limit; 2x once escaped
+    monkeypatch.setattr(
+        FakeClient,
+        "default_pages",
+        [([{"id": "x" * 1023, "v": "y" * 9000} for _ in range(5)], token)],
+    )
+    raw = cosmos.cosmos_query_container(container="c", query="SELECT * FROM c")
+    assert len(raw) <= 4096
+    result = json.loads(raw)
+    assert result["status"] == "success" and result["continuation_token"] == token
+    assert result["items"] == [] and result["truncated"] is True
+
+
+def test_token_that_cannot_fit_gives_the_bounded_failure(client, monkeypatch):
+    _limit(monkeypatch, 4096)
+    monkeypatch.setattr(
+        FakeClient, "default_pages", [([{"id": "1"}], "t" * 9000)]
+    )  # a service that ignored the limit
+    raw = cosmos.cosmos_query_container(container="c", query="SELECT * FROM c")
+    result = json.loads(raw)
+    assert len(raw) <= 4096
+    assert result["status"] == "error" and result["error_code"] == "response_too_large"
+    assert "t" * 50 not in raw and "repeating the same call will not help" in raw
+
+
+def _worst_case_calls(monkeypatch):
+    """Each tool with the longest names, ids, token and items it can see."""
+    quote_name = '"' * cosmos.MAX_NAME_CHARS
+    monkeypatch.setenv("COSMOS_DATABASE", quote_name)
+    monkeypatch.setattr(
+        FakeClient,
+        "default_pages",
+        [
+            (
+                [{"id": "é" * 500, "v": "z" * 4000} for _ in range(50)],
+                '"' * (1024 * cosmos.CONTINUATION_TOKEN_LIMIT_KB),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        FakeClient,
+        "default_containers",
+        [{"id": '"' * 255, "partitionKey": {"paths": ['"' * 200]}}] * 100,
+    )
+    monkeypatch.setattr(FakeClient, "default_item", {"id": "1", "v": "w" * 50_000})
+    monkeypatch.setattr(
+        FakeClient,
+        "list_databases",
+        lambda self, **kw: iter([{"id": '"' * 255}] * 150),
+    )
+    return {
+        "list_databases": lambda: cosmos.cosmos_list_databases(),
+        "list_containers": lambda: cosmos.cosmos_list_containers(),
+        "query": lambda: cosmos.cosmos_query_container(
+            container=quote_name, query="SELECT * FROM c", max_item_count=100
+        ),
+        "read_item": lambda: cosmos.cosmos_read_item(
+            container=quote_name, id="é" * 511, partition_key="p"
+        ),
+    }
+
+
+@pytest.mark.parametrize("budget", [400, 1000, 4096, 8192, 51200])
+@pytest.mark.parametrize(
+    "tool", ["list_databases", "list_containers", "query", "read_item"]
+)
+def test_no_tool_ever_returns_more_than_the_budget(client, monkeypatch, budget, tool):
+    calls = _worst_case_calls(monkeypatch)
+    _limit(monkeypatch, budget)
+    raw = calls[tool]()
+    assert len(raw) <= budget
+    assert json.loads(raw)["status"] in {"success", "error"}
+
+
+@pytest.mark.parametrize("budget", [400, 4096])
+def test_error_envelopes_stay_within_the_budget_too(client, monkeypatch, budget):
+    long_name = '"' * cosmos.MAX_NAME_CHARS
+    monkeypatch.setenv("COSMOS_DATABASE", long_name)
+    _limit(monkeypatch, budget)
+    exc = _http(400, "Message: " + json.dumps({"errors": [{"message": "m" * 5000}]}))
+    exc.headers = {"x-ms-retry-after-ms": "9" * 5000}  # type: ignore[assignment]
+    monkeypatch.setattr(
+        FakeClient, "get_database_client", lambda self, n: (_ for _ in ()).throw(exc)
+    )
+    for call in (
+        lambda: cosmos.cosmos_list_containers(),
+        lambda: cosmos.cosmos_query_container(container=long_name, query="SELECT 1"),
+        lambda: cosmos.cosmos_read_item(container=long_name, id="1", partition_key="p"),
+    ):
+        raw = call()
+        assert len(raw) <= budget and json.loads(raw)["status"] == "error"
+    for status in (404, 429):
+        monkeypatch.setattr(
+            FakeClient,
+            "get_database_client",
+            lambda self, n, st=status: (_ for _ in ()).throw(
+                _http(st, headers={"x-ms-retry-after-ms": "9" * 5000})
+            ),
+        )
+        raw = cosmos.cosmos_query_container(container=long_name, query="SELECT 1")
+        assert len(raw) <= budget and json.loads(raw)["status"] == "error"
+
+
 @pytest.mark.parametrize(
     "query",
     [

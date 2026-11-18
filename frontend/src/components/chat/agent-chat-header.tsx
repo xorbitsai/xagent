@@ -21,7 +21,7 @@ import { AgentProfileDialog } from "@/components/chat/agent-profile-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useAuth } from "@/contexts/auth-context"
-import { AgentChannelHeaderAction } from "@/lib/agent-channel-extension"
+import { AgentChannelHeaderAction, AgentChannelProfileSection } from "@/lib/agent-channel-extension"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
@@ -95,7 +95,7 @@ function AgentChatHeaderContent({
   const [menuOpen, setMenuOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const [deployOpen, setDeployOpen] = useState(false)
-  const [deployView, setDeployView] = useState<"options" | "channel">("options")
+  const [deployView, setDeployView] = useState<"options" | "channel" | "embed" | "api" | "share">("options")
   const [routinesOpen, setRoutinesOpen] = useState(false)
   // Details that have been fetched or saved under this mounted identity; the
   // initial placeholder is not an agent worth reporting (or offering to extensions).
@@ -180,6 +180,16 @@ function AgentChatHeaderContent({
         >
           <button type="button" onClick={() => { setProfileOpen(false); setRoutinesOpen(true) }} className="flex w-full items-center gap-3 rounded-xl border border-border p-3 text-left hover:bg-muted"><CalendarClock className="h-4 w-4 text-[#2536e0]" /><span className="flex-1"><b className="block text-sm font-semibold">{t("workspace.routines")}</b><small className="text-xs text-muted-foreground">{t("workspace.routinesHint")}</small></span><ArrowLeft className="h-4 w-4 rotate-180 text-muted-foreground" /></button>
           <button type="button" onClick={() => router.push(`/build/${agent.id}`)} className="flex w-full items-center gap-3 rounded-xl border border-border p-3 text-left hover:bg-muted"><Code2 className="h-4 w-4 text-[#2536e0]" /><span className="flex-1"><b className="block text-sm font-semibold">{t("workspace.builderSettings")}</b><small className="text-xs text-muted-foreground">{t("workspace.builderHint")}</small></span><ArrowLeft className="h-4 w-4 rotate-180 text-muted-foreground" /></button>
+          {detailsKnown && (
+            <AgentChannelProfileSection
+              agent={agent}
+              onOpenDeploy={(view) => {
+                setProfileOpen(false)
+                if (view === "webhook") setRoutinesOpen(true)
+                else { setDeployView(view); setDeployOpen(true) }
+              }}
+            />
+          )}
         </AgentProfileDialog>
       )}
 

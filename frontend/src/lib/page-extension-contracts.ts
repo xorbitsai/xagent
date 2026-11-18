@@ -155,6 +155,18 @@ export interface AgentChannelViewProps extends AgentChannelExtensionProps {
 }
 export type AgentChannelViewComponent = ComponentType<AgentChannelViewProps>
 
+// Deploy dialog views a section outside the dialog can open directly.
+// `webhook` has no view of its own: the host opens its routines dialog.
+export type AgentDeployView = "options" | "channel" | "embed" | "api" | "share" | "webhook"
+
+// Section rendered inside the agent profile dialog (the phone-sized entry to
+// deployment options). `onOpenDeploy` closes the profile and opens `view`.
+export interface AgentChannelProfileSectionProps extends AgentChannelExtensionProps {
+  onOpenDeploy: (view: AgentDeployView) => void
+}
+export type AgentChannelProfileSectionComponent =
+  ComponentType<AgentChannelProfileSectionProps>
+
 // ---------------------------------------------------------------------------
 // Connecting an app from chat (`connect_connector` cards)
 //

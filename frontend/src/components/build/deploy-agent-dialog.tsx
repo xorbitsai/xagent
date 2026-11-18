@@ -68,7 +68,7 @@ interface DeployAgentDialogProps {
   onManageTriggers?: () => void
   // "channel" opens the extension channel view (see lib/agent-channel-extension).
   // Read on mount only: an always-mounted caller changing it later has no effect.
-  initialView?: "options" | "channel"
+  initialView?: "options" | "channel" | "embed" | "api" | "share"
 }
 
 export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey, onManageTriggers, initialView = "options" }: DeployAgentDialogProps) {

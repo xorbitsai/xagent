@@ -34,7 +34,9 @@ mcp = FastMCP("xero-mcp")
 # * ``list_overdue_invoices`` reads *every* overdue invoice server-side.
 # * ``list_paid_invoices`` reads *every* paid invoice server-side before
 #   selecting the requested settlement date.  UpdatedDateUTC order is not a
-#   valid boundary for FullyPaidOnDate.
+#   valid boundary for FullyPaidOnDate.  PAID invoices that Xero returns
+#   without FullyPaidOnDate are reported separately instead of failing the
+#   whole scan.
 # * A failed call raises, which FastMCP turns into ``isError``. The upstream
 #   package returned the failure as ordinary text, so it counted as a success.
 # * Authentication failures retain Xero's detail; a 403 also names the OAuth
@@ -60,6 +62,10 @@ OVERDUE_DEFAULT_LIMIT = 50
 OVERDUE_MAX_LIMIT = 200
 PAID_INVOICE_DEFAULT_LIMIT = 100
 PAID_INVOICE_MAX_LIMIT = 200
+# PAID invoices that Xero returns without FullyPaidOnDate cannot be matched to
+# any settlement date. They are counted on every list_paid_invoices response,
+# and up to this many are listed so the model can name them.
+UNDATED_PAID_INVOICE_SAMPLE_LIMIT = 20
 INVOICE_HISTORY_MAX_LIMIT = 200
 OVERDUE_TOP_CONTACTS = 25
 OPEN_INVOICE_EXCLUDES = ["credit_notes", "overpayments", "prepayments"]
@@ -1099,13 +1105,21 @@ def _collect_paid_invoices(
     paid_on: date,
     invoice_type: str,
     contact_ids: list[str] | None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Read the complete paid-invoice ledger and select one settlement date.
 
     Xero orders the generic invoice list by update time, not by
     ``FullyPaidOnDate``.  A page containing another payment date therefore
     cannot be used as an end marker.  Keep paging until Xero's own pagination
     metadata says the PAID list is complete, then filter locally.
+
+    Returns ``(matching, undated)``: invoices fully paid on ``paid_on``, and
+    PAID invoices that Xero returned without ``FullyPaidOnDate``.  Xero only
+    documents the field as "returned on fully paid invoices" and does not say
+    which PAID invoices can lack it (third-party reports point to zero-value
+    or fully discounted invoices).  Such a record cannot be matched to any
+    date, so it is reported to the caller instead of being dropped or failing
+    every date's scan.
     """
     params: dict[str, Any] = {
         "where": f'Type=="{invoice_type}"',
@@ -1117,6 +1131,7 @@ def _collect_paid_invoices(
         params["ContactIDs"] = ",".join(_guid_list(contact_ids, "contactIds"))
 
     found: list[dict[str, Any]] = []
+    undated: list[dict[str, Any]] = []
     seen_invoice_ids: set[str] = set()
     for records in _iter_complete_invoice_pages(
         params,
@@ -1129,14 +1144,7 @@ def _collect_paid_invoices(
             if record.get("Type") != invoice_type or record.get("Status") != "PAID":
                 continue
             fully_paid_on = _xero_date(record.get("FullyPaidOnDate"))
-            if not fully_paid_on:
-                identity = record.get("InvoiceID") or record.get("InvoiceNumber")
-                raise RuntimeError(
-                    "Xero returned PAID invoice "
-                    f"{identity or '<unknown>'} without FullyPaidOnDate; refusing "
-                    "to report a settlement-date list as complete"
-                )
-            if date.fromisoformat(fully_paid_on[:10]) != paid_on:
+            if fully_paid_on and date.fromisoformat(fully_paid_on[:10]) != paid_on:
                 continue
             identity = str(
                 record.get("InvoiceID")
@@ -1146,8 +1154,16 @@ def _collect_paid_invoices(
             if identity in seen_invoice_ids:
                 continue
             seen_invoice_ids.add(identity)
-            found.append(_invoice_view(record))
-    return found
+            (found if fully_paid_on else undated).append(_invoice_view(record))
+    if undated:
+        logger.warning(
+            "Xero paid-invoice scan found %s PAID %s invoice(s) without "
+            "FullyPaidOnDate; reporting them as undated (first invoice_id=%s)",
+            len(undated),
+            invoice_type,
+            undated[0].get("invoice_id"),
+        )
+    return found, undated
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1177,6 +1193,13 @@ def list_paid_invoices(
     contactIds; the tool fails rather than returning partial results if the
     safety limit is reached.
 
+    Xero can leave FullyPaidOnDate empty on some PAID invoices, so they
+    cannot be matched to any date. Every response
+    reports undated_paid_invoice_count; when it is above zero, those invoices
+    are not in invoices or the totals, a sample is in undated_paid_invoices,
+    and the answer should say that they exist instead of claiming the list
+    covers every PAID invoice.
+
     paidOnDate: settlement date in YYYY-MM-DD format.
     contactIds: optionally restrict to these contacts (from list_contacts).
     type: ACCREC for customer invoices (default), ACCPAY for bills you paid.
@@ -1185,10 +1208,14 @@ def list_paid_invoices(
     paid_on = _iso_date(paidOnDate, "paidOnDate")
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), PAID_INVOICE_MAX_LIMIT))
-    paid = _collect_paid_invoices(paid_on, type, contactIds)
-    paid.sort(
-        key=lambda view: (view.get("invoice_number", ""), view.get("invoice_id", ""))
-    )
+    paid, undated = _collect_paid_invoices(paid_on, type, contactIds)
+
+    def invoice_order(view: dict[str, Any]) -> tuple[str, str]:
+        return (view.get("invoice_number", ""), view.get("invoice_id", ""))
+
+    paid.sort(key=invoice_order)
+    undated.sort(key=invoice_order)
+    undated_sample = undated[:UNDATED_PAID_INVOICE_SAMPLE_LIMIT]
 
     totals: dict[str, Decimal] = {}
     for view in paid:
@@ -1211,11 +1238,22 @@ def list_paid_invoices(
             "returned": len(shown),
             "has_more": has_more,
             "invoices": shown,
+            "undated_paid_invoice_count": len(undated),
         }
         if has_more:
             payload["next_skip"] = next_skip
         if truncated:
             payload["truncated"] = True
+        if undated:
+            payload["undated_paid_invoices"] = undated_sample
+            if len(undated) > len(undated_sample):
+                payload["undated_paid_invoices_truncated"] = True
+            payload["undated_note"] = (
+                f"{len(undated)} PAID {type} invoice(s) have no FullyPaidOnDate "
+                "in Xero, so they cannot be matched to any settlement date and "
+                "are not included in invoices or the totals. Use list_payments "
+                "or list_credit_notes to see how they were settled."
+            )
         return payload
 
     return _fit_list(build, window)

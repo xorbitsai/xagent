@@ -491,7 +491,9 @@ class _AskTool:
     """A second, callback-less tool that pauses with an ordinary text field."""
 
     def __init__(self) -> None:
-        self.metadata = SimpleNamespace(name="ask_region", description="Ask.")
+        self.metadata = SimpleNamespace(
+            name="ask_region", description="Ask.", concurrency_safe=True
+        )
 
     def args_type(self) -> type[BaseModel]:
         class Args(BaseModel):
@@ -560,9 +562,6 @@ async def test_batch_resumed_by_the_other_tools_answer(connected: bool) -> None:
             return super().metadata.model_copy(update={"concurrency_safe": True})
 
     ask = _AskTool()
-    ask.metadata = SimpleNamespace(
-        name="ask_region", description="Ask.", concurrency_safe=True
-    )
     tools = [_ParallelSafeConnect(resolver=resolver, user_id=7, task_id="t-1"), ask]
     context = ExecutionContext(execution_id="batch-connect")
     context.add_user_message("Connect Cosmos and pick a region")
@@ -580,6 +579,8 @@ async def test_batch_resumed_by_the_other_tools_answer(connected: bool) -> None:
         "connect_connector",
         "text_input",
     }
+    [connect] = [i for i in waiting["interactions"] if i["type"] == "connect_connector"]
+    assert connect["interaction_id"] == resolver.requests[0].interaction_id
 
     resolver.state = ConnectorConnectionState("connected" if connected else "pending")
     context.add_user_message("eu-west")

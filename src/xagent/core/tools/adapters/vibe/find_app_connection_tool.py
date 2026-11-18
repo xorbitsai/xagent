@@ -8,13 +8,10 @@ deliberately not in ``INTERACTION_TYPES``, which feeds the model-facing
 
 The host must ship a renderer for ``connect_connector``: it draws a card from
 the opaque ``connector`` payload and collects the credential out of band. The
-interaction item carries ``interaction_id`` (also returned at the top level of
-the waiting result): the renderer reads it from the item and passes it to the
-host's save and skip endpoints, so the host does not need to put it into
-``connector``. The
 stock front end does not know the type. Without a renderer the user sees only
 the message text and, because ``live_widget`` suppresses the default text box,
-no field to answer in.
+no field to answer in. The renderer reads the interaction id from the item
+(see :class:`ConnectorResolution`).
 
 The tool is registered only while a resolver is set, is refused for the public
 ``widget`` and ``shared_link`` task sources, and is not offered to delegated

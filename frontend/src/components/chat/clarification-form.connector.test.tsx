@@ -91,21 +91,22 @@ describe("ClarificationForm · connect_connector", () => {
     expect(appContextMock.sendMessage).not.toHaveBeenCalled()
   })
 
-  it("leaves a historical card read-only: no request, no resume turn", async () => {
+  it("shows a historical card as no longer needed: no form, no request, no resume turn", async () => {
     appContextMock.state.currentTask = { status: "running", waitingInteractions: [] }
     render(<ClarificationForm interactions={interactions} requestId="req_old" active={false} />)
-    expect(screen.getByRole("button", { name: "Save securely" })).toBeDisabled()
-    expect(screen.getByRole("button", { name: "Not now" })).toBeDisabled()
-    fireEvent.click(screen.getByRole("button", { name: "Not now" }))
+    expect(screen.getByText("No longer needed")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Save securely" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "Not now" })).toBeNull()
     await act(async () => {})
     expect(api.skipConnector).not.toHaveBeenCalled()
     expect(appContextMock.sendMessage).not.toHaveBeenCalled()
   })
 
-  it("leaves a card read-only when the task waits on a different interaction", () => {
+  it("shows a card as no longer needed when the task waits on a different interaction", () => {
     appContextMock.state.currentTask = waiting([{ ...interactions[0], interaction_id: "other" }])
     render(<ClarificationForm interactions={interactions} requestId="req_1" active />)
-    expect(screen.getByRole("button", { name: "Not now" })).toBeDisabled()
+    expect(screen.getByText("No longer needed")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Not now" })).toBeNull()
   })
 
   it("offers Continue for a settled card only while the task waits on this interaction", async () => {
@@ -176,21 +177,37 @@ describe("ClarificationForm · connect_connector", () => {
       expect(screen.getAllByRole("button", { name: "Save securely" })).toHaveLength(1)
     })
 
-    it("falls back to a plain reply box for an entry the card cannot show, when nothing else is there", () => {
-      const noId: Interaction = { ...interactions[0], interaction_id: undefined }
+    const noId: Interaction = { ...interactions[0], interaction_id: undefined }
+    const credentialsHint = /pasted|key|secret/i
+
+    it("shows a read-only notice, and no input of any kind, for an entry the card cannot show", () => {
       render(<ClarificationForm interactions={[noId]} active />)
       expect(screen.queryByTestId("connector-connect-card")).toBeNull()
-      expect(screen.getByRole("textbox")).toBeInTheDocument()
-      expect(screen.getByRole("button", { name: /submit/i })).toBeInTheDocument()
+      expect(screen.getByText(/can't be connected here/)).toBeInTheDocument()
+      expect(screen.queryByRole("textbox")).toBeNull()
+      expect(screen.queryByRole("button")).toBeNull()
+      expect(screen.queryByText(credentialsHint)).toBeNull()
     })
 
     it.each([
       ["no fields", { ...interactions[0], connector: { ...connectorWithoutId, fields: [] } }],
       ["a payload that is not an object", { ...interactions[0], connector: undefined }],
-    ] as Array<[string, Interaction]>)("falls back for %s, keeping the other entries", (_label, bad) => {
+      ["no interaction id", noId],
+    ] as Array<[string, Interaction]>)("shows the notice for %s beside the other entries, which keep their form", (_label, bad) => {
       render(<ClarificationForm interactions={[bad, question]} active />)
       expect(screen.queryByTestId("connector-connect-card")).toBeNull()
+      expect(screen.getByText(/can't be connected here/)).toBeInTheDocument()
       expect(screen.getByText(/Which region\?/)).toBeInTheDocument()
+      // The only inputs are the sibling's own.
+      expect(screen.queryByRole("textbox")).toBeNull()
+    })
+
+    it("keeps a usable card, shows a notice for the unusable one, and drops neither silently", () => {
+      const batch = [interactions[0], noId]
+      appContextMock.state.currentTask = waiting(batch)
+      render(<ClarificationForm interactions={batch} requestId="req_1" active />)
+      expect(screen.getAllByTestId("connector-connect-card")).toHaveLength(1)
+      expect(screen.getAllByText(/can't be connected here/)).toHaveLength(1)
     })
   })
 })

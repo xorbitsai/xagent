@@ -7,20 +7,17 @@ import { ConnectorLogo, CARD, CARD_W } from "./ConnectorLogo"
 import { ConnectorConnectedBody, LockIcon } from "./ConnectorConnectedBody"
 import type { ConnectorInfo } from "./types"
 
-export type ConnectorCardState = "idle" | "saving" | "testing" | "connected" | "failed" | "skipped" | "unavailable"
-
-/** Mock pacing: "Saving…" for 800 ms, then "Testing…" while the request is still out. */
-export const SAVING_PHASE_MS = 800
+type ConnectorCardState = "idle" | "saving" | "connected" | "failed" | "skipped" | "unavailable" | "stale"
 
 const ROUTE_KEYS = { native: "connector.connect.routeNative", mcp: "connector.connect.routeMcp", api: "connector.connect.routeApi" } as const
 const STATE_KEYS: Record<ConnectorCardState, TranslationKey> = {
   idle: "connector.connect.stateIdle",
   saving: "connector.connect.stateSaving",
-  testing: "connector.connect.stateTesting",
   connected: "connector.connect.stateConnected",
   failed: "connector.connect.stateFailed",
   skipped: "connector.connect.stateSkipped",
   unavailable: "connector.connect.stateUnavailable",
+  stale: "connector.connect.stateStale",
 }
 const ERROR_KEYS: Record<ConnectorErrorCode, TranslationKey> = {
   auth_failed: "connector.connect.errorAuthFailed",
@@ -55,6 +52,10 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
   const [needsContinue, setNeedsContinue] = useState(false)
   const [continuing, setContinuing] = useState(false)
   const [continueError, setContinueError] = useState(false)
+  // Field keys whose value is empty after trimming (a whitespace-only entry passes `required`).
+  const [emptyKeys, setEmptyKeys] = useState<string[]>([])
+  // Set once the user starts a save or skip, so a late restore cannot overwrite it.
+  const actedRef = useRef(false)
   const mountedRef = useRef(true)
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false } }, [])
 
@@ -63,7 +64,7 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
     let cancelled = false
     getConnectorState(connector.interaction_id)
       .then((res) => {
-        if (cancelled) return
+        if (cancelled || actedRef.current) return
         if (res.state === "unavailable") {
           setState("unavailable")
         } else if (res.state === "connected") {
@@ -76,17 +77,21 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
     return () => { cancelled = true }
   }, [connector.interaction_id])
 
-  const busy = state === "saving" || state === "testing" || skipping
+  const busy = state === "saving" || skipping
   const locked = busy || !pending
   const ready = connector.fields.every((f) => (values[f.key] ?? "").trim() !== "")
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault()
-    if (locked || !ready) return
+    if (locked) return
+    if (!ready) {
+      setEmptyKeys(connector.fields.filter((f) => (values[f.key] ?? "").trim() === "").map((f) => f.key))
+      return
+    }
+    actedRef.current = true
     const body = Object.fromEntries(connector.fields.map((f) => [f.key, (values[f.key] ?? "").trim()]))
     setState("saving")
     setFailure(null)
-    const timer = setTimeout(() => { if (mountedRef.current) setState((s) => (s === "saving" ? "testing" : s)) }, SAVING_PHASE_MS)
     try {
       const res = await saveConnector(connector.interaction_id, connector.app_id, body)
       if (!mountedRef.current) return
@@ -105,13 +110,12 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
       if (!mountedRef.current) return
       setFailure({ code: null, field: null })
       setState("failed")
-    } finally {
-      clearTimeout(timer)
     }
   }
 
   const skip = async () => {
     if (locked) return
+    actedRef.current = true
     setSkipError(false)
     setSkipping(true)
     try {
@@ -143,8 +147,7 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
     try {
       const res = await resumeConnector(connector.interaction_id)
       if (!mountedRef.current) return
-      if (res.state === "unavailable") setState("unavailable")
-      else if (res.taskResumed === true) setNeedsContinue(false)
+      if (res.state !== "unavailable" && res.taskResumed === true) setNeedsContinue(false)
       else setContinueError(true)
     } catch {
       if (mountedRef.current) setContinueError(true)
@@ -153,9 +156,14 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
     }
   }
 
+  // An unsettled card the task is no longer waiting on (the batch was resumed by
+  // another reply, or the task moved on) is not needed any more.
+  const shownState: ConnectorCardState = !pending && (state === "idle" || state === "failed") ? "stale" : state
   const errorText = failure ? t(failure.code ? ERROR_KEYS[failure.code] : "connector.connect.errorGeneric") : null
-  const stateColor = state === "connected" ? "text-[#15804A]" : state === "failed" ? "text-[#C0322E]" : "text-[#6E6E7A]"
-  const body = state === "skipped" ? null : state === "unavailable" ? (
+  const stateColor = shownState === "connected" ? "text-[#15804A]" : shownState === "failed" ? "text-[#C0322E]" : "text-[#6E6E7A]"
+  const body = shownState === "skipped" ? null : shownState === "stale" ? (
+    <p className="m-0 text-[12.5px] leading-[1.5] text-[#3D3D46]">{t("connector.connect.stale")}</p>
+  ) : state === "unavailable" ? (
     <p role="status" className="m-0 text-[12.5px] leading-[1.5] text-[#3D3D46]">{t("connector.connect.unavailable")}</p>
   ) : state === "connected" ? (
     <ConnectorConnectedBody
@@ -166,17 +174,22 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
     />
   ) : (
     <>
-      <b className="mb-[6px] block text-[12px] font-[650] text-[#3D3D46]">{t("connector.connect.howTo", { what: connector.key_label })}</b>
-      <ol className="mb-[12px] mt-0 list-decimal pl-[19px] text-[12.5px] leading-[1.5] text-[#3D3D46] [&>li+li]:mt-[3px]">
-        {connector.how.map((step, i) => <li key={i}>{step}</li>)}
-      </ol>
+      {connector.key_label && (
+        <b className="mb-[6px] block text-[12px] font-[650] text-[#3D3D46]">{t("connector.connect.howTo", { what: connector.key_label })}</b>
+      )}
+      {connector.how.length > 0 && (
+        <ol className="mb-[12px] mt-0 list-decimal pl-[19px] text-[12.5px] leading-[1.5] text-[#3D3D46] [&>li+li]:mt-[3px]">
+          {connector.how.map((step, i) => <li key={i}>{step}</li>)}
+        </ol>
+      )}
       <form
         autoComplete="off"
         onSubmit={submit}
         className="grid gap-[10px] rounded-[12px] border border-[#E7E7EC] bg-[#FAFAFA] p-[12px]"
       >
         {connector.fields.map((field) => {
-          const fieldError = fieldKnown && failure?.field === field.key
+          const isEmpty = emptyKeys.includes(field.key)
+          const fieldError = isEmpty || (fieldKnown && failure?.field === field.key)
           return (
             <div key={field.key} className="grid gap-[5px]">
             <label className="grid gap-[5px] text-[12px] font-[550] text-[#3D3D46]">
@@ -194,11 +207,11 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
                 value={values[field.key] ?? ""}
                 aria-invalid={fieldError || undefined}
                 aria-describedby={fieldError ? `${errorId}-${field.key}` : undefined}
-                onChange={(e) => setValues((v) => ({ ...v, [field.key]: e.target.value }))}
+                onChange={(e) => { setValues((v) => ({ ...v, [field.key]: e.target.value })); setEmptyKeys((k) => k.filter((x) => x !== field.key)) }}
                 className={`w-full rounded-[10px] border bg-white px-[11px] py-[9px] text-[14px] text-[#1A1A1F] outline-none placeholder:text-[#6E6E7A] focus:border-[#BFC6FA] focus:shadow-[0_0_0_3px_#EEF1FE] ${fieldError ? "border-[#C0322E]" : "border-[#E7E7EC]"}`}
               />
             </label>
-              {fieldError && errorText && <span id={`${errorId}-${field.key}`} role="alert" className="text-[11.5px] text-[#C0322E]">{errorText}</span>}
+              {fieldError && (isEmpty || errorText) && <span id={`${errorId}-${field.key}`} role="alert" className="text-[11.5px] text-[#C0322E]">{isEmpty ? t("connector.connect.fieldRequired") : errorText}</span>}
             </div>
           )
         })}
@@ -212,7 +225,7 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
             disabled={locked}
             className="inline-flex items-center justify-center gap-[7px] rounded-[10px] bg-[#2536E0] px-[15px] py-[9px] text-[13px] font-[600] text-white disabled:opacity-60"
           >
-            {state === "saving" || state === "testing" ? t("connector.connect.saving") : t("connector.connect.save")}
+            {state === "saving" ? t("connector.connect.saving") : t("connector.connect.save")}
           </button>
           <button type="button" disabled={locked} onClick={skip} className="rounded-[9px] px-[11px] py-[8px] text-[12.5px] text-[#6B6B76] hover:bg-[#F5F5F7]">
             {t("connector.connect.skip")}
@@ -225,7 +238,7 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
   )
 
   return (
-    <div className={`${CARD} ${CARD_W}`} data-testid="connector-connect-card" data-s={state}>
+    <div className={`${CARD} ${CARD_W}`} data-testid="connector-connect-card" data-s={shownState}>
       <div className="flex items-center gap-[11px] px-[15px] py-[13px]">
         <ConnectorLogo logo={connector.logo} />
         <div className="min-w-0 flex-1">
@@ -233,9 +246,9 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
             {connector.name}
             <span className="mt-[2px] block rounded-full bg-[#F5F5F7] px-[7px] py-[2px] text-[12px] font-[700] uppercase leading-[1.4] tracking-[0.05em] text-[#6B6B76]">{t(ROUTE_KEYS[connector.route])}</span>
           </b>
-          <span className="mt-[2px] block text-[12px] leading-[1.4] text-[#6B6B76]">{t("connector.connect.lets", { what: connector.what })}</span>
+          {connector.what && <span className="mt-[2px] block text-[12px] leading-[1.4] text-[#6B6B76]">{t("connector.connect.lets", { what: connector.what })}</span>}
         </div>
-        <span role="status" className={`shrink-0 text-[11.5px] font-[600] ${stateColor}`}>{t(STATE_KEYS[state])}</span>
+        <span role="status" className={`shrink-0 text-[11.5px] font-[600] ${stateColor}`}>{t(STATE_KEYS[shownState])}</span>
       </div>
       {body && <div className="border-t border-[#F0F0F4] px-[15px] pb-[14px] pt-[12px]">{body}</div>}
       {needsContinue && pending && (state === "connected" || state === "skipped") && (

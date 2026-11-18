@@ -182,6 +182,15 @@ describe("ChatMessage Session file capability", () => {
     expect(screen.queryByText(indicator)).toBeNull()
   })
 
+  it.each([
+    ["only connector entries", [{ type: "connect_connector", field: "a", label: "A" }], false],
+    ["a connector entry beside another type", [{ type: "connect_connector", field: "a", label: "A" }, { type: "text_input", field: "b", label: "B" }], true],
+    ["no connector entry", [{ type: "text_input", field: "b", label: "B" }], true],
+  ])("keeps the separator above the form only when something other than cards renders: %s", (_label, interactions, separator) => {
+    const { container } = render(<ChatMessage role="assistant" content="Q" interactions={interactions} />)
+    expect(container.querySelector(".border-t.pt-4") !== null).toBe(separator)
+  })
+
   it("passes the resolved file capability to clarification interactions", () => {
     appContextMock.filesDisabled = true
 

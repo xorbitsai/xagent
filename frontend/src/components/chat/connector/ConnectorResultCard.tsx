@@ -13,7 +13,7 @@ function useWhen(createdAt?: string | null): string {
   return t("connector.result.daysAgo", { count: Math.floor(minutes / 1440) })
 }
 
-/** Source-labelled result card (mock `.xc-res`). The footnote is the last list item. */
+/** Source-labelled result card The footnote is the last list item. */
 export function ConnectorResultCard({ card }: { card: ResultCardData }) {
   const { t } = useI18n()
   const when = useWhen(card.created_at)

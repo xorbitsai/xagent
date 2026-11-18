@@ -158,6 +158,10 @@ export type AgentChannelViewComponent = ComponentType<AgentChannelViewProps>
 // ---------------------------------------------------------------------------
 // Connecting an app from chat (`connect_connector` cards)
 //
+// The `connector` payload of the interaction and the types below are a
+// contract between a host and this frontend; the backend forwards the payload
+// as-is and defines no type for it.
+//
 // The module `lib/connector-connect.ts` is the extension point. It must export
 // the four functions of `ConnectorConnectExtension` as named exports. The OSS
 // default has no host service behind it and answers every call with

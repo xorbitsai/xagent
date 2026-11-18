@@ -4462,10 +4462,10 @@ export function AppProvider({
               return
             }
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
-            // A machine-sent turn (metadata.hidden, e.g. the connector resume)
-            // is in the transcript for the model only; live and on replay it
-            // never becomes a chat message.
-            if (eventData.metadata?.hidden === true) return
+            // A turn the server marks metadata.display "none" (e.g. a host-side
+            // settle message) is in the transcript for the model only; live and
+            // on replay it never becomes a chat message.
+            if (eventData.metadata?.display === "none") return
             const messageContent = eventData.message || eventData.content || ""
             const userMessageId = stableUserMessageId(
               eventData,

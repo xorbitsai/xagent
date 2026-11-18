@@ -17,7 +17,7 @@ const FOUND_KEYS = {
 } as const
 
 /**
- * Probe mini-card (mock `.xc-mini`). Steps through `probe.checks` every 750 ms
+ * Probe mini-card. Steps through `probe.checks` every 750 ms
  * and stops on the found route. With `animate={false}` (a reload, or a card the
  * user already acted on) it renders the final state at once.
  */

@@ -1,7 +1,7 @@
 import React from "react"
 import type { ConnectorLogoData } from "./types"
 
-/** 36px brand tile (mock `.xc-logo`). */
+/** 36px brand tile. */
 export function ConnectorLogo({ logo }: { logo: ConnectorLogoData }) {
   return (
     <span
@@ -22,6 +22,6 @@ export function ConnectorLogo({ logo }: { logo: ConnectorLogoData }) {
 export const CARD_W = "w-[min(520px,100%)]"
 export const CARD_W_MINI = "w-[min(340px,100%)]"
 
-/** Shared card shell classes (mock `.xc`). */
+/** Shared card shell classes. */
 export const CARD =
   "mt-[6px] mb-[10px] overflow-hidden rounded-[16px] border border-[#E7E7EC] bg-white text-left text-[14px] leading-[1.5] text-[#1A1A1F] shadow-[0_1px_2px_rgba(20,22,40,.045)]"

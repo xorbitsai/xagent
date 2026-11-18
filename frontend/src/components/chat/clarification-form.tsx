@@ -16,6 +16,7 @@ import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, 
 import { ConnectAppsField } from "./connect-apps-field"
 import { TeammateSummary } from "./teammate-summary"
 import { ConnectorInteraction } from "./connector/ConnectorInteraction"
+import { ConnectorUnusableNotice } from "./connector/ConnectorUnusableNotice"
 import { parseConnectorInfo, type ConnectorInfo } from "./connector/types"
 import { canDeferClarification, CLARIFICATION_PAGE_SIZE, suggestedClarificationValue } from "./clarification-guidance"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
@@ -77,12 +78,15 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
 export function ClarificationForm(props: ClarificationFormProps) {
   const summaries = props.interactions.filter((interaction) => interaction.type === "teammate_summary")
-  // Each connect_connector entry is its own card, settled independently of the
-  // form; every other entry goes to the normal form, with its own fields,
-  // Submit and text box.
+  // Each connect_connector entry is its own card, with its own settle state;
+  // every other entry goes to the normal form, with its own fields, Submit and
+  // text box. The host continues the whole waiting batch on the first reply it
+  // gets (a settled card or the form's answer), so the other entries may stop
+  // being needed; their cards then say so. A connect_connector entry is never
+  // shown as an input.
   const connectors: ConnectorInfo[] = []
   const fields: Interaction[] = []
-  let unusable: Interaction | undefined
+  let unusable = 0
   for (const interaction of props.interactions) {
     if (interaction.type === "teammate_summary") continue
     if (interaction.type !== "connect_connector") {
@@ -91,12 +95,7 @@ export function ClarificationForm(props: ClarificationFormProps) {
     }
     const connector = parseConnectorInfo(interaction.connector, interaction.interaction_id)
     if (connector) connectors.push(connector)
-    else unusable ??= interaction
-  }
-  // An entry the card cannot show (no id, no fields) falls back to the normal
-  // form: with nothing else to answer, a plain reply box.
-  if (unusable && connectors.length === 0 && fields.length === 0) {
-    fields.push({ type: "text_input", field: unusable.field, label: unusable.label })
+    else unusable += 1
   }
   return (
     <div className="space-y-4">
@@ -104,6 +103,7 @@ export function ClarificationForm(props: ClarificationFormProps) {
       {connectors.map((connector) => (
         <ConnectorInteraction key={connector.interaction_id} connector={connector} active={props.active ?? true} />
       ))}
+      {Array.from({ length: unusable }, (_, index) => <ConnectorUnusableNotice key={`unusable-${index}`} />)}
       {fields.length > 0 && <ClarificationFields {...props} interactions={fields} />}
     </div>
   )

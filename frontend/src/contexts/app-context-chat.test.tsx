@@ -1722,7 +1722,7 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
-  it("never stores a hidden user turn, live or on history replay", () => {
+  it("never stores a user turn the server marks display none, live or on history replay", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     const send = (event_id: string, data: Record<string, unknown>) => act(() => {
       webSocketOptions.current?.onMessage?.({
@@ -1732,11 +1732,11 @@ describe("AppProvider websocket message routing", () => {
     })
     send("u1", { message: "Check the customer data", turn_id: "t1" })
     // Live, then the same turn again as a history replay.
-    const hidden = { message: "[connector settled]", metadata: { hidden: true, kind: "connector_settled", interaction_id: "i-1" } }
+    const hidden = { message: "[connector settled]", metadata: { display: "none", kind: "connector_settled", interaction_id: "i-1" } }
     send("u2", { ...hidden, turn_id: "t2" })
     send("u2", { ...hidden, turn_id: "t2", source: "chat_history" })
-    // hidden only as literal true
-    send("u3", { message: "visible", turn_id: "t3", metadata: { hidden: "true" } })
+    // Only the literal "none" hides; the old hidden flag does not.
+    send("u3", { message: "visible", turn_id: "t3", metadata: { display: "chat", hidden: true } })
     const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
     expect(messages.map((m: { content: string }) => m.content)).toEqual(["Check the customer data", "visible"])
   })

@@ -1,6 +1,6 @@
 import type { ConnectorInfo, ResultCardData } from "./types"
 
-/** Mock data for tests and visual checks; mirrors §I of the connector plan. */
+/** Sample data for tests and visual checks. */
 export const cosmosConnector: ConnectorInfo = {
   interaction_id: "11111111-2222-3333-4444-555555555555",
   app_id: "cosmos",

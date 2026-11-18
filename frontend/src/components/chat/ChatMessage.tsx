@@ -680,7 +680,7 @@ export function ChatMessage({
               )}
               {!isUser && resultCard && <ConnectorResultCard card={resultCard} />}
               {!isUser && interactions && interactions.length > 0 && (
-                <div className={interactions.some((i) => i?.type === "connect_connector") ? "" : "mt-4 border-t pt-4"}>
+                <div className={interactions.every((i) => i?.type === "connect_connector") ? "" : "mt-4 border-t pt-4"}>
                   <ClarificationForm
                     interactions={interactions}
                     requestId={interactionRequestId}

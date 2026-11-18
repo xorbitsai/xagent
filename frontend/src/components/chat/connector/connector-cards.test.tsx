@@ -15,7 +15,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-import { ConnectorConnectCard, SAVING_PHASE_MS } from "./ConnectorConnectCard"
+import { ConnectorConnectCard } from "./ConnectorConnectCard"
 import { ConnectorProbeCard, PROBE_STEP_MS } from "./ConnectorProbeCard"
 import { ConnectorResultCard } from "./ConnectorResultCard"
 
@@ -86,26 +86,61 @@ describe("ConnectorConnectCard", () => {
     expect(screen.getByRole("button", { name: "Save securely" })).toBeEnabled()
   })
 
-  it("is read-only while the task is not waiting on it", async () => {
+  it("shows a short no-longer-needed state, and no form, while the task is not waiting on it", async () => {
     render(<ConnectorConnectCard {...props({ pending: false })} />)
-    expect(screen.getByLabelText("Read-only key")).toBeDisabled()
-    expect(screen.getByRole("button", { name: "Save securely" })).toBeDisabled()
-    expect(screen.getByRole("button", { name: "Not now" })).toBeDisabled()
-    fireEvent.click(screen.getByRole("button", { name: "Not now" }))
+    expect(screen.getByText("No longer needed")).toBeInTheDocument()
+    expect(screen.getByText("This connection is no longer needed.")).toBeInTheDocument()
+    expect(screen.queryByLabelText("Read-only key")).toBeNull()
+    expect(screen.queryByRole("button", { name: "Not now" })).toBeNull()
     await act(async () => {})
     expect(api.skipConnector).not.toHaveBeenCalled()
   })
 
-  it("goes saving → testing → connected and clears the inputs; no Continue when the task was resumed", async () => {
-    vi.useFakeTimers()
+  it("shows a field error, without a request, for a whitespace-only value", async () => {
+    render(<ConnectorConnectCard {...props()} />)
+    fill()
+    fireEvent.change(screen.getByLabelText("Database"), { target: { value: "   " } })
+    fireEvent.click(screen.getByRole("button", { name: "Save securely" }))
+    expect(await screen.findByText("This field is required.")).toBeInTheDocument()
+    expect(screen.getByLabelText("Database")).toHaveAttribute("aria-invalid", "true")
+    expect(api.saveConnector).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText("Database"), { target: { value: "customers" } })
+    expect(screen.queryByText("This field is required.")).toBeNull()
+  })
+
+  it("leaves out the how-to heading, list and \"Lets your team use\" line when their text is empty", () => {
+    render(<ConnectorConnectCard {...props()} connector={{ ...cosmosConnector, key_label: "", how: [], what: "" }} />)
+    expect(screen.queryByText(/How to get/)).toBeNull()
+    expect(screen.queryByRole("list")).toBeNull()
+    expect(screen.queryByText(/Lets your team use/)).toBeNull()
+    expect(screen.getByLabelText("Read-only key")).toBeInTheDocument()
+  })
+
+  it("ignores a late restore once a save has started", async () => {
+    let restore!: (r: ConnectorConnectResult) => void
+    api.getConnectorState.mockReturnValue(new Promise<ConnectorConnectResult>((r) => { restore = r }))
+    let finish!: (r: ConnectorConnectResult) => void
+    api.saveConnector.mockReturnValue(new Promise<ConnectorConnectResult>((r) => { finish = r }))
+    render(<ConnectorConnectCard {...props()} />)
+    fill()
+    fireEvent.click(screen.getByRole("button", { name: "Save securely" }))
+    await act(async () => { restore(result({ state: "unavailable", taskResumed: null })) })
+    expect(screen.getAllByText("Saving…").length).toBeGreaterThan(0)
+    expect(screen.queryByText("Unavailable")).toBeNull()
+    await act(async () => { finish(result({ taskResumed: true })) })
+    await act(async () => { restore(result({ taskResumed: null })) })
+    expect(screen.getByText("Connected")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Continue" })).toBeNull()
+  })
+
+  it("goes saving → connected and clears the inputs; no Continue when the task was resumed", async () => {
     let finish!: (r: ConnectorConnectResult) => void
     api.saveConnector.mockReturnValue(new Promise<ConnectorConnectResult>((r) => { finish = r }))
     render(<ConnectorConnectCard {...props()} />)
     fill()
     fireEvent.click(screen.getByRole("button", { name: "Save securely" }))
     expect(screen.getAllByText("Saving…").length).toBeGreaterThan(0)
-    act(() => { vi.advanceTimersByTime(SAVING_PHASE_MS) })
-    expect(screen.getByText("Testing…")).toBeInTheDocument()
+    expect(screen.queryByText("Testing…")).toBeNull()
     await act(async () => { finish(result({ taskResumed: true })) })
     expect(screen.getByText("Connected")).toBeInTheDocument()
     expect(screen.getByText("•••• •••• fdsf · stored in your vault")).toBeInTheDocument()
@@ -262,6 +297,16 @@ describe("ConnectorConnectCard", () => {
       render(<ConnectorConnectCard {...props({ pending: false })} />)
       await screen.findByText("Connected")
       expect(screen.queryByRole("button", { name: "Continue" })).toBeNull()
+    })
+
+    it("keeps the connected body and shows the continue error when the host is unavailable on resume", async () => {
+      api.getConnectorState.mockResolvedValue(result({ taskResumed: null }))
+      api.resumeConnector.mockResolvedValue(result({ state: "unavailable", taskResumed: null }))
+      render(<ConnectorConnectCard {...props()} />)
+      fireEvent.click(await screen.findByRole("button", { name: "Continue" }))
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't continue the task. Try again.")
+      expect(screen.getByText("Connected")).toBeInTheDocument()
+      expect(screen.queryByText("Connecting apps from chat isn't available here.")).toBeNull()
     })
 
     it("is disabled while a call is in flight, and a failure keeps it available", async () => {

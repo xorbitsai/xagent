@@ -454,11 +454,11 @@ describe("the query string", () => {
 })
 
 describe("the response shape", () => {
-  it("drops a message the server marks as hidden", async () => {
+  it("drops a message the server marks display none", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, {
       messages: [
         { id: 1, role: "user", content: "Check it", created_at: "2026-01-02T03:04:05Z", attachments: [] },
-        { id: 2, role: "user", content: "[connector settled]", created_at: "2026-01-02T03:04:06Z", attachments: [], metadata: { hidden: true } },
+        { id: 2, role: "user", content: "[connector settled]", created_at: "2026-01-02T03:04:06Z", attachments: [], metadata: { display: "none" } },
       ],
       next_cursor: null,
     }))

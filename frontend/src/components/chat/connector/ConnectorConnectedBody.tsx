@@ -14,7 +14,7 @@ export function LockIcon({ size, className }: { size: number; className: string 
   )
 }
 
-/** Connected state of the connect card (mock `connected()`). */
+/** Connected state of the connect card. */
 export function ConnectorConnectedBody({
   secretMasked, agentName, scope, tools,
 }: {

@@ -69,6 +69,7 @@ from ...services.generation import (
 )
 from ...services.llm_utils import AutoModelUnavailableError
 from ...services.managed_task_lease import ManagedTaskLease
+from ...services.release_hold import release_hold
 from ...services.shared_channel_execution import SharedChannelTurn
 from ...services.task_event_bridge import get_task_event_bridge
 from ...services.task_execution_context_service import (
@@ -1350,6 +1351,10 @@ class FeishuBotInstance(BatchChannelControl[str]):
             .build()
         )
 
+        # Connect point: nothing opens once finish-only mode began, whatever
+        # path got here. No await before the connect below.
+        if release_hold.finishing:
+            return
         self.ws_client = lark.ws.Client(
             self.app_id,
             self.app_secret,
@@ -1366,6 +1371,9 @@ class FeishuBotInstance(BatchChannelControl[str]):
         except Exception as e:
             logger.error(f"Feishu bot {self.instance_id} connect failed, err: {e}")
             await self.ws_client._disconnect()
+            # The reconnect is a connect point too.
+            if release_hold.finishing:
+                return
             if self.ws_client._auto_reconnect:
                 await self.ws_client._reconnect()
             else:
@@ -1519,6 +1527,10 @@ class FeishuChannelManager:
     async def _sync_bots_async(self) -> None:
         if not get_channel_ingress_enabled():
             return
+        # Finish-only mode ends chat intake for good (begin_finishing stopped
+        # the channels); a later channel create/update sync must not reopen it.
+        if release_hold.finishing:
+            return
         async with self._sync_lock:
             # Chat intake belongs to the serving generation. An unreadable
             # record counts as not serving, so nothing new opens until serving
@@ -1564,6 +1576,12 @@ class FeishuChannelManager:
     async def _start_bot_for_appid(
         self, app_id: str, app_secret: str, channel_id: int, channel_name: str
     ) -> None:
+        # Re-checked here, with no await before the registration below: a sync
+        # that passed the guard before begin_finishing() and then waited on
+        # configuration I/O must not open intake afterwards. A bot registered
+        # before the fence is in ``self.bots`` and is stopped by it.
+        if release_hold.finishing:
+            return
         if app_id not in self.bots:
             instance_id = app_id[:8] + "..." if len(app_id) > 8 else "unknown"
             bot = FeishuBotInstance(

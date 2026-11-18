@@ -48,6 +48,7 @@ ERROR_ENVELOPE_SERVER_MODULES = frozenset(
     {
         "aws",
         "calendar",
+        "chargebee",
         "chartmogul",
         "deputy",
         "employment_hero",

@@ -13,16 +13,19 @@ import {
   compareAuthSession, compareCredentialSession,
   compareAuthSessionLineage,
   commitAuthSessionRefresh,
+  endExpiredAuthSession,
   getAuthStorageAvailability,
   isSafeAuthExpirySeconds,
   readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
+import { isIdleSessionExpiredResponse } from "@/lib/idle-session"
 
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
 const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
   | { status: "refreshed" | "advanced"; accessToken: string; session: AuthSessionSnapshot }
-  | { status: "rejected"; accessToken: null }
+  /** `session_expired`: the server ended this login for inactivity; it must not be refreshed again. */
+  | { status: "rejected"; accessToken: null; reason?: "session_expired" }
   | { status: "not_current"; accessToken: null }
   | { status: "invalid_response"; accessToken: null }
   | { status: "transport_failed"; accessToken: null }
@@ -37,9 +40,19 @@ function shouldSkipRefresh(url: string): boolean {
     return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => parsed.pathname.endsWith(endpoint))
   } catch { return REFRESH_EXCLUDED_AUTH_ENDPOINTS.some(endpoint => url.includes(endpoint)) }
 }
-async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2): Promise<Response> {
+/** Thrown when `shouldSend` declined an attempt; no further attempt of the request was sent. */
+export class RequestNotSentError extends Error {
+  constructor() {
+    super("The request was no longer wanted and was not sent")
+    this.name = "RequestNotSentError"
+  }
+}
+async function fetchWithRetry(url: string, options: RequestInit, shouldSend?: () => boolean, maxRetries = 2): Promise<Response> {
   let lastError: Error | null = null
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // A retry timer can fire long after it was set (the device slept), so
+    // the caller decides again right before each attempt.
+    if (shouldSend && !shouldSend()) throw new RequestNotSentError()
     try {
       const response = await fetch(url, options)
       if (response.status !== 0 && !response.url.includes("net::ERR_")) return response
@@ -103,6 +116,9 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: before.projection.cache.refreshToken }), signal: controller.signal,
       })
+      if (isIdleSessionExpiredResponse(response)) {
+        return { status: "rejected", accessToken: null, reason: "session_expired" } satisfies AuthRefreshResult
+      }
       if (!response.ok) return response.status === 401 || response.status === 403
         ? { status: "rejected", accessToken: null } satisfies AuthRefreshResult
         : { status: "transport_failed", accessToken: null } satisfies AuthRefreshResult
@@ -148,23 +164,56 @@ export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): 
 function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
+/**
+ * Ends the login the server reported idle-expired and goes to the login page.
+ * `session` is the exact credential set of that login, so a replacement login
+ * is left alone.
+ */
+async function endExpiredLogin(session: AuthSessionSnapshot): Promise<void> {
+  if ((await endExpiredAuthSession(session)).status === "cleared") window.location.href = "/login"
+}
+async function endLoginIfIdleExpired(response: Response, session: AuthSessionSnapshot): Promise<Response> {
+  if (isIdleSessionExpiredResponse(response)) await endExpiredLogin(session)
+  return response
+}
+export interface ApiRequestHooks {
+  /**
+   * Runs immediately before every network attempt of the request: the first
+   * one, each transport retry and the one allowed replay. Returning false
+   * before the first attempt or a retry rejects with RequestNotSentError;
+   * before a replay it returns the original response. The login is kept
+   * either way, unless the server already reported it idle-expired.
+   */
+  shouldSend?: () => boolean
+}
 /** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
 export async function apiRequest(
   url: string,
   options: RequestInit = {},
   capturedSession?: AuthSessionSnapshot,
+  hooks: ApiRequestHooks = {},
 ): Promise<Response> {
   const session = capturedSession ?? readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
-  const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
+  const response = await fetchWithRetry(url, withBearer(options, session.accessToken), hooks.shouldSend)
   if (response.status !== 401 || shouldSkipRefresh(url)) return response
   const afterResponse = compareAuthSession(session)
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {
     const advanced = afterResponse.projection.snapshot
-    if (compareCredentialSession(advanced).status === "exact_credentials") return fetch(url, withBearer(options, advanced.accessToken!))
+    if (compareCredentialSession(advanced).status === "exact_credentials") {
+      // A skipped replay still honours an idle expiry on the original
+      // response: the rotated credentials belong to the same login.
+      if (hooks.shouldSend && !hooks.shouldSend()) return endLoginIfIdleExpired(response, advanced)
+      return endLoginIfIdleExpired(await fetch(url, withBearer(options, advanced.accessToken!)), advanced)
+    }
     return response
   }
   if (afterResponse.status !== "exact" && afterResponse.status !== "profile_advanced") return response
+  if (isIdleSessionExpiredResponse(response)) {
+    // Never refresh or replay: the server ended this login for inactivity.
+    await endExpiredLogin(session)
+    return response
+  }
   const errorType = response.headers.get("Error-Type")
   if (errorType && errorType !== "TokenExpired") {
     if ((await clearAuthSessionIfCurrent(session)).status === "cleared") window.location.href = "/login"
@@ -175,10 +224,16 @@ export async function apiRequest(
     case "refreshed":
     case "advanced":
       if (compareCredentialSession(refreshed.session).status === "exact_credentials") {
-        return fetch(url, withBearer(options, refreshed.accessToken))
+        // An idle-expired original never gets here (handled before the refresh).
+        if (hooks.shouldSend && !hooks.shouldSend()) return response
+        return endLoginIfIdleExpired(await fetch(url, withBearer(options, refreshed.accessToken)), refreshed.session)
       }
       return response
     case "rejected":
+      if (refreshed.reason === "session_expired") {
+        await endExpiredLogin(session)
+        return response
+      }
       if ((await clearAuthSessionIfCurrent(session)).status === "cleared") {
         console.error("Refresh token was rejected, redirecting to login")
         window.location.href = "/login"

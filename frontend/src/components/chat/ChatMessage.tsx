@@ -31,6 +31,8 @@ import {
   type TaskRuntimeMessageMetadataExtensionProps,
 } from "@/lib/task-runtime-ui-extension";
 import { getAgentTaskHref } from "@/lib/agent-ui-access";
+import { PersonaAvatar } from "@/components/templates/persona-avatar";
+import type { AvatarPersona } from "@/lib/page-extension-contracts";
 
 const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
 const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
@@ -119,9 +121,12 @@ export interface ChatMessageProps {
   // use the app's chat socket passes it; the agent builder streams over its
   // own socket and leaves it unset.
   connectionNotice?: ConnectionNotice;
+  // The agent this conversation is with. When set, its avatar stands beside
+  // the status line of a turn that has no answer yet.
+  agent?: AvatarPersona;
 }
 
-function GeneratingIndicator({ latestTitle, taskStatus, connectionNotice }: { latestTitle?: string, taskStatus?: string, connectionNotice: ConnectionNotice }) {
+function GeneratingIndicator({ latestTitle, taskStatus, connectionNotice, agent }: { latestTitle?: string, taskStatus?: string, connectionNotice: ConnectionNotice, agent?: AvatarPersona }) {
   const { t } = useI18n();
 
   // Paused, waiting and completed turns show no activity, so a connection
@@ -135,11 +140,22 @@ function GeneratingIndicator({ latestTitle, taskStatus, connectionNotice }: { la
     : taskStatus === 'waiting_for_user'
       ? t("common.waitingForUser")
     : (latestTitle ? `${latestTitle} ` : t("common.planning"));
+  const isWorking = showsActivity && connectionNotice !== "lost";
 
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
+      {agent && (
+        <PersonaAvatar
+          persona={agent}
+          thinking={isWorking}
+          sizeClassName="h-7 w-7"
+          textClassName="text-[10px]"
+          className="mr-2"
+          decorative
+        />
+      )}
       <span>{displayTitle}</span>
-      {showsActivity && connectionNotice !== "lost" && (
+      {isWorking && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />
@@ -297,7 +313,7 @@ function ExpandableMessage({
       </div>
       {isOverflowing && !isExpanded && (
         <>
-          <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-secondary to-transparent pointer-events-none" />
+          <div className="agent-accent-fade absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-secondary to-transparent pointer-events-none" />
           <div className="absolute bottom-1 left-1/2 -translate-x-1/2">
             <Button
               variant="outline"
@@ -351,6 +367,7 @@ export function ChatMessage({
   taskRuntimeExtensionMetadata,
   failureTaskId,
   connectionNotice = null,
+  agent,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
@@ -589,7 +606,7 @@ export function ChatMessage({
           <div
             className={cn(
               isUser
-                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl"
+                ? "agent-accent-surface max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl"
                 : "bg-transparent p-0 w-full max-w-full"
             )}
           >
@@ -622,7 +639,7 @@ export function ChatMessage({
                 // A past paused/waiting turn has showEmptyStatus=false, but with
                 // the trace hidden its status line is all that marks the turn.
                 !isUser && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
-                  <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} connectionNotice={connectionNotice} />
+                  <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} connectionNotice={connectionNotice} agent={agent} />
                 )
               )}
               {failureReference && (
@@ -639,7 +656,7 @@ export function ChatMessage({
                     <div
                       key={`${badge.kind}:${badge.label}:${badge.detail}`}
                       role="note"
-                      className="inline-flex h-7 min-w-0 items-center gap-1.5 rounded-lg border border-border/80 bg-background/55 px-2 text-xs text-muted-foreground"
+                      className="agent-accent-inset inline-flex h-7 min-w-0 items-center gap-1.5 rounded-lg border border-border/80 bg-background/55 px-2 text-xs text-muted-foreground"
                       aria-label={`${badge.label} · ${badge.detail}`}
                     >
                       <Laptop className="h-3.5 w-3.5 shrink-0" />

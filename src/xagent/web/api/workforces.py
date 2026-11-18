@@ -43,6 +43,13 @@ from ..services.deployments import (
 from ..services.llm_utils import AutoModelUnavailableError
 from ..services.task_agent_execution import load_agent_execution_detail
 from ..services.triggers import unregister_deleted_trigger_bindings
+from ..services.widget_voice_switch import (
+    OwnerCaller,
+    OwnerWidgetVoiceResponse,
+    WidgetVoiceSwitchRequest,
+    get_workforce_voice,
+    put_workforce_voice,
+)
 from ..services.workforce_access import (
     can_create_workforce,
     can_edit_workforce,
@@ -1132,6 +1139,38 @@ async def update_workforce_widget(
         if request.allowed_domains is not None:
             cast(Any, deployment).allowed_domains = list(request.allowed_domains)
     return _serialize_workforce_widget(workforce, deployment)
+
+
+@router.get("/{workforce_id}/widget-voice", response_model=OwnerWidgetVoiceResponse)
+async def get_workforce_widget_voice(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> OwnerWidgetVoiceResponse:
+    """Whether widget voice is on for this workforce, and whether it can work.
+
+    Gated on ``can_edit_workforce``. A workforce without a deployment row has
+    voice off. The voice provider is asked only while the switch is on.
+    """
+    # Plain values first: the request session returns its connection next.
+    caller = OwnerCaller.of(user)
+    return await get_workforce_voice(db, caller, workforce_id)
+
+
+@router.put("/{workforce_id}/widget-voice", response_model=OwnerWidgetVoiceResponse)
+async def put_workforce_widget_voice(
+    workforce_id: int,
+    request: WidgetVoiceSwitchRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> OwnerWidgetVoiceResponse:
+    """Turn widget voice on or off for this workforce's widget.
+
+    The widget must already have a deployment row (it never creates one), and
+    turning voice on needs an active workforce.
+    """
+    caller = OwnerCaller.of(user)
+    return await put_workforce_voice(db, caller, workforce_id, request.enabled)
 
 
 @router.post(

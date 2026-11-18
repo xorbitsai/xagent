@@ -56,9 +56,11 @@ Constraints:
 - One process. Each interpreter has its own hold; a pooled host must collect
   every process's ``execution_status`` and treat a missing report as busy,
   never read one process as the whole pool.
-- Imports only ``xagent.config`` (itself a leaf) besides the stdlib:
-  ``task_execution`` imports this module, so it must stay a leaf to avoid
-  import cycles.
+- Imports only ``xagent.config`` (itself a leaf) at module level:
+  ``task_execution`` imports this module, so it must stay free of top-level
+  imports of the execution modules to avoid import cycles. The finish-only
+  status helpers import the database models, the event bridge and the
+  execution modules lazily inside the function that needs them.
 """
 
 from __future__ import annotations
@@ -156,9 +158,17 @@ class ReleaseHold:
         self._reason: str | None = None
         self._responsibilities: dict[int, Responsibility] = {}
         self._keys = itertools.count()
+        # Admissions ever made (ledger entries and socket writes), never
+        # decremented: a status read compares it across an await to see work
+        # that came and went in between.
+        self._admissions = 0
         # Refusals since the hold last closed, by entry kind; diagnostics only.
         self._refused: Counter[str] = Counter()
         self._sealed = False
+        # One-way for the life of the process: this generation only finishes
+        # what it owns (``begin_finishing``). The hold is closed with it, and
+        # ``reopen`` refuses to lift it.
+        self._finishing = False
         # One-way for the life of the lifespan: set once the host started to
         # retire this process's writers (``app.retire_writers``). Entries that
         # would write while the old process only waits to be replaced refuse
@@ -181,6 +191,11 @@ class ReleaseHold:
     @property
     def sealed(self) -> bool:
         return self._sealed
+
+    @property
+    def finishing(self) -> bool:
+        """Whether this process only finishes the runs it owns (one-way)."""
+        return self._finishing
 
     @property
     def socket_writes_fenced(self) -> bool:
@@ -231,6 +246,7 @@ class ReleaseHold:
         if self._socket_writes_fenced:
             raise WritersRetired()
         key = next(self._keys)
+        self._admissions += 1
         self._socket_writes[key] = interrupt
         return SocketWriteToken(self, key)
 
@@ -269,12 +285,31 @@ class ReleaseHold:
             logger.info("Command attempts sealed (%s)", reason)
         self._sealed = True
 
+    def begin_finishing(self) -> None:
+        """Close the hold for good and restrict claims to owned tasks; idempotent.
+
+        Unlike :meth:`seal` this keeps command attempts flowing: the dispatcher
+        still applies commands of tasks whose lease this process holds (the
+        claim predicate, ``_command_routing_predicate``, reads ``finishing``).
+        The closed hold keeps new execution out (a held lease is released once
+        its run ends, so the next command of the task goes to the serving
+        generation). One-way: :meth:`reopen` does not lift it.
+        """
+        self.close("finishing")
+        if not self._finishing:
+            logger.info("Finish-only mode begins")
+        self._finishing = True
+
     def reopen(self) -> None:
         """Admit new execution again on this same process; idempotent.
 
         Lifts a seal too. ``unsettled_total`` is deliberately kept: reopening
-        proves nothing about work that was left to recovery.
+        proves nothing about work that was left to recovery. A process in
+        finish-only mode stays closed.
         """
+        if self._finishing:
+            logger.warning("Reopen ignored: this process only finishes its runs")
+            return
         if self._closed:
             logger.info(
                 "Execution admission reopened (%s); refused while held: %s",
@@ -287,6 +322,10 @@ class ReleaseHold:
 
     def _register(self, kind: str, identity: str) -> HoldToken:
         key = next(self._keys)
+        if kind not in _LEDGER_KINDS_NOT_COUNTED:
+            # The dispatcher's own polling tokens are not work (and would make
+            # every status read look unstable): the same exclusion as idle's.
+            self._admissions += 1
         self._responsibilities[key] = Responsibility(
             kind=kind, identity=identity, started_at=time.monotonic()
         )
@@ -399,6 +438,194 @@ if get_standby_enabled():
     release_hold.seal("standby")
 
 
+_finishing_counters: dict[str, Callable[[], int]] = {}
+
+
+_RESERVED_FINISHING_KEYS = frozenset(
+    {
+        "active",
+        "owned_runs",
+        "responsibilities",
+        "socket_writes",
+        "prompt_dispatches",
+        "tracked_workers",
+        "pending_replies",
+        "idle",
+    }
+)
+
+
+def register_finishing_counter(name: str, count: Callable[[], int]) -> None:
+    """Add a host-owned count of unfinished work to the finishing status.
+
+    The count appears under ``name`` in the ``finishing`` object and keeps
+    ``idle`` false while it is non-zero. ``count`` runs synchronously on the
+    event loop, inside :func:`finishing_status` and :func:`execution_status`,
+    so it must be fast and do no I/O. It must return a non-negative ``int``;
+    an exception, or any other result (a float, a bool, a negative number),
+    reads as unreadable and so as busy. A name that is one of the built-in
+    keys is refused with ``ValueError``. Registering the same name again
+    replaces the earlier counter. The SaaS layer uses this for its channel
+    turns and schedule runs.
+    """
+    if name in _RESERVED_FINISHING_KEYS:
+        raise ValueError(f"{name!r} is a built-in finishing status key")
+    _finishing_counters[name] = count
+
+
+_LEDGER_KINDS_NOT_COUNTED = frozenset({"command_attempt", "command_dispatch"})
+
+
+def _pending_reply_count() -> int:
+    """Unsettled commands of any kind whose reply is bound to this bridge.
+
+    Replies travel to the ingress process named by ``reply_host_id``; while a
+    command carrying this process's host id is unsettled this process still
+    owes an answer through its bridge, so it cannot stop. Zero without a
+    running bridge. Runs a query: call it off the event loop only, and only
+    in finish-only mode (``finishing_status_async`` returns before it
+    otherwise).
+    """
+    from .task_event_bridge import _bridge
+
+    if _bridge is None:
+        return 0
+    from ..models.database import get_session_local
+    from ..models.task_command import (
+        CLAIMABLE_COMMAND_STATUSES,
+        TaskExecutionCommand,
+    )
+
+    with get_session_local()() as db:
+        return int(
+            db.query(TaskExecutionCommand)
+            .filter(
+                TaskExecutionCommand.reply_host_id == _bridge.host_id,
+                TaskExecutionCommand.status.in_(CLAIMABLE_COMMAND_STATUSES),
+            )
+            .count()
+        )
+
+
+def _loop_owned_status() -> tuple[dict[str, Any], bool, int]:
+    """Counts that live on the event loop; no query and no await.
+
+    Returns ``(fields, readable, total)``. Every work source admitted before
+    the fence counts, each under its own key: task leases and runs, ledger
+    responsibilities (the dispatcher's own ``command_attempt`` and
+    ``command_dispatch`` excluded: it polls twice a second by design and
+    whatever it applies is counted through the lease it uses), socket writes,
+    detached prompt dispatches, tracked writer threads, and the host counters.
+    """
+    from .task_command_transport import prompt_dispatch_count
+    from .task_coordinator_runtime import live_coordinator_count
+    from .task_execution import background_task_manager
+    from .writer_workers import active_workers
+
+    owned_runs = sum(background_task_manager.release_counts().values()) + (
+        live_coordinator_count()
+    )
+    responsibilities = sum(
+        1
+        for item in release_hold._responsibilities.values()
+        if item.kind not in _LEDGER_KINDS_NOT_COUNTED
+    )
+    fields: dict[str, Any] = {
+        "owned_runs": owned_runs,
+        "responsibilities": responsibilities,
+        "socket_writes": release_hold.socket_write_count,
+        "prompt_dispatches": prompt_dispatch_count(),
+        # Threads of ``run_tracked`` and friends, including ones left running
+        # by loops that were cancelled: a started thread can still commit.
+        "tracked_workers": active_workers(),
+    }
+    readable = True
+    total = sum(fields.values())
+    for name, count in list(_finishing_counters.items()):
+        value: int | None
+        try:
+            raw = count()
+            if type(raw) is not int or raw < 0:
+                raise ValueError(f"counter returned {raw!r}, not a count")
+            value = raw
+        except Exception:  # noqa: BLE001
+            logger.warning("Finishing counter %s failed", name, exc_info=True)
+            value = None
+            readable = False
+        fields[name] = value
+        total += value or 0
+    return fields, readable, total
+
+
+def finishing_status() -> dict[str, Any]:
+    """Loop-owned finish-only counts, synchronous and without database access.
+
+    This is what ``execution_status()["finishing"]`` carries. It never reports
+    ``idle``: whether replies are still owed needs a query, so
+    ``pending_replies`` is ``None`` and ``idle`` is ``False`` here. A host that
+    stops the process on idle awaits :func:`finishing_status_async`. Event-loop
+    thread only.
+    """
+    if not release_hold.finishing:
+        # Outside finish-only mode nothing is read: no query, no counting.
+        return {"active": False, "pending_replies": 0, "idle": False}
+    fields, _readable, _total = _loop_owned_status()
+    return {
+        "active": True,
+        **fields,
+        "pending_replies": None,
+        "idle": False,
+    }
+
+
+async def finishing_status_async() -> dict[str, Any]:
+    """``{active, owned_runs, responsibilities, socket_writes, ...}`` with ``idle``.
+
+    ``idle`` is true only when finish-only mode is active and nothing admitted
+    before the fence is still running (see ``_loop_owned_status``), no reply
+    route is pending, and every host counter is zero. A count that cannot be
+    read makes ``idle`` false (reported as ``None``): idle is evidence the host
+    stops this process on, so an unknown is never idle. The loop-owned counts
+    are read on the loop; only the reply probe runs in a worker thread, so a
+    slow or exhausted database pool never stalls the loop.
+    """
+    if not release_hold.finishing:
+        return {"active": False, "pending_replies": 0, "idle": False}
+    from .db_runtime import run_db_io_cancellation_safe
+    from .writer_workers import worker_starts
+
+    fields, readable, total = _loop_owned_status()
+    marker = (release_hold._admissions, worker_starts())
+    try:
+        pending_replies: int | None = await run_db_io_cancellation_safe(
+            _pending_reply_count
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not count pending replies", exc_info=True)
+        pending_replies = None
+        readable = False
+    # The probe awaited. Counts can grow meanwhile: the fence stops new
+    # execution, not socket writes (a steering command still enqueues) or
+    # threads already started. Work that was admitted, committed after the
+    # probe's snapshot and released again inside the window is in neither read,
+    # so the admission and thread-start sequences must not have moved either.
+    fields_after, readable_after, total_after = _loop_owned_status()
+    stable = marker == (release_hold._admissions, worker_starts())
+    return {
+        "active": True,
+        **fields_after,
+        "pending_replies": pending_replies,
+        "idle": bool(
+            readable
+            and readable_after
+            and stable
+            and total == 0
+            and total_after == 0
+            and not pending_replies
+        ),
+    }
+
+
 def execution_status() -> dict[str, Any]:
     """What a host needs to tell whether core execution here has settled.
 
@@ -414,6 +641,10 @@ def execution_status() -> dict[str, Any]:
     ``sealed`` and ``unsettled_total`` (with the bounded ``unsettled`` list)
     are reported beside ``busy`` and never change it; a pooled host blocks on
     ``unsettled_total > 0`` itself.
+
+    ``finishing`` is the finish-only status (:func:`finishing_status`): a
+    constant ``{"active": False, ...}`` outside finish-only mode, and
+    loop-owned counts without ``idle`` inside it; it never changes ``busy``.
     """
     from .task_command_transport import prompt_dispatch_count
     from .task_coordinator_runtime import live_coordinator_count
@@ -432,6 +663,7 @@ def execution_status() -> dict[str, Any]:
         "socket_writes_fenced": release_hold.socket_writes_fenced,
         "socket_writes": release_hold.socket_write_count,
         "hold": ledger,
+        "finishing": finishing_status(),
         "sealed": ledger["sealed"],
         "unsettled_total": ledger["unsettled_total"],
         "unsettled": ledger["unsettled"],

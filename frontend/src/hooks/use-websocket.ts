@@ -10,6 +10,7 @@ import { isCanonicalUuid } from "@/lib/widget-session-upload"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 import { websocketAuthProtocols } from "@/lib/websocket-auth"
+import { AUTH_REVALIDATE_EVENT, IDLE_SESSION_CLOSE_CODE } from "@/lib/idle-session"
 
 interface RecentMessage {
   message: string
@@ -147,6 +148,10 @@ export interface ChatMessageFileIds {
   fileIds?: readonly string[]
   maxFileIds?: number
 }
+
+// The only delivery declaration a chat frame can carry: the message starts a
+// new turn and is never taken as the answer to a pending question.
+export type ChatDelivery = "new_turn"
 
 export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
 
@@ -1273,6 +1278,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
 
         if (disposition === "permanent") {
+          // 4010: the server ended the login while connected. 1008: a
+          // handshake rejected by an endpoint without 4001. Ask the auth
+          // layer to confirm with the server; it never reconnects here.
+          if (
+            owner.connection.credentialOwner.kind === "auth-context"
+            && (event.code === IDLE_SESSION_CLOSE_CODE || event.code === 1008)
+          ) {
+            window.dispatchEvent(new Event(AUTH_REVALIDATE_EVENT))
+          }
           reportPermanentFailure(
             owner,
             new Error(
@@ -1669,6 +1683,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     // The earlier conversation a new one continues from; the same on every
     // attempt of one send.
     sourceTaskId?: number,
+    // Declares the frame a new message that is never taken as the answer to a
+    // pending question. The same on every attempt of one send.
+    chatDelivery?: ChatDelivery,
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
     const owner = socketOwnerRef.current
@@ -1728,6 +1745,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         || sourceTaskId > MAX_SOURCE_TASK_ID
       ) {
         throw deliveryError("Message not sent: the conversation source is not valid.", "not_sent")
+      }
+    }
+    // The server closes the connection on a frame whose delivery declaration
+    // is unknown or arrives together with a request id, and only a taskless
+    // Session connection takes one, so those frames are refused here first.
+    if (chatDelivery !== undefined) {
+      if (connection.chatTaskIdMode !== "omit") {
+        throw deliveryError("A delivery declaration is not supported for this connection.", "not_sent")
+      }
+      if (requestId) {
+        throw deliveryError("A delivery declaration cannot accompany an answer to a request.", "not_sent")
+      }
+      if (chatDelivery !== "new_turn") {
+        throw deliveryError("Message not sent: the delivery declaration is not valid.", "not_sent")
       }
     }
 
@@ -1798,6 +1829,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ...(requestId ? { request_id: requestId } : {}),
         ...(fileIds ? { file_ids: [...fileIds] } : {}),
         ...(sourceTaskId !== undefined ? { source_task_id: sourceTaskId } : {}),
+        ...(chatDelivery ? { delivery: chatDelivery } : {}),
         ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }

@@ -2,6 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import React from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { SESSION_END_NOTICE_TTL_MS, writeSessionEndNotice } from "@/lib/idle-session"
+
 import { LoginPage } from "./login"
 
 const apiRequest = vi.hoisted(() => vi.fn())
@@ -107,6 +109,27 @@ describe("LoginPage auth-session creation", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 503 })))
     render(<LoginPage />)
     expect(await screen.findByRole("button", { name: /login.google.unavailable/ })).toBeDisabled()
+  })
+
+  it("explains that the session ended when the server signed the browser out", async () => {
+    writeSessionEndNotice(localStorage, "session_expired")
+    try {
+      render(<LoginPage />)
+      expect(await screen.findByRole("status")).toHaveTextContent("login.session_expired")
+    } finally {
+      localStorage.clear()
+    }
+  })
+
+  it("does not show an outdated session notice", async () => {
+    writeSessionEndNotice(localStorage, "session_expired", Date.now() - SESSION_END_NOTICE_TTL_MS - 1)
+    try {
+      render(<LoginPage />)
+      await screen.findByRole("button", { name: /login.google/ })
+      expect(screen.queryByRole("status")).toBeNull()
+    } finally {
+      localStorage.clear()
+    }
   })
 
   it("explains why a password change requires signing in again", async () => {

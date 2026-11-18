@@ -514,6 +514,9 @@ def resolve_actor_mcp_stdio_configs(
             },
             "user_id": str(user_id),
         }
+        if "read_only_tools" in launch:
+            # Passed through raw: the loader is the one place it is parsed.
+            config["config"]["read_only_tools"] = launch["read_only_tools"]
         if session_identity is not None:
             session_identities.append((identity.app_id, session_identity))
         configs.append(config)

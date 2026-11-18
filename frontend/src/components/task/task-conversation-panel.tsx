@@ -32,6 +32,8 @@ import {
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
+import { useAgentAccentAttributes } from "@/lib/agent-accent"
+import type { AvatarPersona } from "@/lib/page-extension-contracts"
 import { useVoiceCallView } from "@/contexts/voice-call-store"
 import { VoiceOrb } from "@/components/chat/voice-call-ui"
 
@@ -39,6 +41,10 @@ export type TaskConversationPanelMode = "page" | "embedded-preview"
 
 interface TaskConversationPanelProps {
   voiceConversationEnabled?: boolean
+  // Opens a voice call that runs outside this panel (the composer then works
+  // in its "provided" voice mode). It does not mount the signed-in call that
+  // `voiceConversationEnabled` controls.
+  onProvidedVoiceConversation?: () => void
   mode: TaskConversationPanelMode
   className?: string
   showTaskActions?: boolean
@@ -75,6 +81,10 @@ interface TaskConversationPanelProps {
   // adds or removes one, and once a send has completed.
   onAttachmentFilesChange?: (files: File[]) => void
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
+  // The agent this conversation is with, for a caller that presents it as a
+  // chat with that agent: its avatar stands beside the status line while it
+  // works, and its color (when its avatar has one) tints the conversation.
+  agent?: AvatarPersona
 }
 
 type CombinedItem = {
@@ -302,6 +312,8 @@ export function TaskConversationPanel({
   onAttachmentFilesChange,
   onAgentExecutionClick,
   voiceConversationEnabled = false,
+  onProvidedVoiceConversation,
+  agent,
 }: TaskConversationPanelProps) {
   const {
     state,
@@ -324,7 +336,9 @@ export function TaskConversationPanel({
     isSessionInteractionLocked,
     connectionNotice,
     isConnected,
+    messageQueue,
   } = useApp()
+  const accentAttributes = useAgentAccentAttributes(agent)
   const fileAccess = useFileAccess()
   const { t, locale } = useI18n()
   const [files, setFiles] = useState<File[]>([])
@@ -407,7 +421,18 @@ export function TaskConversationPanel({
 
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
     const outboundFiles = filesBlocked ? [] : (filesToSend || selectedFiles)
-    await (onSend ?? sendMessage)(message, config, outboundFiles)
+    if (messageQueue) {
+      // A message held for the turn in progress carries no files and leaves
+      // the selection alone.
+      const outcome = await messageQueue.submit(
+        message,
+        { hasFiles: outboundFiles.length > 0, clientMessageId: config?.clientMessageId },
+        () => (onSend ?? sendMessage)(message, config, outboundFiles),
+      )
+      if (outcome === "queued") return
+    } else {
+      await (onSend ?? sendMessage)(message, config, outboundFiles)
+    }
     // Only the files this send carried leave the selection: files added while
     // it was in flight, and in session mode files kept hidden while uploads
     // are not offered, stay.
@@ -983,6 +1008,7 @@ export function TaskConversationPanel({
   return (
     <div
       ref={containerRef}
+      {...accentAttributes}
       className={cn(
         "h-full bg-background relative transition-all flex overflow-hidden",
         anyPreviewOpen ? "flex-row items-stretch" : "flex-col",
@@ -1101,6 +1127,7 @@ export function TaskConversationPanel({
                           failureReferenceItemIds.has(item.id) ? state.taskId : undefined
                         }
                         connectionNotice={connectionNotice}
+                        agent={agent}
                       />
                     )
                   })}
@@ -1128,6 +1155,7 @@ export function TaskConversationPanel({
                           : undefined
                       }
                       connectionNotice={connectionNotice}
+                      agent={agent}
                     />
                   )}
                 </>
@@ -1246,7 +1274,9 @@ export function TaskConversationPanel({
               onRetryAttachment={onRetryAttachment}
               attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
-              onVoiceConversation={voiceConversationEnabled && taskControlsEnabled ? () => setVoiceOpen(true) : undefined}
+              onVoiceConversation={onProvidedVoiceConversation
+                ?? (voiceConversationEnabled && taskControlsEnabled ? () => setVoiceOpen(true) : undefined)}
+              voiceConversationSource={onProvidedVoiceConversation ? "provided" : "account"}
               voiceConversationDisabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
               hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}

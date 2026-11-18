@@ -1886,6 +1886,40 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "chargebee",
+            "name": "Chargebee",
+            "description": "Connect a Chargebee site with its site name and an API key to look up customers, subscriptions, invoices and transactions. Read-only.",
+            "icon": "https://www.google.com/s2/favicons?domain=chargebee.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Payments",
+            "oauth_scopes": None,
+            # Hidden until verified against a live Chargebee site -- the tests
+            # stub the HTTP layer -- the rollout freshdesk and jira-ticket
+            # followed. Production rollout and the visibility flip are tracked
+            # in xorbitsai/xagent-saas#2467.
+            "is_visible_in_connector": False,
+            # Key-based (non-oauth), like stripe/freshdesk: the site and API
+            # key are per-user values on the existing encrypted per-user env
+            # path. The site is user-supplied, so the connector accepts only
+            # one label under chargebee.com and resolves it against private
+            # addresses, as the freshdesk row does.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.chargebee"],
+                "required_env": ["CHARGEBEE_SITE", "CHARGEBEE_API_KEY"],
+                # Ownership marker: lets runtime code tell this built-in
+                # server from a custom one that shares its name, and makes the
+                # connect flow refuse such a lookalike instead of attaching a
+                # user's API key to it.
+                "builtin_provenance": {
+                    "registry": "xagent",
+                    "app_id": "chargebee",
+                    "version": 1,
+                },
+            },
+        },
+        {
             "app_id": "freshdesk",
             "name": "Freshdesk",
             "description": "Connect your Freshdesk helpdesk (with your tenant subdomain and a per-user API key from Profile settings -> Your API Key) to look up, create and update tickets, read and post conversations, and search contacts and agents.",

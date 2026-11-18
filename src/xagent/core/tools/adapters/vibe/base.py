@@ -56,8 +56,15 @@ BINDING_AUTHORIZED_CATEGORIES: frozenset[str] = frozenset({ToolCategory.SSH.valu
 # names outside the category match. An explicit NONE (zero-tools) spec still
 # excludes them. Legacy allow-list / per-user override paths do a plain name
 # intersection and are not aware of this set, so they can still drop these.
-INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset(
-    {"get_current_time", "validate_local_time"}
+# Intrinsic tools that exist only while a host has registered the hook behind
+# them (``set_connector_resolver_hook``). They are admitted like the others
+# when present; with no hook the creator builds nothing.
+HOST_REGISTERED_INTRINSIC_TOOL_NAMES: frozenset[str] = frozenset(
+    {"find_app_connection"}
+)
+INTRINSIC_TOOL_NAMES: frozenset[str] = (
+    frozenset({"get_current_time", "validate_local_time"})
+    | HOST_REGISTERED_INTRINSIC_TOOL_NAMES
 )
 
 

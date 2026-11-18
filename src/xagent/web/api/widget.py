@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -14,39 +14,67 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
-from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy.orm import Session
 
+from ...config import (
+    WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING,
+    WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT,
+    get_widget_voice_tts_max_text_chars,
+)
 from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..jwt_codec import JWTError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
-from ..models.database import get_db
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
 from ..models.deployment import DeploymentOwnerType
 from ..models.user import User
 from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateResponse, WidgetTaskCreateRequest
+from ..schemas.speech import ASRStreamStart, TTSStreamRequest
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
 from ..services.share_rate_limit import (
     get_share_rate_limiter,
     remote_ip_from_request,
 )
+from ..services.speech_streams import (
+    GUEST_REFUSAL_MESSAGES,
+    SpeechStreamPlan,
+    guest_refusal,
+    run_asr_stream,
+    tts_stream_response,
+)
 from ..services.widget_domains import (
     origin_to_domain,
     require_domain_allowed,
+)
+from ..services.widget_voice import (
+    resolve_widget_transcription_model,
+    resolve_widget_voice_availability,
+    resolve_widget_voice_models,
 )
 from .auth import create_access_token
 from .public_chat_access import (
     PublicChatAccessContext,
     PublicChatAuthResponse,
+    _accept_public_chat_websocket,
+    _ws_close_reason,
     build_public_chat_dependency,
     create_public_chat_access_token,
     create_public_chat_task,
+    get_public_chat_user,
     public_chat_websocket_endpoint,
     public_websocket_header_token,
     upload_public_chat_files,
     widget_entity_key,
 )
+from .websocket_auth import send_websocket_authentication_infrastructure_failure
 
 widget_router = APIRouter(prefix="/api/widget", tags=["widget"])
 
@@ -504,13 +532,17 @@ async def authenticate_widget(
                 "widget_key": owner.widget_key,
             }
         )
-        return WidgetAuthResponse(
+        response = WidgetAuthResponse(
             access_token=access_token,
             workforce_id=int(workforce.id),
             agent_name=workforce.name,
             agent_description=workforce.description,
             suggested_prompts=[],
         )
+        response.voice_enabled = await _widget_voice_offered(
+            db, int(user.id), agent_id=None, workforce_id=int(workforce.id)
+        )
+        return response
 
     agent = owner.agent
     assert agent is not None
@@ -534,7 +566,7 @@ async def authenticate_widget(
         }
     )
 
-    return WidgetAuthResponse(
+    response = WidgetAuthResponse(
         access_token=access_token,
         agent_id=int(agent.id),
         agent_name=agent.name,
@@ -542,6 +574,10 @@ async def authenticate_widget(
         agent_description=agent.description,
         suggested_prompts=agent.suggested_prompts or [],
     )
+    response.voice_enabled = await _widget_voice_offered(
+        db, int(user.id), agent_id=int(agent.id), workforce_id=None
+    )
+    return response
 
 
 get_current_widget_user_dep = build_public_chat_dependency("widget")
@@ -628,4 +664,277 @@ async def websocket_widget_chat_endpoint(
         task_id=task_id,
         token=public_websocket_header_token(websocket),
         expected_auth_mode="widget",
+    )
+
+
+def _widget_voice_enabled(
+    db: Session, *, agent_id: int | None, workforce_id: int | None
+) -> bool:
+    """Read the voice switch of the widget entity a guest is scoped to.
+
+    A workforce reads its deployment row and an agent its own row; a missing
+    row reads as off.
+    """
+    if workforce_id is not None:
+        deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, workforce_id)
+        return bool(deployment is not None and deployment.widget_voice_enabled)
+    if agent_id is None:
+        return False
+    enabled = db.query(Agent.widget_voice_enabled).filter(Agent.id == agent_id).scalar()
+    return bool(enabled)
+
+
+async def _widget_voice_offered(
+    db: Session, owner_user_id: int, *, agent_id: int | None, workforce_id: int | None
+) -> bool:
+    """Whether a widget guest is told voice is available: the entity's voice
+    switch is on, and only then, the deployment's voice models resolve for
+    the owner. A read failure is raised, never reported as unavailable; the
+    voice routes check the switch and the models again themselves. A provider
+    that does not answer reports voice as unavailable.
+    """
+    if not _widget_voice_enabled(db, agent_id=agent_id, workforce_id=workforce_id):
+        return False
+    availability = await resolve_widget_voice_availability(owner_user_id, request_db=db)
+    return availability.available
+
+
+class WidgetVoiceTTSRequest(BaseModel):
+    """Text a widget guest wants spoken; the model and voice are the server's."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    text: str = Field(
+        min_length=1,
+        description=(
+            "Text to speak. At most XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS "
+            f"characters (default {WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT}, "
+            f"never more than {WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING}); a longer "
+            "text is refused with 422."
+        ),
+    )
+
+    @field_validator("text")
+    @classmethod
+    def _within_limit(cls, text: str) -> str:
+        if len(text) > get_widget_voice_tts_max_text_chars():
+            raise ValueError("Text is too long")
+        return text
+
+
+# The body is parsed by the handler, after the guest credential is checked, so
+# the framework cannot infer it; declare it for the API document.
+_WIDGET_VOICE_TTS_BODY = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {"schema": WidgetVoiceTTSRequest.model_json_schema()}
+        },
+    }
+}
+
+
+@widget_router.post(
+    "/voice/tts",
+    response_class=StreamingResponse,
+    openapi_extra=_WIDGET_VOICE_TTS_BODY,
+)
+async def widget_voice_tts(
+    request: Request,
+    widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Speak text for a widget guest with the deployment's synthesis model.
+
+    The guest credential is checked first (the dependency's own responses).
+    Every later refusal is a fixed ``{"detail": {"code", "message"}}`` body:
+    invalid body 422, voice switch off 403, rate limited 429, voice
+    unavailable 503, then the synthesis runner's refusals. The owner pays.
+    """
+    owner_user_id = int(widget_info.user.id)
+    entity_key = widget_entity_key(widget_info)
+    # The credential check ran on this session; do not hold its connection
+    # while the client uploads the body. The switch read re-acquires one.
+    release_db_connection_if_clean(db)
+    try:
+        body = WidgetVoiceTTSRequest.model_validate_json(await request.body())
+    except ValidationError:
+        raise guest_refusal(422, "invalid_request") from None
+    enabled = _widget_voice_enabled(
+        db,
+        agent_id=widget_info.widget_agent_id,
+        workforce_id=widget_info.widget_workforce_id,
+    )
+    # No database session is held across the model lookup or the stream.
+    release_db_connection_if_clean(db)
+    if not enabled or entity_key is None:
+        raise guest_refusal(403, "voice_disabled")
+    visitor_key = remote_ip_from_request(request)
+    if not get_share_rate_limiter().allow_widget_voice_tts(entity_key, visitor_key):
+        raise guest_refusal(429, "rate_limited")
+    if visitor_key is None:
+        raise guest_refusal(503, "voice_unavailable")
+    models = await resolve_widget_voice_models(owner_user_id, request_db=db)
+    if models is None:
+        raise guest_refusal(503, "voice_unavailable")
+    return await tts_stream_response(
+        plan=SpeechStreamPlan(
+            user_id=owner_user_id,
+            config=models.tts,
+            options=TTSStreamRequest(
+                model_id=str(models.tts.model_id),
+                text=body.text,
+                voice=models.voice,
+                format="pcm",
+                sample_rate=24000,
+            ),
+            usage_source="speech_synthesize",
+            audience="guest",
+            entity_key=entity_key,
+            visitor_key=visitor_key,
+        )
+    )
+
+
+# How often a live widget voice transcription session re-reads its access.
+_WIDGET_VOICE_RECHECK_SECONDS = 30.0
+# The close code for a guest whose credential, widget, or voice switch is gone.
+_WIDGET_VOICE_DENIED = 4003
+
+
+class WidgetVoiceASRStart(BaseModel):
+    """The first frame of a widget guest transcription session.
+
+    Only the audio encoding is the guest's; the model and the stream options
+    are the server's, so any other field is refused.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["start"]
+    format: Literal["pcm", "ulaw"] = "pcm"
+    sample_rate: Literal[8000, 16000, 22050, 24000, 44100, 48000] = 16000
+
+
+@dataclass(frozen=True)
+class _WidgetVoiceAccess:
+    """What a widget voice session needs from the guest credential, read
+    before its database session is closed."""
+
+    owner_user_id: int
+    entity_key: str | None
+    voice_enabled: bool
+
+
+def _widget_voice_access_sync(token: str) -> _WidgetVoiceAccess:
+    """Verify a widget guest credential and read its voice switch in a short,
+    worker-owned session. Raises ``HTTPException`` for a credential that is
+    not (or no longer) a live widget guest; other errors are failures to read.
+    """
+    with get_session_local()() as db:
+        context = get_public_chat_user(token, db, expected_auth_mode="widget")
+        return _WidgetVoiceAccess(
+            owner_user_id=int(context.user.id),
+            entity_key=widget_entity_key(context),
+            voice_enabled=_widget_voice_enabled(
+                db,
+                agent_id=context.widget_agent_id,
+                workforce_id=context.widget_workforce_id,
+            ),
+        )
+
+
+@widget_router.websocket("/voice/asr")
+async def widget_voice_asr(websocket: WebSocket) -> None:
+    """Transcribe a widget guest's speech with the deployment's model.
+
+    In order: a per-IP connection gate before the handshake is accepted
+    (4008), the guest credential and live widget (4003 with the credential
+    check's reason), the voice switch (4003), and a per-entity connection
+    gate (1008). The transcription runner then serves a guest session billed
+    to the owner, rechecking the credential, widget, and switch every
+    ``_WIDGET_VOICE_RECHECK_SECONDS`` (4003 when any is gone). A database
+    failure while reading the credential check closes with 1011. No database
+    connection is held while the session runs.
+
+    The first frame is a JSON text frame of at most 4096 bytes:
+    ``{"type": "start"}`` with an optional ``format`` (``pcm`` or ``ulaw``) and
+    an optional ``sample_rate`` (8000, 16000, 22050, 24000, 44100, or 48000);
+    any other field or value is refused with ``invalid_request``. These limits
+    are checked when the frame arrives; a WebSocket route has no OpenAPI
+    entry, so this is where they are written down.
+    """
+    remote_ip = remote_ip_from_request(websocket)
+    if not get_share_rate_limiter().allow_widget_voice_connect_ip(remote_ip):
+        await websocket.close(code=4008, reason="Too many connection attempts")
+        return
+    token = await _accept_public_chat_websocket(
+        websocket, public_websocket_header_token(websocket)
+    )
+    if token is None:
+        return
+    try:
+        access = await run_db_io_cancellation_safe(
+            lambda: _widget_voice_access_sync(token)
+        )
+    except HTTPException as exc:
+        await websocket.close(
+            code=_WIDGET_VOICE_DENIED, reason=_ws_close_reason(exc.detail)
+        )
+        return
+    except Exception as exc:
+        await send_websocket_authentication_infrastructure_failure(websocket, exc)
+        return
+    entity_key = access.entity_key
+    if not access.voice_enabled or entity_key is None:
+        await websocket.close(
+            code=_WIDGET_VOICE_DENIED, reason=GUEST_REFUSAL_MESSAGES["voice_disabled"]
+        )
+        return
+    if not get_share_rate_limiter().allow_widget_voice_connect_entity(entity_key):
+        await websocket.close(code=1008, reason=GUEST_REFUSAL_MESSAGES["rate_limited"])
+        return
+    owner_user_id = access.owner_user_id
+
+    async def prepare(text: str) -> SpeechStreamPlan[ASRStreamStart]:
+        start = WidgetVoiceASRStart.model_validate_json(text)
+        if remote_ip is None:
+            raise guest_refusal(503, "voice_unavailable")
+        # A WebSocket route has no request session to hand over.
+        model = await resolve_widget_transcription_model(owner_user_id, request_db=None)
+        if model is None:
+            raise guest_refusal(503, "voice_unavailable")
+        return SpeechStreamPlan(
+            user_id=owner_user_id,
+            config=model.asr,
+            options=ASRStreamStart(
+                type="start",
+                model_id=str(model.asr.model_id),
+                format=start.format,
+                sample_rate=start.sample_rate,
+                vad=True,
+                vad_silence_threshold_secs=model.vad_silence_threshold_secs,
+            ),
+            usage_source="speech_transcribe",
+            audience="guest",
+            entity_key=entity_key,
+            visitor_key=remote_ip,
+        )
+
+    def still_allowed() -> int | None:
+        try:
+            current = _widget_voice_access_sync(token)
+        except HTTPException:
+            return _WIDGET_VOICE_DENIED
+        return None if current.voice_enabled else _WIDGET_VOICE_DENIED
+
+    async def revalidate() -> int | None:
+        return await run_db_io_cancellation_safe(still_allowed)
+
+    await run_asr_stream(
+        websocket,
+        prepare=prepare,
+        audience="guest",
+        revalidate=revalidate,
+        recheck_seconds=_WIDGET_VOICE_RECHECK_SECONDS,
     )

@@ -44,6 +44,13 @@ class FakeSse(FakeSocket):
     is_broadcast_only = True
 
 
+@pytest.fixture(autouse=True)
+def _no_close_window(monkeypatch):
+    # These tests pin the close protocol, not the spread; see
+    # test_websocket_restart_close_window.py for the stagger.
+    monkeypatch.setenv("XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS", "0")
+
+
 @pytest.fixture
 def manager():
     mgr = ConnectionManager()

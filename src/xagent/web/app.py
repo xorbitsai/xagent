@@ -73,6 +73,7 @@ from .api.admin_memory_embedding_authority import (
     router as admin_memory_embedding_authority_router,
 )
 from .api.admin_users import router as admin_users_router
+from .api.admin_widget_voice import router as admin_widget_voice_router
 from .api.agent_api_keys import router as agent_api_keys_router
 from .api.agents import router as agents_router
 from .api.auth import auth_router
@@ -282,6 +283,10 @@ _file_storage_startup_sync_task: asyncio.Task[Any] | None = None
 _trigger_dispatcher_task: asyncio.Task[Any] | None = None
 _task_command_dispatcher_task: asyncio.Task[Any] | None = None
 _sandbox_idle_sweep_task: asyncio.Task[None] | None = None
+_sandbox_warmup_task: asyncio.Task[None] | None = None
+_sandbox_deferred_stops_task: asyncio.Task[None] | None = None
+SANDBOX_DEFERRED_STOPS_TASK_NAME = "sandbox-deferred-stops"
+SANDBOX_WARMUP_TASK_NAME = "sandbox-warmup"
 
 FILE_STORAGE_STARTUP_SYNC_EXEMPT_PATHS = frozenset({"/health", "/ready"})
 FILE_STORAGE_STARTUP_SYNC_RETRY_INTERVAL_SECONDS = 5.0
@@ -1320,6 +1325,49 @@ def start_retention_purge_task(
     return task
 
 
+def start_browser_session_sweep_task(app_instance: FastAPI) -> asyncio.Task[Any] | None:
+    """Renew the enforcement lease and sweep browser logins.
+
+    Runs on every replica. While the idle policy is enabled it renews this
+    replica's enforcement lease and records current admins' roles every few
+    seconds (so a switch-off or demotion cannot revive expired logins) and
+    revokes idle-expired logins every minute; old rows are pruned either way.
+    Each step is an idempotent conditional write.
+    """
+    from .browser_idle import run_browser_session_sweep_loop
+    from .models.database import get_session_local
+
+    existing = getattr(app_instance.state, "browser_session_sweep_task", None)
+    if existing is not None and not existing.done():
+        return cast(asyncio.Task[Any], existing)
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return None
+    stop_event = asyncio.Event()
+    app_instance.state.browser_session_sweep_stop = stop_event
+    task = asyncio.create_task(
+        run_browser_session_sweep_loop(get_session_local(), stop_event=stop_event)
+    )
+    app_instance.state.browser_session_sweep_task = task
+    return task
+
+
+async def stop_browser_session_sweep_task(app_instance: FastAPI) -> None:
+    stop_event = getattr(app_instance.state, "browser_session_sweep_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    task = getattr(app_instance.state, "browser_session_sweep_task", None)
+    app_instance.state.browser_session_sweep_stop = None
+    app_instance.state.browser_session_sweep_task = None
+    if task is None:
+        return
+    try:
+        await asyncio.wait_for(task, timeout=10)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        task.cancel()
+    except Exception as exc:
+        logger.error("Browser session sweep stopped after failure", exc_info=exc)
+
+
 async def stop_retention_purge_task(app_instance: FastAPI) -> None:
     """Ask the retention purge loop to stop, give it a moment, then cancel it.
 
@@ -2060,6 +2108,7 @@ app.include_router(admin_interaction_rollout_router)
 app.include_router(admin_execution_events_router)
 app.include_router(execution_budget_router)
 app.include_router(admin_memory_embedding_authority_router)
+app.include_router(admin_widget_voice_router)
 app.include_router(admin_mcp_router)
 app.include_router(skills_router)
 app.include_router(skill_hub_router)
@@ -2257,6 +2306,7 @@ async def _start_local_runtime_loops(app_instance: FastAPI) -> None:
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
     start_retention_purge_task(app_instance)
+    start_browser_session_sweep_task(app_instance)
     start_task_cleanup_retry_task(app_instance)
 
 
@@ -2705,15 +2755,60 @@ async def _admit_memory_and_lancedb() -> None:
         logger.info("Started background uploaded files reconcile task")
 
 
+async def _run_sandbox_warmup(sandbox_mgr: Any) -> None:
+    with _startup_phase("sandbox warmup (background)"):
+        try:
+            await sandbox_mgr.warmup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Sandbox warmup failed")
+
+
+async def _run_deferred_sandbox_stops(sandbox_mgr: Any) -> None:
+    try:
+        await sandbox_mgr.drain_deferred_stops()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Deferred sandbox stops failed")
+
+
 async def _start_sandbox_runtime(sandbox_mgr: Any) -> None:
     # cleanup() quiesce can be awaited inline for minutes with no logs.
     # Time each sub-phase so the next slow start names the exact one; the
     # quiesce summary breaks it down further.
+    from ..config import get_sandbox_startup_cleanup_timeout_seconds
+    from .sandbox_manager import bounded_quiesce
+
+    # Thirteen processes share one Docker daemon during a release, so the
+    # quiesce gets a budget after which it issues no further stops. It is a
+    # limit on scheduling more cleanup, never a cancel: abandoning an issued
+    # stop would release its same-name lock while the daemon call still runs.
+    # A container left running keeps the previous generation's exec
+    # processes, so the deferred names are stopped by a background task after
+    # activation (and by the first reconcile that would reuse one, whichever
+    # comes first). The legacy cleanup, for backends that do not reconcile,
+    # ignores the budget and must finish (or fail activation at the step
+    # bound).
     with _startup_phase("sandbox cleanup"):
-        await sandbox_mgr.cleanup()
-    with _startup_phase("sandbox warmup"):
-        await sandbox_mgr.warmup()
-    logger.info("Sandbox manager initialized and warmed up")
+        with bounded_quiesce(get_sandbox_startup_cleanup_timeout_seconds()):
+            await sandbox_mgr.cleanup()
+
+    global _sandbox_deferred_stops_task
+    deferred = getattr(sandbox_mgr, "_deferred_stops", None)
+    if isinstance(deferred, set) and deferred:
+        _sandbox_deferred_stops_task = asyncio.create_task(
+            _run_deferred_sandbox_stops(sandbox_mgr)
+        )
+        _sandbox_deferred_stops_task.set_name(SANDBOX_DEFERRED_STOPS_TASK_NAME)
+
+    # The image warmup only pre-pulls and pre-creates; nothing waits on it, so it
+    # runs after admission opens instead of inside the activation budget.
+    global _sandbox_warmup_task
+    _sandbox_warmup_task = asyncio.create_task(_run_sandbox_warmup(sandbox_mgr))
+    _sandbox_warmup_task.set_name(SANDBOX_WARMUP_TASK_NAME)
+    logger.info("Sandbox manager initialized; warmup started in the background")
 
     from ..config import get_sandbox_idle_ttl
 
@@ -2842,11 +2937,13 @@ async def _start_late_tasks() -> None:
     start_composio_missing_account_task(app)
 
 
-async def _stop_runtime_loops() -> None:
+async def _stop_runtime_loops(*, keep_command_dispatcher: bool = False) -> None:
     """Stop the background loops and dispatchers startup (or activation) started.
 
     Shared by shutdown and by a failed standby activation, which must not leave
-    the claim paths it already started running.
+    the claim paths it already started running. Finish-only mode keeps the
+    command dispatcher (``keep_command_dispatcher``): it applies the commands of
+    tasks this process still owns.
     """
     global \
         _file_storage_startup_sync_task, \
@@ -2854,7 +2951,9 @@ async def _stop_runtime_loops() -> None:
         _uploaded_file_reconcile_task, \
         _task_command_dispatcher_task, \
         _trigger_dispatcher_task, \
-        _sandbox_idle_sweep_task
+        _sandbox_idle_sweep_task, \
+        _sandbox_warmup_task, \
+        _sandbox_deferred_stops_task
 
     # The temp-file walk runs in a thread a task cancel cannot stop; its stop
     # event is what ends it (see ``start_temp_file_cleanup_task``).
@@ -2862,16 +2961,17 @@ async def _stop_runtime_loops() -> None:
     if temp_file_cleanup_stop is not None:
         temp_file_cleanup_stop.set()
 
-    if _task_command_dispatcher_task is not None:
+    if _task_command_dispatcher_task is not None and not keep_command_dispatcher:
         from .services.task_command_transport import stop_task_command_dispatcher
 
         await stop_task_command_dispatcher()
-    _task_command_dispatcher_task = None
+        _task_command_dispatcher_task = None
 
     await stop_orphan_upload_gc_task(app)
     await stop_composio_reconcile_task(app)
     await stop_composio_missing_account_task(app)
     await stop_retention_purge_task(app)
+    await stop_browser_session_sweep_task(app)
     await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
     await stop_task_auto_resume_task(app)
@@ -2883,6 +2983,21 @@ async def _stop_runtime_loops() -> None:
         with suppress(asyncio.CancelledError):
             await _sandbox_idle_sweep_task
     _sandbox_idle_sweep_task = None
+
+    if (
+        _sandbox_deferred_stops_task is not None
+        and not _sandbox_deferred_stops_task.done()
+    ):
+        _sandbox_deferred_stops_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sandbox_deferred_stops_task
+    _sandbox_deferred_stops_task = None
+
+    if _sandbox_warmup_task is not None and not _sandbox_warmup_task.done():
+        _sandbox_warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _sandbox_warmup_task
+    _sandbox_warmup_task = None
 
     preflight_task = getattr(app.state, "file_storage_preflight_task", None)
     if preflight_task is not None and not preflight_task.done():
@@ -3014,9 +3129,13 @@ async def startup_event() -> None:
     from ..config import (
         get_standby_enabled,
         get_task_execution_role,
+        validate_activation_timeouts,
         validate_task_execution_host_config,
     )
 
+    # Strict getters read again at activation: a malformed value must stop the
+    # boot here, not fail every activation after the old generation retired.
+    validate_activation_timeouts()
     if get_standby_enabled():
         standby.begin()
         standby.on_failure(_abort_standby_activation)
@@ -3260,6 +3379,58 @@ async def retire_writers(
             raise RuntimeError("socket writes did not settle")
         _writers_retired = True
         return True
+
+
+_begin_finishing_lock: asyncio.Lock | None = None
+
+
+async def begin_finishing() -> None:
+    """Let this process only finish the runs it owns; one-way and idempotent.
+
+    Used while two backend generations overlap during a release: the serving
+    generation takes all new work, this one finishes what it started.
+
+    **Stopped:** every claim path for new work -- trigger dispatcher, auto-resume
+    sweeper, lease recovery, chat channels, the maintenance loops and the other
+    loops ``_stop_runtime_loops`` stops -- and every new execution (the release
+    hold is closed for good; ``release_hold.begin_finishing``).
+
+    **Kept:** running executions and their lease heartbeats, the event bridge,
+    socket writes, and the command dispatcher, which claims only commands of
+    tasks whose lease this process holds (controls included, see
+    ``_command_routing_predicate``). A lease is released normally once its run
+    ends, so the next command of that task is claimed by the serving generation.
+
+    Requires shared task execution and an activated process (not a standby);
+    otherwise it raises before changing anything.
+    ``finishing_status_async()`` reports when this process is idle. Unlike
+    ``retire_writers`` nothing waits for runs to end. Safe next to it and to
+    shutdown: every step is idempotent. A step that raises leaves the process
+    finishing (the claim restriction is already up); calling again continues.
+    """
+    if not get_shared_task_execution_enabled():
+        # Finish-only mode relies on shared execution: runs are durable and
+        # owned by a lease, so stopping chat intake cannot cancel one. Without
+        # it a channel turn runs inside the channel's own task, which the
+        # channel stop cancels. Refused before anything is changed.
+        raise RuntimeError(
+            "begin_finishing requires shared task execution "
+            "(XAGENT_SHARED_TASK_EXECUTION_ENABLED)"
+        )
+    if standby.standby:
+        # A standby has not activated: activation would reopen admission (which
+        # finish-only mode ignores) but still start the loops that have no
+        # ``release_hold`` gate (lease recovery, auto-resume, the trigger
+        # dispatcher). Refused before anything is changed.
+        raise RuntimeError("begin_finishing is refused on a standby process")
+    global _begin_finishing_lock
+    if _begin_finishing_lock is None:
+        _begin_finishing_lock = asyncio.Lock()
+    async with _begin_finishing_lock:
+        # Fence first: from here on no claim takes a task this process does not own.
+        release_hold.begin_finishing()
+        await _stop_runtime_loops(keep_command_dispatcher=True)
+        await _stop_chat_channels(raise_errors=True)
 
 
 def writers_retired() -> bool:

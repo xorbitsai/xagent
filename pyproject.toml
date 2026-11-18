@@ -119,7 +119,7 @@ command-path-guard = ["bashlex>=0.18"]
 # does not declare its bundled predictor runtime deps, so keep them explicit
 # here until upstream does.
 router = [
-  "xrouter-llm>=0.3.6",
+  "xrouter-llm>=0.3.7",
   "sentence-transformers>=3.0.0",
   # xrouter-llm's embedding model is a Qwen3-architecture checkpoint; transformers
   # only registered the `qwen3` model type in 4.51.
@@ -188,7 +188,7 @@ all = [
   "pymilvus>=2.6.9,<3.0.0",
   "openshell>=0.1.7,<0.2",
   "protobuf>=6.31,<7",
-  "xrouter-llm>=0.3.6",
+  "xrouter-llm>=0.3.7",
   "sentence-transformers>=3.0.0",
 ]
 
@@ -227,7 +227,7 @@ backend-image = [
   "pymilvus>=2.6.9,<3.0.0",
   "torch",
   "torchvision",
-  "xrouter-llm>=0.3.6",
+  "xrouter-llm>=0.3.7",
   "sentence-transformers>=3.0.0",
 ]
 

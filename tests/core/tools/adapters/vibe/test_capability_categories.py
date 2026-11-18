@@ -2,7 +2,11 @@
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.base import INTRINSIC_TOOL_NAMES, ToolCategory
+from xagent.core.tools.adapters.vibe.base import (
+    HOST_REGISTERED_INTRINSIC_TOOL_NAMES,
+    INTRINSIC_TOOL_NAMES,
+    ToolCategory,
+)
 from xagent.core.tools.adapters.vibe.categories import (
     category_catalog,
     configurable_tool_category,
@@ -44,7 +48,12 @@ async def test_actual_factory_capability_membership(
     config._tool_selection_spec = ToolSelectionSpec.from_raw(tool_categories=selection)
     tools = await ToolFactory.create_all_tools(config)
     names = {tool.name for tool in tools}
-    intrinsic = set(INTRINSIC_TOOL_NAMES) if selection else set()
+    # No host hook is registered here, so host-registered tools are absent.
+    intrinsic = (
+        set(INTRINSIC_TOOL_NAMES - HOST_REGISTERED_INTRINSIC_TOOL_NAMES)
+        if selection
+        else set()
+    )
     assert names == expected | intrinsic
     assert "calculator" not in names
 

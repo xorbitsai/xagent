@@ -126,6 +126,7 @@ from xagent.config import (
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
     WEB_SEARCH_PROVIDERS,
+    XROUTER_CALL_HISTORY_ENABLED,
     XROUTER_EXCLUDED_MODELS,
     ExternalUploadsDirConfigurationError,
     format_file_size,
@@ -244,6 +245,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    get_xrouter_call_history_enabled,
     get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
@@ -471,6 +473,9 @@ class TestEnvironmentVariableConstants:
 
     def test_xrouter_excluded_models_constant(self):
         assert XROUTER_EXCLUDED_MODELS == "XAGENT_XROUTER_EXCLUDED_MODELS"
+
+    def test_xrouter_call_history_enabled_constant(self):
+        assert XROUTER_CALL_HISTORY_ENABLED == "XAGENT_XROUTER_CALL_HISTORY_ENABLED"
 
     def test_mcp_oauth_allow_private_hosts_constant(self):
         assert MCP_OAUTH_ALLOW_PRIVATE_HOSTS == "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
@@ -730,6 +735,26 @@ class TestOpenRouterConfig:
             "z-ai/glm-5.3-flash",
             "openai/gpt-5.6-luna",
         )
+
+
+class TestXrouterCallHistoryConfig:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(None, True, id="unset-is-on"),
+            pytest.param("true", True, id="true"),
+            pytest.param(" ON ", True, id="on-padded-uppercase"),
+            pytest.param("false", False, id="false"),
+            pytest.param("0", False, id="zero"),
+            pytest.param("", False, id="empty-is-off"),
+        ],
+    )
+    def test_xrouter_call_history_enabled(self, monkeypatch, value, expected):
+        if value is None:
+            monkeypatch.delenv(XROUTER_CALL_HISTORY_ENABLED, raising=False)
+        else:
+            monkeypatch.setenv(XROUTER_CALL_HISTORY_ENABLED, value)
+        assert get_xrouter_call_history_enabled() is expected
 
 
 class TestFormAnswerContinuationConfig:
@@ -2602,6 +2627,132 @@ class TestTriggerRateLimitConfig:
         assert get_trigger_crud_rate_limit() == "5/minute"
 
 
+class TestWidgetVoiceConfig:
+    """Widget voice settings: models, budgets, session caps and the text limit."""
+
+    _AMOUNTS = [
+        (
+            "get_widget_voice_tts_visitor_daily_chars",
+            "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS",
+            None,
+        ),
+        (
+            "get_widget_voice_tts_entity_daily_chars",
+            "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS",
+            None,
+        ),
+        (
+            "get_widget_voice_tts_site_daily_chars",
+            "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS",
+            1_000_000,
+        ),
+        (
+            "get_widget_voice_tts_max_text_chars",
+            "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS",
+            1000,
+        ),
+        (
+            "get_widget_voice_asr_visitor_daily_seconds",
+            "XAGENT_WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS",
+            None,
+        ),
+        (
+            "get_widget_voice_asr_entity_daily_seconds",
+            "XAGENT_WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS",
+            None,
+        ),
+        (
+            "get_widget_voice_asr_site_daily_seconds",
+            "XAGENT_WIDGET_VOICE_ASR_SITE_DAILY_SECONDS",
+            86_400,
+        ),
+        (
+            "get_widget_voice_max_sessions",
+            "XAGENT_WIDGET_VOICE_MAX_SESSIONS",
+            0,
+        ),
+        (
+            "get_widget_voice_max_sessions_per_entity",
+            "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY",
+            0,
+        ),
+        (
+            "get_widget_voice_max_sessions_per_visitor",
+            "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR",
+            0,
+        ),
+    ]
+
+    @pytest.mark.parametrize("raw", [None, "", "  "])
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_unset_or_blank_is_the_default(
+        self, monkeypatch, func_name, env_var, default, raw
+    ):
+        if raw is None:
+            monkeypatch.delenv(env_var, raising=False)
+        else:
+            monkeypatch.setenv(env_var, raw)
+        assert getattr(config, func_name)() == default
+
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_zero_is_a_real_limit(self, monkeypatch, func_name, env_var, default):
+        monkeypatch.setenv(env_var, "0")
+        assert getattr(config, func_name)() == 0
+
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_value_is_parsed(self, monkeypatch, func_name, env_var, default):
+        monkeypatch.setenv(env_var, " 250 ")
+        assert getattr(config, func_name)() == 250
+
+    @pytest.mark.parametrize("raw", ["-5", "lots", "1.5"])
+    @pytest.mark.parametrize("func_name,env_var,default", _AMOUNTS)
+    def test_invalid_value_is_the_default_with_a_warning(
+        self, monkeypatch, caplog, func_name, env_var, default, raw
+    ):
+        monkeypatch.setenv(env_var, raw)
+        assert getattr(config, func_name)() == default
+        assert f"Invalid {env_var}=" in caplog.text
+
+    @pytest.mark.parametrize("raw,expected", [("5000", 5000), ("5001", 1000)])
+    def test_max_text_chars_is_capped(self, monkeypatch, caplog, raw, expected):
+        monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS", raw)
+        assert config.get_widget_voice_tts_max_text_chars() == expected
+        assert ("Invalid XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS=" in caplog.text) == (
+            raw == "5001"
+        )
+
+    def test_max_text_chars_over_the_ceiling_is_the_default(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS", "999999")
+        assert config.get_widget_voice_tts_max_text_chars() == 1000
+
+    def test_ceiling_matches_the_synthesis_request_bound(self):
+        from xagent.web.schemas.speech import TTSStreamRequest
+
+        bound = next(
+            m.max_length
+            for m in TTSStreamRequest.model_fields["text"].metadata
+            if hasattr(m, "max_length")
+        )
+        assert config.WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING == bound
+
+    @pytest.mark.parametrize(
+        "func_name,env_var",
+        [
+            ("get_widget_voice_asr_model", "XAGENT_WIDGET_VOICE_ASR_MODEL"),
+            ("get_widget_voice_tts_model", "XAGENT_WIDGET_VOICE_TTS_MODEL"),
+            ("get_widget_voice_tts_voice", "XAGENT_WIDGET_VOICE_TTS_VOICE"),
+        ],
+    )
+    def test_model_and_voice_settings(self, monkeypatch, func_name, env_var):
+        getter = getattr(config, func_name)
+        monkeypatch.delenv(env_var, raising=False)
+        assert getter() is None
+        monkeypatch.setenv(env_var, "  ")
+        assert getter() is None
+        monkeypatch.setenv(env_var, "  x  ")
+        assert getter() == "x"
+
+
 class TestShareRateLimitConfig:
     """Config for public share-channel rate limits and run quotas (#973)."""
 
@@ -2682,6 +2833,26 @@ class TestShareRateLimitConfig:
         ),
         ("get_widget_run_quota", "XAGENT_WIDGET_RUN_QUOTA", "500/day"),
         ("get_widget_run_ip_quota", "XAGENT_WIDGET_RUN_IP_QUOTA", "120/hour"),
+        (
+            "get_widget_voice_tts_rate_limit",
+            "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT",
+            "600/minute",
+        ),
+        (
+            "get_widget_voice_tts_ip_rate_limit",
+            "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT",
+            "120/minute",
+        ),
+        (
+            "get_widget_voice_connect_ip_rate_limit",
+            "XAGENT_WIDGET_VOICE_CONNECT_IP_RATE_LIMIT",
+            "120/minute",
+        ),
+        (
+            "get_widget_voice_connect_rate_limit",
+            "XAGENT_WIDGET_VOICE_CONNECT_RATE_LIMIT",
+            "120/minute",
+        ),
     ]
 
     @pytest.mark.parametrize("func_name,env_var,default", _CASES)
@@ -4294,6 +4465,7 @@ _AUTO_RESUME_INT_SETTINGS = [
 _AUTO_RESUME_BOOL_SETTINGS = [
     ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", True),
     ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled", True),
+    ("REFUSE_SEARCH_RESULT_FETCH", "get_refuse_search_result_fetch_enabled", True),
 ]
 
 
@@ -5105,3 +5277,94 @@ def test_execution_event_storage_getters_raw_parsing(monkeypatch, getter, env, l
 def test_execution_event_storage_getters_do_not_validate(monkeypatch):
     monkeypatch.setenv(config.EXECUTION_EVENT_STORAGE_USER_IDS, "1, abc, -2")
     assert config.get_execution_event_storage_user_ids() == ["1", "abc", "-2"]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, 0.0),
+        ("", 0.0),
+        ("20", 20.0),
+        ("2.5", 2.5),
+        ("0", 0.0),
+        ("-1", 0.0),
+        ("inf", 0.0),
+        ("nan", 0.0),
+        ("1e400", 0.0),
+        ("bad", 0.0),
+    ],
+)
+def test_ws_restart_close_window(value, expected, monkeypatch):
+    from xagent.config import get_ws_restart_close_window_seconds
+
+    monkeypatch.delenv("XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS", value)
+    assert get_ws_restart_close_window_seconds() == expected
+
+
+_ACTIVATION_TIMEOUTS = [
+    ("XAGENT_STANDBY_STEP_TIMEOUT_SECONDS", "get_standby_step_timeout_seconds", 60.0),
+    (
+        "XAGENT_SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS",
+        "get_sandbox_startup_cleanup_timeout_seconds",
+        20.0,
+    ),
+    (
+        "XAGENT_TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS",
+        "get_task_event_bridge_start_timeout_seconds",
+        30.0,
+    ),
+]
+
+
+@pytest.mark.parametrize("env,getter,default", _ACTIVATION_TIMEOUTS)
+def test_activation_timeouts_default_override_and_blank(
+    monkeypatch, env, getter, default
+):
+    fn = getattr(config, getter)
+    monkeypatch.delenv(env, raising=False)
+    assert fn() == default
+    monkeypatch.setenv(env, "  ")
+    assert fn() == default
+    monkeypatch.setenv(env, "2.5")
+    assert fn() == 2.5
+
+
+@pytest.mark.parametrize("env,getter,default", _ACTIVATION_TIMEOUTS)
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "garbage"])
+def test_activation_timeouts_reject_invalid_values(
+    monkeypatch, env, getter, default, value
+):
+    monkeypatch.setenv(env, value)
+    with pytest.raises(ValueError, match=env):
+        getattr(config, getter)()
+    with pytest.raises(ValueError, match=env):
+        config.validate_activation_timeouts()
+
+
+def test_validate_activation_timeouts_accepts_defaults(monkeypatch):
+    for env, _, _ in _ACTIVATION_TIMEOUTS:
+        monkeypatch.delenv(env, raising=False)
+    config.validate_activation_timeouts()
+
+
+class TestFetchWebContentBudgetConfig:
+    @pytest.mark.parametrize("value", ["", "  ", "yess", "maybe"])
+    def test_blank_or_mistyped_value_keeps_the_default_on(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_BUDGET", value)
+        assert config.get_fetch_web_content_budget_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "off"])
+    def test_explicit_false_turns_it_off(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_BUDGET", value)
+        assert config.get_fetch_web_content_budget_enabled() is False
+
+    def test_max_chars_default_and_bounds(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_FETCH_WEB_CONTENT_MAX_CHARS", raising=False)
+        assert config.get_fetch_web_content_max_chars() == 12_000
+        monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_MAX_CHARS", "20000")
+        assert config.get_fetch_web_content_max_chars() == 20_000
+        for bad in ("abc", "999", "-5"):
+            monkeypatch.setenv("XAGENT_FETCH_WEB_CONTENT_MAX_CHARS", bad)
+            assert config.get_fetch_web_content_max_chars() == 12_000

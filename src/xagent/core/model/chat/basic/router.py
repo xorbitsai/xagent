@@ -33,15 +33,19 @@ accept those modalities; advisory modalities remain a preference within them.
 
 Every decision (prompt, candidate models with their predicted completion and
 cost, and the chosen slug) is logged to a SQLite call history via xrouter-llm's
-CallStore, defaulting to ``<storage_root>/xrouter/calls.db``. A configured Auto
-model with a single eligible candidate besides its fallback makes no decision
-and logs nothing.
+CallStore, defaulting to ``<storage_root>/xrouter/calls.db``, unless
+``XAGENT_XROUTER_CALL_HISTORY_ENABLED`` turns the history off, in which case
+nothing is written and no database is created. A configured Auto model with a
+single eligible candidate besides its fallback makes no decision and logs
+nothing.
 
 Env overrides (all optional; default to the bundled package data):
   XAGENT_XROUTER_MODEL          path to a trained predictor .joblib
   XAGENT_XROUTER_MODELS_DIR     model-profile registry dir/file
   XAGENT_XROUTER_ROUTERS_DIR    router configs dir/file
   XAGENT_XROUTER_DB             routing-decision SQLite history path
+  XAGENT_XROUTER_CALL_HISTORY_ENABLED  false keeps routing decisions (and their
+                                prompts) out of storage; on by default
   XAGENT_XROUTER_EXCLUDED_MODELS comma-separated candidate model slugs to omit
   XAGENT_ROUTER_FALLBACK_MODEL  slug to use if routing fails
 
@@ -87,6 +91,7 @@ from typing import (
 
 from .....config import (
     get_auto_candidate_cooldown_seconds,
+    get_xrouter_call_history_enabled,
     get_xrouter_excluded_models,
 )
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
@@ -230,7 +235,11 @@ _CANDIDATE_COOLDOWNS = _CandidateCooldowns()
 
 
 class _NullStore:
-    """Duck-typed CallStore that drops the decision log (degradation fallback)."""
+    """Duck-typed CallStore that drops the decision log.
+
+    Used when the call history is turned off, and as the fallback when the
+    history database cannot be opened.
+    """
 
     def record(self, **_kwargs: Any) -> int:
         return 0
@@ -267,9 +276,9 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
         from xrouter_llm.store import CallStore
     except ImportError as exc:  # pragma: no cover - dependency missing or too old
         raise RuntimeError(
-            "The 'router' (auto) provider needs xrouter-llm>=0.3.6; it is not "
+            "The 'router' (auto) provider needs xrouter-llm>=0.3.7; it is not "
             "installed or the installed version is too old. Install it with "
-            "`pip install 'xagent[router]'` (or `pip install 'xrouter-llm>=0.3.6'`)."
+            "`pip install 'xagent[router]'` (or `pip install 'xrouter-llm>=0.3.7'`)."
         ) from exc
 
     # Resolve the backend selected by XROUTER_EMBEDDING_BACKEND (see the module
@@ -285,11 +294,16 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
         raise TypeError(f"{model_path} is not a fitted xrouter-llm predictor")
     profiles = load_benchmark_profiles(models_dir)
     configs = load_router_configs(routers_dir)
-    try:
-        store: Any = CallStore(_store_path())
-    except Exception as exc:  # noqa: BLE001 - history must not break routing
-        logger.warning("xrouter call history disabled (%s)", exc)
+    store: Any
+    if not get_xrouter_call_history_enabled():
+        logger.info("xrouter call history disabled by configuration")
         store = _NullStore()
+    else:
+        try:
+            store = CallStore(_store_path())
+        except Exception as exc:  # noqa: BLE001 - history must not break routing
+            logger.warning("xrouter call history disabled (%s)", exc)
+            store = _NullStore()
     if embedding_backend is not None:
         logger.info("xrouter embedding backend: %s", embedding_backend.name)
     return RoutingService(

@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from ...config import get_tool_credentials_encryption_key
+from ...core.tools.connector_resolver import (  # noqa: F401 - re-exported hook setter
+    set_connector_resolver_hook,
+)
 from ...core.tools.core.sql_tool import (
     validate_external_database_url,
     validate_external_database_url_policy,
@@ -64,6 +67,11 @@ def get_user_tool_allowlist(db: Session, user: Any) -> list[str] | None:
     if _get_user_tool_allowlist_hook is not None:
         return _get_user_tool_allowlist_hook(db, user)
     return None
+
+
+# ``set_connector_resolver_hook`` (re-exported above) registers the host's
+# connector resolver for ``find_app_connection``; the hook itself lives in core so
+# the tool has no web dependency. With none registered the tool is not offered.
 
 
 def has_user_tool_policy_hooks() -> bool:

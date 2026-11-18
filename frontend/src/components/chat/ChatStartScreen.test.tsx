@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const localeState = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
+const accentColor = vi.hoisted(() => ({ value: null as null | readonly [number, number, number], seen: [] as unknown[] }))
 
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -37,6 +38,14 @@ vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
   return { ...actual, getApiUrl: () => "http://api.local" }
 })
+
+vi.mock("@/lib/avatar-style-extension", () => ({
+  usePersonaAccentColor: (persona: unknown) => {
+    accentColor.seen.push(persona)
+    // Like the real hook: no persona, no color.
+    return persona ? accentColor.value : null
+  },
+}))
 
 vi.mock("@/lib/branding", () => ({
   getBrandingFromEnv: () => ({ appName: "Xagent" }),
@@ -72,6 +81,8 @@ afterEach(() => {
   vi.restoreAllMocks()
   chatInputProps.current = null
   localeState.value = "en"
+  accentColor.value = null
+  accentColor.seen.length = 0
 })
 
 describe("ChatStartScreen agents section", () => {
@@ -187,6 +198,32 @@ describe("ChatStartScreen agents section", () => {
     )
     // The plain (no-lead) description only renders in the fallback header.
     expect(screen.queryByText("Some description")).toBeNull()
+  })
+
+  it("tints the screen with the selected teammate's avatar color, and not otherwise", () => {
+    accentColor.value = [17, 78, 184]
+    const maya = { id: 7, name: "Maya" }
+    const { container, rerender } = render(
+      <ChatStartScreen title="Describe the goal" agents={[maya]} selectedAgents={[maya]} onSend={vi.fn()} />
+    )
+
+    const wrapper = container.firstElementChild as HTMLElement
+    expect(wrapper).toHaveAttribute("data-agent-accent")
+    expect(wrapper.style.getPropertyValue("--agent-accent")).toBe("rgb(17 78 184)")
+    // The color is asked for the teammate, by id, as the one persona the hero also shows.
+    expect(accentColor.seen.at(-1)).toEqual({ name: "Maya", avatar: null, agentId: 7 })
+
+    accentColor.value = null
+    rerender(<ChatStartScreen title="Describe the goal" agents={[maya]} selectedAgents={[maya]} onSend={vi.fn()} />)
+    expect(container.firstElementChild).not.toHaveAttribute("data-agent-accent")
+  })
+
+  it("is not tinted while nobody is selected", () => {
+    accentColor.value = [17, 78, 184]
+    const { container } = renderScreen([{ id: 7, name: "Maya" }])
+
+    expect(container.firstElementChild).not.toHaveAttribute("data-agent-accent")
+    expect(accentColor.seen.at(-1)).toBeUndefined()
   })
 
   it("keeps the plain header when nobody is selected", () => {
@@ -545,5 +582,46 @@ describe("ChatStartScreen during a voice call", () => {
     expect(screen.queryByTestId("voice-orb-hero")).not.toBeInTheDocument()
     expect(screen.getByText("Support Agent")).toBeInTheDocument()
     expect(screen.getByTestId("team-strip").closest("[aria-hidden='true']")).toBeNull()
+  })
+})
+
+describe("ChatStartScreen with a provided voice call", () => {
+  function Published() {
+    const call: VoiceCall = {
+      open: true, phase: "listening", active: true, caption: "", muted: false, status: "Listening",
+      settingsLink: false, retryable: true, retryDisabled: false,
+      level: () => 0, retry: vi.fn(), end: vi.fn(), toggleMute: vi.fn(),
+    }
+    usePublishVoiceCall(call)
+    return null
+  }
+
+  it("shows the orb with dictation off and hands the source to the composer", () => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const openVoice = vi.fn()
+    render(
+      <VoiceCallStoreProvider>
+        <Published />
+        <ChatStartScreen title="Support Agent" onSend={vi.fn()} voiceInputEnabled={false}
+          onVoiceConversation={openVoice} voiceConversationSource="provided" />
+      </VoiceCallStoreProvider>
+    )
+    expect(screen.getByTestId("voice-orb-hero")).toBeInTheDocument()
+    const props = chatInputProps.current as unknown as Record<string, unknown>
+    expect(props.voiceConversationSource).toBe("provided")
+    expect(props.onVoiceConversation).toBe(openVoice)
+    expect(props.voiceInputEnabled).toBe(false)
+  })
+
+  it("keeps the account source by default, where dictation off hides the orb", () => {
+    render(
+      <VoiceCallStoreProvider>
+        <Published />
+        <ChatStartScreen title="Support Agent" onSend={vi.fn()} voiceInputEnabled={false} onVoiceConversation={vi.fn()} />
+      </VoiceCallStoreProvider>
+    )
+    expect(screen.queryByTestId("voice-orb-hero")).not.toBeInTheDocument()
+    expect((chatInputProps.current as unknown as Record<string, unknown>).voiceConversationSource).toBe("account")
   })
 })

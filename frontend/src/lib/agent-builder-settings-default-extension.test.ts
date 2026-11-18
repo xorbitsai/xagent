@@ -4,6 +4,12 @@ import { useAgentBuilderSettingsExtension } from "./agent-builder-settings-exten
 
 describe("Agent Builder shipped default settings", () => {
   it("has no panel or submitted settings", () => {
-    expect(useAgentBuilderSettingsExtension({ agentId: 7, enabled: true, saving: false })).toEqual({})
+    expect(useAgentBuilderSettingsExtension({
+      agentId: 7,
+      enabled: true,
+      saving: false,
+      agentName: "Maya",
+      logo: { src: null, select: () => {}, remove: () => {} },
+    })).toEqual({})
   })
 })

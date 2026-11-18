@@ -12,6 +12,19 @@ const authUserMock = vi.hoisted(() => ({
   current: { id: "1", is_admin: true } as { id: string; is_admin: boolean },
 }))
 
+// Passes straight through to the real hook; only records the enabled flag.
+const voiceModelsEnabled = vi.hoisted(() => [] as boolean[])
+vi.mock("@/hooks/use-voice-models", async () => {
+  const actual = await vi.importActual<typeof import("@/hooks/use-voice-models")>("@/hooks/use-voice-models")
+  return {
+    ...actual,
+    useVoiceModels: (enabled: boolean, refreshKey?: boolean) => {
+      voiceModelsEnabled.push(enabled)
+      return actual.useVoiceModels(enabled, refreshKey)
+    },
+  }
+})
+
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
     "@/lib/api-wrapper"
@@ -287,6 +300,48 @@ describe("ChatInput", () => {
     expect(container.querySelector("[contenteditable]")?.closest(".hidden")).toBeNull()
   })
 
+  it.each([
+    { label: "the start screen composer", compact: true },
+    { label: "the conversation panel composer", compact: false },
+  ])("offers a provided call in $label without dictation or a model lookup", async ({ compact }) => {
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null)
+    const openVoice = vi.fn()
+    function Harness({ call }: { call: VoiceCall | null }) {
+      return (
+        <VoiceCallStoreProvider>
+          {call && <PublishedCall call={call} />}
+          <ChatInput onSend={vi.fn()} onVoiceConversation={openVoice} voiceConversationSource="provided"
+            voiceInputEnabled={false} inputValue="" onInputChange={vi.fn()} compact={compact} hideConfig />
+        </VoiceCallStoreProvider>
+      )
+    }
+    const view = render(<Harness call={null} />)
+    const button = screen.getByRole("button", { name: "voiceConversation.open" })
+    expect(button).toBeEnabled()
+    fireEvent.click(button)
+    expect(openVoice).toHaveBeenCalledOnce()
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
+    view.rerender(<Harness call={fakeCall()} />)
+    expect(await screen.findByTestId("voice-call-bar")).toBeInTheDocument()
+    await Promise.resolve()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("never looks the account models up for a provided call, even with dictation on", () => {
+    voiceModelsEnabled.length = 0
+    render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} voiceConversationSource="provided"
+      voiceInputEnabled inputValue="" onInputChange={vi.fn()} hideConfig />)
+    expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeInTheDocument()
+    expect(voiceModelsEnabled.length).toBeGreaterThan(0)
+    expect(voiceModelsEnabled.every(enabled => enabled === false)).toBe(true)
+  })
+
+  it("keeps the account call behind dictation when no source is given", () => {
+    render(<ChatInput onSend={vi.fn()} onVoiceConversation={vi.fn()} voiceInputEnabled={false}
+      inputValue="" onInputChange={vi.fn()} hideConfig />)
+    expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
+  })
+
   it("labels the non-compact send icon and submits through it", async () => {
     const onSend = vi.fn()
     render(<ChatInput onSend={onSend} inputValue="Send my draft" onInputChange={vi.fn()}
@@ -295,6 +350,18 @@ describe("ChatInput", () => {
     expect(send).toHaveAttribute("aria-label", "common.send")
     fireEvent.click(send)
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("Send my draft", expect.objectContaining({ model: "selected-model" })))
+  })
+
+  it("lets the non-compact send icon take the agent accent only while it can send", () => {
+    const { rerender } = render(<ChatInput onSend={vi.fn()} inputValue="Send my draft" onInputChange={vi.fn()}
+      compact={false} hideConfig hideFileUpload voiceInputEnabled={false} />)
+    expect(screen.getByRole("button", { name: "common.send" })).toHaveClass("agent-accent-surface")
+
+    rerender(<ChatInput onSend={vi.fn()} inputValue="" onInputChange={vi.fn()}
+      compact={false} hideConfig hideFileUpload voiceInputEnabled={false} />)
+    const dimmed = screen.getByRole("button", { name: "common.send" })
+    expect(dimmed).toBeDisabled()
+    expect(dimmed).not.toHaveClass("agent-accent-surface")
   })
 
   it("requires a model when submitting generic chat", async () => {
@@ -2373,6 +2440,8 @@ describe("ChatInput", () => {
     const submitButton = container.querySelector('button[type="submit"]') as HTMLButtonElement
     expect(submitButton).toBeDisabled()
     expect(submitButton.className).toContain("bg-muted text-muted-foreground/50")
+    // A control that cannot act stays muted under an agent's accent too.
+    expect(submitButton).not.toHaveClass("agent-accent-surface")
     expect(submitButton).toHaveAccessibleName("widgetSession.stoppingResponse")
     expect(submitButton).toHaveAttribute("title", "widgetSession.stoppingResponse")
     expect(screen.getAllByRole("button", { name: "widgetSession.stoppingResponse" })).toEqual([submitButton])
@@ -2405,6 +2474,7 @@ describe("ChatInput", () => {
     const submitButton = screen.getByRole("button", { name: "common.send" })
     expect(submitButton).not.toBeDisabled()
     expect(submitButton.className).not.toContain("bg-muted")
+    expect(submitButton).toHaveClass("agent-accent-surface")
 
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 

@@ -31,6 +31,7 @@ from ...config import (
     get_session_secret,
     public_entries_configured,
 )
+from .. import browser_idle
 from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from ..auth_sessions import (
     commit_refresh_credentials,
@@ -322,12 +323,18 @@ def _get_or_create_google_user(db: Session, claims: dict[str, Any]) -> User:
 def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
     previous_hash = str(user.password_hash)
     previous_epoch = cast(str | None, user.session_epoch)
+    # A new browser session; commit_refresh_credentials makes it current.
+    sid = browser_idle.new_browser_session_id()
     access_token = create_access_token(
-        data=user_session_claims(user),
+        data={**user_session_claims(user), **browser_idle.browser_session_claims(sid)},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
     refresh_token = create_refresh_token(
-        data={"sub": user.username, "user_id": user.id}
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            **browser_idle.browser_session_claims(sid),
+        }
     )
     # Detach the response before rollback/commit can expire ORM attributes.
     response = {
@@ -347,6 +354,9 @@ def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
         "user_id": user.id,
+        "idle_session": browser_idle.idle_session_fields(
+            user, sid, last_activity_at=browser_idle.utcnow(), db=db
+        ),
     }
     commit_refresh_credentials(
         db,

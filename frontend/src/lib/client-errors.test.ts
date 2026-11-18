@@ -40,6 +40,7 @@ describe("client error wire contract", () => {
     ["message_acceptance_pending", "clientErrors.messageAcceptancePending", "Message acceptance is still being reconciled. Please retry shortly."],
     ["task_unavailable", "clientErrors.taskUnavailable", "Task is no longer available."],
     ["task_busy", "clientErrors.taskBusy", "Task is currently busy; please wait for the previous turn to finish before sending another message."],
+    ["interaction_response_required", "clientErrors.interactionResponseRequired", "This conversation is waiting on a question above; answer it to continue."],
     ["workforce_unavailable", "clientErrors.workforceUnavailable", "This workforce conversation can no longer accept messages; please start a new conversation."],
     ["workforce_archived", "clientErrors.workforceArchived", "This workforce has been archived. Unarchive and publish it before starting a new conversation, or select an active workforce."],
     ["message_attachment_corrupt", "clientErrors.messageAttachmentCorrupt", "A stored file for this message failed its integrity check and must be re-uploaded."],

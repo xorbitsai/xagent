@@ -3,10 +3,20 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...core.tools.adapters.vibe.mcp_tool_allowlist import (
+    READ_ONLY_TOOLS_KEY,
+    is_valid_read_only_tools,
+)
 from ...core.utils.encryption import encrypt_value
 from ..auth_dependencies import get_current_user
 from ..builtin_mcp_registry import (
@@ -26,8 +36,27 @@ admin_mcp_router = APIRouter(prefix="/api/admin/mcp", tags=["Admin MCP"])
 _LAUNCH_CONFIG_DESCRIPTION = (
     "Runtime launch metadata such as command, arguments, required environment "
     "variable names, and mappings. Do not include credentials or secret values; "
-    "configure them through the connector credential flow."
+    "configure them through the connector credential flow. Optional "
+    "read_only_tools: a list of raw MCP tool names; when present, only those "
+    "tools are loaded for servers connected from this app (an empty list loads "
+    "none). Built-in apps declare it in the code registry instead."
 )
+
+
+def _validate_launch_config_read_only_tools(
+    launch_config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Reject a malformed ``read_only_tools`` (it would silently disable every tool)."""
+    if (
+        launch_config is not None
+        and READ_ONLY_TOOLS_KEY in launch_config
+        and not is_valid_read_only_tools(launch_config[READ_ONLY_TOOLS_KEY])
+    ):
+        raise ValueError(
+            f"launch_config.{READ_ONLY_TOOLS_KEY} must be a list of non-empty "
+            "tool name strings"
+        )
+    return launch_config
 
 
 def verify_admin(user: User = Depends(get_current_user)) -> User:
@@ -92,6 +121,10 @@ class PublicMCPAppBase(BaseModel):
 
 
 class PublicMCPAppCreate(PublicMCPAppBase):
+    _check_read_only_tools = field_validator("launch_config")(
+        _validate_launch_config_read_only_tools
+    )
+
     # Validator lives on the write model only, not PublicMCPAppBase — otherwise
     # PublicMCPAppResponse would inherit it and re-run on response serialization,
     # turning one legacy/partial DB row into a full-list 500 on read.
@@ -134,6 +167,10 @@ class PublicMCPAppResponse(PublicMCPAppBase):
 
 
 class PublicMCPAppUpdate(BaseModel):
+    _check_read_only_tools = field_validator("launch_config")(
+        _validate_launch_config_read_only_tools
+    )
+
     app_id: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None

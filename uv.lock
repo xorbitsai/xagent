@@ -8772,8 +8772,8 @@ requires-dist = [
     { name = "volcengine-python-sdk", extras = ["ark"], specifier = ">=5.0.37" },
     { name = "websockets", specifier = ">=15.0.1" },
     { name = "xinference-client", specifier = ">=2.3.0,<3" },
-    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.3.6" },
-    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.3.6" },
+    { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.3.7" },
+    { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.3.7" },
     { name = "yarl", specifier = ">=1.22.0,<2.0.0" },
     { name = "zai-sdk", specifier = ">=0.0.4" },
 ]
@@ -8799,7 +8799,7 @@ backend-image = [
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "typer", specifier = ">=0.9.0" },
     { name = "unstructured", specifier = ">=0.27.28" },
-    { name = "xrouter-llm", specifier = ">=0.3.6" },
+    { name = "xrouter-llm", specifier = ">=0.3.7" },
 ]
 dev = [
     { name = "asyncssh", specifier = ">=2.24.1" },
@@ -8925,7 +8925,7 @@ wheels = [
 
 [[package]]
 name = "xrouter-llm"
-version = "0.3.6"
+version = "0.3.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "alembic" },
@@ -8940,9 +8940,9 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/56/7f/fcd188fb9e104deaf85389a6dfeb34542a6db2f7863baecdc5079a72a2c2/xrouter_llm-0.3.6.tar.gz", hash = "sha256:e0e481ae465e1e20bbed4748f230b14ac373dfbce93873a8d901b2bb739ac016", size = 1477299, upload-time = "2026-10-10T08:33:47.428Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/40/06/0821e5134169b51bcb5a7b02aa140a6dcf8104f40ffc9c149774ee7755ac/xrouter_llm-0.3.7.tar.gz", hash = "sha256:0a3f4bc4bc5ca1adcfb8c86b8ef8dc98c499d3779d41f9543a0ca6e73df32468", size = 1479138, upload-time = "2026-10-26T10:26:35.849Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/38/fdf14f4c5f98f6f8158275277eb14879ec258efc187896e30eaa7ab170fd/xrouter_llm-0.3.6-py3-none-any.whl", hash = "sha256:f62bb3e8d680b3f85fffcb1eb6fa373a6d2b4d62563d1391f8b58aca5779ffdc", size = 162833, upload-time = "2026-10-10T08:33:45.636Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/4d/a67112392a621620524c2b7480f910c8c4e2fe26f885830d039caf79d85e/xrouter_llm-0.3.7-py3-none-any.whl", hash = "sha256:4d030da9a80ae7f93c785fe3558972920673c682e4394517a7115b03579e82b0", size = 169109, upload-time = "2026-10-26T10:26:34.467Z" },
 ]
 
 [[package]]

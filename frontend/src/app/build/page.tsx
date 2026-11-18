@@ -17,6 +17,7 @@ import {
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { SegmentedTabs, type SegmentedTabItem } from "@/components/ui/segmented-tabs"
 import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { toAgentPersona } from "@/lib/agent-persona"
 import { pillClasses } from "@/components/templates/library-template-card"
 import { categoryLabel } from "@/lib/template-categories"
 import { useI18n } from "@/contexts/i18n-context"
@@ -737,7 +738,7 @@ function BuildsPageContent() {
                   >
                     <div className="flex flex-col items-start gap-3">
                       <PersonaAvatar
-                        persona={{ name: agent.name, avatar: resolvedLogoUrl || template?.persona?.avatar }}
+                        persona={toAgentPersona(agent, resolvedLogoUrl || template?.persona?.avatar)}
                         sizeClassName="h-20 w-20"
                         textClassName="text-2xl"
                         className="rounded-[22px] shadow-[0_0_0_4px_var(--card),0_0_0_6px_hsl(var(--primary)/0.15)]"

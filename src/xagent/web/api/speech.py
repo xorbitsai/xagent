@@ -100,9 +100,10 @@ async def stream_asr(
             config=config,
             options=start,
             usage_source="speech_transcribe",
+            audience="member",
         )
 
-    await run_asr_stream(websocket, prepare=prepare)
+    await run_asr_stream(websocket, prepare=prepare, audience="member")
 
 
 @speech_router.post("/tts/stream", response_class=StreamingResponse)
@@ -122,6 +123,7 @@ async def stream_tts(
             config=config,
             options=request,
             usage_source="speech_synthesize",
+            audience="member",
         )
     )
 

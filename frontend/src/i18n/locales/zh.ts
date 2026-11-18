@@ -45,6 +45,13 @@ const zh = {
     autoResumeStoppedCancelled: "自动恢复已取消，可点击“继续”恢复执行。",
     autoResumeStoppedIneligible: "此任务无法自动恢复，可点击“继续”恢复执行。",
   },
+  messageQueue: {
+    held: { sendFailed: "有排队的消息没能发出。" },
+    supportLost: "排队的消息暂时不能自动发出。如果某条已经出现在对话里，说明它已经发出了，不用再发。",
+    full: "最多只能排队 {count} 条消息。",
+    filesNotQueued: "带附件的消息不能排队，请等这一轮回答结束后再发送。",
+    waitingAnswer: "回答上面的问题后，排队的消息会接着发出。",
+  },
   clientErrors: {
     executionQueueFull: "团队执行队列已满，请稍后重试。",
     messageProcessingFailed: "消息处理失败，请重试。",
@@ -60,6 +67,7 @@ const zh = {
     messageAcceptancePending: "消息接收状态仍在确认中，请稍后重试。",
     taskUnavailable: "任务已不可用。",
     taskBusy: "任务正忙，请等待上一轮完成后再发送消息。",
+    interactionResponseRequired: "对话正在等你回答上面的问题，回答后才能继续。",
     workforceUnavailable: "此 Workforce 对话已无法接收新消息，请开始新对话。",
     workforceArchived: "此 Workforce 已归档。请先取消归档并重新发布，再开始新对话；或选择一个活跃的 Workforce。",
     messageAttachmentCorrupt: "此消息使用的已存储文件完整性校验失败，请重新上传。",
@@ -166,6 +174,18 @@ const zh = {
       stopped: "已停止",
       error: "语音连接已结束，请检查麦克风和模型配置后重试。",
     },
+    // Calls in an embedded chat: the visitor has no account or settings.
+    widget: {
+      unavailable: "语音通话暂不可用。",
+      busy: "语音通话繁忙，请稍后再试。",
+      tryLater: "请稍后再试。",
+      temporarilyUnavailable: "语音暂时不可用，请稍后再试。",
+      sessionTimeout: "通话已超时，请重试以继续。",
+      microphoneDenied: "无法使用麦克风。请确认麦克风已连接并允许此页面使用，然后重试。",
+      playbackFailed: "部分语音未能播放。",
+      sendFailed: "消息发送失败，请重试。",
+      connectionEnded: "通话意外中断，请重试。",
+    },
   },
   voiceInput: {
     start: "语音输入",
@@ -234,6 +254,15 @@ const zh = {
     agentFilterLabel: "Agent 筛选",
     agentFilterAll: "全部 Agent",
     untitled: "未命名会话",
+    activeFromLabel: "最近活动起",
+    activeToLabel: "最近活动止",
+    clearTime: "清除",
+    timeRangeInvalid: "开始时间必须早于结束时间。",
+    export: "导出 CSV",
+    exporting: "导出中...",
+    exportFailed: "导出会话日志失败。",
+    exportTooManyRows: "可导出的会话过多，上限为 {limit} 条；请缩小筛选范围后重试。",
+    exportTooLargeFile: "导出文件过大，上限为 {limitMb} MB；请缩小筛选范围后重试。",
     sources: {
       all: "全部",
       widget: "Widget",
@@ -922,7 +951,14 @@ const zh = {
     },
     back_to_login: "返回登录？",
   },
+  session_idle: {
+    warning_title: "还在使用吗？",
+    warning_description: "为了账号安全，由于长时间未操作，将在 {time} 后退出登录。",
+    continue: "继续使用",
+    sign_out: "退出登录",
+  },
   login: {
+    session_expired: "登录已过期（例如长时间未操作），请重新登录。",
     mobile_title: "欢迎回来",
     title: "登录 {appName}",
     description: "请输入您的账户信息以访问智能体平台",
@@ -4261,6 +4297,21 @@ const zh = {
     label_placeholder: "标签（可选），如 CI 流水线",
     create_key: "创建 Key",
     no_keys: "还没有 API Key。"
+  },
+  widget_voice_setting: {
+    title: "语音通话",
+    description: "允许访客在这个聊天窗里语音通话。",
+    unavailable_not_configured: "语音已打开，但当前部署没有配置语音模型，访客暂时看不到通话按钮。请联系平台支持。",
+    unavailable_models: "语音已打开，但语音服务当前不可用，访客暂时看不到通话按钮。请联系平台支持。",
+    requirements_note: "访客要看到通话按钮，你的网站和本聊天服务都需要使用 https。如果你的网页本身被放在另一个框架（iframe）里，那个框架也要允许麦克风。在网站或外层框架禁止麦克风的页面上，Chrome 和 Edge 不显示按钮；Safari 和 Firefox 会显示按钮，通话时提示无法使用麦克风。",
+    refresh_note: "已经打开着的网页刷新后生效。",
+    opt_out_note: "语音通话由「语音通话」开关控制。某个页面不想要语音，在该页面的 script 标签上加 data-voice=\"false\"。",
+    loading: "读取中…",
+    load_failed: "无法读取语音设置。",
+    retry: "重试",
+    saved: "语音设置已更新",
+    save_failed: "语音设置保存失败，请重试。",
+    toggle_label: "在这个聊天窗里提供语音通话"
   },
   api_key: {
     title: "API Key",

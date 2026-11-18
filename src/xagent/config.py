@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,13 @@ EXECUTION_EVENT_STORAGE_ENTRIES = "XAGENT_EXECUTION_EVENT_STORAGE_ENTRIES"
 EXECUTION_EVENT_STORAGE_USER_IDS = "XAGENT_EXECUTION_EVENT_STORAGE_USER_IDS"
 SHARED_TASK_EXECUTION_ENABLED = "XAGENT_SHARED_TASK_EXECUTION_ENABLED"
 STANDBY = "XAGENT_STANDBY"
+STANDBY_STEP_TIMEOUT_SECONDS = "XAGENT_STANDBY_STEP_TIMEOUT_SECONDS"
+SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS = (
+    "XAGENT_SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS"
+)
+TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS = (
+    "XAGENT_TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS"
+)
 TASK_EXECUTION_ROLE = "XAGENT_TASK_EXECUTION_ROLE"
 WORKER_COUNT = "XAGENT_WORKER_COUNT"
 CHANNEL_INGRESS_ENABLED = "XAGENT_CHANNEL_INGRESS_ENABLED"
@@ -64,6 +71,7 @@ ENCRYPTION_MIGRATION_KEY = "XAGENT_ENCRYPTION_MIGRATION_KEY"
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
 INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
 TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
+WS_RESTART_CLOSE_WINDOW_SECONDS = "XAGENT_WS_RESTART_CLOSE_WINDOW_SECONDS"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
@@ -71,6 +79,7 @@ TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
 TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
 SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
+REFUSE_SEARCH_RESULT_FETCH = "XAGENT_REFUSE_SEARCH_RESULT_FETCH"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
@@ -295,6 +304,23 @@ WIDGET_TASK_CREATE_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_RATE_LIMIT"
 WIDGET_TASK_CREATE_IP_RATE_LIMIT = "XAGENT_WIDGET_TASK_CREATE_IP_RATE_LIMIT"
 WIDGET_RUN_QUOTA = "XAGENT_WIDGET_RUN_QUOTA"
 WIDGET_RUN_IP_QUOTA = "XAGENT_WIDGET_RUN_IP_QUOTA"
+WIDGET_VOICE_ASR_MODEL = "XAGENT_WIDGET_VOICE_ASR_MODEL"
+WIDGET_VOICE_TTS_MODEL = "XAGENT_WIDGET_VOICE_TTS_MODEL"
+WIDGET_VOICE_TTS_VOICE = "XAGENT_WIDGET_VOICE_TTS_VOICE"
+WIDGET_VOICE_TTS_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_RATE_LIMIT"
+WIDGET_VOICE_TTS_IP_RATE_LIMIT = "XAGENT_WIDGET_VOICE_TTS_IP_RATE_LIMIT"
+WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS"
+WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS"
+WIDGET_VOICE_TTS_SITE_DAILY_CHARS = "XAGENT_WIDGET_VOICE_TTS_SITE_DAILY_CHARS"
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS = "XAGENT_WIDGET_VOICE_TTS_MAX_TEXT_CHARS"
+WIDGET_VOICE_CONNECT_RATE_LIMIT = "XAGENT_WIDGET_VOICE_CONNECT_RATE_LIMIT"
+WIDGET_VOICE_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_VOICE_CONNECT_IP_RATE_LIMIT"
+WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS = "XAGENT_WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS"
+WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS = "XAGENT_WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS"
+WIDGET_VOICE_ASR_SITE_DAILY_SECONDS = "XAGENT_WIDGET_VOICE_ASR_SITE_DAILY_SECONDS"
+WIDGET_VOICE_MAX_SESSIONS = "XAGENT_WIDGET_VOICE_MAX_SESSIONS"
+WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY = "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY"
+WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR = "XAGENT_WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -341,6 +367,7 @@ OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
 XROUTER_EXCLUDED_MODELS = "XAGENT_XROUTER_EXCLUDED_MODELS"
+XROUTER_CALL_HISTORY_ENABLED = "XAGENT_XROUTER_CALL_HISTORY_ENABLED"
 FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
@@ -354,6 +381,9 @@ MCP_PRIVATE_ENDPOINTS = "XAGENT_MCP_PRIVATE_ENDPOINTS"
 MCP_PRIVATE_CIDRS = "XAGENT_MCP_PRIVATE_CIDRS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
+FETCH_WEB_CONTENT_BUDGET = "XAGENT_FETCH_WEB_CONTENT_BUDGET"
+FETCH_WEB_CONTENT_MAX_CHARS = "XAGENT_FETCH_WEB_CONTENT_MAX_CHARS"
+DEFAULT_FETCH_WEB_CONTENT_MAX_CHARS = 12_000
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
@@ -519,6 +549,27 @@ def get_task_reply_wait_timeout_seconds() -> int:
     return 30
 
 
+def get_ws_restart_close_window_seconds() -> float:
+    """Window over which a planned restart spreads its WebSocket closes.
+
+    Env override, default 0 (close all at once). Negative, non-finite or
+    unparsable values fall back to 0 with a warning.
+    """
+    value = os.getenv(WS_RESTART_CLOSE_WINDOW_SECONDS)
+    if value is None or not value.strip():
+        return 0.0
+    try:
+        seconds = float(value)
+        if math.isfinite(seconds) and seconds >= 0:
+            return seconds
+    except ValueError:
+        pass
+    logger.warning(
+        "Invalid %s=%r; falling back to 0", WS_RESTART_CLOSE_WINDOW_SECONDS, value
+    )
+    return 0.0
+
+
 def get_input_review_timeout_seconds() -> float:
     """Leave part of the durable reply wait for command handoff and settlement."""
     return min(20.0, get_task_reply_wait_timeout_seconds() * 0.8)
@@ -656,6 +707,21 @@ def get_task_auto_resume_enabled() -> bool:
     """
 
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_refuse_search_result_fetch_enabled() -> bool:
+    """Whether page-fetch tools refuse search-engine result-page URLs.
+
+    On, ``fetch_web_content`` and ``download_web_asset`` return an error for
+    such URLs without making a request and tell the model to use
+    ``web_search``. The switch exists only to roll the refusal back.
+
+    Priority:
+        1. XAGENT_REFUSE_SEARCH_RESULT_FETCH environment variable
+        2. True
+    """
+
+    return _get_strict_bool_env(REFUSE_SEARCH_RESULT_FETCH, True)
 
 
 def get_shutdown_handoff_enabled() -> bool:
@@ -1146,6 +1212,18 @@ def get_xrouter_excluded_models() -> tuple[str, ...]:
     )
 
 
+def get_xrouter_call_history_enabled() -> bool:
+    """Return whether Auto routing decisions are written to the call history.
+
+    The history stores each routing prompt (the user's text) with the candidate
+    models and the selection. On by default. Unset means on; any set value other
+    than ``1``, ``true``, ``yes`` or ``on`` (case-insensitive, surrounding
+    whitespace ignored) means off, including an empty value. Read when a process
+    first builds the routing service, so a change applies to new processes.
+    """
+    return _get_bool_env(XROUTER_CALL_HISTORY_ENABLED, True)
+
+
 def get_form_answer_continuation_enabled() -> bool:
     """Return whether the form-answer continuation text may be applied.
 
@@ -1266,6 +1344,54 @@ def get_shared_task_execution_enabled() -> bool:
     if configured is not None and configured.strip():
         return _get_bool_env(SHARED_TASK_EXECUTION_ENABLED, False)
     return get_worker_count() is not None or get_task_execution_role() != "combined"
+
+
+def _positive_seconds_env(name: str, default: float) -> float:
+    """A strictly positive, finite number of seconds; a bad value fails closed."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number of seconds, got {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite, got {raw!r}")
+    return value
+
+
+def get_standby_step_timeout_seconds() -> float:
+    """Upper bound for one activation step (``XAGENT_STANDBY_STEP_TIMEOUT_SECONDS``).
+
+    Default 60 s: under the host's 90 s activation budget, so a stuck step
+    fails with its name instead of leaving the host waiting in silence.
+    """
+    return _positive_seconds_env(STANDBY_STEP_TIMEOUT_SECONDS, 60.0)
+
+
+def get_sandbox_startup_cleanup_timeout_seconds() -> float:
+    """Budget after which the startup quiesce issues no further stops.
+
+    Never cancels a stop already issued; see ``bounded_quiesce``. Containers
+    deferred by it are stopped in the background after activation.
+    """
+    return _positive_seconds_env(SANDBOX_STARTUP_CLEANUP_TIMEOUT_SECONDS, 20.0)
+
+
+def get_task_event_bridge_start_timeout_seconds() -> float:
+    """How long the task event bridge may retry Redis before start fails."""
+    return _positive_seconds_env(TASK_EVENT_BRIDGE_START_TIMEOUT_SECONDS, 30.0)
+
+
+def validate_activation_timeouts() -> None:
+    """Fail at boot on a malformed activation timeout.
+
+    The three getters are strict and otherwise read only at activation time, by
+    which point the host may already have retired the serving generation.
+    """
+    get_standby_step_timeout_seconds()
+    get_sandbox_startup_cleanup_timeout_seconds()
+    get_task_event_bridge_start_timeout_seconds()
 
 
 def get_standby_enabled() -> bool:
@@ -2365,6 +2491,167 @@ def get_widget_run_ip_quota() -> str:
     (example.env carries the same caveat for all per-IP buckets.)
     """
     return _get_rate_limit(WIDGET_RUN_IP_QUOTA, "120/hour")
+
+
+def _get_optional_setting(env_var: str) -> str | None:
+    return (os.getenv(env_var) or "").strip() or None
+
+
+def get_widget_voice_asr_model() -> str | None:
+    """The ``model_id`` of the live transcription model widget voice uses.
+
+    A deployment setting, never the owner's own model choice. Unset means
+    widget voice is not configured on this deployment.
+    """
+    return _get_optional_setting(WIDGET_VOICE_ASR_MODEL)
+
+
+def get_widget_voice_tts_model() -> str | None:
+    """The ``model_id`` of the synthesis model widget voice uses.
+
+    A deployment setting, never the owner's own model choice. Unset means
+    widget voice is not configured on this deployment.
+    """
+    return _get_optional_setting(WIDGET_VOICE_TTS_MODEL)
+
+
+def get_widget_voice_tts_voice() -> str | None:
+    """Optional voice for widget voice synthesis; unset uses the model's own."""
+    return _get_optional_setting(WIDGET_VOICE_TTS_VOICE)
+
+
+def get_widget_voice_tts_rate_limit() -> str:
+    """Per-widget-entity limit on widget guest speech synthesis requests.
+
+    The loose backstop across all callers of one widget. A reply is
+    synthesized sentence by sentence, so one spoken reply is several requests.
+    """
+    return _get_rate_limit(WIDGET_VOICE_TTS_RATE_LIMIT, "600/minute")
+
+
+def get_widget_voice_tts_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget guest speech synthesis requests.
+
+    The tight bucket: six spoken replies of twenty sentences each in one
+    minute is 120 requests from one caller.
+    """
+    return _get_rate_limit(WIDGET_VOICE_TTS_IP_RATE_LIMIT, "120/minute")
+
+
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT = 1000
+# The text bound of TTSStreamRequest; a larger setting could never be sent.
+WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING = 5000
+
+_AmountT = TypeVar("_AmountT", bound="int | None")
+
+
+def _get_widget_voice_amount(
+    env_var: str, default: _AmountT, *, ceiling: int | None = None
+) -> int | _AmountT:
+    """A widget voice amount setting.
+
+    Unset or blank is ``default`` (``None`` means no limit); ``0`` is a real
+    limit; a negative, non-integer, or above-``ceiling`` value is ``default``,
+    with a warning.
+    """
+    raw = (os.getenv(env_var) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0 or (ceiling is not None and value > ceiling):
+        logger.warning(
+            "Invalid %s=%r; falling back to %s",
+            env_var,
+            raw,
+            "no limit" if default is None else default,
+        )
+        return default
+    return value
+
+
+def get_widget_voice_tts_visitor_daily_chars() -> int | None:
+    """Daily synthesis character budget for one widget visitor (the widget
+    entity plus the caller IP); ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_TTS_VISITOR_DAILY_CHARS, None)
+
+
+def get_widget_voice_tts_entity_daily_chars() -> int | None:
+    """Daily synthesis character budget for one widget agent or workforce;
+    ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_TTS_ENTITY_DAILY_CHARS, None)
+
+
+def get_widget_voice_tts_site_daily_chars() -> int:
+    """Daily synthesis character budget for all widget voice on this site."""
+    return _get_widget_voice_amount(WIDGET_VOICE_TTS_SITE_DAILY_CHARS, 1_000_000)
+
+
+def get_widget_voice_tts_max_text_chars() -> int:
+    """Longest text one widget voice synthesis request may carry."""
+    return _get_widget_voice_amount(
+        WIDGET_VOICE_TTS_MAX_TEXT_CHARS,
+        WIDGET_VOICE_TTS_MAX_TEXT_CHARS_DEFAULT,
+        ceiling=WIDGET_VOICE_TTS_MAX_TEXT_CHARS_CEILING,
+    )
+
+
+def get_widget_voice_connect_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget voice transcription connection attempts.
+
+    Checked before the handshake is accepted, when no credential has been
+    read, so it is keyed per IP only.
+    """
+    return _get_rate_limit(WIDGET_VOICE_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_widget_voice_connect_rate_limit() -> str:
+    """Per-widget-entity limit on widget voice transcription connections,
+    checked once the guest credential is verified."""
+    return _get_rate_limit(WIDGET_VOICE_CONNECT_RATE_LIMIT, "120/minute")
+
+
+def get_widget_voice_asr_visitor_daily_seconds() -> int | None:
+    """Daily transcription budget, in seconds, for one widget visitor (widget
+    entity plus caller IP); ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_ASR_VISITOR_DAILY_SECONDS, None)
+
+
+def get_widget_voice_asr_entity_daily_seconds() -> int | None:
+    """Daily transcription budget, in seconds, for one widget agent or
+    workforce; ``None`` means no limit."""
+    return _get_widget_voice_amount(WIDGET_VOICE_ASR_ENTITY_DAILY_SECONDS, None)
+
+
+def get_widget_voice_asr_site_daily_seconds() -> int:
+    """Daily transcription budget, in seconds, for all widget voice on this
+    site."""
+    return _get_widget_voice_amount(WIDGET_VOICE_ASR_SITE_DAILY_SECONDS, 86_400)
+
+
+def get_widget_voice_max_sessions() -> int:
+    """Cap on live widget voice transcription sessions in this process.
+
+    Counts guest sessions only; signed-in speech is never counted. Unset or
+    blank, ``0``, and an invalid value (with a warning) all mean no cap.
+    """
+    return _get_widget_voice_amount(WIDGET_VOICE_MAX_SESSIONS, 0)
+
+
+def get_widget_voice_max_sessions_per_entity() -> int:
+    """Cap on live widget voice transcription sessions per widget agent or
+    workforce in this process. Unset or blank, ``0``, and an invalid value
+    (with a warning) all mean no cap."""
+    return _get_widget_voice_amount(WIDGET_VOICE_MAX_SESSIONS_PER_ENTITY, 0)
+
+
+def get_widget_voice_max_sessions_per_visitor() -> int:
+    """Cap on live widget voice transcription sessions per visitor of one
+    widget agent or workforce in this process. Unset or blank, ``0``, and an
+    invalid value (with a warning) all mean no cap."""
+    return _get_widget_voice_amount(WIDGET_VOICE_MAX_SESSIONS_PER_VISITOR, 0)
 
 
 def get_share_run_quota() -> str:
@@ -4596,6 +4883,25 @@ def get_tool_max_output_length() -> int:
         except ValueError:
             logger.warning("Invalid %s value: %s", TOOL_MAX_OUTPUT_LENGTH, env_str)
     return 50 * 1024
+
+
+def get_fetch_web_content_budget_enabled() -> bool:
+    """Whether ``fetch_web_content`` trims page boilerplate and caps its output.
+
+    On by default. Set ``XAGENT_FETCH_WEB_CONTENT_BUDGET=false`` to return the
+    full extracted page again (rollback switch).
+    """
+    return _get_strict_bool_env(FETCH_WEB_CONTENT_BUDGET, True)
+
+
+def get_fetch_web_content_max_chars() -> int:
+    """Default character budget for one ``fetch_web_content`` result.
+
+    About 3k tokens. The model can ask for more per call with ``max_chars``.
+    """
+    return _get_positive_int_env(
+        FETCH_WEB_CONTENT_MAX_CHARS, DEFAULT_FETCH_WEB_CONTENT_MAX_CHARS, minimum=1_000
+    )
 
 
 def get_web_search_provider() -> str:

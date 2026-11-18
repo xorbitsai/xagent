@@ -981,6 +981,19 @@ _OPEN_COMMAND_AND_REPLY_PRESENCE = select(
 
 
 def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
+    if release_hold.finishing:
+        # Finish-only mode: only commands of tasks whose lease this process
+        # holds, controls included. Never a task nobody or another process
+        # owns, and never one whose lease has lapsed (lease recovery is stopped
+        # here, so the serving generation takes those over).
+        #
+        # Every kind of an owned task stays claimable, START, RESUME_INPUT and
+        # MESSAGE included (the closed-cap ``active_ids`` branch passes them):
+        # a run waiting for user input could never finish otherwise. A task
+        # that keeps receiving follow-ups is therefore not handed over while
+        # they keep coming; that overlap is bounded by the deadline of the
+        # host action that began finishing, not by this process.
+        return and_(Task.runner_id == runner_id, Task.lease_expires_at > now)
     if get_shared_task_execution_enabled():
         # An empty immutable target must not let another worker steal live
         # owner commands and spend the defer budget waiting for that owner.
@@ -2840,6 +2853,22 @@ async def _dispatch_shared_task_command(
         )
 
     async def apply() -> bool:
+        # Finish-only mode can begin during the waits since the cap snapshot
+        # (``ensure`` can wait for an old owner, ``execute_command`` takes the
+        # task hop, the command lock and the admission release). The claim below
+        # still carries that stale cap, which would skip the closed-cap filter,
+        # and rebuilding the cap would not help: this attempt's own slot
+        # reservation makes the task look active. So at the last point before
+        # the claim, a command that would open an execution for a task none of
+        # this process's executions holds goes back to the serving generation.
+        # Returning here runs ``execute_command``'s idle check and the
+        # reservation's release below.
+        if (
+            release_hold.finishing
+            and kind.value in EXECUTION_OPENING_KINDS
+            and not background_task_manager.holds_execution(task_id)
+        ):
+            return False
         try:
             return await _dispatch_task_command(
                 executor, command_db_id=selected_id, cap=cap

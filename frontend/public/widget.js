@@ -299,6 +299,12 @@
   // zone. Optional: absent means the iframe URL is unchanged.
   var embedTimezone = (scriptTag.getAttribute('data-timezone') || '').trim();
 
+  // Appends name=value with the right separator. The value must already be
+  // encoded by the caller.
+  function appendParam(url, name, value) {
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + name + '=' + value;
+  }
+
   function withTimezone(url) {
     if (!embedTimezone) return url;
     var encoded;
@@ -310,7 +316,27 @@
     } catch {
       return url;
     }
-    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
+    return appendParam(url, 'timezone', encoded);
+  }
+
+  // The microphone is delegated to the chat iframe, and its URL marked with
+  // voice=1, unless the site sets data-voice="false". "true", an empty value,
+  // or no attribute all delegate it; any other value is treated as "false" and
+  // logs a warning. voice=1 is an unsigned hint that any page can add to the
+  // URL itself: it only says this script delegated the microphone. Whether
+  // voice calls are offered is decided by the server (the voice switch of the
+  // agent, workforce or grant, and whether the voice models are available),
+  // which the chat page reads at login or from the session payload, and which
+  // the voice endpoints check again on every request.
+  var embedVoiceRaw = (scriptTag.getAttribute('data-voice') || '').trim().toLowerCase();
+  var embedVoice = embedVoiceRaw === '' || embedVoiceRaw === 'true';
+  if (embedVoiceRaw && embedVoiceRaw !== 'true' && embedVoiceRaw !== 'false') {
+    console.warn('Xagent Widget: data-voice must be "true" or "false"; treating it as "false", so this page offers no voice calls.');
+  }
+
+  function withVoice(url) {
+    if (!embedVoice) return url;
+    return appendParam(url, 'voice', '1');
   }
 
   // Panel width: resizable via the left-edge drag handle, persisted across
@@ -613,11 +639,14 @@
   // Iframe
   var iframe = document.createElement('iframe');
   iframe.className = 'xagent-widget-iframe';
-  // The chat is cross-origin to the host page, and browsers refuse the async
-  // Clipboard API in a cross-origin iframe unless the embedder delegates it
-  // here; without this the chat's copy buttons could only rely on the legacy
-  // execCommand fallback.
-  iframe.setAttribute('allow', 'clipboard-write');
+  // The chat is cross-origin to the host page, so the embedder must delegate
+  // each powerful feature here. clipboard-write: without it the chat's copy
+  // buttons could only rely on the legacy execCommand fallback. microphone:
+  // needed for voice calls. Delegating it only lets the chat page request the
+  // microphone, which it does only after the visitor starts a call, and the
+  // visitor still has to agree in the browser's permission prompt. It is
+  // delegated unless the site sets data-voice="false".
+  iframe.setAttribute('allow', embedVoice ? 'clipboard-write; microphone' : 'clipboard-write');
   panel.appendChild(iframe);
 
   // Left-edge resize handle
@@ -1353,7 +1382,7 @@
           if (ticket) {
             url += '&embed_ticket=' + encodeURIComponent(ticket);
           }
-          iframe.src = withTimezone(url);
+          iframe.src = withTimezone(withVoice(url));
         }
 
         // Request a short-lived embed ticket from the top-level page. This fetch
@@ -1485,7 +1514,7 @@
 
     function attach(iframe) {
       state.iframe = iframe;
-      iframe.src = withTimezone(host + '/widget/chat/session');
+      iframe.src = withTimezone(withVoice(host + '/widget/chat/session'));
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);

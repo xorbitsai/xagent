@@ -88,6 +88,14 @@ def _patch_task_command_dispatcher_disabled(
     )
 
 
+def _without_sandbox_warmup(tasks: list) -> list:
+    """The image warmup runs on every startup that has a sandbox manager; these
+    tests count the migration/reconcile tasks, so identify it by name."""
+    from xagent.web.app import SANDBOX_WARMUP_TASK_NAME
+
+    return [t for t in tasks if t.get_name() != SANDBOX_WARMUP_TASK_NAME]
+
+
 @pytest.fixture(autouse=True)
 def unregister_startup_task_extensions():
     """Undo the task extensions ``startup_event()`` registers.
@@ -859,7 +867,7 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
     if created_tasks:
         await asyncio.gather(*created_tasks)
 
-    assert created_tasks == []
+    assert _without_sandbox_warmup(created_tasks) == []
     assert migration_called["value"] is False
     assert lease_recovery_starts == [web_app_module.app]
     assert runtime_start_order == ["admission", "trigger", "diagnostics"]
@@ -994,7 +1002,7 @@ async def test_startup_event_triggers_background_auto_migration(
     # orphaned temp-file cleanup task is gated off under pytest (it walks the
     # real uploads tree); its wiring/shutdown lifecycle is covered directly by
     # test_shutdown_event_stops_temp_file_cleanup_without_cancel below.
-    assert len(created_tasks) == 2
+    assert len(_without_sandbox_warmup(created_tasks)) == 2
     assert migration_called["value"] is True
     assert cleanup_scheduled == [web_app_module.app]
 
@@ -1110,7 +1118,7 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
     # We expect 1 task: uploaded files reconcile (runs under auto_migrate even
     # without migration needs). The orphaned temp-file cleanup task is gated off
     # under pytest; its lifecycle is covered by the dedicated shutdown test.
-    assert len(created_tasks) == 1
+    assert len(_without_sandbox_warmup(created_tasks)) == 1
     assert migration_called["value"] is False
 
 

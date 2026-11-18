@@ -794,7 +794,7 @@ _PROFILE_MODALITIES = {
 
 
 class _SoftModalityRoutingService:
-    """xrouter 0.3.6's modality contract: a preference, not a filter.
+    """xrouter's modality contract since 0.3.6: a preference, not a filter.
 
     Keeps only the models that accept every preferred modality when any do,
     otherwise the whole pool, and then picks the last remaining model -- a

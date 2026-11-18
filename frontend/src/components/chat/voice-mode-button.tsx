@@ -26,7 +26,7 @@ export function VoiceModeButton({ reason, disabled, disabledHint, iconOnly = fal
           aria-describedby={described ? id : undefined} disabled={unavailable}
           // Icon-only is the composer's main action while nothing is typed: the
           // same size and shape as the send button it swaps with.
-          className={cn(iconOnly && "h-8 w-8 rounded-lg p-0 motion-safe:animate-voice-pop", iconOnly && unavailable && "bg-muted text-muted-foreground/60")}
+          className={cn(iconOnly && "h-8 w-8 rounded-lg p-0 motion-safe:animate-voice-pop", iconOnly && (unavailable ? "bg-muted text-muted-foreground/60" : "agent-accent-surface"))}
           onMouseDown={event => event.preventDefault()} onClick={onClick}>
           <VoiceWaveIcon className="h-4 w-4" />
           {!iconOnly && <span className="ml-2">{t("voiceConversation.open")}</span>}

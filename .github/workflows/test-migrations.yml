@@ -204,6 +204,12 @@ on:
       - 'tests/web/api/test_fresh_message_ended_run.py'
   pull_request:
     branches: [main]
+  # An approval starts the migration tests of a pull request that has only had
+  # the quick run; see "Decide what this run covers". So does dismissing a
+  # review, which can approve a pull request without a new approval. Any other
+  # review starts a run whose jobs are all skipped.
+  pull_request_review:
+    types: [submitted, dismissed]
   # Required by the merge queue: without this the two required contexts below
   # are never reported on a merge group, its entries time out, and every merge
   # stalls. Harmless before a queue exists -- merge_group simply never fires.
@@ -218,10 +224,88 @@ jobs:
   detect-migration-changes:
     name: Detect migration changes
     runs-on: ubuntu-latest
+    # A review starts this workflow only to run it fully on an approval.
+    if: github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed'
+    permissions:
+      contents: read
+      # The review decision, and whether an approval's head already has a
+      # full verdict.
+      pull-requests: read
+      checks: read
     outputs:
       should-test: ${{ steps.changes.outputs.should-test }}
+      # 'true' for a full run, 'false' for the quick run of a pull request
+      # that is not approved yet, which skips both migration jobs and reports
+      # `Migrations Quick Summary`. Same rule as ci.yml; see
+      # docs/branch-protection.md "Quick runs before approval".
+      full: ${{ steps.scope.outputs.full }}
 
     steps:
+      - name: Decide what this run covers
+        id: scope
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          VERDICT_CHECK: Migrations Summary
+        run: |
+          full=true
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" || "${GITHUB_EVENT_NAME}" == "pull_request_review" ]]; then
+            # An approval starts this run before the decision it changes can
+            # always be read back, and a quick run here would leave an approved
+            # pull request without its required check: ask a few times.
+            attempts=1
+            if [[ "${GITHUB_EVENT_NAME}" == "pull_request_review" ]]; then
+              attempts=5
+            fi
+            for ((attempt = 1; attempt <= attempts; attempt++)); do
+              # shellcheck disable=SC2016 # GraphQL variables, not shell ones
+              if ! decision="$(gh api graphql \
+                -f query='query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) { reviewDecision }
+                  }
+                }' \
+                -f owner="${REPO%%/*}" -f name="${REPO#*/}" -F number="${PR_NUMBER}" \
+                --jq '.data.repository.pullRequest.reviewDecision // "NONE"')"; then
+                # Unknown: test everything rather than leave an approved pull
+                # request without its required check.
+                echo "::warning::could not read the review decision; running the full CI"
+                full=true
+                break
+              fi
+              echo "Review decision: ${decision}"
+              if [[ "${decision}" == "APPROVED" ]]; then
+                full=true
+                break
+              fi
+              full=false
+              if ((attempt < attempts)); then
+                sleep 3
+              fi
+            done
+            # A second approval of a head that already has its verdict, passed
+            # or failed, does not repeat the full run. A failed lookup repeats
+            # it rather than leave the head without one. This run's own checks
+            # do not count: re-running it after a failure must run it again.
+            if [[ "${GITHUB_EVENT_NAME}" == "pull_request_review" && "${full}" == "true" ]] &&
+              verdicts="$(gh api --method GET "repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+                -f check_name="${VERDICT_CHECK}" -f per_page=100 \
+                --jq '[.check_runs[]
+                       | select(.app.slug == "github-actions" and .status == "completed")
+                       | select(.conclusion == "success" or .conclusion == "failure")
+                       | select((.details_url // "") | contains("/runs/" + env.GITHUB_RUN_ID + "/") | not)]
+                      | length')" &&
+              [[ "${verdicts}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "${HEAD_SHA:0:9} already has a full verdict; not repeating it"
+              full=false
+            fi
+          fi
+          echo "full=${full}" >> "$GITHUB_OUTPUT"
+          echo "Full CI: ${full}"
+
       - name: Checkout code
         uses: actions/checkout@v7
         with:
@@ -443,7 +527,8 @@ jobs:
           )
 
           case "$EVENT_NAME" in
-            pull_request)
+            # An approval run tests the same pull request diff as its push.
+            pull_request|pull_request_review)
               base="$PR_BASE_SHA"
               head="$PR_HEAD_SHA"
               ;;
@@ -468,6 +553,9 @@ jobs:
   test-sqlite-migrations:
     name: Test SQLite Migrations
     needs: detect-migration-changes
+    # Full runs only. A quick run reports under another summary name, so this
+    # job-level skip cannot pass for the required check.
+    if: needs.detect-migration-changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -539,6 +627,9 @@ jobs:
   test-postgresql-migrations:
     name: Test PostgreSQL Migrations
     needs: detect-migration-changes
+    # Full runs only. A quick run reports under another summary name, so this
+    # job-level skip cannot pass for the required check.
+    if: needs.detect-migration-changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     # The serial migration and concurrency suites can exceed 40 minutes.
     timeout-minutes: 60
@@ -1175,7 +1266,8 @@ jobs:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
   migrations-summary:
-    name: Migrations Summary
+    # Only a full run may report the required name; see ci.yml's ci-summary.
+    name: ${{ (needs.detect-migration-changes.outputs.full == 'true' || (github.event_name != 'pull_request' && github.event_name != 'pull_request_review')) && 'Migrations Summary' || 'Migrations Quick Summary' }}
     runs-on: ubuntu-latest
     # always() is what makes this fail-closed. Without it a failure in
     # detect-migration-changes would skip this job too, and a *skipped* required
@@ -1183,7 +1275,7 @@ jobs:
     # go through with neither migration job having run. The individual job names
     # cannot be required contexts for the same reason; this one can, because it
     # always runs and turns every non-success into an explicit failure.
-    if: always()
+    if: always() && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved' || github.event.action == 'dismissed')
     needs:
       - detect-migration-changes
       - test-sqlite-migrations
@@ -1196,6 +1288,7 @@ jobs:
           DETECT_RESULT: ${{ needs.detect-migration-changes.result }}
           SQLITE_RESULT: ${{ needs.test-sqlite-migrations.result }}
           POSTGRESQL_RESULT: ${{ needs.test-postgresql-migrations.result }}
+          FULL: ${{ needs.detect-migration-changes.outputs.full }}
         run: |
           set -uo pipefail
 
@@ -1203,14 +1296,27 @@ jobs:
           check_job() {
             local name="$1"
             local result="$2"
-            if [ "$result" != "success" ]; then
-              echo "::error::$name finished with result: $result"
+            local expected="${3:-success}"
+            if [ "$result" != "$expected" ]; then
+              echo "::error::$name finished with result: $result (expected $expected)"
               failed=1
             fi
           }
 
+          # A quick run must have skipped both migration jobs; anything but a
+          # literal true or false is neither run.
+          case "$FULL" in
+            true) tests_expected=success ;;
+            false) tests_expected=skipped ;;
+            *)
+              echo "::error::detect-migration-changes.outputs.full is '$FULL', expected true or false"
+              failed=1
+              tests_expected=success
+              ;;
+          esac
+
           check_job "detect-migration-changes" "$DETECT_RESULT"
-          check_job "test-sqlite-migrations" "$SQLITE_RESULT"
-          check_job "test-postgresql-migrations" "$POSTGRESQL_RESULT"
+          check_job "test-sqlite-migrations" "$SQLITE_RESULT" "$tests_expected"
+          check_job "test-postgresql-migrations" "$POSTGRESQL_RESULT" "$tests_expected"
 
           exit "$failed"

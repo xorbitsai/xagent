@@ -8,6 +8,8 @@ import type { WorkforceDetail } from "@/types/workforce"
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const copyToClipboardMock = vi.hoisted(() => vi.fn())
 const getWorkforceWidgetConfigMock = vi.hoisted(() => vi.fn())
+const getWorkforceWidgetVoiceMock = vi.hoisted(() => vi.fn())
+const setWorkforceWidgetVoiceMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", () => ({
@@ -25,6 +27,8 @@ vi.mock("@/lib/utils", async (importOriginal) => ({
 
 vi.mock("@/lib/workforces-api", () => ({
   getWorkforceWidgetConfig: getWorkforceWidgetConfigMock,
+  getWorkforceWidgetVoice: getWorkforceWidgetVoiceMock,
+  setWorkforceWidgetVoice: setWorkforceWidgetVoiceMock,
   rotateWorkforceWidgetKey: vi.fn(),
   updateWorkforceWidgetConfig: vi.fn(),
 }))
@@ -74,6 +78,13 @@ describe("WorkforceWidgetDialog", () => {
       widget_key: "wk-regional",
       allowed_domains: ["*"],
     })
+    getWorkforceWidgetVoiceMock.mockReset()
+    getWorkforceWidgetVoiceMock.mockResolvedValue({
+      enabled: false,
+      available: null,
+      reason: null,
+    })
+    setWorkforceWidgetVoiceMock.mockReset()
     copyToClipboardMock.mockReset()
     copyToClipboardMock.mockResolvedValue(true)
     toastErrorMock.mockReset()
@@ -164,5 +175,102 @@ describe("WorkforceWidgetDialog", () => {
         "workforces.widget.messages.copy_failed",
       )
     })
+  })
+
+  it("places the voice switch above the snippet when the widget is enabled", async () => {
+    render(
+      <WorkforceWidgetDialog
+        workforce={WORKFORCE}
+        open
+        onClose={vi.fn()}
+      />,
+    )
+
+    const voiceSwitch = await screen.findByRole("switch", {
+      name: "widget_voice_setting.toggle_label",
+    })
+    await waitFor(() => expect(voiceSwitch).toBeEnabled())
+    expect(getWorkforceWidgetVoiceMock).toHaveBeenCalledWith(42)
+
+    const snippetTitle = screen.getByText("workforces.widget.snippet_title")
+    expect(
+      voiceSwitch.compareDocumentPosition(snippetTitle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+    const optOutNote = screen.getByText("widget_voice_setting.opt_out_note")
+    expect(
+      snippetTitle.compareDocumentPosition(optOutNote) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it("saves the voice switch through the workforce endpoint", async () => {
+    setWorkforceWidgetVoiceMock.mockResolvedValue({
+      enabled: true,
+      available: true,
+      reason: null,
+    })
+    render(
+      <WorkforceWidgetDialog
+        workforce={WORKFORCE}
+        open
+        onClose={vi.fn()}
+      />,
+    )
+
+    const voiceSwitch = await screen.findByRole("switch", {
+      name: "widget_voice_setting.toggle_label",
+    })
+    await waitFor(() => expect(voiceSwitch).toBeEnabled())
+    fireEvent.click(voiceSwitch)
+
+    await waitFor(() => expect(voiceSwitch).toHaveAttribute("aria-checked", "true"))
+    expect(setWorkforceWidgetVoiceMock).toHaveBeenCalledWith(42, true)
+  })
+
+  it("shows neither the voice switch nor its snippet note when the widget is disabled", async () => {
+    getWorkforceWidgetConfigMock.mockResolvedValue({
+      workforce_id: 42,
+      widget_enabled: false,
+      widget_key: null,
+      allowed_domains: [],
+    })
+    render(
+      <WorkforceWidgetDialog
+        workforce={WORKFORCE}
+        open
+        onClose={vi.fn()}
+      />,
+    )
+
+    await screen.findByText("workforces.widget.widget_enabled")
+
+    expect(
+      screen.queryByRole("switch", { name: "widget_voice_setting.toggle_label" }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("widget_voice_setting.opt_out_note"),
+    ).not.toBeInTheDocument()
+    expect(getWorkforceWidgetVoiceMock).not.toHaveBeenCalled()
+  })
+
+  it("shows neither the voice switch nor its snippet note for a workforce that is not active", async () => {
+    render(
+      <WorkforceWidgetDialog
+        workforce={{ ...WORKFORCE, status: "draft" } as WorkforceDetail}
+        open
+        onClose={vi.fn()}
+      />,
+    )
+
+    await screen.findByText("workforces.widget.publish_required")
+
+    expect(
+      screen.queryByRole("switch", { name: "widget_voice_setting.toggle_label" }),
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("widget_voice_setting.opt_out_note"),
+    ).not.toBeInTheDocument()
+    expect(getWorkforceWidgetVoiceMock).not.toHaveBeenCalled()
   })
 })

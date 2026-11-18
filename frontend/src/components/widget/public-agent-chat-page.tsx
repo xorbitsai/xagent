@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
+import { WidgetVoiceConversation } from "@/components/chat/widget-voice-conversation"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
@@ -10,16 +11,22 @@ import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import { useWidgetOpenMessage, W_SEND_FAILED } from "@/hooks/use-widget-open-message"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
+import { VoiceCallStoreProvider } from "@/contexts/voice-call-store"
+import { classifyWidgetVoiceEvent, WIDGET_VOICE_BUSY_TASK_STATUSES, widgetVoiceAnswerRequestId } from "@/hooks/use-widget-voice-call"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { clientErrorTranslationKey } from "@/lib/client-errors"
 import { notifySendFailure } from "@/lib/send-failure-notice"
+import { pageMayUseMicrophone } from "@/lib/widget-microphone"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import { requestPromptContext } from "@/lib/widget-parent-message"
 import {
   getApiUrl,
+  getWsUrl,
 } from "@/lib/utils"
+import type { VoiceAudioTransport } from "@/lib/voice-audio"
+import { websocketAuthProtocols } from "@/lib/websocket-auth"
 
 interface PublicAgentChatPageProps {
   authMode: "widget" | "share"
@@ -39,6 +46,25 @@ type PublicAuthResult = {
   suggested_prompts?: string[] | null
   // Set instead of agent_id when the share token exposes a workforce.
   workforce_id?: number | null
+  // The server offers voice calls to this widget visitor. Missing means no.
+  voice_enabled?: boolean | null
+}
+
+// A voice call is offered only to an embedded widget whose server said so, and
+// only where the page can use the microphone: as a top-level page, or in an
+// iframe widget.js delegated the microphone to (it adds voice=1 unless the
+// site set data-voice="false"), and only where pageMayUseMicrophone() finds
+// the page secure and not blocked by a permissions policy. voice=1 is an
+// unsigned hint that any page can add to the URL itself and is not a
+// permission: whether voice calls are offered is decided by the server
+// (voice_enabled in the login response), and the voice endpoints check again
+// on every request.
+function widgetVoiceCallOffered(authMode: "widget" | "share", voiceEnabled: boolean | null | undefined): boolean {
+  if (authMode !== "widget" || voiceEnabled !== true) return false
+  let topLevel = false
+  try { topLevel = window.self === window.top } catch { topLevel = false }
+  const delegated = topLevel || new URLSearchParams(window.location.search).get("voice") === "1"
+  return delegated && pageMayUseMicrophone()
 }
 
 interface PublicConversationContentProps {
@@ -53,6 +79,7 @@ interface PublicConversationContentProps {
   agentDescription: string | null
   suggestedPrompts: string[]
   onAuthInvalidated?: () => void
+  voiceCallOffered?: boolean
 }
 
 // WS-close reasons that mean "this session isn't usable as-is" rather than a
@@ -147,6 +174,7 @@ function PublicConversationContent({
   agentDescription,
   suggestedPrompts,
   onAuthInvalidated,
+  voiceCallOffered = false,
 }: PublicConversationContentProps) {
   const {
     state,
@@ -154,6 +182,9 @@ function PublicConversationContent({
     sendMessage,
     setTaskId,
     connectionError,
+    connectionPhase,
+    isConnected,
+    isMessageDeliveryPending,
     voiceInputEnabled,
     isSendInFlight,
   } = useApp()
@@ -444,6 +475,36 @@ function PublicConversationContent({
     takeOpenRequest,
   ])
 
+  const [voiceOpen, setVoiceOpen] = useState(false)
+  const voiceTransport = useMemo<VoiceAudioTransport>(() => ({
+    // Same handshake credential as the chat socket; the server picks the models.
+    openAsrSocket: () => new WebSocket(`${getWsUrl().replace(/\/$/, "")}/api/widget/voice/asr`, websocketAuthProtocols(accessToken)),
+    startFrame: { type: "start", format: "pcm", sample_rate: 16000 },
+    requestTts: (text, signal) => fetch(`${getApiUrl()}/api/widget/voice/tts`, {
+      method: "POST", signal,
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }),
+    classify: classifyWidgetVoiceEvent,
+  }), [accessToken])
+  const taskStatus = state.currentTask?.status || ""
+  // Not connected yet, or a first message still in flight, only holds the
+  // words back; a lost connection is what ends the call.
+  const voiceBusy = state.taskId === null
+    ? isBootstrappingTask || isSendInFlight
+    : state.isProcessing || isMessageDeliveryPending || !isConnected || isSendInFlight
+      || WIDGET_VOICE_BUSY_TASK_STATUSES.includes(taskStatus)
+  const voiceDisabled = state.taskId !== null && connectionPhase === "lost"
+  // Spoken words are sent exactly as the composer sends typed ones: with the
+  // call's client message id, and answering the question the task is waiting
+  // on (the same request id the conversation panel hands the composer).
+  const sendSpoken = useCallback((text: string, clientMessageId: string) => {
+    const requestId = widgetVoiceAnswerRequestId(state.currentTask, state.taskId)
+    return handleSend(text, { clientMessageId, ...(requestId ? { metadata: { request_id: requestId } } : {}) }, [])
+  }, [handleSend, state.currentTask, state.taskId])
+  const openVoiceCall = useCallback(() => setVoiceOpen(true), [])
+  const VoiceScope = voiceCallOffered ? VoiceCallStoreProvider : React.Fragment
+
   const resolvedAgentName = state.currentTask?.agentName || agentName || t("widgetChat.title")
   const resolvedAgentLogo = state.currentTask?.agentLogoUrl || agentLogo || null
   const shouldShowStartScreen = !state.taskId && hasResolvedStoredTask
@@ -504,6 +565,23 @@ function PublicConversationContent({
         </div>
       </div>
 
+      <VoiceScope>
+      {voiceCallOffered && (
+        <WidgetVoiceConversation
+          transport={voiceTransport}
+          taskId={state.taskId}
+          messages={state.messages}
+          busy={voiceBusy}
+          waiting={taskStatus === "waiting_for_user"}
+          disabled={voiceDisabled}
+          onSend={sendSpoken}
+          // The widget socket accepts no pause: talking over the answer stops
+          // the speech, and the words go once the current run has finished.
+          onInterrupt={() => false}
+          open={voiceOpen}
+          onOpenChange={setVoiceOpen}
+        />
+      )}
       <div className="flex-1 min-h-0">
         {!hasResolvedStoredTask && !state.taskId ? (
           <div className="flex h-full items-center justify-center">
@@ -527,6 +605,8 @@ function PublicConversationContent({
                 compactInput={true}
                 deferFileUpload={true}
                 voiceInputEnabled={voiceInputEnabled}
+                onVoiceConversation={voiceCallOffered ? openVoiceCall : undefined}
+                voiceConversationSource={voiceCallOffered ? "provided" : "account"}
                 autoFocus={true}
                 inputMinHeightClass="min-h-[44px]"
               />
@@ -548,9 +628,11 @@ function PublicConversationContent({
             compactInput={true}
             deferFileUpload={true}
             onSend={handleSend}
+            onProvidedVoiceConversation={voiceCallOffered ? openVoiceCall : undefined}
           />
         )}
       </div>
+      </VoiceScope>
     </div>
   )
 }
@@ -754,6 +836,7 @@ export function PublicAgentChatPage({
         agentDescription={resolvedAuthResult.agent_description ?? null}
         suggestedPrompts={resolvedAuthResult.suggested_prompts ?? []}
         onAuthInvalidated={onAuthInvalidated}
+        voiceCallOffered={widgetVoiceCallOffered(authMode, resolvedAuthResult.voice_enabled)}
       />
     </AppProvider>
   )

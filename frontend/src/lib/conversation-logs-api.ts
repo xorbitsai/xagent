@@ -96,26 +96,117 @@ export interface ConversationLogDetailResponse {
   read_only: boolean
 }
 
-export async function fetchConversationLogs(params: {
+export interface ConversationLogFilters {
   source: ConversationLogSource
   agentId?: number | null
   search?: string
-  page: number
-  perPage: number
-}): Promise<ConversationLogListResponse> {
-  const query = new URLSearchParams({
-    page: String(params.page),
-    per_page: String(params.perPage),
-    source: params.source,
-  })
-  if (params.agentId) query.set("agent_id", String(params.agentId))
-  if (params.search?.trim()) query.set("search", params.search.trim())
+  // UTC ISO timestamps; the window is [activeFrom, activeTo).
+  activeFrom?: string | null
+  activeTo?: string | null
+}
+
+/**
+ * The filter part of the list and export requests. Both endpoints take the
+ * same filters, so they are built in one place and cannot drift apart.
+ */
+export function buildConversationLogFilterQuery(
+  filters: ConversationLogFilters
+): URLSearchParams {
+  const query = new URLSearchParams({ source: filters.source })
+  if (filters.agentId) query.set("agent_id", String(filters.agentId))
+  if (filters.search?.trim()) query.set("search", filters.search.trim())
+  if (filters.activeFrom) query.set("active_from", filters.activeFrom)
+  if (filters.activeTo) query.set("active_to", filters.activeTo)
+  return query
+}
+
+export async function fetchConversationLogs(
+  params: ConversationLogFilters & {
+    page: number
+    perPage: number
+  }
+): Promise<ConversationLogListResponse> {
+  const query = buildConversationLogFilterQuery(params)
+  query.set("page", String(params.page))
+  query.set("per_page", String(params.perPage))
 
   const response = await apiRequest(`${getApiUrl()}/api/conversation-logs?${query}`)
   if (!response.ok) {
     throw new Error("Failed to load conversation logs")
   }
   return response.json()
+}
+
+export type ConversationLogExportLimitReason = "rows" | "bytes"
+
+/**
+ * The export endpoint refuses, with no file, a result that has too many rows
+ * or is too large; `limit` is the row count or the byte size, per `reason`.
+ */
+export class ConversationLogExportTooLargeError extends Error {
+  readonly reason: ConversationLogExportLimitReason
+  readonly limit: number
+
+  constructor(reason: ConversationLogExportLimitReason, limit: number) {
+    super("Conversation log export is too large")
+    this.name = "ConversationLogExportTooLargeError"
+    this.reason = reason
+    this.limit = limit
+  }
+}
+
+function exportTooLargeFromBody(body: unknown): ConversationLogExportTooLargeError | null {
+  const detail =
+    body && typeof body === "object" ? (body as { detail?: unknown }).detail : undefined
+  if (!detail || typeof detail !== "object") return null
+  const { code, reason, limit } = detail as {
+    code?: unknown
+    reason?: unknown
+    limit?: unknown
+  }
+  if (code !== "conversation_log_export_too_large") return null
+  if (reason !== "rows" && reason !== "bytes") return null
+  if (typeof limit !== "number" || !Number.isFinite(limit)) return null
+  return new ConversationLogExportTooLargeError(reason, limit)
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0")
+}
+
+function exportFilename(now: Date): string {
+  const date = `${now.getFullYear()}${pad2(now.getMonth() + 1)}${pad2(now.getDate())}`
+  const time = `${pad2(now.getHours())}${pad2(now.getMinutes())}${pad2(now.getSeconds())}`
+  return `conversation-logs-${date}-${time}.csv`
+}
+
+/**
+ * Downloads the CSV for the given filters. The file name is generated here
+ * from the local time rather than read from the response headers.
+ */
+export async function downloadConversationLogsCsv(
+  filters: ConversationLogFilters,
+  now: Date = new Date()
+): Promise<void> {
+  const query = buildConversationLogFilterQuery(filters)
+  const response = await apiRequest(`${getApiUrl()}/api/conversation-logs/export?${query}`)
+  if (!response.ok) {
+    if (response.status === 422) {
+      const tooLarge = exportTooLargeFromBody(await response.json().catch(() => null))
+      if (tooLarge) throw tooLarge
+    }
+    throw new Error("Failed to export conversation logs")
+  }
+
+  const blob = await response.blob()
+  const url = window.URL.createObjectURL(blob)
+  const link = document.createElement("a")
+  link.href = url
+  link.download = exportFilename(now)
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  window.URL.revokeObjectURL(url)
 }
 
 /**

@@ -38,6 +38,17 @@ class StandbyActivationError(RuntimeError):
     """Activation failed or was refused; the process stays closed."""
 
 
+class StandbyStepTimeoutError(StandbyActivationError):
+    """One activation step exceeded its bound; ``step`` names it."""
+
+    def __init__(self, step: str, timeout: float) -> None:
+        super().__init__(
+            f"standby activation step {step!r} did not finish within {timeout:g}s"
+        )
+        self.step = step
+        self.timeout = timeout
+
+
 DeferredStep = Callable[[], Awaitable[None]]
 FailureHook = Callable[[], Awaitable[None]]
 
@@ -185,7 +196,7 @@ class StandbyController:
                     step_started = time.monotonic()
                     probe.max_lag = 0.0
                     try:
-                        await step()
+                        await self._run_step(name, step)
                     finally:
                         logger.info(
                             "Standby activation step %s took %.2fs "
@@ -220,6 +231,31 @@ class StandbyController:
                     "Standby activation complete in %.2fs",
                     time.monotonic() - overall_started,
                 )
+
+    @staticmethod
+    async def _run_step(name: str, step: DeferredStep) -> None:
+        """Run one step under the per-step bound; a timeout names the step.
+
+        ``asyncio.timeout`` cancels the step and then waits for it to unwind, so
+        a step that holds blocking work in ``run_tracked_to_completion`` still
+        joins its worker thread before the failure surfaces: a timeout never
+        abandons a running thread. The same holds for Docker lifecycle work:
+        every thread-backed container mutation under a per-name lock is awaited
+        with ``await_shielded``, so cancelling a step cannot release same-name
+        exclusion while an issued stop is still running. A ``TimeoutError``
+        raised by the step itself is not ours and propagates unchanged.
+        """
+        from ...config import get_standby_step_timeout_seconds
+
+        timeout = get_standby_step_timeout_seconds()
+        deadline = asyncio.timeout(timeout)
+        try:
+            async with deadline:
+                await step()
+        except TimeoutError:
+            if deadline.expired():
+                raise StandbyStepTimeoutError(name, timeout) from None
+            raise
 
     def snapshot(self) -> dict[str, object]:
         return {

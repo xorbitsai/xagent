@@ -1,12 +1,14 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Bot, ChevronLeft, ChevronRight, Inbox } from "lucide-react"
+import { Bot, ChevronLeft, ChevronRight, Download, Inbox, X } from "lucide-react"
+import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { CompactionNotice } from "@/components/chat/CompactionNotice"
 import { TraceEventRenderer } from "@/components/chat/TraceEventRenderer"
+import { Input } from "@/components/ui/input"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { SearchInput } from "@/components/ui/search-input"
 import { useI18n } from "@/contexts/i18n-context"
@@ -17,6 +19,8 @@ import {
   type ConversationLogSource,
   type ConversationLogSummary,
   ConversationLogExpiredError,
+  ConversationLogExportTooLargeError,
+  downloadConversationLogsCsv,
   fetchConversationLogDetail,
   fetchConversationLogs,
 } from "@/lib/conversation-logs-api"
@@ -63,6 +67,16 @@ function formatRelativeTime(value: string | null | undefined, locale: string): s
   return formatter.format(deltaSeconds, "second")
 }
 
+const BYTES_PER_MB = 1024 * 1024
+
+/** A `datetime-local` value (local wall time) as a UTC ISO string, or null when empty or invalid. */
+function localInputToIso(value: string): string | null {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toISOString()
+}
+
 function sourceLabel(log: ConversationLogSummary): string {
   return log.source_label || log.source
 }
@@ -76,7 +90,10 @@ export function ConversationLogsPage() {
   const [source, setSource] = useState<ConversationLogSource>("all")
   const [agentId, setAgentId] = useState<number | null>(null)
   const [search, setSearch] = useState("")
+  const [activeFrom, setActiveFrom] = useState("")
+  const [activeTo, setActiveTo] = useState("")
   const [page, setPage] = useState(1)
+  const [isExporting, setIsExporting] = useState(false)
   const [listData, setListData] = useState<ConversationLogListResponse | null>(null)
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null)
   const selectedTaskIdRef = useRef<number | null>(null)
@@ -121,7 +138,20 @@ export function ConversationLogsPage() {
     selectedTaskIdRef.current = selectedTaskId
   }, [selectedTaskId])
 
+  const activeFromIso = useMemo(() => localInputToIso(activeFrom), [activeFrom])
+  const activeToIso = useMemo(() => localInputToIso(activeTo), [activeTo])
+  const timeRangeInvalid =
+    activeFromIso !== null &&
+    activeToIso !== null &&
+    new Date(activeFromIso).getTime() >= new Date(activeToIso).getTime()
+
   useEffect(() => {
+    // An empty window selects nothing, so no request is sent and the last
+    // result stays on screen until the range is fixed.
+    if (timeRangeInvalid) {
+      setIsLoading(false)
+      return
+    }
     let cancelled = false
 
     async function loadLogs() {
@@ -132,6 +162,8 @@ export function ConversationLogsPage() {
           source,
           agentId,
           search,
+          activeFrom: activeFromIso,
+          activeTo: activeToIso,
           page,
           perPage: PER_PAGE,
         })
@@ -171,7 +203,7 @@ export function ConversationLogsPage() {
     return () => {
       cancelled = true
     }
-  }, [agentId, loadDetail, page, search, source])
+  }, [activeFromIso, activeToIso, agentId, loadDetail, page, search, source, timeRangeInvalid])
 
   const tabs = useMemo(() => {
     const counts = listData?.source_counts
@@ -183,7 +215,12 @@ export function ConversationLogsPage() {
 
   const logs = listData?.logs ?? []
   const pagination = listData?.pagination
-  const hasFilter = source !== "all" || Boolean(search.trim()) || agentId !== null
+  const hasFilter =
+    source !== "all" ||
+    Boolean(search.trim()) ||
+    agentId !== null ||
+    Boolean(activeFrom || activeTo)
+  const exportDisabled = isExporting || timeRangeInvalid || (pagination?.total ?? 0) === 0
 
   function selectLog(taskId: number) {
     selectedTaskIdRef.current = taskId
@@ -204,6 +241,43 @@ export function ConversationLogsPage() {
   function updateAgent(nextAgentId: string) {
     setAgentId(nextAgentId === "all" ? null : Number(nextAgentId))
     setPage(1)
+  }
+
+  function updateActiveFrom(value: string) {
+    setActiveFrom(value)
+    setPage(1)
+  }
+
+  function updateActiveTo(value: string) {
+    setActiveTo(value)
+    setPage(1)
+  }
+
+  async function exportCsv() {
+    setIsExporting(true)
+    try {
+      await downloadConversationLogsCsv({
+        source,
+        agentId,
+        search,
+        activeFrom: activeFromIso,
+        activeTo: activeToIso,
+      })
+    } catch (err) {
+      if (err instanceof ConversationLogExportTooLargeError) {
+        toast.error(
+          err.reason === "rows"
+            ? t("conversationLogs.exportTooManyRows", { limit: err.limit })
+            : t("conversationLogs.exportTooLargeFile", {
+                limitMb: Math.round(err.limit / BYTES_PER_MB),
+              })
+        )
+      } else {
+        toast.error(t("conversationLogs.exportFailed"))
+      }
+    } finally {
+      setIsExporting(false)
+    }
   }
 
   return (
@@ -267,6 +341,64 @@ export function ConversationLogsPage() {
             />
           </div>
         </div>
+
+        <div className="mt-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            {(
+              [
+                {
+                  label: t("conversationLogs.activeFromLabel"),
+                  value: activeFrom,
+                  update: updateActiveFrom,
+                },
+                {
+                  label: t("conversationLogs.activeToLabel"),
+                  value: activeTo,
+                  update: updateActiveTo,
+                },
+              ] as const
+            ).map((field) => (
+              <div key={field.label} className="flex items-center gap-1">
+                <Input
+                  type="datetime-local"
+                  value={field.value}
+                  onChange={(event) => field.update(event.target.value)}
+                  aria-label={field.label}
+                  aria-invalid={timeRangeInvalid}
+                  className="h-9 w-full rounded-lg border-slate-200 bg-white text-sm sm:w-52"
+                />
+                {field.value ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-8 w-8"
+                    aria-label={`${t("conversationLogs.clearTime")} - ${field.label}`}
+                    onClick={() => field.update("")}
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                ) : null}
+              </div>
+            ))}
+          </div>
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={exportDisabled}
+            onClick={() => void exportCsv()}
+          >
+            <Download className="h-4 w-4" />
+            {isExporting ? t("conversationLogs.exporting") : t("conversationLogs.export")}
+          </Button>
+        </div>
+        {timeRangeInvalid ? (
+          <p role="alert" className="mt-2 text-xs text-rose-600">
+            {t("conversationLogs.timeRangeInvalid")}
+          </p>
+        ) : null}
       </header>
 
       <main className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-[minmax(320px,372px)_minmax(0,1fr)] md:overflow-hidden">

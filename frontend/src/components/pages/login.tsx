@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input"
 import { getApiUrl } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { apiRequest } from "@/lib/api-wrapper"
+import { readSessionEndNotice } from "@/lib/idle-session"
 import {
   ArrowRight,
   Loader2,
@@ -27,6 +28,11 @@ import { authMutationUnavailableTranslationKey } from "@/lib/auth-pages"
 
 function isAuthMutationUnavailableReason(value: string | null): value is Parameters<typeof authMutationUnavailableTranslationKey>[0] {
   return value === "storage_unavailable" || value === "coordination_unavailable" || value === "operation_failed"
+}
+
+/** Another tab, or this one, may have been signed out by the server's idle policy. */
+function readStoredSessionEndNotice() {
+  try { return readSessionEndNotice(window.localStorage) } catch { return null }
 }
 
 export function LoginPage() {
@@ -57,6 +63,8 @@ export function LoginPage() {
     const oidcError = params.get("oidc_error")
     if (params.get("password_changed") === "1") {
       setNotice(t("settings.password.sign_in_again"))
+    } else if (readStoredSessionEndNotice() === "session_expired") {
+      setNotice(t("login.session_expired"))
     }
     if (isAuthMutationUnavailableReason(authUnavailable)) {
       setError(authMutationUnavailableMessage(authUnavailable))

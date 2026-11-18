@@ -91,6 +91,7 @@ from ....tools.adapters.vibe.interaction_types import (
     OPTIONS_REQUIRED_GUIDANCE,
     SUGGESTED_VALUE_GUIDANCE,
     degrade_options_less_pickers,
+    is_live_widget,
     lacks_required_options,
 )
 from ....tools.adapters.vibe.mcp_approval_gate import (
@@ -692,6 +693,10 @@ def _is_answerable(interaction: Any) -> bool:
     embedded widget's default ``filesDisabled``: a ``file_upload`` renders
     nothing, and an ``action_cards`` whose options are all file actions
     renders no cards (``visibleOptions``, clarification-form.tsx).
+
+    A tool-authored live widget (``is_live_widget``) is deliberately *not*
+    answerable here: it is a control to act on, not a field to answer, and
+    ``_send_waiting_message`` handles it separately.
     """
 
     if not isinstance(interaction, dict):
@@ -5284,6 +5289,7 @@ class ReActPattern(AgentPattern):
         interactions: list[dict[str, Any]],
         metadata: dict[str, Any],
         visible: bool = True,
+        allow_live_widgets: bool = False,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Publish a message that suspends the run, and return what it carried.
 
@@ -5292,6 +5298,10 @@ class ReActPattern(AgentPattern):
         ``runtime.send_message``, which also serves non-suspending messages
         that must stay field-free, and whose callers need the published list
         back to store on the waiting request.
+
+        The one exception to the guarantee: a list made up only of tool-authored
+        live widgets (``allow_live_widgets``) is published as it is, because the
+        widget itself is what the user acts on.
 
         Appended, never substituted for the list: an entry this check cannot
         answer can still be a real control -- ``connect_apps`` is one the
@@ -5303,7 +5313,17 @@ class ReActPattern(AgentPattern):
         """
 
         published = list(interactions)
-        if not any(_is_answerable(item) for item in published):
+        # ``allow_live_widgets`` is passed only for tool-authored interactions.
+        # A live widget (``live_widget``) is the control the user acts on, so
+        # no text box is added when *every* published item is one. A batch that
+        # mixes a live widget with another tool's unanswerable entry still gets
+        # the default field, so that sibling stays answerable. Model-authored
+        # questions never pass the flag.
+        if not any(_is_answerable(item) for item in published) and not (
+            allow_live_widgets
+            and published
+            and all(is_live_widget(item) for item in published)
+        ):
             appended = dict(DEFAULT_WAITING_INTERACTION)
             appended["field"] = _unique_field(
                 str(appended["field"]),
@@ -5639,6 +5659,7 @@ class ReActPattern(AgentPattern):
             message=message,
             message_type=message_type,
             interactions=interactions,
+            allow_live_widgets=True,
             metadata={
                 "tool_calls": [
                     self._tool_message_source(

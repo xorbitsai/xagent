@@ -18,12 +18,34 @@ from ...utils.egress_proxy import get_proxy_url as get_proxy_url
 from ...utils.egress_proxy import get_trusted_proxy_url as get_trusted_proxy_url
 from ...utils.public_network_proxy import PublicNetworkEgressProxy
 from ...utils.security import PrivateNetworkHostError, fetch_public_http_bytes
+from .search_result_pages import search_result_page_refusal
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024
 MAX_DISCOVERED_ASSETS = 50
+# Page furniture that carries no answer text. Dropped only when the caller asks
+# for a trimmed page (``trim_boilerplate``).
+BOILERPLATE_TAGS = ("nav", "aside", "iframe", "dialog")
+# Page-level furniture. Inside a selected main region these are the headline,
+# byline and date of the article itself, so they are kept there.
+PAGE_FURNITURE_TAGS = ("header", "footer")
+ARTICLE_LIKE_TAGS = ["article", "main", "section"]
+BOILERPLATE_ROLES = frozenset({"navigation", "complementary"})
+PAGE_FURNITURE_ROLES = frozenset({"banner", "contentinfo"})
+# If trimming leaves less than this share of the page text, the page does not
+# have the usual shape (for example a body wrapped in one element we would
+# strip), so the untrimmed page is returned instead of an empty one.
+MIN_TRIMMED_TEXT_SHARE = 0.2
+# A <main>/<article> region is used instead of the whole page only when it holds
+# at least this much text; a short one is usually a widget, not the content.
+MIN_MAIN_REGION_CHARS = 400
+TRUNCATION_NOTICE = (
+    "\n\n[Page text cut: showing characters {start}-{end} of {total}. "
+    "To read on, call again with start_char={end}.]"
+)
+FINAL_SLICE_NOTICE = "\n\n[End of page: showing characters {start}-{end} of {total}.]"
 # Statuses a site returns when it refuses an automated client rather than
 # because the page is missing or the fetcher failed.
 SITE_BLOCKED_STATUS_CODES = frozenset({401, 403, 429, 451})
@@ -84,6 +106,8 @@ class WebContentFetchResult:
     error: str | None = None
     assets: tuple[WebAssetReference, ...] = ()
     blocked_by_site: bool = False
+    # True when the fetch was refused by tool policy before any request.
+    blocked_by_policy: bool = False
 
     @property
     def success(self) -> bool:
@@ -107,6 +131,7 @@ class WebContentFetchResult:
             "error": self.error,
             "assets": [asset.as_dict() for asset in self.assets],
             "blocked_by_site": self.blocked_by_site,
+            "blocked_by_policy": self.blocked_by_policy,
         }
 
 
@@ -203,7 +228,15 @@ class WebContentFetcher:
         *,
         include_assets: bool = False,
         asset_query: str | None = None,
+        trim_boilerplate: bool = False,
     ) -> WebContentFetchResult:
+        # Before the log line below: a refused URL carries the search text.
+        refusal = search_result_page_refusal(url)
+        if refusal is not None:
+            return WebContentFetchResult(
+                url=url, content="", error=refusal, blocked_by_policy=True
+            )
+
         logger.info("Fetching webpage content from: %s", url)
 
         headers = {"User-Agent": DEFAULT_USER_AGENT}
@@ -249,7 +282,9 @@ class WebContentFetcher:
                         discovered_assets,
                         asset_query=asset_query,
                     )
-                markdown = self._soup_to_markdown(soup, final_url)
+                markdown = self._soup_to_markdown(
+                    soup, final_url, trim_boilerplate=trim_boilerplate
+                )
 
                 return WebContentFetchResult(
                     url=final_url,
@@ -419,9 +454,14 @@ class WebContentFetcher:
         return ""
 
     @staticmethod
-    def _soup_to_markdown(soup: BeautifulSoup, base_url: str) -> str:
+    def _soup_to_markdown(
+        soup: BeautifulSoup, base_url: str, *, trim_boilerplate: bool = False
+    ) -> str:
         for element in soup(["script", "style", "noscript", "svg"]):
             element.decompose()
+
+        if trim_boilerplate:
+            soup = _trim_boilerplate(soup)
 
         for tag in soup.find_all("a"):
             if not hasattr(tag, "get") or not hasattr(tag, "__setitem__"):
@@ -440,6 +480,90 @@ class WebContentFetcher:
         return markdown
 
 
+def _text_length(node: Any) -> int:
+    return len(node.get_text(" ", strip=True))
+
+
+def _select_main_region(soup: BeautifulSoup) -> Any:
+    """First of <main>, a lone <article>, role=main holding real text."""
+
+    articles = soup.find_all("article")
+    candidates = (
+        soup.find("main"),
+        articles[0] if len(articles) == 1 else None,
+        soup.find(attrs={"role": "main"}),
+    )
+    for candidate in candidates:
+        if candidate is not None and _text_length(candidate) >= MIN_MAIN_REGION_CHARS:
+            return candidate
+    return None
+
+
+def _remove_boilerplate(soup: BeautifulSoup, *, page_level: bool) -> None:
+    tags = BOILERPLATE_TAGS
+    roles = BOILERPLATE_ROLES | (PAGE_FURNITURE_ROLES if page_level else frozenset())
+    for element in soup(list(tags)):
+        element.decompose()
+    if page_level:
+        # Only the site's own header/footer: one inside an article or section
+        # carries its headline, byline and date.
+        for element in soup(list(PAGE_FURNITURE_TAGS)):
+            if (
+                not element.decomposed
+                and element.find_parent(ARTICLE_LIKE_TAGS) is None
+            ):
+                element.decompose()
+    for element in soup.find_all(attrs={"role": True}):
+        # An ancestor removed earlier in this loop clears its descendants.
+        if element.decomposed:
+            continue
+        role = element.get("role")
+        if isinstance(role, str) and role.lower() in roles:
+            element.decompose()
+
+
+def _trim_boilerplate(soup: BeautifulSoup) -> BeautifulSoup:
+    """Drop navigation and page furniture, keeping the main content region.
+
+    Works on a copy. Returns the original page when trimming would leave less
+    than ``MIN_TRIMMED_TEXT_SHARE`` of its text.
+    """
+
+    total = _text_length(soup)
+    trimmed = BeautifulSoup(str(soup), "html.parser")
+    main = _select_main_region(trimmed)
+    if main is not None:
+        trimmed = BeautifulSoup(str(main), "html.parser")
+    _remove_boilerplate(trimmed, page_level=main is None)
+    if (
+        main is None
+        and total
+        and _text_length(trimmed) < total * MIN_TRIMMED_TEXT_SHARE
+    ):
+        return soup
+    return trimmed
+
+
+def slice_page_text(text: str, start: int, max_chars: int) -> tuple[str, int, int]:
+    """Return ``text[start:end]`` with ``end`` at a paragraph or line break.
+
+    ``end`` is at most ``start + max_chars`` and is the offset to resume from.
+    When the rest of the text fits, ``end == len(text)``.
+    """
+
+    total = len(text)
+    start = min(max(0, start), total)
+    end = start + max_chars
+    if end >= total:
+        return text[start:].strip(), total, total
+    for separator in ("\n\n", "\n"):
+        cut = text.rfind(separator, start + max_chars // 2, end)
+        if cut != -1:
+            end = cut + len(separator)
+            break
+    return text[start:end].strip(), end, total
+
+
 def _is_site_blocked_response(response: httpx.Response) -> bool:
     """Return whether an error response means the site refused automated access."""
 
@@ -456,6 +580,7 @@ async def fetch_web_content(
     *,
     include_assets: bool = False,
     asset_query: str | None = None,
+    trim_boilerplate: bool = False,
 ) -> WebContentFetchResult:
     """Fetch a webpage using the default proxy configuration."""
 
@@ -469,6 +594,7 @@ async def fetch_web_content(
         url,
         include_assets=include_assets,
         asset_query=asset_query,
+        trim_boilerplate=trim_boilerplate,
     )
 
 

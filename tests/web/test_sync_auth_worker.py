@@ -5,6 +5,7 @@ import os
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -12,9 +13,11 @@ from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from xagent.web import browser_idle
 from xagent.web.api import auth
-from xagent.web.auth_sessions import hash_refresh_token
+from xagent.web.auth_sessions import hash_refresh_token, token_browser_session_id
 from xagent.web.models import auth_database
+from xagent.web.models.browser_session import BrowserIdleEnforcement, BrowserSession
 from xagent.web.models.user import User
 
 
@@ -34,6 +37,8 @@ def worker_db(tmp_path, request):
     else:
         engine = create_engine(f"sqlite:///{tmp_path / 'auth.db'}")
     User.__table__.create(engine)
+    BrowserSession.__table__.create(engine)
+    BrowserIdleEnforcement.__table__.create(engine)
     with Session(engine) as session:
         session.add(
             User(username="worker", password_hash=auth.hash_password("password123"))
@@ -92,7 +97,7 @@ async def test_dependency_is_lazy_and_worker_owned(worker_db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_login_and_refresh_have_single_thread_owners(worker_db):
-    factory, events, _ = worker_db
+    factory, events, engine = worker_db
     response = await auth.login(
         auth.LoginRequest(username="worker", password="password123"), factory
     )
@@ -101,27 +106,41 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
         "create",
         "SELECT",
         "UPDATE",
+        "INSERT",  # The login's browser_sessions row (#3771).
         "commit",
         "close",
     ]
     assert len({owner for _, owner in events}) == 1
     assert events[0][1] != threading.get_ident()
     events.clear()
-    # Force a different token so UPDATE is observable even within one JWT second.
-    from unittest.mock import patch
+    # The refresh token keeps the login's sid, so the refresh takes the
+    # production fence path; its jti makes the rotated value differ.
+    updated_tables: list[str] = []
 
-    with patch.object(auth, "create_refresh_token", return_value="rotated-token"):
-        renewed = await auth.refresh_token(
-            auth.RefreshTokenRequest(refresh_token=response["refresh_token"]), factory
-        )
-    assert renewed.refresh_token == "rotated-token"
+    @event.listens_for(engine, "before_cursor_execute")
+    def updated_table(conn, cursor, sql, params, context, executemany):
+        if sql.lstrip().upper().startswith("UPDATE"):
+            # PostgreSQL runs in a per-test schema: keep only the table name.
+            updated_tables.append(sql.split()[1].replace('"', "").rsplit(".", 1)[-1])
+
+    renewed = await auth.refresh_token(
+        auth.RefreshTokenRequest(refresh_token=response["refresh_token"]), factory
+    )
+    assert renewed.refresh_token != response["refresh_token"]
+    sid = token_browser_session_id(response["refresh_token"])
+    assert sid is not None
+    assert token_browser_session_id(renewed.refresh_token) == sid
     assert [name for name, _ in events] == [
         "create",
         "SELECT",
+        "SELECT",  # The login's browser_sessions row (#3771).
+        "SELECT",  # The enforcement leases, for the fence's condition.
+        "UPDATE",  # The fence on browser_sessions, before users.
         "UPDATE",
         "commit",
         "close",
     ]
+    assert updated_tables == ["browser_sessions", "users"]
     assert len({owner for _, owner in events}) == 1
     assert events[0][1] != threading.get_ident()
 
@@ -401,3 +420,93 @@ async def test_cancelled_worker_before_session_entry_still_closes(worker_db):
         with pytest.raises(asyncio.CancelledError):
             await task
     assert events[-1][0] == "close"
+
+
+# Browser idle expiry (issue #3771) on the real state backend: a second engine
+# Session plays another API worker that sees the idle deadline pass.
+
+
+def _age_worker(engine, minutes: float) -> None:
+    with Session(engine) as other:
+        other.query(BrowserSession).update(
+            {
+                BrowserSession.last_activity_at: datetime.now(timezone.utc)
+                - timedelta(minutes=minutes)
+            }
+        )
+        other.commit()
+
+
+@pytest.mark.asyncio
+async def test_refresh_loses_to_expiry_seen_by_another_worker(worker_db, monkeypatch):
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    factory, _, engine = worker_db
+    tokens = await auth.login(
+        auth.LoginRequest(username="worker", password="password123"), factory
+    )
+    original = auth._prepare_refresh_response
+
+    def prepare_then_expire(user, request):
+        response = original(user, request)  # The login was still active here.
+        _age_worker(engine, 31)
+        return response
+
+    monkeypatch.setattr(auth, "_prepare_refresh_response", prepare_then_expire)
+    with pytest.raises(HTTPException) as caught:
+        await auth.refresh_token(
+            auth.RefreshTokenRequest(refresh_token=tokens["refresh_token"]), factory
+        )
+    assert caught.value.status_code == 401
+    with Session(engine) as session:
+        assert session.scalar(select(User.refresh_token)) == hash_refresh_token(
+            tokens["refresh_token"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_refresh_racing_a_user_deletion_is_unauthorized(worker_db, monkeypatch):
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    factory, _, engine = worker_db
+    tokens = await auth.login(
+        auth.LoginRequest(username="worker", password="password123"), factory
+    )
+    original = auth._prepare_refresh_response
+
+    def prepare_then_delete(user, request):
+        response = original(user, request)  # The user still existed here.
+        with Session(engine) as other:
+            other.query(BrowserSession).delete()
+            other.query(User).delete()
+            other.commit()
+        return response
+
+    monkeypatch.setattr(auth, "_prepare_refresh_response", prepare_then_delete)
+    with pytest.raises(HTTPException) as caught:
+        await auth.refresh_token(
+            auth.RefreshTokenRequest(refresh_token=tokens["refresh_token"]), factory
+        )
+    assert caught.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_activity_loses_to_expiry_seen_by_another_worker(worker_db, monkeypatch):
+    monkeypatch.setenv("XAGENT_BROWSER_IDLE_TIMEOUT_ENABLED", "true")
+    factory, _, engine = worker_db
+    tokens = await auth.login(
+        auth.LoginRequest(username="worker", password="password123"), factory
+    )
+    sid = token_browser_session_id(tokens["access_token"])
+    _age_worker(engine, 20)
+    with factory() as session:
+        user = session.query(User).one()
+        # Loaded while the login is active; another worker then sees it expire.
+        session.get(BrowserSession, sid)
+        _age_worker(engine, 31)
+        with pytest.raises(browser_idle.BrowserSessionRejected):
+            browser_idle.record_activity(session, user, sid)
+    with Session(engine) as session:
+        last = session.scalar(select(BrowserSession.last_activity_at))
+    assert last is not None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    assert datetime.now(timezone.utc) - last > timedelta(minutes=30)

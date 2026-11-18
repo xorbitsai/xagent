@@ -1603,6 +1603,7 @@ describe("SessionAgentChatPage file attachments", () => {
         const socket = await mountActive()
         receive(socket, { type: "connection_capabilities", capabilities: announced })
         bindTaskWithStatus(socket, "running")
+        receive(socket, ATTACHED)
         await waitFor(() => expect(editor()).toBeInTheDocument())
         submit("A")
         await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))

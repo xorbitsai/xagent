@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import type { MessageQueuePhase, MessageQueueState } from "@/contexts/session-message-queue"
 import type { SessionMessageQueueControls, SessionStopState } from "@/contexts/app-context-chat"
+import { VoiceCallStoreProvider, usePublishVoiceCall, useVoiceCallView } from "@/contexts/voice-call-store"
+import type { VoiceCall } from "@/hooks/use-voice-call"
 
 type PanelTraceEvent = {
   event_id?: string
@@ -336,6 +338,14 @@ vi.mock("@/components/layout/center-panel", () => ({
 
 import { TaskConversationPanel } from "./task-conversation-panel"
 
+const pageCall: VoiceCall = {
+  open: true, phase: "listening", active: true, caption: "", muted: false,
+  status: "voiceConversation.states.listening", settingsLink: false, retryable: false, retryDisabled: false,
+  level: () => 0, retry: vi.fn(), end: vi.fn(), toggleMute: vi.fn(),
+}
+function PublishedCall() { usePublishVoiceCall(pageCall); return null }
+function CallPhase() { return <span data-testid="call-phase">{useVoiceCallView()?.phase ?? "none"}</span> }
+
 describe("TaskConversationPanel", () => {
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => undefined)
@@ -430,6 +440,28 @@ describe("TaskConversationPanel", () => {
       const list = screen.getByRole("list", { name: "messageQueue.listLabel" })
       expect(list.compareDocumentPosition(screen.getByTestId("chat-input")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
       expect(screen.getByRole("button", { name: "messageQueue.continue" })).toHaveProperty("disabled", !enabled)
+    })
+
+    it.each([
+      ["the panel's own call", () => {
+        render(<TaskConversationPanel mode="page" voiceConversationEnabled />)
+        fireEvent.click(screen.getByText("Composer voice mode"))
+        expect(screen.getByText("Close voice conversation")).toBeInTheDocument()
+      }],
+      ["a call the page runs", () => {
+        render(
+          <VoiceCallStoreProvider>
+            <PublishedCall />
+            <CallPhase />
+            <TaskConversationPanel mode="page" compactInput onProvidedVoiceConversation={vi.fn()} />
+          </VoiceCallStoreProvider>,
+        )
+        expect(screen.getByTestId("call-phase")).toHaveTextContent("listening")
+      }],
+    ])("keeps the queue listed while %s is open", (_name, startCall) => {
+      appControls.messageQueue = queueControls({ kind: "waiting", since: 1, answerRequired: false })
+      startCall()
+      expect(screen.getByRole("list", { name: "messageQueue.listLabel" })).toHaveTextContent("queued text")
     })
   })
 

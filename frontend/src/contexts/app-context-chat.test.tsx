@@ -13900,6 +13900,24 @@ describe("session message queue", () => {
     expect(sent()).toEqual([["D", null], ["B", "new_turn"]])
   })
 
+  it("leaves a direct send refused as busy out of the queue and still sends the message queued behind it", async () => {
+    const { server } = await mount()
+    server.ackGate = deferred<void>()
+    server.refuseDirect = () => new MessageDeliveryError("refused", "rejected", { errorCode: "task_busy" })
+    // A send that does not go through the queue, as a spoken message does.
+    let direct!: Promise<unknown>
+    act(() => { direct = getSessionControls().sendMessage("D", { clientMessageId: "id-D" }, []).catch((error: unknown) => error) })
+    await act(async () => {})
+    expect(await submit("B")).toBe("queued")
+
+    await act(async () => server.ackGate!.resolve())
+    expect(await direct).toMatchObject({ disposition: "rejected", errorCode: "task_busy" })
+    await waitFor(() => expect(sent()).toEqual([["D", null], ["B", "new_turn"]]))
+    expect(queue().items).toEqual([])
+    expect(phase()).toMatchObject({ kind: "waiting" })
+    expect(toasts()).toEqual([])
+  })
+
   it("puts a direct send refused as busy back in submission order, without holding, while a later message is queued", async () => {
     const { server } = await mount()
     server.ackGate = deferred<void>()

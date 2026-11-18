@@ -101,8 +101,13 @@ describe("QueuedMessageList", () => {
   ] as const)("explains a queue held for %s and offers continue and clear", (reason, text) => {
     const queue = controls([item("a", "waiting"), item("b", "waiting")], { kind: "held", reason })
     render(<QueuedMessageList queue={queue} canContinue />)
-    expect(screen.getByRole("status")).toHaveTextContent(text)
-    fireEvent.click(screen.getByRole("button", { name: "messageQueue.continue" }))
+    const status = screen.getByRole("status")
+    expect(status.tagName).toBe("P")
+    expect(status.textContent).toBe(text)
+    const continueButton = screen.getByRole("button", { name: "messageQueue.continue" })
+    expect(continueButton).not.toHaveAttribute("aria-describedby")
+    expect(screen.queryByText("messageQueue.continueUnavailable")).toBeNull()
+    fireEvent.click(continueButton)
     fireEvent.click(screen.getByRole("button", { name: "messageQueue.clear" }))
     expect(queue.continueSending).toHaveBeenCalledTimes(1)
     expect(queue.clear).toHaveBeenCalledTimes(1)
@@ -113,6 +118,11 @@ describe("QueuedMessageList", () => {
     render(<QueuedMessageList queue={queue} canContinue={false} />)
     expect(screen.getByRole("button", { name: "messageQueue.continue" })).toBeDisabled()
     expect(screen.getByRole("button", { name: "messageQueue.clear" })).toBeEnabled()
+    const reason = screen.getByText("messageQueue.continueUnavailable")
+    expect(reason.id).not.toBe("")
+    expect(screen.getByRole("button", { name: "messageQueue.continue" })).toHaveAttribute("aria-describedby", reason.id)
+    expect(screen.getByRole("status")).not.toContainElement(reason)
+    expect(screen.getByRole("status").textContent).toBe("messageQueue.held.sendFailed")
   })
 
   it.each([

@@ -69,15 +69,24 @@ export function QueuedMessageList({
   canContinue: boolean
 }) {
   const { t } = useI18n()
+  const unavailableId = useId()
   const { state } = queue
   if (state.items.length === 0) return null
   return (
     <div className="mb-2 space-y-2">
       {state.phase.kind === "held" && (
-        <div role="status" className={cn("space-y-2", NOTICE_CLASS)}>
-          <p>{t(HELD_KEYS[state.phase.reason])}</p>
+        <div className={cn("space-y-2", NOTICE_CLASS)}>
+          <p role="status">{t(HELD_KEYS[state.phase.reason])}</p>
+          {!canContinue && <p id={unavailableId}>{t("messageQueue.continueUnavailable")}</p>}
           <div className="flex flex-wrap gap-2">
-            <Button type="button" size="sm" variant="outline" disabled={!canContinue} onClick={queue.continueSending}>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={!canContinue}
+              aria-describedby={canContinue ? undefined : unavailableId}
+              onClick={queue.continueSending}
+            >
               {t("messageQueue.continue")}
             </Button>
             <Button type="button" size="sm" variant="outline" onClick={queue.clear}>

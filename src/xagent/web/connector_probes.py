@@ -115,6 +115,7 @@ CONNECTOR_PROBES: Mapping[str, ConnectorProbe] = {
     # /v1/account needs Accounts Read, which the catalog description never asks for.
     "stripe": ConnectorProbe("stripe_list_customers", {"limit": 1}),
     "freshdesk": ConnectorProbe("freshdesk_list_agents", {"per_page": 1}),
+    "chargebee": ConnectorProbe("chargebee_list_customers", {"limit": 1}),
     "chartmogul": ConnectorProbe("chartmogul_list_customers", {"per_page": 1}),
     "shopify": ConnectorProbe("shopify_validate_connection"),
     "magento": ConnectorProbe("magento_list_products", {"limit": 1}),

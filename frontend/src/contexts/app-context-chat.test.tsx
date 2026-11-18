@@ -166,6 +166,7 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   VERSIONED_TASK_EVENT_TYPES,
+  acceptTaskControlVersion,
   createInitialState,
   extractTaskControlEnvelope,
   initialSessionStop,
@@ -179,6 +180,8 @@ import {
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MessageDeliveryError } from "@/hooks/use-websocket"
+import type { ClientErrorCode } from "@/lib/client-errors"
+import { isAwaitingAnswer } from "./session-message-queue"
 import {
   RESEND_RECONNECT_DEADLINE_MS,
   ResendWaiters,
@@ -387,7 +390,7 @@ const makeSessionConnection = (identity = "session-one") => ({
 
 const makeSessionTransport = (
   connection: ReturnType<typeof makeSessionConnection> | null = makeSessionConnection(),
-  capabilities?: { taskStop?: "enabled" | "disabled" },
+  capabilities?: { taskStop?: "enabled" | "disabled"; messageQueue?: "enabled" | "disabled" },
 ) => ({
   uploadFiles: vi.fn(),
   ...(capabilities ? { capabilities } : {}),
@@ -6339,6 +6342,136 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  describe("a delivery declaration on a send", () => {
+    const mount = (transport: "session" | "task") => {
+      render(transport === "session"
+        ? <AppProvider token="token" transport={makeSessionTransport()}><SessionControlsProbe /></AppProvider>
+        : <AppProvider token="token"><SeedRunningTask /><SessionControlsProbe /></AppProvider>)
+      act(() => webSocketOptions.current?.onConnect?.())
+    }
+    const send = (config: Record<string, unknown>) => act(async () => getSessionControls()
+      .sendMessage("continue", config)
+      .then(() => "ok", (error: unknown) => error))
+
+    const announce = (capabilities: readonly string[]) =>
+      act(() => webSocketOptions.current?.onConnectionCapabilities?.(capabilities))
+    const NEW_TURN_CAPABILITIES = ["heartbeat", "conversation_attached", "delivery_new_turn"]
+
+    it("passes a new-turn declaration to the chat frame on the Session transport", async () => {
+      mount("session")
+      announce(NEW_TURN_CAPABILITIES)
+
+      expect(await send({ clientMessageId: "declared", delivery: "new_turn" })).toBe("ok")
+      expect(await send({ clientMessageId: "declared-source", delivery: "new_turn", sourceTaskId: 101 })).toBe("ok")
+
+      expect(sendChatMessageMock.mock.calls).toEqual([
+        ["continue", undefined, undefined, "declared", undefined, undefined, undefined, "new_turn"],
+        ["continue", undefined, undefined, "declared-source", undefined, undefined, 101, "new_turn"],
+      ])
+    })
+
+    it("passes a declaration together with uploaded files", async () => {
+      const transport = makeSessionTransport()
+      const fileId = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
+      render(
+        <AppProvider
+          token="token"
+          transport={{ ...transport, session: { ...transport.session, attachments: { accept: ".pdf", maxFiles: 3, maxFileBytes: 1024 } } }}
+        >
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      announce(NEW_TURN_CAPABILITIES)
+
+      await act(async () => {
+        await getSessionControls().sendMessage(
+          "continue",
+          { clientMessageId: "both", delivery: "new_turn" },
+          [],
+          { uploadedFiles: [{ kind: "uploaded", fileId, name: "a.pdf", size: 1, type: "application/pdf" }] },
+        )
+      })
+
+      expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+        "continue", [], undefined, "both", undefined, { fileIds: [fileId], maxFileIds: 3 }, undefined, "new_turn",
+      )
+    })
+
+    it("treats an empty request id as no request id", async () => {
+      mount("session")
+      announce(NEW_TURN_CAPABILITIES)
+
+      expect(await send({
+        clientMessageId: "blank", delivery: "new_turn", metadata: { request_id: "" },
+      })).toBe("ok")
+
+      expect(sendChatMessageMock.mock.calls.at(-1)?.[4]).toBeUndefined()
+      expect(sendChatMessageMock.mock.calls.at(-1)?.[7]).toBe("new_turn")
+    })
+
+    it.each([
+      ["no capabilities frame has arrived", null],
+      ["the capabilities frame does not list the capability", ["heartbeat", "conversation_attached"]],
+    ])("refuses a declaration when %s", async (_name, capabilities) => {
+      mount("session")
+      if (capabilities) announce(capabilities)
+
+      expect(await send({ clientMessageId: "undeclared", delivery: "new_turn" })).toMatchObject({
+        message: "Message not sent: this connection does not take a delivery declaration.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("refuses a declaration on a new connection until its own capabilities frame arrives, though the previous one announced it", async () => {
+      const tree = (identity: string) => (
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      const { rerender } = render(tree("session-one"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      announce(NEW_TURN_CAPABILITIES)
+      expect(getSessionControls().newTurnDelivery).toBe("supported")
+
+      rerender(tree("session-two"))
+      act(() => webSocketOptions.current?.onConnect?.())
+      expect(getSessionControls().newTurnDelivery).toBe("supported")
+
+      expect(await send({ clientMessageId: "stale", delivery: "new_turn" })).toMatchObject({
+        message: "Message not sent: this connection does not take a delivery declaration.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+
+      announce(NEW_TURN_CAPABILITIES)
+      expect(await send({ clientMessageId: "fresh", delivery: "new_turn" })).toBe("ok")
+      expect(sendChatMessageMock.mock.calls.at(-1)?.[7]).toBe("new_turn")
+    })
+
+    it("refuses an unknown declaration, and any declaration off the Session transport, before sending", async () => {
+      mount("session")
+      expect(await send({ clientMessageId: "unknown", delivery: "inject" })).toMatchObject({
+        message: "Message not sent: the delivery declaration is not valid.",
+        disposition: "not_sent",
+      })
+      expect(await send({
+        clientMessageId: "answer", delivery: "new_turn", metadata: { request_id: "req-1" },
+      })).toMatchObject({
+        message: "A delivery declaration cannot accompany an answer to a request.",
+        disposition: "not_sent",
+      })
+      cleanup()
+      mount("task")
+      expect(await send({ clientMessageId: "task", delivery: "new_turn" })).toMatchObject({
+        message: "A delivery declaration is not supported for this connection.",
+        disposition: "not_sent",
+      })
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+  })
+
   describe("a conversation source on a send", () => {
     const SOURCES = [
       ["no source", undefined],
@@ -9640,6 +9773,39 @@ describe("session conversation attachment", () => {
       act(() => socket()?.onConnectionCapabilities?.(["heartbeat"]))
 
       expect(attachment()).toBe("unsupported")
+    })
+
+    it("the new-turn capability is read from the current connection and survives a drop", () => {
+      const newTurnDelivery = () => getSessionControls().newTurnDelivery
+      const NEW_TURN_CAPABILITIES = [...ATTACH_CAPABILITIES, "delivery_new_turn"]
+      const view = render(tree(makeSessionTransport()))
+      act(() => socket()?.onConnect?.())
+      expect(newTurnDelivery()).toBe("unknown")
+
+      act(() => socket()?.onConnectionCapabilities?.(NEW_TURN_CAPABILITIES))
+      expect(newTurnDelivery()).toBe("supported")
+
+      // A drop does not reset it; only the next capabilities frame changes it.
+      wsHarness.isConnected = false
+      view.rerender(tree(makeSessionTransport()))
+      expect(newTurnDelivery()).toBe("supported")
+
+      wsHarness.isConnected = true
+      view.rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+      act(() => socket()?.onConnect?.())
+      expect(newTurnDelivery()).toBe("supported")
+      act(() => socket()?.onConnectionCapabilities?.(ATTACH_CAPABILITIES))
+      expect(newTurnDelivery()).toBe("unsupported")
+    })
+
+    it("ignores a capabilities frame from a socket that is no longer current", () => {
+      const view = render(tree(makeSessionTransport()))
+      const previousOnCapabilities = socket()?.onConnectionCapabilities
+      act(() => socket()?.onConnect?.())
+      view.rerender(tree(makeSessionTransport(makeSessionConnection("session-two"))))
+
+      act(() => previousOnCapabilities?.([...ATTACH_CAPABILITIES, "delivery_new_turn"]))
+      expect(getSessionControls().newTurnDelivery).toBe("unknown")
     })
 
     it("returns to pending once the connection drops", () => {
@@ -13365,5 +13531,683 @@ describe("sends in flight", () => {
     await delivery
     expect(renders[renders.length - 1]).toEqual({ taskId: 77, inFlight: false })
     expect(failure).toMatchObject({ disposition: "not_sent" })
+  })
+})
+
+describe("the task state version gate", () => {
+  const frame = (
+    type: string,
+    fields: Partial<TestWebSocketMessage> = {},
+  ): TestWebSocketMessage => ({ type, timestamp: "2026-11-17T00:00:00Z", task_id: 5, ...fields })
+  const accept = (
+    versions: Map<number, { version: number; runId?: string | null; status?: string }>,
+    message: TestWebSocketMessage,
+  ) => acceptTaskControlVersion(
+    message as Parameters<typeof acceptTaskControlVersion>[0],
+    extractTaskControlEnvelope(message as Parameters<typeof extractTaskControlEnvelope>[0]),
+    versions as Parameters<typeof acceptTaskControlVersion>[2],
+  )
+
+  it("the version gate records the status of an accepted versioned frame and keeps it only across the same version", () => {
+    const versions = new Map<number, { version: number; runId?: string | null; status?: string }>()
+
+    // A frame with a status records it with its version.
+    expect(accept(versions, frame("task_completed", { state_version: 2, status: "completed" }))).toBe(true)
+    expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A replayed task_info at the same version that reports no status keeps
+    // the recorded status. Defensive: a frame carrying a version normally
+    // carries its status too, and dropping a known status would only lose
+    // information.
+    expect(accept(versions, taskInfoMessage(5, { state_version: 2, status: undefined }))).toBe(true)
+    expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A frame the gate drops as older writes nothing.
+    expect(accept(versions, frame("task_error", { state_version: 1, status: "failed" }))).toBe(false)
+    expect(versions.get(5)).toMatchObject({ version: 2, status: "completed" })
+
+    // A same-version frame of another run does not inherit the status either.
+    expect(accept(versions, frame("task_started", { state_version: 2, run_id: "r2" }))).toBe(true)
+    expect(versions.get(5)).toMatchObject({ version: 2, runId: "r2" })
+    expect(versions.get(5)?.status).toBeUndefined()
+
+    // A newer frame that reports no status does not inherit the older one.
+    expect(accept(versions, frame("task_resumed", { state_version: 3 }))).toBe(true)
+    expect(versions.get(5)?.version).toBe(3)
+    expect(versions.get(5)?.status).toBeUndefined()
+
+    // An unversioned error frame writes nothing, even with a status.
+    expect(accept(versions, frame("agent_error", { status: "failed" }))).toBe(true)
+    expect(versions.get(5)?.version).toBe(3)
+    expect(versions.get(5)?.status).toBeUndefined()
+  })
+})
+
+describe("session message queue", () => {
+  const TASK = 7
+  const CAPABILITIES = ["heartbeat", "conversation_attached", "delivery_new_turn"]
+  type Status = "pending" | "running" | "completed" | "failed" | "paused" | "waiting_for_user"
+  const socket = () => webSocketOptions.current
+  const push = (message: TestWebSocketMessage) => act(async () => { socket()?.onMessage?.(message) })
+
+  // The task row and what the Session server does with a chat frame. A frame
+  // appended to a finished task only reserves a start: the row stays as it was
+  // until the task process takes the start up, and a frame arriving before then
+  // is refused as busy. The row's state reaches the page as frames or snapshots.
+  const makeServer = (initial: { status: Status; version: number }) => {
+    const server = {
+      ...initial,
+      startPending: false,
+      windDown: false,
+      deferAnswers: false,
+      ackGate: null as null | ReturnType<typeof deferred<void>>,
+      refuseHead: null as null | (() => Error),
+      refuseDirect: null as null | (() => Error),
+      accepted: new Set<string>(),
+      frame(type: string, extra: Partial<TestWebSocketMessage> = {}): TestWebSocketMessage {
+        return {
+          type, timestamp: "2026-11-17T00:00:00Z", task_id: TASK, state_version: server.version,
+          status: server.status, task: { id: TASK, status: server.status }, ...extra,
+        }
+      },
+      snapshot: () => server.frame("task_stream_snapshot"),
+      handover() { server.startPending = false; server.status = "running"; server.version += 1 },
+      end(status: Status = "completed") {
+        server.status = status
+        server.version += 1
+        return server.frame(status === "paused" ? "task_paused" : "task_completed")
+      },
+      ask() {
+        server.status = "waiting_for_user"
+        server.version += 1
+        return taskInfoMessage(TASK, { status: server.status, state_version: server.version })
+      },
+      chat: async (...args: unknown[]) => {
+        const id = args[3] as string
+        const declared = args[7] === "new_turn"
+        await server.ackGate?.promise
+        // A message the server already took is acknowledged again, unchanged.
+        if (server.accepted.has(id)) return { client_message_id: id, turn_id: id }
+        if (declared && server.refuseHead) throw server.refuseHead()
+        if (!declared && server.refuseDirect) throw server.refuseDirect()
+        const refuse = (code: "task_busy" | "interaction_response_required") =>
+          new MessageDeliveryError("refused", "rejected", { errorCode: code })
+        if (server.status === "waiting_for_user") {
+          if (declared) throw refuse("interaction_response_required")
+          if (!server.deferAnswers) { server.status = "running"; server.version += 1 }
+        } else if (server.startPending || server.windDown || server.status === "running") {
+          throw refuse("task_busy")
+        } else {
+          server.startPending = true
+        }
+        server.accepted.add(id)
+        return { client_message_id: id, turn_id: id }
+      },
+    }
+    return server
+  }
+
+  const tree = (identity = "session-one") => (
+    <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity), { messageQueue: "enabled" })}>
+      <SessionControlsProbe />
+    </AppProvider>
+  )
+  const connect = async (capabilities: readonly string[] = CAPABILITIES) => {
+    act(() => socket()?.onConnect?.())
+    act(() => socket()?.onConnectionCapabilities?.(capabilities))
+    await push({ type: "conversation_attached", timestamp: "2026-11-17T00:00:00Z", data: { type: "conversation_attached" } })
+  }
+  const mount = async (initial: { status: Status; version: number } = { status: "completed", version: 2 }) => {
+    const server = makeServer(initial)
+    sendChatMessageMock.mockImplementation(server.chat)
+    const view = render(tree())
+    await connect()
+    await push(taskInfoMessage(TASK, { status: initial.status, state_version: initial.version }))
+    return { server, view }
+  }
+  const submit = (text: string) => act(async () => {
+    const id = `id-${text}`
+    const send = () => getSessionControls().sendMessage(text, { clientMessageId: id })
+    return getSessionControls().messageQueue!.submit(text, { hasFiles: false, clientMessageId: id }, send)
+      .then(outcome => outcome, (error: unknown) => error)
+  })
+  const queue = () => getSessionControls().messageQueue!.state
+  const phase = () => queue().phase
+  const sent = () => sendChatMessageMock.mock.calls.map(call => [call[0], call[7] ?? null])
+  const toasts = () => vi.mocked(toast.error).mock.calls.map(call => call[0])
+  // A queued head the task has not yet taken: A is sent, B waits behind it.
+  const startedTurnWithWaitingB = async () => {
+    const mounted = await mount()
+    await submit("A")
+    await submit("B")
+    return mounted
+  }
+
+  beforeEach(() => {
+    webSocketOptions.current = null
+    webSocketOptions.all = []
+    sessionControls = null
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
+    sendChatMessageMock.mockReset()
+    vi.mocked(toast.error).mockClear()
+    localStorage.clear()
+  })
+  afterEach(() => {
+    cleanup()
+    localStorage.clear()
+  })
+
+  it("queue scripts follow the frame order the Session server produces: consecutive messages", async () => {
+    const { server } = await mount()
+    expect(await submit("A")).toBe("sent")
+    expect(await submit("B")).toBe("queued")
+    expect(await submit("C")).toBe("queued")
+    expect(phase()).toMatchObject({ kind: "waiting", since: 2 })
+
+    // The start has not been taken up yet: the retry is refused and unseen.
+    await push(server.snapshot())
+    expect(sent()).toEqual([["A", null], ["B", "new_turn"]])
+    expect(phase()).toMatchObject({ kind: "waiting", since: 2 })
+
+    server.handover()
+    await push(server.snapshot())
+    await push(server.end())
+    expect(sent().slice(2)).toEqual([["B", "new_turn"]])
+    expect(queue().items.map(item => item.text)).toEqual(["C"])
+
+    server.handover()
+    await push(server.snapshot())
+    await push(server.end())
+    server.handover()
+    await push(server.snapshot())
+    await push(server.end())
+    expect(sent().slice(3)).toEqual([["C", "new_turn"]])
+    expect(queue()).toMatchObject({ items: [], phase: { kind: "idle" } })
+    expect(toasts()).toEqual([])
+  })
+
+  it("queue scripts follow the frame order the Session server produces: a start that was never taken up", async () => {
+    const { server } = await startedTurnWithWaitingB()
+    server.startPending = false
+    for (let snapshots = 0; snapshots < 3; snapshots += 1) await push(server.snapshot())
+    // The row never changed, so the first snapshot sends B and the server takes it.
+    expect(sent()).toEqual([["A", null], ["B", "new_turn"]])
+    expect(queue().items).toEqual([])
+    expect(toasts()).toEqual([])
+  })
+
+  it("queue scripts follow the frame order the Session server produces: a refusal while an answered turn winds down", async () => {
+    // The turn that resumed after the visitor's inline answer runs in the web
+    // process, which still refuses new messages for a moment after the turn's
+    // end frame.
+    const { server } = await startedTurnWithWaitingB()
+    server.handover()
+    await push(server.ask())
+    await submit("X")
+    await push(server.frame("task_resumed"))
+    server.windDown = true
+    await push(server.end())
+    expect(sent().at(-1)).toEqual(["B", "new_turn"])
+    expect(phase()).toMatchObject({ kind: "waiting" })
+    expect(toasts()).toEqual([])
+
+    server.windDown = false
+    await push(server.snapshot())
+    expect(sent().filter(([text]) => text === "B")).toHaveLength(2)
+    expect(queue().items).toEqual([])
+  })
+
+  it("queue scripts follow the frame order the Session server produces: a question answered inline", async () => {
+    const { server } = await startedTurnWithWaitingB()
+    server.handover()
+    await push(server.snapshot())
+    await push(server.ask())
+    expect(sent()).toEqual([["A", null]])
+    expect(isAwaitingAnswer(queue())).toBe(true)
+
+    // The visitor answers: sent as a plain message the server takes as the answer.
+    expect(await submit("X")).toBe("sent")
+    expect(sent().at(-1)).toEqual(["X", null])
+    await push(server.frame("task_resumed"))
+    expect(isAwaitingAnswer(queue())).toBe(false)
+    expect(sent()).toHaveLength(2)
+
+    await push(server.end())
+    expect(sent().at(-1)).toEqual(["B", "new_turn"])
+  })
+
+  it("queue scripts follow the frame order the Session server produces: a question answered later", async () => {
+    const { server } = await startedTurnWithWaitingB()
+    server.handover()
+    await push(server.ask())
+    server.deferAnswers = true
+    await submit("X")
+    // The answer is accepted but the row does not move: nothing goes out, and
+    // an unversioned error frame does not read as the turn ending.
+    await push({ type: "agent_error", timestamp: "2026-11-17T00:00:01Z", task_id: TASK, message: "late" })
+    for (let snapshots = 0; snapshots < 3; snapshots += 1) await push(server.snapshot())
+    expect(sent()).toEqual([["A", null], ["X", null]])
+    expect(isAwaitingAnswer(queue())).toBe(false)
+
+    server.deferAnswers = false
+    server.status = "running"
+    server.version += 1
+    await push(server.snapshot())
+    await push(server.end())
+    expect(sent().at(-1)).toEqual(["B", "new_turn"])
+  })
+
+  it.each([
+    ["no one has answered", false],
+    ["the answer is still on its way", true],
+  ])("queue scripts follow the frame order the Session server produces: continuing while a question waits and %s", async (_name, answered) => {
+    const { server } = await startedTurnWithWaitingB()
+    server.handover()
+    await push(server.end("failed"))
+    expect(phase()).toMatchObject({ kind: "held", reason: "turn_failed" })
+    await push(server.ask())
+    if (answered) {
+      server.deferAnswers = true
+      await submit("X")
+    }
+    await act(async () => getSessionControls().messageQueue!.continueSending())
+    // The server refuses the head until the question is answered; no alert.
+    expect(sent().filter(([, delivery]) => delivery).length).toBe(1)
+    expect(phase()).toMatchObject({ kind: "waiting", answerRequired: true })
+    expect(isAwaitingAnswer(queue())).toBe(true)
+    expect(toasts()).toEqual([])
+
+    if (!answered) {
+      await submit("X")
+      await push(server.frame("task_resumed"))
+    } else {
+      server.deferAnswers = false
+      server.status = "running"
+      server.version += 1
+      await push(server.snapshot())
+    }
+    expect(isAwaitingAnswer(queue())).toBe(false)
+    await push(server.end())
+    expect(sent().at(-1)).toEqual(["B", "new_turn"])
+    expect(sent().filter(([text]) => text === "B").length).toBe(2)
+  })
+
+  it.each([
+    ["a failed turn", (server: ReturnType<typeof makeServer>) => server.end("failed"), "turn_failed"],
+    ["a paused turn", (server: ReturnType<typeof makeServer>) => server.end("paused"), "turn_paused"],
+    ["an interrupted turn", (server: ReturnType<typeof makeServer>) => {
+      server.status = "failed"
+      server.version += 1
+      return server.frame("task_error", { code: "external_turn_interrupted" } as Partial<TestWebSocketMessage>)
+    }, "turn_failed"],
+    ["a turn that ended without a frame", (server: ReturnType<typeof makeServer>) => {
+      server.status = "failed"
+      server.version += 1
+      return server.snapshot()
+    }, "turn_failed"],
+  ])("queue scripts follow the frame order the Session server produces: %s holds the queue", async (_name, end, reason) => {
+    const { server } = await startedTurnWithWaitingB()
+    server.handover()
+    await push(end(server))
+    await push(server.snapshot())
+    expect(phase()).toEqual({ kind: "held", reason })
+    expect(sent()).toEqual([["A", null]])
+
+    await submit("D")
+    expect(queue().items.map(item => item.text)).toEqual(["B", "D"])
+    await act(async () => getSessionControls().messageQueue!.continueSending())
+    expect(sent().at(-1)).toEqual(["B", "new_turn"])
+  })
+
+  it("queue scripts follow the frame order the Session server produces: the end frame before the acknowledgement", async () => {
+    const { server } = await mount()
+    server.ackGate = deferred<void>()
+    const first = submit("A")
+    await act(async () => {})
+    expect(await submit("B")).toBe("queued")
+    // The turn fails and says so before the server's answer to A arrives.
+    server.status = "failed"
+    server.version += 1
+    await push(server.frame("task_completed"))
+    server.ackGate.resolve()
+    await first
+    expect(phase()).toEqual({ kind: "held", reason: "turn_failed" })
+    expect(sent()).toEqual([["A", null]])
+  })
+
+  describe("a refused or failed send of the head", () => {
+    const refusal = (disposition: "not_sent" | "rejected" | "outcome_unknown", errorCode: ClientErrorCode | null, retryWithNewId = false) =>
+      () => new MessageDeliveryError("refused", disposition, { errorCode, retryWithNewId })
+    it.each([
+      ["busy", refusal("rejected", "task_busy"), "waiting", false],
+      ["still processing on another connection", refusal("outcome_unknown", "message_acceptance_pending"), "waiting", false],
+      ["not sent", refusal("not_sent", null), "waiting", false],
+      ["id unusable", refusal("rejected", "message_not_accepted", true), "held", true],
+      ["task unavailable", refusal("rejected", "task_unavailable"), "held", true],
+      ["outcome unknown", refusal("outcome_unknown", null), "held", true],
+      ["not a delivery error", () => new Error("boom"), "held", true],
+    ])("lands in its own outcome: %s", async (_name, error, expected, alert) => {
+      const { server } = await startedTurnWithWaitingB()
+      server.handover()
+      server.refuseHead = error
+      await push(server.end())
+      expect(phase().kind).toBe(expected)
+      expect(toasts()).toEqual(alert ? ["messageQueue.held.sendFailed"] : [])
+      expect(queue().items[0].status).toBe(alert ? "failed" : "waiting")
+      if (_name === "id unusable") expect(queue().items[0].clientMessageId).not.toBe("id-B")
+      else expect(queue().items[0].clientMessageId).toBe("id-B")
+      if (!alert) {
+        // Another turn now runs: snapshots at one version neither send again
+        // nor alert while the queue waits it out.
+        const before = sent().length
+        server.handover()
+        for (let snapshots = 0; snapshots < 20; snapshots += 1) await push(server.snapshot())
+        expect(sent()).toHaveLength(before)
+        expect(toasts()).toEqual([])
+        expect(queue().items.map(item => item.status)).toEqual(["waiting"])
+      }
+    })
+  })
+
+  it("the queue is dropped and never sent into another conversation", async () => {
+    await startedTurnWithWaitingB()
+    const callsBefore = sendChatMessageMock.mock.calls.length
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      socket()?.onMessage?.({ type: "conversation_reset", timestamp: "2026-11-17T00:00:03Z", data: {} })
+      await reset
+    })
+    expect(queue()).toMatchObject({ items: [], phase: { kind: "idle" } })
+    expect(sendChatMessageMock.mock.calls).toHaveLength(callsBefore)
+  })
+
+  it("the queue survives what does not end the conversation", async () => {
+    const { view } = await startedTurnWithWaitingB()
+    // A replaced connection of the same conversation, whose server still takes new turns.
+    view.rerender(tree("session-two"))
+    await connect()
+    expect(queue().items.map(item => item.text)).toEqual(["B"])
+    expect(phase().kind).toBe("waiting")
+  })
+
+  it("holds the queue as failed, once, when a new connection's server stops taking new turns", async () => {
+    const { server, view } = await startedTurnWithWaitingB()
+    expect(getSessionControls().newTurnDelivery).toBe("supported")
+    view.rerender(tree("session-two"))
+    await connect(["heartbeat", "conversation_attached"])
+    expect(getSessionControls().newTurnDelivery).toBe("unsupported")
+    expect(queue().items.map(item => item.status)).toEqual(["failed"])
+    expect(phase()).toEqual({ kind: "held", reason: "send_failed" })
+    expect(toasts()).toEqual(["messageQueue.supportLost"])
+
+    // Nothing is sent, the visitor's own sends go out as before, and continue does nothing.
+    await act(async () => getSessionControls().messageQueue!.continueSending())
+    server.handover()
+    await push(server.end())
+    expect(sent()).toEqual([["A", null]])
+    expect(await submit("N")).toBe("sent")
+    expect(sent().at(-1)).toEqual(["N", null])
+  })
+
+  describe("what a submit does while a message has not finished", () => {
+    const submitWithFiles = (text: string, hasFiles: boolean) => act(async () => {
+      const id = `id-${text}`
+      const send = () => getSessionControls().sendMessage(text, { clientMessageId: id })
+      return getSessionControls().messageQueue!.submit(text, { hasFiles, clientMessageId: id }, send)
+        .then(outcome => outcome, (error: unknown) => error)
+    })
+
+    it.each([
+      ["a message behind a running turn is held", { status: "completed" as const, version: 2 }, async () => {
+        await submit("A")
+        expect(await submit("B")).toBe("queued")
+        return { items: 1, alerts: [] }
+      }],
+      ["a sixth message is refused", { status: "completed" as const, version: 2 }, async () => {
+        await submit("A")
+        for (const text of ["B", "C", "D", "E", "F"]) expect(await submit(text)).toBe("queued")
+        expect(await submit("G")).toMatchObject({ notificationHandled: true })
+        return { items: 5, alerts: ['messageQueue.full:{"count":5}'] }
+      }],
+      ["a message with files is not held", { status: "completed" as const, version: 2 }, async () => {
+        await submit("A")
+        expect(await submitWithFiles("B", true)).toMatchObject({ notificationHandled: true })
+        return { items: 0, alerts: ["messageQueue.filesNotQueued"] }
+      }],
+      ["a direct send refused as busy joins the queue", { status: "running" as const, version: 3 }, async () => {
+        expect(await submit("A")).toBe("queued")
+        return { items: 1, alerts: [] }
+      }],
+      ["a direct send with files refused as busy is not held", { status: "running" as const, version: 3 }, async () => {
+        expect(await submitWithFiles("A", true)).toMatchObject({ notificationHandled: true })
+        return { items: 0, alerts: ["messageQueue.filesNotQueued"] }
+      }],
+    ])("%s", async (_name, initial, run) => {
+      await mount(initial)
+      const expected = await run()
+      expect(queue().items).toHaveLength(expected.items)
+      expect(toasts()).toEqual(expected.alerts)
+    })
+
+    it("a direct send refused as busy is not held once the queue is full", async () => {
+      const { server } = await startedTurnWithWaitingB()
+      for (const text of ["C", "D", "E", "F"]) await submit(text)
+      server.handover()
+      await push(server.ask())
+      // Another tab answered; this page has not heard yet and sends its own answer.
+      server.status = "running"
+      expect(await submit("X")).toMatchObject({ notificationHandled: true })
+      expect(queue().items).toHaveLength(5)
+      expect(toasts()).toEqual(['messageQueue.full:{"count":5}'])
+    })
+
+    it("a direct send refused as busy is not held when the connection stops taking new turns during the send", async () => {
+      const { server } = await mount({ status: "running", version: 3 })
+      server.ackGate = deferred<void>()
+      const first = submit("A")
+      await act(async () => {})
+      act(() => socket()?.onConnectionCapabilities?.(["heartbeat", "conversation_attached"]))
+      server.ackGate.resolve()
+      expect(await first).toMatchObject({ disposition: "rejected", errorCode: "task_busy" })
+      expect(queue().items).toEqual([])
+      expect(toasts()).toEqual([])
+    })
+
+    it("a direct send refused for any other reason throws as it is and is not held", async () => {
+      const { server } = await mount()
+      server.refuseDirect = () => new MessageDeliveryError("gone", "rejected", { errorCode: "task_unavailable" })
+      expect(await submit("A")).toMatchObject({ errorCode: "task_unavailable", disposition: "rejected" })
+      expect(queue()).toMatchObject({ items: [], phase: { kind: "idle" } })
+      expect(toasts()).toEqual([])
+    })
+  })
+
+  describe("the queue is inert unless the page, the transport and the server all offer it", () => {
+    const WITHOUT_NEW_TURNS = ["heartbeat", "conversation_attached"]
+    it.each([
+      ["the page does not ask", undefined],
+      ["the page switches it off", { messageQueue: "disabled" as const }],
+    ])("%s", async (_name, capabilities) => {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), capabilities)}>
+          <SessionControlsProbe />
+        </AppProvider>,
+      )
+      await connect()
+      expect(getSessionControls().messageQueue).toBeNull()
+    })
+
+    it("a transport without a Session ignores the page's request", () => {
+      render(
+        <AppProvider token="token" transport={{ capabilities: { messageQueue: "enabled" } }}>
+          <SessionControlsProbe />
+        </AppProvider>,
+      )
+      expect(getSessionControls().messageQueue).toBeNull()
+    })
+
+    it.each([
+      ["the server does not declare new turns", WITHOUT_NEW_TURNS],
+      ["the server's capabilities have not arrived", null],
+    ])("sends as before when %s", async (_name, frames) => {
+      const server = makeServer({ status: "running", version: 3 })
+      sendChatMessageMock.mockImplementation(server.chat)
+      render(tree())
+      if (frames) await connect(frames)
+      else {
+        act(() => socket()?.onConnect?.())
+        await push({ type: "conversation_attached", timestamp: "2026-11-17T00:00:00Z", data: { type: "conversation_attached" } })
+      }
+      await push(taskInfoMessage(TASK, { status: "running", state_version: 3 }))
+      // The refusal reaches the caller as it is: nothing is held or alerted.
+      expect(await submit("A")).toMatchObject({ disposition: "rejected", errorCode: "task_busy" })
+      expect(sent()).toEqual([["A", null]])
+      expect(queue().items).toEqual([])
+      expect(toasts()).toEqual([])
+      server.handover()
+      await push(server.snapshot())
+      await push(server.end())
+      expect(sent()).toEqual([["A", null]])
+    })
+  })
+
+  describe("the head waits for every send check", () => {
+    // B is the head and its turn has ended, but something still holds it back.
+    const onceHeld = async (hold: (server: ReturnType<typeof makeServer>) => Promise<void> | void) => {
+      const { server, view } = await startedTurnWithWaitingB()
+      server.handover()
+      await hold(server)
+      await push(server.end())
+      return { server, view }
+    }
+    const headSends = () => sent().filter(([text]) => text === "B")
+
+    it("another delivery is in flight", async () => {
+      let release!: () => void
+      const { server } = await onceHeld(async current => {
+        current.ackGate = deferred<void>()
+        release = () => current.ackGate!.resolve()
+        void getSessionControls().sendMessage("Z", { clientMessageId: "id-Z" }).catch(() => undefined)
+        await act(async () => {})
+      })
+      expect(phase()).toEqual({ kind: "ready" })
+      expect(headSends()).toHaveLength(0)
+      await act(async () => release())
+      expect(headSends()).toHaveLength(1)
+      expect(server.accepted.has("id-Z")).toBe(true)
+    })
+
+    it("the new connection has not announced attach completion", async () => {
+      const { server, view } = await startedTurnWithWaitingB()
+      server.handover()
+      view.rerender(tree("session-two"))
+      act(() => socket()?.onConnect?.())
+      expect(getSessionControls().sessionConversationState).toBe("bound")
+      await push(server.end())
+      expect(phase()).toEqual({ kind: "ready" })
+      expect(headSends()).toHaveLength(0)
+      await connect()
+      expect(headSends()).toHaveLength(1)
+    })
+
+    it("the conversation is no longer bound", async () => {
+      let release!: () => void
+      const { server } = await onceHeld(async current => {
+        current.ackGate = deferred<void>()
+        release = () => current.ackGate!.resolve()
+        void getSessionControls().sendMessage("Z", { clientMessageId: "id-Z" }).catch(() => undefined)
+        await act(async () => {})
+      })
+      await push({ type: "conversation_reload_required", timestamp: "2026-11-17T00:00:02Z", task_id: TASK })
+      expect(getSessionControls().sessionConversationState).toBe("reload_required")
+      await act(async () => release())
+      expect(headSends()).toHaveLength(0)
+      expect(server.accepted.has("id-B")).toBe(false)
+      // Nothing was attempted: the head is still ready and untouched.
+      expect(phase()).toEqual({ kind: "ready" })
+      expect(queue().items.map(item => item.status)).toEqual(["waiting"])
+      expect(toasts()).toEqual([])
+    })
+  })
+
+  describe("a head in flight when the connection changes", () => {
+    it("is sent again on the new connection as the same declared message", async () => {
+      const { server, view } = await startedTurnWithWaitingB()
+      server.handover()
+      sendChatMessageMock.mockImplementationOnce(async () => {
+        throw new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true })
+      })
+      await push(server.end())
+      expect(headCalls()).toHaveLength(1)
+      view.rerender(tree("session-two"))
+      act(() => socket()?.onConnect?.())
+      await connect()
+      expect(headCalls()).toHaveLength(2)
+      expect(headCalls().map(call => [call[3], call[7]])).toEqual([["id-B", "new_turn"], ["id-B", "new_turn"]])
+      expect(queue().items).toEqual([])
+      expect(phase()).toMatchObject({ kind: "waiting" })
+      expect(toasts()).toEqual([])
+    })
+
+    it("is dropped on acknowledgement when the new server stops taking new turns, and sent again as the same message once it does", async () => {
+      const { server, view } = await startedTurnWithWaitingB()
+      server.handover()
+      server.ackGate = deferred<void>()
+      await push(server.end())
+      expect(queue().items.map(item => item.status)).toEqual(["sending"])
+
+      view.rerender(tree("session-two"))
+      await connect(["heartbeat", "conversation_attached"])
+      expect(queue().items.map(item => item.status)).toEqual(["failed"])
+      expect(toasts()).toEqual(["messageQueue.supportLost"])
+      await act(async () => server.ackGate!.resolve())
+      // The late acknowledgement is not applied.
+      expect(queue().items.map(item => [item.clientMessageId, item.status])).toEqual([["id-B", "failed"]])
+      expect(toasts()).toEqual(["messageQueue.supportLost"])
+
+      view.rerender(tree("session-three"))
+      await connect()
+      await act(async () => getSessionControls().messageQueue!.continueSending())
+      expect(headCalls().map(call => [call[3], call[7]])).toEqual([["id-B", "new_turn"], ["id-B", "new_turn"]])
+      expect(queue().items).toEqual([])
+      expect(phase()).toMatchObject({ kind: "waiting" })
+    })
+    const headCalls = () => sendChatMessageMock.mock.calls.filter(call => call[0] === "B")
+  })
+
+  it("holds a message sent after the one that created the task", async () => {
+    const server = makeServer({ status: "completed", version: 0 })
+    sendChatMessageMock.mockImplementation(server.chat)
+    render(tree())
+    await connect()
+    expect(await submit("A")).toBe("sent")
+    // The server created the task and announced it after acknowledging A.
+    server.startPending = false
+    server.status = "pending"
+    server.version = 1
+    expect(phase()).toMatchObject({ kind: "waiting", since: undefined })
+    await push(taskInfoMessage(TASK, { status: "pending", state_version: 1 }))
+    expect(phase()).toMatchObject({ kind: "waiting", since: undefined })
+    expect(await submit("B")).toBe("queued")
+    expect(sent()).toEqual([["A", null]])
+
+    server.status = "running"
+    server.version = 2
+    await push(server.snapshot())
+    await push(server.end())
+    expect(sent()).toEqual([["A", null], ["B", "new_turn"]])
+    expect(queue().items).toEqual([])
+  })
+
+  it("an unchanged observation leaves the queue's state object alone", async () => {
+    const { server } = await startedTurnWithWaitingB()
+    server.handover()
+    await push(server.snapshot())
+    const before = queue()
+    await push(server.snapshot())
+    expect(queue()).toBe(before)
   })
 })

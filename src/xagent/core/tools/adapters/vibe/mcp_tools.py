@@ -1,6 +1,9 @@
 """MCP tools registration using @register_tool decorator."""
 
+import hashlib
+import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any, List
 
 from ....utils.setup_metrics import mcp_setup
@@ -285,6 +288,119 @@ async def _finish_mcp_setup(
     return model_visible_mcp_tools(tools)
 
 
+# A rebuild of the same tool config shortly after a build (for example a host
+# installing per-turn tools and invalidating the agent) must not pay for a
+# second full MCP handshake round. Every fence that forces a fresh config read
+# also discards the entry (``discard_mcp_load_reuse``); the window is only a
+# safety net so tokens inside the loaded tools cannot go stale across turns.
+_MCP_LOAD_REUSE_SECONDS = 60.0
+_MCP_LOAD_CACHE_ATTR = "_mcp_load_reuse_entry"
+_clock = time.monotonic
+
+
+def _json_default(value: Any) -> str:
+    # Callables (such as the connector runtime refresh hook) carry a memory
+    # address in their repr, which would make every key unique.
+    return "<callable>" if callable(value) else repr(value)
+
+
+def _mcp_load_reuse_key(
+    mcp_configs: List[dict[str, Any]],
+    sandbox: Any,
+    session_identities: Any,
+) -> str | None:
+    """Digest of everything the load depends on; never logged or persisted.
+
+    Returns ``None`` (no reuse) when the inputs cannot be digested.
+    """
+    try:
+        identities = sorted(
+            (str(name), repr(getattr(identity, "key", identity)))
+            for name, identity in (session_identities or {}).items()
+        )
+        payload = json.dumps(
+            [mcp_configs, identities], sort_keys=True, default=_json_default
+        )
+    except Exception:
+        return None
+    return hashlib.sha256(f"{id(sandbox)}|{payload}".encode()).hexdigest()
+
+
+_MCP_LOAD_GENERATION_ATTR = "_mcp_load_reuse_generation"
+
+
+def _reuse_generation(config: Any) -> int:
+    return getattr(config, _MCP_LOAD_GENERATION_ATTR, 0)
+
+
+def discard_mcp_load_reuse(config: Any) -> None:
+    """Forget the MCP load a config remembered for reuse, if any.
+
+    Also bumps a generation, so a load that was already in flight when a fence
+    fired cannot write its (now stale) result back afterwards.
+    """
+    try:
+        setattr(config, _MCP_LOAD_GENERATION_ATTR, _reuse_generation(config) + 1)
+        setattr(config, _MCP_LOAD_CACHE_ATTR, None)
+    except Exception:  # a config that rejects attributes never reuses
+        logger.debug("MCP load reuse entry could not be cleared", exc_info=True)
+
+
+def _reusable_mcp_load(config: Any, key: str | None) -> tuple[List[Any], Any] | None:
+    entry = getattr(config, _MCP_LOAD_CACHE_ATTR, None)
+    if not entry:
+        return None
+    stored_key, stored_at, tools, summary = entry
+    if (
+        key is not None
+        and stored_key == key
+        and _clock() - stored_at <= (_MCP_LOAD_REUSE_SECONDS)
+    ):
+        return list(tools), summary
+    discard_mcp_load_reuse(config)
+    return None
+
+
+def _declared_unavailable_names(mcp_configs: List[dict[str, Any]]) -> set[str]:
+    """Servers the config itself declares unavailable (for example OAuth not
+    connected). They are part of the key, so they do not need a retry."""
+    from .selection_spec import normalize_mcp_server_name
+
+    return {
+        normalize_mcp_server_name(cfg.get("name", ""))
+        for cfg in mcp_configs
+        if isinstance(cfg.get("config"), dict) and cfg["config"].get("unavailable")
+    }
+
+
+def _remember_mcp_load(
+    config: Any,
+    key: str | None,
+    tools: List[Any],
+    summary: Any,
+    *,
+    generation: int,
+    mcp_configs: List[dict[str, Any]],
+) -> None:
+    from .selection_spec import normalize_mcp_server_name
+
+    if key is None or generation != _reuse_generation(config):
+        return  # a fence fired while the load was in flight
+    # Only a load without real failures is worth replaying: a failed server
+    # must be retried and a required-policy failure must not outlive the
+    # outage. A server the config declares unavailable is not a load failure.
+    declared = _declared_unavailable_names(mcp_configs)
+    if any(
+        normalize_mcp_server_name(failure.server_name) not in declared
+        for failure in summary.failures
+    ):
+        return
+    try:
+        setattr(config, _MCP_LOAD_CACHE_ATTR, (key, _clock(), list(tools), summary))
+    except Exception:  # a config that rejects attributes just never reuses
+        logger.debug("MCP load reuse entry could not be stored", exc_info=True)
+
+
 @register_tool(categories={"mcp"}, selection_gate="mcp")
 @mcp_setup.measure()
 async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
@@ -419,9 +535,18 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 actor_stdio_session_identities=session_identities,
                 actor_stdio_session_consumer=session_consumer,
             )
-        tools = await ToolFactory._create_mcp_tools_from_configs(
-            mcp_configs, **create_kwargs
+        reuse_generation = _reuse_generation(config)
+        reuse_key = _mcp_load_reuse_key(
+            mcp_configs, create_kwargs["sandbox"], session_identities
         )
+        reused = _reusable_mcp_load(config, reuse_key)
+        if reused is not None:
+            logger.debug("Reusing MCP tools loaded moments ago")
+            tools = reused[0]
+        else:
+            tools = await ToolFactory._create_mcp_tools_from_configs(
+                mcp_configs, **create_kwargs
+            )
     except ConnectorRuntimeError:
         summary = _build_mcp_load_summary(
             mcp_configs,
@@ -439,6 +564,17 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
             forced_failure_reason="loader_failed",
         )
     else:
-        summary = _build_mcp_load_summary(mcp_configs, tools)
+        if reused is not None:
+            summary = reused[1]
+        else:
+            summary = _build_mcp_load_summary(mcp_configs, tools)
+            _remember_mcp_load(
+                config,
+                reuse_key,
+                tools,
+                summary,
+                generation=reuse_generation,
+                mcp_configs=mcp_configs,
+            )
 
     return await _finish_mcp_setup(config, summary, tools)

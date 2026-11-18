@@ -1115,6 +1115,7 @@ class TestAPITool:
             "headers": {"x-request-id": "request-1"},
             "body": {"message": "unauthorized"},
             "error": "HTTP 401",
+            "blocked_by_policy": False,
         }
 
     def test_return_value_formatting(self):

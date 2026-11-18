@@ -50,9 +50,9 @@ class Deployment(Base):  # type: ignore[no-any-unimported]
     widget_enabled = Column(Boolean, default=False, nullable=False)
     allowed_domains = Column(JSON, nullable=True, default=list)
     widget_key = Column(String(255), nullable=True, unique=True, index=True)
-    # Whether widget guests of this workforce may use voice. Written only by
-    # the admin widget-voice API; owner-reachable writers and responses never
-    # carry it.
+    # Whether widget guests of this workforce may use voice. Written by the
+    # admin widget-voice API and by the owner widget-voice API (whoever may edit
+    # the workforce); it does not appear in other owner responses.
     widget_voice_enabled = Column(
         Boolean, default=False, server_default=false(), nullable=False
     )

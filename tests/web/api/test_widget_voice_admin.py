@@ -1,4 +1,5 @@
-"""Only the admin widget-voice API writes or returns the widget voice switch."""
+"""The widget voice switch is written only through the admin and owner voice
+routes; the other owner request and response shapes never carry it."""
 
 # Pytest fixture imports are intentionally shadowed by test parameters.
 # ruff: noqa: F811
@@ -7,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import logging
 
 import pytest
 from pydantic import BaseModel
@@ -21,9 +23,10 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.user import User
 from xagent.web.schemas import v1 as v1_schemas
-from xagent.web.services import agent_management
+from xagent.web.services import agent_management, widget_voice_switch
 from xagent.web.services.agent_store import _AGENT_UPDATE_FIELDS
 from xagent.web.services.widget_voice import WidgetVoiceAvailability
+from xagent.web.services.widget_voice_switch import WidgetVoiceTarget
 
 from .conftest import (
     _admin_headers,
@@ -34,7 +37,7 @@ from .conftest import (
 )
 from .test_widget_voice_asr import asr_model  # noqa: F401
 from .test_widget_voice_tts import voice  # noqa: F401
-from .test_workforce_widget import _create_workforce, _enable_widget
+from .test_workforce_widget import _create_workforce, _enable_widget, _user_id
 
 pytestmark = pytest.mark.usefixtures("_test_db")
 
@@ -298,7 +301,7 @@ def test_admin_routes_answer_on_a_one_slot_pool(
 
 @pytest.mark.parametrize("entity", ["agent", "workforce"])
 def test_admin_put_writes_nothing_when_the_target_disappears(
-    entity, voice, monkeypatch
+    entity, voice, monkeypatch, caplog
 ) -> None:
     path, target_id = _make_target(entity, voice)
 
@@ -319,8 +322,14 @@ def test_admin_put_writes_nothing_when_the_target_disappears(
     monkeypatch.setattr(
         admin_widget_voice, "resolve_widget_voice_availability", delete_target
     )
-    response = client.put(path, headers=voice.admin, json={"enabled": True})
+    with caplog.at_level(logging.INFO, logger=widget_voice_switch.logger.name):
+        response = client.put(path, headers=voice.admin, json={"enabled": True})
     assert response.status_code == 404, response.text
+    assert not [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Widget voice switch set by administrator"
+    ]
     db = _direct_db_session()
     try:
         if entity == "agent":
@@ -331,12 +340,65 @@ def test_admin_put_writes_nothing_when_the_target_disappears(
         db.close()
 
 
+def _set_switch(entity: str, target_id: int, value: bool) -> None:
+    db = _direct_db_session()
+    try:
+        if entity == "agent":
+            row = db.get(Agent, target_id)
+        else:
+            row = (
+                db.query(Deployment)
+                .filter_by(
+                    owner_type=DeploymentOwnerType.WORKFORCE.value, owner_id=target_id
+                )
+                .one()
+            )
+        row.widget_voice_enabled = value
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("entity", ["agent", "workforce"])
+@pytest.mark.parametrize("before, after", [(False, True), (True, False), (True, True)])
+def test_admin_put_logs_previous_and_new(entity, before, after, caplog) -> None:
+    admin = _admin_headers()
+    if entity == "agent":
+        owner = _register_second_user()
+        target_id = client.post(
+            "/api/agents", headers=owner, json={"name": "Logged voice"}
+        ).json()["id"]
+        path = f"/api/admin/widget-voice/agents/{target_id}"
+    else:
+        target_id = _create_workforce("Logged voice workforce")
+        _enable_widget(target_id)
+        path = f"/api/admin/widget-voice/workforces/{target_id}"
+    _set_switch(entity, target_id, before)
+    with caplog.at_level(logging.INFO, logger=widget_voice_switch.logger.name):
+        response = client.put(path, headers=admin, json={"enabled": after})
+    assert response.status_code == 200, response.text
+    records = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Widget voice switch set by administrator"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.actor_user_id == _user_id("admin")
+    assert record.actor_is_admin is True
+    assert record.previous_widget_voice_enabled is before
+    assert record.widget_voice_enabled is after
+    # No voice models are configured here: the provider answers "not configured".
+    assert record.available is False
+    assert getattr(record, f"{entity}_id") == target_id
+
+
 async def test_admin_target_refuses_a_request_session_with_uncommitted_work() -> None:
     reads: list[int] = []
 
-    def read() -> admin_widget_voice._Target:
+    def read() -> WidgetVoiceTarget:
         reads.append(1)
-        return admin_widget_voice._Target(1, False)
+        return WidgetVoiceTarget(1, False)
 
     db = _direct_db_session()
     try:

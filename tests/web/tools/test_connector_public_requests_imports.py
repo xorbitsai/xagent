@@ -13,6 +13,7 @@ MIGRATED_MODULES = [
     *[
         f"xagent.web.tools.mcp.{name}"
         for name in (
+            "chargebee",
             "chartmogul",
             "deputy",
             "employment_hero",

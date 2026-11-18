@@ -1,11 +1,12 @@
 import React from "react";
 import { cn } from "@/lib/utils";
+import type { AvatarPersona } from "@/lib/page-extension-contracts";
 
 interface PersonaAvatarProps {
   /** Only `name` and `avatar` are read - narrower than the full
    * `PersonaInfo` type so callers with just an agent's name/logo (no real
    * persona) can reuse this without fabricating unused fields. */
-  persona: { name: string; avatar?: string | null };
+  persona: AvatarPersona;
   /** Tailwind size classes, e.g. "h-11 w-11" or "h-16 w-16". */
   sizeClassName: string;
   /** Tailwind text-size class for the fallback initial, e.g. "text-sm" or "text-xl". */
@@ -20,6 +21,9 @@ interface PersonaAvatarProps {
   /** Inline style pass-through - e.g. a caller-computed box-shadow ring color
    * that can't be expressed as a static Tailwind class. */
   style?: React.CSSProperties;
+  /** Set while this persona is working on a reply, so the avatar reads as
+   * busy rather than idle. */
+  thinking?: boolean;
 }
 
 /** A persona's circular avatar image, falling back to its first initial on a
@@ -33,14 +37,16 @@ export function PersonaAvatar({
   className,
   decorative = false,
   style,
+  thinking = false,
 }: PersonaAvatarProps) {
+  const thinkingClassName = thinking && "motion-safe:animate-pulse";
   if (persona.avatar) {
     return (
       <img
         src={persona.avatar}
         alt={decorative ? "" : persona.name}
         style={style}
-        className={cn(sizeClassName, "flex-shrink-0 rounded-full object-cover", className)}
+        className={cn(sizeClassName, "flex-shrink-0 rounded-full object-cover", thinkingClassName, className)}
       />
     );
   }
@@ -53,6 +59,7 @@ export function PersonaAvatar({
         sizeClassName,
         "flex flex-shrink-0 items-center justify-center rounded-full bg-muted font-semibold text-muted-foreground",
         textClassName,
+        thinkingClassName,
         className
       )}
     >

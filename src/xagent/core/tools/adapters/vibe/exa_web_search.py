@@ -78,6 +78,8 @@ class ExaWebSearchTool(AbstractBaseTool):
             "Returns lightweight results with titles and links by default. "
             "Set content_mode only when search-result highlights, text, or summaries "
             "are needed; otherwise use fetch_web_content to read one selected URL. "
+            "For a simple question prefer content_mode='highlights' over fetching "
+            "pages, and fetch at most one or two pages. "
             "Supports category filtering, domain filtering, text filtering, and date range filtering. "
             "Useful for finding current information, research, news, and company data."
         )

@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   dispatch: vi.fn(),
   success: vi.fn(),
   push: vi.fn(),
+  deployProps: vi.fn(),
 }))
 const translate = (key: string, params?: Record<string, string>) => {
   const translation = key.split(".").reduce<unknown>((object, part) =>
@@ -27,7 +28,17 @@ vi.mock("next/navigation", () => ({ useRouter: () => ({ push: mocks.push }) }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: mocks.request }))
 vi.mock("@/components/ui/sonner", () => ({ toast: { success: mocks.success } }))
 vi.mock("@/components/build/agent-triggers-dialog", () => ({ AgentTriggersDialog: () => null }))
-vi.mock("@/components/build/deploy-agent-dialog", () => ({ DeployAgentDialog: () => null }))
+vi.mock("@/components/build/deploy-agent-dialog", () => ({
+  DeployAgentDialog: (props: { initialView?: string }) => {
+    mocks.deployProps(props)
+    return <div data-testid="deploy-dialog" data-view={props.initialView} />
+  },
+}))
+vi.mock("@/lib/agent-channel-extension", () => ({
+  AgentChannelHeaderAction: ({ agent, onOpen }: { agent: { name: string; status: string }; onOpen: () => void }) => (
+    <button type="button" onClick={onOpen}>{`channel-action ${agent.name} ${agent.status}`}</button>
+  ),
+}))
 
 let savedProfile: Record<string, unknown>
 
@@ -132,6 +143,43 @@ describe("Agent profile editing", () => {
     await openProfile()
     expect(screen.getByLabelText("Name")).toHaveValue("Ben Support")
     expect(screen.getByLabelText("Standing rules")).toHaveValue("Ask before sending refunds.")
+  })
+
+  it("reports the agent it fetched, not the route hints, and none before the fetch lands", async () => {
+    let finish!: (response: Response) => void
+    mocks.request.mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve }))
+    const onAgentChange = vi.fn()
+    render(<AgentChatHeader agentId={7} name="Hint name" logoUrl="/uploads/hint.png" onAgentChange={onAgentChange} />)
+
+    expect(onAgentChange).not.toHaveBeenCalled()
+    await act(async () => finish(Response.json({ ...savedProfile, name: "Ben", logo_url: "/uploads/agent_logos/ben.png" })))
+
+    await waitFor(() => expect(onAgentChange).toHaveBeenCalledOnce())
+    expect(onAgentChange).toHaveBeenCalledWith({ name: "Ben", avatar: expect.stringMatching(/\/uploads\/agent_logos\/ben\.png$/), agentId: 7 })
+  })
+
+  it("reports a rename and a new logo that the profile dialog saved", async () => {
+    const onAgentChange = vi.fn()
+    render(<AgentChatHeader agentId={7} name="Ben" onAgentChange={onAgentChange} />)
+    await waitFor(() => expect(onAgentChange).toHaveBeenCalledOnce())
+    await openProfile()
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Ben Support" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(onAgentChange).toHaveBeenLastCalledWith(expect.objectContaining({ name: "Ben Support", agentId: 7 })))
+  })
+
+  it("reports once per change, not on every render", async () => {
+    const onAgentChange = vi.fn()
+    const view = render(<AgentChatHeader agentId={7} name="Ben" onAgentChange={onAgentChange} />)
+    await waitFor(() => expect(onAgentChange).toHaveBeenCalledOnce())
+
+    // A parent that passes a fresh callback each render must not cause a report each time.
+    view.rerender(<AgentChatHeader agentId={7} name="Ben" onAgentChange={(agent) => onAgentChange(agent)} />)
+    view.rerender(<AgentChatHeader agentId={7} name="Ben" onAgentChange={(agent) => onAgentChange(agent)} />)
+
+    expect(onAgentChange).toHaveBeenCalledOnce()
   })
 
   it("discards edits on cancel and does not submit empty names or rules", async () => {
@@ -251,5 +299,36 @@ describe("Agent profile editing", () => {
     expect(savedProfile.instructions).toBe(instructions)
     await openProfile()
     expect(screen.getByLabelText("Standing rules")).toHaveValue(instructions ?? "")
+  })
+
+  describe("channel extension", () => {
+    it("renders the header action only with the loaded agent, never the placeholder", async () => {
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      expect(screen.queryByText(/channel-action/)).not.toBeInTheDocument()
+      expect(await screen.findByText("channel-action Ben published")).toBeInTheDocument()
+      expect(screen.queryByText(/channel-action Agent/)).not.toBeInTheDocument()
+    })
+
+    it("does not render the header action when the agent fails to load", async () => {
+      mocks.request.mockResolvedValue(new Response("{}", { status: 500 }))
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      await waitFor(() => expect(mocks.request).toHaveBeenCalled())
+      expect(screen.queryByText(/channel-action/)).not.toBeInTheDocument()
+    })
+
+    it("opens the dialog on the channel view from the action and on options from the menu", async () => {
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      fireEvent.click(await screen.findByText("channel-action Ben published"))
+      expect(screen.getByTestId("deploy-dialog")).toHaveAttribute("data-view", "channel")
+    })
+
+    it("resets to the options view when Deploy is chosen from the menu after the channel view", async () => {
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      fireEvent.click(await screen.findByText("channel-action Ben published"))
+      expect(screen.getByTestId("deploy-dialog")).toHaveAttribute("data-view", "channel")
+      fireEvent.click(screen.getByRole("button", { name: /More options for/ }))
+      fireEvent.click(screen.getByRole("button", { name: "Deploy" }))
+      expect(screen.getByTestId("deploy-dialog")).toHaveAttribute("data-view", "options")
+    })
   })
 })

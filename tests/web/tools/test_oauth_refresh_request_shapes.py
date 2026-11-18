@@ -39,7 +39,11 @@ ZENDESK_MARKETPLACE_ENV = {
     "ZENDESK_MARKETPLACE_APP_ID": "67890",
 }
 # Where a provider's grant records the account its refresh goes to.
-INSTANCE_URLS = {"zendesk": "acme", "deputy": "https://acme.as.deputy.com"}
+INSTANCE_URLS = {
+    "zendesk": "acme",
+    "shopify": "acme",
+    "deputy": "https://acme.as.deputy.com",
+}
 
 
 @pytest.fixture()
@@ -265,6 +269,21 @@ EXPECTED_SHAPES: dict[str, dict] = {
             "x-zendesk-marketplace-organization-id": "12345",
             "x-zendesk-marketplace-app-id": "67890",
         },
+    },
+    "shopify": {
+        "method": "POST",
+        "url": "https://acme.myshopify.com/admin/oauth/access_token",
+        "query": {},
+        "body": {
+            "grant_type": "refresh_token",
+            "refresh_token": REFRESH_TOKEN,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            # Ask for an expiring offline token again, as the exchange did.
+            "expiring": "1",
+        },
+        "content_type": "application/x-www-form-urlencoded",
+        "accept": "application/json",
     },
     "salesforce": {
         "method": "POST",

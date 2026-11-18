@@ -25,6 +25,7 @@ import {
 } from "@/lib/client-errors"
 import type { VoiceAudioTransport } from "@/lib/voice-audio"
 import type { WidgetSessionHistoryAuth } from "@/lib/widget-session-history"
+import { pageMayUseMicrophone } from "@/lib/widget-microphone"
 import {
   toAttachments,
   useSessionAttachments,
@@ -117,7 +118,7 @@ interface SessionConversationContentProps {
   historyAvailable: boolean
   // The token of the session the page holds right now, or null while it has none.
   readCurrentToken: () => string | null
-  // Whether a voice call is offered to this session (voice=1 and the server's voice capability).
+  // Whether a voice call is offered to this session (voice=1, the page may use the microphone, and the server's voice capability).
   voiceOffered: boolean
   // Ends the session as expired when the voice recognition socket is closed with 4408.
   onSessionExpired: () => void
@@ -826,15 +827,18 @@ export function SessionAgentChatPage() {
   sessionTokenRef.current = bridge.session?.token ?? null
   const readCurrentToken = useCallback(() => sessionTokenRef.current, [])
 
-  // The page runs in the host page's iframe only, and widget.js adds voice=1
-  // where the host page granted the microphone. voice=1 is an unsigned hint
-  // that any page can add to the URL itself. It only says the embedder
-  // delegated the microphone to this iframe and is not a permission: whether
-  // voice calls are offered is decided by the server (the voice capability of
-  // the session payload), and the voice endpoints check again on every
-  // request.
+  // The page runs in the host page's iframe only. widget.js adds voice=1
+  // wherever it delegated the microphone, which is every page that did not set
+  // data-voice="false". voice=1 is an unsigned hint that any page can add to
+  // the URL itself and is not a permission: whether voice calls are offered is
+  // decided by the server (the voice capability of the session payload), and
+  // the voice endpoints check again on every request.
   const [voiceRequested] = useState(
-    () => new URLSearchParams(window.location.search).get("voice") === "1",
+    // This first render also runs on the server, where there is no window:
+    // voice is then not requested, and the browser computes it on hydration.
+    () => typeof window !== "undefined"
+      && new URLSearchParams(window.location.search).get("voice") === "1"
+      && pageMayUseMicrophone(),
   )
   // Held across a refresh like the capabilities above, and kept once the
   // session is down, so an open call sees the session end instead of

@@ -337,7 +337,7 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     return "unconnectable"
 
 
-def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
+def _app_to_dict(app: "PublicMCPApp | CatalogRow") -> Dict[str, Any]:
     # One registry scan (not two - see the helper's own docstring) since
     # this runs per app on the connector-listing path.
     execution_fields, optional_oauth_scopes = (
@@ -439,6 +439,83 @@ def get_all_mcp_apps(
         snapshot.catalog_apps if snapshot is not None else db.query(PublicMCPApp).all()
     )
     return [_app_to_dict(app) for app in apps]
+
+
+@dataclass(frozen=True)
+class CatalogRow:
+    """Plain copy of the ``PublicMCPApp`` columns ``_app_to_dict`` reads.
+
+    Deliberately not a ``PublicMCPApp``: the model is only constructed where a
+    row is created (see ``test_production_association_creation_paths_share_the_
+    model_default``), and a copy that is never attached to a session stays valid
+    after the session that loaded it is closed.
+    """
+
+    app_id: str
+    name: str
+    description: str | None
+    icon: str | None
+    transport: str
+    provider_name: str | None
+    category: str | None
+    oauth_scopes: Any
+    launch_config: Any
+    is_visible_in_connector: bool
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    """One copied catalog row. The canonical ``_app_to_dict`` view is computed
+    only for the entries a lookup matches (it is the costly part)."""
+
+    app_id: str
+    row_name: str
+    row: CatalogRow
+
+    def app(self) -> Dict[str, Any]:
+        return _app_to_dict(self.row)
+
+
+def load_catalog_entries(db: Session) -> tuple[CatalogEntry, ...]:
+    """Copy the whole catalog once (one query)."""
+    return tuple(
+        CatalogEntry(
+            str(app.app_id),
+            str(app.name),
+            CatalogRow(
+                app_id=str(app.app_id),
+                name=str(app.name),
+                description=app.description,
+                icon=app.icon,
+                transport=app.transport,
+                provider_name=app.provider_name,
+                category=app.category,
+                oauth_scopes=deepcopy(app.oauth_scopes),
+                launch_config=deepcopy(app.launch_config),
+                is_visible_in_connector=bool(app.is_visible_in_connector),
+            ),
+        )
+        for app in db.query(PublicMCPApp).all()
+    )
+
+
+def match_catalog_entries(
+    entries: Iterable[CatalogEntry], *, app_id: str | None = None, name: str = ""
+) -> list[CatalogEntry]:
+    """Entries owning ``app_id``, or (without one) the name, one per ``app_id``.
+
+    The name rule is that of ``_get_app_for_server_name``: a row matches when
+    the name equals its ``app_id`` or its stored name.
+    """
+    matches: dict[str, CatalogEntry] = {}
+    for entry in entries:
+        if (
+            entry.app_id == app_id
+            if app_id is not None
+            else name in (entry.app_id, entry.row_name)
+        ):
+            matches.setdefault(entry.app_id, entry)
+    return list(matches.values())
 
 
 def get_app_by_id(db: Session, app_id: str) -> Dict[str, Any] | None:

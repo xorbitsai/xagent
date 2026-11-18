@@ -49,12 +49,24 @@ def _user(db, uid):
     return db.query(User).filter(User.id == uid).first()
 
 
-def _add_shopify_catalog_app(db):
+# A key-based builtin carrying a provenance marker (Shopify was the first,
+# before it moved to OAuth in #2810).
+STAMPED_STDIO_APP = "jira-ticket"
+STAMPED_STDIO_ENV = {
+    "JIRA_TICKET_SITE": "acme",
+    "JIRA_TICKET_EMAIL": "agent@example.com",
+    "JIRA_TICKET_API_TOKEN": "jira_test_secret",
+    "JIRA_TICKET_PROJECT_KEY": "OPS",
+}
+
+
+def _add_stamped_stdio_catalog_app(db):
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 
-    row = get_builtin_public_mcp_app("shopify")
+    row = get_builtin_public_mcp_app(STAMPED_STDIO_APP)
     assert row is not None
-    db.add(PublicMCPApp(**row))
+    # Shown, so connect reaches the provenance checks under test.
+    db.add(PublicMCPApp(**{**row, "is_visible_in_connector": True}))
     db.commit()
 
 
@@ -89,42 +101,37 @@ def test_connect_provisions_shared_server_with_per_user_env(test_db):
     assert decrypt_env_dict(assoc.env) == {"GOOGLE_MAPS_API_KEY": "alice-key"}
 
 
-def test_shopify_connect_stamps_official_server_provenance(test_db):
+def test_builtin_stdio_connect_stamps_official_server_provenance(test_db):
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
-    _add_shopify_catalog_app(test_db)
+    _add_stamped_stdio_catalog_app(test_db)
     connect_mcp_app(
-        "shopify",
-        MCPAppConnectRequest(
-            env={
-                "SHOPIFY_STORE_DOMAIN": "acme",
-                "SHOPIFY_ACCESS_TOKEN": "shpat_test_secret",
-            }
-        ),
+        STAMPED_STDIO_APP,
+        MCPAppConnectRequest(env=STAMPED_STDIO_ENV),
         current_user=_user(test_db, 1),
         db=test_db,
     )
 
-    server = test_db.query(MCPServer).filter(MCPServer.name == "shopify").one()
+    server = test_db.query(MCPServer).filter(MCPServer.name == STAMPED_STDIO_APP).one()
     assert server.auth == {
         "builtin_provenance": {
             "registry": "xagent",
-            "app_id": "shopify",
+            "app_id": STAMPED_STDIO_APP,
             "version": 1,
         }
     }
     assert "auth" not in server.to_connection_dict()
 
 
-@pytest.mark.parametrize("server_name", ["shopify", " Shopify ", "ShOpIfY"])
-def test_shopify_connect_refuses_unstamped_custom_server_even_if_shape_matches(
+@pytest.mark.parametrize("server_name", ["jira-ticket", " Jira-Ticket ", "JiRa-TiCkEt"])
+def test_builtin_stdio_connect_refuses_unstamped_custom_server_even_if_shape_matches(
     test_db, server_name
 ):
     from fastapi import HTTPException
 
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
-    _add_shopify_catalog_app(test_db)
+    _add_stamped_stdio_catalog_app(test_db)
     test_db.add(
         MCPServer(
             name=server_name,
@@ -132,20 +139,15 @@ def test_shopify_connect_refuses_unstamped_custom_server_even_if_shape_matches(
             managed="external",
             transport="stdio",
             command="python",
-            args=["-m", "xagent.web.tools.mcp.shopify"],
+            args=["-m", "xagent.web.tools.mcp.jira_ticket"],
         )
     )
     test_db.commit()
 
     with pytest.raises(HTTPException) as exc_info:
         connect_mcp_app(
-            "shopify",
-            MCPAppConnectRequest(
-                env={
-                    "SHOPIFY_STORE_DOMAIN": "acme",
-                    "SHOPIFY_ACCESS_TOKEN": "shpat_test_secret",
-                }
-            ),
+            STAMPED_STDIO_APP,
+            MCPAppConnectRequest(env=STAMPED_STDIO_ENV),
             current_user=_user(test_db, 1),
             db=test_db,
         )
@@ -153,16 +155,18 @@ def test_shopify_connect_refuses_unstamped_custom_server_even_if_shape_matches(
     assert exc_info.value.status_code == 409
 
 
-def test_shopify_connect_refuses_normalized_custom_catalog_name_collision(test_db):
+def test_builtin_stdio_connect_refuses_normalized_custom_catalog_name_collision(
+    test_db,
+):
     from fastapi import HTTPException
 
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
-    _add_shopify_catalog_app(test_db)
+    _add_stamped_stdio_catalog_app(test_db)
     test_db.add(
         PublicMCPApp(
-            app_id="custom-store",
-            name=" SHOPIFY ",
+            app_id="custom-tickets",
+            name=" JIRA-TICKET ",
             transport="stdio",
             launch_config={"command": "custom"},
         )
@@ -171,13 +175,8 @@ def test_shopify_connect_refuses_normalized_custom_catalog_name_collision(test_d
 
     with pytest.raises(HTTPException) as exc_info:
         connect_mcp_app(
-            "shopify",
-            MCPAppConnectRequest(
-                env={
-                    "SHOPIFY_STORE_DOMAIN": "acme",
-                    "SHOPIFY_ACCESS_TOKEN": "shpat_test_secret",
-                }
-            ),
+            STAMPED_STDIO_APP,
+            MCPAppConnectRequest(env=STAMPED_STDIO_ENV),
             current_user=_user(test_db, 1),
             db=test_db,
         )

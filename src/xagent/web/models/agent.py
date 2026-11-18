@@ -133,9 +133,10 @@ class Agent(Base):  # type: ignore
     share_enabled = Column(Boolean, default=False, nullable=False)
     share_token = Column(String(255), nullable=True, index=True)
     share_updated_at = Column(DateTime(timezone=True), nullable=True)
-    # Whether widget guests of this agent may use voice. Written only by the
-    # admin widget-voice API; owner-reachable writers and responses never
-    # carry it, and it survives an ownership change.
+    # Whether widget guests of this agent may use voice. Written by the admin
+    # widget-voice API and by the owner widget-voice API (whoever may edit the
+    # agent); it does not appear in agent detail or ``/v1``
+    # responses, and it survives an ownership change.
     widget_voice_enabled = Column(
         Boolean, default=False, server_default=false(), nullable=False
     )

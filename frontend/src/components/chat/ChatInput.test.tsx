@@ -352,6 +352,18 @@ describe("ChatInput", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("Send my draft", expect.objectContaining({ model: "selected-model" })))
   })
 
+  it("lets the non-compact send icon take the agent accent only while it can send", () => {
+    const { rerender } = render(<ChatInput onSend={vi.fn()} inputValue="Send my draft" onInputChange={vi.fn()}
+      compact={false} hideConfig hideFileUpload voiceInputEnabled={false} />)
+    expect(screen.getByRole("button", { name: "common.send" })).toHaveClass("agent-accent-surface")
+
+    rerender(<ChatInput onSend={vi.fn()} inputValue="" onInputChange={vi.fn()}
+      compact={false} hideConfig hideFileUpload voiceInputEnabled={false} />)
+    const dimmed = screen.getByRole("button", { name: "common.send" })
+    expect(dimmed).toBeDisabled()
+    expect(dimmed).not.toHaveClass("agent-accent-surface")
+  })
+
   it("requires a model when submitting generic chat", async () => {
     const onSend = vi.fn()
     const { container } = render(
@@ -2428,6 +2440,8 @@ describe("ChatInput", () => {
     const submitButton = container.querySelector('button[type="submit"]') as HTMLButtonElement
     expect(submitButton).toBeDisabled()
     expect(submitButton.className).toContain("bg-muted text-muted-foreground/50")
+    // A control that cannot act stays muted under an agent's accent too.
+    expect(submitButton).not.toHaveClass("agent-accent-surface")
     expect(submitButton).toHaveAccessibleName("widgetSession.stoppingResponse")
     expect(submitButton).toHaveAttribute("title", "widgetSession.stoppingResponse")
     expect(screen.getAllByRole("button", { name: "widgetSession.stoppingResponse" })).toEqual([submitButton])
@@ -2460,6 +2474,7 @@ describe("ChatInput", () => {
     const submitButton = screen.getByRole("button", { name: "common.send" })
     expect(submitButton).not.toBeDisabled()
     expect(submitButton.className).not.toContain("bg-muted")
+    expect(submitButton).toHaveClass("agent-accent-surface")
 
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 

@@ -49,6 +49,18 @@ export type BuildPageExtensionProviderComponent =
 export type BuildAgentCardExtensionComponent =
   ComponentType<BuildAgentCardExtensionProps>
 
+/** What an avatar is drawn from. `agentId` names the Agent a persona stands
+ * for, when it stands for one: a distribution that lets people style an
+ * Agent's avatar looks the style up by it. The OSS avatar does not read it. */
+export interface AvatarPersona {
+  name: string
+  avatar?: string | null
+  agentId?: number | null
+}
+
+/** An avatar's own color as an [r, g, b] triple, each 0-255. */
+export type AvatarAccentColor = readonly [number, number, number]
+
 export interface AgentBuilderSettingsExtensionOptions {
   /** Undefined when creating an Agent. */
   agentId?: number
@@ -56,10 +68,30 @@ export interface AgentBuilderSettingsExtensionOptions {
   enabled: boolean
   /** True while an Agent save is in progress. */
   saving: boolean
+  /** The name as currently typed; an avatar drawn from it changes with it. */
+  agentName: string
+  /** The Agent's logo image, which is the one thing its avatar can be besides a drawn one. */
+  logo: AgentBuilderLogoControls
+}
+
+export interface AgentBuilderLogoControls {
+  /** Where the current logo can be shown (a chosen file's preview or the saved image), or null. */
+  src: string | null
+  /** Use this image as the logo; it is uploaded when the Agent is saved. */
+  select: (file: File) => void
+  /** Clear the logo, saved or just chosen. */
+  remove: () => void
 }
 
 export interface AgentBuilderSettingsExtension {
   panel?: ReactNode
+  /** Replaces the built-in logo upload at the top of the form in every state,
+   * read-only and loading included: while `enabled` is false return it with
+   * its control disabled instead of leaving it out, or the built-in logo
+   * upload would show in its place. A distribution that draws avatars shows
+   * the logo and its avatar as one control through it, driving the logo with
+   * `logo` from the options. */
+  avatarPanel?: ReactNode
   /** Immutable JSON settings to submit. Omit or return an empty object when clean. */
   changes?: Record<string, unknown>
   /** Acknowledge the submitted settings after a successful save. Keep newer edits dirty. */
@@ -77,3 +109,48 @@ export interface DeployAgentEmbedExtensionProps {
 
 export type DeployAgentEmbedExtensionComponent =
   ComponentType<DeployAgentEmbedExtensionProps>
+
+// Agent the channel extension acts on; a subset of the chat header's agent.
+// The header only renders its action once the agent details have loaded, and
+// the Deploy dialog receives the caller's agent, so these are real values.
+export interface AgentChannelAgent {
+  id: number
+  name: string
+  description: string
+  logo_url: string | null
+  status: string
+}
+
+// Extra deployment channel (for example a chat integration) offered by the
+// agent chat header and the Deploy dialog. The OSS default renders nothing.
+export interface AgentChannelExtensionProps {
+  agent: AgentChannelAgent
+}
+
+// Header action rendered next to Routines; `onOpen` opens the Deploy dialog
+// directly on the channel view.
+export interface AgentChannelHeaderActionProps extends AgentChannelExtensionProps {
+  onOpen: () => void
+}
+export type AgentChannelHeaderActionComponent =
+  ComponentType<AgentChannelHeaderActionProps>
+
+// Option card rendered first in the Deploy dialog's options grid.
+export interface AgentChannelOptionProps extends AgentChannelExtensionProps {
+  onOpen: () => void
+}
+export type AgentChannelOptionComponent = ComponentType<AgentChannelOptionProps>
+
+// Full replacement for the Deploy dialog's `DialogContent` while the channel
+// view is active. Contract:
+// - render its own `DialogContent` (or portal/overlay/content equivalent);
+// - include a `DialogTitle` and `DialogDescription`, so Radix does not warn and
+//   screen readers get a dialog name;
+// - own the back (`onBack`) and close (`onClose`) controls;
+// - own any deployment-config error UI it needs: the dialog's default
+//   `DeploymentConfigErrorAlert` is not rendered in this view.
+export interface AgentChannelViewProps extends AgentChannelExtensionProps {
+  onBack: () => void
+  onClose: () => void
+}
+export type AgentChannelViewComponent = ComponentType<AgentChannelViewProps>

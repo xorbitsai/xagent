@@ -70,30 +70,35 @@ describe("widget bootstrap", () => {
   it("also boots the exact uninstrumented browser artifact", () => {
     runWidget({ "data-token": "legacy-token" }, () => window.eval(widgetScript))
     expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
-      "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed",
+      "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed&voice=1",
     )
     expect(document.querySelector(".xagent-widget-fab")).not.toBeNull()
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it("delegates clipboard writes to the cross-origin chat iframe", () => {
+  it("delegates clipboard writes and the microphone to the cross-origin chat iframe by default", () => {
     runWidget({ "data-token": "legacy-token" })
     expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.getAttribute("allow"))
-      .toBe("clipboard-write")
+      .toBe("clipboard-write; microphone")
   })
 
-  describe("data-voice microphone opt-in", () => {
+  describe("data-voice microphone delegation", () => {
     const GRANT = "eyJhbGciOiJIUzI1NiJ9.grant-one.sig"
     const cases: Array<[string, string | undefined, boolean, boolean]> = [
-      // [label, data-voice value, declared, expects an invalid-value warning]
-      ["missing", undefined, false, false],
+      // [label, data-voice value, microphone delegated, expects an invalid-value warning]
+      ["missing", undefined, true, false],
+      ["empty", "", true, false],
+      ["whitespace only", "   ", true, false],
       ["true", "true", true, false],
       ["padded upper-case TRUE", " TRUE ", true, false],
       ["false", "false", false, false],
+      ["padded mixed-case False", " False ", false, false],
       ["1", "1", false, true],
-      ["empty", "", false, false],
+      ["yes", "yes", false, true],
+      ["no", "no", false, true],
     ]
-    const INVALID_VOICE_WARNING = 'Xagent Widget: data-voice must be "true" or "false"; ignoring it.'
+    const INVALID_VOICE_WARNING =
+      'Xagent Widget: data-voice must be "true" or "false"; treating it as "false", so this page offers no voice calls.'
     let warnSpy: ReturnType<typeof vi.spyOn>
 
     beforeEach(() => {
@@ -123,44 +128,72 @@ describe("widget bootstrap", () => {
       }
     }
 
-    it.each(cases)("guest-token mode with data-voice %s", (_label, value, declared, warns) => {
-      runWidget({ "data-token": "legacy-token", "data-timezone": "Australia/Perth", ...voiceAttrs(value) })
-      expect(frame()?.getAttribute("allow")).toBe(declared ? "clipboard-write; microphone" : "clipboard-write")
-      expect(frame()?.src).toBe(
-        "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed" +
-          (declared ? "&voice=1" : "") +
-          "&timezone=Australia%2FPerth",
-      )
-      expectVoiceWarning(warns)
+    describe.each([
+      ["with data-timezone", { "data-timezone": "Australia/Perth" }, "&timezone=Australia%2FPerth"],
+      ["without data-timezone", {}, ""],
+    ] as Array<[string, Record<string, string>, string]>)("%s", (_tzLabel, tzAttrs, tzSuffix) => {
+      it.each(cases)("guest-token mode with data-voice %s", (_label, value, delegated, warns) => {
+        runWidget({ "data-token": "legacy-token", ...tzAttrs, ...voiceAttrs(value) })
+        expect(frame()?.getAttribute("allow")).toBe(delegated ? "clipboard-write; microphone" : "clipboard-write")
+        expect(frame()?.src).toBe(
+          "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed" +
+            (delegated ? "&voice=1" : "") +
+            tzSuffix,
+        )
+        expectVoiceWarning(warns)
+      })
+
+      it.each(cases)("embed-ticket mode with data-voice %s", async (_label, value, delegated, warns) => {
+        fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "ticket/one", agent_id: 17 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }))
+        runWidget({ "data-widget-key": "widget-secret", ...tzAttrs, ...voiceAttrs(value) })
+        await vi.waitFor(() => {
+          expect(frame()?.src).toContain("embed_ticket=")
+        })
+        expect(frame()?.getAttribute("allow")).toBe(delegated ? "clipboard-write; microphone" : "clipboard-write")
+        expect(frame()?.src).toBe(
+          "https://chat.example/widget/chat/default?guest_id=guest-fixed&agent_id=17&embed_ticket=ticket%2Fone" +
+            (delegated ? "&voice=1" : "") +
+            tzSuffix,
+        )
+        expectVoiceWarning(warns)
+      })
+
+      it.each(cases)("session mode with data-voice %s", (_label, value, delegated, warns) => {
+        fetchMock.mockReturnValueOnce(new Promise(() => undefined))
+        runWidget({ "data-encrypted-context": GRANT, ...tzAttrs, ...voiceAttrs(value) })
+        expect(frame()?.getAttribute("allow")).toBe(delegated ? "clipboard-write; microphone" : "clipboard-write")
+        const query = [delegated ? "voice=1" : "", tzSuffix.replace(/^&/, "")].filter(Boolean).join("&")
+        expect(frame()?.src).toBe("https://chat.example/widget/chat/session" + (query ? `?${query}` : ""))
+        expectVoiceWarning(warns)
+      })
     })
 
-    it.each(cases)("embed-ticket mode with data-voice %s", async (_label, value, declared, warns) => {
+    it("needs no server data to decide on the microphone", async () => {
+      runWidget({ "data-token": "legacy-token" })
+      expect(fetchMock).toHaveBeenCalledTimes(0)
+
+      document.body.innerHTML = ""
+      Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetGrants")
+      fetchMock.mockReturnValueOnce(new Promise(() => undefined))
+      runWidget({ "data-encrypted-context": GRANT })
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/external/chat/sessions")
+
+      document.body.innerHTML = ""
+      fetchMock.mockReset()
       fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ ticket: "ticket/one", agent_id: 17 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }))
-      runWidget({ "data-widget-key": "widget-secret", "data-timezone": "Australia/Perth", ...voiceAttrs(value) })
+      runWidget({ "data-widget-key": "widget-secret" })
       await vi.waitFor(() => {
         expect(frame()?.src).toContain("embed_ticket=")
       })
-      expect(frame()?.getAttribute("allow")).toBe(declared ? "clipboard-write; microphone" : "clipboard-write")
-      expect(frame()?.src).toBe(
-        "https://chat.example/widget/chat/default?guest_id=guest-fixed&agent_id=17&embed_ticket=ticket%2Fone" +
-          (declared ? "&voice=1" : "") +
-          "&timezone=Australia%2FPerth",
-      )
-      expectVoiceWarning(warns)
-    })
-
-    it.each(cases)("session mode with data-voice %s", (_label, value, declared, warns) => {
-      fetchMock.mockReturnValueOnce(new Promise(() => undefined))
-      runWidget({ "data-encrypted-context": GRANT, "data-timezone": "Australia/Perth", ...voiceAttrs(value) })
-      expect(frame()?.getAttribute("allow")).toBe(declared ? "clipboard-write; microphone" : "clipboard-write")
-      expect(frame()?.src).toBe(
-        "https://chat.example/widget/chat/session" +
-          (declared ? "?voice=1&timezone=Australia%2FPerth" : "?timezone=Australia%2FPerth"),
-      )
-      expectVoiceWarning(warns)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(String(fetchMock.mock.calls[0][0])).toContain("/api/widget/embed-ticket")
     })
   })
 
@@ -183,7 +216,7 @@ describe("widget bootstrap", () => {
     expect(guestId).toBe("guest_4fzyo82mvyqnk000qvgin")
     await vi.waitFor(() => {
       expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
-        `https://chat.example/widget/chat/default?guest_id=${guestId}&agent_id=17&embed_ticket=ticket%2Fone`,
+        `https://chat.example/widget/chat/default?guest_id=${guestId}&agent_id=17&embed_ticket=ticket%2Fone&voice=1`,
       )
     })
   })
@@ -201,7 +234,7 @@ describe("widget bootstrap", () => {
 
     await vi.waitFor(() => {
       expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
-        "https://chat.example/widget/chat/default?guest_id=guest-fixed&agent_id=17&embed_ticket=ticket%2Fone",
+        "https://chat.example/widget/chat/default?guest_id=guest-fixed&agent_id=17&embed_ticket=ticket%2Fone&voice=1",
       )
     })
     expect(fetchMock).toHaveBeenCalledTimes(1)
@@ -247,7 +280,7 @@ describe("widget bootstrap", () => {
 
     expect(fetchMock).not.toHaveBeenCalled()
     expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
-      "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed",
+      "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed&voice=1",
     )
   })
 

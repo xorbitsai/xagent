@@ -27,10 +27,12 @@ import {
   deleteWorkforcePermanently,
   discardWorkforce,
   getWorkforceAgentExecution,
+  getWorkforceWidgetVoice,
   listAgentOptions,
   listWorkforces,
   runWorkforce,
   runWorkforcePreview,
+  setWorkforceWidgetVoice,
   unarchiveWorkforce,
 } from "./workforces-api"
 
@@ -405,6 +407,52 @@ describe("workforces-api", () => {
 
     await expect(discardWorkforce(5, "Failed to discard draft")).rejects.toThrow(
       "Failed to discard draft",
+    )
+  })
+
+  it("reads the widget voice setting with GET on the workforce's widget-voice path", async () => {
+    const setting = { enabled: true, available: false, reason: "voice_models_unavailable" }
+    apiRequestMock.mockResolvedValueOnce(jsonResponse(setting))
+
+    await expect(getWorkforceWidgetVoice(42)).resolves.toEqual(setting)
+
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+    expect(apiRequestMock.mock.calls[0][0]).toBe(
+      "http://api.local/api/workforces/42/widget-voice",
+    )
+    expect(apiRequestMock.mock.calls[0][1]?.method ?? "GET").toBe("GET")
+  })
+
+  it.each([true, false])(
+    "writes the widget voice switch %s with PUT and an enabled-only body",
+    async (enabled) => {
+      apiRequestMock.mockResolvedValueOnce(
+        jsonResponse({ enabled, available: null, reason: null }),
+      )
+
+      await expect(setWorkforceWidgetVoice("42", enabled)).resolves.toMatchObject({
+        enabled,
+      })
+
+      expect(apiRequestMock).toHaveBeenCalledTimes(1)
+      const [url, init] = apiRequestMock.mock.calls[0]
+      expect(url).toBe("http://api.local/api/workforces/42/widget-voice")
+      expect(init.method).toBe("PUT")
+      expect(JSON.parse(init.body)).toEqual({ enabled })
+    },
+  )
+
+  it("rejects with the server's message when the widget voice setting cannot be read or written", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({ detail: "Access denied" }, { status: 403 }),
+    )
+    await expect(getWorkforceWidgetVoice(42)).rejects.toThrow("Access denied")
+
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({ detail: "Only active workforces can enable voice" }, { status: 400 }),
+    )
+    await expect(setWorkforceWidgetVoice(42, true)).rejects.toThrow(
+      "Only active workforces can enable voice",
     )
   })
 })

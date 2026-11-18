@@ -246,6 +246,31 @@ def _xero_list_check(list_field: str, *, paged: bool, capped: bool = True) -> Re
     )
 
 
+def _chargebee_list_check(resource: str, item_keys: tuple[str, ...]) -> ReadCheck:
+    """A structural read check on one of Chargebee's list tools.
+
+    The tool is ``chargebee_list_<resource>s``. Each answers ``{status,
+    <resource>s: [...], next_offset, has_more, truncated}`` with every entry
+    unwrapped from Chargebee's ``{"<resource>": {...}}``. Chargebee leaves
+    unset attributes out of a record, so only the attributes its API reference
+    marks as always present are asserted. Asked for one item.
+    """
+    field = f"{resource}s"
+    return ReadCheck(
+        f"chargebee.list_{field}",
+        f"chargebee_list_{field}",
+        {"limit": 1},
+        assertions=(
+            StatusSuccess(),
+            HasKeys((), (field, "next_offset", "has_more", "truncated")),
+            IsType(("has_more",), "boolean"),
+            IsType((field,), "array"),
+            EachHasKeys((field,), item_keys),
+            Length((field,), max=1),
+        ),
+    )
+
+
 def _linear_list_check(
     tool_suffix: str, list_field: str, item_keys: tuple[str, ...]
 ) -> ReadCheck:
@@ -1942,6 +1967,25 @@ CONNECTOR_CHECKS: Mapping[str, ConnectorChecks] = {
             writes_without_cleanup=(
                 "intercom_add_internal_note",
                 "intercom_reply_to_conversation",
+            ),
+        ),
+    ),
+    "chargebee": ConnectorChecks(
+        "chargebee",
+        reads=(
+            # The L3 probe lists one customer, which covers that list tool.
+            _declared_l3("chargebee"),
+            _chargebee_list_check("subscription", ("id", "customer_id", "status")),
+            _chargebee_list_check("invoice", ("id", "customer_id", "status")),
+            _chargebee_list_check("transaction", ("id", "type", "currency_code")),
+        ),
+        exemptions=_exemptions(
+            issue=_TIER_2,
+            reads=(
+                "chargebee_get_customer",
+                "chargebee_get_subscription",
+                "chargebee_get_invoice",
+                "chargebee_get_transaction",
             ),
         ),
     ),

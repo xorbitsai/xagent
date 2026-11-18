@@ -248,10 +248,24 @@ describe("ConnectorConnectCard", () => {
     render(<ConnectorConnectCard {...props()} />)
     if (label === "save") { fill(); fireEvent.click(screen.getByRole("button", { name: "Save securely" })) }
     if (label === "skip") fireEvent.click(screen.getByRole("button", { name: "Not now" }))
-    expect(await screen.findByText("Connecting apps from chat isn't available here.")).toBeInTheDocument()
+    expect(await screen.findByText(/^Connecting apps from chat isn't available here\. Tell me in the chat to carry on without it\.$/)).toBeInTheDocument()
     expect(screen.getByText("Unavailable")).toBeInTheDocument()
     expect(screen.queryByText("Couldn't connect")).toBeNull()
     expect(screen.queryByLabelText("Read-only key")).toBeNull()
+  })
+
+  it("clears the previous action's error when the other action starts", async () => {
+    api.skipConnector.mockRejectedValue(new Error("network"))
+    api.saveConnector.mockResolvedValue(result({ state: "failed", errorCode: "auth_failed", errorField: null, taskResumed: null }))
+    render(<ConnectorConnectCard {...props()} />)
+    fireEvent.click(screen.getByRole("button", { name: "Not now" }))
+    await screen.findByText("Couldn't record that. Please try again.")
+    fill()
+    fireEvent.click(screen.getByRole("button", { name: "Save securely" }))
+    await screen.findByText("The service rejected these credentials.")
+    expect(screen.queryByText("Couldn't record that. Please try again.")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Not now" }))
+    await waitFor(() => expect(screen.queryByText("The service rejected these credentials.")).toBeNull())
   })
 
   it("shows an error and stays idle when the skip request fails", async () => {
@@ -292,6 +306,13 @@ describe("ConnectorConnectCard", () => {
       expect(await screen.findByRole("button", { name: "Continue" })).toBeInTheDocument()
     })
 
+    it("is not offered for a restored settled card the host already resumed", async () => {
+      api.getConnectorState.mockResolvedValue(result({ taskResumed: true }))
+      render(<ConnectorConnectCard {...props()} />)
+      await screen.findByText("Connected")
+      expect(screen.queryByRole("button", { name: "Continue" })).toBeNull()
+    })
+
     it("is not offered for a settled card the task is no longer waiting on", async () => {
       api.getConnectorState.mockResolvedValue(result({ taskResumed: null }))
       render(<ConnectorConnectCard {...props({ pending: false })} />)
@@ -306,7 +327,7 @@ describe("ConnectorConnectCard", () => {
       fireEvent.click(await screen.findByRole("button", { name: "Continue" }))
       expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't continue the task. Try again.")
       expect(screen.getByText("Connected")).toBeInTheDocument()
-      expect(screen.queryByText("Connecting apps from chat isn't available here.")).toBeNull()
+      expect(screen.queryByText(/isn't available here/)).toBeNull()
     })
 
     it("is disabled while a call is in flight, and a failure keeps it available", async () => {
@@ -335,13 +356,23 @@ describe("ConnectorResultCard", () => {
   it("renders title, source line, items and the footnote as the last item", () => {
     render(<ConnectorResultCard card={cosmosResultCard} />)
     expect(screen.getByText("Query · top customers by revenue")).toBeInTheDocument()
-    expect(screen.getByText("From Azure Cosmos DB · just now")).toBeInTheDocument()
+    expect(screen.getByText(/^From Azure Cosmos DB · /)).toBeInTheDocument()
     const items = screen.getAllByRole("listitem").map((li) => li.textContent)
     expect(items).toEqual([...cosmosResultCard.items, cosmosResultCard.footnote])
   })
-  it("formats the relative time", () => {
-    const hourAgo = new Date(Date.now() - 2 * 3600_000).toISOString()
-    render(<ConnectorResultCard card={{ ...cosmosResultCard, created_at: hourAgo, footnote: null }} />)
-    expect(screen.getByText("From Azure Cosmos DB · 2 h ago")).toBeInTheDocument()
+  it("formats the relative time with Intl", () => {
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString()
+    render(<ConnectorResultCard card={{ ...cosmosResultCard, created_at: twoHoursAgo, footnote: null }} />)
+    expect(screen.getByText("From Azure Cosmos DB · 2 hours ago")).toBeInTheDocument()
+  })
+  it.each([[undefined], [null], ["not a date"]])("leaves out the time when created_at is %s", (createdAt) => {
+    render(<ConnectorResultCard card={{ ...cosmosResultCard, created_at: createdAt as string | null | undefined }} />)
+    expect(screen.getByText("From Azure Cosmos DB")).toBeInTheDocument()
+  })
+  it("leaves out the source segment when the name is empty, and the line when both are missing", () => {
+    const { container, rerender } = render(<ConnectorResultCard card={{ ...cosmosResultCard, source: { ...cosmosResultCard.source, name: "" }, created_at: new Date(Date.now() - 3 * 3600_000).toISOString() }} />)
+    expect(screen.getByText("3 hours ago")).toBeInTheDocument()
+    rerender(<ConnectorResultCard card={{ ...cosmosResultCard, source: { ...cosmosResultCard.source, name: "" }, created_at: null }} />)
+    expect(container.textContent).not.toMatch(/From|ago/)
   })
 })

@@ -33,13 +33,18 @@ export function ConnectorInteraction({
 }) {
   // Outside the app context (no task state) a card is never pending.
   let waitingTask: { status?: string; waitingInteractions?: Array<{ type: string; interaction_id?: string }> } | null | undefined
+  let historyLoading = false
   try {
-    waitingTask = useApp().state?.currentTask
+    const { state } = useApp()
+    waitingTask = state?.currentTask
+    historyLoading = state?.isHistoryLoading === true
   } catch {
     waitingTask = null
   }
   // Only the interaction the task is waiting on right now may be acted on.
-  const pending = active && waitingTask?.status === "waiting_for_user"
+  // While history replays, an older message briefly re-asserts its own waiting
+  // state; that is not the task waiting on it now.
+  const pending = active && !historyLoading && waitingTask?.status === "waiting_for_user"
     && (waitingTask.waitingInteractions ?? []).some(
       (i) => i.type === "connect_connector" && i.interaction_id === connector.interaction_id,
     )

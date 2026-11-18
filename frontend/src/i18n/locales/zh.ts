@@ -56,7 +56,7 @@ const zh = {
       continueHint: "我还没有继续处理你的请求。",
       continueFailed: "未能继续任务，请重试。",
       continue: "继续",
-      unavailable: "此处暂不支持在聊天中连接应用。",
+      unavailable: "此处暂不支持在聊天中连接应用。请在聊天中告诉我跳过它继续。",
       skipFailed: "未能记录，请重试。",
       errorGeneric: "出了点问题，请检查填写内容后重试。",
       errorAuthFailed: "服务拒绝了这些凭据。",
@@ -66,11 +66,7 @@ const zh = {
       errorInvalidField: "这个值看起来不对。",
     },
     result: {
-      from: "来自 {name} · {when}",
-      justNow: "刚刚",
-      minutesAgo: "{count} 分钟前",
-      hoursAgo: "{count} 小时前",
-      daysAgo: "{count} 天前",
+      from: "来自 {name}",
     },
   },
   taskInterruption: {

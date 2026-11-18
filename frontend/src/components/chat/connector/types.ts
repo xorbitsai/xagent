@@ -49,13 +49,36 @@ const text = (v: unknown): string => (typeof v === "string" ? v : "")
 const strings = (v: unknown): string[] =>
   Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []
 
+// Logo data comes from a host payload, so only plain colour values and image
+// URLs are accepted; anything else falls back to the default colour or the
+// letter mark.
+const HEX_COLOR = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/
+const FUNCTIONAL_COLOR = /^(?:rgb|rgba|hsl|hsla)\([0-9\s,.%/-]+\)$/i
+const NAMED_COLOR = /^[a-zA-Z]{3,20}$/
+const DATA_IMAGE = /^data:image\/[a-z0-9.+-]+[;,]/i
+
+export function safeColor(value: unknown, fallback: string): string {
+  const color = typeof value === "string" ? value.trim() : ""
+  return HEX_COLOR.test(color) || FUNCTIONAL_COLOR.test(color) || NAMED_COLOR.test(color) ? color : fallback
+}
+
+export function safeIconUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  if (DATA_IMAGE.test(value)) return value
+  try {
+    return new URL(value).protocol === "https:" ? value : null
+  } catch {
+    return null
+  }
+}
+
 function logo(v: unknown): ConnectorLogoData {
   const l = isJsonRecord(v) ? v : {}
   return {
     mark: text(l.mark) || "•",
-    bg: text(l.bg) || "#3D3D46",
-    fg: text(l.fg) || "#fff",
-    icon_url: typeof l.icon_url === "string" ? l.icon_url : null,
+    bg: safeColor(l.bg, "#3D3D46"),
+    fg: safeColor(l.fg, "#fff"),
+    icon_url: safeIconUrl(l.icon_url),
   }
 }
 
@@ -65,8 +88,7 @@ function logo(v: unknown): ConnectorLogoData {
  * not a field of `connector`. A card with no id or no fields cannot be used.
  */
 export function parseConnectorInfo(raw: unknown, interactionId: string | undefined): ConnectorInfo | null {
-  const id = interactionId
-  if (!isJsonRecord(raw) || !id || !text(raw.name)) return null
+  if (!isJsonRecord(raw) || !interactionId || !text(raw.name)) return null
   const route: ConnectorRoute = raw.route === "native" || raw.route === "api" ? raw.route : "mcp"
   const probe = isJsonRecord(raw.probe) ? raw.probe : null
   const fields: ConnectorField[] = Array.isArray(raw.fields)
@@ -78,7 +100,7 @@ export function parseConnectorInfo(raw: unknown, interactionId: string | undefin
     : []
   if (fields.length === 0) return null
   return {
-    interaction_id: id,
+    interaction_id: interactionId,
     app_id: text(raw.app_id),
     name: text(raw.name),
     logo: logo(raw.logo),

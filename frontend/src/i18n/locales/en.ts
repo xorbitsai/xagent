@@ -56,7 +56,7 @@ const en = {
       continueHint: "I haven't picked up your request yet.",
       continueFailed: "Couldn't continue the task. Try again.",
       continue: "Continue",
-      unavailable: "Connecting apps from chat isn't available here.",
+      unavailable: "Connecting apps from chat isn't available here. Tell me in the chat to carry on without it.",
       skipFailed: "Couldn't record that. Please try again.",
       errorGeneric: "Something went wrong. Check the details and try again.",
       errorAuthFailed: "The service rejected these credentials.",
@@ -66,11 +66,7 @@ const en = {
       errorInvalidField: "This value doesn't look right.",
     },
     result: {
-      from: "From {name} · {when}",
-      justNow: "just now",
-      minutesAgo: "{count} min ago",
-      hoursAgo: "{count} h ago",
-      daysAgo: "{count} d ago",
+      from: "From {name}",
     },
   },
   taskInterruption: {

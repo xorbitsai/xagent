@@ -86,7 +86,7 @@ export function ClarificationForm(props: ClarificationFormProps) {
   // shown as an input.
   const connectors: ConnectorInfo[] = []
   const fields: Interaction[] = []
-  let unusable = 0
+  let hasUnusable = false
   for (const interaction of props.interactions) {
     if (interaction.type === "teammate_summary") continue
     if (interaction.type !== "connect_connector") {
@@ -95,7 +95,7 @@ export function ClarificationForm(props: ClarificationFormProps) {
     }
     const connector = parseConnectorInfo(interaction.connector, interaction.interaction_id)
     if (connector) connectors.push(connector)
-    else unusable += 1
+    else hasUnusable = true
   }
   return (
     <div className="space-y-4">
@@ -103,7 +103,7 @@ export function ClarificationForm(props: ClarificationFormProps) {
       {connectors.map((connector) => (
         <ConnectorInteraction key={connector.interaction_id} connector={connector} active={props.active ?? true} />
       ))}
-      {Array.from({ length: unusable }, (_, index) => <ConnectorUnusableNotice key={`unusable-${index}`} />)}
+      {hasUnusable && <ConnectorUnusableNotice />}
       {fields.length > 0 && <ClarificationFields {...props} interactions={fields} />}
     </div>
   )

@@ -68,9 +68,9 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
         if (res.state === "unavailable") {
           setState("unavailable")
         } else if (res.state === "connected") {
-          setResult(res); setState("connected"); setNeedsContinue(true)
+          setResult(res); setState("connected"); setNeedsContinue(res.taskResumed !== true)
         } else if (res.state === "skipped") {
-          setState("skipped"); setNeedsContinue(true)
+          setState("skipped"); setNeedsContinue(res.taskResumed !== true)
         }
       })
       .catch(() => {})
@@ -89,6 +89,7 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
       return
     }
     actedRef.current = true
+    setSkipError(false)
     const body = Object.fromEntries(connector.fields.map((f) => [f.key, (values[f.key] ?? "").trim()]))
     setState("saving")
     setFailure(null)
@@ -117,6 +118,7 @@ export function ConnectorConnectCard({ connector, pending }: Props) {
     if (locked) return
     actedRef.current = true
     setSkipError(false)
+    setFailure(null)
     setSkipping(true)
     try {
       const res = await skipConnector(connector.interaction_id)

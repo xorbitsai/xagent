@@ -3,20 +3,35 @@ import { useI18n } from "@/contexts/i18n-context"
 import { ConnectorLogo, CARD, CARD_W } from "./ConnectorLogo"
 import type { ResultCardData } from "./types"
 
-function useWhen(createdAt?: string | null): string {
-  const { t } = useI18n()
-  const ms = createdAt ? Date.now() - new Date(createdAt).getTime() : 0
-  if (!createdAt || !Number.isFinite(ms) || ms < 60_000) return t("connector.result.justNow")
-  const minutes = Math.floor(ms / 60_000)
-  if (minutes < 60) return t("connector.result.minutesAgo", { count: minutes })
-  if (minutes < 1440) return t("connector.result.hoursAgo", { count: Math.floor(minutes / 60) })
-  return t("connector.result.daysAgo", { count: Math.floor(minutes / 1440) })
+const UNITS = [
+  ["year", 60 * 60 * 24 * 365],
+  ["month", 60 * 60 * 24 * 30],
+  ["week", 60 * 60 * 24 * 7],
+  ["day", 60 * 60 * 24],
+  ["hour", 60 * 60],
+  ["minute", 60],
+] as const
+
+/** "3 hours ago" in the locale; empty when the time is missing or invalid. */
+function formatWhen(createdAt: string | null | undefined, locale: string | undefined): string {
+  const time = createdAt ? new Date(createdAt).getTime() : NaN
+  if (!Number.isFinite(time)) return ""
+  const delta = Math.round((time - Date.now()) / 1000)
+  const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" })
+  for (const [unit, seconds] of UNITS) {
+    if (Math.abs(delta) >= seconds) return formatter.format(Math.round(delta / seconds), unit)
+  }
+  return formatter.format(delta, "second")
 }
 
-/** Source-labelled result card The footnote is the last list item. */
+/** Source-labelled result card. The footnote is the last list item. */
 export function ConnectorResultCard({ card }: { card: ResultCardData }) {
-  const { t } = useI18n()
-  const when = useWhen(card.created_at)
+  const { t, locale } = useI18n()
+  // Each segment is left out when its value is missing.
+  const byline = [
+    card.source.name ? t("connector.result.from", { name: card.source.name }) : "",
+    formatWhen(card.created_at, locale),
+  ].filter(Boolean).join(" · ")
   const items = card.footnote ? [...card.items, card.footnote] : card.items
   return (
     <div className={`${CARD} ${CARD_W}`} data-testid="connector-result-card">
@@ -24,9 +39,7 @@ export function ConnectorResultCard({ card }: { card: ResultCardData }) {
         <ConnectorLogo logo={card.source.logo} />
         <div className="min-w-0 flex-1">
           <b className="flex items-center gap-[7px] text-[13.5px] font-[620] tracking-[-0.01em]">{card.title}</b>
-          <span className="mt-[2px] block text-[12px] leading-[1.4] text-[#6B6B76]">
-            {t("connector.result.from", { name: card.source.name, when })}
-          </span>
+          {byline && <span className="mt-[2px] block text-[12px] leading-[1.4] text-[#6B6B76]">{byline}</span>}
         </div>
       </div>
       {items.length > 0 && (

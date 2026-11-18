@@ -1347,13 +1347,7 @@ async def get_conversation_log_detail(
 
     # Hidden messages (a client's resume signal) are plumbing, not conversation.
     messages = (
-        [
-            message
-            for message in task.chat_messages or []
-            if not is_display_none_metadata(message.message_metadata)
-        ]
-        if task.conversation_storage_version == 1
-        else []
+        _visible_chat_messages(task) if task.conversation_storage_version == 1 else []
     )
     file_reference_records = load_assistant_file_reference_records(
         db,
@@ -1365,9 +1359,12 @@ async def get_conversation_log_detail(
 
         view = load_event_display_snapshot(db, int(task.id))
         transcript = []
-        for message in view.messages:
-            if is_display_none_metadata(message.get("message_metadata")):
-                continue
+        shown = [
+            message
+            for message in view.messages
+            if not is_display_none_metadata(message.get("message_metadata"))
+        ]
+        for message in shown:
             item = dict(message)
             item.pop("message_metadata", None)
             if item["role"] == "assistant":
@@ -1404,8 +1401,8 @@ async def get_conversation_log_detail(
             positioned.append((position, item))
         transcript = [item for _, item in sorted(positioned, key=lambda pair: pair[0])]
         event_activity = (
-            len(view.messages),
-            max((item["created_at"] for item in view.messages), default=None),
+            len(shown),
+            max((item["created_at"] for item in shown), default=None),
         )
     else:
         transcript = _serialize_transcript_with_events(

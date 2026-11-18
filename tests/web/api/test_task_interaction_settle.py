@@ -471,3 +471,48 @@ def test_event_backed_replay_carries_the_settle_metadata() -> None:
         event = db.query(TaskExecutionEvent).filter_by(id=fact.id).one()
         projected = project_event_message(event)
     assert projected["message_metadata"]["interaction_id"] == "z"
+
+
+async def test_a_client_frame_cannot_use_the_settle_command_prefix(dispatched) -> None:
+    task_id = _waiting("z")
+    with pytest.raises(ClientVisibleValidationError):
+        await ws_api._enqueue_websocket_task_command(
+            task_id=task_id,
+            message_data={"user": _owner(), "message": "hi"},
+            kind=transport.TaskCommandKind.MESSAGE,
+            command_id="settle:abcdef",
+        )
+    assert _commands(task_id) == []
+    # The host's own settle is unaffected.
+    outcome = await settle_task_interaction(
+        task_id=task_id, actor_user=_owner(), interaction_id="z"
+    )
+    assert outcome is SettleOutcome.QUEUED
+
+
+async def test_a_retried_settle_after_the_task_left_waiting_still_reaches_prepare(
+    monkeypatch,
+) -> None:
+    """Attempt 1 injected the settle (a delivery row exists, the task is no
+    longer waiting) and the worker died before marking it dispatched. The retry
+    must not be dropped by the interaction guard: reconciling the delivery
+    happens in ``_prepare_task_message_sync``."""
+    task_id = _task(TaskStatus.RUNNING, waiting_on=["z"])
+    with _direct_db_session() as db:
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=_user_id("admin"),
+                role="user",
+                content="[interaction settled]",
+                message_type="user_message",
+                turn_id="settle:z",
+                delivery_status="pending",
+            )
+        )
+        db.commit()
+    prepare = MagicMock(side_effect=RuntimeError("reached"))
+    monkeypatch.setattr(execution, "_prepare_task_message_sync", prepare)
+    with pytest.raises(RuntimeError, match="reached"):
+        await execution.handle_task_message(AsyncMock(), task_id, _settle_frame())
+    prepare.assert_called_once()

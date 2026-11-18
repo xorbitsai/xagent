@@ -600,3 +600,75 @@ def test_completion_wait_recovers_owner_lost_after_real_result_finalization(acce
         assert task.runner_id is None
         assert task.output == "finished"
         assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata,expected",
+    [
+        (
+            {"display": "none", "kind": "interaction_settled", "interaction_id": "i1"},
+            "kept",
+        ),
+        (None, "Hello"),
+    ],
+    ids=["display_none", "visible"],
+)
+async def test_start_handoff_leaves_task_input_for_a_display_none_turn(
+    tmp_path, monkeypatch, metadata, expected
+):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_coordinator_runtime, "get_runner_id", lambda: "worker-1")
+    init_db(db_url=f"sqlite:///{tmp_path / 'consumer-input.db'}")
+    try:
+        with get_session_local()() as db:
+            user = User(username="owner", password_hash="unused")
+            db.add(user)
+            db.flush()
+            task = Task(
+                user_id=user.id,
+                title="Shared",
+                source="sdk",
+                status=TaskStatus.PENDING,
+                run_id=None,
+                state_version=1,
+                control_state="idle",
+                input="kept",
+            )
+            db.add(task)
+            db.flush()
+            start = TaskStartPayload(
+                version=1,
+                run_id="run-1",
+                state_version=1,
+                turn_id="turn-1",
+                kind="create",
+                message="Hello",
+                execution_message="Hello",
+                file_ids=[],
+                message_metadata=metadata,
+            )
+            staged = stage_task_start_command(
+                db, task_id=task.id, actor_user_id=user.id, start=start
+            )
+            db.commit()
+            command = await claim_task_command(
+                db, runner_id="worker-1", command_db_id=staged.staged_db_id
+            )
+            assert command is not None
+        seen = []
+        from xagent.web.services import workforce_runtime
+
+        original = workforce_runtime.sync_workforce_run_status
+
+        def spy(db, task, status):
+            # Called right after the handoff applied (or skipped) the input.
+            seen.append(task.input)
+            return original(db, task, status)
+
+        monkeypatch.setattr(workforce_runtime, "sync_workforce_run_status", spy)
+        commit_handoff(command)
+        assert seen == [expected]
+    finally:
+        await task_coordinator_runtime.close_task_coordinators()
+        Base.metadata.drop_all(bind=get_engine())

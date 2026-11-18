@@ -2783,7 +2783,6 @@ def _schedule_bg(
                         context,
                         payload.turn_id,
                         files=payload.attachments,
-                        message_metadata=payload.message_metadata,
                     )
                     # The agent's uploaded-file registration and the
                     # user_message trace read only ``file_info``. A shared
@@ -3382,13 +3381,10 @@ def _execution_context_with_turn_id(
     turn_id: str,
     *,
     files: Optional[List[Dict[str, Any]]] = None,
-    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     execution_context = dict(context or {})
     if turn_id:
         execution_context["turn_id"] = turn_id
-    if message_metadata:
-        execution_context["message_metadata"] = dict(message_metadata)
     # A resumed/retried turn may already carry its authoritative file batch.
     if files and not execution_context.get("files"):
         execution_context["files"] = [dict(file_info) for file_info in files]

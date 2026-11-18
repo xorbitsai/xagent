@@ -210,6 +210,7 @@ from ..services.task_execution_controller import (
 )
 from ..services.task_execution_host import consumes_task_commands
 from ..services.task_interaction_read import get_pending_interaction_question
+from ..services.task_interaction_settle import SETTLE_COMMAND_PREFIX
 from ..services.task_orchestrator import TaskTurnError
 from ..services.task_runtime import (
     mcp_runtime_authorization_policy_required,
@@ -2599,6 +2600,16 @@ async def _enqueue_websocket_task_command(
     if is_auto_resume_command_id(resolved_command_id.strip()):
         raise ClientVisibleValidationError(
             "Command ids starting with 'auto-resume:' are reserved",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
+    if server_message_metadata is None and resolved_command_id.strip().startswith(
+        SETTLE_COMMAND_PREFIX
+    ):
+        # ``settle:`` ids are the host settle's idempotency ladder
+        # (``task_interaction_settle``); a client occupying one would make the
+        # host's settle fail on a payload mismatch.
+        raise ClientVisibleValidationError(
+            "Command ids starting with 'settle:' are reserved",
             error_code=ClientErrorCode.INVALID_MESSAGE,
         )
     if kind == TaskCommandKind.MESSAGE:

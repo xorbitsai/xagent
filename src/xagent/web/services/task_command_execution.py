@@ -198,7 +198,10 @@ from .task_interaction_close import (
     active_interaction_id_sync,
     close_legacy_resume_interaction_sync,
 )
-from .task_interaction_settle import task_waits_on_interaction_sync
+from .task_interaction_settle import (
+    task_waits_on_interaction_sync,
+    turn_delivery_exists_sync,
+)
 from .task_lease_service import TaskLease, bind_task_lease_context
 from .task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
@@ -1207,11 +1210,9 @@ def _prepare_task_message_sync(
 
         file_info_list: list[dict[str, Any]] = []
         execution_context = deepcopy(raw_context)
-        # Only the sanitized top-level field may carry message metadata; a
+        # Message metadata is server-set and travels as its own argument; a
         # client must not smuggle it in through the free-form context.
         execution_context.pop("message_metadata", None)
-        if message_metadata:
-            execution_context["message_metadata"] = deepcopy(message_metadata)
         if files:
             file_ids = [
                 str(file_ref.get("file_id"))
@@ -1812,8 +1813,15 @@ async def handle_task_message(
             # on another question), applying it would inject a stray message
             # into a running turn, start a new one or close the live question,
             # so it is dropped as an accepted no-op before anything is touched.
+            # A retried attempt is not stale: an earlier attempt may have
+            # injected the settle, which is what moved the task out of waiting.
+            # Its delivery row is the proof, and the reconciliation in
+            # ``_prepare_task_message_sync`` must see the retry.
             if not await run_db_io_cancellation_safe(
-                lambda: task_waits_on_interaction_sync(task_id, settled_interaction_id)
+                lambda: (
+                    task_waits_on_interaction_sync(task_id, settled_interaction_id)
+                    or turn_delivery_exists_sync(task_id, turn_id)
+                )
             ):
                 logger.info(
                     "task %s: dropping settle for interaction %s; the task does "

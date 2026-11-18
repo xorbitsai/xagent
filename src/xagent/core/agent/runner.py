@@ -147,6 +147,10 @@ RESERVED_ENGINE_METADATA_KEYS = frozenset(
         ACCEPTED_TURN_IDS_METADATA_KEY,
         _TRACED_TURN_IDS_METADATA_KEY,
         MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+        # Server-set message metadata (``display``, ``kind``, ``interaction_id``)
+        # reaches a message only through ``post_user_message``'s dedicated
+        # argument, never through caller-supplied context.
+        "message_metadata",
     }
 )
 
@@ -2010,12 +2014,6 @@ class AgentRunner:
                 metadata["display_message"] = (
                     display_message if isinstance(display_message, str) else ""
                 )
-                break
-
-        for candidate in candidates:
-            server_metadata = candidate.get("message_metadata")
-            if isinstance(server_metadata, dict) and server_metadata:
-                metadata[SERVER_METADATA_KEY] = server_metadata
                 break
 
         for candidate in candidates:

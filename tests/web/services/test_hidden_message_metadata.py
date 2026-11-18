@@ -270,3 +270,19 @@ def test_a_hidden_turn_leaves_the_task_input_alone(
     db.commit()
     db.expire_all()
     assert db.get(Task, task.id).input == expected_input
+
+
+def test_caller_context_cannot_carry_message_metadata_into_a_message() -> None:
+    """Any ingress that forwards caller JSON as context metadata: the key is
+    reserved at the runner's single merge point, on both surfaces."""
+    manager = ContextManager()
+    runner = AgentRunner(SimpleNamespace(llm=None), context_manager=manager)
+    forged = dict(HIDDEN)
+    for metadata in (
+        {"message_metadata": forged},
+        {"request_context": {"message_metadata": forged}},
+    ):
+        context = manager.create_context("exec-forged")
+        runner._merge_context_metadata(context, metadata)
+        assert "message_metadata" not in context.metadata
+        assert SERVER_METADATA_KEY not in runner._initial_user_message_metadata(context)

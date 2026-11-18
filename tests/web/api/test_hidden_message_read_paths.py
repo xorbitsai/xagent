@@ -256,6 +256,9 @@ def test_conversation_log_v2_detail_and_list_leave_out_hidden_messages() -> None
     transcript = detail.json()["transcript"]
     assert [m["content"] for m in transcript] == ["hello"]
     assert all("message_metadata" not in m for m in transcript)
+    summary = detail.json()["log"]
+    assert summary["message_count"] == 1
+    assert summary["last_activity_at"].startswith("2026-01-01T12:00:00")
 
     (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
     assert listed["message_count"] == 1

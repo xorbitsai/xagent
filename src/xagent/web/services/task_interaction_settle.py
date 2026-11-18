@@ -34,6 +34,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus, TraceEvent
 from ..models.task_command import TERMINAL_COMMAND_STATUSES, TaskExecutionCommand
@@ -45,7 +46,7 @@ from .message_metadata import is_valid_interaction_id, is_valid_metadata_kind
 DEFAULT_SETTLE_KIND = "interaction_settled"
 DEFAULT_SETTLE_TEXT = "[interaction settled]"
 MAX_SETTLE_TEXT_CHARS = 200
-_COMMAND_ID_PREFIX = "settle:"
+SETTLE_COMMAND_PREFIX = "settle:"
 # Command ids are at most 64 characters, so the interaction id is hashed in.
 _COMMAND_ID_DIGEST_CHARS = 24
 _MAX_SETTLE_ATTEMPTS = 8
@@ -81,24 +82,9 @@ def _open_interaction_ids(db: Session, task: Task) -> frozenset[str]:
     task's own storage version.
     """
     if task.conversation_storage_version == 2:
-        event = db.scalar(
-            select(TaskExecutionEvent)
-            .where(
-                TaskExecutionEvent.task_id == task.id,
-                TaskExecutionEvent.scope_id == "root",
-                TaskExecutionEvent.run_id == task.run_id,
-                TaskExecutionEvent.kind == "agent_message",
-                TaskExecutionEvent.payload["data"]["expect_response"]
-                .as_boolean()
-                .is_(True),
-            )
-            .order_by(TaskExecutionEvent.sequence.desc())
-            .limit(1)
-        )
-        payload = event.payload if event is not None else None
-        return _recorded_interaction_ids(
-            payload.get("data") if isinstance(payload, dict) else None
-        )
+        from .task_execution_event_recovery import read_event_waiting_data
+
+        return _recorded_interaction_ids(read_event_waiting_data(db, int(task.id)))
     rows = db.scalars(
         select(TraceEvent)
         .where(TraceEvent.task_id == task.id, TraceEvent.event_type == "agent_message")
@@ -118,6 +104,33 @@ def task_waits_on_interaction_sync(task_id: int, interaction_id: str) -> bool:
         if task is None or task.status != TaskStatus.WAITING_FOR_USER:
             return False
         return interaction_id in _open_interaction_ids(db, task)
+
+
+def turn_delivery_exists_sync(task_id: int, turn_id: str) -> bool:
+    """Whether a user message was already accepted for ``turn_id``.
+
+    An earlier attempt of the same command leaves this row behind when it
+    injected the settle and the worker died before marking it dispatched.
+    """
+    with get_session_local()() as db:
+        row = db.scalar(
+            select(TaskChatMessage.id).where(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "user",
+                TaskChatMessage.turn_id == turn_id,
+            )
+        )
+        if row is not None:
+            return True
+        event = db.scalar(
+            select(TaskExecutionEvent.id).where(
+                TaskExecutionEvent.task_id == task_id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.idempotency_key == f"message:{turn_id}",
+                TaskExecutionEvent.kind == "input_accepted",
+            )
+        )
+        return event is not None
 
 
 def _check_actor_sync(task_id: int, actor_user_id: int, actor_is_admin: bool) -> None:
@@ -143,7 +156,7 @@ def _check_actor_sync(task_id: int, actor_user_id: int, actor_is_admin: bool) ->
 
 def _attempt_command_ids(interaction_id: str) -> list[str]:
     digest = hashlib.sha256(interaction_id.encode("utf-8")).hexdigest()
-    base = f"{_COMMAND_ID_PREFIX}{digest[:_COMMAND_ID_DIGEST_CHARS]}"
+    base = f"{SETTLE_COMMAND_PREFIX}{digest[:_COMMAND_ID_DIGEST_CHARS]}"
     return [base] + [f"{base}:{attempt}" for attempt in range(1, _MAX_SETTLE_ATTEMPTS)]
 
 
@@ -178,8 +191,11 @@ async def settle_task_interaction(
     ``DUPLICATE`` while an earlier settle for it is still queued (or when the
     task has already moved on after one); ``QUEUED`` otherwise.
 
-    Raises ``ValueError`` for a malformed argument and the same client-visible
-    errors as a chat frame (task missing, access denied, input rejected).
+    Raises ``ValueError`` for a malformed argument, when a different settle is
+    already queued under the same derived command id (a changed ``text`` racing
+    an earlier call), and after 8 settle attempts for one interaction. It also
+    raises the same client-visible errors as a chat frame (task missing, access
+    denied, input rejected).
     """
     from ..api.websocket import _enqueue_websocket_task_command
     from .task_command_execution import (

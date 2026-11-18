@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -439,10 +439,13 @@ def find_event_checkpoint_anchor(
     return event
 
 
-def read_event_waiting_question(
-    db: Session, task_id: int
-) -> tuple[str | None, list[dict[str, Any]] | None]:
-    """Read the legacy-shaped waiting projection from V2 outbound facts."""
+def read_event_waiting_data(db: Session, task_id: int) -> dict[str, Any] | None:
+    """The ``data`` of the latest waiting message of a V2 task's current run.
+
+    The one lookup behind both the waiting question
+    (``read_event_waiting_question``) and the open interaction ids a host
+    settle checks (``task_interaction_settle``), so the two cannot drift.
+    """
     run_id = db.scalar(select(Task.run_id).where(Task.id == task_id))
     event = db.scalar(
         select(TaskExecutionEvent)
@@ -459,12 +462,21 @@ def read_event_waiting_question(
         .limit(1)
     )
     if event is None:
-        return None, None
+        return None
     if event.payload_version != 1:
         raise CheckpointCorruptError(
             "Waiting message uses an unsupported event version"
         )
-    data = event.payload["data"]
+    return cast(dict[str, Any], event.payload["data"])
+
+
+def read_event_waiting_question(
+    db: Session, task_id: int
+) -> tuple[str | None, list[dict[str, Any]] | None]:
+    """Read the legacy-shaped waiting projection from V2 outbound facts."""
+    data = read_event_waiting_data(db, task_id)
+    if data is None:
+        return None, None
     metadata = data.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         raise CheckpointCorruptError("Waiting message has invalid metadata")

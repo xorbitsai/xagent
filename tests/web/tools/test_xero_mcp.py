@@ -308,6 +308,37 @@ def test_list_invoices_exposes_expected_and_planned_payment_dates(
     assert "expected_payment_date" not in result["invoices"][1]
 
 
+def test_list_contacts_leaves_out_archived_contacts_by_default(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse({"Contacts": []})
+
+    _call_tool("list_contacts", searchTerm=" Omnia ")
+
+    params = fake.calls[-1]["params"]
+    assert params["searchTerm"] == "Omnia"
+    assert "includeArchived" not in params
+
+
+def test_list_contacts_can_include_archived_contacts(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse(
+        {
+            "Contacts": [
+                {
+                    "ContactID": CONTACT_ID,
+                    "Name": "Omnia Logistics Pty Ltd",
+                    "ContactStatus": "ARCHIVED",
+                    "IsCustomer": True,
+                }
+            ]
+        }
+    )
+
+    result = _call_tool("list_contacts", searchTerm="Omnia", includeArchived=True)
+
+    assert fake.calls[-1]["params"]["includeArchived"] == "true"
+    assert result["contacts"][0]["status"] == "ARCHIVED"
+    assert result["contacts"][0]["is_customer"] is True
+
+
 def test_list_invoice_history_returns_xero_notes_oldest_first(fake: FakeXero) -> None:
     fake.responder = lambda call: MockResponse(
         {

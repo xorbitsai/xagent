@@ -1673,19 +1673,25 @@ def list_contacts(
     page: int = 1,
     searchTerm: str | None = None,
     page_size: int = 50,
+    includeArchived: bool = False,
 ) -> str:
     """
     List contacts (customers and suppliers) in Xero. The result reports
     total_count, has_more and next_page; if has_more is true call again with
-    next_page.
+    next_page. An archived contact's status is ARCHIVED.
 
     searchTerm: case-insensitive search across name, first name, last name,
         contact number and email address.
     page_size: contacts per page, 1-100 (default 50).
+    includeArchived: also return archived contacts. Xero leaves them out by
+        default, so a past or archived customer is only found with this set;
+        set it before reporting that a contact does not exist.
     """
     params: dict[str, Any] = {}
     if searchTerm:
         params["searchTerm"] = searchTerm.strip()
+    if includeArchived:
+        params["includeArchived"] = "true"
     return _list_paged(
         "Contacts",
         "Contacts",

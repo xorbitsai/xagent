@@ -276,9 +276,9 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
         from xrouter_llm.store import CallStore
     except ImportError as exc:  # pragma: no cover - dependency missing or too old
         raise RuntimeError(
-            "The 'router' (auto) provider needs xrouter-llm>=0.3.6; it is not "
+            "The 'router' (auto) provider needs xrouter-llm>=0.3.7; it is not "
             "installed or the installed version is too old. Install it with "
-            "`pip install 'xagent[router]'` (or `pip install 'xrouter-llm>=0.3.6'`)."
+            "`pip install 'xagent[router]'` (or `pip install 'xrouter-llm>=0.3.7'`)."
         ) from exc
 
     # Resolve the backend selected by XROUTER_EMBEDDING_BACKEND (see the module

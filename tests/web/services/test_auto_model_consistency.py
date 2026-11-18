@@ -342,7 +342,7 @@ def test_routing_maps_missing_router_dependency_to_unavailable(env, monkeypatch)
 
     def missing_dependency():
         raise auto_model_service.AutoModelDependencyError(
-            "Auto model configuration needs xrouter-llm>=0.3.6"
+            "Auto model configuration needs xrouter-llm>=0.3.7"
         )
 
     monkeypatch.setattr(
@@ -682,7 +682,6 @@ def test_bundled_catalog_has_the_profiles_saved_auto_configs_rebind_across():
         "anthropic/claude-fable-5.1",
         "anthropic/claude-opus-5.5",
         "anthropic/claude-sonnet-5.5",
-        "deepseek/deepseek-v4.1-flash",
         "google/gemini-3.8-flash",
         "openai/gpt-6-astra",
         "openai/gpt-6-luna",
@@ -694,22 +693,38 @@ def test_bundled_catalog_has_the_profiles_saved_auto_configs_rebind_across():
         "xiaomi/mimo-v2.6-pro",
         "z-ai/glm-5.3",
         "z-ai/glm-5.3-flashx",
+        "anthropic/claude-haiku-5.5",
+        "deepseek/deepseek-v4.1-flash-1017",
+        "google/gemini-4-argon",
+        "minimax/minimax-m3.1-flash",
+        "mistralai/mistral-large-4-0",
+        "moonshotai/kimi-k3.1-pro",
+        "stepfun/step-5-preview",
+    }
+    # Still bindable, so saved configurations keep loading, but no longer in
+    # the bundled ``auto`` candidate set.
+    legacy = {
+        "deepseek/deepseek-v4.1-flash",
+        "google/gemini-3.5-flash",
+        "google/gemini-3.7-flash",
+        "z-ai/glm-5.2",
     }
 
     assert known.isdisjoint(removed)
-    assert added <= known
+    assert added | legacy <= known
     assert set(catalog.get("deepseek/deepseek-v4.1-flash").input_modalities) == {
         "text",
         "image",
     }
-    assert auto_models.isdisjoint(
-        removed | {"google/gemini-3.5-flash", "google/gemini-3.7-flash"}
+    assert {"text", "image"} <= set(
+        catalog.get("anthropic/claude-haiku-5.5").input_modalities
     )
+    assert auto_models.isdisjoint(removed | legacy)
     assert {
-        "deepseek/deepseek-v4.1-flash",
         "google/gemini-3.8-flash",
         "openai/gpt-6-astra",
         "qwen/qwen3.8-max-0902",
         "qwen/qwen3.8-omni-flash",
+        "stepfun/step-5-preview",
         "z-ai/glm-5.3",
     } <= auto_models

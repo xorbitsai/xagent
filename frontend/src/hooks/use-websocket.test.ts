@@ -21,6 +21,7 @@ import {
 } from "./use-websocket"
 import { refreshStoredAccessToken } from "@/lib/api-wrapper"
 import { AUTH_CACHE_KEY, readAuthCache, readAuthSessionSnapshot, type AuthSessionSnapshot } from "@/lib/auth-cache"
+import { AUTH_REVALIDATE_EVENT } from "@/lib/idle-session"
 
 const authState = vi.hoisted(() => ({
   user: { id: "user-1" } as { id: string } | null,
@@ -2831,6 +2832,47 @@ describe("useWebSocket normalized connections", () => {
       recoverable: false,
       error: expect.objectContaining({ message: expectedMessage }),
     })
+  })
+
+  it.each([4010, 1008])("asks for a session check and does not reconnect when a login socket closes with %i", async code => {
+    const revalidate = vi.fn()
+    window.addEventListener(AUTH_REVALIDATE_EVENT, revalidate)
+    const { result } = renderHook(() => useWebSocket({
+      connection: sessionConnection({
+        credentialOwner: { kind: "auth-context", accessToken: "access", userId: "user-1" },
+      }),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+    vi.useFakeTimers()
+    try {
+      act(() => socket.triggerClose(code))
+      // Past the longest first reconnect delay (base delay plus jitter).
+      await act(async () => { vi.advanceTimersByTime(2 * RECONNECT_BASE_DELAY_MS) })
+
+      expect(revalidate).toHaveBeenCalledOnce()
+      expect(result.current.connectionError).not.toBeNull()
+      expect(MockWebSocket.instances).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+      window.removeEventListener(AUTH_REVALIDATE_EVENT, revalidate)
+    }
+  })
+
+  it("leaves the browser login alone when a socket with its own credentials closes with 4010", async () => {
+    const revalidate = vi.fn()
+    window.addEventListener(AUTH_REVALIDATE_EVENT, revalidate)
+    renderHook(() => useWebSocket({ connection: sessionConnection() }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+    act(() => socket.triggerClose(4010))
+
+    expect(revalidate).not.toHaveBeenCalled()
+    window.removeEventListener(AUTH_REVALIDATE_EVENT, revalidate)
   })
 
   it.each([

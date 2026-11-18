@@ -27,10 +27,12 @@ from ..connector_probes import ConnectorProbe
 from ..services.connector_probe import ConnectorProbeOutcome, evaluate_probe_result
 from .declarations import (
     Assertion,
+    AssertionPath,
     Contains,
     CreatedRef,
     EachHasKeys,
     Equals,
+    FirstWhere,
     HasKeys,
     IsType,
     L3Envelope,
@@ -196,9 +198,27 @@ def _parse(text: str) -> Any:
         return _MISSING
 
 
-def at_path(value: Any, path: PayloadPath) -> Any:
-    """The value at ``path`` in ``value``, or ``MISSING``."""
+def at_path(value: Any, path: AssertionPath) -> Any:
+    """The value at ``path`` in ``value``, or ``MISSING``.
+
+    A ``FirstWhere`` segment takes the first item of the list that is an
+    object whose ``key`` is the string ``value``; none is ``MISSING``.
+    """
     for segment in path:
+        if isinstance(segment, FirstWhere):
+            if not isinstance(value, list):
+                return _MISSING
+            value = next(
+                (
+                    item
+                    for item in value
+                    if isinstance(item, Mapping)
+                    and _json_equal(item.get(segment.key, _MISSING), segment.value)
+                ),
+                _MISSING,
+            )
+            # Every later segment finds nothing in MISSING.
+            continue
         if isinstance(segment, str):
             if not isinstance(value, Mapping) or segment not in value:
                 return _MISSING

@@ -52,6 +52,7 @@ from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
     TaskRuntimeContext,
 )
+from ...core.tools.adapters.vibe.base import BINDING_AUTHORIZED_CATEGORIES
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
@@ -724,7 +725,12 @@ def _build_tool_selection_spec_for_task(
 
     ``excluded_tool_categories`` is the task model override's requested
     exclusion set (see ``_task_model_override_excluded_categories``); a plain
-    ``mcp`` entry in it suppresses the actor-marked MCP add-back below.
+    ``mcp`` entry in it suppresses the actor-marked MCP add-back below, and a
+    ``BINDING_AUTHORIZED_CATEGORIES`` entry (``ssh``) withholds that category
+    for this run. Those categories are granted by the agent's binding rather
+    than by ``tool_categories``, so the exclusion has to reach the spec for the
+    creator dispatch and the name filter to drop them; the binding itself is
+    untouched. Without an exclusion the spec is byte-identical to before.
     """
     from ...core.tools.adapters.vibe.selection_spec import (
         ToolSelectionSpec,
@@ -747,6 +753,9 @@ def _build_tool_selection_spec_for_task(
             workforce_runtime.worker_tool_names if workforce_runtime else None
         ),
         extras_only_when_unconfigured=workforce_runtime is not None,
+        excluded_binding_authorized=(
+            excluded_tool_categories & BINDING_AUTHORIZED_CATEGORIES
+        ),
     )
     if include_mcp_tools and "mcp" not in excluded_tool_categories:
         # An explicit "mcp" exclusion from the task model override wins over

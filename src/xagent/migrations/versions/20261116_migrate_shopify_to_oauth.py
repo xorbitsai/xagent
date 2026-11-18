@@ -1,7 +1,7 @@
 """switch the Shopify connector from pasted Admin API tokens to per-store OAuth
 
 Revision ID: 20261116_shopify_oauth
-Revises: 20261115_serving_generation
+Revises: 20261117_seed_chargebee_mcp_app
 Create Date: 2026-11-16
 
 Hard switch (#2810), as Zendesk did (20261012_zendesk_oauth): existing
@@ -29,7 +29,7 @@ from xagent.builtin_identity import builtin_provenance_identity
 logger = logging.getLogger(__name__)
 
 revision: str = "20261116_shopify_oauth"
-down_revision: Union[str, None] = "20261115_serving_generation"
+down_revision: Union[str, None] = "20261117_seed_chargebee_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

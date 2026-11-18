@@ -50,6 +50,7 @@ ERROR_ENVELOPE_SERVER_MODULES = frozenset(
         "calendar",
         "chargebee",
         "chartmogul",
+        "cosmos",
         "deputy",
         "employment_hero",
         "excel",

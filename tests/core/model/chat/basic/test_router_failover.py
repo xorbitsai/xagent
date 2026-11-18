@@ -335,6 +335,63 @@ async def test_sequential_failover_skips_incompatible_and_smaller_candidates(
     assert [model.calls for model in models.values()] == [1, 0, 0, 1]
 
 
+def _mixed_chain(monkeypatch, *, primary_error, last_error=None):
+    """DeepSeek (image) -> GLM (text only) -> DeepSeek again (image)."""
+    models = {
+        PRIMARY: _FakeLLM("saved-primary", error=primary_error),
+        THIRD: _FakeLLM("saved-text-only"),
+        FOURTH: _FakeLLM("saved-last", error=last_error),
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda model: ("text",) if model == THIRD else ("text", "image"),
+    )
+    return router, models
+
+
+@pytest.mark.asyncio
+async def test_image_call_fails_over_past_a_text_only_candidate(monkeypatch):
+    router, models = _mixed_chain(
+        monkeypatch, primary_error=_status_error(openai.InternalServerError, 503)
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    assert await prepared.vision_chat(IMAGE_MESSAGES) == "saved-last"
+    assert [model.calls for model in models.values()] == [1, 0, 1]
+
+
+@pytest.mark.asyncio
+async def test_image_call_never_reaches_a_text_only_candidate_when_image_ones_fail(
+    monkeypatch,
+):
+    router, models = _mixed_chain(
+        monkeypatch,
+        primary_error=_status_error(openai.InternalServerError, 503),
+        last_error=_status_error(openai.InternalServerError, 503),
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    with pytest.raises(openai.InternalServerError):
+        await prepared.vision_chat(IMAGE_MESSAGES)
+    assert [model.calls for model in models.values()] == [1, 0, 1]
+
+
+@pytest.mark.asyncio
+async def test_text_call_still_fails_over_through_every_candidate(monkeypatch):
+    router, models = _mixed_chain(
+        monkeypatch, primary_error=_status_error(openai.InternalServerError, 503)
+    )
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await prepared.chat(MESSAGES) == "saved-text-only"
+    assert [model.calls for model in models.values()] == [1, 1, 0]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",

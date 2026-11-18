@@ -1,4 +1,4 @@
-"""The vision tool accepts a configured Auto only when every candidate reads images."""
+"""The vision tool accepts a configured Auto with at least one image-reading candidate."""
 
 from __future__ import annotations
 
@@ -52,10 +52,12 @@ def _core(tmp_path: Path, model: BaseLLM) -> tuple[VisionCore, str]:
     return VisionCore(model, str(tmp_path), str(tmp_path)), str(image)
 
 
-def test_accepts_image_input_needs_every_candidate() -> None:
+def test_accepts_image_input_needs_one_image_candidate() -> None:
     both = ["text", "image"]
     assert _auto({"candidate:1": both, "candidate:2": both}).accepts_image_input
-    assert not _auto({"candidate:1": both, "candidate:2": ["text"]}).accepts_image_input
+    assert _auto({"candidate:1": both, "candidate:2": ["text"]}).accepts_image_input
+    assert _auto({"candidate:1": ["text"], "candidate:2": both}).accepts_image_input
+    assert not _auto({"candidate:1": ["text"]}).accepts_image_input
     assert not RouterLLM(
         model_name="auto", use_environment_fallback=False
     ).accepts_image_input
@@ -74,12 +76,12 @@ def test_understand_images_runs_on_all_vision_auto(tmp_path: Path) -> None:
     assert _Downstream.calls, "the image never reached the downstream model"
 
 
-def test_understand_images_refuses_auto_with_a_text_only_candidate(
+def test_understand_images_refuses_auto_without_an_image_candidate(
     tmp_path: Path,
 ) -> None:
     _Downstream.calls = []
     core, image = _core(
-        tmp_path, _auto({"candidate:1": ["text", "image"], "candidate:2": ["text"]})
+        tmp_path, _auto({"candidate:1": ["text"], "candidate:2": ["text"]})
     )
     result = asyncio.run(core.understand_images([image], "what colour?"))
     assert not result.success
@@ -87,14 +89,14 @@ def test_understand_images_refuses_auto_with_a_text_only_candidate(
     assert not _Downstream.calls
 
 
-def test_detect_objects_gate_accepts_all_vision_auto_and_refuses_mixed(
+def test_detect_objects_gate_accepts_an_image_candidate_and_refuses_none(
     tmp_path: Path,
 ) -> None:
-    core, image = _core(tmp_path, _auto({"candidate:1": ["text", "image"]}))
-    ok = asyncio.run(core.detect_objects(image, "pixel"))
-    assert "does not support vision" not in (ok.error or "")
     core, image = _core(
         tmp_path, _auto({"candidate:1": ["text", "image"], "candidate:2": ["text"]})
     )
+    ok = asyncio.run(core.detect_objects(image, "pixel"))
+    assert "does not support vision" not in (ok.error or "")
+    core, image = _core(tmp_path, _auto({"candidate:1": ["text"]}))
     refused = asyncio.run(core.detect_objects(image, "pixel"))
     assert "does not support vision" in (refused.error or "")

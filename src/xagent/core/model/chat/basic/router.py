@@ -469,18 +469,21 @@ class RouterLLM(BaseLLM):
 
     @property
     def accepts_image_input(self) -> bool:
-        """Whether every candidate of a configured Auto reads images.
+        """Whether a configured Auto can take an image.
 
         ``abilities`` never lists ``vision`` for a router, because which model
-        answers is decided per call. A configured Auto whose candidates all
-        accept images can nevertheless take an image whichever one is chosen,
-        so an image-only tool may use it. One text-only candidate, or an Auto
-        without configured candidates, makes this False.
+        answers is decided per call. A call that carries an image requires the
+        ``image`` modality, and both modes bind such a call only to candidates
+        that accept it (``_prepare_sequential_failover`` and ``_resolve_route``),
+        so one image-reading candidate is enough for an image-only tool to use
+        the Auto: a text-only candidate is skipped for that call, and when every
+        image-reading candidate fails the call raises instead of reaching a
+        text-only model. An Auto without configured candidates is False.
         """
 
         if not self._candidate_models:
             return False
-        return all(
+        return any(
             "image" in self._input_modalities(candidate)
             for candidate in self._candidate_models
         )

@@ -1154,9 +1154,14 @@ def _collect_paid_invoices(
             if identity in seen_invoice_ids:
                 continue
             seen_invoice_ids.add(identity)
-            (found if fully_paid_on else undated).append(_invoice_view(record))
+            if fully_paid_on:
+                found.append(_invoice_view(record))
+            else:
+                undated.append(_undated_paid_invoice_view(record))
     if undated:
-        logger.warning(
+        # Info, not warning: every call rescans the ledger, so a tenant with a
+        # permanently undated invoice would otherwise warn on every request.
+        logger.info(
             "Xero paid-invoice scan found %s PAID %s invoice(s) without "
             "FullyPaidOnDate; reporting them as undated (first invoice_id=%s)",
             len(undated),
@@ -1164,6 +1169,22 @@ def _collect_paid_invoices(
             undated[0].get("invoice_id"),
         )
     return found, undated
+
+
+def _undated_paid_invoice_view(record: dict[str, Any]) -> dict[str, Any]:
+    """Identify an undated PAID invoice compactly; it is only a sample."""
+    return _compact(
+        {
+            "invoice_id": record.get("InvoiceID"),
+            "invoice_number": record.get("InvoiceNumber"),
+            "contact": _contact_ref(record),
+            "date": _doc_date(record, "Date"),
+            "currency": record.get("CurrencyCode"),
+            "total": record.get("Total"),
+            "amount_paid": record.get("AmountPaid"),
+            "amount_credited": record.get("AmountCredited"),
+        }
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1194,11 +1215,13 @@ def list_paid_invoices(
     safety limit is reached.
 
     Xero can leave FullyPaidOnDate empty on some PAID invoices, so they
-    cannot be matched to any date. Every response
-    reports undated_paid_invoice_count; when it is above zero, those invoices
-    are not in invoices or the totals, a sample is in undated_paid_invoices,
-    and the answer should say that they exist instead of claiming the list
-    covers every PAID invoice.
+    cannot be matched to any date. Every response reports
+    undated_paid_invoice_count for the whole scanned PAID ledger (or the
+    contactIds subset); it does not depend on paidOnDate and is the same for
+    every date. When it is above zero, those invoices are not in invoices or
+    the totals and a sample is in undated_paid_invoices; say once that they
+    have no settlement date in Xero rather than counting them as paid on the
+    requested date.
 
     paidOnDate: settlement date in YYYY-MM-DD format.
     contactIds: optionally restrict to these contacts (from list_contacts).
@@ -1249,13 +1272,20 @@ def list_paid_invoices(
             if len(undated) > len(undated_sample):
                 payload["undated_paid_invoices_truncated"] = True
             payload["undated_note"] = (
-                f"{len(undated)} PAID {type} invoice(s) have no FullyPaidOnDate "
-                "in Xero, so they cannot be matched to any settlement date and "
-                "are not included in invoices or the totals. Use list_payments "
-                "or list_credit_notes to see how they were settled."
+                f"{len(undated)} PAID {type} invoice(s) in the scanned ledger "
+                "have no FullyPaidOnDate in Xero. This count does not depend on "
+                "paidOnDate: these invoices cannot be matched to any settlement "
+                "date and are not included in invoices or the totals. "
+                "list_payments(invoiceId=...) shows any payments against one; "
+                "zero-value or fully credited invoices may have none."
             )
         return payload
 
+    # The undated sample is supplementary, so shrink it before _fit_list starts
+    # dropping the dated invoices the caller actually asked for.
+    max_output_length = get_tool_max_output_length()
+    while undated_sample and len(_success(**build(window, False))) > max_output_length:
+        undated_sample = undated_sample[: len(undated_sample) // 2]
     return _fit_list(build, window)
 
 

@@ -598,7 +598,7 @@ def _undated_paid_invoice(number: str, **kwargs: Any) -> dict[str, Any]:
 
 
 def test_list_paid_invoices_reports_paid_record_without_settlement_date(
-    fake: FakeXero,
+    fake: FakeXero, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Production regression: one historical PAID invoice without
     # FullyPaidOnDate made every list_paid_invoices call fail. It must be
@@ -619,21 +619,100 @@ def test_list_paid_invoices_reports_paid_record_without_settlement_date(
         ]
     )
 
-    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
+    with caplog.at_level("INFO", logger="xero-mcp"):
+        result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
 
     assert result["complete"] is True
     assert result["total_count"] == 1
     assert [row["invoice_number"] for row in result["invoices"]] == ["INV-1"]
     assert result["total_invoice_amount_by_currency"] == {"AUD": "10.00"}
     assert result["undated_paid_invoice_count"] == 1
-    assert [row["invoice_id"] for row in result["undated_paid_invoices"]] == [
-        "id-INV-ZERO"
+    assert result["undated_paid_invoices"] == [
+        {
+            "invoice_id": "id-INV-ZERO",
+            "invoice_number": "INV-ZERO",
+            "contact": {"id": CONTACT_ID, "name": "Acme"},
+            "date": "2026-09-01T00:00:00",
+            "currency": "AUD",
+            "total": 0,
+            "amount_paid": 0,
+        }
     ]
-    assert "fully_paid_on" not in result["undated_paid_invoices"][0]
     assert "undated_paid_invoices_truncated" not in result
     assert result["undated_note"].startswith("1 PAID ACCREC invoice(s)")
+    assert "does not depend on paidOnDate" in result["undated_note"]
+    assert "list_payments(invoiceId=...)" in result["undated_note"]
     api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
     assert [call["params"]["page"] for call in api_calls] == [1, 2]
+    [record] = [r for r in caplog.records if "without FullyPaidOnDate" in r.message]
+    assert record.levelname == "INFO"
+    assert "found 1 PAID ACCREC invoice(s)" in record.message
+    assert "first invoice_id=id-INV-ZERO" in record.message
+
+
+def test_list_paid_invoices_reports_undated_on_later_windows(
+    fake: FakeXero,
+) -> None:
+    fake.responder = _paid_pages(
+        [
+            [
+                _paid_invoice("INV-1", "2026-10-13"),
+                _paid_invoice("INV-2", "2026-10-13"),
+                _undated_paid_invoice("INV-U1"),
+            ]
+        ]
+    )
+
+    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13", skip=1)
+
+    assert [row["invoice_number"] for row in result["invoices"]] == ["INV-2"]
+    assert result["undated_paid_invoice_count"] == 1
+    assert [row["invoice_number"] for row in result["undated_paid_invoices"]] == [
+        "INV-U1"
+    ]
+    assert "undated_note" in result
+
+
+def test_list_paid_invoices_undated_sample_at_limit_is_not_truncated(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "UNDATED_PAID_INVOICE_SAMPLE_LIMIT", 2)
+    fake.responder = _paid_pages(
+        [[_undated_paid_invoice(f"INV-U{number}") for number in (1, 2)]]
+    )
+
+    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
+
+    assert result["undated_paid_invoice_count"] == 2
+    assert len(result["undated_paid_invoices"]) == 2
+    assert "undated_paid_invoices_truncated" not in result
+
+
+def test_list_paid_invoices_shrinks_undated_sample_before_dated_invoices(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The undated sample is supplementary: under a tight output limit it must
+    # give way before the dated invoices the caller asked for are dropped.
+    limit = 2500
+    monkeypatch.setattr(xero, "get_tool_max_output_length", lambda: limit)
+    fake.responder = _paid_pages(
+        [
+            [
+                _paid_invoice("INV-1", "2026-10-13"),
+                *[_undated_paid_invoice(f"INV-U{number:02d}") for number in range(20)],
+            ]
+        ]
+    )
+
+    output = xero.list_paid_invoices(paidOnDate="2026-10-13")
+    result = json.loads(output)
+
+    assert len(output) <= limit
+    assert [row["invoice_number"] for row in result["invoices"]] == ["INV-1"]
+    assert "truncated" not in result
+    assert result["undated_paid_invoice_count"] == 20
+    assert 0 < len(result["undated_paid_invoices"]) < 20
+    assert result["undated_paid_invoices_truncated"] is True
 
 
 def test_list_paid_invoices_caps_undated_sample_but_reports_full_count(

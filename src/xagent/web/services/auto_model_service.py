@@ -49,7 +49,7 @@ def load_router_profile_catalog() -> Any:
         from xrouter_llm import default_models_dir, load_benchmark_profiles
     except ImportError as exc:
         raise AutoModelDependencyError(
-            "Auto model configuration needs xrouter-llm>=0.3.6"
+            "Auto model configuration needs xrouter-llm>=0.3.7"
         ) from exc
     return load_benchmark_profiles(default_models_dir())
 

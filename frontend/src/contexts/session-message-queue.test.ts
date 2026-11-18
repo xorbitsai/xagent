@@ -133,6 +133,14 @@ describe("transitionMessageQueue", () => {
       ["accepted: a held queue stays held", state(HELD, [A]), { type: "DELIVERY_ACCEPTED", clientMessageId: "x", sinceVersion: 9 }, HELD],
       ["accepted: the last queued message accepted from a held queue waits", state(HELD, [A]), { type: "DELIVERY_ACCEPTED", clientMessageId: "a", sinceVersion: 9 }, waiting(9), []],
       ["accepted: one of several queued messages leaves a held queue held", state(HELD, [A, B]), { type: "DELIVERY_ACCEPTED", clientMessageId: "a", sinceVersion: 9 }, HELD, ["b:waiting"]],
+      ["delivery failed: ready holds when a message was queued after the failed send started", state(READY, [A, B]), { type: "DELIVERY_FAILED", queuedFrom: 2 }, { kind: "held", reason: "earlier_send_failed" }, ["a:waiting", "b:waiting"]],
+      ["delivery failed: ready goes on when every queued message came before it", state(READY, [A]), { type: "DELIVERY_FAILED", queuedFrom: 2 }, READY, ["a:waiting"]],
+      ["delivery failed: waiting holds when a message was queued after the failed send started", state(waiting(1), [A, B]), { type: "DELIVERY_FAILED", queuedFrom: 2 }, { kind: "held", reason: "earlier_send_failed" }, ["a:waiting", "b:waiting"]],
+      ["delivery failed: waiting on a question keeps waiting when every queued message came before it", state(waiting(1, true), [A]), { type: "DELIVERY_FAILED", queuedFrom: 2 }, waiting(1, true), ["a:waiting"]],
+      ["delivery failed: waiting with nothing queued keeps waiting", state(waiting(1)), { type: "DELIVERY_FAILED", queuedFrom: 0 }, waiting(1), []],
+      ["delivery failed: idle stays idle", state(IDLE), { type: "DELIVERY_FAILED", queuedFrom: 0 }, IDLE, []],
+      ["delivery failed: the head being sent decides for itself", state(sending("a", 1), [item("a", 1, "sending"), B]), { type: "DELIVERY_FAILED", queuedFrom: 0 }, sending("a", 1), ["a:sending", "b:waiting"]],
+      ["delivery failed: a held queue keeps its reason", state(HELD, [A, B]), { type: "DELIVERY_FAILED", queuedFrom: 0 }, HELD, ["a:waiting", "b:waiting"]],
       ["enqueue: idle becomes ready", state(IDLE), { type: "ENQUEUE", item: A }, READY, ["a:waiting"]],
       ["enqueue: held stays held", state(HELD, [A]), { type: "ENQUEUE", item: B }, HELD, ["a:waiting", "b:waiting"]],
       ["requeue: idle waits and orders by submission", state(IDLE, [B]), { type: "REQUEUE_REFUSED", item: A, sinceVersion: 3 }, waiting(3), ["a:waiting", "b:waiting"]],
@@ -196,6 +204,7 @@ describe("transitionMessageQueue", () => {
     expect(apply(failing, { type: "SEND_FAILED", clientMessageId: "a", verdict: "wait" }).effect).toBeNull()
     expect(apply(state(waiting(1), [A]), { type: "SUPPORT_LOST" }).effect).toBe("support_lost")
     expect(apply(state(HELD, [A]), { type: "SUPPORT_LOST" }).effect).toBeNull()
+    expect(apply(state(READY, [A]), { type: "DELIVERY_FAILED", queuedFrom: 0 }).effect).toBeNull()
     const idle = state(IDLE)
     expect(apply(idle, { type: "SUPPORT_LOST" })).toEqual({ next: idle, effect: null })
     expect(apply(idle, { type: "SUPPORT_LOST" }).next).toBe(idle)

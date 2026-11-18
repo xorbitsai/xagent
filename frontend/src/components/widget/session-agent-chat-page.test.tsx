@@ -273,6 +273,7 @@ describe("SessionAgentChatPage", () => {
     expect(app.provider?.transport?.capabilities).toEqual({
       linksOpenInNewTab: "enabled",
       taskStop: "enabled",
+      messageQueue: "enabled",
     })
   })
 

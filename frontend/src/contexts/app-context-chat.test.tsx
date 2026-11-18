@@ -13878,6 +13878,42 @@ describe("session message queue", () => {
     expect(sent()).toEqual([["A", null]])
   })
 
+  it("holds a message queued behind a direct send that then fails, until the visitor continues", async () => {
+    const { server } = await mount()
+    server.ackGate = deferred<void>()
+    server.refuseDirect = () => new MessageDeliveryError("lost", "outcome_unknown", { errorCode: "message_outcome_unknown" })
+    // A send that does not go through the queue, as a spoken message does.
+    let direct!: Promise<unknown>
+    act(() => { direct = getSessionControls().sendMessage("D", { clientMessageId: "id-D" }, []).catch((error: unknown) => error) })
+    await act(async () => {})
+    expect(await submit("B")).toBe("queued")
+
+    await act(async () => server.ackGate!.resolve())
+    expect(await direct).toMatchObject({ disposition: "outcome_unknown" })
+    expect(sent()).toEqual([["D", null]])
+    expect(phase()).toEqual({ kind: "held", reason: "earlier_send_failed" })
+    expect(queue().items.map(entry => `${entry.text}:${entry.status}`)).toEqual(["B:waiting"])
+    expect(toasts()).toEqual([])
+
+    server.refuseDirect = null
+    await act(async () => getSessionControls().messageQueue!.continueSending())
+    expect(sent()).toEqual([["D", null], ["B", "new_turn"]])
+  })
+
+  it("puts a direct send refused as busy back in submission order, without holding, while a later message is queued", async () => {
+    const { server } = await mount()
+    server.ackGate = deferred<void>()
+    const first = submit("A")
+    await act(async () => {})
+    expect(await submit("B")).toBe("queued")
+    server.status = "running"
+    await act(async () => server.ackGate!.resolve())
+    expect(await first).toBe("queued")
+    expect(queue().items.map(entry => entry.text)).toEqual(["A", "B"])
+    expect(phase()).toMatchObject({ kind: "waiting" })
+    expect(toasts()).toEqual([])
+  })
+
   describe("a refused or failed send of the head", () => {
     const refusal = (disposition: "not_sent" | "rejected" | "outcome_unknown", errorCode: ClientErrorCode | null, retryWithNewId = false) =>
       () => new MessageDeliveryError("refused", disposition, { errorCode, retryWithNewId })
@@ -14209,5 +14245,64 @@ describe("session message queue", () => {
     const before = queue()
     await push(server.snapshot())
     expect(queue()).toBe(before)
+  })
+
+  describe("opening the chat with a message while the queue sends", () => {
+    const resetConfirmed = () => push({ type: "conversation_reset", timestamp: "2026-11-17T00:00:03Z", data: {} } as TestWebSocketMessage)
+    // A is sent, B waits behind it, and the turn ends so that B is next.
+    const nextIsB = async () => {
+      const mounted = await startedTurnWithWaitingB()
+      mounted.server.handover()
+      return mounted
+    }
+
+    it("sends nothing from the old conversation once the new one is requested", async () => {
+      const { server } = await nextIsB()
+      let reset!: Promise<void>
+      act(() => { reset = getSessionControls().startNewConversation() })
+      await push(server.end())
+      expect(sent()).toEqual([["A", null]])
+      // The held message is not failed or reported: it is simply not sent.
+      expect(toasts()).toEqual([])
+      expect(queue().items.map(item => item.status)).toEqual(["waiting"])
+      await resetConfirmed()
+      await act(async () => reset)
+      expect(queue()).toMatchObject({ items: [], phase: { kind: "idle" } })
+      await act(async () => getSessionControls().sendMessage("host", { clientMessageId: "id-host" }))
+      expect(sent()).toEqual([["A", null], ["host", null]])
+    })
+
+    it("does not send a held queue's head when the visitor continues while a new conversation is being started", async () => {
+      const { server } = await nextIsB()
+      server.refuseHead = () => new MessageDeliveryError("refused", "rejected", { errorCode: "task_unavailable" })
+      await push(server.end())
+      expect(queue().items.map(item => item.status)).toEqual(["failed"])
+      expect(toasts()).toEqual(["messageQueue.held.sendFailed"])
+      const callsBefore = sendChatMessageMock.mock.calls.length
+
+      let reset!: Promise<void>
+      act(() => { reset = getSessionControls().startNewConversation() })
+      await act(async () => getSessionControls().messageQueue!.continueSending())
+      expect(sendChatMessageMock.mock.calls).toHaveLength(callsBefore)
+      expect(toasts()).toEqual(["messageQueue.held.sendFailed"])
+      expect(queue().items.map(item => item.status)).toEqual(["waiting"])
+
+      await resetConfirmed()
+      await act(async () => reset)
+    })
+
+    it("refuses the new conversation while the head is in flight and keeps the queue as it was", async () => {
+      const { server } = await nextIsB()
+      server.ackGate = deferred<void>()
+      await push(server.end())
+      expect(sent()).toEqual([["A", null], ["B", "new_turn"]])
+      await expect(act(async () => getSessionControls().startNewConversation())).rejects.toThrow(/blocked/)
+      expect(getSessionControls().sessionConversationState).toBe("bound")
+      expect(queue().items.map(item => [item.text, item.status])).toEqual([["B", "sending"]])
+
+      await act(async () => server.ackGate!.resolve())
+      expect(queue()).toMatchObject({ items: [], phase: { kind: "waiting" } })
+      expect(toasts()).toEqual([])
+    })
   })
 })

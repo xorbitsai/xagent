@@ -207,7 +207,7 @@ export function WidgetHistoryView({
           <p className="text-destructive" role="alert">{failureLine(readFailure)}</p>
           {endsTheView(readFailure) ? null : retry}
         </div>
-      ) : messages.length === 0 ? (
+      ) : messages.length === 0 && nextCursor === null ? (
         <p className="text-sm text-muted-foreground">{t("widgetSession.history.viewEmpty")}</p>
       ) : (
         <>

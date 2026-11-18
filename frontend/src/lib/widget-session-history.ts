@@ -143,6 +143,8 @@ const parseMessagePage = (
       if (!attachment) return null
       attachments.push(attachment)
     }
+    // A message the server marks metadata.display "none" is never shown.
+    if (isRecord(entry.metadata) && entry.metadata.display === "none") continue
     messages.push({
       id: entry.id,
       role: entry.role,

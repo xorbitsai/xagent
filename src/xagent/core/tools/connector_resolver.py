@@ -54,7 +54,9 @@ class ConnectorResolution:
     """Outcome of resolving an app name for this user.
 
     ``connector`` is required for ``needs_connection`` and is forwarded as-is
-    in the interaction's ``connector`` field. ``message`` is model- and
+    in the interaction's ``connector`` field. The tool itself sets
+    ``interaction_id`` on the interaction item (the id it passed in the
+    request), so a host need not copy it into ``connector``. ``message`` is model- and
     user-facing text; ``result`` is extra model-visible data for ``connected``.
     """
 

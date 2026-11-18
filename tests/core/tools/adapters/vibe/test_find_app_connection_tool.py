@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.tools import connector_resolver
@@ -418,6 +419,7 @@ async def test_end_to_end_pause_checkpoint_resume_settlement() -> None:
     assert waiting["status"] == "waiting_for_user"
     # The card is the only control: no default text box beside it.
     assert [i["type"] for i in waiting["interactions"]] == ["connect_connector"]
+    _assert_interaction_id_on_every_layer(waiting, pattern, runtime, resolver)
     [published] = [m for m in runtime.outbound_messages if m.get("expect_response")]
     assert published["metadata"]["interactions"] == waiting["interactions"]
 
@@ -453,3 +455,141 @@ async def test_end_to_end_pause_checkpoint_resume_settlement() -> None:
     assert record.status == "completed"
     assert record.result["status"] == "connected" and record.result["server"] == "db"
     assert "SECRET-123" not in repr(record.result)
+
+
+def _assert_interaction_id_on_every_layer(waiting, pattern, runtime, resolver) -> None:
+    """The id the card needs must survive every hop from tool result to client."""
+    from xagent.web.services.task_clarification_draft import (
+        build_clarification_payload,
+        parse_clarification_payload,
+    )
+
+    issued = resolver.requests[0].interaction_id
+    [item] = waiting["interactions"]
+    assert item["interaction_id"] == issued
+    assert item["connector"] == CONNECTOR  # forwarded untouched
+    # What the client receives on the outbound waiting message.
+    [published] = [m for m in runtime.outbound_messages if m.get("expect_response")]
+    assert published["metadata"]["interactions"][0]["interaction_id"] == issued
+    # The engine's own record of the wait, and the per-tool attribution.
+    request = pattern.waiting_for_user_request
+    assert request["interactions"][0]["interaction_id"] == issued
+    assert request["requests"][0]["interaction_id"] == issued
+    assert request["requests"][0]["interactions"][0]["interaction_id"] == issued
+    # The draft that is persisted and replayed.
+    draft = waiting["clarification_draft"]
+    assert draft.interactions[0]["interaction_id"] == issued
+    payload = build_clarification_payload(draft)
+    assert payload["interactions"][0]["interaction_id"] == issued
+    _, legacy_interactions = parse_clarification_payload(payload)
+    assert legacy_interactions is not None
+    assert legacy_interactions[0]["interaction_id"] == issued
+    assert legacy_interactions[0]["connector"] == CONNECTOR
+
+
+class _AskTool:
+    """A second, callback-less tool that pauses with an ordinary text field."""
+
+    def __init__(self) -> None:
+        self.metadata = SimpleNamespace(name="ask_region", description="Ask.")
+
+    def args_type(self) -> type[BaseModel]:
+        class Args(BaseModel):
+            pass
+
+        return Args
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "interaction_id": "ask-1",
+            "message": "Which region?",
+            "message_type": "question",
+            "interactions": [{"type": "text_input", "field": "region", "label": "R"}],
+        }
+
+
+def _two_calls() -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "c-connect",
+                "function": {
+                    "name": "find_app_connection",
+                    "arguments": json.dumps(ARGS),
+                },
+            },
+            {"id": "c-ask", "function": {"name": "ask_region", "arguments": "{}"}},
+        ]
+    }
+
+
+def _final() -> dict[str, Any]:
+    return _call(
+        "final_answer",
+        {
+            "response_language": "English",
+            "answer": "Done.",
+            "outcome": "completed",
+        },
+        "c-final",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connected", [False, True], ids=["pending", "connected"])
+async def test_batch_resumed_by_the_other_tools_answer(connected: bool) -> None:
+    """Two tools pause together; the user answers only the other tool.
+
+    The reply is delivered to every resumable interaction. While the connection
+    is still pending ``find_app_connection`` returns ``None`` (its call stays
+    unanswered, the run is not failed); once the host recorded the connection
+    it settles from that state regardless of the reply text.
+    """
+    resolver = FakeResolver(
+        ConnectorResolution("needs_connection", connector=CONNECTOR)
+    )
+
+    class _ParallelSafeConnect(FindAppConnectionTool):
+        """The tool is not concurrency-safe, so ReAct never co-pauses it with
+        another tool; it is marked safe here only to force a shared batch."""
+
+        @property
+        def metadata(self):
+            return super().metadata.model_copy(update={"concurrency_safe": True})
+
+    ask = _AskTool()
+    ask.metadata = SimpleNamespace(
+        name="ask_region", description="Ask.", concurrency_safe=True
+    )
+    tools = [_ParallelSafeConnect(resolver=resolver, user_id=7, task_id="t-1"), ask]
+    context = ExecutionContext(execution_id="batch-connect")
+    context.add_user_message("Connect Cosmos and pick a region")
+    runtime = PatternRuntime(execution_id="batch-connect")
+    pattern = ReActPattern(max_iterations=4, tool_parallel_enabled=True)
+    waiting = await pattern.run(
+        context=context,
+        tools=tools,
+        llm=_FakeLLM([_two_calls()]),
+        runtime=runtime,
+    )
+    assert waiting["status"] == "waiting_for_user"
+    # The sibling's text field is kept: a live widget does not hide it.
+    assert {i["type"] for i in waiting["interactions"]} == {
+        "connect_connector",
+        "text_input",
+    }
+
+    resolver.state = ConnectorConnectionState("connected" if connected else "pending")
+    context.add_user_message("eu-west")
+    resumed = ReActPattern(max_iterations=4, tool_parallel_enabled=True)
+    resumed.load_state(pattern.get_state())
+    final = await resumed.run(context=context, tools=tools, llm=_FakeLLM([_final()]))
+
+    assert final["success"] is True  # the run was not failed
+    assert [c["interaction_id"] for c in resolver.state_calls] == [
+        resolver.requests[0].interaction_id
+    ]
+    record = resumed._record_for_tool_call_id("c-connect")
+    assert record.status == ("completed" if connected else "waiting_for_user")

@@ -2,15 +2,19 @@
 
 import asyncio
 import inspect
+import io
 import json
 import logging
+import typing
 from typing import Any
 
 import pytest
+import requests
 from azure.core.exceptions import ServiceRequestError, ServiceResponseTimeoutError
-from azure.core.pipeline.transport import RequestsTransport
-from azure.cosmos.exceptions import CosmosHttpResponseError
+from azure.core.pipeline.transport import HttpRequest, RequestsTransport
+from azure.cosmos.exceptions import CosmosClientTimeoutError, CosmosHttpResponseError
 
+from xagent.core.utils import public_requests
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 from xagent.web.connector_probes import get_connector_probe
 from xagent.web.tools.mcp import cosmos
@@ -37,10 +41,12 @@ class FakePager:
     def __init__(self, pages, calls):
         self._pages = list(pages)
         self._calls = calls
-        self.continuation_token = None
+        self.continuation_token = "TOKEN-SENT"  # the token the caller passed
 
     def __next__(self):
         self._calls.append("next")
+        if not self._pages:
+            raise StopIteration  # the real pager does this on an empty block
         items, token = self._pages.pop(0)
         self.continuation_token = token
         return iter(items)
@@ -63,10 +69,12 @@ class FakeContainer:
 
     def query_items(self, **kwargs):
         self.owner.query_kwargs = kwargs
+        self.owner.timeouts.append(kwargs.get("timeout"))
         return FakeItems(self.owner.pages, self.owner.calls, kwargs["response_hook"])
 
-    def read_item(self, item, partition_key, response_hook=None):
+    def read_item(self, item, partition_key, response_hook=None, **kwargs):
         self.owner.read_args = (item, partition_key)
+        self.owner.timeouts.append(kwargs.get("timeout"))
         response_hook({"x-ms-request-charge": "1"}, {})
         return self.owner.item
 
@@ -75,11 +83,13 @@ class FakeDatabase:
     def __init__(self, owner):
         self.owner = owner
 
-    def read(self):
+    def read(self, **kwargs):
         self.owner.calls.append("db.read")
+        self.owner.timeouts.append(kwargs.get("timeout"))
         return {}
 
-    def list_containers(self, max_item_count=None):
+    def list_containers(self, max_item_count=None, **kwargs):
+        self.owner.timeouts.append(kwargs.get("timeout"))
         self.owner.list_containers_max = max_item_count
         return iter(self.owner.containers)
 
@@ -105,8 +115,10 @@ class FakeClient:
         self.databases: list[dict[str, Any]] = [{"id": "appdb"}, {"id": "other"}]
         self.item = self.default_item
         self.closed = False
+        self.timeouts: list[Any] = []
 
-    def list_databases(self, max_item_count=None):
+    def list_databases(self, max_item_count=None, **kwargs):
+        self.timeouts.append(kwargs.get("timeout"))
         return iter(self.databases)
 
     def get_database_client(self, name):
@@ -186,7 +198,7 @@ def test_rejected_endpoint_never_creates_a_client(client, monkeypatch):
     assert client.last is None
 
 
-def test_guarded_transport_blocks_other_hosts(monkeypatch):
+def test_guarded_transport_blocks_other_hosts(monkeypatch, caplog):
     sent = []
     monkeypatch.setattr(
         RequestsTransport, "send", lambda self, request, **kw: sent.append(request.url)
@@ -200,9 +212,91 @@ def test_guarded_transport_blocks_other_hosts(monkeypatch):
         "http://acct.documents.azure.com/dbs",
         "https://10.0.0.5/dbs",
     ):
-        with pytest.raises(cosmos.CosmosConfigError):
+        with pytest.raises(cosmos.BlockedDestinationError):
             transport.send(req(bad))
     assert sent == ["https://acct.documents.azure.com/dbs/appdb/colls?x=1"]
+    assert "evil.example.net" in caplog.text
+
+
+def test_blocked_destination_is_its_own_error_code(client, monkeypatch, caplog):
+    def blocked(self, *a, **kw):
+        raise cosmos.BlockedDestinationError
+
+    monkeypatch.setattr(FakeClient, "list_databases", blocked)
+    result = run("cosmos_list_databases")
+    assert result["error_code"] == "blocked_destination"
+    assert KEY not in json.dumps(result)
+
+
+def test_transport_uses_the_public_only_session():
+    """Dropping ``session=`` would remove the private-address guard."""
+    transport = cosmos._GuardedTransport()
+    assert isinstance(transport.session, public_requests.Session)
+
+
+def test_transport_does_not_follow_redirects(monkeypatch):
+    seen = {}
+
+    def fake_request(method, url, **kw):
+        seen.update(kw)
+        response = requests.Response()
+        response.status_code = 204
+        response.raw = io.BytesIO(b"")
+        return response
+
+    transport = cosmos._GuardedTransport()
+    monkeypatch.setattr(transport.session, "request", fake_request)
+    transport.send(HttpRequest("GET", "https://acct.documents.azure.com/dbs"))
+    assert seen["allow_redirects"] is False
+
+
+def test_real_sdk_never_contacts_a_discovered_regional_endpoint(monkeypatch):
+    """Account metadata names another host; with discovery off the real SDK
+    must stay on the validated endpoint."""
+    urls = []
+
+    def fake_request(self, method, url, **kw):
+        urls.append(url)
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/json"
+        if url.rstrip("/").endswith("/dbs"):
+            body: dict[str, Any] = {"Databases": [{"id": "appdb"}], "_count": 1}
+        else:
+            region = [
+                {
+                    "name": "West US",
+                    "databaseAccountEndpoint": "https://evil.example.net:443/",
+                }
+            ]
+            body = {
+                "id": "acct",
+                "writableLocations": region,
+                "readableLocations": region,
+                "userConsistencyPolicy": {"defaultConsistencyLevel": "Session"},
+            }
+        response._content = json.dumps(body).encode()
+        response.raw = io.BytesIO(response._content)
+        return response
+
+    monkeypatch.setattr(public_requests.Session, "request", fake_request)
+    result = run("cosmos_list_databases")
+    assert result["databases"] == ["appdb"]
+    assert urls and all(u.startswith("https://acct.documents.azure.com/") for u in urls)
+
+
+def test_client_closes_the_transport_when_construction_fails(monkeypatch):
+    closed = []
+    monkeypatch.setattr(
+        cosmos._GuardedTransport, "close", lambda self: closed.append(True)
+    )
+
+    def failing(*a, **kw):
+        raise ServiceRequestError("network down")
+
+    monkeypatch.setattr(cosmos, "CosmosClient", failing)
+    assert run("cosmos_list_databases")["error_code"] == "unreachable"
+    assert closed == [True]
 
 
 def test_client_is_built_bounded_and_without_discovery(client):
@@ -318,33 +412,196 @@ def test_query_page_size_is_clamped(client, requested, effective):
     assert result["max_item_count"] == effective
 
 
-def test_query_payload_cap_truncates_with_flag(client, monkeypatch):
-    big = "x" * 20_000
+def test_query_exhausted_pager_ends_the_paging(client, monkeypatch):
+    """A continuation that yields no further page must not echo the token."""
+    monkeypatch.setattr(FakeClient, "default_pages", [])
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c",
+        continuation_token="TOKEN-SENT",
+    )
+    assert result["items"] == []
+    assert result["continuation_token"] is None
+    assert result["has_more"] is False
 
+
+def test_query_unchanged_token_is_not_offered_again(client, monkeypatch):
+    monkeypatch.setattr(FakeClient, "default_pages", [([], "TOKEN-SENT")])
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c",
+        continuation_token="TOKEN-SENT",
+    )
+    assert (result["continuation_token"], result["has_more"]) == (None, False)
+
+
+def _limit(monkeypatch, chars):
+    monkeypatch.setenv("XAGENT_TOOL_MAX_OUTPUT_LENGTH", str(chars))
+
+
+def test_query_response_is_capped_as_a_whole_and_keeps_paging_fields(
+    client, monkeypatch
+):
+    _limit(monkeypatch, 5000)
+    big = "x" * 1500
     monkeypatch.setattr(
         FakeClient,
         "default_pages",
-        [([{"id": f"i{n}", "v": big} for n in range(6)], "T")],
+        [([{"id": f"i{n}", "v": big} for n in range(6)], "NEXT")],
     )
-    result = run("cosmos_query_container", container="c", query="SELECT * FROM c")
+    raw = cosmos.cosmos_query_container(container="c", query="SELECT * FROM c")
+    assert len(raw) <= 5000
+    result = json.loads(raw)
     assert result["truncated"] is True
-    assert result["count"] == 2
-    assert result["omitted_count"] == 4
-    assert result["omitted_ids"] == ["i2", "i3", "i4", "i5"]
-    assert result["continuation_token"] == "T"
-    assert len(json.dumps(result["items"])) <= cosmos.MAX_RESULT_BYTES
+    kept = len(result["items"])
+    assert 0 < kept < 6
+    assert result["omitted_count"] == 6 - kept
+    assert result["omitted_ids"] == [f"i{n}" for n in range(kept, 6)]
+    assert (result["continuation_token"], result["has_more"]) == ("NEXT", True)
+    # the paging fields are the last keys of the JSON, the first a blind cut drops
+    assert raw.index('"has_more"') > raw.index('"items"')
 
 
-def test_query_single_oversized_item_returns_no_items(client, monkeypatch):
+def test_query_first_item_alone_over_the_limit_still_makes_progress(
+    client, monkeypatch
+):
+    _limit(monkeypatch, 3000)
     monkeypatch.setattr(
-        FakeClient, "default_pages", [([{"id": "huge", "v": "x" * 100_000}], None)]
+        FakeClient, "default_pages", [([{"id": "huge", "v": "x" * 20_000}], "NEXT")]
     )
-    result = run("cosmos_query_container", container="c", query="SELECT * FROM c")
-    assert (result["items"], result["truncated"], result["omitted_ids"]) == (
-        [],
-        True,
-        ["huge"],
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c",
+        continuation_token="CURRENT",
     )
+    assert result["items"] == [] and result["omitted_ids"] == ["huge"]
+    assert result["continuation_token"] == "NEXT"  # past the page, not the input
+    assert result["truncated"] is True
+
+
+def test_list_tools_are_capped_as_a_whole_too(client, monkeypatch):
+    _limit(monkeypatch, 1500)
+    monkeypatch.setattr(
+        FakeClient,
+        "default_containers",
+        [{"id": "c" * 100, "partitionKey": {"paths": ["/pk"]}} for _ in range(60)],
+    )
+    raw = cosmos.cosmos_list_containers()
+    assert len(raw) <= 1500
+    result = json.loads(raw)
+    assert result["truncated"] is True and result["database"] == "appdb"
+    assert result["omitted_count"] == 60 - len(result["containers"])
+
+
+def test_list_databases_is_capped_as_a_whole_too(client, monkeypatch):
+    _limit(monkeypatch, 600)
+    monkeypatch.setattr(
+        FakeClient, "__init__", _init_many_databases(FakeClient.__init__)
+    )
+    raw = cosmos.cosmos_list_databases()
+    assert len(raw) <= 600
+    assert json.loads(raw)["truncated"] is True
+
+
+def _init_many_databases(original):
+    def init(self, *a, **kw):
+        original(self, *a, **kw)
+        self.databases = [{"id": "d" * 50 + str(n)} for n in range(40)]
+
+    return init
+
+
+def test_read_item_is_capped_as_a_whole(client, monkeypatch):
+    _limit(monkeypatch, 2000)
+    monkeypatch.setattr(
+        FakeClient,
+        "default_item",
+        {"id": "1", "tags": [f"t{n}" * 20 for n in range(200)], "name": "n"},
+    )
+    raw = cosmos.cosmos_read_item(container="c", id="1", partition_key="p")
+    assert len(raw) <= 2000
+    result = json.loads(raw)
+    assert result["truncated"] is True
+    assert result["request_charge"] == 1.0
+    assert result["database"] == "appdb" and result["container"] == "c"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT * FROM c ORDER BY c.ts",
+        "select c.a, count(1) from c group by c.a",
+        "SELECT DISTINCT c.a FROM c",
+        "SELECT TOP 5 * FROM c",
+        "SELECT * FROM c OFFSET 5 LIMIT 5",
+        "SELECT VALUE COUNT(1) FROM c",
+        "SELECT VALUE MAX (c.ts) FROM c",
+    ],
+)
+def test_cross_partition_non_resumable_queries_give_no_token(
+    client, monkeypatch, query
+):
+    monkeypatch.setattr(FakeClient, "default_pages", [([{"id": "1"}], "UNUSABLE")])
+    result = run("cosmos_query_container", container="c", query=query)
+    assert result["continuation_token"] is None
+    assert result["has_more"] is False
+    assert result["resumable"] is False
+    assert result["may_be_incomplete"] is False
+
+
+def test_non_resumable_full_page_says_it_may_be_incomplete(client, monkeypatch):
+    monkeypatch.setattr(
+        FakeClient, "default_pages", [([{"id": "1"}, {"id": "2"}], "UNUSABLE")]
+    )
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c ORDER BY c.ts",
+        max_item_count=2,
+    )
+    assert result["may_be_incomplete"] is True and result["has_more"] is False
+
+
+def test_non_resumable_query_rejects_a_token(client):
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c ORDER BY c.ts",
+        continuation_token="T",
+    )
+    assert result["error_code"] == "invalid_configuration"
+    assert client.last is None
+
+
+def test_partition_scoped_or_streamable_queries_keep_their_token(client, monkeypatch):
+    monkeypatch.setattr(FakeClient, "default_pages", [([{"id": "1"}], "NEXT")])
+    ordered = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c ORDER BY c.ts",
+        partition_key="p",
+    )
+    streamable = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c WHERE c.note = 'order by top'",
+    )
+    assert ordered["continuation_token"] == "NEXT" == streamable["continuation_token"]
+    assert "resumable" not in streamable
+
+
+def test_every_operation_gets_the_total_timeout(client):
+    run("cosmos_list_databases")
+    assert client.last.timeouts == [cosmos.TOTAL_TIMEOUT_SECONDS]
+    run("cosmos_list_containers")
+    assert client.last.timeouts == [cosmos.TOTAL_TIMEOUT_SECONDS] * 2
+    run("cosmos_query_container", container="c", query="SELECT 1")
+    assert client.last.timeouts == [cosmos.TOTAL_TIMEOUT_SECONDS]
+    run("cosmos_read_item", container="c", id="1", partition_key="p")
+    assert client.last.timeouts == [cosmos.TOTAL_TIMEOUT_SECONDS]
 
 
 @pytest.mark.parametrize(
@@ -390,20 +647,67 @@ def test_read_item(client):
     assert result["truncated"] is False
 
 
-def test_read_item_oversized_returns_preview(client, monkeypatch):
-    monkeypatch.setattr(FakeClient, "default_item", {"id": "1", "v": "x" * 100_000})
-    result = run("cosmos_read_item", container="c", id="1", partition_key="p")
-    assert result["truncated"] is True
-    assert result["item"] is None
-    assert result["item_preview"].startswith('{"id": "1"')
-    assert len(result["item_preview"]) < cosmos.MAX_RESULT_BYTES
-    assert result["size_bytes"] > cosmos.MAX_RESULT_BYTES
-
-
-@pytest.mark.parametrize("bad_id", ["", "a/b", "a\\b", "a?b", "a#b", "a\nb", " "])
+@pytest.mark.parametrize(
+    "bad_id", ["", "a/b", "a\\b", "a?b", "a#b", "a\nb", " ", ".", "..", "é" * 600]
+)
 def test_read_item_rejects_bad_id(client, bad_id):
     result = run("cosmos_read_item", container="c", id=bad_id, partition_key="p")
     assert result["error_code"] == "invalid_configuration"
+
+
+def test_item_ids_may_be_up_to_1023_bytes_but_names_only_255_characters(client):
+    ok = run("cosmos_read_item", container="c", id="x" * 1023, partition_key="p")
+    assert ok["status"] == "success"
+    assert (
+        run("cosmos_read_item", container="c", id="x" * 1024, partition_key="p")[
+            "status"
+        ]
+        == "error"
+    )
+    assert (
+        run("cosmos_read_item", container="c", id="é" * 511, partition_key="p")[
+            "status"
+        ]
+        == "success"
+    )  # 1,022 bytes
+    long_name = "c" * 256
+    assert (
+        run("cosmos_read_item", container=long_name, id="1", partition_key="p")[
+            "error_code"
+        ]
+        == "invalid_configuration"
+    )
+
+
+@pytest.mark.parametrize("name", [".", ".."])
+def test_container_name_rejects_dot_segments(client, name):
+    result = run("cosmos_query_container", container=name, query="SELECT 1")
+    assert result["error_code"] == "invalid_configuration"
+
+
+def test_read_item_partition_key_cannot_be_null():
+    """``None`` means a cross-partition query elsewhere; here it would silently
+    mean "the item whose key is null", so the type does not allow it."""
+    hint = typing.get_type_hints(cosmos.cosmos_read_item)["partition_key"]
+    assert type(None) not in typing.get_args(hint)
+    assert (
+        inspect.signature(cosmos.cosmos_read_item).parameters["partition_key"].default
+        is inspect.Parameter.empty
+    )
+
+
+def test_not_found_messages_are_written_per_call_site(client, monkeypatch):
+    def not_found(self, *a, **kw):
+        raise _http(404)
+
+    monkeypatch.setattr(FakeClient, "list_databases", not_found)
+    assert "account was not found" in run("cosmos_list_databases")["message"]
+    monkeypatch.setattr(FakeClient, "get_database_client", not_found)
+    assert "Database 'appdb' was not found" in run("cosmos_list_containers")["message"]
+    query = run("cosmos_query_container", container="orders", query="SELECT 1")
+    assert "Container 'orders' or the configured database" in query["message"]
+    item = run("cosmos_read_item", container="orders", id="42", partition_key="p")
+    assert "Item '42' was not found in container 'orders'" in item["message"]
 
 
 def test_container_tools_are_pinned_to_the_configured_database():
@@ -447,6 +751,7 @@ def _http(status, message=SENTINEL, headers=None):
         (_http(503), "service_unavailable"),
         (_http(418), "request_failed"),
         (ServiceResponseTimeoutError(f"{SENTINEL} {KEY}"), "timeout"),
+        (CosmosClientTimeoutError(f"{SENTINEL} {KEY}"), "timeout"),
         (ServiceRequestError(f"{SENTINEL} {KEY}"), "unreachable"),
         (RuntimeError(f"{SENTINEL} {KEY}"), "internal_error"),
         (ValueError(f"{SENTINEL} {KEY}"), "internal_error"),

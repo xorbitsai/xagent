@@ -7,8 +7,10 @@ gain from the async client).
 Configuration, all three required: ``COSMOS_ENDPOINT`` (the account URI from
 the portal, ``https://<account>.documents.azure.com:443/``), ``COSMOS_KEY``
 (an account key; a read-only key is enough and recommended) and
-``COSMOS_DATABASE``. Container tools are pinned to ``COSMOS_DATABASE``; the
-account key itself is account-wide, so "one database only" is enforced here.
+``COSMOS_DATABASE``. The container tools (list containers, query, read item)
+are pinned to ``COSMOS_DATABASE`` and take no database argument. The account
+key itself is account-wide, and ``cosmos_list_databases`` lists the whole
+account.
 
 Read-only by construction: the only SDK calls made are ``list_databases``,
 ``DatabaseProxy.read``, ``list_containers``, ``query_items`` and ``read_item``.
@@ -26,15 +28,19 @@ The endpoint is user supplied and this module runs on the web host, so:
   rejects private/link-local addresses and connects to the address it checked).
 
 The key, the endpoint's query string and raw SDK exception text never reach a
-tool result or a log line; failures are mapped to ``error_code`` values.
+tool result or a log line; failures are mapped to ``error_code`` values. Every
+response is capped as a whole against ``get_tool_max_output_length()``, so the
+paging fields at its end survive the platform's output filter.
 """
 
 import json
 import logging
 import os
 import re
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from itertools import islice
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import urlsplit
 
 from azure.core.exceptions import (
@@ -45,13 +51,14 @@ from azure.core.exceptions import (
 )
 from azure.core.pipeline.transport import RequestsTransport
 from azure.cosmos import CosmosClient
-from azure.cosmos.exceptions import CosmosHttpResponseError
+from azure.cosmos.exceptions import CosmosClientTimeoutError, CosmosHttpResponseError
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from ....config import get_tool_max_output_length
 from ....core.utils import public_requests
 from ....core.utils.security import redact_sensitive_text
-from .utils import clamp_limit
+from .utils import clamp_limit, success_with_capped_dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cosmos-mcp")
@@ -75,10 +82,19 @@ _HOST_PATTERN = re.compile(
     + "|".join(re.escape(s) for s in ALLOWED_HOST_SUFFIXES)
     + r")\Z"
 )
-# Cosmos resource ids may not contain / \ ? # (Cosmos DB resource-id rules).
+# Characters Cosmos DB resource ids may not contain: / \ ? # (Microsoft Learn,
+# ``Resource.Id`` in the SDK reference); control characters are refused too.
 _ID_FORBIDDEN = re.compile(r"[/\\?#\x00-\x1f\x7f]")
 _PARAM_NAME = re.compile(r"\A@?([A-Za-z_][A-Za-z0-9_]{0,63})\Z")
 _SELECT = re.compile(r"\A\s*SELECT\b", re.IGNORECASE)
+_STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+# Clauses that make the Python SDK merge partial results on the client, so
+# the token of the last backend response cannot resume a cross-partition query.
+_NON_RESUMABLE = re.compile(
+    r"\b(?:ORDER\s+BY|GROUP\s+BY|DISTINCT|TOP|OFFSET)\b"
+    r"|\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(",
+    re.IGNORECASE,
+)
 
 # Bounds on a single call. The SDK defaults (65 s read timeout, up to 9
 # throttle retries) are far too generous for a call the model is waiting on.
@@ -96,9 +112,10 @@ MAX_LIST_ITEMS = 100
 MAX_QUERY_CHARS = 4096
 MAX_PARAMETERS = 50
 MAX_CONTINUATION_TOKEN_CHARS = 32768
-# Cap on the serialized ``items`` / ``item`` of a result; the envelope around
-# them is small. Over the cap the tool truncates and says so.
-MAX_RESULT_BYTES = 60_000
+# Limits from "Azure Cosmos DB service quotas": database and container names
+# 255 characters, item ids 1,023 bytes.
+MAX_NAME_CHARS = 255
+MAX_ITEM_ID_BYTES = 1023
 MAX_OMITTED_IDS = 50
 
 _REQUEST_CHARGE_HEADER = "x-ms-request-charge"
@@ -108,6 +125,10 @@ _KEY_AUTH_DISABLED_MARKER = "local authorization is disabled"
 
 class CosmosConfigError(ValueError):
     """A problem with the connector's own input; the message is ours, safe to show."""
+
+
+class BlockedDestinationError(Exception):
+    """A request was refused because its host is not an allowed Cosmos DB host."""
 
 
 def _success(**payload: Any) -> str:
@@ -145,9 +166,9 @@ def validate_endpoint(raw: str) -> str:
         raise CosmosConfigError("COSMOS_ENDPOINT is not a valid URL") from None
     if parts.scheme != "https":
         raise CosmosConfigError("COSMOS_ENDPOINT must be an https URL")
-    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+    if "@" in parts.netloc:
         raise CosmosConfigError("COSMOS_ENDPOINT must not contain credentials")
-    if "?" in value or "#" in value or parts.query or parts.fragment:
+    if "?" in value or "#" in value:
         raise CosmosConfigError("COSMOS_ENDPOINT must not contain a query or fragment")
     if parts.path not in ("", "/"):
         raise CosmosConfigError("COSMOS_ENDPOINT must not contain a path")
@@ -177,46 +198,93 @@ class _GuardedTransport(RequestsTransport):  # type: ignore[no-any-unimported]
 
     def send(self, request: Any, **kwargs: Any) -> Any:
         parts = urlsplit(str(request.url))
-        validate_endpoint(f"{parts.scheme}://{parts.netloc}/")
+        try:
+            validate_endpoint(f"{parts.scheme}://{parts.netloc}/")
+        except CosmosConfigError:
+            logger.warning(
+                "Refused a request to a host outside the Cosmos DB allowlist: %s",
+                parts.hostname,
+            )
+            raise BlockedDestinationError from None
         return super().send(request, **kwargs)
 
 
 def _client() -> CosmosClient:
     endpoint = validate_endpoint(_env("COSMOS_ENDPOINT"))
     key = _env("COSMOS_KEY")
-    return CosmosClient(
-        endpoint,
-        credential=key,
-        transport=_GuardedTransport(),
-        # No regional endpoint discovery: all traffic stays on the endpoint
-        # validated above (the account metadata can name other hosts).
-        enable_endpoint_discovery=False,
-        connection_timeout=CONNECTION_TIMEOUT_SECONDS,
-        read_timeout=READ_TIMEOUT_SECONDS,
-        timeout=TOTAL_TIMEOUT_SECONDS,
-        retry_total=RETRY_TOTAL,
-        retry_backoff_max=RETRY_BACKOFF_MAX_SECONDS,
-        retry_throttle_total=THROTTLE_RETRY_TOTAL,
-        retry_throttle_backoff_max=THROTTLE_BACKOFF_MAX_SECONDS,
-    )
+    transport = _GuardedTransport()
+    try:
+        return CosmosClient(
+            endpoint,
+            credential=key,
+            transport=transport,
+            # No regional endpoint discovery: all traffic stays on the endpoint
+            # validated above (the account metadata can name other hosts).
+            enable_endpoint_discovery=False,
+            connection_timeout=CONNECTION_TIMEOUT_SECONDS,
+            read_timeout=READ_TIMEOUT_SECONDS,
+            timeout=TOTAL_TIMEOUT_SECONDS,
+            retry_total=RETRY_TOTAL,
+            retry_backoff_max=RETRY_BACKOFF_MAX_SECONDS,
+            retry_throttle_total=THROTTLE_RETRY_TOTAL,
+            retry_throttle_backoff_max=THROTTLE_BACKOFF_MAX_SECONDS,
+        )
+    except BaseException:
+        # The constructor does network I/O (the account read); do not leak the
+        # transport's session when it fails.
+        transport.close()
+        raise
+
+
+@contextmanager
+def _open_client() -> Iterator[CosmosClient]:
+    client = _client()
+    try:
+        yield client
+    finally:
+        client.close()
 
 
 def _database_name() -> str:
-    return _check_id(_env("COSMOS_DATABASE"), "COSMOS_DATABASE")
+    return _check_name(_env("COSMOS_DATABASE"), "COSMOS_DATABASE")
 
 
-def _check_id(value: Any, name: str) -> str:
+def _check_name(value: Any, name: str) -> str:
+    """A database or container name (255 characters at most)."""
     if (
         not isinstance(value, str)
         or not value.strip()
-        or len(value) > 255
+        or len(value) > MAX_NAME_CHARS
+        or value in (".", "..")
         or _ID_FORBIDDEN.search(value)
     ):
         raise CosmosConfigError(
-            f"{name} must be a non-empty name of at most 255 characters without "
-            "/ \\ ? # or control characters"
+            f"{name} must be a non-empty name of at most {MAX_NAME_CHARS} characters, "
+            "not '.' or '..', without / \\ ? # or control characters"
         )
     return value
+
+
+def _check_item_id(value: Any) -> str:
+    """An item id (1,023 bytes at most). ``.`` and ``..`` are dot segments that
+    URL normalization removes from the request path, so they could never match
+    the signed resource."""
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value.encode("utf-8")) > MAX_ITEM_ID_BYTES
+        or value in (".", "..")
+        or _ID_FORBIDDEN.search(value)
+    ):
+        raise CosmosConfigError(
+            f"id must be a non-empty item id of at most {MAX_ITEM_ID_BYTES} bytes, "
+            "not '.' or '..', without / \\ ? # or control characters"
+        )
+    return value
+
+
+def _short(value: str) -> str:
+    return value if len(value) <= 80 else value[:77] + "..."
 
 
 def _query_error_details(exc: CosmosHttpResponseError) -> str | None:
@@ -240,10 +308,20 @@ def _query_error_details(exc: CosmosHttpResponseError) -> str | None:
     return redact_sensitive_text(" ".join(messages))[:300]
 
 
-def _map_error(exc: Exception, target: str) -> str:
-    """Map an exception to an actionable envelope without echoing its text."""
+def _map_error(exc: Exception, target: str, not_found: str) -> str:
+    """Map an exception to an actionable envelope without echoing its text.
+
+    ``target`` names the call for the log; ``not_found`` is the full 404
+    message for this call site.
+    """
     if isinstance(exc, CosmosConfigError):
         return _error("invalid_configuration", str(exc))
+    if isinstance(exc, BlockedDestinationError):
+        return _error(
+            "blocked_destination",
+            "The request was refused because it targeted a host that is not an "
+            "Azure Cosmos DB account host.",
+        )
     if isinstance(exc, CosmosHttpResponseError):
         status = exc.status_code
         text = f"{getattr(exc, 'message', '')} {exc}".lower()
@@ -271,12 +349,7 @@ def _map_error(exc: Exception, target: str) -> str:
                 http_status=403,
             )
         if status == 404:
-            return _error(
-                "not_found",
-                f"Not found (404): check that {target} exists in the configured "
-                "database.",
-                http_status=404,
-            )
+            return _error("not_found", not_found, http_status=404)
         if status == 429:
             retry_after = (getattr(exc, "headers", None) or {}).get(_RETRY_AFTER_HEADER)
             return _error(
@@ -307,7 +380,14 @@ def _map_error(exc: Exception, target: str) -> str:
             f"Cosmos DB returned HTTP {status}.",
             http_status=status,
         )
-    if isinstance(exc, (ServiceRequestTimeoutError, ServiceResponseTimeoutError)):
+    if isinstance(
+        exc,
+        (
+            CosmosClientTimeoutError,
+            ServiceRequestTimeoutError,
+            ServiceResponseTimeoutError,
+        ),
+    ):
         logger.error("Cosmos request timed out on %s", target)
         return _error("timeout", "The request to Cosmos DB timed out.")
     if isinstance(exc, ServiceRequestError):
@@ -323,21 +403,56 @@ def _map_error(exc: Exception, target: str) -> str:
     return _error("internal_error", "The Cosmos DB request could not be completed.")
 
 
-def _serialized_size(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+def _success_with_capped_list(
+    field: str, payload: dict[str, Any], hint: str | None = None
+) -> str:
+    """A success payload, halving ``payload[field]`` until the *whole* response
+    fits ``get_tool_max_output_length()``.
 
+    The platform's output filter slices an oversized response blindly, which
+    would drop the paging fields that follow the list, so the cap covers the
+    entire JSON. Halved entries belong to the page already fetched and are not
+    on the next page: their ids are returned (``omitted_ids``) so a caller can
+    still fetch each one, even when one record alone is larger than the limit.
+    The paging fields (``continuation_token``, ``has_more``) always survive,
+    and the token already points past the page, so a retry makes progress.
+    """
+    max_output_length = max(64, get_tool_max_output_length())
+    items = payload[field]
+    rest = {k: v for k, v in payload.items() if k != "truncated"}
+    already_truncated = bool(payload.get("truncated"))
 
-def _fit_items(items: list[Any]) -> tuple[list[Any], list[Any]]:
-    """Split ``items`` into the prefix that fits ``MAX_RESULT_BYTES`` and the rest."""
-    kept: list[Any] = []
-    used = 2
-    for index, item in enumerate(items):
-        size = _serialized_size(item) + 1
-        if used + size > MAX_RESULT_BYTES:
-            return kept, items[index:]
-        kept.append(item)
-        used += size
-    return kept, []
+    def build(kept: list[Any]) -> str:
+        if len(kept) == len(items):
+            return _success(**rest, truncated=already_truncated)
+        omitted = items[len(kept) :]
+        ids = [i["id"] for i in omitted if isinstance(i, dict) and "id" in i]
+        return _success(
+            **{**rest, field: kept},
+            truncated=True,
+            omitted_count=len(omitted),
+            omitted_ids=ids[:MAX_OMITTED_IDS],
+            message=hint
+            or (
+                f"Returned {len(kept)} of {len(items)} {field}; the rest did not "
+                "fit the output size limit and are not on the next page. Fetch "
+                "each omitted id with cosmos_read_item, select fewer fields, or "
+                "lower max_item_count."
+            ),
+        )
+
+    kept = items
+    response = build(kept)
+    while len(response) > max_output_length and kept:
+        kept = kept[: len(kept) // 2]
+        response = build(kept)
+    if len(response) > max_output_length:
+        # Even the envelope plus ids does not fit (a very small configured
+        # limit): keep it valid JSON and say how many were left out.
+        response = _success(
+            **{**rest, field: []}, truncated=True, omitted_count=len(items)
+        )
+    return response
 
 
 def _parameters(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -356,6 +471,18 @@ def _parameters(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
             )
         result.append({"name": f"@{match.group(1)}", "value": value})
     return result
+
+
+def _is_resumable_across_partitions(query: str) -> bool:
+    """Whether a continuation token can resume this query across partitions.
+
+    Microsoft Learn: in the Python SDK aggregate cross-partition queries
+    (sorting, counting, distinct) do not support continuation tokens, and
+    GROUP BY / DISTINCT cannot use them at the service. TOP and OFFSET are
+    merged client-side the same way (read from the SDK source). A best-effort
+    check on the query text with string literals removed.
+    """
+    return not _NON_RESUMABLE.search(_STRING_LITERAL.sub("''", query))
 
 
 def _charge_recorder() -> tuple[list[float], Any]:
@@ -384,20 +511,27 @@ def cosmos_list_databases() -> str:
     """
     try:
         database_name = _database_name()
-        client = _client()
-        try:
+        with _open_client() as client:
             databases, truncated = _bounded(
-                client.list_databases(max_item_count=MAX_LIST_ITEMS + 1)
+                client.list_databases(
+                    max_item_count=MAX_LIST_ITEMS + 1, timeout=TOTAL_TIMEOUT_SECONDS
+                )
             )
-        finally:
-            client.close()
-        return _success(
-            databases=[d.get("id") for d in databases],
-            configured_database=database_name,
-            truncated=truncated,
+        return _success_with_capped_list(
+            "databases",
+            {
+                "databases": [d.get("id") for d in databases],
+                "configured_database": database_name,
+                "truncated": truncated,
+            },
+            hint="The list did not fit the output size limit.",
         )
     except Exception as e:
-        return _map_error(e, "the account")
+        return _map_error(
+            e,
+            "the account",
+            "The Cosmos DB account was not found (404). Check COSMOS_ENDPOINT.",
+        )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -407,30 +541,42 @@ def cosmos_list_containers() -> str:
     paths. Also confirms that the endpoint, key, network access and database
     name all work (use it first if any other Cosmos call fails).
     """
+    database_name = "the configured database"
     try:
         database_name = _database_name()
-        client = _client()
-        try:
+        with _open_client() as client:
             database = client.get_database_client(database_name)
-            database.read()  # one metadata read: the database must exist
+            # One metadata read: the database must exist.
+            database.read(timeout=TOTAL_TIMEOUT_SECONDS)
             containers, truncated = _bounded(
-                database.list_containers(max_item_count=MAX_LIST_ITEMS + 1)
+                database.list_containers(
+                    max_item_count=MAX_LIST_ITEMS + 1, timeout=TOTAL_TIMEOUT_SECONDS
+                )
             )
-        finally:
-            client.close()
-        return _success(
-            database=database_name,
-            containers=[
-                {
-                    "id": c.get("id"),
-                    "partition_key_paths": (c.get("partitionKey") or {}).get("paths"),
-                }
-                for c in containers
-            ],
-            truncated=truncated,
+        return _success_with_capped_list(
+            "containers",
+            {
+                "database": database_name,
+                "containers": [
+                    {
+                        "id": c.get("id"),
+                        "partition_key_paths": (c.get("partitionKey") or {}).get(
+                            "paths"
+                        ),
+                    }
+                    for c in containers
+                ],
+                "truncated": truncated,
+            },
+            hint="The list did not fit the output size limit.",
         )
     except Exception as e:
-        return _map_error(e, "the configured database")
+        return _map_error(
+            e,
+            "the configured database",
+            f"Database {_short(database_name)!r} was not found (404). "
+            "Check COSMOS_DATABASE.",
+        )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -455,23 +601,28 @@ def cosmos_query_container(
     query: Cosmos DB SQL, e.g. "SELECT c.id, c.status FROM c WHERE c.status = @s".
     parameters: values for @names used in the query, e.g. {"@s": "open"}.
     partition_key: optional; restricts the query to one logical partition
-    (a list for hierarchical keys). Without it the query fans out across all
+    (a list for hierarchical keys). Omit it (null) for a query across all
     partitions, which costs more request units.
     max_item_count: page size, 1-100 (default 25).
     continuation_token: the continuation_token of the previous page to get the
     next one; omit for the first page.
-    Cross-partition queries with ORDER BY, aggregates (COUNT, SUM...) or DISTINCT
-    do not support continuation tokens (Microsoft's azure-cosmos README): narrow
-    them with partition_key or a filter instead of paging.
-    Returns items, request_charge (RU), continuation_token (null when there is
-    no further page) and truncated. When the page is larger than the size cap,
-    items are cut: truncated is true, omitted_count says how many were dropped
-    and omitted_ids lists their ids; select fewer fields or lower
-    max_item_count instead of paging on.
+    Returns items, request_charge (RU), continuation_token (null on the last
+    page), has_more and truncated. When the response is larger than the output
+    size limit, items are cut: truncated is true, omitted_count says how many
+    were dropped and omitted_ids lists their ids (fetch them with
+    cosmos_read_item, or select fewer fields); the continuation_token still
+    points past this page.
+    A query across partitions (no partition_key) that uses ORDER BY, GROUP BY,
+    DISTINCT, TOP, OFFSET or an aggregate (COUNT, SUM, AVG, MIN, MAX) cannot be
+    resumed with a token: the result has no continuation_token, resumable is
+    false and may_be_incomplete says whether the page was full; a token passed
+    with such a query is rejected. Narrow it with partition_key or a filter, or
+    use a streamable query (SELECT ... WHERE ...) to page.
     """
+    container_name = "the container"
     try:
         database_name = _database_name()
-        container = _check_id(container, "container")
+        container_name = _check_name(container, "container")
         if not isinstance(query, str) or not _SELECT.match(query):
             raise CosmosConfigError("query must be a SQL query starting with SELECT")
         if len(query) > MAX_QUERY_CHARS:
@@ -485,19 +636,25 @@ def cosmos_query_container(
             or len(continuation_token) > MAX_CONTINUATION_TOKEN_CHARS
         ):
             raise CosmosConfigError("continuation_token is not valid")
+        resumable = partition_key is not None or _is_resumable_across_partitions(query)
+        if continuation_token and not resumable:
+            raise CosmosConfigError(
+                "this query cannot be resumed with a continuation token across "
+                "partitions (ORDER BY, GROUP BY, DISTINCT, TOP, OFFSET or an "
+                "aggregate): pass partition_key or narrow the query"
+            )
 
         charges, record_charge = _charge_recorder()
-
-        client = _client()
-        try:
+        with _open_client() as client:
             container_client = client.get_database_client(
                 database_name
-            ).get_container_client(container)
+            ).get_container_client(container_name)
             query_kwargs: dict[str, Any] = {
                 "query": query,
                 "parameters": sql_parameters or None,
                 "max_item_count": page_size,
                 "response_hook": record_charge,
+                "timeout": TOTAL_TIMEOUT_SECONDS,
             }
             if partition_key is None:
                 query_kwargs["enable_cross_partition_query"] = True
@@ -506,92 +663,91 @@ def cosmos_query_container(
             pager: Any = container_client.query_items(**query_kwargs).by_page(
                 continuation_token or None
             )
-            page = list(next(pager, iter(())))
-            next_token = pager.continuation_token
-        finally:
-            client.close()
+            try:
+                page = list(next(pager))
+                next_token = pager.continuation_token
+            except StopIteration:
+                # No more results. The pager still holds the token the caller
+                # sent, which must not be echoed back.
+                page, next_token = [], None
+        if next_token == continuation_token:
+            next_token = None  # no progress: never invite a loop
+        if not resumable:
+            next_token = None
 
-        kept, omitted = _fit_items(page)
-        extra: dict[str, Any] = {}
-        if omitted:
-            extra = {
-                "omitted_count": len(omitted),
-                "omitted_ids": [
-                    i["id"] for i in omitted if isinstance(i, dict) and "id" in i
-                ][:MAX_OMITTED_IDS],
-            }
-        return _success(
-            database=database_name,
-            container=container,
-            items=kept,
-            count=len(kept),
-            max_item_count=page_size,
-            request_charge=round(sum(charges), 2),
-            continuation_token=next_token or None,
-            has_more=bool(next_token),
-            truncated=bool(omitted),
-            **extra,
-        )
+        payload: dict[str, Any] = {
+            "database": database_name,
+            "container": container_name,
+            "items": page,
+            "max_item_count": page_size,
+            "request_charge": round(sum(charges), 2),
+            "continuation_token": next_token or None,
+            "has_more": bool(next_token),
+        }
+        if not resumable:
+            payload["resumable"] = False
+            payload["may_be_incomplete"] = len(page) >= page_size
+        return _success_with_capped_list("items", payload)
     except Exception as e:
-        return _map_error(e, "the container")
+        return _map_error(
+            e,
+            "the container",
+            f"Container {_short(container_name)!r} or the configured database was "
+            "not found (404).",
+        )
 
 
 @mcp.tool(annotations=READ_ONLY)
 def cosmos_read_item(
     container: str,
     id: str,
-    partition_key: str | int | float | bool | list[str | int | float | bool] | None,
+    partition_key: str | int | float | bool | list[str | int | float | bool],
 ) -> str:
     """
     Read one item by id and partition key from a container of the configured
     database (a point read: the cheapest read Cosmos DB offers).
     container: container name (see cosmos_list_containers).
     id: the item's id.
-    partition_key: the item's partition key value (a list for hierarchical keys).
-    An item over the size cap comes back as item_preview (the start of its JSON)
-    with truncated true.
+    partition_key: the item's partition key value (a list for hierarchical
+    keys). Required; an item with a null partition key cannot be read here.
+    An item larger than the output size limit is trimmed field by field and
+    truncated is true.
     """
+    container_name = "the container"
+    item_id = "the item"
     try:
         database_name = _database_name()
-        container = _check_id(container, "container")
-        item_id = _check_id(id, "id")
+        container_name = _check_name(container, "container")
+        item_id = _check_item_id(id)
         charges, record_charge = _charge_recorder()
-
-        client = _client()
-        try:
+        with _open_client() as client:
             item = (
                 client.get_database_client(database_name)
-                .get_container_client(container)
+                .get_container_client(container_name)
                 .read_item(
-                    item_id, partition_key=partition_key, response_hook=record_charge
+                    item_id,
+                    partition_key=partition_key,
+                    response_hook=record_charge,
+                    timeout=TOTAL_TIMEOUT_SECONDS,
                 )
             )
-        finally:
-            client.close()
-        charge = round(sum(charges), 2)
-        size = _serialized_size(item)
-        if size > MAX_RESULT_BYTES:
-            preview = json.dumps(item, ensure_ascii=False, default=str)[
-                : MAX_RESULT_BYTES // 4
-            ]
-            return _success(
-                database=database_name,
-                container=container,
-                item=None,
-                item_preview=preview,
-                size_bytes=size,
-                request_charge=charge,
-                truncated=True,
-            )
-        return _success(
-            database=database_name,
-            container=container,
-            item=item,
-            request_charge=charge,
-            truncated=False,
+        return success_with_capped_dict(
+            "item",
+            item,
+            critical_fields={
+                "database": database_name,
+                "container": container_name,
+                "request_charge": round(sum(charges), 2),
+            },
         )
     except Exception as e:
-        return _map_error(e, "the item")
+        return _map_error(
+            e,
+            "the item",
+            f"Item {_short(item_id)!r} was not found in container "
+            f"{_short(container_name)!r} (404). Check the id and the partition key "
+            "value, and that the container exists in the configured database.",
+        )
 
 
 if __name__ == "__main__":

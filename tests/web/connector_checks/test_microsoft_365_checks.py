@@ -662,6 +662,27 @@ def _newer_message(tenant: Tenant) -> None:
     tenant.messages[CHANNEL_ID].insert(0, tenant.message("1731500000000", "hello"))
 
 
+def _membership_changes(tenant: Tenant) -> None:
+    # Disabling the test account and enabling it again posts these two (#3836).
+    # Graph v1.0 lists them with messageType unknownFutureValue, not
+    # systemEventMessage, and above the seeded message.
+    for message_id, detail in (
+        ("1794660949705", "membersAddedEventMessageDetail"),
+        ("1794658198232", "membersDeletedEventMessageDetail"),
+    ):
+        tenant.messages[CHANNEL_ID].insert(
+            len(tenant.messages[CHANNEL_ID]) - 1,
+            {
+                "id": message_id,
+                "messageType": "unknownFutureValue",
+                "createdDateTime": "2026-11-14T12:09:58Z",
+                "from": None,
+                "body": {"contentType": "html", "content": "<systemEventMessage/>"},
+                "eventDetail": {"@odata.type": f"#microsoft.graph.{detail}"},
+            },
+        )
+
+
 def _edited_message(tenant: Tenant) -> None:
     # Still starts like the seed's text, so only the whole text tells them apart.
     tenant.messages[CHANNEL_ID][0]["body"]["content"] = "xagent smoke test message"
@@ -747,6 +768,7 @@ def _speaker_notes(tenant: Tenant) -> None:
         (_other_channel, {"teams.list_seed_channels"}),
         (_extra_channel, {"teams.list_seed_channels"}),
         (_newer_message, {"teams.read_seed_message"}),
+        (_membership_changes, set()),
         (_edited_message, {"teams.read_seed_message"}),
         (_html_message, set()),
         (_extra_paragraph, {"word.list_paragraphs"}),

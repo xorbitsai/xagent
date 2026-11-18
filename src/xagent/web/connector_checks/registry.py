@@ -22,6 +22,7 @@ from .declarations import (
     DeclarationError,
     EachHasKeys,
     Equals,
+    FirstWhere,
     HasKeys,
     IsType,
     ItemRef,
@@ -666,9 +667,15 @@ def _onedrive_checks() -> ConnectorChecks:
     )
 
 
+# The first message a channel lists that is not a system message: Graph v1.0
+# lists one, such as a membership change's, as unknownFutureValue (#3836).
+_FIRST_MESSAGE = FirstWhere("messageType", "message")
+
+
 def _teams_checks() -> ConnectorChecks:
     """Teams' Tier 1 read checks (#3569), on the read team's one channel,
-    which lists the seeded message first. The account belongs to other
+    which lists the seeded message first once system messages are skipped
+    (#3836). The account belongs to other
     teams too, so the team list is checked for its shape only, and the seed
     cannot hold a chat, so the chat list is checked for its shape on an
     empty list too. The probe-derived L3 row, which reads get_current_user,
@@ -719,10 +726,16 @@ def _teams_checks() -> ConnectorChecks:
                 assertions=(
                     StatusSuccess(),
                     # Graph's message id is a string of digits, so the
-                    # registry records the fixture as a string.
-                    Equals(("messages", 0, "id"), FixtureRef("teams.seed_message_id")),
+                    # registry records the fixture as a string. System
+                    # messages, such as the ones a membership change posts,
+                    # are listed too and are skipped (#3836).
+                    Equals(
+                        ("messages", _FIRST_MESSAGE, "id"),
+                        FixtureRef("teams.seed_message_id"),
+                    ),
                     Contains(
-                        ("messages", 0, "body", "content"), "xagent smoke seed message"
+                        ("messages", _FIRST_MESSAGE, "body", "content"),
+                        "xagent smoke seed message",
                     ),
                 ),
             ),

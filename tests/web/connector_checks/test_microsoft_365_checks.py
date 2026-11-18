@@ -5,7 +5,7 @@ check calls the real tool function of ``web/tools/mcp/{onedrive,teams,word,
 excel,powerpoint}.py``. Only Microsoft Graph is replaced, by an in-memory
 tenant laid out like the test account's seed: a closed OneDrive folder
 holding a text note and the Word, Excel and PowerPoint seed files, and a team
-whose one channel lists the seeded message first. The family runs read
+whose one channel lists the seeded message first once system messages are skipped. The family runs read
 checks only, so no test here switches writes on.
 """
 

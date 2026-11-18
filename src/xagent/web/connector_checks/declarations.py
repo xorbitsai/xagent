@@ -36,7 +36,9 @@ Assertions read a payload taken from the tool's normalized result
 - ``json_text_items``: the list of every text item parsed as JSON.
 - ``structured_content``: the MCP ``structuredContent`` object.
 
-A path is a tuple of object keys and list indexes into that payload. A check
+A path is a tuple of object keys and list indexes into that payload. An
+assertion's path may also hold a ``FirstWhere``: the first item of a list
+whose key has a given value. A check
 whose result is flagged ``is_error`` fails before any assertion runs.
 ``L3Envelope`` judges the result exactly as the L3 probe does
 (``evaluate_probe_result`` in ``services/connector_probe.py``) and is the only
@@ -59,7 +61,7 @@ from .codes import APP_ID_PATTERN, TOOL_NAME_PATTERN, connector_label, is_check_
 from .fixtures import FixtureRef, FixtureValue
 
 # Bumped on any change a declared check or a consumer must adapt to.
-DECLARATION_FORMAT_VERSION = 2
+DECLARATION_FORMAT_VERSION = 3
 
 _RUN_SCOPED_SUFFIX_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
@@ -75,6 +77,24 @@ JsonType = Literal["object", "array", "string", "number", "boolean", "null"]
 ExpectedVerdict = Literal["allow", "require_approval", "deny"]
 
 PayloadPath = tuple[str | int, ...]
+
+
+@dataclass(frozen=True)
+class FirstWhere:
+    """A path segment: the first item of a list whose ``key`` is ``value``.
+
+    Only an assertion's path may hold one. Teams lists a channel's system
+    messages among its messages, above the seeded one once the team's
+    membership changes (#3836), so the check that reads the seeded message
+    takes the first item whose ``messageType`` is ``"message"``.
+    """
+
+    key: str
+    value: str
+
+
+# An assertion's path: a ``PayloadPath`` that may also hold ``FirstWhere``.
+AssertionPath = tuple[str | int | FirstWhere, ...]
 
 
 class DeclarationError(ValueError):
@@ -149,7 +169,7 @@ class StatusSuccess:
 class HasKeys:
     """The object at ``path`` carries every key in ``keys``."""
 
-    path: PayloadPath
+    path: AssertionPath
     keys: tuple[str, ...]
 
 
@@ -157,7 +177,7 @@ class HasKeys:
 class EachHasKeys:
     """Every item of the array at ``path`` carries every key in ``keys``."""
 
-    path: PayloadPath
+    path: AssertionPath
     keys: tuple[str, ...]
 
 
@@ -165,7 +185,7 @@ class EachHasKeys:
 class Contains:
     """The string at ``path`` contains ``value``."""
 
-    path: PayloadPath
+    path: AssertionPath
     value: str
 
 
@@ -173,7 +193,7 @@ class Contains:
 class IsType:
     """The value at ``path`` has JSON type ``type``."""
 
-    path: PayloadPath
+    path: AssertionPath
     type: JsonType
 
 
@@ -181,7 +201,7 @@ class IsType:
 class Length:
     """The array at ``path`` has between ``min`` and ``max`` items."""
 
-    path: PayloadPath
+    path: AssertionPath
     min: int = 0
     max: int | None = None
 
@@ -191,7 +211,7 @@ class Equals:
     """The value at ``path`` equals ``value``: typically a seeded fixture, or
     in a write step the run-scoped name or the id it created."""
 
-    path: PayloadPath
+    path: AssertionPath
     value: FixtureValue | FixtureRef | RunScopedName | CreatedRef | None
 
 
@@ -798,7 +818,7 @@ def _validate_assertion(where: str, assertion: Assertion) -> None:
     if isinstance(assertion, L3Envelope):
         _validate_keys(where, assertion.expect_keys, allow_empty=True)
         return
-    _validate_path(where, assertion.path)
+    _validate_path(where, assertion.path, first_where=True)
     if isinstance(assertion, (HasKeys, EachHasKeys)):
         _validate_keys(where, assertion.keys, allow_empty=False)
     elif isinstance(assertion, Contains):
@@ -831,12 +851,27 @@ def _validate_keys(where: str, keys: tuple[str, ...], *, allow_empty: bool) -> N
         raise DeclarationError(f"{where}: keys must be non-empty strings")
 
 
-def _validate_path(where: str, path: PayloadPath) -> None:
+def _validate_path(
+    where: str, path: AssertionPath, *, first_where: bool = False
+) -> None:
+    """``path`` is a tuple of valid segments; ``first_where`` lets it hold a
+    ``FirstWhere``, which only an assertion's path may."""
     # A string would pass as a path of one-letter keys.
     if not isinstance(path, tuple):
         raise DeclarationError(
             f"{where}: a path must be a tuple, not {type(path).__name__}"
         )
     for segment in path:
-        if not _is_path_segment(segment):
+        if isinstance(segment, FirstWhere):
+            if not first_where:
+                raise DeclarationError(
+                    f"{where}: only an assertion's path may hold FirstWhere"
+                )
+            if not (isinstance(segment.key, str) and segment.key) or not isinstance(
+                segment.value, str
+            ):
+                raise DeclarationError(
+                    f"{where}: FirstWhere takes a non-empty key and a string value"
+                )
+        elif not _is_path_segment(segment):
             raise DeclarationError(f"{where}: invalid path segment {segment!r}")

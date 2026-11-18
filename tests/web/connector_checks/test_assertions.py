@@ -19,6 +19,7 @@ from xagent.web.connector_checks.declarations import (
     CreatedRef,
     EachHasKeys,
     Equals,
+    FirstWhere,
     HasKeys,
     IsType,
     L3Envelope,
@@ -266,6 +267,48 @@ def test_an_unresolved_value_never_reaches_the_evaluator(value: Any) -> None:
         judge_result(
             json_result(_DOCUMENT), "json_text", (Equals(("site", "id"), value),)
         )
+
+
+# A path segment that takes the first item where a key matches
+
+_MESSAGES = {
+    "messages": [
+        {"id": "sys-1", "messageType": "unknownFutureValue"},
+        "not an object",
+        {"id": "num-1", "messageType": 1},
+        {"id": "m-1", "messageType": "message", "body": "seed"},
+        {"id": "m-2", "messageType": "message", "body": "later"},
+    ],
+    "site": {"messageType": "message"},
+}
+_FIRST_MESSAGE = FirstWhere("messageType", "message")
+
+
+def test_first_where_takes_the_first_item_whose_key_matches() -> None:
+    """Items that are not objects, or whose key holds another value, even one
+    that is not a string, are skipped; later matches are not read."""
+    assertions = (
+        Equals(("messages", _FIRST_MESSAGE, "id"), "m-1"),
+        Contains(("messages", _FIRST_MESSAGE, "body"), "seed"),
+    )
+
+    assert judge_result(json_result(_MESSAGES), "json_text", assertions) == PASS
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("messages", FirstWhere("messageType", "chatEvent"), "id"),
+        ("messages", FirstWhere("missing", "message"), "id"),
+        ("site", _FIRST_MESSAGE, "id"),
+        ("messages", 2, "messageType", _FIRST_MESSAGE),
+        ("absent", _FIRST_MESSAGE, "id"),
+    ],
+)
+def test_first_where_without_a_matching_item_fails_the_assertion(path: Any) -> None:
+    assert judge_result(
+        json_result(_MESSAGES), "json_text", (Equals(path, "m-1"),)
+    ) == (FailureClass.ASSERTION_FAILED, "equals")
 
 
 # Reading one value, for a tenant pin and a created-object reference

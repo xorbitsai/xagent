@@ -2564,7 +2564,7 @@ async def _enqueue_websocket_task_command(
         if key not in {"user", "user_id"} and not key.startswith("_durable_")
     }
     if "message_metadata" in payload:
-        # Message metadata (for example ``hidden``) is set only by server
+        # Message metadata (for example ``display``) is set only by server
         # code through ``server_message_metadata``; a client frame carrying it
         # is refused for the same reason as ``scope`` below.
         raise ClientVisibleValidationError(

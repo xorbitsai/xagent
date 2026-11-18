@@ -13,7 +13,7 @@ import pytest
 from xagent.web.api.v1._step_mapping import map_trace_events_to_public_steps
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
-from xagent.web.services.message_metadata import is_hidden_user_event
+from xagent.web.services.message_metadata import is_display_none_user_event
 
 from .conftest import _admin_headers, _direct_db_session, client
 from .test_agent_preview_history import create_agent
@@ -26,7 +26,7 @@ from .test_conversation_logs import (
 
 pytestmark = pytest.mark.usefixtures("_test_db")
 
-HIDDEN = {"hidden": True, "kind": "connector_settled", "interaction_id": "i-1"}
+HIDDEN = {"display": "none", "kind": "connector_settled", "interaction_id": "i-1"}
 STAMP = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -41,12 +41,12 @@ def _event(event_type: str, data: dict) -> SimpleNamespace:
     )
 
 
-def test_is_hidden_user_event_needs_a_user_message_with_the_flag() -> None:
-    assert is_hidden_user_event("user_message", {"metadata": HIDDEN})
-    assert not is_hidden_user_event("user_message", {"metadata": {"kind": "x"}})
-    assert not is_hidden_user_event("user_message", {"message": "hi"})
-    assert not is_hidden_user_event("user_message", None)
-    assert not is_hidden_user_event("ai_message", {"metadata": HIDDEN})
+def test_is_display_none_user_event_needs_a_user_message_with_the_flag() -> None:
+    assert is_display_none_user_event("user_message", {"metadata": HIDDEN})
+    assert not is_display_none_user_event("user_message", {"metadata": {"kind": "x"}})
+    assert not is_display_none_user_event("user_message", {"message": "hi"})
+    assert not is_display_none_user_event("user_message", None)
+    assert not is_display_none_user_event("ai_message", {"metadata": HIDDEN})
 
 
 def test_public_steps_omit_hidden_user_messages_but_keep_the_reply() -> None:
@@ -285,3 +285,24 @@ def test_conversation_log_v1_list_count_and_activity_ignore_hidden_messages() ->
     (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
     assert listed["message_count"] == 1
     assert listed["last_activity_at"].startswith("2026-01-01T12:00:00")
+
+
+def test_a_result_card_message_is_displayed_in_the_list_count() -> None:
+    headers = _admin_headers()
+    user_id, task_id = _trigger_task(storage_version=1)
+    with _direct_db_session() as db:
+        for metadata in (None, {"display": "result_card"}, HIDDEN):
+            db.add(
+                TaskChatMessage(
+                    task_id=task_id,
+                    user_id=user_id,
+                    role="assistant" if metadata != HIDDEN else "user",
+                    content="x",
+                    message_type="chat",
+                    message_metadata=metadata,
+                    created_at=STAMP,
+                )
+            )
+        db.commit()
+    (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
+    assert listed["message_count"] == 2

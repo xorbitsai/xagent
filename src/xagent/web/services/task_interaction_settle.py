@@ -3,7 +3,7 @@
 A task that waits for user input resumes when a new user message arrives. When
 the answer was collected outside the chat (a host saved a connector, the user
 skipped a step), the host calls ``settle_task_interaction``: it appends a
-hidden, server-flagged user message to the task, through the same durable
+server-flagged, not-displayed user message to the task, through the same durable
 command a chat frame uses, so the run resumes exactly as it would for a typed
 answer. No WebSocket client has to be connected.
 
@@ -233,7 +233,7 @@ async def settle_task_interaction(
         kind=TaskCommandKind.MESSAGE,
         command_id=command_id,
         server_message_metadata={
-            "hidden": True,
+            "display": "none",
             "kind": kind,
             "interaction_id": interaction_id,
         },

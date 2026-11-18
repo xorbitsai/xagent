@@ -135,7 +135,7 @@ async def test_a_waiting_task_queues_one_hidden_message_with_no_websocket(
     assert command_id.startswith("settle:")
     assert payload["message"] == "[interaction settled]"
     assert payload["message_metadata"] == {
-        "hidden": True,
+        "display": "none",
         "kind": "interaction_settled",
         "interaction_id": "abc-123",
     }
@@ -358,7 +358,7 @@ async def test_a_client_frame_cannot_set_message_metadata(dispatched) -> None:
             task_id,
             {
                 "message": "hi",
-                "message_metadata": {"hidden": True, "kind": "interaction_settled"},
+                "message_metadata": {"display": "none", "kind": "interaction_settled"},
             },
         )
     assert _commands(task_id) == []
@@ -373,7 +373,7 @@ async def test_an_old_frame_with_metadata_still_works_and_stores_none(
         {
             "message": "hi",
             "client_message_id": "c-1",
-            "metadata": {"hidden": True, "kind": "x", "request_id": "r"},
+            "metadata": {"display": "none", "kind": "x", "request_id": "r"},
         },
     )
     assert enqueued is not None and enqueued.created
@@ -388,7 +388,7 @@ def _settle_frame(interaction_id: str = "z") -> dict:
         "user": _owner(),
         "client_message_id": f"settle:{interaction_id}",
         "message_metadata": {
-            "hidden": True,
+            "display": "none",
             "kind": "interaction_settled",
             "interaction_id": interaction_id,
         },
@@ -405,7 +405,7 @@ async def test_execution_applies_a_settle_for_the_open_interaction(
         await execution.handle_task_message(AsyncMock(), task_id, _settle_frame())
     prepare.assert_called_once()
     assert prepare.call_args.kwargs["message_metadata"] == {
-        "hidden": True,
+        "display": "none",
         "kind": "interaction_settled",
         "interaction_id": "z",
     }
@@ -460,7 +460,7 @@ def test_event_backed_replay_carries_the_settle_metadata() -> None:
                 "content": "[interaction settled]",
                 "message_type": "user",
                 "message_metadata": {
-                    "hidden": True,
+                    "display": "none",
                     "kind": "interaction_settled",
                     "interaction_id": "z",
                 },

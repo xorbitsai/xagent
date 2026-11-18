@@ -24,7 +24,7 @@ def _settle(interaction_id: str) -> Message:
         content="[interaction settled]",
         metadata={
             SERVER_METADATA_KEY: {
-                "hidden": True,
+                "display": "none",
                 "kind": "interaction_settled",
                 "interaction_id": interaction_id,
             }

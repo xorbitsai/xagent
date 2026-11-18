@@ -55,9 +55,9 @@ from ..services.file_reference_output_service import (
     reconcile_assistant_file_references,
 )
 from ..services.message_metadata import (
-    is_hidden_message_metadata,
-    is_hidden_user_event,
-    not_hidden_message_clause,
+    displayed_message_clause,
+    is_display_none_metadata,
+    is_display_none_user_event,
 )
 from ..services.public_trace_events import (
     is_audit_only_trace_data,
@@ -664,7 +664,7 @@ def _visible_chat_messages(task: Task) -> list[TaskChatMessage]:
     return [
         message
         for message in getattr(task, "chat_messages", []) or []
-        if not is_hidden_message_metadata(message.message_metadata)
+        if not is_display_none_metadata(message.message_metadata)
     ]
 
 
@@ -838,7 +838,7 @@ def _serialize_trace_events(db: Session, task_id: int) -> list[dict[str, Any]]:
         return []
     serialized: list[dict[str, Any]] = []
     for event, data in zip(events, decoded):
-        if is_audit_only_trace_data(data) or is_hidden_user_event(
+        if is_audit_only_trace_data(data) or is_display_none_user_event(
             str(event.event_type), data
         ):
             continue
@@ -981,7 +981,7 @@ def _event_log_message_predicate(db: Session) -> Any:
         audit_only.is_not(True),
         # Hidden user messages are plumbing: the detail view omits them, so the
         # list's count and last activity must not include them either.
-        not_hidden_message_clause(TaskExecutionEvent.payload["message_metadata"]),
+        displayed_message_clause(TaskExecutionEvent.payload["message_metadata"]),
         or_(
             TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
             and_(
@@ -1005,7 +1005,7 @@ def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
         .where(
             Task.conversation_storage_version == 1,
             Task.id.in_(task_ids),
-            not_hidden_message_clause(TaskChatMessage.message_metadata),
+            displayed_message_clause(TaskChatMessage.message_metadata),
         )
     )
     canonical = (
@@ -1350,7 +1350,7 @@ async def get_conversation_log_detail(
         [
             message
             for message in task.chat_messages or []
-            if not is_hidden_message_metadata(message.message_metadata)
+            if not is_display_none_metadata(message.message_metadata)
         ]
         if task.conversation_storage_version == 1
         else []
@@ -1366,7 +1366,7 @@ async def get_conversation_log_detail(
         view = load_event_display_snapshot(db, int(task.id))
         transcript = []
         for message in view.messages:
-            if is_hidden_message_metadata(message.get("message_metadata")):
+            if is_display_none_metadata(message.get("message_metadata")):
                 continue
             item = dict(message)
             item.pop("message_metadata", None)

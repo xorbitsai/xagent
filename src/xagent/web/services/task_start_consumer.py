@@ -30,7 +30,7 @@ from .mcp_runtime import (
     MCPActorAuthorizationPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from .message_metadata import is_hidden_message_metadata
+from .message_metadata import is_display_none_metadata
 from .task_actor_policy import load_shared_actor_policy
 from .task_command_transport import (
     COMMAND_COMPLETED,
@@ -405,7 +405,7 @@ def _commit_handoff(
                 return _reject_start(db, row, "start_state_changed")
             lease = acquired
         db.refresh(task)
-        if not is_hidden_message_metadata(start.message_metadata):
+        if not is_display_none_metadata(start.message_metadata):
             setattr(task, "input", start.message)
         from .workforce_runtime import sync_workforce_run_status
 

@@ -31,7 +31,7 @@ from xagent.web.services.chat_history_service import (
     persist_user_message_no_commit,
 )
 from xagent.web.services.message_metadata import (
-    is_hidden_message_metadata,
+    is_display_none_metadata,
     validate_server_message_metadata,
 )
 from xagent.web.services.task_event_display import (
@@ -40,7 +40,7 @@ from xagent.web.services.task_event_display import (
 )
 from xagent.web.services.task_start_protocol import TaskStartPayload
 
-HIDDEN = {"hidden": True, "kind": "interaction_settled", "interaction_id": "i-1"}
+HIDDEN = {"display": "none", "kind": "interaction_settled", "interaction_id": "i-1"}
 
 
 def test_validate_accepts_well_formed_server_metadata() -> None:
@@ -54,12 +54,13 @@ def test_validate_accepts_well_formed_server_metadata() -> None:
     "raw",
     [
         [],
-        "hidden",
+        "display",
         {"extra": 1},
         {**HIDDEN, "extra": {"a": 1}},
-        {"hidden": True},
-        {"hidden": "true", "kind": "k"},
-        {"hidden": 1, "kind": "k"},
+        {"display": "none"},
+        {"display": "None", "kind": "k"},
+        {"display": 1, "kind": "k"},
+        {"display": "result_card", "kind": "k"},
         {"kind": "Bad Kind"},
         {"kind": "k" * 65},
         {"kind": 3},
@@ -72,11 +73,12 @@ def test_validate_rejects_malformed_server_metadata(raw) -> None:
         validate_server_message_metadata(raw)
 
 
-def test_hidden_requires_literal_true() -> None:
-    assert is_hidden_message_metadata({"hidden": True})
-    assert not is_hidden_message_metadata({"hidden": "true"})
-    assert not is_hidden_message_metadata({"hidden": 1})
-    assert not is_hidden_message_metadata(None)
+def test_only_display_none_is_not_displayed() -> None:
+    assert is_display_none_metadata({"display": "none"})
+    assert not is_display_none_metadata({"display": "None"})
+    assert not is_display_none_metadata({"display": 1})
+    assert not is_display_none_metadata({"display": "result_card"})
+    assert not is_display_none_metadata(None)
 
 
 def _sqlite_session():

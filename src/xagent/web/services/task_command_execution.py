@@ -150,7 +150,7 @@ from .managed_file_ref import (
     log_durable_storage_fault,
 )
 from .message_metadata import (
-    is_hidden_message_metadata,
+    is_display_none_metadata,
     validate_server_message_metadata,
 )
 from .sdk_task_cancel import SDK_COMMAND_SCOPE, cancel_sdk_task_unserialized
@@ -1231,9 +1231,9 @@ def _prepare_task_message_sync(
                     missing_id,
                 )
         if task_created:
-            # A hidden message is plumbing, never a title or description.
+            # A not-displayed message is plumbing, never a title or description.
             title_source = (
-                "" if is_hidden_message_metadata(message_metadata) else user_message
+                "" if is_display_none_metadata(message_metadata) else user_message
             )
             task_title = f"Chat: {title_source}" if title_source else "Untitled Task"
             if len(task_title) > 50:

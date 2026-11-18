@@ -148,7 +148,7 @@ from xagent.core.tools.adapters.vibe.connector_runtime import (
     redact_runtime_sensitive_payload,
 )
 
-from ...services.message_metadata import is_hidden_user_event
+from ...services.message_metadata import is_display_none_user_event
 from ...services.public_trace_events import is_audit_only_trace_data
 
 logger = logging.getLogger(__name__)
@@ -363,7 +363,7 @@ class PublicStepProjector:
             return []
         # A hidden user message (a client's own resume signal) is plumbing; an
         # SDK reader, whose client may predate it, must not see it as a turn.
-        if is_hidden_user_event(event_type, _safe_get(event, "data")):
+        if is_display_none_user_event(event_type, _safe_get(event, "data")):
             return []
 
         # ===== messages: one event per message, no pairing =====

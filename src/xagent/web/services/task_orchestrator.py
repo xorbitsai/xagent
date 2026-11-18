@@ -109,7 +109,7 @@ from .mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
-from .message_metadata import is_hidden_message_metadata
+from .message_metadata import is_display_none_metadata
 from .release_hold import release_hold
 from .sdk_task_cancel import sdk_cancel_result_fact, sdk_cancel_settlement_text
 from .task_auto_recovery import (
@@ -226,9 +226,9 @@ class TaskTurnPayload:
     # event for this user turn. Historical replay uses it to merge persisted
     # transcript rows with trace rows without collapsing repeated text.
     turn_id: str = field(default_factory=lambda: str(uuid4()))
-    # Server-set metadata for the user message (``hidden``, ``kind``,
+    # Server-set metadata for the user message (``display``, ``kind``,
     # ``interaction_id``): persisted with the transcript row and echoed on the
-    # user-message event. ``hidden`` is a display flag; the model still sees
+    # user-message event. ``display: "none"`` is a display flag; the model still sees
     # the message.
     message_metadata: Optional[Dict[str, Any]] = None
 
@@ -1360,8 +1360,8 @@ def _accept_turn_no_commit(
             Task.state_version: func.coalesce(Task.state_version, 0) + 1,
             Task.control_state: TaskControlState.RUNNING.value,
         }
-        if not is_hidden_message_metadata(payload.message_metadata):
-            # A hidden message must not replace the task's last visible input.
+        if not is_display_none_metadata(payload.message_metadata):
+            # A not-displayed message must not replace the task's last visible input.
             values[Task.input] = payload.transcript_message
         coordinator = current_task_coordinator(task_id)
         predicates = []

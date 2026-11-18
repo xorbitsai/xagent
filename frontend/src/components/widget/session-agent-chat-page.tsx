@@ -881,6 +881,7 @@ export function SessionAgentChatPage() {
       // route, so an in-tab navigation always abandons the visitor's iframe.
       linksOpenInNewTab: "enabled",
       taskStop: "enabled",
+      messageQueue: "enabled",
     },
     session: {
       connection,

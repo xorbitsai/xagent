@@ -1593,6 +1593,74 @@ describe("SessionAgentChatPage file attachments", () => {
 
       await waitFor(() => expect(selected("a.pdf")).toBe(true))
     })
+
+    describe("a message sent while a turn runs", () => {
+      const queued = () => screen.queryByRole("list", { name: "messageQueue.listLabel" })
+      it.each([
+        ["the server takes new turns", ["heartbeat", "conversation_attached", "delivery_new_turn"], true],
+        ["the server does not", ["heartbeat", "conversation_attached"], false],
+      ])("is listed beside the composer only when %s", async (_name, announced, listed) => {
+        const socket = await mountActive()
+        receive(socket, { type: "connection_capabilities", capabilities: announced })
+        bindTaskWithStatus(socket, "running")
+        receive(socket, ATTACHED)
+        await waitFor(() => expect(editor()).toBeInTheDocument())
+        submit("A")
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+        acceptLast(socket)
+        await waitFor(() => expect(editor().textContent).toBe(""))
+
+        // The composer ignores a second submit for half a second.
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 600)) })
+        submit("B")
+        if (listed) {
+          await waitFor(() => expect(queued()).toHaveTextContent("B"))
+          expect(chatFrames(socket)).toHaveLength(1)
+        } else {
+          await waitFor(() => expect(chatFrames(socket)).toHaveLength(2))
+          expect(queued()).toBeNull()
+          expect(chatFrames(socket)[1]).not.toHaveProperty("delivery")
+        }
+      })
+
+      it("sends the listed message as a new turn once the running turn ends", async () => {
+        const socket = await mountActive()
+        receive(socket, { type: "connection_capabilities", capabilities: ["heartbeat", "conversation_attached", "delivery_new_turn"] })
+        bindTaskWithStatus(socket, "running")
+        receive(socket, ATTACHED)
+        await waitFor(() => expect(editor()).toBeInTheDocument())
+        submit("A")
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+        acceptLast(socket)
+        await waitFor(() => expect(editor().textContent).toBe(""))
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 600)) })
+        submit("B")
+        await waitFor(() => expect(queued()).toHaveTextContent("B"))
+        expect(chatFrames(socket)).toHaveLength(1)
+
+        receive(socket, {
+          type: "trace_event",
+          timestamp: "2026-05-27T05:01:00Z",
+          data: {
+            event_id: "task-info-42-done",
+            event_type: "task_info",
+            data: {
+              id: 42,
+              title: "Task 42",
+              status: "completed",
+              state_version: 2,
+              description: "Session task",
+              created_at: "2026-05-27T05:00:00Z",
+              updated_at: "2026-05-27T05:01:00Z",
+            },
+          },
+        })
+        await waitFor(() => expect(chatFrames(socket)).toHaveLength(2))
+        expect(chatFrames(socket)[1]).toMatchObject({ message: "B", delivery: "new_turn" })
+        acceptLast(socket)
+        await waitFor(() => expect(queued()).toBeNull())
+      })
+    })
   })
 })
 

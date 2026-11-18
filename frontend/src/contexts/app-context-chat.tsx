@@ -2771,11 +2771,12 @@ export type SessionConversationAttachment = "pending" | "attached" | "unsupporte
 // Whether the Session server said, in the capabilities frame of the latest
 // connection that sent one, that it takes chat frames declared as new turns.
 // It is not reset when a connection drops: only the next capabilities frame
-// changes it, and "unknown" until one has arrived. It is exposed for display,
-// and the message queue reads it to decide whether to hold and send queued
-// messages. A send that carries a declaration additionally requires
-// that the connection which reported "supported" is the current one, so this
-// value alone does not authorize a send.
+// changes it, and "unknown" until one has arrived. The message queue reads it
+// to decide whether to hold and send queued messages, and the Session page
+// reads it to decide whether the queue's "continue" action is available.
+// A send that carries a declaration additionally requires that the connection
+// which reported "supported" is the current one, so this value alone does not
+// authorize a send.
 export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
 
 export interface SessionMessageQueueControls {
@@ -7949,6 +7950,9 @@ export function AppProvider({
         : sourceTaskId === undefined
           ? [message, files, config?.force, clientMessageId, requestId]
           : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
+      // Where messages queued while this send is in flight start: one of them
+      // must not go out first if this send fails.
+      const queuedFrom = nextQueuedSeqRef.current
       beginSessionMessageDelivery()
       try {
         await sendChatWithResend(
@@ -7984,6 +7988,11 @@ export function AppProvider({
         }
         addOptimisticUserMessage(state.taskId)
       } catch (error) {
+        // A busy refusal is left to the caller, which may queue the message
+        // itself. The generation check is defensive, as above.
+        if (!isBusyRefusal(error) && sessionDeliveryOwner.deliveryGeneration === deliveryGenerationRef.current) {
+          applyMessageQueue({ type: "DELIVERY_FAILED", queuedFrom })
+        }
         if (startsReplacementConversation) {
           if (!replacementSendStillOwned()) {
             throw error

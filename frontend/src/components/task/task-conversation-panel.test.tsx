@@ -3,7 +3,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { ComposerAttachmentStatus } from "@/components/chat/ChatInput"
-import type { SessionStopState } from "@/contexts/app-context-chat"
+import type { MessageQueuePhase, MessageQueueState } from "@/contexts/session-message-queue"
+import type { SessionMessageQueueControls, SessionStopState } from "@/contexts/app-context-chat"
+import { VoiceCallStoreProvider, usePublishVoiceCall, useVoiceCallView } from "@/contexts/voice-call-store"
+import type { VoiceCall } from "@/hooks/use-voice-call"
 
 type PanelTraceEvent = {
   event_id?: string
@@ -54,8 +57,26 @@ const appControls = vi.hoisted(() => ({
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
   connectionNotice: null as "reconnecting" | "lost" | null,
-  messageQueue: null as null | { submit: (...args: any[]) => Promise<"sent" | "queued"> },
+  messageQueue: null as null | SessionMessageQueueControls,
+  newTurnDelivery: "supported",
+  sessionConversationState: "bound",
 }))
+const queueControls = (
+  phase: MessageQueuePhase,
+  submit: SessionMessageQueueControls["submit"] = vi.fn(),
+  items: MessageQueueState["items"] = [{ clientMessageId: "q1", text: "queued text", seq: 1, status: "waiting" }],
+): SessionMessageQueueControls => ({
+  state: {
+    items,
+    phase,
+    observed: { version: undefined, status: undefined },
+  },
+  submit,
+  continueSending: vi.fn(),
+  remove: vi.fn(),
+  clear: vi.fn(),
+})
+
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
     files?: File[]
@@ -102,6 +123,8 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
     isSessionInteractionLocked: appControls.isSessionInteractionLocked,
     connectionNotice: appControls.connectionNotice,
     messageQueue: appControls.messageQueue,
+    newTurnDelivery: appControls.newTurnDelivery,
+    sessionConversationState: appControls.sessionConversationState,
   }),
 }))
 
@@ -315,6 +338,14 @@ vi.mock("@/components/layout/center-panel", () => ({
 
 import { TaskConversationPanel } from "./task-conversation-panel"
 
+const pageCall: VoiceCall = {
+  open: true, phase: "listening", active: true, caption: "", muted: false,
+  status: "voiceConversation.states.listening", settingsLink: false, retryable: false, retryDisabled: false,
+  level: () => 0, retry: vi.fn(), end: vi.fn(), toggleMute: vi.fn(),
+}
+function PublishedCall() { usePublishVoiceCall(pageCall); return null }
+function CallPhase() { return <span data-testid="call-phase">{useVoiceCallView()?.phase ?? "none"}</span> }
+
 describe("TaskConversationPanel", () => {
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => undefined)
@@ -340,6 +371,8 @@ describe("TaskConversationPanel", () => {
     appControls.isSessionInteractionLocked = false
     appControls.connectionNotice = null
     appControls.messageQueue = null
+    appControls.newTurnDelivery = "supported"
+    appControls.sessionConversationState = "bound"
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
@@ -368,12 +401,12 @@ describe("TaskConversationPanel", () => {
       ["queued", false, 0],
       ["refused", false, 0],
     ])("a submit that was %s: file leaves the selection %s, send callback calls %s", async (outcome, removed, sends) => {
-      const submit = vi.fn(async (_text: string, _options: unknown, send: () => Promise<void>) => {
+      const submit = vi.fn(async (_text: string, _options: unknown, send: () => void | Promise<void>) => {
         if (outcome === "refused") throw new Error("refused")
         if (outcome === "sent") await send()
         return outcome as "sent" | "queued"
       })
-      appControls.messageQueue = { submit }
+      appControls.messageQueue = queueControls({ kind: "idle" }, submit, [])
       render(<TaskConversationPanel mode="page" />)
       fireEvent.click(screen.getByRole("button", { name: "stage file" }))
       let result: unknown
@@ -385,6 +418,50 @@ describe("TaskConversationPanel", () => {
       expect(submit).toHaveBeenCalledWith("send draft", { hasFiles: true, clientMessageId: "m1" }, expect.any(Function))
       expect(sendMessageMock).toHaveBeenCalledTimes(sends)
       expect(chatInputProps.current?.files).toHaveLength(removed ? 0 : 1)
+    })
+  })
+
+  describe("message queue", () => {
+    it("lists nothing when the page offers no queue", () => {
+      render(<TaskConversationPanel mode="page" />)
+      expect(screen.queryByRole("list", { name: "messageQueue.listLabel" })).toBeNull()
+    })
+
+    it.each([
+      ["supported", "bound", true],
+      ["unsupported", "bound", false],
+      ["unknown", "bound", false],
+      ["supported", "reload_required", false],
+    ])("lists the queue above the composer; continue with %s delivery in a %s conversation is enabled: %s", (delivery, phase, enabled) => {
+      appControls.messageQueue = queueControls({ kind: "held", reason: "turn_failed" })
+      appControls.newTurnDelivery = delivery
+      appControls.sessionConversationState = phase
+      render(<TaskConversationPanel mode="page" />)
+      const list = screen.getByRole("list", { name: "messageQueue.listLabel" })
+      expect(list.compareDocumentPosition(screen.getByTestId("chat-input")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(screen.getByRole("button", { name: "messageQueue.continue" })).toHaveProperty("disabled", !enabled)
+    })
+
+    it.each([
+      ["the panel's own call", () => {
+        render(<TaskConversationPanel mode="page" voiceConversationEnabled />)
+        fireEvent.click(screen.getByText("Composer voice mode"))
+        expect(screen.getByText("Close voice conversation")).toBeInTheDocument()
+      }],
+      ["a call the page runs", () => {
+        render(
+          <VoiceCallStoreProvider>
+            <PublishedCall />
+            <CallPhase />
+            <TaskConversationPanel mode="page" compactInput onProvidedVoiceConversation={vi.fn()} />
+          </VoiceCallStoreProvider>,
+        )
+        expect(screen.getByTestId("call-phase")).toHaveTextContent("listening")
+      }],
+    ])("keeps the queue listed while %s is open", (_name, startCall) => {
+      appControls.messageQueue = queueControls({ kind: "waiting", since: 1, answerRequired: false })
+      startCall()
+      expect(screen.getByRole("list", { name: "messageQueue.listLabel" })).toHaveTextContent("queued text")
     })
   })
 

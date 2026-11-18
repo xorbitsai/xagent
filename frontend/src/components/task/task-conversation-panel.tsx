@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput"
+import { QueuedMessageList } from "@/components/chat/queued-message-list"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { VoiceConversation } from "@/components/chat/voice-conversation"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
@@ -337,6 +338,8 @@ export function TaskConversationPanel({
     connectionNotice,
     isConnected,
     messageQueue,
+    newTurnDelivery,
+    sessionConversationState,
   } = useApp()
   const accentAttributes = useAgentAccentAttributes(agent)
   const fileAccess = useFileAccess()
@@ -1235,6 +1238,12 @@ export function TaskConversationPanel({
               <div className="pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2">
                 <VoiceOrb call={voiceOrbCall} className="h-[88px] w-[88px]" />
               </div>
+            )}
+            {messageQueue && (
+              <QueuedMessageList
+                queue={messageQueue}
+                canContinue={newTurnDelivery === "supported" && sessionConversationState === "bound"}
+              />
             )}
             <ChatInput
               onSend={handleSend}

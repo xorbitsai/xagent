@@ -15,6 +15,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
 import { TeammateSummary } from "./teammate-summary"
+import { ConnectorInteraction } from "./connector/ConnectorInteraction"
+import { parseConnectorInfo, type ConnectorInfo } from "./connector/types"
 import { canDeferClarification, CLARIFICATION_PAGE_SIZE, suggestedClarificationValue } from "./clarification-guidance"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import { clientErrorTranslationKey, type ClientErrorCode } from "@/lib/client-errors"
@@ -75,10 +77,33 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
 export function ClarificationForm(props: ClarificationFormProps) {
   const summaries = props.interactions.filter((interaction) => interaction.type === "teammate_summary")
-  const fields = props.interactions.filter((interaction) => interaction.type !== "teammate_summary")
+  // Each connect_connector entry is its own card, settled independently of the
+  // form; every other entry goes to the normal form, with its own fields,
+  // Submit and text box.
+  const connectors: ConnectorInfo[] = []
+  const fields: Interaction[] = []
+  let unusable: Interaction | undefined
+  for (const interaction of props.interactions) {
+    if (interaction.type === "teammate_summary") continue
+    if (interaction.type !== "connect_connector") {
+      fields.push(interaction)
+      continue
+    }
+    const connector = parseConnectorInfo(interaction.connector, interaction.interaction_id)
+    if (connector) connectors.push(connector)
+    else unusable ??= interaction
+  }
+  // An entry the card cannot show (no id, no fields) falls back to the normal
+  // form: with nothing else to answer, a plain reply box.
+  if (unusable && connectors.length === 0 && fields.length === 0) {
+    fields.push({ type: "text_input", field: unusable.field, label: unusable.label })
+  }
   return (
     <div className="space-y-4">
       {summaries.map((interaction, index) => <TeammateSummary key={`${interaction.field}-${index}`} interaction={interaction} />)}
+      {connectors.map((connector) => (
+        <ConnectorInteraction key={connector.interaction_id} connector={connector} active={props.active ?? true} />
+      ))}
       {fields.length > 0 && <ClarificationFields {...props} interactions={fields} />}
     </div>
   )

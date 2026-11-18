@@ -454,6 +454,18 @@ describe("the query string", () => {
 })
 
 describe("the response shape", () => {
+  it("drops a message the server marks as hidden", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {
+      messages: [
+        { id: 1, role: "user", content: "Check it", created_at: "2026-01-02T03:04:05Z", attachments: [] },
+        { id: 2, role: "user", content: "[connector settled]", created_at: "2026-01-02T03:04:06Z", attachments: [], metadata: { hidden: true } },
+      ],
+      next_cursor: null,
+    }))
+    const page = await readWidgetConversation(ORIGIN, makeAuth(), 7, {})
+    expect(page.messages.map((m) => m.content)).toEqual(["Check it"])
+  })
+
   const conversation = { task_id: 101, title: "Support Agent chat", created_at: "2026-01-02T03:04:05Z" }
   const message = MESSAGES_BODY.messages[0]
   const attachment = message.attachments[0]

@@ -143,6 +143,9 @@ const parseMessagePage = (
       if (!attachment) return null
       attachments.push(attachment)
     }
+    // A machine-sent turn (metadata.hidden) is never shown, when the server
+    // reports it.
+    if (isRecord(entry.metadata) && entry.metadata.hidden === true) continue
     messages.push({
       id: entry.id,
       role: entry.role,

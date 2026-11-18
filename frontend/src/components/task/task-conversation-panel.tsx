@@ -1,5 +1,6 @@
 "use client"
 
+import type { ResultCardData } from "@/components/chat/connector/types"
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
@@ -99,6 +100,7 @@ type CombinedItem = {
   traceEvents?: any[]
   interactions?: any[]
   interactionRequestId?: string
+  resultCard?: ResultCardData
   showEmptyStatus?: boolean
   processStatus?: string
   showInterruptedStatus?: boolean
@@ -464,6 +466,7 @@ export function TaskConversationPanel({
           ),
           interactions: message.interactions,
           interactionRequestId: message.interactionRequestId,
+          resultCard: message.resultCard,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -1114,6 +1117,7 @@ export function TaskConversationPanel({
                         timestamp={item.timestamp}
                         interactions={item.interactions}
                         interactionRequestId={item.interactionRequestId}
+                        resultCard={item.resultCard}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}

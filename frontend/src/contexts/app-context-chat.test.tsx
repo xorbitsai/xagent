@@ -223,6 +223,7 @@ function StateProbe() {
             isResult: message.isResult,
             isSystemNotice: message.isSystemNotice,
             interactionRequestId: message.interactionRequestId,
+            resultCard: message.resultCard,
             status: message.status,
           }))
         )}
@@ -1719,6 +1720,52 @@ describe("AppProvider websocket message routing", () => {
         }),
       ])
     })
+  })
+
+  it("never stores a hidden user turn, live or on history replay", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const send = (event_id: string, data: Record<string, unknown>) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event", task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        data: { event_id, event_type: "user_message", data },
+      } as never)
+    })
+    send("u1", { message: "Check the customer data", turn_id: "t1" })
+    // Live, then the same turn again as a history replay.
+    const hidden = { message: "[connector settled]", metadata: { hidden: true, kind: "connector_settled", interaction_id: "i-1" } }
+    send("u2", { ...hidden, turn_id: "t2" })
+    send("u2", { ...hidden, turn_id: "t2", source: "chat_history" })
+    // hidden only as literal true
+    send("u3", { message: "visible", turn_id: "t3", metadata: { hidden: "true" } })
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages.map((m: { content: string }) => m.content)).toEqual(["Check the customer data", "visible"])
+  })
+
+  it("turns a result_card agent_message into an assistant message carrying the card", () => {
+    render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+    const card = {
+      title: "Query · top customers by revenue",
+      source: { name: "Azure Cosmos DB", app_id: "cosmos", logo: { mark: "◎", bg: "#0078D4", fg: "#fff", icon_url: null } },
+      items: ["Contoso Ltd · $182,400"], footnote: "1 of 1,284 customers", created_at: "2026-11-17T06:00:00Z",
+    }
+    const send = (event_id: string) => act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "trace_event", event_type: "agent_message", event_id, task_id: 1, timestamp: "2026-05-27T05:00:00Z",
+        data: {
+          message: card.title, display: "chat", message_type: "result_card", expect_response: false,
+          metadata: { display: "result_card", result_card: card },
+        },
+      } as never)
+    })
+    // Two cards with the same title are two messages; a replay of one is not a third.
+    send("rc-1")
+    send("rc-2")
+    send("rc-1")
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]")
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ role: "assistant", content: card.title, isResult: true })
+    expect(messages[0].resultCard).toMatchObject({ title: card.title, items: card.items, footnote: card.footnote })
+    expect(messages[0].resultCard.source.name).toBe("Azure Cosmos DB")
   })
 
   it("keeps a second user turn whose text repeats an unreconciled optimistic turn", async () => {

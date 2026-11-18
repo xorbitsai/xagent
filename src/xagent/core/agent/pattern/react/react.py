@@ -111,7 +111,6 @@ from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
-from ...attachments import CLIENT_METADATA_KEY
 from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceError
 from ...clarification import draft_from_waiting_request
 from ...context import ExecutionContext
@@ -119,9 +118,11 @@ from ...context.components import LoadedToolsComponent
 from ...context.enrichment import (
     IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
+    is_stale_settle_message,
     latest_user_text,
     pending_user_response_lifecycle,
     pending_user_response_marker,
+    settled_interaction_id,
 )
 from ...context.execution import (
     note_compaction_evidence_loss,
@@ -3202,6 +3203,9 @@ class ReActPattern(AgentPattern):
             waiting_request=self.waiting_for_user_request,
             response=response or "",
             tools=tools,
+            only_interaction_id=self._answering_settle_id(
+                context, waiting_message_count
+            ),
         )
         if self.pending_tool_calls:
             # Waiting checkpoints written before the pause path discarded the
@@ -3257,26 +3261,25 @@ class ReActPattern(AgentPattern):
     def _is_stale_settle_message(self, message: Any) -> bool:
         """Whether ``message`` settles an interaction this run is not waiting on.
 
-        A host settles a waiting interaction with a hidden user message that
-        names the tool's ``interaction_id`` (``task_interaction_settle``). It
-        only answers a pending request of the waiting batch that carries that
-        id; any other settle is a leftover of an earlier question and must
-        neither resume the run nor be taken as the answer to this one.
+        See ``is_stale_settle_message``: a host settle only answers a request
+        of the waiting batch that carries its ``interaction_id``.
         """
-        metadata = getattr(message, "metadata", None)
-        client = (
-            metadata.get(CLIENT_METADATA_KEY) if isinstance(metadata, dict) else None
-        )
-        settled_id = client.get("interaction_id") if isinstance(client, dict) else None
-        if not isinstance(settled_id, str):
-            return False
-        waiting_request = self.waiting_for_user_request or {}
-        requests = waiting_request.get("requests")
-        return not isinstance(requests, list) or all(
-            not isinstance(request, dict)
-            or str(request.get("interaction_id") or "") != settled_id
-            for request in requests
-        )
+        return is_stale_settle_message(message, self.waiting_for_user_request)
+
+    def _answering_settle_id(
+        self, context: Any, waiting_message_count: int
+    ) -> str | None:
+        """The ``interaction_id`` of the settle that answers the waiting batch.
+
+        ``None`` when the first answering user message is an ordinary reply.
+        """
+        for message in getattr(context, "messages", [])[waiting_message_count:]:
+            if getattr(message, "role", None) != "user":
+                continue
+            if self._is_stale_settle_message(message):
+                continue
+            return settled_interaction_id(message)
+        return None
 
     def _has_answer_after(self, context: Any, waiting_message_count: int) -> bool:
         """Whether a message that can answer the waiting request follows it."""
@@ -3321,12 +3324,16 @@ class ReActPattern(AgentPattern):
         waiting_request: Any,
         response: str,
         tools: list[Any],
+        only_interaction_id: str | None = None,
     ) -> None:
         """Queue replies only for tools that expose the optional resume callback.
 
         One user reply is queued verbatim for every resumable interaction in
         the batch; see ``_deliver_pending_tool_interaction_responses`` for why
-        that fan-out is the intended product behavior.
+        that fan-out is the intended product behavior. A host settle is the
+        exception: it names one interaction, so ``only_interaction_id`` queues
+        it for that request alone and the other tools of the batch are not
+        handed text that was never their answer.
         """
 
         if (
@@ -3341,6 +3348,10 @@ class ReActPattern(AgentPattern):
                 continue
             tool_name = str(request.get("tool_name") or "")
             if not tool_name:
+                continue
+            if only_interaction_id is not None and (
+                str(request.get("interaction_id") or "") != only_interaction_id
+            ):
                 continue
             try:
                 tool = self._find_tool(tool_name, tools)
@@ -5704,6 +5715,9 @@ class ReActPattern(AgentPattern):
                     )
                     for tool_call, _ in waiting_pairs
                 ],
+                # Persisted with the waiting message so a host can tell which
+                # interactions are open (``task_interaction_settle``).
+                "interaction_ids": [request["interaction_id"] for request in requests],
             },
         )
         self.status = "waiting_for_user"

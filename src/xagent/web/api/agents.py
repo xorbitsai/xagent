@@ -11,7 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import String
 from sqlalchemy import cast as sql_cast
-from sqlalchemy import false, func, or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -76,6 +76,7 @@ from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
 from ..services.execution_budget import budget_policy_provider
 from ..services.llm_utils import AutoModelUnavailableError, UserAwareModelStorage
+from ..services.message_metadata import not_hidden_message_clause
 from ..services.widget_voice_switch import (
     OwnerCaller,
     OwnerWidgetVoiceResponse,
@@ -1102,9 +1103,7 @@ async def get_agent_preview_task(
             TaskChatMessage.task_id == task.id,
             TaskChatMessage.role == "user",
             # A hidden resume signal is never the sample the user submitted.
-            func.coalesce(
-                TaskChatMessage.message_metadata["hidden"].as_boolean(), false()
-            ).is_(False),
+            not_hidden_message_clause(TaskChatMessage.message_metadata),
         )
         .order_by(TaskChatMessage.id.asc())
         .first()

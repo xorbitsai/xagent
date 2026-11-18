@@ -7,7 +7,7 @@ from typing import Any, Dict, List, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, false, func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, defer
 
 from ...config import (
@@ -79,7 +79,10 @@ from ..services.hot_path_cache import (
 )
 from ..services.llm_utils import AutoModelUnavailableError, resolve_llms_from_names
 from ..services.managed_file_ref import async_ensure_uploaded_file_local_path
-from ..services.message_metadata import is_hidden_message_metadata
+from ..services.message_metadata import (
+    is_hidden_message_metadata,
+    not_hidden_message_clause,
+)
 from ..services.model_service import _get_visible_user_ids
 from ..services.public_trace_events import public_task_trace_filter
 from ..services.task_auto_recovery import current_auto_recovery_view
@@ -850,10 +853,7 @@ async def get_tasks(
                     ),
                     TaskChatMessage.content.ilike(pattern, escape="\\"),
                     # Hidden messages are plumbing, not searchable conversation.
-                    func.coalesce(
-                        TaskChatMessage.message_metadata["hidden"].as_boolean(),
-                        false(),
-                    ).is_(False),
+                    not_hidden_message_clause(TaskChatMessage.message_metadata),
                 )
                 # SQL narrows candidates before the shared public projection
                 # applies provenance, audit/checkpoint and question visibility

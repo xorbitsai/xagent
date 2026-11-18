@@ -20,10 +20,11 @@ from typing import Any, Dict, List
 from ..context_ref import ContextReference
 from ..file_ref import build_file_ref, guess_mime_type
 
-# ``Message.metadata`` key holding the client-supplied metadata of a user
-# message (for example ``{"hidden": true}``). Echoed on the user-message trace
-# event as ``metadata``; never interpreted by the agent.
-CLIENT_METADATA_KEY = "client_metadata"
+# ``Message.metadata`` key holding the server-set metadata of a user message
+# (``{"hidden", "kind", "interaction_id"}``). Echoed on the user-message trace
+# event as ``metadata``. ``hidden`` only affects display surfaces: the message
+# still reaches the model. Only ``interaction_id`` is read by the agent.
+SERVER_METADATA_KEY = "server_metadata"
 
 # Keep the direct-context contract to the formats shared by the supported chat
 # providers. SVG remains a source-inspection case for ``understand_media`` and

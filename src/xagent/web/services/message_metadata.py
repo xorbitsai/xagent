@@ -3,9 +3,11 @@
 A host settles a waiting interaction by appending a message flagged
 ``{"hidden": true, "kind": ..., "interaction_id": ...}`` (see
 ``task_interaction_settle``). Clients and server-derived surfaces treat such a
-message as plumbing rather than conversation. The text still reaches the model,
-still passes input review and still resumes the waiting run -- ``hidden`` only
-affects display, titles, search and the task's last input.
+message as plumbing rather than conversation. ``hidden`` means hidden from
+display, not from the model (``Message.hidden`` is the "not sent to the model"
+flag, a different thing): the text still reaches the model, still passes input
+review and still resumes the waiting run. It only affects display, titles,
+search and the task's last input.
 
 Only server code can set this metadata: a client chat frame cannot carry it.
 """
@@ -14,6 +16,11 @@ from __future__ import annotations
 
 import re
 from typing import Any
+
+from sqlalchemy import String
+from sqlalchemy import cast as sql_cast
+from sqlalchemy import func
+from sqlalchemy.sql.elements import ColumnElement
 
 _KIND_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _INTERACTION_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -64,6 +71,17 @@ def validate_server_message_metadata(raw: Any) -> dict[str, Any] | None:
 def is_hidden_message_metadata(metadata: Any) -> bool:
     """True only for an explicit ``hidden: true`` flag."""
     return isinstance(metadata, dict) and metadata.get("hidden") is True
+
+
+def not_hidden_message_clause(metadata_column: Any) -> ColumnElement[bool]:
+    """SQL predicate: the row's ``message_metadata`` does not flag it hidden.
+
+    Compares the serialized JSON scalar rather than casting it to a boolean, so
+    a malformed stored value cannot break a PostgreSQL read (SQLite serializes
+    JSON ``true`` as ``1``). A NULL column or a missing key counts as visible.
+    """
+    flag = func.coalesce(sql_cast(metadata_column["hidden"], String), "")
+    return flag.not_in(("true", "1"))
 
 
 def is_hidden_user_event(event_type: Any, data: Any) -> bool:

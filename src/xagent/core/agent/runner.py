@@ -53,7 +53,7 @@ from ..task_runtime import (
 )
 from ..user_context import current_user_id
 from ..workspace import WorkspaceManager
-from .attachments import CLIENT_METADATA_KEY, build_image_context_references
+from .attachments import SERVER_METADATA_KEY, build_image_context_references
 from .budget import (
     BudgetPolicyProvider,
     ExecutionBudget,
@@ -1398,7 +1398,7 @@ class AgentRunner:
                     metadata["files"] = files
                 metadata["turn_id"] = requested_turn_id or str(uuid4())
                 if message_metadata:
-                    metadata[CLIENT_METADATA_KEY] = dict(message_metadata)
+                    metadata[SERVER_METADATA_KEY] = dict(message_metadata)
 
                 # Only messages and top-level metadata are mutated below; components
                 # and existing messages are read-only during checkpoint serialization.
@@ -2013,9 +2013,9 @@ class AgentRunner:
                 break
 
         for candidate in candidates:
-            client_metadata = candidate.get("message_metadata")
-            if isinstance(client_metadata, dict) and client_metadata:
-                metadata[CLIENT_METADATA_KEY] = client_metadata
+            server_metadata = candidate.get("message_metadata")
+            if isinstance(server_metadata, dict) and server_metadata:
+                metadata[SERVER_METADATA_KEY] = server_metadata
                 break
 
         for candidate in candidates:

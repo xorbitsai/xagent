@@ -226,9 +226,10 @@ class TaskTurnPayload:
     # event for this user turn. Historical replay uses it to merge persisted
     # transcript rows with trace rows without collapsing repeated text.
     turn_id: str = field(default_factory=lambda: str(uuid4()))
-    # Client-supplied metadata for the user message (for example
-    # ``{"hidden": true}``): persisted with the transcript row and echoed on
-    # the user-message event; never interpreted here.
+    # Server-set metadata for the user message (``hidden``, ``kind``,
+    # ``interaction_id``): persisted with the transcript row and echoed on the
+    # user-message event. ``hidden`` is a display flag; the model still sees
+    # the message.
     message_metadata: Optional[Dict[str, Any]] = None
 
     @property

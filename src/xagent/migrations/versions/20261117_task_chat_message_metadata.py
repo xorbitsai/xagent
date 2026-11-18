@@ -1,6 +1,7 @@
 """Add message_metadata to task_chat_messages.
 
-Client-supplied metadata for a user message (for example ``{"hidden": true}``).
+Server-set metadata for a user message (``hidden``, ``kind``,
+``interaction_id``); ``hidden`` is a display flag, not "hidden from the model".
 Nullable; existing rows stay NULL.
 
 Revision ID: 20261117_chat_message_metadata

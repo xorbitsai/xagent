@@ -86,8 +86,9 @@ class TaskChatMessage(Base):  # type: ignore
     # the original file metadata (file_id, name, size, type) is available for
     # historical replay without having to re-derive it from the message body.
     attachments = Column(JSON, nullable=True)
-    # Client-supplied metadata for a user message (for example
-    # ``{"hidden": true}``). Stored and replayed unchanged; NULL when absent.
+    # Server-set metadata for a user message (``hidden``, ``kind``,
+    # ``interaction_id``). ``hidden`` means hidden from display, not from the
+    # model. Stored and replayed unchanged; NULL when absent.
     message_metadata = Column(JSON, nullable=True)
     # Transitional projection identity; NULL for legacy transcript rows.
     execution_event_id = Column(String(36), nullable=True, unique=True, index=True)

@@ -16,7 +16,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from xagent.core.agent.attachments import CLIENT_METADATA_KEY
+from xagent.core.agent.attachments import SERVER_METADATA_KEY
 from xagent.core.agent.context import ContextManager
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.tracing import TraceEventCallback
@@ -218,7 +218,7 @@ async def test_runner_keeps_metadata_on_message_and_trace_event() -> None:
     )
     message = context.messages[-1]
     assert message.content == "[connector settled]"  # still model context
-    assert message.metadata[CLIENT_METADATA_KEY] == HIDDEN
+    assert message.metadata[SERVER_METADATA_KEY] == HIDDEN
 
     recorder = _Recorder()
     await TraceEventCallback().on_user_message_posted(
@@ -234,3 +234,37 @@ def test_start_payload_wire_shape_unchanged_without_metadata() -> None:
     assert "message_metadata" not in plain
     hidden = TaskStartPayload(**base, message="m", message_metadata=HIDDEN)
     assert hidden.model_dump(mode="json")["message_metadata"] == HIDDEN
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_input"),
+    [(HIDDEN, "original request"), (None, "[connector settled]")],
+    ids=["hidden", "visible"],
+)
+def test_a_hidden_turn_leaves_the_task_input_alone(
+    monkeypatch, metadata, expected_input
+) -> None:
+    from xagent.web.services.task_orchestrator import (
+        TaskTurnPayload,
+        TurnKind,
+        _accept_turn_no_commit,
+    )
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
+    db, user, task = _sqlite_session()
+    task.status = TaskStatus.COMPLETED
+    task.input = "original request"
+    db.commit()
+
+    _accept_turn_no_commit(
+        db,
+        int(task.id),
+        int(user.id),
+        payload=TaskTurnPayload(
+            "[connector settled]", turn_id="t1", message_metadata=metadata
+        ),
+        kind=TurnKind.APPEND,
+    )
+    db.commit()
+    db.expire_all()
+    assert db.get(Task, task.id).input == expected_input

@@ -57,6 +57,7 @@ from ..services.file_reference_output_service import (
 from ..services.message_metadata import (
     is_hidden_message_metadata,
     is_hidden_user_event,
+    not_hidden_message_clause,
 )
 from ..services.public_trace_events import (
     is_audit_only_trace_data,
@@ -659,8 +660,16 @@ def _conversation_source_query(
     return query, ui_source
 
 
+def _visible_chat_messages(task: Task) -> list[TaskChatMessage]:
+    return [
+        message
+        for message in getattr(task, "chat_messages", []) or []
+        if not is_hidden_message_metadata(message.message_metadata)
+    ]
+
+
 def _last_activity_at(task: Task) -> Any:
-    messages = list(getattr(task, "chat_messages", []) or [])
+    messages = _visible_chat_messages(task)
     if messages:
         latest_message = max(messages, key=_message_sort_key)
         return latest_message.created_at or task.updated_at or task.created_at
@@ -699,7 +708,7 @@ def _serialize_log_summary(
         "llm_calls": task.llm_calls or 0,
         "message_count": event_activity[0]
         if event_activity is not None
-        else len(getattr(task, "chat_messages", []) or []),
+        else len(_visible_chat_messages(task)),
     }
 
 
@@ -970,6 +979,9 @@ def _event_log_message_predicate(db: Session) -> Any:
         )
     return and_(
         audit_only.is_not(True),
+        # Hidden user messages are plumbing: the detail view omits them, so the
+        # list's count and last activity must not include them either.
+        not_hidden_message_clause(TaskExecutionEvent.payload["message_metadata"]),
         or_(
             TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
             and_(
@@ -990,7 +1002,11 @@ def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
             TaskChatMessage.created_at.label("created_at"),
         )
         .join(Task, Task.id == TaskChatMessage.task_id)
-        .where(Task.conversation_storage_version == 1, Task.id.in_(task_ids))
+        .where(
+            Task.conversation_storage_version == 1,
+            Task.id.in_(task_ids),
+            not_hidden_message_clause(TaskChatMessage.message_metadata),
+        )
     )
     canonical = (
         select(

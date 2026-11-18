@@ -198,6 +198,7 @@ from .task_interaction_close import (
     active_interaction_id_sync,
     close_legacy_resume_interaction_sync,
 )
+from .task_interaction_settle import task_waits_on_interaction_sync
 from .task_lease_service import TaskLease, bind_task_lease_context
 from .task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
@@ -1443,13 +1444,6 @@ async def handle_missing_task_message(
         await handle_task_message(reply, task_id, message_data)
 
 
-def _task_waiting_for_user_sync(task_id: int) -> bool:
-    """Whether the task row currently waits for user input."""
-    with get_session_local()() as db:
-        status = db.query(Task.status).filter(Task.id == task_id).scalar()
-    return bool(status == TaskStatus.WAITING_FOR_USER)
-
-
 async def handle_task_message(
     reply: CommandReply, task_id: int, message_data: dict
 ) -> None:
@@ -1811,19 +1805,21 @@ async def handle_task_message(
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
-        if (message_metadata or {}).get("interaction_id") is not None:
-            # A settle answers one waiting interaction. If the task is no longer
-            # waiting (a real answer won the race, or it finished), applying it
-            # would inject a stray message into a running turn or start a new
-            # one, so it is dropped as an accepted no-op.
+        settled_interaction_id = (message_metadata or {}).get("interaction_id")
+        if settled_interaction_id is not None:
+            # A settle answers one waiting interaction. If the task no longer
+            # waits on it (a real answer won the race, it finished, or it waits
+            # on another question), applying it would inject a stray message
+            # into a running turn, start a new one or close the live question,
+            # so it is dropped as an accepted no-op before anything is touched.
             if not await run_db_io_cancellation_safe(
-                lambda: _task_waiting_for_user_sync(task_id)
+                lambda: task_waits_on_interaction_sync(task_id, settled_interaction_id)
             ):
                 logger.info(
-                    "task %s: dropping settle for interaction %s; the task is "
-                    "not waiting for user input",
+                    "task %s: dropping settle for interaction %s; the task does "
+                    "not wait on it",
                     task_id,
-                    (message_metadata or {}).get("interaction_id"),
+                    settled_interaction_id,
                 )
                 await finish_delivery(True)
                 return

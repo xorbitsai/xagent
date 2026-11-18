@@ -7,35 +7,49 @@ hidden, server-flagged user message to the task, through the same durable
 command a chat frame uses, so the run resumes exactly as it would for a typed
 answer. No WebSocket client has to be connected.
 
-The call is idempotent per ``interaction_id`` (the default command id is
-``settle:<interaction_id>``): repeating it never appends a second message. At
-execution the command is dropped if the task is no longer waiting, and the
-agent ignores it unless a pending request of the waiting batch carries that
-``interaction_id`` (``ReActPattern._is_stale_settle_message``), so a settle can
-neither start a new turn nor answer a different question.
+A settle only counts when the task waits on that exact interaction. The open
+interaction ids are recorded on the waiting message
+(``metadata.interaction_ids``, one per request of the waiting batch), and both
+the call below and the command's execution check them before anything is
+enqueued or injected (``task_waits_on_interaction_sync``). The agent applies
+the same rule to its restored state (``is_stale_settle_message``) as a last
+line of defence. A wait without recorded ids (a plain question, or one that
+predates this record) cannot be settled.
+
+On a match the settle text is handed to the matched tool alone; every other
+request of the batch is left unanswered, and the run resumes and replans.
+
+The call is idempotent while a settle for the same interaction is still
+queued. A settle that ran to completion without resuming the task (it was
+dropped, or failed) does not block a later one: the next call enqueues under a
+fresh derived command id.
 """
 
 from __future__ import annotations
 
 import enum
+import hashlib
 from typing import Any
 
-from sqlalchemy import exists
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from ..models.database import get_session_local
-from ..models.task import Task, TaskStatus
-from ..models.task_command import TaskExecutionCommand
+from ..models.task import Task, TaskStatus, TraceEvent
+from ..models.task_command import TERMINAL_COMMAND_STATUSES, TaskExecutionCommand
+from ..models.task_execution_event import TaskExecutionEvent
 from ..models.user import User
 from .client_error_messages import ClientErrorCode
-from .message_metadata import (
-    is_valid_interaction_id,
-    is_valid_metadata_kind,
-)
+from .message_metadata import is_valid_interaction_id, is_valid_metadata_kind
 
 DEFAULT_SETTLE_KIND = "interaction_settled"
 DEFAULT_SETTLE_TEXT = "[interaction settled]"
 MAX_SETTLE_TEXT_CHARS = 200
 _COMMAND_ID_PREFIX = "settle:"
+# Command ids are at most 64 characters, so the interaction id is hashed in.
+_COMMAND_ID_DIGEST_CHARS = 24
+_MAX_SETTLE_ATTEMPTS = 8
+_RECENT_WAITING_EVENT_SCAN = 10
 
 
 class SettleOutcome(str, enum.Enum):
@@ -44,43 +58,105 @@ class SettleOutcome(str, enum.Enum):
     QUEUED = "queued"
     """The settle message was accepted and will resume the task."""
     DUPLICATE = "duplicate"
-    """The same ``interaction_id`` was already queued or applied."""
+    """A settle for this interaction is already queued, or already applied."""
     NOT_WAITING = "not_waiting"
-    """The task is not waiting for user input; nothing was queued."""
+    """The task does not wait on this interaction; nothing was queued."""
 
 
-def _precheck_sync(task_id: int, actor_user_id: int, actor_is_admin: bool) -> str:
-    """``waiting``, ``duplicate`` or ``not_waiting`` for the task's current state."""
+def _recorded_interaction_ids(raw: Any) -> frozenset[str]:
+    data = raw if isinstance(raw, dict) else {}
+    if not data.get("expect_response"):
+        return frozenset()
+    metadata = data.get("metadata")
+    ids = metadata.get("interaction_ids") if isinstance(metadata, dict) else None
+    if not isinstance(ids, list):
+        return frozenset()
+    return frozenset(item for item in ids if isinstance(item, str))
+
+
+def _open_interaction_ids(db: Session, task: Task) -> frozenset[str]:
+    """Interaction ids of the task's latest waiting message.
+
+    Reads the same persisted fact the waiting question is shown from, in the
+    task's own storage version.
+    """
+    if task.conversation_storage_version == 2:
+        event = db.scalar(
+            select(TaskExecutionEvent)
+            .where(
+                TaskExecutionEvent.task_id == task.id,
+                TaskExecutionEvent.scope_id == "root",
+                TaskExecutionEvent.run_id == task.run_id,
+                TaskExecutionEvent.kind == "agent_message",
+                TaskExecutionEvent.payload["data"]["expect_response"]
+                .as_boolean()
+                .is_(True),
+            )
+            .order_by(TaskExecutionEvent.sequence.desc())
+            .limit(1)
+        )
+        payload = event.payload if event is not None else None
+        return _recorded_interaction_ids(
+            payload.get("data") if isinstance(payload, dict) else None
+        )
+    rows = db.scalars(
+        select(TraceEvent)
+        .where(TraceEvent.task_id == task.id, TraceEvent.event_type == "agent_message")
+        .order_by(TraceEvent.id.desc())
+        .limit(_RECENT_WAITING_EVENT_SCAN)
+    )
+    for row in rows:
+        if isinstance(row.data, dict) and row.data.get("expect_response"):
+            return _recorded_interaction_ids(row.data)
+    return frozenset()
+
+
+def task_waits_on_interaction_sync(task_id: int, interaction_id: str) -> bool:
+    """Whether the task waits for user input on exactly ``interaction_id``."""
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        if task is None or task.status != TaskStatus.WAITING_FOR_USER:
+            return False
+        return interaction_id in _open_interaction_ids(db, task)
+
+
+def _check_actor_sync(task_id: int, actor_user_id: int, actor_is_admin: bool) -> None:
+    """Raise the chat-frame errors for a missing task or a foreign actor."""
     from .task_command_execution import (
         ClientVisiblePermissionError,
         ClientVisibleValidationError,
     )
 
     with get_session_local()() as db:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if task is None:
-            raise ClientVisibleValidationError(
-                f"Task {task_id} not found",
-                error_code=ClientErrorCode.TASK_UNAVAILABLE,
-            )
-        if not actor_is_admin and int(task.user_id) != actor_user_id:
-            raise ClientVisiblePermissionError(
-                f"Access denied: Task {task_id} does not belong to you",
-                error_code=ClientErrorCode.TASK_UNAVAILABLE,
-            )
-        return "waiting" if task.status == TaskStatus.WAITING_FOR_USER else "other"
-
-
-def _command_exists_sync(task_id: int, command_id: str) -> bool:
-    with get_session_local()() as db:
-        return bool(
-            db.query(
-                exists().where(
-                    TaskExecutionCommand.task_id == task_id,
-                    TaskExecutionCommand.command_id == command_id,
-                )
-            ).scalar()
+        owner_id = db.query(Task.user_id).filter(Task.id == task_id).scalar()
+    if owner_id is None:
+        raise ClientVisibleValidationError(
+            f"Task {task_id} not found",
+            error_code=ClientErrorCode.TASK_UNAVAILABLE,
         )
+    if not actor_is_admin and int(owner_id) != actor_user_id:
+        raise ClientVisiblePermissionError(
+            f"Access denied: Task {task_id} does not belong to you",
+            error_code=ClientErrorCode.TASK_UNAVAILABLE,
+        )
+
+
+def _attempt_command_ids(interaction_id: str) -> list[str]:
+    digest = hashlib.sha256(interaction_id.encode("utf-8")).hexdigest()
+    base = f"{_COMMAND_ID_PREFIX}{digest[:_COMMAND_ID_DIGEST_CHARS]}"
+    return [base] + [f"{base}:{attempt}" for attempt in range(1, _MAX_SETTLE_ATTEMPTS)]
+
+
+def _settle_commands_sync(
+    task_id: int, command_ids: list[str]
+) -> dict[str, str | None]:
+    with get_session_local()() as db:
+        rows = db.query(TaskExecutionCommand.command_id, TaskExecutionCommand.status)
+        rows = rows.filter(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id.in_(command_ids),
+        )
+        return {str(command_id): status for command_id, status in rows}
 
 
 async def settle_task_interaction(
@@ -90,14 +166,17 @@ async def settle_task_interaction(
     interaction_id: str,
     text: str = DEFAULT_SETTLE_TEXT,
     kind: str = DEFAULT_SETTLE_KIND,
-    command_id: str | None = None,
 ) -> SettleOutcome:
     """Settle the waiting interaction ``interaction_id`` of ``task_id``.
 
     ``actor_user`` must own the task (or be an admin), exactly as for a chat
     frame. ``interaction_id`` is the opaque id the waiting tool put in its
-    result; it is also the idempotency key. ``kind`` is a host-chosen
-    identifier clients can branch on. ``text`` is what the model sees.
+    result. ``kind`` is a host-chosen identifier clients can branch on. ``text``
+    is what the model and the settled tool see.
+
+    Returns ``NOT_WAITING`` unless the task waits on that interaction;
+    ``DUPLICATE`` while an earlier settle for it is still queued (or when the
+    task has already moved on after one); ``QUEUED`` otherwise.
 
     Raises ``ValueError`` for a malformed argument and the same client-visible
     errors as a chat frame (task missing, access denied, input rejected).
@@ -120,28 +199,39 @@ async def settle_task_interaction(
         raise ValueError(
             f"text must be 1-{MAX_SETTLE_TEXT_CHARS} characters of visible text"
         )
-    resolved_command_id = command_id or f"{_COMMAND_ID_PREFIX}{interaction_id}"
 
-    state = await run_db_io_cancellation_safe(
-        lambda: _precheck_sync(
+    await run_db_io_cancellation_safe(
+        lambda: _check_actor_sync(
             task_id, int(actor_user.id), bool(getattr(actor_user, "is_admin", False))
         )
     )
-    if state != "waiting":
-        # A repeated call after the first one resumed the task is a replay, not
-        # a "not waiting" error.
-        if await run_db_io_cancellation_safe(
-            lambda: _command_exists_sync(task_id, resolved_command_id)
-        ):
+    attempts = _attempt_command_ids(interaction_id)
+    seen = await run_db_io_cancellation_safe(
+        lambda: _settle_commands_sync(task_id, attempts)
+    )
+    if not await run_db_io_cancellation_safe(
+        lambda: task_waits_on_interaction_sync(task_id, interaction_id)
+    ):
+        # A repeated call after the first one resumed the task is a replay.
+        return SettleOutcome.DUPLICATE if seen else SettleOutcome.NOT_WAITING
+
+    command_id = None
+    for candidate in attempts:
+        status = seen.get(candidate, "")
+        if status == "":
+            command_id = candidate
+            break
+        if status not in TERMINAL_COMMAND_STATUSES:
             return SettleOutcome.DUPLICATE
-        return SettleOutcome.NOT_WAITING
+    if command_id is None:
+        raise ValueError("too many settle attempts for this interaction")
 
     message_data: dict[str, Any] = {"message": text, "user": actor_user}
     enqueued = await _enqueue_websocket_task_command(
         task_id=task_id,
         message_data=message_data,
         kind=TaskCommandKind.MESSAGE,
-        command_id=resolved_command_id,
+        command_id=command_id,
         server_message_metadata={
             "hidden": True,
             "kind": kind,

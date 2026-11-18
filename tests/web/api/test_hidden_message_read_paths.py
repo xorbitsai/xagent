@@ -161,3 +161,127 @@ def test_preview_sample_is_never_a_hidden_message() -> None:
     response = client.get(f"/api/agents/{agent['id']}/preview-task", headers=headers)
     assert response.status_code == 200, response.text
     assert response.json()["message"] == "the real sample"
+
+
+def _admin_id() -> int:
+    return _user_id("admin")
+
+
+def test_websocket_replay_of_a_legacy_task_carries_message_metadata() -> None:
+    from xagent.web.api.websocket import _load_historical_stream_snapshot_sync
+
+    _admin_headers()
+    user_id = _admin_id()
+    task_id = _create_task_row(user_id=user_id, title="Connect")
+    with _direct_db_session() as db:
+        for content, metadata in (("hello", None), ("[connector settled]", HIDDEN)):
+            db.add(
+                TaskChatMessage(
+                    task_id=task_id,
+                    user_id=user_id,
+                    role="user",
+                    content=content,
+                    message_type="chat",
+                    message_metadata=metadata,
+                )
+            )
+        db.commit()
+    snapshot = _load_historical_stream_snapshot_sync(
+        task_id, actor_user_id=user_id, actor_is_admin=True
+    )
+    assert snapshot is not None
+    replayed = {
+        event["data"]["content"]: event["data"]
+        for event in snapshot.events
+        if event.get("event_type") == "user_message"
+    }
+    assert replayed["[connector settled]"]["metadata"] == HIDDEN
+    assert "metadata" not in replayed["hello"]
+
+
+def _trigger_task(*, storage_version: int) -> tuple[int, int]:
+    user_id = _admin_id()
+    agent_id = _create_agent_row(user_id=user_id, name="Audit Agent")
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="Connect",
+        source="trigger",
+        is_visible=False,
+        agent_id=agent_id,
+        agent_config={"trigger_type": "webhook"},
+    )
+    _attach_trigger_run(
+        user_id=user_id,
+        agent_id=agent_id,
+        task_id=task_id,
+        trigger_type="webhook",
+        source_event_id="evt-1",
+    )
+    with _direct_db_session() as db:
+        db.query(Task).filter(Task.id == task_id).update(
+            {Task.conversation_storage_version: storage_version, Task.run_id: "run-1"}
+        )
+        db.commit()
+    return user_id, task_id
+
+
+def _add_v2_input(task_id: int, key: str, content: str, metadata, at: datetime):
+    from xagent.web.services.task_execution_event_writer import append_fact_no_commit
+
+    payload = {"content": content, "message_type": "user"}
+    if metadata:
+        payload["message_metadata"] = metadata
+    with _direct_db_session() as db:
+        append_fact_no_commit(
+            db,
+            task_id=task_id,
+            kind="input_accepted",
+            key=key,
+            run_id="run-1",
+            turn_id=key,
+            payload=payload,
+            occurred_at=at,
+        )
+        db.commit()
+
+
+def test_conversation_log_v2_detail_and_list_leave_out_hidden_messages() -> None:
+    headers = _admin_headers()
+    _, task_id = _trigger_task(storage_version=2)
+    _add_v2_input(task_id, "u1", "hello", None, STAMP)
+    _add_v2_input(task_id, "u2", "[connector settled]", HIDDEN, STAMP.replace(hour=13))
+
+    detail = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    transcript = detail.json()["transcript"]
+    assert [m["content"] for m in transcript] == ["hello"]
+    assert all("message_metadata" not in m for m in transcript)
+
+    (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
+    assert listed["message_count"] == 1
+    assert listed["last_activity_at"].startswith("2026-01-01T12:00:00")
+
+
+def test_conversation_log_v1_list_count_and_activity_ignore_hidden_messages() -> None:
+    headers = _admin_headers()
+    user_id, task_id = _trigger_task(storage_version=1)
+    with _direct_db_session() as db:
+        for content, metadata, at in (
+            ("hello", None, STAMP),
+            ("[connector settled]", HIDDEN, STAMP.replace(hour=13)),
+        ):
+            db.add(
+                TaskChatMessage(
+                    task_id=task_id,
+                    user_id=user_id,
+                    role="user",
+                    content=content,
+                    message_type="chat",
+                    message_metadata=metadata,
+                    created_at=at,
+                )
+            )
+        db.commit()
+    (listed,) = client.get("/api/conversation-logs", headers=headers).json()["logs"]
+    assert listed["message_count"] == 1
+    assert listed["last_activity_at"].startswith("2026-01-01T12:00:00")

@@ -19,6 +19,7 @@ from ...checkpoint import CheckpointPersistenceError, ExecutionEventPersistenceE
 from ...context.enrichment import (
     enrich_context_with_memory,
     hydrate_top_level_user_request,
+    is_stale_settle_message,
     latest_pending_user_response,
     pending_user_response_marker,
     top_level_user_request,
@@ -2318,7 +2319,35 @@ class DAGPattern(AgentPattern):
             return True
         if self.status not in {"interrupted", "waiting_for_user", "replanning"}:
             return False
-        return self._user_message_count(context) > self.planned_user_message_count
+        return bool(self._unconsumed_user_messages(context))
+
+    def _is_stale_settle_message(self, message: Any) -> bool:
+        """Whether ``message`` is a host settle that answers no waiting step.
+
+        Same rule as ReAct (``is_stale_settle_message``), applied to the
+        waiting step's request: outside ``waiting_for_user`` no request is
+        open, so every settle is stale.
+        """
+        waiting_request = None
+        if self.status == "waiting_for_user":
+            step_id = self._waiting_step_id()
+            state = self.active_step_pattern_states.get(step_id) if step_id else None
+            if isinstance(state, dict):
+                waiting_request = state.get("waiting_for_user_request")
+        return is_stale_settle_message(message, waiting_request)
+
+    def _unconsumed_user_messages(self, context: Any) -> list[tuple[int, Any]]:
+        """Root user messages after the last plan that can still drive a replan."""
+        user_messages = [
+            (index, message)
+            for index, message in enumerate(context.messages)
+            if message.role == "user"
+        ]
+        return [
+            (index, message)
+            for index, message in user_messages[self.planned_user_message_count :]
+            if not self._is_stale_settle_message(message)
+        ]
 
     def _forward_user_response_to_waiting_step(self, root_context: Any) -> bool:
         if self.status != "waiting_for_user":
@@ -2328,19 +2357,14 @@ class DAGPattern(AgentPattern):
         if step_id is None:
             return False
 
-        root_user_messages = [
-            (index, message)
-            for index, message in enumerate(root_context.messages)
-            if message.role == "user"
-        ]
-        if len(root_user_messages) <= self.planned_user_message_count:
+        new_root_messages = self._unconsumed_user_messages(root_context)
+        if not new_root_messages:
             return False
 
         active_context = self.active_step_contexts.get(step_id)
         if not active_context:
             return False
 
-        new_root_messages = root_user_messages[self.planned_user_message_count :]
         response_index, response_message = new_root_messages[0]
         pattern_state = self.active_step_pattern_states.get(step_id)
         waiting_request = (
@@ -2382,7 +2406,7 @@ class DAGPattern(AgentPattern):
             )
 
         self._set_active_step_context(step_id, child_context.to_dict())
-        self.planned_user_message_count = len(root_user_messages)
+        self.planned_user_message_count = self._user_message_count(root_context)
         # Every consumed reply stays listed until a plan absorbs them all.
         if step_id not in self.replan_owed_step_ids:
             self.replan_owed_step_ids.append(step_id)

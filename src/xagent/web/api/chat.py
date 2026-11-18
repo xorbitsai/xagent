@@ -79,6 +79,10 @@ from ..services.hot_path_cache import (
 )
 from ..services.llm_utils import AutoModelUnavailableError, resolve_llms_from_names
 from ..services.managed_file_ref import async_ensure_uploaded_file_local_path
+from ..services.message_metadata import (
+    displayed_message_clause,
+    is_display_none_metadata,
+)
 from ..services.model_service import _get_visible_user_ids
 from ..services.public_trace_events import public_task_trace_filter
 from ..services.task_auto_recovery import current_auto_recovery_view
@@ -848,10 +852,12 @@ async def get_tasks(
                         ),
                     ),
                     TaskChatMessage.content.ilike(pattern, escape="\\"),
+                    # Hidden messages are plumbing, not searchable conversation.
+                    displayed_message_clause(TaskChatMessage.message_metadata),
                 )
                 # SQL narrows candidates before the shared public projection
                 # applies provenance, audit/checkpoint and question visibility
-                # rules. Never match raw diagnostics or hidden event metadata.
+                # rules. Never match raw diagnostics or not-displayed event metadata.
                 candidate_events = (
                     db.query(TaskExecutionEvent)
                     .join(Task, Task.id == TaskExecutionEvent.task_id)
@@ -886,6 +892,10 @@ async def get_tasks(
                         message = project_event_message(event)
                     except ValueError:
                         # Invalid/unknown persisted payloads fail closed.
+                        continue
+                    if message and is_display_none_metadata(
+                        message.get("message_metadata")
+                    ):
                         continue
                     if (
                         message

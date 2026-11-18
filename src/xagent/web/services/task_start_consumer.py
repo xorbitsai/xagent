@@ -30,6 +30,7 @@ from .mcp_runtime import (
     MCPActorAuthorizationPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from .message_metadata import is_display_none_metadata
 from .task_actor_policy import load_shared_actor_policy
 from .task_command_transport import (
     COMMAND_COMPLETED,
@@ -110,6 +111,7 @@ def reconcile_start_acceptance(
         if (
             body.get("message") != payload.transcript_message
             or body.get("execution_message") != payload.execution_message
+            or body.get("message_metadata") != payload.message_metadata
             or body.get("file_ids") != list(payload.file_ids)
             or body.get("before_message_id") != accepted.before_message_id
         ):
@@ -403,7 +405,8 @@ def _commit_handoff(
                 return _reject_start(db, row, "start_state_changed")
             lease = acquired
         db.refresh(task)
-        setattr(task, "input", start.message)
+        if not is_display_none_metadata(start.message_metadata):
+            setattr(task, "input", start.message)
         from .workforce_runtime import sync_workforce_run_status
 
         sync_workforce_run_status(db, task, TaskStatus.RUNNING)
@@ -610,6 +613,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                 execution_message=start.execution_message,
                 file_ids=tuple(start.file_ids),
                 turn_id=start.turn_id,
+                message_metadata=start.message_metadata,
             ),
             claimed=handoff.claimed,
             kind=TurnKind(start.kind),

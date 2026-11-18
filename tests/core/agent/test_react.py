@@ -11589,6 +11589,14 @@ async def test_concurrent_tool_interactions_pause_in_one_deterministic_message()
         for request in pattern.waiting_for_user_request["requests"]
     ] == ["decision", "decision_2"]
     assert len(runtime.outbound_messages) == 1
+    # The waiting message records every open interaction id for a host settle.
+    open_ids = [
+        request["interaction_id"]
+        for request in pattern.waiting_for_user_request["requests"]
+    ]
+    assert open_ids and runtime.outbound_messages[0]["metadata"]["interaction_ids"] == (
+        open_ids
+    )
     assert pattern._record_for_tool_call_id("first-call").status == "waiting_for_user"
     assert pattern._record_for_tool_call_id("second-call").status == "waiting_for_user"
     assert pattern._record_for_tool_call_id("stale-mutation").status == "cancelled"

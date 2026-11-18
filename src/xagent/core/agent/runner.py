@@ -53,7 +53,7 @@ from ..task_runtime import (
 )
 from ..user_context import current_user_id
 from ..workspace import WorkspaceManager
-from .attachments import build_image_context_references
+from .attachments import SERVER_METADATA_KEY, build_image_context_references
 from .budget import (
     BudgetPolicyProvider,
     ExecutionBudget,
@@ -147,6 +147,10 @@ RESERVED_ENGINE_METADATA_KEYS = frozenset(
         ACCEPTED_TURN_IDS_METADATA_KEY,
         _TRACED_TURN_IDS_METADATA_KEY,
         MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+        # Server-set message metadata (``display``, ``kind``, ``interaction_id``)
+        # reaches a message only through ``post_user_message``'s dedicated
+        # argument, never through caller-supplied context.
+        "message_metadata",
     }
 )
 
@@ -1136,6 +1140,7 @@ class AgentRunner:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        message_metadata: dict[str, Any] | None = None,
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
@@ -1151,6 +1156,7 @@ class AgentRunner:
                 execution_message=execution_message,
                 display_message=display_message,
                 files=files,
+                message_metadata=message_metadata,
                 turn_id=turn_id,
                 request_interrupt=request_interrupt,
                 reason=reason,
@@ -1216,6 +1222,7 @@ class AgentRunner:
         execution_message: str | None,
         display_message: str | None,
         files: list[dict[str, Any]] | None,
+        message_metadata: dict[str, Any] | None,
         turn_id: str | None,
         request_interrupt: bool,
         reason: str | None,
@@ -1394,6 +1401,8 @@ class AgentRunner:
                 if files is not None:
                     metadata["files"] = files
                 metadata["turn_id"] = requested_turn_id or str(uuid4())
+                if message_metadata:
+                    metadata[SERVER_METADATA_KEY] = dict(message_metadata)
 
                 # Only messages and top-level metadata are mutated below; components
                 # and existing messages are read-only during checkpoint serialization.
@@ -1744,6 +1753,7 @@ class AgentRunner:
         execution_message: str | None = None,
         display_message: str | None = None,
         files: list[dict[str, Any]] | None = None,
+        message_metadata: dict[str, Any] | None = None,
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
@@ -1759,6 +1769,7 @@ class AgentRunner:
             execution_message=execution_message,
             display_message=display_message,
             files=files,
+            message_metadata=message_metadata,
             turn_id=turn_id,
             request_interrupt=request_interrupt,
             reason=reason,

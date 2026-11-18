@@ -54,6 +54,11 @@ from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
 )
+from ..services.message_metadata import (
+    displayed_message_clause,
+    is_display_none_metadata,
+    is_display_none_user_event,
+)
 from ..services.public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
@@ -655,8 +660,16 @@ def _conversation_source_query(
     return query, ui_source
 
 
+def _visible_chat_messages(task: Task) -> list[TaskChatMessage]:
+    return [
+        message
+        for message in getattr(task, "chat_messages", []) or []
+        if not is_display_none_metadata(message.message_metadata)
+    ]
+
+
 def _last_activity_at(task: Task) -> Any:
-    messages = list(getattr(task, "chat_messages", []) or [])
+    messages = _visible_chat_messages(task)
     if messages:
         latest_message = max(messages, key=_message_sort_key)
         return latest_message.created_at or task.updated_at or task.created_at
@@ -695,7 +708,7 @@ def _serialize_log_summary(
         "llm_calls": task.llm_calls or 0,
         "message_count": event_activity[0]
         if event_activity is not None
-        else len(getattr(task, "chat_messages", []) or []),
+        else len(_visible_chat_messages(task)),
     }
 
 
@@ -825,7 +838,9 @@ def _serialize_trace_events(db: Session, task_id: int) -> list[dict[str, Any]]:
         return []
     serialized: list[dict[str, Any]] = []
     for event, data in zip(events, decoded):
-        if is_audit_only_trace_data(data):
+        if is_audit_only_trace_data(data) or is_display_none_user_event(
+            str(event.event_type), data
+        ):
             continue
         event_type, public_data = normalize_public_trace_event(
             str(event.event_type), data
@@ -964,6 +979,9 @@ def _event_log_message_predicate(db: Session) -> Any:
         )
     return and_(
         audit_only.is_not(True),
+        # Hidden user messages are plumbing: the detail view omits them, so the
+        # list's count and last activity must not include them either.
+        displayed_message_clause(TaskExecutionEvent.payload["message_metadata"]),
         or_(
             TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
             and_(
@@ -984,7 +1002,11 @@ def _latest_message_activity_subquery(db: Session, task_ids: Any) -> Any:
             TaskChatMessage.created_at.label("created_at"),
         )
         .join(Task, Task.id == TaskChatMessage.task_id)
-        .where(Task.conversation_storage_version == 1, Task.id.in_(task_ids))
+        .where(
+            Task.conversation_storage_version == 1,
+            Task.id.in_(task_ids),
+            displayed_message_clause(TaskChatMessage.message_metadata),
+        )
     )
     canonical = (
         select(
@@ -1323,8 +1345,9 @@ async def get_conversation_log_detail(
     if ui_source is None:
         raise HTTPException(status_code=404, detail="Conversation log not found")
 
+    # Hidden messages (a client's resume signal) are plumbing, not conversation.
     messages = (
-        list(task.chat_messages or []) if task.conversation_storage_version == 1 else []
+        _visible_chat_messages(task) if task.conversation_storage_version == 1 else []
     )
     file_reference_records = load_assistant_file_reference_records(
         db,
@@ -1336,8 +1359,14 @@ async def get_conversation_log_detail(
 
         view = load_event_display_snapshot(db, int(task.id))
         transcript = []
-        for message in view.messages:
+        shown = [
+            message
+            for message in view.messages
+            if not is_display_none_metadata(message.get("message_metadata"))
+        ]
+        for message in shown:
             item = dict(message)
+            item.pop("message_metadata", None)
             if item["role"] == "assistant":
                 item["content"] = reconcile_assistant_file_references(
                     db,
@@ -1372,8 +1401,8 @@ async def get_conversation_log_detail(
             positioned.append((position, item))
         transcript = [item for _, item in sorted(positioned, key=lambda pair: pair[0])]
         event_activity = (
-            len(view.messages),
-            max((item["created_at"] for item in view.messages), default=None),
+            len(shown),
+            max((item["created_at"] for item in shown), default=None),
         )
     else:
         transcript = _serialize_transcript_with_events(

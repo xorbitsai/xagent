@@ -6,9 +6,17 @@ transcript row. All variants begin execution under the worker coordinator's task
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -75,6 +83,7 @@ class TaskStartPayload(BaseModel):
     kind: Literal["create", "append", "existing", "channel"]
     message: str
     execution_message: str | None = None
+    message_metadata: dict[str, JsonValue] | None = None
     file_ids: list[_FileId] = Field(default_factory=list)
     before_message_id: Annotated[int, Field(gt=0)] | None = None
     timezone: str | None = None
@@ -82,6 +91,18 @@ class TaskStartPayload(BaseModel):
     runtime_values_ref: _Identity | None = None
     existing_context: ExistingExecutionContext | None = None
     channel: ChannelExecutionContext | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_message_metadata(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Absent metadata stays off the wire so a payload without it is
+        # byte-identical to one produced before the field existed (extra
+        # fields are rejected by an older consumer).
+        data: dict[str, Any] = handler(self)
+        if data.get("message_metadata") is None:
+            data.pop("message_metadata", None)
+        return data
 
     @model_validator(mode="after")
     def validate_turn_kind(self) -> Self:

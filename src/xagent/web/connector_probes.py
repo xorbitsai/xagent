@@ -116,6 +116,9 @@ CONNECTOR_PROBES: Mapping[str, ConnectorProbe] = {
     "stripe": ConnectorProbe("stripe_list_customers", {"limit": 1}),
     "freshdesk": ConnectorProbe("freshdesk_list_agents", {"per_page": 1}),
     "chargebee": ConnectorProbe("chargebee_list_customers", {"limit": 1}),
+    # Reads the configured database, then lists its containers: endpoint, key,
+    # network access and database name all have to work.
+    "cosmos": ConnectorProbe("cosmos_list_containers"),
     "chartmogul": ConnectorProbe("chartmogul_list_customers", {"per_page": 1}),
     "shopify": ConnectorProbe("shopify_validate_connection"),
     "magento": ConnectorProbe("magento_list_products", {"limit": 1}),

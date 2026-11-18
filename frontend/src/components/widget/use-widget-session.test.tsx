@@ -404,6 +404,148 @@ describe("useWidgetSession", () => {
     expect(result.current).toBe(snapshot)
   })
 
+  describe("planned restart (1012)", () => {
+    const restartClose = () => new CloseEvent("close", { code: 1012 })
+    const reconnectRequests = (postMessage: { mock: { calls: unknown[][] } }) =>
+      postMessage.mock.calls.filter(([message]) => (message as { type?: string } | undefined)?.type === "reconnect_request")
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+    })
+
+    it("reopens the socket with the same session token instead of asking the parent", () => {
+      const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage({ session_delivery_id: "delivery-r" }))
+      act(() => result.current.handleConnectionOpen("widget-session:1"))
+      postMessage.mockClear()
+
+      let disposition: "handled" | "default" | undefined
+      act(() => {
+        disposition = result.current.handleConnectionClose(restartClose(), "widget-session:1")
+      })
+
+      expect(disposition).toBe("handled")
+      expect(result.current.status).toBe("refreshing")
+      expect(result.current.session).toBeNull()
+
+      act(() => vi.advanceTimersByTime(1_500))
+
+      expect(result.current.status).toBe("active")
+      expect(result.current.session?.token).toBe("st_session_token")
+      expect(result.current.session?.generation).toBe(2)
+      expect(reconnectRequests(postMessage)).toHaveLength(0)
+
+      // The reopened socket's open is echoed with the delivery the parent awaits.
+      act(() => result.current.handleConnectionOpen("widget-session:2"))
+      expect(postMessage.mock.calls.filter((call) => call[0]?.type === "session_connection_open")).toEqual([[
+        { xagent: true, v: 1, type: "session_connection_open", session_delivery_id: "delivery-r" },
+        PARENT_ORIGIN,
+      ]])
+    })
+
+    it("hands the reopened session to a caller waiting for one", async () => {
+      vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      act(() => {
+        result.current.handleConnectionClose(restartClose(), "widget-session:1")
+      })
+      const fresh = result.current.ensureFreshSession()
+      act(() => vi.advanceTimersByTime(1_500))
+
+      await expect(fresh).resolves.toMatchObject({ token: "st_session_token", generation: 2 })
+    })
+
+    it("falls back to the parent after repeated restarts with no socket opening", () => {
+      const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      for (let generation = 1; generation <= 3; generation += 1) {
+        act(() => {
+          result.current.handleConnectionClose(restartClose(), `widget-session:${generation}`)
+        })
+        act(() => vi.advanceTimersByTime(1_500))
+      }
+      expect(reconnectRequests(postMessage)).toHaveLength(0)
+
+      act(() => {
+        result.current.handleConnectionClose(restartClose(), "widget-session:4")
+      })
+
+      expect(reconnectRequests(postMessage)).toEqual([[
+        { xagent: true, v: 1, type: "reconnect_request", reason: "ws_closed" },
+        PARENT_ORIGIN,
+      ]])
+    })
+
+    it("keeps reopening while each reopened socket opens", () => {
+      const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      for (let generation = 1; generation <= 5; generation += 1) {
+        act(() => result.current.handleConnectionOpen(`widget-session:${generation}`))
+        act(() => {
+          result.current.handleConnectionClose(restartClose(), `widget-session:${generation}`)
+        })
+        act(() => vi.advanceTimersByTime(1_500))
+      }
+
+      expect(result.current.session?.generation).toBe(6)
+      expect(reconnectRequests(postMessage)).toHaveLength(0)
+    })
+
+    it("asks the parent when the token would not outlive the reopen", () => {
+      const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      act(() => vi.advanceTimersByTime(15 * 60_000 - 62_000))
+      act(() => {
+        result.current.handleConnectionClose(restartClose(), "widget-session:1")
+      })
+
+      expect(result.current.status).toBe("refreshing")
+      expect(reconnectRequests(postMessage)).toHaveLength(1)
+      act(() => vi.advanceTimersByTime(5_000))
+      expect(result.current.status).toBe("refreshing")
+    })
+
+    it("lets a session from the parent replace a pending reopen", () => {
+      vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      act(() => {
+        result.current.handleConnectionClose(restartClose(), "widget-session:1")
+      })
+      dispatchFromParent(updateMessage({ session_token: "st_from_parent" }))
+      act(() => vi.advanceTimersByTime(5_000))
+
+      expect(result.current.session?.token).toBe("st_from_parent")
+      expect(result.current.session?.generation).toBe(2)
+    })
+
+    it("does not reopen a session that ended while the reopen was pending", () => {
+      vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      act(() => {
+        result.current.handleConnectionClose(restartClose(), "widget-session:1")
+      })
+      dispatchFromParent({ xagent: true, v: 1, type: "session_terminal", code: "session_expired" })
+      act(() => vi.advanceTimersByTime(5_000))
+
+      expect(result.current.status).toBe("terminal")
+      expect(result.current.session).toBeNull()
+    })
+  })
+
   it("rejects a whitespace-only token without normalizing a nonblank raw token", () => {
     const first = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage({ session_token: "   " }))

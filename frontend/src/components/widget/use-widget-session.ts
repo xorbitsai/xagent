@@ -7,6 +7,20 @@ import { WidgetSessionUploadError } from "@/lib/widget-session-upload"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
+// A planned backend restart (a release switching slots) closes every socket
+// with 1012. The session survives it -- the server binds the socket to the
+// session and validates the token without consuming it -- so the socket is
+// reopened with the same token rather than asking the parent for a new session
+// over HTTP. Rebuilding thousands of sessions at once on every release is what
+// filled the Gate's request budget on 2026-11-18. The reopen waits a random
+// delay below RESTART_REOPEN_MAX_DELAY_MS so the sockets do not all reach the
+// new backend in the same instant.
+const SERVICE_RESTART_CLOSE_CODE = 1012
+const RESTART_REOPEN_MAX_DELAY_MS = 3_000
+// Consecutive restart reopens without a socket opening in between before
+// falling back to the parent's reconnect (a slot that keeps restarting, or a
+// handshake the server keeps refusing).
+const MAX_RESTART_REOPENS = 3
 // Keep this predicate aligned with the two retry signals emitted by
 // frontend/public/widget.js; every other parent code fails closed.
 const isParentRecoverableCode = (code: string): boolean =>
@@ -209,6 +223,17 @@ export function useWidgetSession() {
   const openGenerationRef = useRef<number | null>(null)
   const sessionWaitRef = useRef<{ promise: Promise<WidgetSession>, waiters: Waiter<WidgetSession>[] } | null>(null)
   const openWaitersRef = useRef<Waiter<void>[]>([])
+  // The pending reopen after a 1012 close, and how many happened in a row
+  // without a socket opening.
+  const restartReopenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const restartReopensRef = useRef(0)
+
+  const cancelRestartReopen = useCallback(() => {
+    if (restartReopenTimerRef.current) {
+      clearTimeout(restartReopenTimerRef.current)
+      restartReopenTimerRef.current = null
+    }
+  }, [])
 
   const rejectSessionWaiters = useCallback((error: Error) => {
     const pending = sessionWaitRef.current
@@ -248,6 +273,7 @@ export function useWidgetSession() {
     sessionRef.current = null
     openGenerationRef.current = null
     recoveryInFlightRef.current = false
+    cancelRestartReopen()
     clearWarningTimer()
     failPendingWaits()
     setState({
@@ -257,10 +283,11 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
-  }, [clearWarningTimer, failPendingWaits])
+  }, [cancelRestartReopen, clearWarningTimer, failPendingWaits])
 
   const transitionDegraded = useCallback(() => {
     if (terminalRef.current) return
+    cancelRestartReopen()
     activeSessionGenerationRef.current = null
     activeDeliveryIdRef.current = null
     sessionRef.current = null
@@ -275,7 +302,49 @@ export function useWidgetSession() {
       terminalCode: null,
       isAbsoluteExpiryWarningVisible: false,
     }))
-  }, [clearWarningTimer, failPendingWaits])
+  }, [cancelRestartReopen, clearWarningTimer, failPendingWaits])
+
+  const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
+    clearWarningTimer()
+    const delay = Math.max(0, absoluteExpiresAt - Date.now() - EXPIRY_WARNING_LEAD_MS)
+    warningTimerRef.current = setTimeout(() => {
+      warningTimerRef.current = null
+      setState((current) => current.status === "active"
+        ? { ...current, isAbsoluteExpiryWarningVisible: true }
+        : current)
+    }, delay)
+  }, [clearWarningTimer])
+
+  // Makes `fields` the current session under a new generation, so the chat
+  // page opens a new socket for it, and hands it to every caller waiting for
+  // one. `deliveryId` is what the socket's open is echoed to the parent with.
+  const activateSession = useCallback((
+    fields: Omit<WidgetSession, "generation">,
+    deliveryId: string | null,
+  ) => {
+    recoveryInFlightRef.current = false
+    generationRef.current += 1
+    const session: WidgetSession = { ...fields, generation: generationRef.current }
+    activeSessionGenerationRef.current = session.generation
+    activeDeliveryIdRef.current = deliveryId
+    sessionRef.current = session
+    degradedRef.current = false
+    openGenerationRef.current = null
+    setState({
+      status: "active",
+      session,
+      agent: session.agent,
+      terminalCode: null,
+      isAbsoluteExpiryWarningVisible: false,
+    })
+    scheduleExpiryWarning(Date.parse(session.absoluteExpiresAt))
+    const pending = sessionWaitRef.current
+    sessionWaitRef.current = null
+    pending?.waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer)
+      waiter.resolve(session)
+    })
+  }, [scheduleExpiryWarning])
 
   const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
     const targetOrigin = targetOriginRef.current
@@ -302,6 +371,42 @@ export function useWidgetSession() {
     issueReconnectRequest(reason)
   }, [issueReconnectRequest])
 
+  // Reopens the socket after a planned restart (1012) with the session it
+  // already has; false when that is not possible and the parent must issue a
+  // new session instead: no usable session, a recovery already under way, too
+  // many reopens in a row, or a token that would not outlive the reopen. Until
+  // the reopen the page shows the same "refreshing" state a parent reconnect
+  // does, and the latch keeps a parent reconnect from starting alongside it.
+  const reopenAfterRestart = useCallback((): boolean => {
+    const session = sessionRef.current
+    if (!session || !mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return false
+    if (restartReopensRef.current >= MAX_RESTART_REOPENS) return false
+    const tokenLeftMs = Date.parse(session.tokenExpiresAt) - Date.now()
+    if (tokenLeftMs < TOKEN_REFRESH_THRESHOLD_MS + RESTART_REOPEN_MAX_DELAY_MS) return false
+
+    restartReopensRef.current += 1
+    const deliveryId = activeDeliveryIdRef.current
+    recoveryInFlightRef.current = true
+    activeSessionGenerationRef.current = null
+    sessionRef.current = null
+    openGenerationRef.current = null
+    clearWarningTimer()
+    setState((current) => ({
+      status: "refreshing",
+      session: null,
+      agent: current.agent,
+      terminalCode: null,
+      isAbsoluteExpiryWarningVisible: false,
+    }))
+    restartReopenTimerRef.current = setTimeout(() => {
+      restartReopenTimerRef.current = null
+      if (!mountedRef.current || terminalRef.current) return
+      // Under a new generation: the chat page opens a socket per generation.
+      activateSession(session, deliveryId)
+    }, Math.random() * RESTART_REOPEN_MAX_DELAY_MS)
+    return true
+  }, [activateSession, clearWarningTimer])
+
   const isActiveConnection = useCallback((connectionIdentity?: string) => {
     const activeGeneration = activeSessionGenerationRef.current
     return connectionIdentity === undefined || (
@@ -317,6 +422,7 @@ export function useWidgetSession() {
     // not.
     if (activeGeneration !== null && connectionIdentity === `widget-session:${activeGeneration}`) {
       openGenerationRef.current = activeGeneration
+      restartReopensRef.current = 0
       const waiters = openWaitersRef.current
       openWaitersRef.current = []
       waiters.forEach((waiter) => {
@@ -363,9 +469,11 @@ export function useWidgetSession() {
       return "handled"
     }
 
+    if (event.code === SERVICE_RESTART_CLOSE_CODE && reopenAfterRestart()) return "handled"
+
     requestReconnect("ws_closed")
     return "handled"
-  }, [isActiveConnection, requestReconnect, transitionTerminal])
+  }, [isActiveConnection, reopenAfterRestart, requestReconnect, transitionTerminal])
 
   const handleConnectionFailure = useCallback((
     failure: WebSocketConnectionFailure,
@@ -475,17 +583,6 @@ export function useWidgetSession() {
     })
   }, [newWaiter, unavailableError])
 
-  const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
-    clearWarningTimer()
-    const delay = Math.max(0, absoluteExpiresAt - Date.now() - EXPIRY_WARNING_LEAD_MS)
-    warningTimerRef.current = setTimeout(() => {
-      warningTimerRef.current = null
-      setState((current) => current.status === "active"
-        ? { ...current, isAbsoluteExpiryWarningVisible: true }
-        : current)
-    }, delay)
-  }, [clearWarningTimer])
-
   useEffect(() => {
     if (window.parent === window) {
       transitionTerminal("unexpected_error")
@@ -554,36 +651,17 @@ export function useWidgetSession() {
         return
       }
 
-      recoveryInFlightRef.current = false
-      generationRef.current += 1
+      // A session from the parent replaces any pending restart reopen.
+      cancelRestartReopen()
+      restartReopensRef.current = 0
       const capabilities = parseCapabilities(event.data.capabilities)
-      const session: WidgetSession = {
+      activateSession({
         token,
         tokenExpiresAt: event.data.session_token_expires_at as string,
         absoluteExpiresAt: event.data.absolute_expires_at as string,
         agent,
         ...(capabilities ? { capabilities } : {}),
-        generation: generationRef.current,
-      }
-      activeSessionGenerationRef.current = session.generation
-      activeDeliveryIdRef.current = hasDeliveryId ? deliveryId as string : null
-      sessionRef.current = session
-      degradedRef.current = false
-      openGenerationRef.current = null
-      setState({
-        status: "active",
-        session,
-        agent,
-        terminalCode: null,
-        isAbsoluteExpiryWarningVisible: false,
-      })
-      scheduleExpiryWarning(absoluteExpiresAt)
-      const pending = sessionWaitRef.current
-      sessionWaitRef.current = null
-      pending?.waiters.forEach((waiter) => {
-        clearTimeout(waiter.timer)
-        waiter.resolve(session)
-      })
+      }, hasDeliveryId ? deliveryId as string : null)
     }
 
     window.addEventListener("message", onMessage)
@@ -598,6 +676,7 @@ export function useWidgetSession() {
       failPendingWaits()
       window.removeEventListener("message", onMessage)
       recoveryInFlightRef.current = false
+      cancelRestartReopen()
       clearWarningTimer()
     }
     // The bridge owns its parent message subscription for the mounted lifetime.

@@ -834,7 +834,11 @@ export function SessionAgentChatPage() {
   // decided by the server (the voice capability of the session payload), and
   // the voice endpoints check again on every request.
   const [voiceRequested] = useState(
-    () => new URLSearchParams(window.location.search).get("voice") === "1" && pageMayUseMicrophone(),
+    // This first render also runs on the server, where there is no window:
+    // voice is then not requested, and the browser computes it on hydration.
+    () => typeof window !== "undefined"
+      && new URLSearchParams(window.location.search).get("voice") === "1"
+      && pageMayUseMicrophone(),
   )
   // Held across a refresh like the capabilities above, and kept once the
   // session is down, so an open call sees the session end instead of

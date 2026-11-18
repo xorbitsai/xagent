@@ -180,14 +180,16 @@ function AgentChatHeaderContent({
         >
           <button type="button" onClick={() => { setProfileOpen(false); setRoutinesOpen(true) }} className="flex w-full items-center gap-3 rounded-xl border border-border p-3 text-left hover:bg-muted"><CalendarClock className="h-4 w-4 text-[#2536e0]" /><span className="flex-1"><b className="block text-sm font-semibold">{t("workspace.routines")}</b><small className="text-xs text-muted-foreground">{t("workspace.routinesHint")}</small></span><ArrowLeft className="h-4 w-4 rotate-180 text-muted-foreground" /></button>
           <button type="button" onClick={() => router.push(`/build/${agent.id}`)} className="flex w-full items-center gap-3 rounded-xl border border-border p-3 text-left hover:bg-muted"><Code2 className="h-4 w-4 text-[#2536e0]" /><span className="flex-1"><b className="block text-sm font-semibold">{t("workspace.builderSettings")}</b><small className="text-xs text-muted-foreground">{t("workspace.builderHint")}</small></span><ArrowLeft className="h-4 w-4 rotate-180 text-muted-foreground" /></button>
-          <AgentChannelProfileSection
-            agent={agent}
-            onOpenDeploy={(view) => {
-              setProfileOpen(false)
-              if (view === "webhook") setRoutinesOpen(true)
-              else { setDeployView(view); setDeployOpen(true) }
-            }}
-          />
+          {detailsKnown && (
+            <AgentChannelProfileSection
+              agent={agent}
+              onOpenDeploy={(view) => {
+                setProfileOpen(false)
+                if (view === "webhook") setRoutinesOpen(true)
+                else { setDeployView(view); setDeployOpen(true) }
+              }}
+            />
+          )}
         </AgentProfileDialog>
       )}
 

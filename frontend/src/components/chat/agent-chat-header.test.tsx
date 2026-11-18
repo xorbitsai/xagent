@@ -27,7 +27,9 @@ vi.mock("@/contexts/auth-context", () => ({ useAuth: () => ({ user: { id: mocks.
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: mocks.push }) }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: mocks.request }))
 vi.mock("@/components/ui/sonner", () => ({ toast: { success: mocks.success } }))
-vi.mock("@/components/build/agent-triggers-dialog", () => ({ AgentTriggersDialog: () => null }))
+vi.mock("@/components/build/agent-triggers-dialog", () => ({
+  AgentTriggersDialog: ({ open }: { open: boolean }) => <div data-testid="triggers-dialog" data-open={String(open)} />,
+}))
 vi.mock("@/components/build/deploy-agent-dialog", () => ({
   DeployAgentDialog: (props: { initialView?: string }) => {
     mocks.deployProps(props)
@@ -351,6 +353,26 @@ describe("Agent profile editing", () => {
       fireEvent.click(screen.getByRole("button", { name: "profile-webhook" }))
       expect(screen.queryByTestId("deploy-dialog")).not.toBeInTheDocument()
       expect(screen.queryByLabelText("Standing rules")).not.toBeInTheDocument()
+      expect(screen.getByTestId("triggers-dialog")).toHaveAttribute("data-open", "true")
+    })
+
+    it("does not render the profile section while the agent details are pending", async () => {
+      mocks.request.mockReturnValue(new Promise(() => undefined))
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      fireEvent.click(screen.getByRole("button", { name: /More options for/ }))
+      fireEvent.click(screen.getByRole("button", { name: "Profile" }))
+      await screen.findByRole("dialog")
+      expect(screen.queryByRole("button", { name: "profile-embed" })).not.toBeInTheDocument()
+    })
+
+    it("does not render the profile section when the agent details fail to load", async () => {
+      mocks.request.mockResolvedValue(new Response("{}", { status: 500 }))
+      render(<AgentChatHeader agentId={7} name="Ben" />)
+      await waitFor(() => expect(mocks.request).toHaveBeenCalled())
+      fireEvent.click(screen.getByRole("button", { name: /More options for/ }))
+      fireEvent.click(screen.getByRole("button", { name: "Profile" }))
+      await screen.findByRole("dialog")
+      expect(screen.queryByRole("button", { name: "profile-embed" })).not.toBeInTheDocument()
     })
   })
 })

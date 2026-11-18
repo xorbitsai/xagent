@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.router import RouterLLM, _ProfileLookupError
 from xagent.core.tools.core.vision_tool import VisionCore

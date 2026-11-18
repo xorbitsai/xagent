@@ -217,8 +217,7 @@ def at_path(value: Any, path: AssertionPath) -> Any:
                 ),
                 _MISSING,
             )
-            if value is _MISSING:
-                return _MISSING
+            # Every later segment finds nothing in MISSING.
             continue
         if isinstance(segment, str):
             if not isinstance(value, Mapping) or segment not in value:

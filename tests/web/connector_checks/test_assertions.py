@@ -9,6 +9,7 @@ import pytest
 
 from xagent.web.connector_checks.assertions import (
     MISSING,
+    at_path,
     json_equal,
     judge_result,
     resolve_expected,
@@ -276,10 +277,13 @@ _MESSAGES = {
         {"id": "sys-1", "messageType": "unknownFutureValue"},
         "not an object",
         {"id": "num-1", "messageType": 1},
+        {"id": "bool-1", "messageType": True},
+        {"id": "null-1", "messageType": None},
         {"id": "m-1", "messageType": "message", "body": "seed"},
         {"id": "m-2", "messageType": "message", "body": "later"},
     ],
     "site": {"messageType": "message"},
+    "empty": [],
 }
 _FIRST_MESSAGE = FirstWhere("messageType", "message")
 
@@ -295,6 +299,20 @@ def test_first_where_takes_the_first_item_whose_key_matches() -> None:
     assert judge_result(json_result(_MESSAGES), "json_text", assertions) == PASS
 
 
+def test_first_where_may_end_a_path() -> None:
+    first = at_path(_MESSAGES, ("messages", _FIRST_MESSAGE))
+
+    assert first == {"id": "m-1", "messageType": "message", "body": "seed"}
+    assert (
+        judge_result(
+            json_result(_MESSAGES),
+            "json_text",
+            (HasKeys(("messages", _FIRST_MESSAGE), ("id", "body")),),
+        )
+        == PASS
+    )
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -302,6 +320,7 @@ def test_first_where_takes_the_first_item_whose_key_matches() -> None:
         ("messages", FirstWhere("missing", "message"), "id"),
         ("site", _FIRST_MESSAGE, "id"),
         ("messages", 2, "messageType", _FIRST_MESSAGE),
+        ("empty", _FIRST_MESSAGE, "id"),
         ("absent", _FIRST_MESSAGE, "id"),
     ],
 )

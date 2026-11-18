@@ -666,21 +666,32 @@ def _membership_changes(tenant: Tenant) -> None:
     # Disabling the test account and enabling it again posts these two (#3836).
     # Graph v1.0 lists them with messageType unknownFutureValue, not
     # systemEventMessage, and above the seeded message.
-    for message_id, detail in (
-        ("1794660949705", "membersAddedEventMessageDetail"),
-        ("1794658198232", "membersDeletedEventMessageDetail"),
-    ):
-        tenant.messages[CHANNEL_ID].insert(
-            len(tenant.messages[CHANNEL_ID]) - 1,
-            {
-                "id": message_id,
-                "messageType": "unknownFutureValue",
-                "createdDateTime": "2026-11-14T12:09:58Z",
-                "from": None,
-                "body": {"contentType": "html", "content": "<systemEventMessage/>"},
-                "eventDetail": {"@odata.type": f"#microsoft.graph.{detail}"},
-            },
-        )
+    messages = tenant.messages[CHANNEL_ID]
+    seed = next(i for i, m in enumerate(messages) if m["id"] == MESSAGE_ID)
+    messages[seed:seed] = [
+        _system_message("1794660949705", "membersAddedEventMessageDetail"),
+        _system_message("1794658198232", "membersDeletedEventMessageDetail"),
+    ]
+
+
+def _system_message_above_a_newer_message(tenant: Tenant) -> None:
+    # The filter skips system messages only: a person's newer message under one
+    # is still what the check reads first.
+    tenant.messages[CHANNEL_ID][0:0] = [
+        _system_message("1794660949705", "membersAddedEventMessageDetail"),
+        tenant.message("1731500000000", "hello"),
+    ]
+
+
+def _system_message(message_id: str, detail: str) -> dict[str, Any]:
+    return {
+        "id": message_id,
+        "messageType": "unknownFutureValue",
+        "createdDateTime": "2026-11-14T12:09:58Z",
+        "from": None,
+        "body": {"contentType": "html", "content": "<systemEventMessage/>"},
+        "eventDetail": {"@odata.type": f"#microsoft.graph.{detail}"},
+    }
 
 
 def _edited_message(tenant: Tenant) -> None:
@@ -769,6 +780,7 @@ def _speaker_notes(tenant: Tenant) -> None:
         (_extra_channel, {"teams.list_seed_channels"}),
         (_newer_message, {"teams.read_seed_message"}),
         (_membership_changes, set()),
+        (_system_message_above_a_newer_message, {"teams.read_seed_message"}),
         (_edited_message, {"teams.read_seed_message"}),
         (_html_message, set()),
         (_extra_paragraph, {"word.list_paragraphs"}),

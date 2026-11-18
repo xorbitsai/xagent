@@ -92,6 +92,15 @@ class FirstWhere:
     key: str
     value: str
 
+    def __post_init__(self) -> None:
+        if not (isinstance(self.key, str) and self.key) or not isinstance(
+            self.value, str
+        ):
+            raise ValueError(
+                "FirstWhere takes a non-empty key and a string value: "
+                f"{self.key!r}, {self.value!r}"
+            )
+
 
 # An assertion's path: a ``PayloadPath`` that may also hold ``FirstWhere``.
 AssertionPath = tuple[str | int | FirstWhere, ...]
@@ -866,12 +875,6 @@ def _validate_path(
             if not first_where:
                 raise DeclarationError(
                     f"{where}: only an assertion's path may hold FirstWhere"
-                )
-            if not (isinstance(segment.key, str) and segment.key) or not isinstance(
-                segment.value, str
-            ):
-                raise DeclarationError(
-                    f"{where}: FirstWhere takes a non-empty key and a string value"
                 )
         elif not _is_path_segment(segment):
             raise DeclarationError(f"{where}: invalid path segment {segment!r}")

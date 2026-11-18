@@ -168,6 +168,14 @@ def test_an_assertion_path_may_take_the_first_item_where_a_key_matches() -> None
     )
 
 
+@pytest.mark.parametrize(("key", "value"), [("", "x"), (1, "x"), ("a", 1), ("a", None)])
+def test_first_where_takes_a_non_empty_key_and_a_string_value(
+    key: Any, value: Any
+) -> None:
+    with pytest.raises(ValueError, match="FirstWhere takes a non-empty key"):
+        FirstWhere(key, value)
+
+
 @pytest.mark.parametrize("kind", [CreatedRef, ItemRef])
 def test_a_reference_path_takes_no_first_where(kind: Any) -> None:
     with pytest.raises(ValueError, match="path"):
@@ -949,27 +957,10 @@ def _read(**changes: Any) -> ReadCheck:
             ),
             "only an assertion's path may hold FirstWhere",
         ),
-        (
-            _checks(
-                reads=(_read(assertions=(HasKeys((FirstWhere("", "x"),), ("a",)),)),)
-            ),
-            "FirstWhere takes a non-empty key and a string value",
-        ),
-        (
-            _checks(
-                reads=(
-                    _read(
-                        assertions=(
-                            HasKeys((FirstWhere("a", 1),), ("a",)),  # type: ignore[arg-type]
-                        )
-                    ),
-                )
-            ),
-            "FirstWhere takes a non-empty key and a string value",
-        ),
         (_checks(sweep=_sweep(name=())), "name path"),
         (_checks(sweep=_sweep(name="summary")), "name path"),
         (_checks(sweep=_sweep(name=("summary", -1))), "name path"),
+        (_checks(sweep=_sweep(name=("fields", FirstWhere("a", "b")))), "name path"),
         (ConnectorChecks("custom-foo"), "result label"),
         (ConnectorChecks("a" * 65), "result label"),
     ],

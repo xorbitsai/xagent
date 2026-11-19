@@ -1284,3 +1284,206 @@ def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
 
     assert resolution.access_token == expected_token
     assert posted == []
+
+
+@pytest.mark.parametrize(
+    "new_owner",
+    [
+        pytest.param("another-user", id="another-user"),
+        pytest.param("actor", id="same-account-actor"),
+    ],
+)
+def test_a_refresh_never_takes_another_owners_grant_that_reused_its_id(
+    shopify_db, monkeypatch, new_owner
+):
+    """SQLite hands a new row the id of a deleted row with the highest id.
+    The owner disconnects while their refresh waits for the store and
+    someone else connects the store; the waiting refresh must not take the
+    new owner's grant by its reused id."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    grant = _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    grant_id = grant.id
+    if new_owner == "another-user":
+        new_user_id, new_resource_owner_key = _other_user(db).id, None
+    else:
+        new_user_id, new_resource_owner_key = user.id, "toby:w1:u1"
+    reused_ids: list[int] = []
+    posted = _fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+
+    def lock_after_another_owner_connects(session, **kwargs):
+        with sessionmaker(bind=db.get_bind())() as other:
+            other.delete(other.get(UserOAuth, grant_id))
+            other.flush()
+            new_grant = UserOAuth(
+                user_id=new_user_id,
+                provider=TEST_APP_ID,
+                oauth_provider="shopify",
+                resource_owner_key=new_resource_owner_key,
+                access_token="new-owner-access",
+                refresh_token="new-owner-refresh",
+                instance_url="acme",
+                provider_user_id=SHOP_GID,
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+            other.add(new_grant)
+            other.commit()
+            reused_ids.append(new_grant.id)
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(
+        shopify_store_locks, "lock_shopify_store", lock_after_another_owner_connects
+    )
+
+    resolution = _resolve_shopify(db, user.id)
+
+    # The case under test: the new owner's grant took the old grant's id.
+    assert reused_ids == [grant_id]
+    assert resolution.access_token is None
+    assert posted == []
+
+
+def _record_lock_order(engine) -> tuple[list, object]:
+    """Record, per connection, store locks, actor grant-row locks and the
+    ends of transactions, in the order SQL runs them."""
+    from sqlalchemy import event
+
+    events: list = []
+
+    def on_execute(conn, cursor, statement, parameters, *args):
+        sql = " ".join(statement.split()).lower()
+        key = id(conn.connection.dbapi_connection)
+        if sql.startswith("insert into shopify_store_locks"):
+            events.append((key, "store", tuple(parameters)))
+        elif sql.startswith("update user_oauth set id = id"):
+            events.append((key, "row", None))
+
+    def on_end(conn):
+        events.append((id(conn.connection.dbapi_connection), "end", None))
+
+    listeners = [
+        ("before_cursor_execute", on_execute),
+        ("commit", on_end),
+        ("rollback", on_end),
+    ]
+    for name, fn in listeners:
+        event.listen(engine, name, fn)
+
+    def remove():
+        for name, fn in listeners:
+            event.remove(engine, name, fn)
+
+    return events, remove
+
+
+def _assert_no_new_store_lock_after_a_row_lock(events) -> None:
+    """Within a transaction, every store lock comes before the grant-row
+    lock; locking a store already held again is harmless."""
+    state: dict = {}
+    for key, kind, store in events:
+        held, row_locked = state.setdefault(key, (set(), False))
+        if kind == "end":
+            state[key] = (set(), False)
+        elif kind == "row":
+            state[key] = (held, True)
+        else:
+            assert not row_locked or store in held, (
+                f"store {store} locked after the grant row"
+            )
+            state[key] = (held | {store}, row_locked)
+
+
+def _resolve_actor_shopify(db, user_id: int):
+    import asyncio
+
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    config = tool_config.WebToolConfig(
+        db=None, request=None, db_factory=factory, user_id=user_id
+    )
+    return asyncio.run(
+        config._resolve_legacy_oauth_access_token(
+            provider_name="shopify",
+            app_id=TEST_APP_ID,
+            resource_owner_key="toby:w1:u1",
+        )
+    )
+
+
+def test_an_actor_refresh_whose_grant_moved_store_never_locks_a_store_after_it(
+    shopify_db, monkeypatch
+):
+    """The actor reconnects to another store between the refresh reading
+    the grant's store and locking the grant. Locking the new store after the
+    grant would invert the callback's order (store, then grant) and can
+    deadlock on PostgreSQL; the refresh starts over instead."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    grant = _held_grant(
+        db, user, resource_owner_key="toby:w1:u1", expires_in=-timedelta(minutes=1)
+    )
+    grant_id = grant.id
+    posted = _fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+    moved: list[bool] = []
+
+    def lock_after_a_move(session, **kwargs):
+        if not moved:
+            moved.append(True)
+            with sessionmaker(bind=db.get_bind())() as other:
+                other.get(UserOAuth, grant_id).instance_url = "beta"
+                other.commit()
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(shopify_store_locks, "lock_shopify_store", lock_after_a_move)
+    events, remove = _record_lock_order(db.get_bind())
+    try:
+        resolution = _resolve_actor_shopify(db, user.id)
+    finally:
+        remove()
+
+    _assert_no_new_store_lock_after_a_row_lock(events)
+    assert resolution.access_token == "rotated-access"
+    assert len(posted) == 1
+    assert "beta.myshopify.com" in posted[0][0]
+
+
+def test_an_actor_grant_that_appears_after_the_store_read_is_locked_store_first(
+    shopify_db, monkeypatch
+):
+    """The actor had no grant when the refresh read the store, and connects
+    before the grant is locked: the refresh starts over and locks the new
+    grant's store first."""
+    from sqlalchemy import event
+
+    db, user = shopify_db
+    posted = _fake_refresh_client(monkeypatch)
+    engine = db.get_bind()
+    connected: list[bool] = []
+
+    def connect_before_the_row_lock(conn, cursor, statement, *args):
+        sql = " ".join(statement.split()).lower()
+        if not connected and sql.startswith("update user_oauth set id = id"):
+            connected.append(True)
+            with sessionmaker(bind=engine)() as other:
+                _held_grant(
+                    other,
+                    user,
+                    resource_owner_key="toby:w1:u1",
+                    expires_in=-timedelta(minutes=1),
+                )
+
+    event.listen(engine, "before_cursor_execute", connect_before_the_row_lock)
+    events, remove = _record_lock_order(engine)
+    try:
+        resolution = _resolve_actor_shopify(db, user.id)
+    finally:
+        remove()
+        event.remove(engine, "before_cursor_execute", connect_before_the_row_lock)
+
+    assert connected == [True]
+    _assert_no_new_store_lock_after_a_row_lock(events)
+    assert resolution.access_token == "rotated-access"
+    assert len(posted) == 1

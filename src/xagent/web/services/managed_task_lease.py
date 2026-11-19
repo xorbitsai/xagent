@@ -367,6 +367,8 @@ async def finalize_managed_task_lease_result_isolated(
     message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
     error_message: str | None = None,
     execution_result: Mapping[str, Any] | None = None,
+    settle_interruption: bool = False,
+    report: SettlementReport | None = None,
 ) -> bool:
     """Settle one exact managed lease using a worker-owned short Session."""
 
@@ -380,6 +382,8 @@ async def finalize_managed_task_lease_result_isolated(
             message_type=message_type,
             error_message=error_message,
             execution_result=execution_result,
+            settle_interruption=settle_interruption,
+            report=report,
         )
     )
 
@@ -449,8 +453,16 @@ class ManagedTaskLease:
         message_type: str = ASSISTANT_RESPONSE_MESSAGE_TYPE,
         error_message: str | None = None,
         execution_result: Mapping[str, Any] | None = None,
+        settle_interruption: bool = False,
+        report: SettlementReport | None = None,
     ) -> bool:
-        """Stop heartbeating, then atomically persist this owner's result."""
+        """Stop heartbeating, then atomically persist this owner's result.
+
+        ``settle_interruption`` and ``report`` are forwarded to
+        ``finalize_managed_task_lease_result_sync``: an interrupted FAILED
+        ``execution_result`` may rest PAUSED, and ``report`` is filled only
+        once a pause has committed.
+        """
 
         if self._closed:
             return False
@@ -464,6 +476,8 @@ class ManagedTaskLease:
                 message_type=message_type,
                 error_message=error_message,
                 execution_result=execution_result,
+                settle_interruption=settle_interruption,
+                report=report,
             )
         )
         return await self._confirmed(cleanup_task, "finalize")
@@ -511,6 +525,8 @@ class ManagedTaskLease:
         message_type: str,
         error_message: str | None,
         execution_result: Mapping[str, Any] | None = None,
+        settle_interruption: bool = False,
+        report: SettlementReport | None = None,
     ) -> bool:
         if not await self._stop_heartbeat_for_settlement():
             return False
@@ -523,6 +539,8 @@ class ManagedTaskLease:
             message_type=message_type,
             error_message=error_message,
             execution_result=execution_result,
+            settle_interruption=settle_interruption,
+            report=report,
         )
 
     async def _close_resources(self) -> bool:

@@ -117,12 +117,16 @@ interface SidebarProps {
   profileSubtitle?: string
   /**
    * `mobile-home` renders the teammate list as a full-screen phone home view
-   * (profile button, new menu, list, search) instead of the desktop sidebar.
+   * (new menu, list, search, account menu) instead of the desktop sidebar.
+   * Hosts must not mount it next to a default Sidebar: each instance owns the
+   * `?settings=` deep link and would open its own Settings dialog.
    */
   variant?: "default" | "mobile-home"
 }
 
 const TASKS_PER_PAGE = 40
+
+const isPublished = (agent: AgentSummary) => agent.status === "published"
 
 const CHANNEL_ICON_PATHS: Record<string, string> = {
   feishu: "/icons/channels/feishu.svg",
@@ -781,10 +785,10 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle, va
     void openFirstConversation(agent)
   }
 
-  const rosterAgents = agents.filter((agent) => agent.status === "published")
+  const rosterAgents = agents.filter(isPublished)
   const hasSearchResults = searchResults.query === searchQuery
   const visibleAgents = (searchQuery ? hasSearchResults ? searchResults.agents : [] : agents)
-    .filter((agent) => agent.status === "published")
+    .filter(isPublished)
   const visibleTasks = searchQuery ? hasSearchResults ? searchResults.tasks : [] : tasks
   const primaryUserMenuItems = userMenuItems.filter((item) => item.href !== "/settings" && !item.children?.length)
   const workspaceUserMenuItems = userMenuItems.filter((item) => item.children?.length)
@@ -838,6 +842,7 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle, va
               <Link
                 key={agent.id}
                 href={destination}
+                aria-current={active ? "page" : undefined}
                 aria-busy={isOpening || undefined}
                 onClick={(event) => handleAgentLinkClick(event, agent)}
                 className={cn("group flex items-start gap-2.5 rounded-xl px-2.5 py-2 transition-colors", roomy && "gap-3.5 px-3 py-3.5", active ? "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]" : "hover:bg-[#f0f0f3]", isOpening && "pointer-events-none opacity-70")}
@@ -955,16 +960,18 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle, va
       <>
         <aside className={cn("flex h-full w-full flex-col bg-[#f8f8fa] text-[#1a1a1f]", className)}>
           <div className="flex h-16 shrink-0 items-center justify-between px-4">
-            <button type="button" onClick={() => setUserMenuOpen(true)} aria-label={profileLabel} title={profileLabel} className="grid h-10 w-10 place-items-center rounded-full bg-[#2536e0] text-sm font-semibold uppercase text-white shadow-sm">{userLabel.charAt(0)}</button>
+            <span aria-hidden="true" className="grid h-10 w-10 place-items-center rounded-full bg-[#2536e0] text-sm font-semibold uppercase text-white shadow-sm">{userLabel.charAt(0)}</span>
             <h1 className="text-base font-bold tracking-tight">{branding.appName}</h1>
             {renderStartMenu("grid h-10 w-10 place-items-center rounded-full bg-white text-foreground shadow-sm", "h-5 w-5")}
           </div>
           <div className="flex min-h-0 flex-1 flex-col px-2">
             {teamListBody}
           </div>
-          <div ref={userMenuRef} className="relative flex shrink-0 items-center gap-2 px-4 pb-4 pt-2">
-            {renderUserMenu("left-4 w-[min(20rem,calc(100%-2rem))]")}
-            <button type="button" onClick={() => setUserMenuOpen((open) => !open)} aria-expanded={userMenuOpen} aria-label={t("workspace.openNavigation")} title={t("workspace.openNavigation")} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-white text-muted-foreground shadow-sm"><LayoutGrid className="h-5 w-5" /></button>
+          <div className="flex shrink-0 items-center gap-2 px-4 pb-4 pt-2">
+            <div ref={userMenuRef} className="relative shrink-0">
+              {renderUserMenu("left-0 w-[min(20rem,calc(100vw-2rem))]")}
+              <button type="button" onClick={() => setUserMenuOpen((open) => !open)} aria-expanded={userMenuOpen} aria-haspopup="true" aria-label={t("workspace.accountMenu")} title={t("workspace.accountMenu")} className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-white text-muted-foreground shadow-sm"><LayoutGrid className="h-5 w-5" /></button>
+            </div>
             <label className="relative block min-w-0 flex-1">
               <span className="sr-only">{t("workspace.searchLabel")}</span>
               <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />

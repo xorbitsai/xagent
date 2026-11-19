@@ -2207,6 +2207,7 @@ const zh = {
   },
   workspace: {
     openNavigation: "展开导航",
+    accountMenu: "账户菜单",
     closeNavigation: "收起导航",
     startNew: "开始新工作",
     newTask: "新建任务",

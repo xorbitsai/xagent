@@ -9,8 +9,19 @@ compliance topics (``customers/data_request``, ``customers/redact`` and
   grant of this deployment's Shopify app for the store is deleted; its owners
   see the connector ask them to reconnect.
 - ``shop/redact`` (about 48 hours after an uninstall): the same deletion, again,
-  in case anything was reconnected or left behind. The grant is everything
-  this deployment keeps about a store.
+  in case anything was left behind. The grant is everything this deployment
+  keeps about a store.
+
+A grant written after the event happened (``X-Shopify-Triggered-At``) is kept:
+Shopify retries for hours and does not deliver in order, so a late
+``app/uninstalled`` must not delete the grant of a merchant who has since
+reconnected. Without a usable time every grant for the store is deleted.
+
+The store is matched by its label (``<label>.myshopify.com`` in the body) or
+by the shop's id, which the callback stores as the grant's identity
+(``gid://shopify/Shop/<id>``). Grants of an administrator-created
+``shopify-*`` provider row belong to another Shopify app, signed with another
+secret, and are not touched.
 - ``customers/redact`` and ``customers/data_request``: no per-customer records
   are kept, so these are acknowledged and logged without the customer's
   details.
@@ -31,11 +42,12 @@ import json
 import logging
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -61,6 +73,7 @@ TOPIC_CUSTOMERS_DATA_REQUEST = "customers/data_request"
 # Topics that delete the store's grants.
 _STORE_DELETING_TOPICS = frozenset({TOPIC_APP_UNINSTALLED, TOPIC_SHOP_REDACT})
 _CUSTOMER_TOPICS = frozenset({TOPIC_CUSTOMERS_REDACT, TOPIC_CUSTOMERS_DATA_REQUEST})
+_SHOP_GID_PREFIX = "gid://shopify/Shop/"
 # Header values are unsigned; only a plain id is worth putting in a log line.
 _LOGGABLE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
 
@@ -78,11 +91,22 @@ class ShopifyWebhookRefused(Exception):
 
 @dataclass(frozen=True)
 class ShopifyWebhook:
-    """A verified delivery. ``store`` is ``None`` for a topic we ignore."""
+    """A verified delivery.
+
+    ``store`` and ``shop_gid`` identify the store when the body names it;
+    ``triggered_at`` is when Shopify says the event happened, if known.
+    """
 
     topic: str
     store: str | None
+    shop_gid: str | None
+    triggered_at: datetime | None
     webhook_id: str | None
+
+    @property
+    def applies(self) -> bool:
+        """Whether this deployment acts on (and passes on) the topic."""
+        return self.topic in _STORE_DELETING_TOPICS or self.topic in _CUSTOMER_TOPICS
 
 
 def shopify_webhook_secret(db: Session) -> str:
@@ -103,34 +127,58 @@ def shopify_webhook_secret(db: Session) -> str:
     )
 
 
-def _store_label(domain: object) -> str:
-    """The store label of ``<label>.myshopify.com``; refuse anything else."""
+def _store_label(domain: object) -> str | None:
+    """The store label of ``<label>.myshopify.com``, or ``None``."""
     if not isinstance(domain, str):
-        raise ShopifyWebhookRefused(400, "shop_invalid")
+        return None
     label, _, suffix = domain.strip().lower().partition(".")
     try:
         account = normalize_oauth_account(label)
     except OAuthAccountError:
-        account = None
+        return None
     if account is None or suffix != SHOPIFY_HOST_SUFFIX:
-        raise ShopifyWebhookRefused(400, "shop_invalid")
+        return None
     return account
 
 
-def _store_of(topic: str, payload: Mapping[str, Any]) -> str:
-    """The store a payload names, once the payload fits ``topic``.
+def _shop_gid(shop_id: object) -> str | None:
+    """The grant identity of a shop id from the body, or ``None``."""
+    if isinstance(shop_id, int) and shop_id > 0:
+        return f"{_SHOP_GID_PREFIX}{shop_id}"
+    if isinstance(shop_id, str) and shop_id.isascii() and shop_id.isdigit():
+        return f"{_SHOP_GID_PREFIX}{int(shop_id)}"
+    return None
 
-    ``app/uninstalled`` carries the shop resource (``myshopify_domain``); the
-    compliance topics carry ``shop_domain``, and only the customer topics a
-    ``customer``. Requiring each topic's own fields keeps a signed body of one
-    topic from being replayed under the unsigned header of another.
+
+def _store_of(topic: str, payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """The store label and shop gid a payload names, once it fits ``topic``.
+
+    ``app/uninstalled`` carries the shop resource (``id``,
+    ``myshopify_domain``); the compliance topics carry ``shop_id`` and
+    ``shop_domain``, and only the customer topics a ``customer``. Requiring the
+    customer field to match the topic keeps a signed customer request from
+    being replayed under the unsigned ``shop/redact`` header.
     """
     if topic == TOPIC_APP_UNINSTALLED:
-        return _store_label(payload.get("myshopify_domain"))
+        return _store_label(payload.get("myshopify_domain")), _shop_gid(
+            payload.get("id")
+        )
     is_customer_topic = topic in _CUSTOMER_TOPICS
     if is_customer_topic != isinstance(payload.get("customer"), dict):
         raise ShopifyWebhookRefused(400, "payload_mismatch")
-    return _store_label(payload.get("shop_domain"))
+    return _store_label(payload.get("shop_domain")), _shop_gid(payload.get("shop_id"))
+
+
+def _triggered_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment
 
 
 def read_shopify_webhook(
@@ -148,23 +196,66 @@ def read_shopify_webhook(
         raise ShopifyWebhookRefused(401, "hmac_invalid")
     topic = headers.get("x-shopify-topic", "").strip().lower()
     raw_id = headers.get("x-shopify-webhook-id", "").strip()
-    webhook_id = raw_id if _LOGGABLE_ID.fullmatch(raw_id) else None
-    if topic not in _STORE_DELETING_TOPICS and topic not in _CUSTOMER_TOPICS:
-        return ShopifyWebhook(topic=topic, store=None, webhook_id=webhook_id)
+    webhook = ShopifyWebhook(
+        topic=topic,
+        store=None,
+        shop_gid=None,
+        triggered_at=_triggered_at(headers.get("x-shopify-triggered-at")),
+        webhook_id=raw_id if _LOGGABLE_ID.fullmatch(raw_id) else None,
+    )
+    if not webhook.applies:
+        return webhook
     try:
         payload = json.loads(body)
     except ValueError:
         raise ShopifyWebhookRefused(400, "payload_invalid") from None
     if not isinstance(payload, dict):
         raise ShopifyWebhookRefused(400, "payload_invalid")
-    return ShopifyWebhook(
-        topic=topic, store=_store_of(topic, payload), webhook_id=webhook_id
+    store, shop_gid = _store_of(topic, payload)
+    return replace(webhook, store=store, shop_gid=shop_gid)
+
+
+def _written_at(grant: UserOAuth) -> datetime | None:
+    moment = grant.updated_at or grant.created_at
+    if not isinstance(moment, datetime):
+        return None
+    # SQLite hands timestamps back naive; they are UTC (func.now()).
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _delete_store_grants(db: Session, webhook: ShopifyWebhook) -> tuple[int, int]:
+    """Delete the store's grants written before the event; count kept ones."""
+    identity = []
+    if webhook.store is not None:
+        identity.append(func.lower(UserOAuth.instance_url) == webhook.store)
+    if webhook.shop_gid is not None:
+        identity.append(UserOAuth.provider_user_id == webhook.shop_gid)
+    grants = (
+        db.query(UserOAuth)
+        .filter(
+            func.lower(UserOAuth.oauth_provider) == SHOPIFY_PROVIDER,
+            or_(*identity),
+        )
+        .all()
     )
+    kept = 0
+    for grant in grants:
+        written_at = _written_at(grant)
+        if (
+            webhook.triggered_at is not None
+            and written_at is not None
+            and written_at > webhook.triggered_at
+        ):
+            kept += 1
+            continue
+        db.delete(grant)
+    db.commit()
+    return len(grants) - kept, kept
 
 
 def apply_shopify_webhook(db: Session, webhook: ShopifyWebhook) -> None:
     """Apply a verified delivery to this deployment's database and commit."""
-    if webhook.store is None:
+    if not webhook.applies:
         logger.info(
             "Ignoring Shopify webhook topic %r (webhook %s)",
             webhook.topic[:64],
@@ -172,21 +263,27 @@ def apply_shopify_webhook(db: Session, webhook: ShopifyWebhook) -> None:
         )
         return
     if webhook.topic in _STORE_DELETING_TOPICS:
-        deleted = (
-            db.query(UserOAuth)
-            .filter(
-                func.lower(UserOAuth.oauth_provider) == SHOPIFY_PROVIDER,
-                func.lower(UserOAuth.instance_url) == webhook.store,
+        if webhook.store is None and webhook.shop_gid is None:
+            # Signed by Shopify but naming no store we can look up (Shopify's
+            # sample payloads carry placeholders). Refusing it would only make
+            # Shopify retry the same body.
+            logger.warning(
+                "Shopify %s named no store (webhook %s); nothing deleted",
+                webhook.topic,
+                webhook.webhook_id,
             )
-            .delete(synchronize_session=False)
-        )
-        db.commit()
+            return
+        deleted, kept = _delete_store_grants(db, webhook)
         logger.info(
-            "Shopify %s for store %s (webhook %s): deleted %d grant(s)",
+            "Shopify %s for store %s / %s (webhook %s): deleted %d grant(s), "
+            "kept %d written after the event%s",
             webhook.topic,
             webhook.store,
+            webhook.shop_gid,
             webhook.webhook_id,
             deleted,
+            kept,
+            "" if webhook.triggered_at is not None else " (no event time)",
         )
         return
     # No per-customer records are kept; never log the customer's details.
@@ -208,6 +305,9 @@ async def receive_verified_shopify_webhook(
     """
     body = await request.body()
     client_secret = await run_in_threadpool(shopify_webhook_secret, db)
+    # End the read's transaction: a multi-region caller keeps this session
+    # open while it passes the delivery on.
+    await run_in_threadpool(db.rollback)
     if not client_secret:
         logger.warning("Shopify webhook received with no Shopify client configured")
         return Response(status_code=503)

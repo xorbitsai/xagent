@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import FastAPI
@@ -120,7 +121,16 @@ def _grant(
     )
 
 
-def _post(client, topic, payload, *, secret=CLIENT_SECRET, body=None, signature=None):
+def _post(
+    client,
+    topic,
+    payload,
+    *,
+    secret=CLIENT_SECRET,
+    body=None,
+    signature=None,
+    triggered_at=None,
+):
     raw = body if body is not None else json.dumps(payload).encode()
     headers = {
         "Content-Type": "application/json",
@@ -130,6 +140,8 @@ def _post(client, topic, payload, *, secret=CLIENT_SECRET, body=None, signature=
     }
     if signature is not False:
         headers["X-Shopify-Hmac-Sha256"] = signature or _signature(raw, secret)
+    if triggered_at is not None:
+        headers["X-Shopify-Triggered-At"] = triggered_at
     return client.post(PATH, content=raw, headers=headers)
 
 
@@ -155,6 +167,9 @@ def test_known_webhook_signature_vector_verifies():
     assert not verify_shopify_webhook(body, None, client_secret="secret")
     assert not verify_shopify_webhook(body, "", client_secret="secret")
     assert not verify_shopify_webhook(body, expected, client_secret="")
+    # A signature made with an empty key must not pass for an unset secret.
+    unkeyed = base64.b64encode(hmac.new(b"", body, hashlib.sha256).digest()).decode()
+    assert not verify_shopify_webhook(body, unkeyed, client_secret="")
 
 
 @pytest.mark.parametrize(
@@ -212,6 +227,7 @@ def test_uninstall_and_shop_redact_delete_every_grant_for_the_store(
             _grant(user),
             _grant(user, actor="actor:toby:1"),
             _grant(other, store="ACME"),
+            _grant(other, store="acme", oauth_provider="SHOPIFY", actor="actor:toby:2"),
             _grant(user, store="beta", gid="2"),
             # Another issuer's grant that happens to hold the same label.
             _grant(other, oauth_provider="deputy", app="deputy"),
@@ -239,29 +255,110 @@ def test_a_repeated_delivery_is_still_accepted(client, shopify_db):
     "topic,payload",
     [
         # The topic header is not signed: a signed customer body relabelled
-        # as shop/redact, or one topic's body relabelled as the other's, must
-        # not delete anything.
+        # as shop/redact must not delete anything.
         ("shop/redact", CUSTOMERS_REDACT),
         ("shop/redact", CUSTOMERS_DATA_REQUEST),
-        ("shop/redact", UNINSTALLED),
-        ("app/uninstalled", SHOP_REDACT),
-        ("app/uninstalled", CUSTOMERS_REDACT),
-        # Only a store directly under myshopify.com is ours to look up.
-        ("app/uninstalled", {**UNINSTALLED, "myshopify_domain": "acme.example.com"}),
-        ("app/uninstalled", {**UNINSTALLED, "myshopify_domain": "a.b.myshopify.com"}),
-        ("shop/redact", {**SHOP_REDACT, "shop_domain": ""}),
-        ("shop/redact", {**SHOP_REDACT, "shop_domain": 5}),
+        ("customers/redact", SHOP_REDACT),
     ],
 )
 def test_a_body_that_does_not_fit_its_topic_is_refused(
     client, shopify_db, topic, payload
 ):
     _, db, user, _ = shopify_db
-    db.add(_grant(user))
+    db.add(_grant(user, gid="548380009"))
     db.commit()
     response = _post(client, topic, payload)
     assert response.status_code == 400
     assert _stores(db) == [("shopify", "acme", None)]
+
+
+@pytest.mark.parametrize(
+    "topic,payload",
+    [
+        # One topic's body under the other's header names no store there.
+        ("shop/redact", UNINSTALLED),
+        ("app/uninstalled", SHOP_REDACT),
+        ("app/uninstalled", CUSTOMERS_REDACT),
+        # Only a store directly under myshopify.com, or a numeric shop id.
+        ("app/uninstalled", {"id": "x", "myshopify_domain": "acme.example.com"}),
+        ("app/uninstalled", {"id": True, "myshopify_domain": "a.b.myshopify.com"}),
+        # Shopify's sample payloads carry placeholders.
+        ("shop/redact", {"shop_id": None, "shop_domain": "{shop}.myshopify.com"}),
+        ("shop/redact", {"shop_domain": 5}),
+    ],
+)
+def test_a_signed_body_naming_no_store_is_acknowledged_and_deletes_nothing(
+    client, shopify_db, topic, payload
+):
+    """Refusing it would only make Shopify retry the same signed body."""
+    _, db, user, _ = shopify_db
+    db.add(_grant(user, gid="548380009"))
+    db.commit()
+    response = _post(client, topic, payload)
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+@pytest.mark.parametrize(
+    "topic,payload",
+    [
+        ("app/uninstalled", {**UNINSTALLED, "myshopify_domain": None}),
+        ("shop/redact", {**SHOP_REDACT, "shop_domain": "{shop}.myshopify.com"}),
+        ("shop/redact", {**SHOP_REDACT, "shop_id": "548380009", "shop_domain": None}),
+    ],
+)
+def test_the_shop_id_finds_the_store_without_a_domain(
+    client, shopify_db, topic, payload
+):
+    _, db, user, other = shopify_db
+    db.add_all(
+        [
+            _grant(user, store="renamed", gid="548380009"),
+            _grant(other, store="beta", gid="2"),
+        ]
+    )
+    db.commit()
+    response = _post(client, topic, payload)
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "beta", None)]
+
+
+def test_a_late_event_keeps_a_grant_written_after_it(client, shopify_db):
+    """Shopify retries for hours and does not keep order: an app/uninstalled
+    that arrives after the merchant reconnected must not delete the new grant."""
+    _, db, user, other = shopify_db
+    uninstalled_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    reconnected = _grant(user, actor="actor:toby:1")
+    reconnected.created_at = uninstalled_at - timedelta(days=3)
+    reconnected.updated_at = uninstalled_at + timedelta(minutes=2)
+    stale = _grant(other)
+    stale.created_at = uninstalled_at - timedelta(days=3)
+    db.add_all([reconnected, stale])
+    db.commit()
+
+    response = _post(
+        client,
+        "app/uninstalled",
+        UNINSTALLED,
+        triggered_at="2026-11-19T07:00:00.877041743Z",
+    )
+
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", "actor:toby:1")]
+
+
+@pytest.mark.parametrize("triggered_at", [None, "yesterday", "2026-11-19T07:00:00"])
+def test_without_a_usable_event_time_every_grant_for_the_store_goes(
+    client, shopify_db, triggered_at
+):
+    _, db, user, _ = shopify_db
+    grant = _grant(user)
+    grant.updated_at = datetime.now(timezone.utc) + timedelta(days=1)
+    db.add(grant)
+    db.commit()
+    response = _post(client, "app/uninstalled", UNINSTALLED, triggered_at=triggered_at)
+    assert response.status_code == 200
+    assert _stores(db) == []
 
 
 @pytest.mark.parametrize("body", [b"not json", b"[]", b"null"])

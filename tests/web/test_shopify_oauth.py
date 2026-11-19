@@ -1357,6 +1357,16 @@ def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
     # token never reaches the provider.
     assert bool(posted) == (failure == "transient")
     assert _probe_store_lock(db) is True
+    db.expire_all()
+    if failure == "permanent":
+        # The dead grant is cleared, so the store is free for someone else.
+        assert not _grant(db, user).access_token
+        flow = _login_state(db, _other_user(db))
+        _mock_shopify_http(monkeypatch)
+        assert _callback(db, flow).status_code == 200
+    else:
+        # A transient failure keeps the grant, and with it the store.
+        assert _grant(db, user).access_token == "held-access"
 
 
 def test_a_refresh_that_waited_for_the_store_uses_the_newer_token(

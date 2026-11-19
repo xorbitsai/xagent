@@ -1,3 +1,4 @@
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from xagent.core.tools.core.document_parser import (
     document_parser_registry,
     filter_parsers_by_capabilities,
 )
+from xagent.core.workspace import TaskWorkspace
 from xagent.providers.pdf_parser.base import (
     DocumentParser,
     FigureParsing,
@@ -256,7 +258,7 @@ async def test_document_parse_tool_successful_run(
 
 
 @pytest.mark.asyncio
-async def test_document_parse_tool_default_parser_selection(mock_workspace):
+async def test_document_parse_tool_default_parser_selection():
     """Test that document parse tool correctly uses deepdoc parser for PDF files."""
     # Use a real PDF file for testing
     from pathlib import Path
@@ -269,7 +271,9 @@ async def test_document_parse_tool_default_parser_selection(mock_workspace):
     if not test_pdf_path.exists():
         pytest.skip(f"Test PDF not found: {test_pdf_path}")
 
-    tool = DocumentParseTool(workspace=mock_workspace)
+    # No workspace: this test covers parser auto-selection, and the fixture PDF
+    # lives outside any task workspace.
+    tool = DocumentParseTool()
     args = {
         "file_path": str(test_pdf_path),
         "parser_name": "",  # Empty parser_name triggers auto-selection for PDF -> deepdoc
@@ -464,3 +468,173 @@ async def test_document_parse_with_output_tool_error_on_file_writing(
         RuntimeError, match="Failed to write output to /mock/workspace/output.txt"
     ):
         await tool.run_json_async(args)
+
+
+# --- Workspace containment ---------------------------------------------------
+# A path the workspace refuses to resolve must fail the tool call. Nothing may
+# be read from or written to the raw, unresolved path.
+
+_CAPABILITIES = {
+    "capability_text": True,
+    "capability_figure": False,
+    "requires_full_text_result": False,
+    "requires_segmented_result": False,
+    "use_local_parser": True,
+}
+
+
+@pytest.fixture
+def contained_workspace(tmp_path, monkeypatch):
+    """A real workspace whose directory differs from the process cwd.
+
+    The cwd sits two levels below ``tmp_path`` so that a rejected
+    ``../../`` path would still land inside ``tmp_path`` if it were opened
+    relative to the cwd, where the test can see it.
+    """
+    workspace = TaskWorkspace("doc-parse", base_dir=str(tmp_path / "ws"))
+    cwd = tmp_path / "cwd" / "a"
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    source = workspace.input_dir / "doc.txt"
+    source.write_text("hello", encoding="utf-8")
+    return workspace
+
+
+def _files_under(root: Path) -> set[Path]:
+    return {p for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output_path",
+    [
+        pytest.param("ABSOLUTE_OUTSIDE", id="absolute-outside-workspace"),
+        pytest.param("../../escape.md", id="relative-parent-traversal"),
+    ],
+)
+async def test_document_parse_with_output_rejects_unresolvable_output_path(
+    tmp_path, contained_workspace, output_path
+):
+    if output_path == "ABSOLUTE_OUTSIDE":
+        output_path = str(tmp_path / "outside.md")
+    files_before = _files_under(tmp_path)
+    parse = AsyncMock(return_value=ParseResult(full_text="parsed text"))
+    tool = DocumentParseWithOutputTool(workspace=contained_workspace)
+
+    with patch("xagent.core.tools.core.document_parser.parse_document", parse):
+        with pytest.raises(ValueError, match="outside allowed directories"):
+            await tool.run_json_async(
+                {
+                    "file_path": "doc.txt",
+                    "output_path": output_path,
+                    "capabilities": _CAPABILITIES,
+                }
+            )
+
+    parse.assert_not_awaited()
+    assert _files_under(tmp_path) == files_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_path",
+    [
+        pytest.param("ABSOLUTE_OUTSIDE", id="absolute-outside-workspace"),
+        pytest.param("../../secret.txt", id="relative-parent-traversal"),
+    ],
+)
+async def test_document_parse_with_output_rejects_unresolvable_file_path(
+    tmp_path, contained_workspace, file_path
+):
+    # Both parametrized paths name this existing file outside the workspace.
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outside", encoding="utf-8")
+    if file_path == "ABSOLUTE_OUTSIDE":
+        file_path = str(secret)
+    files_before = _files_under(tmp_path)
+    parse = AsyncMock(return_value=ParseResult(full_text="parsed text"))
+    tool = DocumentParseWithOutputTool(workspace=contained_workspace)
+
+    with patch("xagent.core.tools.core.document_parser.parse_document", parse):
+        with pytest.raises(ValueError, match="outside allowed directories"):
+            await tool.run_json_async(
+                {
+                    "file_path": file_path,
+                    "output_path": "result.md",
+                    "capabilities": _CAPABILITIES,
+                }
+            )
+
+    parse.assert_not_awaited()
+    assert _files_under(tmp_path) == files_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_path",
+    [
+        pytest.param("ABSOLUTE_OUTSIDE", id="absolute-outside-workspace"),
+        pytest.param("../../secret.txt", id="relative-parent-traversal"),
+    ],
+)
+async def test_document_parse_rejects_unresolvable_file_path(
+    tmp_path, contained_workspace, file_path
+):
+    # Both parametrized paths name this existing file outside the workspace.
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outside", encoding="utf-8")
+    if file_path == "ABSOLUTE_OUTSIDE":
+        file_path = str(secret)
+    parse = AsyncMock(return_value=ParseResult(full_text="outside"))
+    tool = DocumentParseTool(workspace=contained_workspace)
+
+    with patch("xagent.core.tools.adapters.vibe.document_parser.parse_document", parse):
+        with pytest.raises(ValueError, match="outside allowed directories"):
+            await tool.run_json_async(
+                {"file_path": file_path, "capabilities": _CAPABILITIES}
+            )
+
+    parse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_document_parse_rejects_file_missing_from_workspace(
+    contained_workspace,
+):
+    parse = AsyncMock(return_value=ParseResult(full_text="parsed text"))
+    tool = DocumentParseTool(workspace=contained_workspace)
+
+    with patch("xagent.core.tools.adapters.vibe.document_parser.parse_document", parse):
+        with pytest.raises(FileNotFoundError, match="not found in workspace"):
+            await tool.run_json_async(
+                {"file_path": "missing.pdf", "capabilities": _CAPABILITIES}
+            )
+
+    parse.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_document_parse_with_output_writes_inside_workspace(
+    contained_workspace,
+):
+    parse = AsyncMock(return_value=ParseResult(full_text="parsed text"))
+    tool = DocumentParseWithOutputTool(workspace=contained_workspace)
+
+    with patch("xagent.core.tools.core.document_parser.parse_document", parse):
+        result = await tool.run_json_async(
+            {
+                "file_path": "doc.txt",
+                "output_path": "result.md",
+                "capabilities": _CAPABILITIES,
+            }
+        )
+
+    assert result == DocumentParseWithOutputResult()
+    parsed_args = parse.await_args.args[0]
+    assert (
+        Path(parsed_args.file_path)
+        == (contained_workspace.input_dir / "doc.txt").resolve()
+    )
+    written = (contained_workspace.output_dir / "result.md").resolve()
+    assert Path(parsed_args.output_path) == written
+    assert "parsed text" in written.read_text(encoding="utf-8")

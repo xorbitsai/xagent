@@ -23,6 +23,7 @@ from xagent.web.tools.mcp import cosmos
 
 KEY = "dGhpcy1pcy1hLXNlY3JldC1rZXk="
 ENDPOINT = "https://acct.documents.azure.com:443/"
+HOST = "acct.documents.azure.com"
 SENTINEL = "SENTINEL-RAW-SDK-TEXT"
 TOOLS = [
     "cosmos_list_databases",
@@ -74,6 +75,11 @@ class FakeContainer:
         self.owner.timeouts.append(kwargs.get("timeout"))
         return FakeItems(self.owner.pages, self.owner.calls, kwargs["response_hook"])
 
+    def read(self, **kwargs):
+        self.owner.calls.append("container.read")
+        self.owner.timeouts.append(kwargs.get("timeout"))
+        return self.owner.container_props
+
     def read_item(self, item, partition_key, response_hook=None, **kwargs):
         self.owner.read_args = (item, partition_key)
         self.owner.timeouts.append(kwargs.get("timeout"))
@@ -118,6 +124,10 @@ class FakeClient:
         self.item = self.default_item
         self.closed = False
         self.timeouts: list[Any] = []
+        self.container_props: dict[str, Any] = {
+            "id": "c",
+            "partitionKey": {"paths": ["/pk"], "kind": "Hash"},
+        }
 
     def list_databases(self, max_item_count=None, **kwargs):
         self.timeouts.append(kwargs.get("timeout"))
@@ -208,7 +218,7 @@ def test_guarded_transport_blocks_other_hosts(monkeypatch, caplog):
         return type("Response", (), {"status_code": 200})()
 
     monkeypatch.setattr(RequestsTransport, "send", fake_send)
-    transport = cosmos._GuardedTransport()
+    transport = cosmos._GuardedTransport(HOST)
     req = lambda url: type("R", (), {"url": url})()  # noqa: E731
     transport.send(req("https://acct.documents.azure.com/dbs/appdb/colls?x=1"))
     for bad in (
@@ -223,6 +233,37 @@ def test_guarded_transport_blocks_other_hosts(monkeypatch, caplog):
     assert "evil.example.net" in caplog.text
 
 
+def test_transport_is_pinned_to_the_configured_account_host(monkeypatch):
+    sent = []
+
+    def fake_send(self, request, **kw):
+        sent.append(request.url)
+        return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(RequestsTransport, "send", fake_send)
+    transport = cosmos._GuardedTransport(HOST)
+    for other in (
+        "https://acct-westus.documents.azure.com/",  # a valid account host, but not ours
+        "https://other.documents.azure.com/",
+        "https://acct.documents.azure.us/",
+    ):
+        with pytest.raises(cosmos.BlockedDestinationError):
+            transport.send(HttpRequest("GET", other))
+    transport.send(HttpRequest("GET", f"https://{HOST.upper()}/dbs"))
+    assert len(sent) == 1
+
+
+def test_other_value_errors_are_not_reported_as_blocked(real_transport):
+    """A closed transport or an encoding failure is not an outbound refusal."""
+    real_transport("93.184.216.34")
+    transport = cosmos._GuardedTransport(HOST)
+    transport.open()
+    transport.close()
+    with pytest.raises(ValueError) as excinfo:
+        transport.send(HttpRequest("GET", f"https://{HOST}/dbs"))
+    assert not isinstance(excinfo.value, cosmos.BlockedDestinationError)
+
+
 def test_blocked_destination_is_its_own_error_code(client, monkeypatch, caplog):
     def blocked(self, *a, **kw):
         raise cosmos.BlockedDestinationError
@@ -235,7 +276,7 @@ def test_blocked_destination_is_its_own_error_code(client, monkeypatch, caplog):
 
 def test_transport_uses_the_public_only_session():
     """Dropping ``session=`` would remove the private-address guard."""
-    transport = cosmos._GuardedTransport()
+    transport = cosmos._GuardedTransport(HOST)
     assert isinstance(transport.session, public_requests.Session)
 
 
@@ -249,7 +290,7 @@ def test_transport_does_not_follow_redirects(monkeypatch):
         response.raw = io.BytesIO(b"")
         return response
 
-    transport = cosmos._GuardedTransport()
+    transport = cosmos._GuardedTransport(HOST)
     monkeypatch.setattr(transport.session, "request", fake_request)
     transport.send(HttpRequest("GET", "https://acct.documents.azure.com/dbs"))
     assert seen["allow_redirects"] is False
@@ -808,7 +849,6 @@ def test_every_operation_gets_the_total_timeout(client):
         "EXEC sproc",
         "",
         "-- SELECT 1\nDELETE",
-        "x" * (cosmos.MAX_QUERY_CHARS + 1),
     ],
 )
 def test_query_rejects_non_select(client, query):
@@ -821,9 +861,9 @@ def test_query_rejects_non_select(client, query):
     "kwargs",
     [
         {"parameters": {"bad name": 1}},
-        {"parameters": {str(i): i for i in range(cosmos.MAX_PARAMETERS + 1)}},
         {"continuation_token": "x" * (cosmos.MAX_CONTINUATION_TOKEN_CHARS + 1)},
         {"continuation_token": "a\r\nInjected: header"},
+        {"continuation_token": "ab\u4e2d"},
         {"container": "a/b"},
         {"container": ""},
     ],
@@ -1007,6 +1047,152 @@ def test_key_never_logged_on_success(client, caplog):
     assert KEY not in caplog.text
 
 
+def test_query_length_limit_is_enforced(client):
+    ok = "SELECT " + "x" * (cosmos.MAX_QUERY_CHARS - len("SELECT "))
+    too_long = ok + "x"
+    assert run("cosmos_query_container", container="c", query=ok)["status"] == "success"
+    result = run("cosmos_query_container", container="c", query=too_long)
+    assert result["error_code"] == "invalid_configuration"
+    assert f"at most {cosmos.MAX_QUERY_CHARS} characters" in result["message"]
+
+
+def test_parameter_count_limit_is_enforced(client):
+    ok = {f"p{i}": i for i in range(cosmos.MAX_PARAMETERS)}
+    assert (
+        run("cosmos_query_container", container="c", query="SELECT 1", parameters=ok)[
+            "status"
+        ]
+        == "success"
+    )
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT 1",
+        parameters={**ok, "extra": 1},
+    )
+    assert result["error_code"] == "invalid_configuration"
+    assert f"at most {cosmos.MAX_PARAMETERS} named values" in result["message"]
+
+
+def test_duplicate_parameter_names_are_rejected_after_normalization(client):
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT 1",
+        parameters={"s": 1, "@s": 2},
+    )
+    assert result["error_code"] == "invalid_configuration"
+    assert "@s is given twice" in result["message"]
+
+
+@pytest.mark.parametrize("key", [0, "", False])
+def test_falsy_partition_keys_are_passed_as_a_partition_key(client, key):
+    run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c",
+        partition_key=key,
+    )
+    kwargs = client.last.query_kwargs
+    assert kwargs["partition_key"] == key and kwargs["partition_key"] is key
+    assert "enable_cross_partition_query" not in kwargs
+    run("cosmos_read_item", container="c", id="1", partition_key=key)
+    assert client.last.read_args == ("1", key)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["", "not base64!", "a2V5=extra", "dGhpcyBpcyBhIGtleQ"],  # last: bad padding
+)
+def test_a_key_that_is_not_base64_is_a_configuration_error(client, monkeypatch, key):
+    monkeypatch.setenv("COSMOS_KEY", key or "   ")
+    result = run("cosmos_list_databases")
+    assert result["error_code"] == "invalid_configuration"
+    assert key.strip() == "" or key not in json.dumps(result)
+    assert client.last is None
+
+
+def test_non_ascii_continuation_token_is_invalid_input_not_a_blocked_destination(
+    client,
+):
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT 1",
+        continuation_token="ab\u4e2d",
+    )
+    assert result["error_code"] == "invalid_configuration"
+    assert result["message"] == "continuation_token is not valid"
+
+
+# --- prefix keys of a hierarchical container -------------------------------
+
+
+def _hierarchical(monkeypatch, depth=3):
+    def init(original):
+        def wrapper(self, *a, **kw):
+            original(self, *a, **kw)
+            self.container_props = {
+                "id": "c",
+                "partitionKey": {
+                    "paths": [f"/k{i}" for i in range(depth)],
+                    "kind": "MultiHash",
+                },
+            }
+
+        return wrapper
+
+    monkeypatch.setattr(FakeClient, "__init__", init(FakeClient.__init__))
+
+
+@pytest.mark.parametrize("key", ["t", ["t"], ["t", "u"]])
+def test_prefix_partition_key_is_cross_partition_for_ordered_queries(
+    client, monkeypatch, key
+):
+    _hierarchical(monkeypatch)
+    monkeypatch.setattr(FakeClient, "default_pages", [([{"id": "1"}], "UNUSABLE")])
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c ORDER BY c.ts",
+        partition_key=key,
+    )
+    assert result["resumable"] is False and result["continuation_token"] is None
+    rejected = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c ORDER BY c.ts",
+        partition_key=key,
+        continuation_token="T",
+    )
+    assert rejected["error_code"] == "invalid_configuration"
+    assert "prefix of a hierarchical partition key" in rejected["message"]
+
+
+def test_full_hierarchical_key_keeps_ordered_queries_resumable(client, monkeypatch):
+    _hierarchical(monkeypatch)
+    monkeypatch.setattr(FakeClient, "default_pages", [([{"id": "1"}], "NEXT")])
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c ORDER BY c.ts",
+        partition_key=["t", "u", "s"],
+    )
+    assert result["continuation_token"] == "NEXT" and "resumable" not in result
+    assert "container.read" in client.last.calls
+
+
+def test_prefix_keys_cost_no_extra_read_for_streamable_queries(client, monkeypatch):
+    _hierarchical(monkeypatch)
+    run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c",
+        partition_key=["t"],
+    )
+    assert "container.read" not in client.last.calls
+
+
 # --- truncation hints ------------------------------------------------------
 
 
@@ -1023,6 +1209,25 @@ def test_cut_hint_with_ids_names_an_action_that_needs_only_those_ids(
     assert result["omitted_ids"]
     assert "c.id IN" in result["message"]
     assert "cosmos_read_item" not in result["message"]  # it needs a partition key
+
+
+def test_cut_hint_for_a_non_resumable_query_does_not_promise_a_next_page(
+    client, monkeypatch
+):
+    _limit(monkeypatch, 5000)
+    monkeypatch.setattr(
+        FakeClient,
+        "default_pages",
+        [([{"id": f"i{n}", "v": "x" * 1500} for n in range(6)], "UNUSABLE")],
+    )
+    result = run(
+        "cosmos_query_container", container="c", query="SELECT * FROM c ORDER BY c.v"
+    )
+    assert result["truncated"] and result["continuation_token"] is None
+    assert "next page" not in result["message"]
+    assert "continuation_token you sent" not in result["message"]
+    assert "no continuation_token to page on" in result["message"]
+    assert "c.id IN" in result["message"]
 
 
 def test_cut_hint_without_ids_does_not_mention_ids(client, monkeypatch):
@@ -1071,7 +1276,7 @@ def test_link_local_address_maps_to_blocked_destination(real_transport):
 
 def test_transport_send_raises_blocked_for_a_private_resolution(real_transport):
     real_transport("127.0.0.1")
-    transport = cosmos._GuardedTransport()
+    transport = cosmos._GuardedTransport(HOST)
     with pytest.raises(cosmos.BlockedDestinationError) as excinfo:
         transport.send(HttpRequest("GET", "https://acct.documents.azure.com/"))
     assert excinfo.value.reason == "non_public_address"
@@ -1095,14 +1300,29 @@ def test_redirect_answer_maps_to_blocked_destination(real_transport, monkeypatch
     assert "redirect" in result["message"]
 
 
-def test_policy_refusal_before_sending_maps_to_blocked_destination(monkeypatch):
-    def refuse(self, *a, **kw):
-        raise ValueError("HTTP tunnels are not allowed")
+def test_policy_refusal_from_public_requests_maps_to_blocked_destination(
+    real_transport, monkeypatch
+):
+    """A POST (a query) answered by a cross-origin redirect: public_requests
+    refuses to replay the body with a plain ValueError."""
+    real_transport("93.184.216.34")
 
-    monkeypatch.setattr(public_requests.Session, "request", refuse)
-    result = run("cosmos_list_databases")
-    assert result["error_code"] == "blocked_destination"
-    assert "outbound network policy" in result["message"]
+    def redirect(self, request, **kw):
+        response = requests.Response()
+        response.status_code = 307
+        response.headers["Location"] = "https://evil.example.net/"
+        response.raw = io.BytesIO(b"")
+        response.url = request.url
+        response.request = request
+        return response
+
+    monkeypatch.setattr(HTTPAdapter, "send", redirect)
+    transport = cosmos._GuardedTransport(HOST)
+    with pytest.raises(cosmos.BlockedDestinationError) as excinfo:
+        transport.send(
+            HttpRequest("POST", f"https://{HOST}/dbs/appdb/colls/c/docs", data=b"{}")
+        )
+    assert excinfo.value.reason == "policy"
 
 
 def test_unresolvable_host_is_unreachable_not_blocked(real_transport, monkeypatch):

@@ -23,9 +23,12 @@ The endpoint is user supplied and this module runs on the web host, so:
   Azure Government and Azure operated by 21Vianet), default port only;
 * the SDK's regional endpoint discovery is turned off, so every request goes to
   the validated endpoint, and the SDK does not follow redirects;
-* every request additionally passes ``_GuardedTransport``, which re-checks the
-  host and sends through the public-only ``public_requests`` session (resolves,
-  rejects private/link-local addresses and connects to the address it checked).
+* every request additionally passes ``_GuardedTransport``, which is pinned to
+  the configured account host (a regional name such as
+  ``<account>-<region>.documents.azure.com`` is a valid account host too, so
+  the host pattern alone cannot tell it apart) and sends through the
+  public-only ``public_requests`` session (resolves, rejects private and
+  link-local addresses and connects to the address it checked).
 
 The key, the endpoint's query string and raw SDK exception text never reach a
 tool result or a log line; failures are mapped to ``error_code`` values. Every
@@ -33,6 +36,7 @@ response is capped as a whole against ``get_tool_max_output_length()``, so the
 paging fields at its end survive the platform's output filter.
 """
 
+import base64
 import functools
 import json
 import logging
@@ -258,25 +262,53 @@ def validate_endpoint(raw: str) -> str:
     return f"https://{host}/"
 
 
+_POLICY_MODULES = frozenset(
+    {
+        "xagent.core.utils.public_requests",
+        "xagent.core.utils.security",
+        "xagent.core.utils.public_policy",
+    }
+)
+
+
+def _raised_in_policy_layer(exc: BaseException) -> bool:
+    """Whether ``exc`` was raised by the outbound-policy modules themselves.
+
+    ``public_requests`` signals a refusal with a plain ``ValueError``, which
+    cannot be told from other ``ValueError`` by type, so look at where it was
+    raised: the innermost frame of its traceback.
+    """
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return tb.tb_frame.f_globals.get("__name__") in _POLICY_MODULES
+
+
 class _GuardedTransport(RequestsTransport):  # type: ignore[no-any-unimported]
     """Azure Core's requests transport with the host re-checked on every request.
 
     The session is ``public_requests.Session``: it resolves the host, rejects
     non-public addresses and connects to the address it checked. The host check
-    here means a request to anything but an allowed Cosmos host (a discovered
-    regional endpoint, a redirect target) is refused before it is sent.
+    here means a request to anything but the configured account host (a
+    discovered regional endpoint, a redirect target) is refused before it is
+    sent.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, allowed_host: str) -> None:
         super().__init__(session=public_requests.Session(), session_owner=True)
+        self._allowed_host = allowed_host.lower()
 
     def send(self, request: Any, **kwargs: Any) -> Any:
         parts = urlsplit(str(request.url))
         try:
             validate_endpoint(f"{parts.scheme}://{parts.netloc}/")
+            if (parts.hostname or "").lower() != self._allowed_host:
+                raise CosmosConfigError("not the configured account host")
         except CosmosConfigError:
             logger.warning(
-                "Refused a request to a host outside the Cosmos DB allowlist: %s",
+                "Refused a request to a host other than the configured account: %s",
                 parts.hostname,
             )
             raise BlockedDestinationError("host") from None
@@ -296,9 +328,13 @@ class _GuardedTransport(RequestsTransport):  # type: ignore[no-any-unimported]
                 )
                 raise BlockedDestinationError("non_public_address") from None
             raise
-        except ValueError:
-            # ``public_requests`` refuses with plain ``ValueError`` before it
-            # sends (destination checks, tunnels, untrusted proxies).
+        except ValueError as exc:
+            # ``public_requests`` refuses with plain ``ValueError`` (destination
+            # checks, tunnels, untrusted proxies, a cross-origin redirect that
+            # would replay a body). Any other ``ValueError`` (an encoding error,
+            # a closed transport) is not a refusal and keeps its own mapping.
+            if not _raised_in_policy_layer(exc):
+                raise
             logger.warning(
                 "The outbound policy refused a request to %s", parts.hostname
             )
@@ -315,7 +351,14 @@ class _GuardedTransport(RequestsTransport):  # type: ignore[no-any-unimported]
 def _client() -> CosmosClient:
     endpoint = validate_endpoint(_env("COSMOS_ENDPOINT"))
     key = _env("COSMOS_KEY")
-    transport = _GuardedTransport()
+    try:
+        base64.b64decode(key, validate=True)
+    except ValueError:  # binascii.Error: the SDK signs requests with the decoded key
+        raise CosmosConfigError(
+            "COSMOS_KEY is not valid base64; copy the full account key from the "
+            "portal (not the connection string)"
+        ) from None
+    transport = _GuardedTransport(urlsplit(endpoint).hostname or "")
     try:
         return CosmosClient(
             endpoint,
@@ -570,15 +613,29 @@ def _success_with_capped_list(
     return response  # still over budget only for _bounded_output to replace
 
 
-_QUERY_CUT_HINTS = (
-    "Some items did not fit the output size limit and are not on the next page. "
-    "Re-run this call (same continuation_token) with fewer selected fields or a "
-    "smaller max_item_count, or fetch the omitted ids with a query such as "
-    "SELECT * FROM c WHERE c.id IN (@a, @b) and their ids as parameters.",
-    "Some items did not fit the output size limit and are not on the next page. "
-    "Re-run this call (same continuation_token) with fewer selected fields or a "
-    "smaller max_item_count.",
+_QUERY_IDS_ADVICE = (
+    "or fetch the omitted ids with a query such as "
+    "SELECT * FROM c WHERE c.id IN (@a, @b) and their ids as parameters."
 )
+
+
+def _query_cut_hints(resumable: bool) -> tuple[str, str]:
+    """Advice for a cut page, (with ids, without ids), true for the response it
+    is attached to: only a resumable query has a continuation token, and only
+    then is the cut page behind it."""
+    if resumable:
+        lead = (
+            "Some items did not fit the output size limit and are not on the next "
+            "page. Re-run this call (with the continuation_token you sent, if "
+            "any) using fewer selected fields or a smaller max_item_count"
+        )
+    else:
+        lead = (
+            "Some items did not fit the output size limit, and this query has no "
+            "continuation_token to page on. Re-run it using fewer selected fields "
+            "or a smaller max_item_count"
+        )
+    return f"{lead}, {_QUERY_IDS_ADVICE}", f"{lead}."
 
 
 def _parameters(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -588,15 +645,44 @@ def _parameters(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
         raise CosmosConfigError(
             f"parameters must be an object of at most {MAX_PARAMETERS} named values"
         )
-    result = []
+    result: dict[str, Any] = {}
     for name, value in raw.items():
         match = _PARAM_NAME.match(str(name))
         if not match:
             raise CosmosConfigError(
                 "parameter names must look like @name (letters, digits, underscore)"
             )
-        result.append({"name": f"@{match.group(1)}", "value": value})
-    return result
+        normalized = f"@{match.group(1)}"
+        if normalized in result:
+            raise CosmosConfigError(
+                f"parameter {normalized} is given twice (with and without the @)"
+            )
+        result[normalized] = value
+    return [{"name": n, "value": v} for n, v in result.items()]
+
+
+def _not_resumable_error() -> CosmosConfigError:
+    return CosmosConfigError(
+        "this query cannot be resumed with a continuation token (ORDER BY, GROUP "
+        "BY, DISTINCT, TOP, OFFSET or an aggregate across partitions, including a "
+        "prefix of a hierarchical partition key): pass the full partition_key or "
+        "narrow the query"
+    )
+
+
+def _is_full_partition_key(properties: Any, partition_key: Any) -> bool:
+    """Whether ``partition_key`` names one logical partition of the container.
+
+    A container's key has one path, or up to three for a hierarchical
+    (``MultiHash``) key; a value with fewer levels is a prefix and the query is
+    routed to several physical partitions (Microsoft Learn, "Hierarchical
+    Partition Keys").
+    """
+    definition = (properties or {}).get("partitionKey") or {}
+    paths = definition.get("paths") or []
+    depth = len(paths) if definition.get("kind") == "MultiHash" else 1
+    given = len(partition_key) if isinstance(partition_key, list) else 1
+    return given >= depth
 
 
 def _is_resumable_across_partitions(query: str) -> bool:
@@ -762,7 +848,8 @@ def cosmos_query_container(
     query: Cosmos DB SQL, e.g. "SELECT c.id, c.status FROM c WHERE c.status = @s".
     parameters: values for @names used in the query, e.g. {"@s": "open"}.
     partition_key: optional; restricts the query to one logical partition
-    (a list for hierarchical keys). Omit it (null) for a query across all
+    (a list with every level for a hierarchical key; a shorter list is a prefix
+    and spans several partitions). Omit it (null) for a query across all
     partitions, which costs more request units.
     max_item_count: page size, 1-100 (default 25).
     continuation_token: the continuation_token of the previous page to get the
@@ -771,15 +858,18 @@ def cosmos_query_container(
     page), has_more and truncated. When the response is larger than the output
     size limit, items are cut: truncated is true, omitted_count says how many
     were dropped and omitted_ids lists their ids. Fetch them with a query such
-    as SELECT * FROM c WHERE c.id IN (@a, @b), or re-run the same call (same
-    continuation_token) with fewer selected fields or a smaller max_item_count;
-    the continuation_token returned still points past this page.
-    A query across partitions (no partition_key) that uses ORDER BY, GROUP BY,
-    DISTINCT, TOP, OFFSET or an aggregate (COUNT, SUM, AVG, MIN, MAX) cannot be
-    resumed with a token: the result has no continuation_token, resumable is
-    false and may_be_incomplete says whether the page was full; a token passed
-    with such a query is rejected. Narrow it with partition_key or a filter, or
-    use a streamable query (SELECT ... WHERE ...) to page.
+    as SELECT * FROM c WHERE c.id IN (@a, @b), or re-run the same call (with
+    the continuation_token you sent, if any) with fewer selected fields or a
+    smaller max_item_count. When the query is resumable, the continuation_token
+    returned points past the cut page.
+    A query across partitions that uses ORDER BY, GROUP BY, DISTINCT, TOP,
+    OFFSET or an aggregate (COUNT, SUM, AVG, MIN, MAX) cannot be resumed with a
+    token. That includes a query with only a prefix of a hierarchical
+    partition_key. Such a result has no continuation_token (resumable is false,
+    may_be_incomplete says whether the page was full), nothing lies beyond a cut
+    page, and a token passed with the query is rejected. Narrow it with the full
+    partition_key or a filter, or use a streamable query (SELECT ... WHERE ...)
+    to page.
     """
     container_name = "the container"
     try:
@@ -794,23 +884,34 @@ def cosmos_query_container(
         sql_parameters = _parameters(parameters)
         page_size = clamp_limit(max_item_count, max_limit=MAX_PAGE_SIZE)
         if continuation_token is not None and (
-            not continuation_token.isprintable()
+            not continuation_token.isascii()
+            or not continuation_token.isprintable()
             or len(continuation_token) > MAX_CONTINUATION_TOKEN_CHARS
         ):
             raise CosmosConfigError("continuation_token is not valid")
-        resumable = partition_key is not None or _is_resumable_across_partitions(query)
-        if continuation_token and not resumable:
-            raise CosmosConfigError(
-                "this query cannot be resumed with a continuation token across "
-                "partitions (ORDER BY, GROUP BY, DISTINCT, TOP, OFFSET or an "
-                "aggregate): pass partition_key or narrow the query"
-            )
+        streamable = _is_resumable_across_partitions(query)
+        # Without a partition key the query fans out; with one, whether it stays
+        # in one partition depends on the key depth (decided below).
+        resumable = streamable
+        if continuation_token and not streamable and partition_key is None:
+            raise _not_resumable_error()
 
         charges, record_charge = _charge_recorder()
         with _open_client() as client:
             container_client = client.get_database_client(
                 database_name
             ).get_container_client(container_name)
+            if partition_key is not None and not streamable:
+                # One metadata read, only here: ORDER BY, TOP and aggregates are
+                # applied across the whole result only inside one logical
+                # partition, i.e. when the key has every level of the container's
+                # key (a prefix of a hierarchical key spans several partitions).
+                resumable = _is_full_partition_key(
+                    container_client.read(timeout=TOTAL_TIMEOUT_SECONDS),
+                    partition_key,
+                )
+                if continuation_token and not resumable:
+                    raise _not_resumable_error()
             query_kwargs: dict[str, Any] = {
                 "query": query,
                 "parameters": sql_parameters or None,
@@ -851,7 +952,7 @@ def cosmos_query_container(
         if not resumable:
             payload["resumable"] = False
             payload["may_be_incomplete"] = len(page) >= page_size
-        return _success_with_capped_list("items", payload, _QUERY_CUT_HINTS)
+        return _success_with_capped_list("items", payload, _query_cut_hints(resumable))
     except Exception as e:
         return _map_error(
             e,

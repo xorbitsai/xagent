@@ -33,7 +33,7 @@ without the filter.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -54,8 +54,10 @@ ActorPrivateMCPServersHook = Callable[..., Mapping[int, str]]
 # The only transports an actor-private server may use.
 ACTOR_PRIVATE_MCP_TRANSPORTS = frozenset({"sse", "streamable_http"})
 
-# ``xagent:user:{id}`` is the executing user's own default owner.
-DEFAULT_OWNER_KEY_PREFIX = "xagent:user:"
+# ``xagent:user:`` is the engine's default-owner namespace, i.e. the workspace
+# credential of any executing user. No actor lives there, so every key under it
+# is refused, not only the executing user's own.
+RESERVED_OWNER_KEY_PREFIX = "xagent:user:"
 
 _hook: ActorPrivateMCPServersHook | None = None
 
@@ -72,6 +74,26 @@ def actor_private_mcp_servers_hook_installed() -> bool:
     return _hook is not None
 
 
+def actor_private_row_refused(server: Any, catalog_entries: Iterable[Any]) -> bool:
+    """Whether a mapped row must not run as an actor-private server.
+
+    A private server is a custom remote HTTP server, so any catalog claim
+    (resolvable or not) refuses it: a transport other than remote HTTP, an
+    ``auth.app_id`` or ``auth.builtin_provenance`` key whatever its value, or a
+    name a catalog app owns. The task builder and the OAuth start share this
+    rule, so OAuth never starts for a row a task would refuse.
+    """
+    from ..mcp_apps import match_catalog_entries
+
+    if str(getattr(server, "transport", "") or "") not in ACTOR_PRIVATE_MCP_TRANSPORTS:
+        return True
+    auth = getattr(server, "auth", None)
+    if isinstance(auth, Mapping) and ("app_id" in auth or "builtin_provenance" in auth):
+        return True
+    name = str(getattr(server, "name", "") or "")
+    return bool(name) and bool(match_catalog_entries(catalog_entries, name=name))
+
+
 def _validate_answer(answer: Any) -> dict[int, str]:
     if not isinstance(answer, Mapping):
         raise ValueError("actor-private MCP servers must be a mapping")
@@ -86,10 +108,14 @@ def _validate_answer(answer: Any) -> dict[int, str]:
             or normalize_user_oauth_resource_owner_key(owner_key) != owner_key
         ):
             raise ValueError("actor-private MCP owner keys must be normalized")
-        # The executing user's own default owner is the workspace credential,
-        # which a private server must never fall back to.
-        if owner_key.startswith(DEFAULT_OWNER_KEY_PREFIX):
-            raise ValueError("actor-private MCP owner keys must name an actor")
+        # ``xagent:user:`` is the default-owner namespace (any executing user's
+        # workspace credential). No actor lives there, so refuse every key
+        # under it.
+        if owner_key.startswith(RESERVED_OWNER_KEY_PREFIX):
+            raise ValueError(
+                "actor-private MCP owner keys must not use the reserved "
+                f"{RESERVED_OWNER_KEY_PREFIX!r} namespace"
+            )
         validated[server_id] = owner_key
     return validated
 

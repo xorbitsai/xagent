@@ -74,6 +74,7 @@ from ..mcp_apps import (
     get_app_for_mcp_server,
     get_catalog_mcp_oauth_credentials,
     is_user_owned_server,
+    load_catalog_entries,
     normalize_catalog_key,
     oauth_grant_keys_rejected_by_app_scope,
     restrict_to_app_scoped_oauth_grant,
@@ -5260,7 +5261,7 @@ async def connect_mcp_oauth_server_for_owner(
     with ``ConnectorHookSessionBoundaryError``.
     """
     from ..services.actor_private_mcp import (
-        ACTOR_PRIVATE_MCP_TRANSPORTS,
+        actor_private_row_refused,
         resolve_actor_private_mcp_servers_or_raise,
     )
 
@@ -5277,11 +5278,8 @@ async def connect_mcp_oauth_server_for_owner(
     _association, server = _get_user_mcp_server_or_404(
         db, user_id=user_id, server_id=server_id, require_active=True
     )
-    # The same rows the task builder runs: remote HTTP only, never a catalog row.
-    if (
-        server.transport not in ACTOR_PRIVATE_MCP_TRANSPORTS
-        or get_app_for_mcp_server(db, server) is not None
-    ):
+    # The same rule the task builder applies: remote HTTP only, no catalog claim.
+    if actor_private_row_refused(server, load_catalog_entries(db)):
         raise not_found
     # Keep nested race-recovery savepoints inside one caller-owned transaction,
     # as connect_mcp_oauth_app_for_owner does.

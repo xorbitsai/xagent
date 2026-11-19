@@ -17,6 +17,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
@@ -253,6 +254,7 @@ def test_the_hook_is_asked_for_the_executing_user(seeded) -> None:
         {1: ""},
         {1: f" {OWNER_A} "},
         {1: "xagent:user:1"},
+        {1: "xagent:user:999"},
     ],
 )
 def test_a_malformed_answer_fails_closed(seeded, answer) -> None:
@@ -268,14 +270,39 @@ def test_a_malformed_answer_fails_closed(seeded, answer) -> None:
 
 def test_a_failing_hook_fails_closed_and_leaves_the_session_usable(seeded) -> None:
     def hook(db, *, user_id):
-        raise RuntimeError("store unavailable")
+        db.add(User(id=user_id, username="flush-poison-dup", password_hash="x"))
+        db.flush()  # primary-key collision with the seeded user: fails on SQLite too
 
     set_actor_private_mcp_servers_hook(hook)
 
-    with pytest.raises(ConnectorRuntimeError):
+    with pytest.raises(ConnectorRuntimeError) as error:
         resolve_actor_private_mcp_servers_or_raise(
             seeded.db, user_id=int(seeded.user.id)
         )
+
+    assert isinstance(error.value.__cause__, SQLAlchemyError)
+    # Without the session restore this raises PendingRollbackError.
+    assert seeded.db.query(MCPServer).count() == 3
+
+
+def test_a_poisoned_session_behind_a_malformed_answer_is_restored(seeded) -> None:
+    def hook(db, *, user_id):
+        try:
+            db.add(User(id=user_id, username="flush-poison-dup", password_hash="x"))
+            db.flush()
+        except SQLAlchemyError:
+            pass
+        # Nothing propagates from the hook: the validator rejects this answer.
+        return {1: f"xagent:user:{user_id}"}
+
+    set_actor_private_mcp_servers_hook(hook)
+
+    with pytest.raises(ConnectorRuntimeError) as error:
+        resolve_actor_private_mcp_servers_or_raise(
+            seeded.db, user_id=int(seeded.user.id)
+        )
+
+    assert isinstance(error.value.__cause__, ValueError)
     assert seeded.db.query(MCPServer).count() == 3
 
 
@@ -667,6 +694,66 @@ async def test_oauth_start_refuses_a_catalog_server_even_when_mapped(seeded) -> 
 
     assert error.value.status_code == 404
     assert seeded.db.query(MCPOAuthFlowState).count() == 0
+
+
+def _ghost_app_id(url: str) -> dict:
+    return {**_oauth_auth(url), "app_id": "ghost"}
+
+
+def _empty_app_id(url: str) -> dict:
+    return {**_oauth_auth(url), "app_id": ""}
+
+
+def _missing_provenance(url: str) -> dict:
+    return {
+        **_oauth_auth(url),
+        "builtin_provenance": {"registry": "xagent", "app_id": "missing"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape", ["ghost_app_id", "empty_app_id", "missing_provenance", "name_collision"]
+)
+async def test_one_rule_refuses_a_claimed_row_at_oauth_start_and_in_the_builder(
+    seeded, shape
+) -> None:
+    url = "https://a.example/mcp"
+    if shape == "name_collision":
+        seeded.db.add(
+            PublicMCPApp(
+                app_id="catalog-remote",
+                name="Catalog Remote",
+                transport="streamable_http",
+                launch_config={"url": url, "auth": _oauth_auth(url)},
+                is_visible_in_connector=True,
+            )
+        )
+        seeded.a.name = "catalog-remote"
+    else:
+        seeded.a.auth = {
+            "ghost_app_id": _ghost_app_id,
+            "empty_app_id": _empty_app_id,
+            "missing_provenance": _missing_provenance,
+        }[shape](url)
+    seeded.db.commit()
+
+    with pytest.raises(HTTPException) as error:
+        await mcp_api.connect_mcp_oauth_server_for_owner(
+            int(seeded.a.id),
+            MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+            seeded.user,
+            seeded.db,
+            resource_owner_key=OWNER_A,
+            accept="application/json",
+        )
+    assert error.value.status_code == 404
+    assert seeded.db.query(MCPOAuthFlowState).count() == 0
+
+    configs = await _config(seeded, policy=_policy(OWNER_A)).get_mcp_server_configs()
+    config = next(c for c in configs if c["name"] == seeded.a.name)
+    assert config["transport"] == "unavailable"
+    assert config["config"]["reason"] == "invalid_configuration"
 
 
 @pytest.mark.asyncio

@@ -5164,15 +5164,14 @@ class WebToolConfig(BaseToolConfig):
         )
         actor_private = actor_private_owner_key is not None
         if actor_private:
-            from ...web.mcp_apps import get_app_for_mcp_server
-            from ..services.actor_private_mcp import ACTOR_PRIVATE_MCP_TRANSPORTS
+            from ..services.actor_private_mcp import actor_private_row_refused
 
-            # A private server is a custom remote HTTP server. A mapped catalog
-            # row is refused here, as connect_mcp_oauth_server_for_owner
-            # refuses it, rather than run outside the catalog's own path.
-            if (
-                server.transport not in ACTOR_PRIVATE_MCP_TRANSPORTS
-                or get_app_for_mcp_server(self.db, server) is not None
+            # A private server is a custom remote HTTP server. A row with any
+            # catalog claim is refused here by the rule
+            # connect_mcp_oauth_server_for_owner shares, rather than run
+            # outside the catalog's own path.
+            if actor_private_row_refused(
+                server, self._catalog_entries_for_pass() or ()
             ):
                 return self._build_unavailable_mcp_config(
                     server=server,

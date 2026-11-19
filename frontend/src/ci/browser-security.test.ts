@@ -35,6 +35,92 @@ describe("standalone browser security policy", () => {
     }
   })
 
+  it.each<[string, string[]]>([
+    ["https://widget.example.com", ["https://widget.example.com"]],
+    ["https://*.widget.example.com", ["https://*.widget.example.com"]],
+    ["https://intranet", ["https://intranet"]],
+    ["https://xn--bcher-kva.example", ["https://xn--bcher-kva.example"]],
+    [
+      " https://a.example.com\thttps://*.b.example.com\nhttps://a.example.com ",
+      ["https://a.example.com", "https://*.b.example.com"],
+    ],
+    [
+      "https://a.example.com https://evil.example.com;script-src https://*.b.example.com",
+      ["https://a.example.com", "https://*.b.example.com"],
+    ],
+  ])("appends valid extra frame-src origins for %j", (extraFrameSrc, origins) => {
+    for (const embeddable of [false, true]) {
+      const policy = browserSecurityHeaders({ extraFrameSrc, embeddable })[0].value
+      expect(policy.split("; ").find(part => part.startsWith("frame-src "))).toBe(
+        ["frame-src 'self' blob: https://docs.google.com", ...origins].join(" "),
+      )
+    }
+  })
+
+  it.each([
+    "widget.example.com",
+    "http://widget.example.com",
+    "wss://widget.example.com",
+    "https://widget.example.com:443",
+    "https://widget.example.com/",
+    "https://widget.example.com/chat",
+    "https://widget.example.com?x=1",
+    "https://widget.example.com#x",
+    "https://user@widget.example.com",
+    "https://widget%2eexample.com",
+    "https://widget.example.com\\evil",
+    "https://Widget.example.com",
+    "https://wídget.example.com",
+    "https://widget.example.com.",
+    "https://-widget.example.com",
+    "https://widget-.example.com",
+    `https://${"a".repeat(64)}.example.com`,
+    "https://10.0.0.1",
+    "https://[::1]",
+    "https://*",
+    "*",
+    "https://*.com",
+    "https://*.*.example.com",
+    "https://a.*.example.com",
+    "https://widget.example.com;script-src",
+    "https://widget.example.com,https://evil.example.com",
+    "https://a.example.com\u00a0https://b.example.com",
+    "'self'",
+    "'unsafe-inline'",
+    "data:",
+  ])("refuses the invalid extra frame-src entry %j", (extraFrameSrc) => {
+    expect(browserSecurityHeaders({ extraFrameSrc })).toEqual(browserSecurityHeaders({ extraFrameSrc: "" }))
+  })
+
+  it("leaves the policy byte-for-byte unchanged without extra frame-src origins", () => {
+    vi.stubEnv("XAGENT_CSP_EXTRA_FRAME_SRC", "")
+    for (const embeddable of [false, true]) {
+      const baseline = browserSecurityHeaders({ embeddable, extraFrameSrc: undefined })
+      expect(baseline[0].value).toContain("; frame-src 'self' blob: https://docs.google.com; worker-src")
+      for (const extraFrameSrc of ["", " \t\n"]) {
+        expect(browserSecurityHeaders({ embeddable, extraFrameSrc })).toEqual(baseline)
+      }
+      expect(browserSecurityHeaders({ embeddable })).toEqual(baseline)
+    }
+  })
+
+  it("reads extra frame-src origins from the build environment and the frontend image", () => {
+    vi.stubEnv("XAGENT_CSP_EXTRA_FRAME_SRC", "https://*.widget.example.com")
+    expect(browserSecurityHeaders()[0].value).toContain(" https://*.widget.example.com;")
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      const { default: config } = await import('./next.config.mjs');
+      console.log(JSON.stringify(await config.headers()));
+    `], { env: { ...process.env, NODE_ENV: "production", NEXT_OUTPUT: "standalone" }, encoding: "utf8" })
+    expect(child.status, child.stderr).toBe(0)
+    for (const route of JSON.parse(child.stdout)) {
+      expect(route.headers.find((h: { key: string }) => h.key === "Content-Security-Policy").value)
+        .toContain(" https://*.widget.example.com;")
+    }
+    const dockerfile = readFileSync("../docker/Dockerfile.frontend", "utf8")
+    expect(dockerfile).toContain("ARG XAGENT_CSP_EXTRA_FRAME_SRC=")
+    expect(dockerfile).toContain("ENV XAGENT_CSP_EXTRA_FRAME_SRC=${XAGENT_CSP_EXTRA_FRAME_SRC}")
+  })
+
   it("passes the public build setting to CSP and every official frontend image build", async () => {
     vi.stubEnv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", "https://preview.example.test/path")
     const policy = browserSecurityHeaders()[0].value

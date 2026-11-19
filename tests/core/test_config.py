@@ -1459,6 +1459,24 @@ def test_get_html_preview_origin(monkeypatch, value, expected):
     assert config.get_html_preview_origin() == expected
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, ""),
+        ("", ""),
+        (
+            " https://widget.example.com https://*.chat.example.com ",
+            "https://widget.example.com https://*.chat.example.com",
+        ),
+    ],
+)
+def test_get_csp_extra_frame_src(monkeypatch, value, expected):
+    monkeypatch.delenv(config.CSP_EXTRA_FRAME_SRC, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.CSP_EXTRA_FRAME_SRC, value)
+    assert config.get_csp_extra_frame_src() == expected
+
+
 class TestGetFrontendDistDir:
     """Test get_frontend_dist_dir() function."""
 

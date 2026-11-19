@@ -120,6 +120,16 @@ Real-time communication with the FastAPI backend for live updates.
   exact `frame-ancestors` policy cannot authorize an arbitrary outer customer
   site. Static quoted `src`/`href` assets are rewritten; other relative URL
   syntaxes and runtime-constructed URLs must be absolute or inlined.
+- `XAGENT_CSP_EXTRA_FRAME_SRC`: Optional space-separated origins appended to the
+  page CSP `frame-src`, for a custom build that embeds a third-party iframe (for
+  example a support widget from `https://widget.example.com`). Each entry must be
+  `https://<host>` or `https://*.<host>` with a lowercase DNS host; a wildcard
+  needs at least two labels after `*.` and matches subdomains only, not the bare
+  host. An entry with a port, path, query, credentials, IP address, uppercase or
+  any other character is dropped on its own. Unset leaves the policy unchanged.
+  Like the preview origin, Next includes the build setting (Docker accepts a
+  build argument) and packaged/static serving reads the same variable at backend
+  runtime.
 
 ### Backend Integration
 

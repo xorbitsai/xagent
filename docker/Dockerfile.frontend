@@ -21,6 +21,8 @@ WORKDIR /app
 ARG NEXT_PUBLIC_API_URL=
 ARG NEXT_PUBLIC_WS_URL=
 ARG NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=
+# Space-separated extra frame-src origins (https://host or https://*.host).
+ARG XAGENT_CSP_EXTRA_FRAME_SRC=
 
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY . .
@@ -29,6 +31,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ENV NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL}
 ENV NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN}
+ENV XAGENT_CSP_EXTRA_FRAME_SRC=${XAGENT_CSP_EXTRA_FRAME_SRC}
 # This image serves the frontend via a Node server, so build the standalone
 # output rather than the default static export used by the pip/uvx deployment.
 ENV NEXT_OUTPUT=standalone

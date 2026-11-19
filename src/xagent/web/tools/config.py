@@ -1324,30 +1324,40 @@ def send_oauth_refresh_request(
     return client.post(request.url, timeout=10.0, **request.kwargs)
 
 
-def _oauth_token_refresh_due(oauth_account: Any) -> bool:
-    """Whether :func:`refresh_oauth_token_if_needed` would call the provider.
-
-    An undecryptable token needs a reconnect, not a refresh, and a token
-    without an expiry is never refreshed.
-    """
+def _oauth_token_undecryptable(oauth_account: Any) -> bool:
+    """Whether a stored token cannot be opened with the configured key."""
     from ..models.user_oauth import is_undecryptable_oauth_token
 
-    if is_undecryptable_oauth_token(
+    return is_undecryptable_oauth_token(
         getattr(oauth_account, "access_token", None)
-    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None)):
-        return False
+    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None))
+
+
+def _oauth_token_expiring(
+    oauth_account: Any, *, margin: timedelta = timedelta(0)
+) -> bool:
+    """Whether the access token is expired or expires within the refresh skew
+    (plus ``margin``). A token without an expiry never expires."""
     expires_at = oauth_account.expires_at
     if not expires_at:
         return False
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
-    # A minute beyond the refresh's own skew: the refresh reads the clock
-    # again later, and a token due by then must not be refreshed unlocked.
     return bool(
-        expires_at
-        <= datetime.now(timezone.utc)
-        + OAUTH_TOKEN_EXPIRY_SKEW
-        + _SHOPIFY_LOCK_EXPIRY_MARGIN
+        expires_at <= datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW + margin
+    )
+
+
+def _oauth_token_refresh_due(oauth_account: Any) -> bool:
+    """Whether :func:`refresh_oauth_token_if_needed` may call the provider.
+
+    It shares that function's predicates. An undecryptable token needs a
+    reconnect, not a refresh. A minute's margin covers the refresh reading
+    the clock again later: a token due by then must not be refreshed without
+    the store lock.
+    """
+    return not _oauth_token_undecryptable(oauth_account) and _oauth_token_expiring(
+        oauth_account, margin=_SHOPIFY_LOCK_EXPIRY_MARGIN
     )
 
 
@@ -1429,14 +1439,12 @@ async def refresh_oauth_token_if_needed(
     flush_changes: bool = True,
 ) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
-    from ..models.user_oauth import is_undecryptable_oauth_token
-
     # A ciphertext that cannot be opened with the configured key is exposed by
     # the ORM as an empty reconnect marker.  Handle it before the expiry check
     # so rows without ``expires_at`` cannot be treated as usable credentials.
-    if is_undecryptable_oauth_token(
-        getattr(oauth_account, "access_token", None)
-    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None)):
+    # The predicates are shared with _oauth_token_refresh_due, which decides
+    # whether a Shopify refresh takes its store lock first.
+    if _oauth_token_undecryptable(oauth_account):
         logger.warning(
             "Cannot refresh %s OAuth credentials for user %s: "
             "stored token was encrypted with a rotated key; reconnect required",
@@ -1445,19 +1453,8 @@ async def refresh_oauth_token_if_needed(
         )
         return False
 
-    if not oauth_account.expires_at:
-        return True  # Assume valid if no expiration is set
-
-    # Check if expired (or expiring within 5 minutes)
-    now = datetime.now(timezone.utc)
-
-    # Handle timezone naive vs aware
-    expires_at = oauth_account.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-    if expires_at > now + OAUTH_TOKEN_EXPIRY_SKEW:
-        return True  # Token is still valid
+    if not _oauth_token_expiring(oauth_account):
+        return True  # No expiry set, or not expiring within the skew
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:

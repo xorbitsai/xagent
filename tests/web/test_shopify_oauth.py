@@ -1274,6 +1274,30 @@ def test_a_token_that_needs_no_refresh_does_not_wait_for_the_store(
     assert posted == []
 
 
+def test_a_token_about_to_become_due_takes_the_store_lock(shopify_db, monkeypatch):
+    """A token expiring just beyond the refresh skew is not refreshed now, but
+    it takes the lock: the refresh reads the clock again and may find it due."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    _held_grant(db, user, expires_in=timedelta(minutes=5, seconds=30))
+    posted = _fake_refresh_client(monkeypatch)
+    real_lock = shopify_store_locks.lock_shopify_store
+    locked: list = []
+
+    def recording_lock(session, **kwargs):
+        locked.append(kwargs["store"])
+        return real_lock(session, **kwargs)
+
+    monkeypatch.setattr(shopify_store_locks, "lock_shopify_store", recording_lock)
+
+    resolution = _resolve_shopify(db, user.id)
+
+    assert resolution.access_token == "held-access"
+    assert locked == ["acme"]
+    assert posted == []
+
+
 @pytest.mark.parametrize("failure", ["transient", "permanent"])
 def test_a_failed_refresh_releases_the_store(shopify_db, monkeypatch, failure):
     db, user = shopify_db

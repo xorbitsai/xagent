@@ -2263,6 +2263,9 @@ class WebToolConfig(BaseToolConfig):
         self._cached_music_models: Optional[Dict[str, Any]] = None
         self._cached_music_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
+        # Advanced by every invalidation of that cache; a scan that started
+        # before one must not publish its result.
+        self._mcp_config_cache_generation = 0
         # Catalog projection for one MCP config-load pass (see
         # ``_catalog_entries_for_pass``); reset at the start of every pass.
         self._catalog_entries: tuple[Any, ...] | None = None
@@ -2517,6 +2520,7 @@ class WebToolConfig(BaseToolConfig):
         from ...core.tools.adapters.vibe.mcp_tools import discard_mcp_load_reuse
 
         self._cached_mcp_configs = None
+        self._mcp_config_cache_generation += 1
         discard_mcp_load_reuse(self)
 
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
@@ -2538,8 +2542,10 @@ class WebToolConfig(BaseToolConfig):
             # before failing.
             self._discard_cached_mcp_configs()
 
+        generation = self._mcp_config_cache_generation
         configs = await self._load_mcp_server_configs()
-        self._store_mcp_config_cache_if_cacheable(configs)
+        if generation == self._mcp_config_cache_generation:
+            self._store_mcp_config_cache_if_cacheable(configs)
         return configs
 
     def _refused_mcp_server_configs(self, reason: str) -> List[Dict[str, Any]]:

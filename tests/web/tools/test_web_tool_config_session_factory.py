@@ -6,6 +6,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from types import MappingProxyType, SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -3327,6 +3328,58 @@ def test_set_tool_selection_spec_swaps_only_a_different_selection():
     _prime_scope_derived_caches(cfg)
     assert cfg.set_tool_selection_spec(narrowed, include_mcp_tools=True) is True
     _assert_scope_derived_caches_dropped(cfg)
+
+
+@pytest.mark.asyncio
+async def test_a_config_scan_started_before_a_selection_change_is_not_published():
+    spec_a = ToolSelectionSpec.from_raw(tool_categories=["mcp:a"])
+    spec_ab = ToolSelectionSpec.from_raw(tool_categories=["mcp:a", "mcp:b"])
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        user_id=1,
+        tool_selection_spec=spec_a,
+        include_mcp_tools=True,
+    )
+    visible = [{"name": "a", "config": {}}]
+    scans: list[list[str]] = []
+    in_oauth = asyncio.Event()
+    finish_oauth = asyncio.Event()
+    hold_next_scan = False
+
+    async def scan() -> list[dict[str, Any]]:
+        cfg._reset_mcp_config_load_cache_state()  # as a real scan starts
+        rows = list(visible)  # the rows are read first ...
+        scans.append([row["name"] for row in rows])
+        if hold_next_scan:
+            in_oauth.set()
+            await finish_oauth.wait()  # ... then per-server OAuth resolution is awaited
+        return rows
+
+    cfg._load_mcp_server_configs = scan  # type: ignore[method-assign]
+
+    # Nothing invalidated: one scan, published, and the next read does not scan again.
+    assert [row["name"] for row in await cfg.get_mcp_server_configs()] == ["a"]
+    assert [row["name"] for row in await cfg.get_mcp_server_configs()] == ["a"]
+    assert scans == [["a"]] and cfg._cached_mcp_configs is not None
+
+    # A scan is suspended in OAuth resolution when the owner connects B and selects it.
+    cfg._discard_cached_mcp_configs()
+    scans.clear()
+    hold_next_scan = True
+    old_scan = asyncio.create_task(cfg.get_mcp_server_configs())
+    await in_oauth.wait()
+    visible.append({"name": "b", "config": {}})
+    assert cfg.set_tool_selection_spec(spec_ab, include_mcp_tools=True) is True
+    hold_next_scan = False
+    finish_oauth.set()
+    assert [row["name"] for row in await old_scan] == ["a"]
+
+    # The old result was not kept, so the retry scans the current rows and gets B.
+    assert cfg._cached_mcp_configs is None
+    assert [row["name"] for row in await cfg.get_mcp_server_configs()] == ["a", "b"]
+    assert scans == [["a"], ["a", "b"]]
+    assert [row["name"] for row in cfg._cached_mcp_configs or []] == ["a", "b"]
 
 
 def test_set_execution_scope_swaps_the_scope_and_drops_scope_derived_caches():

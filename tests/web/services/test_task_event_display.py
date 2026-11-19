@@ -1058,7 +1058,7 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
             task_id,
             "agent_message",
             "child",
-            {"message": "secret"},
+            {"message": "secret", "expect_response": True, "visible": True},
             scope_id="child",
         )
         fact(
@@ -1096,5 +1096,42 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
                 "[2026-09-30 00:00 UTC] User:\nhello\n\n"
                 "[2026-09-30 00:00 UTC] Assistant:\nWhich?\n\n"
                 "[2026-09-30 00:00 UTC] Assistant:\ndone"
+            )
+        }
+
+
+def test_export_transcripts_put_a_null_created_at_before_timed_messages(canonical):
+    from xagent.web.api.conversation_logs import _load_export_transcripts
+
+    factory, task_id = canonical
+    with factory() as db:
+        task = db.get(Task, task_id)
+        task.conversation_storage_version = 1
+        rows = [
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=task.user_id,
+                role="user",
+                content=content,
+                message_type="chat",
+                created_at=at,
+            )
+            for content, at in (
+                ("timed", datetime(2026, 9, 30, 8, 0, tzinfo=timezone.utc)),
+                ("untimed", datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)),
+            )
+        ]
+        db.add_all(rows)
+        db.flush()
+        db.execute(
+            sa.update(TaskChatMessage)
+            .where(TaskChatMessage.id == rows[1].id)
+            .values(created_at=None)
+        )
+        db.commit()
+
+        assert _load_export_transcripts(db, [task_id]) == {
+            task_id: (
+                "[time unknown] User:\nuntimed\n\n[2026-09-30 08:00 UTC] User:\ntimed"
             )
         }

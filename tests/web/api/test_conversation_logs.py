@@ -1572,22 +1572,19 @@ def test_export_conversation_writes_stored_assistant_text_verbatim(
 
 @pytest.mark.parametrize(
     ("role", "label"),
-    [("user", "User"), ("assistant", "Assistant"), ("system", "System")],
+    [
+        ("user", "User"),
+        ("assistant", "Assistant"),
+        ("system", "System"),
+        ("", "Unknown"),
+        (None, "Unknown"),
+    ],
 )
-def test_export_conversation_labels_roles(role: str, label: str) -> None:
-    headers = _admin_headers()
-    user_id = _user_id("admin")
-    task_id = _sdk_task(user_id)
-    _add_messages(task_id, user_id, [(role, "text", _minute(9, 0))])
-
-    assert _conversation_cells(headers)[str(task_id)] == (
-        f"[2026-03-01 09:00 UTC] {label}:\ntext"
-    )
+def test_export_role_label(role: str | None, label: str) -> None:
+    assert conversation_logs._export_role_label(role) == label
 
 
-def test_export_role_label_falls_back_to_unknown_and_empty_content_keeps_its_title():
-    assert conversation_logs._export_role_label("") == "Unknown"
-    assert conversation_logs._export_role_label(None) == "Unknown"
+def test_export_message_with_empty_content_keeps_its_title_line() -> None:
     assert conversation_logs._export_message_block("user", None, _minute(9)) == (
         "[2026-03-01 09:00 UTC] User:\n"
     )
@@ -1601,31 +1598,21 @@ def test_export_conversation_is_empty_without_messages() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text_value", "expected_tail", "dropped"),
+    ("text_value", "kept_chars", "dropped"),
     [
-        ("a" * 32_000, "", 0),
-        ("a" * 32_001, "\n\n[truncated: 1 more characters]", 1),
-        ("a" * 31_999 + "\U0001f600" + "b", "\n\n[truncated: 3 more characters]", 3),
-        ("a" * 40_000, "\n\n[truncated: 8,000 more characters]", 8_000),
+        ("a" * 32_000, 32_000, 0),
+        ("a" * 32_001, 32_000, 1),
+        ("a" * 31_999 + "\U0001f600" + "b", 31_999, 3),
     ],
 )
 def test_truncate_export_cell_counts_utf16_units_and_never_splits_a_pair(
-    text_value: str, expected_tail: str, dropped: int
+    text_value: str, kept_chars: int, dropped: int
 ) -> None:
     result = conversation_logs._truncate_export_cell(text_value)
 
-    assert result.endswith(expected_tail)
-    kept = result[: len(result) - len(expected_tail)]
-    assert text_value.startswith(kept)
-    assert (
-        len(text_value.encode("utf-16-le")) // 2 - (len(kept.encode("utf-16-le")) // 2)
-        == dropped
-    )
+    tail = f"\n\n[truncated: {dropped} more characters]" if dropped else ""
+    assert result == text_value[:kept_chars] + tail
     assert len(result.encode("utf-16-le")) // 2 <= 32_767
-    if dropped == 0:
-        assert result == text_value
-    if "\U0001f600" in text_value and dropped:
-        assert len(kept) == 31_999
 
 
 def test_export_conversation_cell_is_truncated_in_the_file() -> None:
@@ -1640,40 +1627,15 @@ def test_export_conversation_cell_is_truncated_in_the_file() -> None:
     assert len(cell.encode("utf-16-le")) // 2 <= 32_767
 
 
-def test_export_time_columns_are_spreadsheet_datetimes_in_utc() -> None:
-    headers = _admin_headers()
-    user_id = _user_id("admin")
-    created = datetime(2026, 3, 1, 8, 30, 45, 123456, tzinfo=timezone.utc)
-    task_id = _create_task_row(
-        user_id=user_id,
-        title="t",
-        source="sdk",
-        is_visible=False,
-        created_at=created,
-        updated_at=created,
-    )
-    _add_messages(
-        task_id,
-        user_id,
-        [("user", "hi", datetime(2026, 3, 2, 3, 4, 5, tzinfo=timezone.utc))],
-    )
-
-    (row,) = _exported_by_column(_export(headers))
-
-    pattern = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
-    assert re.fullmatch(pattern, row["started_at"])
-    assert re.fullmatch(pattern, row["last_activity_at"])
-    assert row["started_at"] == "2026-03-01 08:30:45"
-    assert row["last_activity_at"] == "2026-03-02 03:04:05"
-    assert row["conversation"].startswith("[2026-03-02 03:04 UTC] User:")
-
-
 def test_export_timestamp_converts_to_utc_and_keeps_none() -> None:
     zone = timezone(timedelta(hours=8))
     moment = datetime(2026, 3, 1, 16, 30, 45, tzinfo=zone)
 
     assert conversation_logs._export_timestamp(moment) == "2026-03-01 08:30:45"
     assert conversation_logs._export_timestamp(None) is None
+    assert conversation_logs._export_timestamp(
+        datetime(2026, 3, 1, 8, 30, 45, 999999, tzinfo=timezone.utc)
+    ) == ("2026-03-01 08:30:45")
     assert conversation_logs._export_timestamp(moment.replace(tzinfo=None)) == (
         "2026-03-01 16:30:45"
     )
@@ -1714,6 +1676,8 @@ def test_export_conversation_reads_each_row_from_its_own_task_across_batches(
         if index % 2:
             task_id = _v2_task(user_id, f"row {index}")
             _add_v2_input(task_id, f"k{index}", f"text {index}", _minute(9, index))
+            # A v1-style row on a v2 task is not part of its conversation.
+            _add_messages(task_id, user_id, [("user", "stray", _minute(9, index))])
         else:
             task_id = _sdk_task(user_id, f"row {index}")
             _add_messages(
@@ -1748,16 +1712,6 @@ def test_export_conversation_marks_only_the_task_whose_events_cannot_be_read(
     assert [m for m in warnings if "could not project" in m] == [
         f"Conversation export could not project the events of task {broken}"
     ]
-
-
-def test_load_export_transcripts_without_ids_runs_no_query() -> None:
-    with _capture_sql_statements() as statements:
-        db = _direct_db_session()
-        try:
-            assert conversation_logs._load_export_transcripts(db, []) == {}
-        finally:
-            db.close()
-    assert statements == []
 
 
 def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:

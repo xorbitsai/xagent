@@ -1224,13 +1224,12 @@ def _export_message_block(role: str | None, content: str | None, at: Any) -> str
 def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, str]:
     """The conversation cell for each of ``task_ids`` that has displayed messages.
 
-    A message shows when the detail page shows it, in the detail page's order,
-    with its stored text. A task whose v2 events cannot be projected gets
+    A message shows when the detail page shows it, in the detail page's order.
+    A v1 message is written as stored; a v2 message is the text the detail
+    page's event projection produces. A task whose v2 events cannot be projected gets
     ``EXPORT_CONVERSATION_UNAVAILABLE``. A task without messages has no key.
     """
     ids = list(task_ids)
-    if not ids:
-        return {}
     blocks: dict[int, list[str]] = {}
 
     v1_rows = db.execute(

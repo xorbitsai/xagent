@@ -92,10 +92,11 @@ class DocumentParseWithOutputTool(AbstractBaseTool):
             # Both paths are resolved before any parsing or writing. The
             # workspace is the only containment check on the output write, so
             # a rejected path fails the call rather than being opened as given.
+            # resolve_write_path also refuses the engine-owned output subtree.
             tool_args.file_path = str(
                 self.workspace.resolve_path_with_search(tool_args.file_path)
             )
             tool_args.output_path = str(
-                self.workspace.resolve_path(tool_args.output_path)
+                self.workspace.resolve_write_path(tool_args.output_path)
             )
         return await parse_document_with_output(tool_args)

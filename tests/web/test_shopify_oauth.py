@@ -954,6 +954,12 @@ def test_the_owner_can_reconnect_their_store(shopify_db, monkeypatch):
         pytest.param({"oauth_provider": "shopify-acme"}, id="another-app"),
         # A Composio-held grant records no issuer; its token is not ours.
         pytest.param({"oauth_provider": None}, id="no-issuer"),
+        # A refresh token lasts at most 90 days from the last token issued:
+        # an owner who stopped using the store cannot refresh any more.
+        pytest.param(
+            {"expires_in": -timedelta(days=90, minutes=1)},
+            id="past-the-refresh-window",
+        ),
     ],
 )
 def test_a_store_not_held_by_a_live_grant_of_this_app_can_be_connected(
@@ -967,6 +973,19 @@ def test_a_store_not_held_by_a_live_grant_of_this_app_can_be_connected(
 
     assert response.status_code == 200
     assert _grant(db, user) is not None
+
+
+def test_an_expired_access_token_still_holds_the_store_within_the_refresh_window(
+    shopify_db, monkeypatch
+):
+    db, user = shopify_db
+    _held_grant(db, _other_user(db), expires_in=-timedelta(days=89))
+    calls = _mock_shopify_http(monkeypatch)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 409
+    assert calls == []
 
 
 def test_another_owner_of_the_same_account_holds_the_store_too(shopify_db):

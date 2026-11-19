@@ -17,6 +17,7 @@ The check covers one database, so one region. Two regions sharing one Shopify
 app can still retire each other's tokens.
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func
@@ -25,6 +26,11 @@ from sqlalchemy.orm import Session
 from ..models.shopify_store_lock import ShopifyStoreLock
 from ..models.user_oauth import UserOAuth
 from ..shopify_oauth import is_shopify_provider
+
+# Shopify issues each refresh token for at most 90 days, and a refresh can
+# only shorten that. A grant whose access token expired longer ago than that
+# has no usable refresh token left, whether or not anyone tried it.
+SHOPIFY_REFRESH_TOKEN_LIFETIME = timedelta(days=90)
 
 
 def lock_shopify_store(db: Session, *, provider: str, store: str) -> None:
@@ -70,6 +76,8 @@ def shopify_store_held_by_another_owner(
     one actor of that user, the same split ``UserOAuth`` stores grants by. A
     grant whose access token was cleared (a dead refresh token) or cannot be
     decrypted no longer holds the store: its owner has to reconnect anyway.
+    Nor does one past Shopify's refresh token lifetime: an owner who stopped
+    using the store never triggers the failed refresh that would clear it.
     Call it under :func:`lock_shopify_store` so the answer still holds when
     the grant is stored.
     """
@@ -77,11 +85,26 @@ def shopify_store_held_by_another_owner(
         func.lower(UserOAuth.oauth_provider) == provider.lower(),
         func.lower(UserOAuth.instance_url) == store.lower(),
     )
+    now = datetime.now(timezone.utc)
     return any(
         grant.access_token
+        and not _past_refresh_window(grant.expires_at, now)
         and (grant.user_id, grant.resource_owner_key) != (user_id, resource_owner_key)
         for grant in grants
     )
+
+
+def _past_refresh_window(expires_at: datetime | None, now: datetime) -> bool:
+    """Whether a grant's refresh token has certainly expired.
+
+    The refresh token was issued with the access token, no later than its
+    expiry. A grant with no expiry is a non-expiring token and never lapses.
+    """
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at + SHOPIFY_REFRESH_TOKEN_LIFETIME < now
 
 
 def shopify_store_of(provider_name: object, instance_url: object) -> str | None:

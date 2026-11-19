@@ -163,7 +163,13 @@ async def connector_hook_session_boundary_error_handler(
 ConnectorType = Literal["mcp", "custom_api"]
 
 ConnectorHookSlot = Literal[
-    "visibility", "team_visibility", "access", "deleted", "renamed"
+    "visibility",
+    "team_visibility",
+    "access",
+    "deleted",
+    "renamed",
+    # Installed from ``actor_private_mcp``; it reuses this module's gate.
+    "actor_private",
 ]
 
 # Called with the endpoint's live session; see the session contract in this

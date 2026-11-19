@@ -2910,6 +2910,27 @@ class WebToolConfig(BaseToolConfig):
             f"xagent:user:{self._user_id}",
         )
 
+    @staticmethod
+    def _actor_private_headers(
+        server: Any, built_headers: Mapping[str, Any] | None
+    ) -> Dict[str, Any]:
+        """The only headers an actor-private server sends.
+
+        Its credential comes from the encrypted ``auth`` fields, never from the
+        plaintext ``headers`` column, so custom headers are dropped: the static
+        key headers derived from ``auth``, plus, for MCP OAuth, the owner's
+        bearer that the runtime build selected.
+        """
+        auth_config = server._decrypt_auth_config(getattr(server, "auth", None))
+        headers: Dict[str, Any] = dict(
+            server._merge_auth_headers(None, auth_config) or {}
+        )
+        if isinstance(auth_config, Mapping) and auth_config.get("type") == "mcp_oauth":
+            bearer = (built_headers or {}).get("Authorization")
+            if bearer:
+                headers["Authorization"] = bearer
+        return headers
+
     def _task_authorization_rejected_config(self, server: Any) -> Dict[str, Any]:
         """The unavailable config for task-supplied authorization a policy refuses."""
         policy_diagnostic = {
@@ -5127,12 +5148,39 @@ class WebToolConfig(BaseToolConfig):
         actor_builtin_invalid: bool = False,
         actor_builtin_invalid_reason: str = "config_load_failed",
         custom_stdio: bool = False,
+        actor_private_owner_key: str | None = None,
     ) -> Dict[str, Any]:
-        """Build one MCP server config, preserving explicit unavailable outcomes."""
+        """Build one MCP server config, preserving explicit unavailable outcomes.
+
+        ``actor_private_owner_key`` is set for a server the actor-private hook
+        maps to the running actor (``services/actor_private_mcp.py``). Such a
+        server runs only over a remote HTTP transport, takes no task-supplied
+        authorization or connector runtime values, and uses exactly its
+        owner's credential.
+        """
         actor_builtin = bool(
             actor_catalog_app_info is not None
             and actor_catalog_app_info.get("auth_type") == "builtin_oauth"
         )
+        actor_private = actor_private_owner_key is not None
+        if actor_private:
+            from ...web.mcp_apps import get_app_for_mcp_server
+            from ..services.actor_private_mcp import ACTOR_PRIVATE_MCP_TRANSPORTS
+
+            # A private server is a custom remote HTTP server. A mapped catalog
+            # row is refused here, as connect_mcp_oauth_server_for_owner
+            # refuses it, rather than run outside the catalog's own path.
+            if (
+                server.transport not in ACTOR_PRIVATE_MCP_TRANSPORTS
+                or get_app_for_mcp_server(self.db, server) is not None
+            ):
+                return self._build_unavailable_mcp_config(
+                    server=server,
+                    reason="invalid_configuration",
+                    message=mcp_load_failure_message(
+                        MCPFailurePhase.INVALID_CONFIGURATION
+                    ),
+                )
         # The catalog app resolved on the way, so the allowlist lookup agrees
         # with it instead of resolving the row a second time.
         resolved_catalog_app: Mapping[str, Any] | None = actor_catalog_app_info
@@ -5150,34 +5198,30 @@ class WebToolConfig(BaseToolConfig):
                 diagnostic=policy_diagnostic,
             )
 
-        if actor_builtin and (self._mcp_auth_context or {}).get(str(server.id)):
-            policy_diagnostic = {
-                "code": "config_load_failed",
-                "message": "Task-supplied MCP authorization is not accepted",
-                "server_id": int(server.id),
-                "server_name": server.name,
-            }
-            self._mcp_oauth_diagnostics.append(policy_diagnostic)
-            return self._build_unavailable_mcp_config(
-                server=server,
-                reason="config_load_failed",
-                diagnostic=policy_diagnostic,
-            )
+        actor_owned = actor_builtin or actor_private
+        if actor_owned and (self._mcp_auth_context or {}).get(str(server.id)):
+            return self._task_authorization_rejected_config(server)
+        if actor_private:
+            # The runtime selector is refused too, not just left unread.
+            task_runtime = self._get_connector_runtime_for("mcp", int(server.id))
+            if (task_runtime or {}).get(RUNTIME_INPUT_AUTH_SELECTOR):
+                return self._task_authorization_rejected_config(server)
 
         # Actor builtins are constructed only from canonical catalog metadata
-        # and the exact actor credential. Task connector runtime values are not
-        # loaded, retained, or exposed in the serialized config.
+        # and the exact actor credential, and actor-private servers only from
+        # their row and their owner's credential. Task connector runtime values
+        # are not loaded, retained, or exposed in the serialized config.
         runtime_bindings = (
-            None if actor_builtin else getattr(server, "runtime_bindings", None)
+            None if actor_owned else getattr(server, "runtime_bindings", None)
         )
         allow_delegated_authorization = (
             False
-            if actor_builtin
+            if actor_owned
             else bool(getattr(server, "allow_delegated_authorization", False))
         )
         runtime_values = (
             None
-            if actor_builtin
+            if actor_owned
             else self._get_connector_runtime_for("mcp", int(server.id))
         )
         config: Dict[str, Any] = {
@@ -5190,7 +5234,7 @@ class WebToolConfig(BaseToolConfig):
                 else server.description
             ),
         }
-        if not actor_builtin:
+        if not actor_owned:
             config.update(
                 runtime_input_schema=getattr(server, "runtime_input_schema", None),
                 runtime_bindings=runtime_bindings,
@@ -5583,12 +5627,17 @@ class WebToolConfig(BaseToolConfig):
                         )
                     }
                 }
+            elif actor_private:
+                # Exactly the owner's grant: no workspace fallback.
+                auth_context = {
+                    str(server.id): {"resource_owner_key": actor_private_owner_key}
+                }
 
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
             remote_auth_type: str | None = None
-            if resolver is not None and not actor_remote_oauth:
+            if resolver is not None and not actor_remote_oauth and not actor_private:
                 remote_providers_to_resolve = (
                     _oauth_token_provider_candidates(app_info)
                     if app_info
@@ -5677,9 +5726,13 @@ class WebToolConfig(BaseToolConfig):
                             reason="runtime_connection_failed",
                         )
                     if runtime_build.connection is None:
-                        if runtime_build.diagnostic is not None:
-                            self._mcp_oauth_diagnostics.append(runtime_build.diagnostic)
                         diagnostic = runtime_build.diagnostic
+                        if actor_private and isinstance(diagnostic, Mapping):
+                            # The owner key identifies an actor of the
+                            # embedding app; keep it out of diagnostics.
+                            diagnostic = {**diagnostic, "resource_owner_key": None}
+                        if diagnostic is not None:
+                            self._mcp_oauth_diagnostics.append(diagnostic)
                         diagnostic_code = (
                             diagnostic.get("code")
                             if isinstance(diagnostic, Mapping)
@@ -5704,6 +5757,12 @@ class WebToolConfig(BaseToolConfig):
                                 "Authorization"
                             ]
                         }
+                    elif actor_private:
+                        runtime_build.connection["headers"] = (
+                            self._actor_private_headers(
+                                server, runtime_build.connection.get("headers")
+                            )
+                        )
                     transport_config.update(
                         connection_to_transport_config(runtime_build.connection)
                     )
@@ -5852,6 +5911,7 @@ class WebToolConfig(BaseToolConfig):
         actor_builtin_invalid: bool = False,
         actor_builtin_invalid_reason: str = "config_load_failed",
         custom_stdio: bool = False,
+        actor_private_owner_key: str | None = None,
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -5864,6 +5924,7 @@ class WebToolConfig(BaseToolConfig):
                 actor_builtin_invalid=actor_builtin_invalid,
                 actor_builtin_invalid_reason=actor_builtin_invalid_reason,
                 custom_stdio=custom_stdio,
+                actor_private_owner_key=actor_private_owner_key,
             )
         except ConnectorRuntimeError:
             raise
@@ -5878,7 +5939,11 @@ class WebToolConfig(BaseToolConfig):
                 reason="config_load_failed",
             )
 
-    def _visible_mcp_server_query(self, team_mcp_ids: frozenset[int]) -> Any:
+    def _visible_mcp_server_query(
+        self,
+        team_mcp_ids: frozenset[int],
+        actor_private_servers: Mapping[int, str] | None = None,
+    ) -> Any:
         """Compile the production semi-join query for visible MCP servers.
 
         No join on ``user_mcpservers`` -- an inner join would drop every
@@ -5886,15 +5951,35 @@ class WebToolConfig(BaseToolConfig):
         evaluated. Extracted to its own method so a compiled-query test can
         exercise the exact object ``_load_mcp_server_configs`` uses, not a
         parallel reconstruction of it.
+
+        Actor-private servers (``services/actor_private_mcp.py``) are left out
+        unless the active policy's owner key is exactly theirs. The filter
+        lives here so every caller of this query gets it. A caller that already
+        resolved the hook passes its answer; otherwise it is resolved here,
+        and a hook failure raises the seam's typed error.
         """
         from ...web.models.mcp import MCPServer
+        from ..services.actor_private_mcp import (
+            excluded_actor_private_server_ids,
+            resolve_actor_private_mcp_servers_or_raise,
+        )
         from ..services.connector_team_scope import visible_mcp_server_clause
 
-        return (
-            self.db.query(MCPServer)
-            .filter(visible_mcp_server_clause(self._user_id, team_mcp_ids))
-            .order_by(MCPServer.id)
+        if actor_private_servers is None:
+            actor_private_servers = resolve_actor_private_mcp_servers_or_raise(
+                self.db, user_id=self._user_id
+            )
+        policy = self._mcp_runtime_authorization_policy
+        excluded = excluded_actor_private_server_ids(
+            actor_private_servers,
+            resource_owner_key=(policy.resource_owner_key if policy else None),
         )
+        query = self.db.query(MCPServer).filter(
+            visible_mcp_server_clause(self._user_id, team_mcp_ids)
+        )
+        if excluded:
+            query = query.filter(MCPServer.id.notin_(excluded))
+        return query.order_by(MCPServer.id)
 
     async def load_mcp_server_config(self, server_id: int) -> Dict[str, Any] | None:
         """Build one visible server's config exactly as a task would, uncached.
@@ -5946,6 +6031,16 @@ class WebToolConfig(BaseToolConfig):
             log_subject=self._user_id,
         )
         team_mcp_ids = team_selection.mcp_ids
+        # Resolved before the guarded region for the same reason as the team
+        # scope: a hook failure must surface as the typed error, never as
+        # "every server unavailable".
+        from ..services.actor_private_mcp import (
+            resolve_actor_private_mcp_servers_or_raise,
+        )
+
+        actor_private_servers = resolve_actor_private_mcp_servers_or_raise(
+            self.db, user_id=self._user_id
+        )
 
         try:
             from ..services.mcp_runtime import (
@@ -5957,7 +6052,9 @@ class WebToolConfig(BaseToolConfig):
                 warn_team_env_hook_missing_once,
             )
 
-            visible_query = self._visible_mcp_server_query(team_mcp_ids)
+            visible_query = self._visible_mcp_server_query(
+                team_mcp_ids, actor_private_servers
+            )
             if only_server_id is not None:
                 from ...web.models.mcp import MCPServer
 
@@ -6066,6 +6163,10 @@ class WebToolConfig(BaseToolConfig):
                 )
 
                 for visible_server in servers:
+                    if int(visible_server.id) in actor_private_servers:
+                        # Never a catalog server: it runs on its own row and
+                        # its owner's credential (``actor_private_owner_key``).
+                        continue
                     try:
                         catalog_app = classify_actor_builtin_oauth_server(
                             self.db, visible_server
@@ -6218,6 +6319,9 @@ class WebToolConfig(BaseToolConfig):
                     int(server.id), "config_load_failed"
                 ),
                 custom_stdio=int(server.id) in custom_stdio_ids,
+                # The visible query already dropped every mapped server that
+                # another owner holds, so a mapped id here is the run's own.
+                actor_private_owner_key=actor_private_servers.get(int(server.id)),
             )
             for server in servers
         ]

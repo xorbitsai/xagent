@@ -5,17 +5,20 @@ compliance topics (``customers/data_request``, ``customers/redact`` and
 ``shop/redact``) before it can be listed. Shopify posts all four to
 ``POST /api/shopify/webhooks``:
 
-- ``app/uninstalled``: Shopify has already revoked the store's token, so every
-  grant of this deployment's Shopify app for the store is deleted; its owners
-  see the connector ask them to reconnect.
-- ``shop/redact`` (about 48 hours after an uninstall): the same deletion, again,
-  in case anything was left behind. The grant is everything this deployment
-  keeps about a store.
+- ``app/uninstalled``: Shopify has already revoked the store's token, so the
+  tokens of every grant of this deployment's Shopify app for the store are
+  cleared and the row is kept as a reconnect tombstone, the same as a grant
+  whose refresh failed for good (tools/config.py): its owner sees the
+  connector ask them to reconnect.
+- ``shop/redact`` (about 48 hours after an uninstall): the store's grants are
+  deleted, tombstones included. A grant (store label, shop id, owner) is the
+  only record this module keeps per store.
 - ``customers/redact`` and ``customers/data_request``: no per-customer records
   are kept, so these are acknowledged and logged without the customer's
-  details.
+  details. Customer data that connector tools returned into a conversation is
+  the user's own task history and out of scope here.
 
-A grant written after the uninstall is kept: the uninstall revoked the
+A grant that holds a token and was written after the uninstall is kept: the uninstall revoked the
 store's token, so only a new install writes one, and Shopify retries for hours
 without keeping order, so a late delivery must not delete the grant of a
 merchant who has since reconnected. The uninstall is taken to have happened
@@ -58,10 +61,10 @@ from starlette.concurrency import run_in_threadpool
 from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
 from ..models.user_oauth import UserOAuth
-from ..oauth_account_hosts import OAuthAccountError, normalize_oauth_account
 from ..shopify_oauth import (
-    SHOPIFY_HOST_SUFFIX,
+    _SHOP_GID_PREFIX,
     SHOPIFY_PROVIDER,
+    shopify_store_label,
     verify_shopify_webhook,
 )
 from .auth import _resolve_oauth_secret
@@ -74,16 +77,15 @@ TOPIC_APP_UNINSTALLED = "app/uninstalled"
 TOPIC_SHOP_REDACT = "shop/redact"
 TOPIC_CUSTOMERS_REDACT = "customers/redact"
 TOPIC_CUSTOMERS_DATA_REQUEST = "customers/data_request"
-# Topics that delete the store's grants.
+# Topics that clear or delete the store's grants.
 _STORE_DELETING_TOPICS = frozenset({TOPIC_APP_UNINSTALLED, TOPIC_SHOP_REDACT})
 _CUSTOMER_TOPICS = frozenset({TOPIC_CUSTOMERS_REDACT, TOPIC_CUSTOMERS_DATA_REQUEST})
-_SHOP_GID_PREFIX = "gid://shopify/Shop/"
 # Shopify sends shop/redact this long after the uninstall.
 SHOP_REDACT_DELAY = timedelta(hours=48)
 # Header values are unsigned; only a plain id is worth putting in a log line.
 _LOGGABLE_ID = re.compile(r"[A-Za-z0-9-]{1,64}")
 
-router = APIRouter(prefix="/api/shopify", tags=["shopify"])
+router = APIRouter(tags=["shopify"])
 
 
 class ShopifyWebhookRefused(Exception):
@@ -133,23 +135,9 @@ def shopify_webhook_secret(db: Session) -> str:
     )
 
 
-def _store_label(domain: object) -> str | None:
-    """The store label of ``<label>.myshopify.com``, or ``None``."""
-    if not isinstance(domain, str):
-        return None
-    label, _, suffix = domain.strip().lower().partition(".")
-    try:
-        account = normalize_oauth_account(label)
-    except OAuthAccountError:
-        return None
-    if account is None or suffix != SHOPIFY_HOST_SUFFIX:
-        return None
-    return account
-
-
 def _shop_gid(shop_id: object) -> str | None:
     """The grant identity of a shop id from the body, or ``None``."""
-    if isinstance(shop_id, int) and shop_id > 0:
+    if isinstance(shop_id, int) and not isinstance(shop_id, bool) and shop_id > 0:
         return f"{_SHOP_GID_PREFIX}{shop_id}"
     if isinstance(shop_id, str) and shop_id.isascii() and shop_id.isdigit():
         return f"{_SHOP_GID_PREFIX}{int(shop_id)}"
@@ -166,13 +154,15 @@ def _store_of(topic: str, payload: Mapping[str, Any]) -> tuple[str | None, str |
     being replayed under the unsigned ``shop/redact`` header.
     """
     if topic == TOPIC_APP_UNINSTALLED:
-        return _store_label(payload.get("myshopify_domain")), _shop_gid(
+        return shopify_store_label(payload.get("myshopify_domain")), _shop_gid(
             payload.get("id")
         )
     is_customer_topic = topic in _CUSTOMER_TOPICS
     if is_customer_topic != isinstance(payload.get("customer"), dict):
         raise ShopifyWebhookRefused(400, "payload_mismatch")
-    return _store_label(payload.get("shop_domain")), _shop_gid(payload.get("shop_id"))
+    return shopify_store_label(payload.get("shop_domain")), _shop_gid(
+        payload.get("shop_id")
+    )
 
 
 def _triggered_at(value: str | None) -> datetime | None:
@@ -192,10 +182,11 @@ def read_shopify_webhook(
 ) -> ShopifyWebhook:
     """Verify a delivery and read the store it is about.
 
-    Raises :class:`ShopifyWebhookRefused`: 401 when the signature does not
+    ``headers`` are matched case-insensitively. Raises :class:`ShopifyWebhookRefused`: 401 when the signature does not
     verify (Shopify's own check expects 401), 400 when a signed body does not
     fit its topic.
     """
+    headers = {name.lower(): value for name, value in headers.items()}
     if not verify_shopify_webhook(
         body, headers.get("x-shopify-hmac-sha256"), client_secret=client_secret
     ):
@@ -229,13 +220,21 @@ def _written_at(grant: UserOAuth) -> datetime | None:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
 
 
-def _delete_store_grants(db: Session, webhook: ShopifyWebhook) -> tuple[int, int]:
-    """Delete the store's grants written before the event; count kept ones."""
+def _clear_store_grants(db: Session, webhook: ShopifyWebhook) -> tuple[int, int]:
+    """Tombstone (uninstall) or delete (redact) the store's grants.
+
+    Returns how many grants were changed and how many were kept as written
+    after the uninstall. A kept grant must still hold a token: a tombstone is
+    always the uninstalled grant, even when clearing it moved ``updated_at``
+    past the uninstall.
+    """
     identity = []
     if webhook.store is not None:
         identity.append(func.lower(UserOAuth.instance_url) == webhook.store)
     if webhook.shop_gid is not None:
         identity.append(UserOAuth.provider_user_id == webhook.shop_gid)
+    if not identity:
+        return 0, 0
     grants = (
         db.query(UserOAuth)
         .filter(
@@ -247,19 +246,26 @@ def _delete_store_grants(db: Session, webhook: ShopifyWebhook) -> tuple[int, int
     uninstalled_at = webhook.triggered_at
     if uninstalled_at is not None and webhook.topic == TOPIC_SHOP_REDACT:
         uninstalled_at -= SHOP_REDACT_DELAY
-    kept = 0
+    changed = kept = 0
     for grant in grants:
         written_at = _written_at(grant)
         if (
-            uninstalled_at is not None
+            grant.access_token
+            and uninstalled_at is not None
             and written_at is not None
             and written_at > uninstalled_at
         ):
             kept += 1
-            continue
-        db.delete(grant)
+        elif webhook.topic == TOPIC_SHOP_REDACT:
+            db.delete(grant)
+            changed += 1
+        elif grant.access_token or grant.refresh_token:
+            setattr(grant, "access_token", "")
+            setattr(grant, "refresh_token", None)
+            setattr(grant, "expires_at", None)
+            changed += 1
     db.commit()
-    return len(grants) - kept, kept
+    return changed, kept
 
 
 def apply_shopify_webhook(db: Session, webhook: ShopifyWebhook) -> None:
@@ -277,20 +283,21 @@ def apply_shopify_webhook(db: Session, webhook: ShopifyWebhook) -> None:
             # sample payloads carry placeholders). Refusing it would only make
             # Shopify retry the same body.
             logger.warning(
-                "Shopify %s named no store (webhook %s); nothing deleted",
+                "Shopify %s named no store (webhook %s); nothing changed",
                 webhook.topic,
                 webhook.webhook_id,
             )
             return
-        deleted, kept = _delete_store_grants(db, webhook)
+        changed, kept = _clear_store_grants(db, webhook)
         logger.info(
-            "Shopify %s for store %s / %s (webhook %s): deleted %d grant(s), "
-            "kept %d written after the event%s",
+            "Shopify %s for store %s / %s (webhook %s): %s %d grant(s), "
+            "kept %d written after the uninstall%s",
             webhook.topic,
             webhook.store,
             webhook.shop_gid,
             webhook.webhook_id,
-            deleted,
+            "deleted" if webhook.topic == TOPIC_SHOP_REDACT else "cleared",
+            changed,
             kept,
             "" if webhook.triggered_at is not None else " (no event time)",
         )
@@ -310,7 +317,9 @@ async def receive_verified_shopify_webhook(
     """Read, verify and apply a delivery on this deployment.
 
     Returns the raw body and the delivery once applied, or the response to
-    answer a refused delivery with.
+    answer a refused delivery with. It ends the transaction of ``db`` (a
+    rollback after reading the secret, then the apply's own commit), so the
+    caller must not have pending changes on it.
     """
     body = await request.body()
     client_secret = await run_in_threadpool(shopify_webhook_secret, db)
@@ -331,7 +340,7 @@ async def receive_verified_shopify_webhook(
     return body, webhook
 
 
-@router.post("/webhooks")
+@router.post(SHOPIFY_WEBHOOK_PATH)
 async def receive_shopify_webhook(
     request: Request, db: Session = Depends(get_db)
 ) -> Response:

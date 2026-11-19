@@ -150,6 +150,22 @@ def verify_shopify_callback(
         )
 
 
+def shopify_store_label(domain: object) -> str | None:
+    """The store label of ``<label>.myshopify.com``, or ``None``.
+
+    Only a single valid label directly under ``myshopify.com`` names a store.
+    """
+    if not isinstance(domain, str):
+        return None
+    label, _, suffix = domain.strip().lower().partition(".")
+    if suffix != SHOPIFY_HOST_SUFFIX:
+        return None
+    try:
+        return normalize_oauth_account(label)
+    except OAuthAccountError:
+        return None
+
+
 def verify_shopify_webhook(
     body: bytes, received: str | None, *, client_secret: str
 ) -> bool:
@@ -219,12 +235,8 @@ def verify_shopify_launch(
             "timestamp_stale",
             "This link from Shopify has expired. Open the app from Shopify again.",
         )
-    label, _, suffix = params.get("shop", "").strip().lower().partition(".")
-    try:
-        account = normalize_oauth_account(label)
-    except OAuthAccountError:
-        account = None
-    if account is None or suffix != SHOPIFY_HOST_SUFFIX:
+    account = shopify_store_label(params.get("shop", ""))
+    if account is None:
         raise ShopifyOAuthError(
             "shop_invalid", "Shopify's request did not name a store."
         )

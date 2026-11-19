@@ -146,10 +146,24 @@ def _post(
 
 
 def _stores(db):
+    """The live grants: rows that still hold a token."""
     db.expire_all()
     return sorted(
         (grant.oauth_provider, grant.instance_url, grant.resource_owner_key)
         for grant in db.query(UserOAuth).all()
+        if grant.access_token
+    )
+
+
+def _tombstones(db):
+    """Rows kept for reconnect with every credential cleared."""
+    db.expire_all()
+    return sorted(
+        (grant.instance_url, grant.resource_owner_key)
+        for grant in db.query(UserOAuth).all()
+        if grant.access_token == ""
+        and grant.refresh_token is None
+        and grant.expires_at is None
     )
 
 
@@ -417,6 +431,79 @@ def test_without_a_usable_event_time_every_grant_for_the_store_goes(
 def test_a_signed_body_that_is_not_a_json_object_is_refused(client, body):
     response = _post(client, "shop/redact", None, body=body)
     assert response.status_code == 400
+
+
+def test_uninstall_leaves_a_reconnect_tombstone_and_redact_removes_it(
+    client, shopify_db
+):
+    """Like a grant whose refresh failed for good (tools/config.py), the row
+    stays with no credentials, so the connector asks its owner to reconnect;
+    shop/redact then deletes it, even though clearing it moved updated_at past
+    the uninstall."""
+    _, db, user, other = shopify_db
+    uninstalled_at = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    grant = _grant(user, actor="actor:toby:1")
+    grant.created_at = uninstalled_at - timedelta(days=3)
+    grant.expires_at = uninstalled_at + timedelta(hours=1)
+    db.add_all([grant, _grant(other, store="beta", gid="2")])
+    db.commit()
+
+    response = _post(
+        client, "app/uninstalled", UNINSTALLED, triggered_at="2026-11-19T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "beta", None)]
+    assert _tombstones(db) == [("acme", "actor:toby:1")]
+    assert db.query(UserOAuth).count() == 2
+
+    response = _post(
+        client, "shop/redact", SHOP_REDACT, triggered_at="2026-11-21T07:00:00Z"
+    )
+
+    assert response.status_code == 200
+    assert _tombstones(db) == []
+    assert _stores(db) == [("shopify", "beta", None)]
+    assert db.query(UserOAuth).count() == 1
+
+
+def test_a_boolean_shop_id_names_no_shop(client, shopify_db):
+    _, db, user, _ = shopify_db
+    grant = _grant(user)
+    grant.provider_user_id = "gid://shopify/Shop/True"
+    db.add(grant)
+    db.commit()
+    response = _post(client, "app/uninstalled", {"id": True, "myshopify_domain": None})
+    assert response.status_code == 200
+    assert _stores(db) == [("shopify", "acme", None)]
+
+
+def test_read_matches_header_names_in_any_case():
+    body = json.dumps(SHOP_REDACT).encode()
+    webhook = shopify_webhooks.read_shopify_webhook(
+        body,
+        {
+            "X-Shopify-Hmac-Sha256": _signature(body),
+            "X-Shopify-Topic": "shop/redact",
+        },
+        client_secret=CLIENT_SECRET,
+    )
+    assert (webhook.topic, webhook.store) == ("shop/redact", "acme")
+
+
+def test_a_delivery_naming_no_store_matches_no_grant(shopify_db):
+    _, db, user, _ = shopify_db
+    db.add(_grant(user))
+    db.commit()
+    webhook = shopify_webhooks.ShopifyWebhook(
+        topic="app/uninstalled",
+        store=None,
+        shop_gid=None,
+        triggered_at=None,
+        webhook_id=None,
+    )
+    assert shopify_webhooks._clear_store_grants(db, webhook) == (0, 0)
+    assert _stores(db) == [("shopify", "acme", None)]
 
 
 # ---------- customer topics ---------------------------------------------------

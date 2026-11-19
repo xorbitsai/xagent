@@ -1386,6 +1386,15 @@ class PatternRuntime:
         result["output"] = message
         return True
 
+    @property
+    def delivers_messages(self) -> bool:
+        """Whether a message sent now reaches the user.
+
+        Without an outbound handler (a delegated sub-agent) ``send_message``
+        only buffers the message in memory.
+        """
+        return self.outbound_message_handler is not None
+
     async def send_message(
         self,
         *,

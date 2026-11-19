@@ -1043,13 +1043,12 @@ def _persist_agent_outbound_event(
         elif (card_metadata := result_card_metadata(data)) is not None:
             task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
             task_user_id = _task_user_id(task) if task else None
-            message = str(data.get("message") or "")
-            if task and task_user_id is not None and message:
+            if task and task_user_id is not None:
                 persist_assistant_message_no_commit(
                     db,
                     task_id=task_id,
                     user_id=task_user_id,
-                    content=message,
+                    content=data["message"],
                     message_type=RESULT_CARD_MESSAGE_TYPE,
                     message_metadata=card_metadata,
                     source_event_id=str(trace_event.event_id),

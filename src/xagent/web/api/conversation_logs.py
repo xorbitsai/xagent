@@ -987,21 +987,18 @@ def _event_log_message_predicate(db: Session) -> Any:
             TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
             and_(
                 TaskExecutionEvent.kind == "agent_message",
-                expects_response,
                 hidden.is_not(True),
                 data["message"].as_string().isnot(None),
                 data["message"].as_string() != "",
-            ),
-            # A result card is a displayed assistant message that asks nothing
-            # (the detail view shows it, so the list counts it too).
-            and_(
-                TaskExecutionEvent.kind == "agent_message",
-                expects_response.is_not(True),
-                hidden.is_not(True),
-                data["message_type"].as_string() == RESULT_CARD_MESSAGE_TYPE,
-                data["metadata"]["display"].as_string() == RESULT_CARD_DISPLAY,
-                data["message"].as_string().isnot(None),
-                data["message"].as_string() != "",
+                or_(
+                    expects_response,
+                    # A result card is a displayed assistant message that asks
+                    # nothing (the detail view shows it, so the list counts it).
+                    and_(
+                        data["message_type"].as_string() == RESULT_CARD_MESSAGE_TYPE,
+                        data["metadata"]["display"].as_string() == RESULT_CARD_DISPLAY,
+                    ),
+                ),
             ),
         ),
     )

@@ -14,6 +14,7 @@ from ....utils.encryption import decrypt_value
 from ...core.api_tool import call_api, has_auth_credentials
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .connector_runtime import (
+    CONNECTOR_TYPE_CUSTOM_API,
     MISSING_RUNTIME_VALUE,
     RUNTIME_INPUT_CONTEXT,
     RUNTIME_INPUT_SECRETS,
@@ -181,7 +182,7 @@ class CustomApiTool(AbstractBaseTool):
         from .selection_spec import normalize_mcp_server_name
 
         self.source_server = normalize_mcp_server_name(name)
-        self.source_kind = "custom_api"
+        self.source_kind = CONNECTOR_TYPE_CUSTOM_API
 
         default_info = ""
         if url:

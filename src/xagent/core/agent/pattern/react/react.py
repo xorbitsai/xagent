@@ -7021,6 +7021,7 @@ class ReActPattern(AgentPattern):
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)
         is_control = tool_call["name"] in CONTROL_TOOL_NAMES
+        connector = None if is_control else self._tool_connector(tool_call, tools)
         if not is_control:
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
             committed = await runtime.load_committed_tool_outcome(tool_call)
@@ -7036,6 +7037,7 @@ class ReActPattern(AgentPattern):
                     ),
                     result=result,
                     error=committed["error"],
+                    connector=connector,
                 )
                 return result
             # The duplicate-write scan runs before this call writes any ledger
@@ -7063,7 +7065,7 @@ class ReActPattern(AgentPattern):
                 await runtime.on_tool_start(tool_call=tool_call)
                 await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
                 return suppressed
-        self._record_tool_call(tool_call, status="running")
+        self._record_tool_call(tool_call, status="running", connector=connector)
         recorded_terminal = False
         try:
             if is_control:
@@ -7171,7 +7173,6 @@ class ReActPattern(AgentPattern):
                 tool_call,
                 status="completed",
                 result=result,
-                connector=self._tool_connector(tool_call, tools),
             )
             recorded_terminal = True
             await runtime.on_tool_end(tool_call=tool_call, result=result)
@@ -7311,6 +7312,8 @@ class ReActPattern(AgentPattern):
             RunDisplayContext(
                 invoked_connectors=frozenset(invoked),
                 send_message=runtime.send_message,
+                delivers=runtime.delivers_messages,
+                issued_at=tool_call.get("issued_at"),
                 message_source=self._tool_message_source(tool_call),
             )
         )
@@ -7370,6 +7373,15 @@ class ReActPattern(AgentPattern):
         index_tool_call_id: bool = True,
         connector: ResultCardConnector | None = None,
     ) -> None:
+        """Write one ledger row for ``tool_call``.
+
+        The connector the call's tool belongs to is stamped on the first row
+        written for the call (``_execute_tool_safely`` passes it) and carried
+        over from the call's existing row by every later write, so a call that
+        reaches ``completed`` through any route keeps it: a direct run, a
+        replayed committed outcome, or a settlement after an approval or a
+        user interaction. A completed call adds its connector to the run's set.
+        """
         tool_call_id = str(
             tool_call.get("id") or f"tool_call_{len(self.tool_call_id_index)}"
         )
@@ -7380,6 +7392,10 @@ class ReActPattern(AgentPattern):
             tool_call_id=tool_call_id,
             invocation_id=invocation_id,
         )
+        if connector is None and existing is not None and existing.source_server:
+            connector = ResultCardConnector(
+                existing.source_server, existing.source_kind
+            )
         raw_issued_at = tool_call.get("issued_at")
         issued_at = (
             existing.issued_at

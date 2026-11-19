@@ -196,6 +196,8 @@ def _card_call() -> dict[str, Any]:
         },
         "tool_attempt_id": "attempt-1",
         "assistant_message_id": "batch-1",
+        # When the model issued the call; a retry of the call repeats it.
+        "issued_at": 1_795_000_000.4,
     }
 
 
@@ -255,6 +257,10 @@ async def test_card_tool_call_is_one_attributed_fact_with_a_replay_that_adds_non
         assert fact.tool_attempt_id == "attempt-1"
         assert fact.assistant_message_id == "batch-1"
         assert fact.payload["data"]["metadata"]["result_card"]["title"] == CARD["title"]
+        assert (
+            fact.payload["data"]["metadata"]["result_card"]["created_at"]
+            == "2026-11-18T11:06:40Z"
+        )
         rows = db.scalars(select(TaskChatMessage)).all()
         assert [r.message_type for r in rows] == ["result_card"]
         assert rows[0].message_metadata["result_card"]["source"]["app_id"] == "cosmos"

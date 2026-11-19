@@ -48,6 +48,14 @@ def _enable() -> None:
     )
 
 
+async def _accept(payload: dict[str, Any]) -> None:
+    """An outbound handler that accepts every message."""
+
+
+def _runtime() -> PatternRuntime:
+    return PatternRuntime(outbound_message_handler=_accept)
+
+
 def _connectors(names: set[str]) -> frozenset[ResultCardConnector]:
     """``name`` is an MCP server, or ``kind:name`` for another kind."""
     parsed = [n.split(":", 1) if ":" in n else ["mcp", n] for n in names]
@@ -85,9 +93,17 @@ async def _call(
     *,
     blocked: bool = False,
     source: dict[str, Any] | None = None,
+    delivers: bool = True,
+    issued_at: float | None = None,
 ) -> tuple[Any, _Sender]:
     sender = _Sender(blocked)
-    ctx = RunDisplayContext(_connectors(invoked), sender, source or {})
+    ctx = RunDisplayContext(
+        _connectors(invoked),
+        sender,
+        delivers=delivers,
+        issued_at=issued_at,
+        message_source=source or {},
+    )
     with bind_run_display_context(ctx):
         return await ShowResultCardTool().run_json_async(args), sender
 
@@ -119,7 +135,9 @@ async def test_card_for_an_invoked_connector_is_emitted_in_the_contract_shape() 
     }
     assert card["items"] == ["Contoso Ltd · $182,400", "Northwind Traders · $149,950"]
     assert card["footnote"] == "2 of 1,284 customers · read-only query"
-    assert card["created_at"].endswith("Z")
+    # Not set without the call's issue time: the wall clock would make a
+    # retry of the call differ from it.
+    assert card["created_at"] is None
 
 
 @pytest.mark.asyncio
@@ -142,7 +160,7 @@ async def test_forged_provenance_is_refused_without_emitting(invoked: set[str]) 
     _enable()
     result, sender = await _call(_args(), invoked)
     assert result["success"] is False
-    assert "was not invoked" in result["error"]
+    assert "was not called successfully" in result["error"]
     assert sender.sent == []
 
 
@@ -242,7 +260,7 @@ async def test_react_run_validates_against_tools_it_really_called() -> None:
         ]
     )
     pattern = ReActPattern(max_iterations=8)
-    runtime = PatternRuntime()
+    runtime = _runtime()
     context = ExecutionContext()
     context.add_user_message("Top customers?")
 
@@ -270,7 +288,7 @@ async def test_failed_connector_call_does_not_count_as_invoked() -> None:
             {"content": "Done.", "done": True},
         ]
     )
-    runtime = PatternRuntime()
+    runtime = _runtime()
     context = ExecutionContext()
     context.add_user_message("Top customers?")
     pattern = ReActPattern(max_iterations=8)
@@ -280,7 +298,10 @@ async def test_failed_connector_call_does_not_count_as_invoked() -> None:
         llm=llm,
         runtime=runtime,
     )
-    assert "was not invoked" in pattern._record_for_tool_call_id("c1").result["error"]
+    assert (
+        "was not called successfully"
+        in pattern._record_for_tool_call_id("c1").result["error"]
+    )
     assert not [
         m for m in runtime.outbound_messages if m.get("message_type") == "result_card"
     ]
@@ -483,7 +504,7 @@ async def test_model_cannot_forge_a_card_through_send_message() -> None:
             {"content": "Done.", "done": True},
         ]
     )
-    runtime = PatternRuntime()
+    runtime = _runtime()
     context = ExecutionContext()
     context.add_user_message("hi")
     await ReActPattern(max_iterations=4).run(
@@ -500,7 +521,7 @@ async def test_model_cannot_forge_a_card_through_send_message() -> None:
 
 @pytest.mark.asyncio
 async def test_runtime_strips_card_metadata_from_other_message_types() -> None:
-    runtime = PatternRuntime()
+    runtime = _runtime()
     await runtime.send_message(
         message="x",
         message_type="info",
@@ -533,7 +554,7 @@ def _bound_connectors(
     from xagent.core.agent.result_card import current_run_display_context
 
     call = {"id": "c1", "name": RESULT_CARD_TOOL_NAME, "arguments": {}}
-    with pattern._bind_result_card_context(call, tools, PatternRuntime()):
+    with pattern._bind_result_card_context(call, tools, _runtime()):
         context = current_run_display_context()
         assert context is not None
         return context.invoked_connectors
@@ -578,6 +599,7 @@ def _dag_step_llm(
     script: dict[str, list[dict[str, Any]]],
     on_done: Any = None,
 ) -> Any:
+    seen: list[tuple[str, str]] = []
     from .test_dag import (
         DAG_COMPLETION_TOOL_NAME,
         current_step_task,
@@ -593,12 +615,15 @@ def _dag_step_llm(
             if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
                 return default_completion_assessment_response(kwargs)
             task = current_step_task(list(kwargs.get("messages", [])))
+            seen.append((task, json.dumps(kwargs.get("messages", []), default=str)))
             response = self.script[task].pop(0)
             if on_done is not None:
                 await on_done(task, response)
             return response
 
-    return StepLLM()
+    llm = StepLLM()
+    llm.seen = seen  # type: ignore[attr-defined]
+    return llm
 
 
 def _cards(runtime: PatternRuntime) -> list[dict[str, Any]]:
@@ -637,7 +662,7 @@ async def test_card_in_a_later_dag_step_accepts_a_connector_used_in_an_earlier_o
             ],
         }
     )
-    runtime = PatternRuntime()
+    runtime = _runtime()
     context = ExecutionContext(execution_id="dag-card")
     context.add_user_message("Top customers?")
     dag = DAGPattern(lambda **_: plan)
@@ -679,7 +704,7 @@ async def test_a_failed_connector_call_in_one_dag_step_does_not_count_for_the_ne
             ],
         }
     )
-    runtime = PatternRuntime()
+    runtime = _runtime()
     context = ExecutionContext(execution_id="dag-card-failed")
     context.add_user_message("Top customers?")
     dag = DAGPattern(lambda **_: plan)
@@ -691,6 +716,9 @@ async def test_a_failed_connector_call_in_one_dag_step_does_not_count_for_the_ne
     )
     assert _cards(runtime) == []
     assert dag.run_connectors == set()
+    # The present step did call the tool and was refused (not silently idle).
+    last_present = [text for task, text in llm.seen if task == "present"][-1]
+    assert "was not called successfully in this turn" in last_present
 
 
 @pytest.mark.asyncio
@@ -734,7 +762,7 @@ async def test_concurrent_dag_steps_share_the_run_level_connector_set() -> None:
         return await original(**kwargs)
 
     base.chat = chat
-    runtime = PatternRuntime()
+    runtime = _runtime()
     context = ExecutionContext(execution_id="dag-card-parallel")
     context.add_user_message("Top customers?")
     dag = DAGPattern(lambda **_: plan)
@@ -774,3 +802,276 @@ def test_schema_keeps_its_bounds_through_the_gemini_schema_sanitizer() -> None:
     )
     assert schema["properties"]["items"]["maxItems"] == MAX_ITEMS
     assert schema["properties"]["title"]["maxLength"] == MAX_TITLE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_error_names_the_valid_connectors_and_what_to_do() -> None:
+    _enable()
+    result, sender = await _call(
+        _args(source_connector="mcp_Azure_Cosmos_DB_query"),
+        {"zeta", "azure_cosmos_db", "custom_api:alpha"},
+    )
+    assert sender.sent == []
+    error = result["error"]
+    assert "alpha, azure_cosmos_db, zeta" in error
+    assert "in this turn" in error
+    assert "answer in text" in error
+
+
+@pytest.mark.asyncio
+async def test_error_lists_at_most_ten_connectors() -> None:
+    _enable()
+    result, _ = await _call(_args(), {f"c{i:02d}" for i in range(25)})
+    assert "c09" in result["error"] and "c10" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_error_without_any_connector_says_so() -> None:
+    _enable()
+    result, _ = await _call(_args(), set())
+    assert "have not called any connector" in result["error"]
+
+
+def test_the_tool_text_says_this_turn_and_names_custom_apis() -> None:
+    tool = ShowResultCardTool()
+    assert "in this turn" in tool.description
+    field = tool.args_type().model_json_schema()["properties"]["source_connector"]
+    assert "Custom API" in field["description"]
+    assert "in this turn" in field["description"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_without_an_outbound_handler_does_not_claim_the_card_was_shown() -> (
+    None
+):
+    _enable()
+    result, sender = await _call(_args(), {"azure_cosmos_db"}, delivers=False)
+    assert result["success"] is True and result["shown"] is False
+    assert sender.sent == []
+
+
+@pytest.mark.asyncio
+async def test_card_time_comes_from_the_call_so_a_retry_repeats_it(monkeypatch) -> None:
+    from xagent.core.tools.adapters.vibe import result_card_tool
+
+    class _NoWallClock:
+        @staticmethod
+        def fromtimestamp(ts: float, tz: Any) -> Any:
+            import datetime as real
+
+            return real.datetime.fromtimestamp(ts, tz)
+
+        @staticmethod
+        def now(*_: Any, **__: Any) -> Any:
+            raise AssertionError("the card must not read the wall clock")
+
+    monkeypatch.setattr(result_card_tool, "datetime", _NoWallClock)
+    _enable()
+    first, a = await _call(_args(), {"azure_cosmos_db"}, issued_at=1_795_000_000.4)
+    second, b = await _call(_args(), {"azure_cosmos_db"}, issued_at=1_795_000_000.4)
+    assert first == second
+    assert a.sent == b.sent
+    assert a.sent[0]["metadata"]["result_card"]["created_at"].endswith("Z")
+
+
+# --- every way a connector call reaches ``completed`` ---------------------------
+
+
+class _Gated(_CosmosQuery):
+    """A connector tool whose first call asks the user to approve it."""
+
+    name = "cosmos_gated"  # type: ignore[assignment]
+
+    async def run_json_async(self, args):
+        return {"status": "waiting_for_user", "message": "Approve?"}
+
+
+CONNECTOR = ResultCardConnector("azure_cosmos_db", "mcp")
+
+
+def _shared_step_patterns() -> tuple[ReActPattern, ReActPattern]:
+    """Two step patterns holding the one run-level set, as ``DAGPattern`` does."""
+    shared: set[ResultCardConnector] = set()
+    a, b = ReActPattern(), ReActPattern()
+    a.run_connectors = b.run_connectors = shared
+    return a, b
+
+
+def _call_dict(name: str, call_id: str) -> dict[str, Any]:
+    return {"id": call_id, "name": name, "arguments": {}}
+
+
+@pytest.mark.asyncio
+async def test_connector_is_recorded_for_a_direct_call() -> None:
+    a, b = _shared_step_patterns()
+    await a._execute_tool_safely(
+        _call_dict("cosmos_query", "q1"), [_CosmosQuery()], _runtime(), context=None
+    )
+    assert _bound_connectors(b, []) == {CONNECTOR}
+    assert a._record_for_tool_call_id("q1").source_server == "azure_cosmos_db"
+
+
+@pytest.mark.asyncio
+async def test_connector_is_recorded_for_a_replayed_committed_outcome() -> None:
+    a, b = _shared_step_patterns()
+    runtime = _runtime()
+
+    async def committed(_call: dict[str, Any]) -> dict[str, Any]:
+        return {"result": {"success": True, "rows": 2}, "error": None}
+
+    runtime.load_committed_tool_outcome = committed  # type: ignore[method-assign]
+    await a._execute_tool_safely(
+        _call_dict("cosmos_query", "q1"), [_CosmosQuery()], runtime, context=None
+    )
+    record = a._record_for_tool_call_id("q1")
+    assert record.status == "completed" and record.source_server == "azure_cosmos_db"
+    assert _bound_connectors(b, []) == {CONNECTOR}
+
+
+@pytest.mark.asyncio
+async def test_a_replayed_failed_outcome_does_not_count() -> None:
+    a, b = _shared_step_patterns()
+    runtime = _runtime()
+
+    async def committed(_call: dict[str, Any]) -> dict[str, Any]:
+        return {"result": {"success": False, "error": "boom"}, "error": "boom"}
+
+    runtime.load_committed_tool_outcome = committed  # type: ignore[method-assign]
+    await a._execute_tool_safely(
+        _call_dict("cosmos_query", "q1"), [_CosmosQuery()], runtime, context=None
+    )
+    assert _bound_connectors(b, []) == frozenset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rebuilt", [False, True])
+async def test_connector_is_recorded_when_an_approval_settles_the_call(
+    rebuilt: bool,
+) -> None:
+    """Approval-gated connector tools: the connector rides on the waiting row."""
+    from xagent.core.tools.user_interaction import ToolInteractionSettlement
+
+    a, b = _shared_step_patterns()
+    runtime = _runtime()
+    await a._execute_tool_safely(
+        _call_dict("cosmos_gated", "g1"), [_Gated()], runtime, context=None
+    )
+    waiting = a._record_for_tool_call_id("g1")
+    assert waiting.status == "waiting_for_user"
+    assert waiting.source_server == "azure_cosmos_db"
+    assert _bound_connectors(b, []) == frozenset()  # not completed yet
+
+    settling = a
+    if rebuilt:  # the run is rebuilt from its checkpoint before the approval
+        settling = ReActPattern()
+        settling.run_connectors = b.run_connectors
+        settling.load_state(json.loads(json.dumps(a.get_state())))
+        waiting = settling._record_for_tool_call_id("g1")
+    result = {"success": True, "rows": 2}
+    settling._record_settled_tool_call(
+        record=waiting,
+        settlement=ToolInteractionSettlement.succeeded(result),
+        result=result,
+        runtime=runtime,
+    )
+    settled = settling._record_for_tool_call_id("g1")
+    assert settled.status == "completed" and settled.source_server == "azure_cosmos_db"
+    assert _bound_connectors(b, []) == {CONNECTOR}
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_approval_does_not_count() -> None:
+    from xagent.core.tools.user_interaction import ToolInteractionSettlement
+
+    a, b = _shared_step_patterns()
+    runtime = _runtime()
+    await a._execute_tool_safely(
+        _call_dict("cosmos_gated", "g1"), [_Gated()], runtime, context=None
+    )
+    waiting = a._record_for_tool_call_id("g1")
+    a._record_settled_tool_call(
+        record=waiting,
+        settlement=ToolInteractionSettlement.rejected(error="denied"),
+        result={"success": False, "error": "denied"},
+        runtime=runtime,
+    )
+    assert _bound_connectors(b, []) == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_connector_is_recorded_when_a_call_is_retried() -> None:
+    a, b = _shared_step_patterns()
+    tool = _CosmosQuery()
+    tool.fail = True
+    runtime = _runtime()
+    await a._execute_tool_safely(_call_dict("cosmos_query", "q1"), [tool], runtime)
+    assert _bound_connectors(b, []) == frozenset()
+    tool.fail = False
+    await a._execute_tool_safely(_call_dict("cosmos_query", "q2"), [tool], runtime)
+    assert _bound_connectors(b, []) == {CONNECTOR}
+
+
+def test_every_row_that_reaches_completed_keeps_the_source_it_was_stamped_with() -> (
+    None
+):
+    """The recording function carries the connector over from the call's row."""
+    pattern = ReActPattern()
+    call = _call_dict("cosmos_query", "q1")
+    pattern._record_tool_call(call, status="running", connector=CONNECTOR)
+    pattern._record_tool_call(call, status="completed", result={"success": True})
+    row = pattern._record_for_tool_call_id("q1")
+    assert (row.source_server, row.source_kind) == ("azure_cosmos_db", "mcp")
+    assert pattern.run_connectors == {CONNECTOR}
+
+
+@pytest.mark.asyncio
+async def test_a_dag_run_with_no_outbound_handler_reports_the_card_as_not_shown() -> (
+    None
+):
+    from xagent.core.agent import DAGPattern, PlanStep
+
+    from .test_dag import build_plan
+
+    _enable()
+    plan = build_plan(
+        PlanStep(id="a", task="query"),
+        PlanStep(id="b", task="present", dependencies=["a"]),
+    )
+    llm = _dag_step_llm(
+        {
+            "query": [
+                {"tool_calls": [_call_of("cosmos_query", "q1")]},
+                {"content": "queried", "done": True},
+            ],
+            "present": [
+                {"tool_calls": [_call_of(RESULT_CARD_TOOL_NAME, "c1", **_args())]},
+                {"content": "answered in text", "done": True},
+            ],
+        }
+    )
+    runtime = PatternRuntime()  # no outbound handler, like a delegated sub-agent
+    context = ExecutionContext(execution_id="dag-card-no-handler")
+    context.add_user_message("Top customers?")
+    await DAGPattern(lambda **_: plan).run(
+        context=context,
+        tools=[_CosmosQuery(), ShowResultCardTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+    assert _cards(runtime) == []
+    last_present = [text for task, text in llm.seen if task == "present"][-1]
+    assert "'shown': False" in last_present
+
+
+def test_runtime_adapters_forward_whether_messages_are_delivered() -> None:
+    from xagent.core.agent.pattern.auto.auto import _AutoChildRuntime
+    from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
+
+    for handler in (None, _accept):
+        parent = PatternRuntime(outbound_message_handler=handler)
+        expected = handler is not None
+        assert parent.delivers_messages is expected
+        dag_step = _DAGStepRuntime(parent, None, None, "s")  # type: ignore[arg-type]
+        assert dag_step.delivers_messages is expected
+        auto_child = _AutoChildRuntime(parent, None, None)  # type: ignore[arg-type]
+        assert auto_child.delivers_messages is expected

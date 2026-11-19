@@ -128,6 +128,10 @@ class _DAGStepRuntime:
         return self.parent.interrupt_reason
 
     @property
+    def delivers_messages(self) -> bool:
+        return self.parent.delivers_messages
+
+    @property
     def tracer(self) -> Any | None:
         return self.parent.tracer
 

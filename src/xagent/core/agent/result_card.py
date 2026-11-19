@@ -34,19 +34,15 @@ MAX_ITEM_CHARS = 240
 MAX_FOOTNOTE_CHARS = 200
 
 
-# Connector kinds a tool can come from. ``None`` means the origin is unknown, or
-# that two kinds with the same name were both used in the run.
-CONNECTOR_KIND_MCP = "mcp"
-CONNECTOR_KIND_CUSTOM_API = "custom_api"
-
-
 @dataclass(frozen=True)
 class ResultCardConnector:
     """Which connector a card is attributed to, as the run used it.
 
     ``name`` is the normalized server name (``normalize_mcp_server_name``).
-    ``kind`` says what kind of connector carries that name: an MCP server or a
-    user-defined Custom API. Names are unique among MCP servers but not across
+    ``kind`` says what kind of connector carries that name, one of the
+    ``CONNECTOR_TYPE_*`` values of ``tools.adapters.vibe.connector_runtime``
+    (an MCP server or a user-defined Custom API), or ``None`` when the origin
+    is unknown or both kinds with that name were used in the run. Names are unique among MCP servers but not across
     kinds, so a name alone does not identify a catalog app: a user's Custom API
     can be called "Salesforce" too. A host maps ``(kind, name)`` to its catalog
     and must not apply catalog branding to ``custom_api`` or to ``None``.
@@ -180,6 +176,12 @@ class RunDisplayContext:
     invoked_connectors: frozenset[ResultCardConnector]
     # ``PatternRuntime.send_message``: emits one assistant-side chat message.
     send_message: Callable[..., Awaitable[dict[str, Any]]]
+    # Whether a message sent now reaches anyone: a run with no outbound handler
+    # (a delegated sub-agent) only buffers it in memory.
+    delivers: bool = True
+    # When the model issued the tool call. Stable across a retry of the call,
+    # unlike the wall clock, so the card payload is identical on replay.
+    issued_at: Optional[float] = None
     # Attribution of the tool call that is showing the card (tool attempt,
     # assistant message, turn), merged into the message metadata so the fact
     # is attributed to the call and replays idempotently.

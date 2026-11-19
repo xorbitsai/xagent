@@ -712,6 +712,7 @@ def _build_tool_selection_spec_for_task(
     omit_published_agent_tools: bool = False,
     include_mcp_tools: bool = False,
     excluded_tool_categories: frozenset[str] = frozenset(),
+    announce: bool = True,
 ) -> Any:
     """Single SSOT normalizer for chat reconstruct + snapshot paths.
 
@@ -755,6 +756,8 @@ def _build_tool_selection_spec_for_task(
         spec = with_mcp_tools(spec)
     if omit_published_agent_tools:
         spec = without_published_agent_tools(spec)
+    if not announce:
+        return spec
     if spec.is_all():
         logger.info(
             f"Task {task_id} has no tool_categories restriction "
@@ -3467,10 +3470,72 @@ class AgentServiceManager:
         self._agent_owner_ids[task_id] = runtime_user_id
         self._agent_scope_fingerprints[task_id] = fingerprint
         self._record_model_override(task_id, requested_model_override)
+        if not rebuilt_this_call:
+            self._sync_tool_selection(
+                task_id, task_setup_snapshot, actor_marked=actor_marked
+            )
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         self._sync_mcp_actor_execution_identity(task_id, mcp_actor_execution_identity)
         self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
+
+    def _sync_tool_selection(
+        self,
+        task_id: int,
+        task_setup_snapshot: Optional[TaskSetupSnapshot],
+        *,
+        actor_marked: bool,
+    ) -> None:
+        """Apply this turn's tool selection to a reused AgentService.
+
+        The selection is baked into the cached tool config when the runtime is
+        built. Without this, an agent whose tools were edited (in the builder,
+        or by a host that just connected an app for it) keeps running a warm
+        or waiting task on the old selection until the cached instance
+        expires. Derived exactly as the build path derives it, from this
+        turn's setup snapshot; a lookup without a snapshot has nothing fresh
+        to compare and leaves the selection alone.
+
+        Never applied under a run that is executing: a live-control lookup
+        (stop, interrupt) reaches the same instance mid-turn, and the turn
+        finishes on the selection it started with. A waiting or paused run is
+        between turns, so its next turn picks the change up.
+        """
+        if task_setup_snapshot is None:
+            return
+        agent = self._agents.get(task_id)
+        tool_config = getattr(agent, "tool_config", None)
+        if tool_config is None or not hasattr(tool_config, "set_tool_selection_spec"):
+            return
+        try:
+            status = agent.get_execution_status(str(task_id))  # type: ignore[union-attr]
+            executing = bool(status and status.get("is_running"))
+        except Exception:  # noqa: BLE001 - unknown: leave a possible live run alone
+            executing = True
+        if executing:
+            return
+        excluded_tool_categories = _task_model_override_excluded_categories(
+            task_setup_snapshot
+        )
+        tool_selection_spec = _build_tool_selection_spec_for_task(
+            task_setup_snapshot.agent_config,
+            task_setup_snapshot.workforce_runtime,
+            task_id=task_id,
+            omit_published_agent_tools=actor_marked,
+            include_mcp_tools=actor_marked,
+            excluded_tool_categories=excluded_tool_categories,
+            announce=False,
+        )
+        force_mcp_tools = actor_marked and "mcp" not in excluded_tool_categories
+        if tool_config.set_tool_selection_spec(
+            tool_selection_spec,
+            include_mcp_tools=force_mcp_tools or _spec_wants_mcp(tool_selection_spec),
+        ):
+            logger.info(
+                "Refreshing tools for task %s: its tool selection changed", task_id
+            )
+            assert agent is not None
+            agent.invalidate_tools()
 
     def _agent_run_in_progress(self, task_id: int) -> bool:
         """Whether the cached AgentService has a running or resumable execution."""

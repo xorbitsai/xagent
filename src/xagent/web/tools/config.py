@@ -2691,6 +2691,33 @@ class WebToolConfig(BaseToolConfig):
         self._pending_runtime_policy = None
         return True
 
+    def set_tool_selection_spec(
+        self, tool_selection_spec: Optional[Any], *, include_mcp_tools: bool
+    ) -> bool:
+        """Switch the tool selection of a reused tool config.
+
+        ``WebToolConfig`` instances are cached with ``AgentService`` by task,
+        and the selection is fixed when they are built. An agent whose tools
+        were edited since must not keep running a task on the old selection
+        until the cached instance happens to expire.
+
+        No-op for an equal selection: specs are frozen value objects whose
+        members are frozensets, so equality ignores the order the categories
+        were stored in.
+        """
+
+        if (
+            self._tool_selection_spec == tool_selection_spec
+            and self._include_mcp_tools == include_mcp_tools
+        ):
+            return False
+        self._tool_selection_spec = tool_selection_spec
+        self._include_mcp_tools = include_mcp_tools
+        self._discard_cached_mcp_configs()
+        self._factory_runtime_snapshot = None
+        self._pending_runtime_policy = None
+        return True
+
     def set_mcp_actor_execution_identity(
         self, identity: MCPActorExecutionIdentity | None
     ) -> bool:

@@ -1061,9 +1061,10 @@ def test_an_actor_connecting_a_store_held_by_someone_else_is_refused(
     assert _probe_store_lock(db) is True
 
 
-def test_a_store_lock_timeout_asks_to_try_again(shopify_db, monkeypatch):
+def test_a_store_lock_timeout_asks_to_start_again(shopify_db, monkeypatch):
     """Another callback or refresh holds the store past the database's lock
-    or busy timeout: nothing was exchanged, so the merchant can retry."""
+    or busy timeout: nothing was exchanged, and the merchant starts the
+    connection again (this flow's state is spent)."""
     from sqlalchemy.exc import OperationalError
 
     db, user = shopify_db
@@ -1299,6 +1300,34 @@ def test_a_valid_token_does_not_queue_behind_the_users_refresh(shopify_db, monke
     resolution = asyncio.run(resolve_while_locked())
 
     assert resolution.access_token == "held-access"
+    assert posted == []
+
+
+def test_a_due_refresh_waits_for_the_users_refresh_lock(shopify_db, monkeypatch):
+    """A refresh runs only under the user's in-process refresh lock: while
+    another request of the user holds it, a due token is not refreshed."""
+    import asyncio
+
+    db, user = shopify_db
+    _held_grant(db, user, expires_in=-timedelta(minutes=1))
+    posted = _fake_refresh_client(monkeypatch)
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    async def resolve_while_locked():
+        async with tool_config._shopify_oauth_refresh_lock(user.id, "shopify"):
+            config = tool_config.WebToolConfig(
+                db=None, request=None, db_factory=factory, user_id=user.id
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    config._resolve_legacy_oauth_access_token(
+                        provider_name="shopify", app_id=TEST_APP_ID
+                    ),
+                    timeout=1,
+                )
+
+    asyncio.run(resolve_while_locked())
+
     assert posted == []
 
 

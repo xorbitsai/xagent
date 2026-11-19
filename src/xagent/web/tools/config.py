@@ -1342,11 +1342,11 @@ def _oauth_token_expiring(
 ) -> bool:
     """Whether the access token is expired or expires within the refresh skew
     (plus ``margin``). A token without an expiry never expires."""
-    expires_at = oauth_account.expires_at
-    if not expires_at:
+    from ..services.time_utils import coerce_utc
+
+    expires_at = coerce_utc(oauth_account.expires_at)
+    if expires_at is None:
         return False
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
     return bool(
         expires_at <= datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW + margin
     )

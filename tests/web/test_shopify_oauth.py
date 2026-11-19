@@ -1274,6 +1274,34 @@ def test_a_token_that_needs_no_refresh_does_not_wait_for_the_store(
     assert posted == []
 
 
+def test_a_valid_token_does_not_queue_behind_the_users_refresh(shopify_db, monkeypatch):
+    """Another request of the same user holds the in-process refresh lock
+    (it waits for the store): a token that needs no refresh is used at once."""
+    import asyncio
+
+    db, user = shopify_db
+    _held_grant(db, user)
+    posted = _fake_refresh_client(monkeypatch)
+    factory = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+
+    async def resolve_while_locked():
+        async with tool_config._shopify_oauth_refresh_lock(user.id, "shopify"):
+            config = tool_config.WebToolConfig(
+                db=None, request=None, db_factory=factory, user_id=user.id
+            )
+            return await asyncio.wait_for(
+                config._resolve_legacy_oauth_access_token(
+                    provider_name="shopify", app_id=TEST_APP_ID
+                ),
+                timeout=2,
+            )
+
+    resolution = asyncio.run(resolve_while_locked())
+
+    assert resolution.access_token == "held-access"
+    assert posted == []
+
+
 def test_a_token_about_to_become_due_takes_the_store_lock(shopify_db, monkeypatch):
     """A token expiring just beyond the refresh skew is not refreshed now, but
     it takes the lock: the refresh reads the clock again and may find it due."""

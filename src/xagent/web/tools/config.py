@@ -951,6 +951,10 @@ class _OAuthRefreshClientRejected(Exception):
         self.reason = reason
 
 
+class _ShopifyRefreshNeedsLock(Exception):
+    """A Shopify refresh is due but the in-process refresh lock is not held."""
+
+
 class _OAuthRefreshPermanentlyInvalid(Exception):
     """The provider (or our own stored config) confirms this connection's
     refresh token is dead -- revoked, expired, or the token/config it needs
@@ -4490,9 +4494,13 @@ class WebToolConfig(BaseToolConfig):
         user_id: int,
         resource_owner_key: str | None,
         actor_app_id: object = None,
+        shopify_refresh_lock_held: bool = True,
     ) -> _LegacyOAuthTokenResolution:
         """``actor_app_id`` is the app an actor grant is resolved for; ordinary
-        resolutions leave it unset."""
+        resolutions leave it unset. ``shopify_refresh_lock_held=False`` means
+        the caller has not taken the in-process Shopify refresh lock: a
+        Shopify refresh then backs off with :class:`_ShopifyRefreshNeedsLock`.
+        """
         from ...web.models.user_oauth import UserOAuth
 
         if not oauth_account:
@@ -4515,6 +4523,12 @@ class WebToolConfig(BaseToolConfig):
             return _LegacyOAuthTokenResolution(
                 access_token=None, credential_present=True
             )
+        if (
+            not shopify_refresh_lock_held
+            and shopify_store_of(provider_name, oauth_account.instance_url)
+            and _oauth_token_refresh_due(oauth_account)
+        ):
+            raise _ShopifyRefreshNeedsLock()
         # A Shopify grant is reread under its store lock (see the helper).
         oauth_account = _lock_shopify_store_and_reread(
             oauth_db,
@@ -5183,20 +5197,28 @@ class WebToolConfig(BaseToolConfig):
         """
         from ..services.db_runtime import run_db_io_cancellation_safe
 
+        def resolve(lock_held: bool) -> Callable[[], _LegacyOAuthTokenResolution]:
+            return lambda: asyncio.run(
+                self._resolve_ordinary_oauth_access_token(
+                    session_factory=session_factory,
+                    provider_name=provider_name,
+                    app_id=app_id,
+                    app_info=app_info,
+                    user_id=user_id,
+                    shopify_refresh_lock_held=lock_held,
+                )
+            )
+
+        # A token that needs no refresh is used without queueing behind
+        # this user's requests that wait for the store.
+        try:
+            return await run_db_io_cancellation_safe(resolve(False))
+        except _ShopifyRefreshNeedsLock:
+            pass
         # Same-process waiters must not reserve a pooled connection while
         # waiting.
         async with _shopify_oauth_refresh_lock(user_id, provider_name):
-            return await run_db_io_cancellation_safe(
-                lambda: asyncio.run(
-                    self._resolve_ordinary_oauth_access_token(
-                        session_factory=session_factory,
-                        provider_name=provider_name,
-                        app_id=app_id,
-                        app_info=app_info,
-                        user_id=user_id,
-                    )
-                )
-            )
+            return await run_db_io_cancellation_safe(resolve(True))
 
     async def _resolve_ordinary_oauth_access_token(
         self,
@@ -5206,6 +5228,7 @@ class WebToolConfig(BaseToolConfig):
         app_id: object,
         app_info: Mapping[str, Any] | None,
         user_id: int,
+        shopify_refresh_lock_held: bool = True,
     ) -> _LegacyOAuthTokenResolution:
         """Resolve and persist the user's own grant in an isolated transaction."""
         from ...web.mcp_apps import (
@@ -5318,6 +5341,7 @@ class WebToolConfig(BaseToolConfig):
                 provider_name=provider_name,
                 user_id=user_id,
                 resource_owner_key=None,
+                shopify_refresh_lock_held=shopify_refresh_lock_held,
             )
         except Exception:
             oauth_db.rollback()

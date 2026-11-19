@@ -58,10 +58,17 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
 
     category = ToolCategory.KNOWLEDGE
 
-    def __init__(self, user_id: int, is_admin: bool = False) -> None:
+    def __init__(
+        self,
+        user_id: int,
+        is_admin: bool = False,
+        *,
+        embedding_model_id: Optional[str],
+    ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.user_id = user_id
         self.is_admin = is_admin
+        self.embedding_model_id = embedding_model_id
 
     @property
     def name(self) -> str:
@@ -90,6 +97,7 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
             args,
             user_id=self.user_id,
             is_admin=self.is_admin,
+            embedding_model_id=self.embedding_model_id,
         )
 
 
@@ -129,6 +137,7 @@ async def _create_knowledge_base_from_file_impl(
     *,
     user_id: int,
     is_admin: bool = False,
+    embedding_model_id: Optional[str],
 ) -> Any:
     from ...core.RAG_tools.core.exceptions import CollectionMigratingError
     from ...core.RAG_tools.management.migration_state import (
@@ -152,16 +161,14 @@ async def _create_knowledge_base_from_file_impl(
             async_ensure_uploaded_file_local_path,
             log_durable_storage_fault,
         )
-        from ...core.RAG_tools.core.schemas import (
-            DEFAULT_EMBEDDING_MODEL_ID,
-            IngestionConfig,
-        )
+        from ...core.RAG_tools.core.schemas import IngestionConfig
         from ...core.RAG_tools.pipelines.document_ingestion import (
             run_document_ingestion,
         )
         from .agent_kb_service import (
             AgentKnowledgeBaseError,
             AgentKnowledgeBaseService,
+            requested_embedding_model_id,
         )
 
         tool_args = CreateKnowledgeBaseFromFileArgs.model_validate(args)
@@ -199,12 +206,16 @@ async def _create_knowledge_base_from_file_impl(
             )[:30]
             collection_name = f"{base_name}_{int(time.time())}"
 
-        config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
         kb_service = AgentKnowledgeBaseService(user_id=user_id)
         collection_name = await kb_service.prepare_collection(collection_name)
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if every file fails.
         collection_existed_before = await kb_service.collection_exists(collection_name)
+        config = IngestionConfig(
+            embedding_model_id=requested_embedding_model_id(
+                embedding_model_id, collection_existed_before
+            )
+        )
         # One admission for every file, so a freeze between files cannot strand a partial.
         # The lease goes in first and spans the same work, so a migration waits
         # for this tool too.

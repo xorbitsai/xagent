@@ -76,6 +76,18 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
         FakeStorage,
     )
 
+    def fake_default_embedding(user_id: int, *, db: object) -> str:
+        assert user_id == 42
+        assert isinstance(db, FakeSession)
+        session_events.append(("embedding", threading.get_ident()))
+        return "user-default-embedding"
+
+    monkeypatch.setattr(
+        builder_chat_runtime,
+        "get_default_embedding_model",
+        fake_default_embedding,
+    )
+
     result = await load_builder_chat_runtime_inputs(
         user_id=42,
         requested_file_ids=("owned-file", "missing-file", "owned-file"),
@@ -87,14 +99,75 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
         authorized_file_ids=("owned-file", "owned-file"),
         llm=selected_llm,
         compact_llm=default_compact_llm,
+        embedding_model_id="user-default-embedding",
     )
     assert [event for event, _thread_id in session_events] == [
         "enter",
         "query",
         "storage",
+        "embedding",
         "exit",
     ]
     assert all(thread_id != event_loop_thread for _event, thread_id in session_events)
+
+
+@pytest.mark.asyncio
+async def test_load_builder_chat_runtime_inputs_survives_embedding_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    selected_llm = object()
+    compact_llm = object()
+
+    class FakeQuery:
+        def filter(self, *_conditions: object) -> FakeQuery:
+            return self
+
+        def all(self) -> list[object]:
+            return []
+
+    class FakeSession:
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def query(self, _model: object) -> FakeQuery:
+            return FakeQuery()
+
+    class FakeStorage:
+        def __init__(self, _session: FakeSession) -> None:
+            pass
+
+        def get_llm_by_name_with_access(
+            self, model_name: object, user_id: int | None = None
+        ) -> object:
+            return selected_llm if model_name == "selected" else compact_llm
+
+    def failing_default_embedding(_user_id: int, *, db: object) -> str:
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(builder_chat_runtime, "get_session_local", lambda: FakeSession)
+    monkeypatch.setattr(builder_chat_runtime, "UserAwareModelStorage", FakeStorage)
+    monkeypatch.setattr(
+        builder_chat_runtime, "get_default_embedding_model", failing_default_embedding
+    )
+
+    result = await load_builder_chat_runtime_inputs(
+        user_id=42,
+        requested_file_ids=(),
+        model_name="selected",
+        compact_model_name="compact",
+    )
+
+    assert result == BuilderChatRuntimeInputs(
+        authorized_file_ids=(),
+        llm=selected_llm,
+        compact_llm=compact_llm,
+        embedding_model_id=None,
+    )
+    assert "Default embedding lookup failed" in caplog.text
 
 
 @pytest.mark.asyncio

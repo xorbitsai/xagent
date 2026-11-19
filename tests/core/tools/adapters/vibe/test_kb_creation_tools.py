@@ -338,7 +338,9 @@ async def test_create_kb_from_url_empty_crawl_publishes_nothing(monkeypatch):
             new=AsyncMock(return_value=ingest_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"url": "https://example.com", "collection_name": "agent_url_kb"}
         )
@@ -398,7 +400,9 @@ async def test_create_kb_from_url_blocked_crawl_is_not_reported_as_success(monke
             new=AsyncMock(return_value=ingest_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"url": "https://example.com", "collection_name": "agent_url_kb"}
         )
@@ -449,7 +453,9 @@ async def test_create_kb_from_url_uses_shared_service(monkeypatch):
             new=run_web_ingestion_mock,
         ),
     ):
-        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"url": "https://example.com", "collection_name": "agent_url_kb"}
         )
@@ -481,7 +487,9 @@ async def test_create_kb_from_url_returns_error_when_shared_service_fails():
         "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
         return_value=service,
     ):
-        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"url": "https://example.com", "collection_name": "agent_url_kb"}
         )
@@ -502,7 +510,9 @@ async def test_create_kb_from_url_rejects_invalid_start_url():
         "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
         return_value=service,
     ):
-        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"url": "www.example.com", "collection_name": "agent_url_kb"}
         )
@@ -566,7 +576,9 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
             new=Mock(return_value=ingest_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -646,7 +658,9 @@ async def test_create_kb_from_file_continues_after_unexpected_ingest_error(tmp_p
             new=run_ingestion,
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-bad", "file-good"], "collection_name": "agent_file_kb"}
         )
@@ -740,7 +754,9 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
             new=AsyncMock(return_value=source_file),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -832,7 +848,9 @@ async def test_create_kb_from_file_preserves_storage_context_in_executor(
             new=AsyncMock(return_value=source_file),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -909,7 +927,9 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
             new=run_ingestion,
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -996,7 +1016,9 @@ async def test_create_kb_from_url_partial_failure_preserves_pipeline_policy(
         fake_run_web_ingestion_impl,
     )
 
-    tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+    tool = CreateKnowledgeBaseFromUrlTool(
+        user_id=71, is_admin=False, embedding_model_id=None
+    )
     result = await tool.run_json_async(
         {"url": "https://example.com", "collection_name": "agent_url_kb"}
     )
@@ -1096,7 +1118,9 @@ async def test_create_kb_from_url_publish_failure_keeps_the_collection_name():
             new=AsyncMock(return_value=ingest_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromUrlTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"url": "https://example.com", "collection_name": "agent_url_kb"}
         )
@@ -1162,7 +1186,9 @@ async def test_create_kb_from_file_publishes_a_partial_it_did_not_roll_back(tmp_
             new=Mock(return_value=partial_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_partial_kb"}
         )
@@ -1225,7 +1251,9 @@ async def test_create_kb_from_file_publish_failure_keeps_the_collection_name(tmp
             new=Mock(return_value=ingest_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -1287,7 +1315,9 @@ async def test_create_kb_from_file_failed_ingest_cleans_up_a_new_collection(tmp_
             new=Mock(return_value=failed_result),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -1434,7 +1464,9 @@ async def test_create_kb_from_file_durable_fault_logs_cause_and_hides_storage_ke
         ),
         caplog.at_level(logging.WARNING, logger=logger_name),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=7, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=7, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -1524,7 +1556,9 @@ async def test_create_kb_from_file_integrity_failure_is_not_an_outage_warning(
         ),
         caplog.at_level(logging.WARNING, logger=logger_name),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=7, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=7, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -1599,7 +1633,9 @@ async def test_create_kb_from_file_admits_once_for_all_files(
             new=run_ingestion,
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["f-a.txt", "f-b.txt"], "collection_name": "agent_file_kb"}
         )
@@ -1672,7 +1708,9 @@ async def test_create_kb_from_file_leases_the_collection_while_it_ingests(
             new=Mock(side_effect=_ingest),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
@@ -1748,7 +1786,9 @@ async def test_create_kb_from_file_stops_the_run_when_its_lease_is_lost(
             new=ingest,
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-0", "file-1"], "collection_name": "agent_file_kb"}
         )
@@ -1802,10 +1842,122 @@ async def test_create_kb_from_file_releases_its_lease_when_ingestion_fails(
             new=Mock(side_effect=_ingest),
         ),
     ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        tool = CreateKnowledgeBaseFromFileTool(
+            user_id=71, is_admin=False, embedding_model_id=None
+        )
         result = await tool.run_json_async(
             {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
         )
 
     assert result["success"] is False
     assert leases.live_leases("agent_file_kb") == []
+
+
+async def _run_kb_tool_capturing_config(
+    kind, tmp_path, *, embedding_model_id, collection_existed_before
+):
+    service = MagicMock()
+    service.prepare_collection = AsyncMock(return_value="agent_kb")
+    service.publish_collection = AsyncMock()
+    service.collection_exists = AsyncMock(return_value=collection_existed_before)
+    service.cleanup_failed_collection = AsyncMock()
+    service_patch = patch(
+        "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+        return_value=service,
+    )
+
+    if kind == "url":
+        run_web = AsyncMock(
+            return_value=WebIngestionResult(
+                status="success",
+                collection="agent_kb",
+                total_urls_found=1,
+                pages_crawled=1,
+                pages_failed=0,
+                documents_created=1,
+                chunks_created=1,
+                embeddings_created=1,
+                crawled_urls=["https://example.com"],
+                failed_urls={},
+                message="ok",
+                warnings=[],
+                elapsed_time_ms=1,
+            )
+        )
+        with (
+            service_patch,
+            patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_web_ingestion",
+                new=run_web,
+            ),
+        ):
+            tool = CreateKnowledgeBaseFromUrlTool(
+                user_id=71, embedding_model_id=embedding_model_id
+            )
+            result = await tool.run_json_async(
+                {"url": "https://example.com", "collection_name": "agent_kb"}
+            )
+        pipeline_config = run_web.await_args.kwargs["ingestion_config"]
+    else:
+        source_file = tmp_path / "notes.txt"
+        source_file.write_text("hello", encoding="utf-8")
+        query = MagicMock()
+        query.filter.return_value = query
+        query.all.return_value = [
+            SimpleNamespace(
+                user_id=71,
+                filename="notes.txt",
+                storage_path=str(source_file),
+                file_id="file-1",
+            )
+        ]
+        db = MagicMock()
+        db.query.return_value = query
+        run_doc = Mock(return_value=_successful_ingestion_result())
+        with (
+            patch(
+                "xagent.web.models.database.get_db",
+                side_effect=lambda: _fake_db_generator(db),
+            ),
+            service_patch,
+            patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
+                new=run_doc,
+            ),
+        ):
+            tool = CreateKnowledgeBaseFromFileTool(
+                user_id=71, embedding_model_id=embedding_model_id
+            )
+            result = await tool.run_json_async(
+                {"file_ids": ["file-1"], "collection_name": "agent_kb"}
+            )
+        pipeline_config = run_doc.call_args.kwargs["ingestion_config"]
+
+    assert result["success"] is True
+    published_config = service.publish_collection.await_args.args[1]
+    assert published_config is pipeline_config
+    return pipeline_config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["file", "url"])
+@pytest.mark.parametrize(
+    ("embedding_model_id", "collection_existed_before", "expected"),
+    [
+        ("user-default-embedding", False, "user-default-embedding"),
+        (None, False, DEFAULT_EMBEDDING_MODEL_ID),
+        ("user-default-embedding", True, DEFAULT_EMBEDDING_MODEL_ID),
+    ],
+    ids=["new-uses-user-default", "no-default-falls-back", "existing-unchanged"],
+)
+async def test_agent_kb_tools_request_the_users_default_embedding_for_new_collections(
+    kind, tmp_path, embedding_model_id, collection_existed_before, expected
+):
+    config = await _run_kb_tool_capturing_config(
+        kind,
+        tmp_path,
+        embedding_model_id=embedding_model_id,
+        collection_existed_before=collection_existed_before,
+    )
+
+    assert config.embedding_model_id == expected

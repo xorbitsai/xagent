@@ -203,7 +203,9 @@ async def test_knowledge_base_lock_wait_keeps_event_loop_responsive(
         owner = pool.submit(hold_lock)
         assert entered.wait(5)
         try:
-            result = await CreateKnowledgeBaseFromFileTool(user_id=1).run_json_async(
+            result = await CreateKnowledgeBaseFromFileTool(
+                user_id=1, embedding_model_id=None
+            ).run_json_async(
                 {"file_ids": [file_id], "collection_name": "caller_contract"}
             )
         finally:

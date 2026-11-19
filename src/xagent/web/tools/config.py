@@ -1329,8 +1329,10 @@ def _lock_shopify_store_and_reread(
     the same store, so refreshes and callbacks for a store take turns under
     the lock until this transaction ends. Whoever went first may have stored
     a token that needs no refresh, so the grant is read again after the wait.
-    A reconnect replaces the row under a new id, so a missing row is looked
-    up again in its owner's namespace; ``None`` means the grant is gone.
+    The reread goes through the owner's namespace, never the row id alone:
+    a reconnect replaces the row under a new id, and SQLite can hand a
+    deleted row's id to another owner's new grant. ``None`` means the owner
+    has no grant for the locked store any more.
     """
     from ..models.user_oauth import UserOAuth
 
@@ -1340,17 +1342,11 @@ def _lock_shopify_store_and_reread(
     user_id = int(oauth_account.user_id)
     resource_owner_key = oauth_account.resource_owner_key
     app_provider = str(oauth_account.provider)
+    grant_id = oauth_account.id
     shopify_store_locks.lock_shopify_store(db, provider=str(provider_name), store=store)
-    reread = (
-        db.query(UserOAuth)
-        .filter(UserOAuth.id == oauth_account.id)
-        .populate_existing()
-        .first()
-    )
-    if reread is not None:
-        return reread
     # Only a grant for the locked store: one for another store is not under
-    # this lock, and the next resolution locks that store instead.
+    # this lock, and the next resolution locks that store instead. The same
+    # row is preferred when it is still there.
     return (
         scoped_user_oauth_query(
             db, user_id=user_id, resource_owner_key=resource_owner_key
@@ -1359,7 +1355,7 @@ def _lock_shopify_store_and_reread(
             UserOAuth.provider == app_provider,
             func.lower(UserOAuth.instance_url) == store.lower(),
         )
-        .order_by(UserOAuth.id.desc())
+        .order_by((UserOAuth.id == grant_id).desc(), UserOAuth.id.desc())
         .populate_existing()
         .first()
     )

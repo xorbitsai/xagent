@@ -2884,6 +2884,47 @@ class WebToolConfig(BaseToolConfig):
             context[str(server_id)] = dict(auth_selector)
         return context
 
+    def _task_selects_foreign_owner(
+        self, *, server_id: int, auth_context: Dict[str, Any]
+    ) -> bool:
+        """Whether task input names a grant owner the actor policy forbids.
+
+        Task input (``mcp_auth_context`` or the runtime ``auth_selector``) can
+        name the ``resource_owner_key`` whose grant the native lookup uses.
+        Under an actor policy it may name only the policy's own owner or the
+        executing user's default owner, compared exactly; anything else could
+        select another actor's grant on the same server and user (#2155).
+        Without a policy, task selectors keep their existing meaning.
+        """
+        policy = self._mcp_runtime_authorization_policy
+        if policy is None:
+            return False
+        from ..services.mcp_runtime import mcp_oauth_selection
+
+        owner = mcp_oauth_selection(auth_context, server_id).get("resource_owner_key")
+        if not owner:
+            # The native lookup falls back to the default owner for a falsy value.
+            return False
+        return owner not in (
+            policy.resource_owner_key,
+            f"xagent:user:{self._user_id}",
+        )
+
+    def _task_authorization_rejected_config(self, server: Any) -> Dict[str, Any]:
+        """The unavailable config for task-supplied authorization a policy refuses."""
+        policy_diagnostic = {
+            "code": "config_load_failed",
+            "message": "Task-supplied MCP authorization is not accepted",
+            "server_id": int(server.id),
+            "server_name": server.name,
+        }
+        self._mcp_oauth_diagnostics.append(policy_diagnostic)
+        return self._build_unavailable_mcp_config(
+            server=server,
+            reason="config_load_failed",
+            diagnostic=policy_diagnostic,
+        )
+
     def get_embedding_model(self) -> Optional[str]:
         """Load default embedding model ID from database."""
         if self._cached_embedding_model is None:
@@ -5520,18 +5561,7 @@ class WebToolConfig(BaseToolConfig):
             if actor_remote_oauth and (self._mcp_auth_context or {}).get(
                 str(server.id)
             ):
-                policy_diagnostic = {
-                    "code": "config_load_failed",
-                    "message": "Task-supplied MCP authorization is not accepted",
-                    "server_id": int(server.id),
-                    "server_name": server.name,
-                }
-                self._mcp_oauth_diagnostics.append(policy_diagnostic)
-                return self._build_unavailable_mcp_config(
-                    server=server,
-                    reason="config_load_failed",
-                    diagnostic=policy_diagnostic,
-                )
+                return self._task_authorization_rejected_config(server)
 
             auth_context = self._mcp_auth_context_for_server(
                 server_id=int(server.id),
@@ -5622,6 +5652,10 @@ class WebToolConfig(BaseToolConfig):
                         connection_to_transport_config(delegated_connection)
                     )
                 else:
+                    if not actor_remote_oauth and self._task_selects_foreign_owner(
+                        server_id=int(server.id), auth_context=auth_context
+                    ):
+                        return self._task_authorization_rejected_config(server)
                     try:
                         runtime_build = await build_mcp_runtime_connection(
                             self.db,

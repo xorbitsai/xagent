@@ -18,9 +18,10 @@ compliance topics (``customers/data_request``, ``customers/redact`` and
 A grant written after the uninstall is kept: the uninstall revoked the
 store's token, so only a new install writes one, and Shopify retries for hours
 without keeping order, so a late delivery must not delete the grant of a
-merchant who has since reconnected. The uninstall happened at
-``X-Shopify-Triggered-At`` for ``app/uninstalled`` and
-``SHOP_REDACT_DELAY`` before it for ``shop/redact``. Without a usable time
+merchant who has since reconnected. The uninstall is taken to have happened
+at ``X-Shopify-Triggered-At`` for ``app/uninstalled``, and, going by
+Shopify's documented 48-hour delay, ``SHOP_REDACT_DELAY`` before it for
+``shop/redact``. Without a usable time
 every grant for the store is deleted.
 
 The store is matched by its label (``<label>.myshopify.com`` in the body) or

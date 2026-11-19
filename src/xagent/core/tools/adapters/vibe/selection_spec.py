@@ -774,8 +774,11 @@ class _SpecByCategories(ToolSelectionSpec):
             # selection regardless of the category picker (NONE never reaches
             # this subclass). Same ID-level shape as the task-runtime admit.
             # This runs ahead of any injection-only scoping too, so an
-            # unconfigured workforce-manager spec also gets it; harmless, as the
-            # tool is read-only and grants no new capability.
+            # unconfigured workforce-manager spec also gets it. Most intrinsic
+            # tools are read-only, but ``show_result_card`` writes a persisted
+            # assistant message; it still grants no new data access: a card is
+            # only accepted for a connector the run already called, so a spec
+            # that grants no connector tools can never produce one.
             if tool_name in INTRINSIC_TOOL_NAMES:
                 names.add(tool_name)
                 continue

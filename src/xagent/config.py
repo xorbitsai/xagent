@@ -42,6 +42,7 @@ WEB_DIR = "XAGENT_WEB_DIR"
 FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
 # Shared with the frontend build; runtime value is needed by packaged SPA CSP.
 HTML_PREVIEW_ORIGIN = "NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN"
+CSP_EXTRA_FRAME_SRC = "XAGENT_CSP_EXTRA_FRAME_SRC"
 IMAGE_DOWNLOAD_MAX_BYTES = "XAGENT_IMAGE_DOWNLOAD_MAX_BYTES"
 VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
 REMOTE_JSON_DOWNLOAD_MAX_BYTES = "XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES"
@@ -3375,6 +3376,16 @@ def get_uploads_dir() -> Path:
 def get_html_preview_origin() -> str:
     """Preview runner setting; match the value baked into the frontend build."""
     return os.getenv(HTML_PREVIEW_ORIGIN, "").strip()
+
+
+def get_csp_extra_frame_src() -> str:
+    """Extra frame-src origins for the packaged SPA CSP, read at runtime.
+
+    A standalone Next build reads the same variable at build time instead. The
+    raw value is returned because the validator splits on ASCII whitespace only,
+    matching the Next builder.
+    """
+    return os.getenv(CSP_EXTRA_FRAME_SRC, "")
 
 
 def get_frontend_dist_dir() -> Path:

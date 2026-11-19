@@ -2571,3 +2571,29 @@ def test_legacy_settlement_supersedes_unambiguous_provider_call():
         assert results == [{"value": "settled"}]
     finally:
         db_session.close()
+
+
+def test_result_card_rows_are_not_part_of_the_reconstructed_context():
+    session = _create_db_session()
+    task = _create_task(session)
+    _add_chat_message(
+        session, task, role="user", content="Top customers?", created_at=_ts(0)
+    )
+    card = TaskChatMessage(
+        task_id=int(task.id),
+        user_id=int(task.user_id),
+        role="assistant",
+        content="Query · top customers",
+        message_type="result_card",
+        message_metadata={"display": "result_card"},
+        created_at=_ts(1),
+    )
+    session.add(card)
+    _add_chat_message(
+        session, task, role="assistant", content="Contoso leads.", created_at=_ts(2)
+    )
+    session.commit()
+
+    context = load_task_conversation_context_sync(session, int(task.id))
+
+    assert [m["content"] for m in context] == ["Top customers?", "Contoso leads."]

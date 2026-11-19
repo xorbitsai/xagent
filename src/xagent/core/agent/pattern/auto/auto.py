@@ -206,6 +206,10 @@ class _AutoChildRuntime:
         """
         return self.parent._dag_turn_id(context)
 
+    @property
+    def delivers_messages(self) -> bool:
+        return self.parent.delivers_messages
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 

@@ -5,7 +5,8 @@ import posixpath
 import re
 from urllib.parse import urlsplit
 
-from ..config import get_html_preview_origin
+from ..config import get_csp_extra_frame_src, get_html_preview_origin
+from .extra_frame_src import extra_frame_src_origins
 
 
 def _preview_origins() -> list[str]:
@@ -76,7 +77,11 @@ def page_security_headers(*, embeddable: bool = False) -> dict[str, str]:
         "font-src 'self' data: https:",
         "connect-src 'self' https: wss:",
         " ".join(
-            ["frame-src 'self' blob: https://docs.google.com", *_preview_origins()]
+            [
+                "frame-src 'self' blob: https://docs.google.com",
+                *_preview_origins(),
+                *extra_frame_src_origins(get_csp_extra_frame_src()),
+            ]
         ),
         "worker-src 'self' blob:",
     ]

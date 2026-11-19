@@ -194,7 +194,22 @@ def _try_unified_rerank(
         return None
 
 
-def _encode_query_vector(adapter: BaseEmbedding, query_text: str) -> List[float]:
+QWEN3_EMBEDDING_QUERY_INSTRUCTION = (
+    "Instruct: Given a search query, retrieve relevant passages that answer the query"
+    "\nQuery: "
+)
+
+
+def _query_text_for_embedding(model_name: Optional[str], query_text: str) -> str:
+    # Qwen3-Embedding is asymmetric: only queries carry the instruction.
+    if model_name and "qwen3-embedding" in model_name.lower():
+        return QWEN3_EMBEDDING_QUERY_INSTRUCTION + query_text
+    return query_text
+
+
+def _encode_query_vector(
+    adapter: BaseEmbedding, query_text: str, model_name: Optional[str] = None
+) -> List[float]:
     """Encode query text into a single vector using embedding adapter.
 
     Provider responses come in many shapes (``List[float]``, ``List[List[float]]``,
@@ -208,7 +223,7 @@ def _encode_query_vector(adapter: BaseEmbedding, query_text: str) -> List[float]
             cannot be normalized to a single numeric vector.
     """
     try:
-        raw_vector = adapter.encode(query_text)
+        raw_vector = adapter.encode(_query_text_for_embedding(model_name, query_text))
     except Exception as exc:  # noqa: BLE001
         raise VectorValidationError(
             f"Embedding adapter failed to encode query: {exc}"
@@ -728,7 +743,9 @@ def _search_documents_impl(
                 with progress_tracker.track_step("encode_query"):
                     pass
                 current_step = "encode_query_vector"
-                query_vector = _encode_query_vector(embedding_adapter, query_text)
+                query_vector = _encode_query_vector(
+                    embedding_adapter, query_text, embedding_config.model_name
+                )
             except VectorValidationError:
                 if requested_type == SearchType.HYBRID and cfg.fallback_to_sparse:
                     current_step = "search_sparse_fallback"

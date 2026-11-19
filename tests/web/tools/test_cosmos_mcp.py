@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import logging
+import socket
 import typing
 from typing import Any
 
@@ -13,6 +14,7 @@ import requests
 from azure.core.exceptions import ServiceRequestError, ServiceResponseTimeoutError
 from azure.core.pipeline.transport import HttpRequest, RequestsTransport
 from azure.cosmos.exceptions import CosmosClientTimeoutError, CosmosHttpResponseError
+from requests.adapters import HTTPAdapter
 
 from xagent.core.utils import public_requests
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
@@ -200,9 +202,12 @@ def test_rejected_endpoint_never_creates_a_client(client, monkeypatch):
 
 def test_guarded_transport_blocks_other_hosts(monkeypatch, caplog):
     sent = []
-    monkeypatch.setattr(
-        RequestsTransport, "send", lambda self, request, **kw: sent.append(request.url)
-    )
+
+    def fake_send(self, request, **kw):
+        sent.append(request.url)
+        return type("Response", (), {"status_code": 200})()
+
+    monkeypatch.setattr(RequestsTransport, "send", fake_send)
     transport = cosmos._GuardedTransport()
     req = lambda url: type("R", (), {"url": url})()  # noqa: E731
     transport.send(req("https://acct.documents.azure.com/dbs/appdb/colls?x=1"))
@@ -538,15 +543,23 @@ def test_query_asks_the_service_to_bound_the_continuation_token(client):
     )
 
 
+MIN_OUTPUT_BUDGET = 4096  # the smallest budget the module is sized for
+WORST_CASE_TOKEN_CHARS = 2 * 1024 * 1  # 1 KB limit, every character escaped
+
+
 def test_budget_constants_cannot_drift_apart():
     """A token bounded to the limit, in the worst JSON escaping, plus the
     worst empty-items envelope must fit the smallest supported budget."""
-    assert (
-        cosmos.WORST_CASE_TOKEN_CHARS == 2 * 1024 * cosmos.CONTINUATION_TOKEN_LIMIT_KB
-    )
+    assert cosmos.CONTINUATION_TOKEN_LIMIT_KB == 1
+    assert WORST_CASE_TOKEN_CHARS == 2 * 1024 * cosmos.CONTINUATION_TOKEN_LIMIT_KB
     names = 2 * 2 * cosmos.MAX_NAME_CHARS
-    assert cosmos.WORST_CASE_TOKEN_CHARS + names + 300 < cosmos.MIN_OUTPUT_BUDGET
-    assert len(cosmos._too_large()) < 512
+    assert WORST_CASE_TOKEN_CHARS + names + 300 < MIN_OUTPUT_BUDGET
+    for name in (
+        "cosmos_query_container",
+        "cosmos_read_item",
+        "cosmos_list_containers",
+    ):
+        assert len(cosmos._too_large(name)) < 512
 
 
 def test_long_token_with_a_4k_budget_stays_valid_json_and_keeps_the_cursor(
@@ -659,17 +672,57 @@ def test_error_envelopes_stay_within_the_budget_too(client, monkeypatch, budget)
         assert len(raw) <= budget and json.loads(raw)["status"] == "error"
 
 
+NON_RESUMABLE_QUERIES = [
+    "SELECT * FROM c ORDER BY c.ts",
+    "select * from c order\n  by c.ts desc",
+    "select c.a, count(1) from c group by c.a",
+    "SELECT * FROM c GROUP   BY c.a",
+    "SELECT DISTINCT c.a FROM c",
+    "select distinct value c.a from c",
+    "SELECT TOP 5 * FROM c",
+    "SELECT TOP @n * FROM c",
+    "SELECT DISTINCT TOP 5 c.a FROM c",
+    "SELECT * FROM c OFFSET 5 LIMIT 5",
+    "SELECT * FROM c offset @o limit @l",
+    "SELECT VALUE COUNT(1) FROM c",
+    "select value count(1) from c",
+    "SELECT VALUE MAX (c.ts) FROM c",
+    "SELECT SUM(c.n), AVG(c.n), MIN(c.n) FROM c",
+    "SELECT ARRAY(SELECT VALUE t FROM t IN c.tags ORDER BY t) FROM c",
+    # cannot be read with certainty: fail towards "not resumable"
+    "SELECT * FROM c -- order by c.ts",
+    "SELECT * FROM c /* don't */ WHERE c.a = 1",
+    "SELECT * FROM c WHERE c.a = 'open",
+]
+RESUMABLE_QUERIES = [
+    "SELECT * FROM c",
+    "SELECT * FROM c WHERE c.top = 1 AND c.offset > 2 AND c.distinct = true",
+    "SELECT c.top, c.offset, c.distinct, c.count, c.min FROM c",
+    "SELECT * FROM c WHERE c.count > 3",
+    "SELECT * FROM c WHERE c.order_by = 1 AND c.groupId = 2 AND c.orderBy = 3",
+    "SELECT * FROM c WHERE c . top = 1",
+    'SELECT c["top"], c[\'order\'], c["group by"] FROM c',
+    "SELECT c.a AS top, c.b AS offset, c.c AS count FROM c",
+    "SELECT * FROM c WHERE c.type = 'ORDER BY x' OR c.t = \"TOP 5\"",
+    "SELECT * FROM c WHERE udf.count(c.x) > 1",
+    "SELECT * FROM c WHERE c.a = 'it\\'s' AND c.b = 1",
+    "SELECT * FROM c JOIN top IN c.tags",
+    "SELECT VALUE c.id FROM c WHERE STARTSWITH(c.name, @p)",
+]
+
+
+@pytest.mark.parametrize("query", NON_RESUMABLE_QUERIES)
+def test_classifier_marks_real_clauses_and_unreadable_text_non_resumable(query):
+    assert cosmos._is_resumable_across_partitions(query) is False
+
+
+@pytest.mark.parametrize("query", RESUMABLE_QUERIES)
+def test_classifier_keeps_property_names_aliases_and_literals_resumable(query):
+    assert cosmos._is_resumable_across_partitions(query) is True
+
+
 @pytest.mark.parametrize(
-    "query",
-    [
-        "SELECT * FROM c ORDER BY c.ts",
-        "select c.a, count(1) from c group by c.a",
-        "SELECT DISTINCT c.a FROM c",
-        "SELECT TOP 5 * FROM c",
-        "SELECT * FROM c OFFSET 5 LIMIT 5",
-        "SELECT VALUE COUNT(1) FROM c",
-        "SELECT VALUE MAX (c.ts) FROM c",
-    ],
+    "query", ["SELECT * FROM c ORDER BY c.ts", "SELECT TOP 3 * FROM c"]
 )
 def test_cross_partition_non_resumable_queries_give_no_token(
     client, monkeypatch, query
@@ -680,6 +733,19 @@ def test_cross_partition_non_resumable_queries_give_no_token(
     assert result["has_more"] is False
     assert result["resumable"] is False
     assert result["may_be_incomplete"] is False
+
+
+def test_plain_cross_partition_query_on_property_names_keeps_its_token(
+    client, monkeypatch
+):
+    monkeypatch.setattr(FakeClient, "default_pages", [([{"id": "1"}], "NEXT")])
+    query = "SELECT * FROM c WHERE c.top = 1 AND c.offset > 2"
+    first = run("cosmos_query_container", container="c", query=query)
+    again = run(
+        "cosmos_query_container", container="c", query=query, continuation_token="NEXT"
+    )
+    assert first["continuation_token"] == "NEXT" and "resumable" not in first
+    assert again["status"] == "success"  # a returned token is accepted
 
 
 def test_non_resumable_full_page_says_it_may_be_incomplete(client, monkeypatch):
@@ -939,6 +1005,239 @@ def test_key_never_logged_on_success(client, caplog):
     caplog.set_level(logging.DEBUG)
     run("cosmos_list_containers")
     assert KEY not in caplog.text
+
+
+# --- truncation hints ------------------------------------------------------
+
+
+def test_cut_hint_with_ids_names_an_action_that_needs_only_those_ids(
+    client, monkeypatch
+):
+    _limit(monkeypatch, 5000)
+    monkeypatch.setattr(
+        FakeClient,
+        "default_pages",
+        [([{"id": f"i{n}", "v": "x" * 1500} for n in range(6)], "NEXT")],
+    )
+    result = run("cosmos_query_container", container="c", query="SELECT * FROM c")
+    assert result["omitted_ids"]
+    assert "c.id IN" in result["message"]
+    assert "cosmos_read_item" not in result["message"]  # it needs a partition key
+
+
+def test_cut_hint_without_ids_does_not_mention_ids(client, monkeypatch):
+    _limit(monkeypatch, 5000)
+    monkeypatch.setattr(
+        FakeClient,
+        "default_pages",
+        [([{"v": "x" * 1500} for _ in range(6)], "NEXT")],  # no ids in the rows
+    )
+    result = run("cosmos_query_container", container="c", query="SELECT c.v FROM c")
+    assert result["omitted_ids"] == []
+    assert "c.id IN" not in result["message"] and "omitted ids" not in result["message"]
+    assert "fewer selected fields" in result["message"]
+
+
+# --- every way the outbound policy can refuse a request, through the real stack
+
+
+@pytest.fixture
+def real_transport(monkeypatch):
+    """The real SDK, transport and public_requests session; only DNS and the
+    final socket send are replaced, so nothing leaves the process."""
+
+    def resolve(addr):
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, 443))],
+        )
+
+    return resolve
+
+
+def test_private_address_at_resolve_time_maps_to_blocked_destination(real_transport):
+    real_transport("10.1.2.3")
+    result = run("cosmos_list_databases")
+    assert result["error_code"] == "blocked_destination"
+    assert "non-public network address" in result["message"]
+    assert "10.1.2.3" not in json.dumps(result)
+
+
+def test_link_local_address_maps_to_blocked_destination(real_transport):
+    real_transport("169.254.169.254")
+    assert run("cosmos_list_databases")["error_code"] == "blocked_destination"
+
+
+def test_transport_send_raises_blocked_for_a_private_resolution(real_transport):
+    real_transport("127.0.0.1")
+    transport = cosmos._GuardedTransport()
+    with pytest.raises(cosmos.BlockedDestinationError) as excinfo:
+        transport.send(HttpRequest("GET", "https://acct.documents.azure.com/"))
+    assert excinfo.value.reason == "non_public_address"
+
+
+def test_redirect_answer_maps_to_blocked_destination(real_transport, monkeypatch):
+    real_transport("93.184.216.34")
+
+    def redirect(self, request, **kw):
+        response = requests.Response()
+        response.status_code = 307
+        response.headers["Location"] = "https://evil.example.net/"
+        response.raw = io.BytesIO(b"")
+        response.url = request.url
+        response.request = request
+        return response
+
+    monkeypatch.setattr(HTTPAdapter, "send", redirect)
+    result = run("cosmos_list_databases")
+    assert result["error_code"] == "blocked_destination"
+    assert "redirect" in result["message"]
+
+
+def test_policy_refusal_before_sending_maps_to_blocked_destination(monkeypatch):
+    def refuse(self, *a, **kw):
+        raise ValueError("HTTP tunnels are not allowed")
+
+    monkeypatch.setattr(public_requests.Session, "request", refuse)
+    result = run("cosmos_list_databases")
+    assert result["error_code"] == "blocked_destination"
+    assert "outbound network policy" in result["message"]
+
+
+def test_unresolvable_host_is_unreachable_not_blocked(real_transport, monkeypatch):
+    def fail(*a, **kw):
+        raise socket.gaierror("no such host")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    assert run("cosmos_list_databases")["error_code"] == "unreachable"
+
+
+def test_blocked_destination_is_logged_with_the_host_only(real_transport, caplog):
+    real_transport("10.1.2.3")
+    caplog.set_level(logging.DEBUG)
+    run("cosmos_list_databases")
+    assert "acct.documents.azure.com" in caplog.text
+    assert KEY not in caplog.text and "10.1.2.3" not in caplog.text
+
+
+# --- the real SDK builds the requests we think it builds -------------------
+
+
+@pytest.fixture
+def real_sdk(monkeypatch):
+    """Real CosmosClient, ContainerProxy and transport; the HTTP exchange is
+    answered in-process and every outgoing request is recorded."""
+    seen: list[dict[str, Any]] = []
+
+    def respond(self, method, url, **kw):
+        headers = dict(kw.get("headers") or {})
+        path = url.split(".com", 1)[1].split("?")[0].rstrip("/") or "/"
+        seen.append(
+            {
+                "method": method,
+                "path": path,
+                "headers": headers,
+                "timeout": kw["timeout"],
+            }
+        )
+        response = requests.Response()
+        response.status_code = 200
+        response.headers["Content-Type"] = "application/json"
+        if path == "/":
+            body: dict[str, Any] = {
+                "id": "acct",
+                "userConsistencyPolicy": {"defaultConsistencyLevel": "Session"},
+            }
+        elif path == "/dbs/appdb/colls/c":
+            body = {
+                "id": "c",
+                "_rid": "RID",
+                "partitionKey": {"paths": ["/pk"], "kind": "Hash", "version": 2},
+            }
+        elif path == "/dbs/appdb/colls/c/docs" and method == "POST":
+            body = {"_rid": "RID", "Documents": [{"id": "1"}], "_count": 1}
+            response.headers["x-ms-request-charge"] = "3.5"
+            response.headers["x-ms-continuation"] = "NEXT"
+        elif path == "/dbs/appdb/colls/c/docs/42":
+            body = {"id": "42", "pk": "p"}
+            response.headers["x-ms-request-charge"] = "1"
+        elif path == "/dbs/appdb/colls":
+            body = {"_rid": "", "DocumentCollections": [{"id": "c"}], "_count": 1}
+        elif path == "/dbs/appdb":
+            body = {"id": "appdb", "_rid": "R"}
+        elif path == "/dbs":
+            body = {"_rid": "", "Databases": [{"id": "appdb"}], "_count": 1}
+        else:
+            body = {}
+        response._content = json.dumps(body).encode()
+        response.raw = io.BytesIO(response._content)
+        return response
+
+    monkeypatch.setattr(public_requests.Session, "request", respond)
+    return seen
+
+
+def _last(seen, method, path):
+    return next(
+        r for r in reversed(seen) if r["method"] == method and r["path"] == path
+    )
+
+
+def test_real_sdk_cross_partition_query_headers(real_sdk):
+    result = run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c WHERE c.a = @a",
+        parameters={"a": 1},
+        max_item_count=7,
+        continuation_token="TOK",
+    )
+    headers = _last(real_sdk, "POST", "/dbs/appdb/colls/c/docs")["headers"]
+    assert headers["x-ms-max-item-count"] == "7"
+    assert headers["x-ms-documentdb-query-enablecrosspartition"] == "True"
+    assert headers["x-ms-documentdb-responsecontinuationtokenlimitinkb"] == "1"
+    assert headers["x-ms-continuation"] == "TOK"
+    assert "x-ms-documentdb-partitionkey" not in headers
+    assert (result["request_charge"], result["continuation_token"]) == (3.5, "NEXT")
+
+
+def test_real_sdk_partition_scoped_query_headers(real_sdk):
+    run(
+        "cosmos_query_container",
+        container="c",
+        query="SELECT * FROM c",
+        partition_key="p",
+    )
+    headers = _last(real_sdk, "POST", "/dbs/appdb/colls/c/docs")["headers"]
+    assert headers["x-ms-documentdb-partitionkey"] == '["p"]'
+    assert "x-ms-documentdb-query-enablecrosspartition" not in headers
+    assert headers["x-ms-max-item-count"] == str(cosmos.DEFAULT_PAGE_SIZE)
+    assert headers["x-ms-documentdb-responsecontinuationtokenlimitinkb"] == "1"
+    assert "x-ms-continuation" not in headers
+
+
+def test_real_sdk_read_item_and_list_calls(real_sdk):
+    item = run("cosmos_read_item", container="c", id="42", partition_key="p")
+    assert item["item"] == {"id": "42", "pk": "p"} and item["request_charge"] == 1.0
+    read = _last(real_sdk, "GET", "/dbs/appdb/colls/c/docs/42")
+    assert read["headers"]["x-ms-documentdb-partitionkey"] == '["p"]'
+    assert run("cosmos_list_containers")["containers"][0]["id"] == "c"
+    assert run("cosmos_list_databases")["databases"] == ["appdb"]
+    paths = {(r["method"], r["path"]) for r in real_sdk}
+    assert {
+        ("GET", "/dbs/appdb"),
+        ("GET", "/dbs/appdb/colls"),
+        ("GET", "/dbs"),
+    } <= paths
+    assert not [r for r in real_sdk if r["method"] not in ("GET", "POST")]
+    assert all(r["method"] == "GET" for r in real_sdk if "/docs" not in r["path"])
+
+
+def test_real_sdk_operations_use_bounded_socket_timeouts(real_sdk):
+    run("cosmos_query_container", container="c", query="SELECT 1", partition_key="p")
+    timeout = _last(real_sdk, "POST", "/dbs/appdb/colls/c/docs")["timeout"]
+    assert timeout == (cosmos.CONNECTION_TIMEOUT_SECONDS, cosmos.READ_TIMEOUT_SECONDS)
 
 
 # --- registry and probe ----------------------------------------------------

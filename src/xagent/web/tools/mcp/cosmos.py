@@ -58,7 +58,7 @@ from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests
-from ....core.utils.security import redact_sensitive_text
+from ....core.utils.security import PrivateNetworkHostError, redact_sensitive_text
 from .utils import clamp_limit, success_with_capped_dict
 
 logging.basicConfig(level=logging.INFO)
@@ -89,13 +89,8 @@ _ID_FORBIDDEN = re.compile(r"[/\\?#\x00-\x1f\x7f]")
 _PARAM_NAME = re.compile(r"\A@?([A-Za-z_][A-Za-z0-9_]{0,63})\Z")
 _SELECT = re.compile(r"\A\s*SELECT\b", re.IGNORECASE)
 _STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
-# Clauses that make the Python SDK merge partial results on the client, so
-# the token of the last backend response cannot resume a cross-partition query.
-_NON_RESUMABLE = re.compile(
-    r"\b(?:ORDER\s+BY|GROUP\s+BY|DISTINCT|TOP|OFFSET)\b"
-    r"|\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(",
-    re.IGNORECASE,
-)
+_QUERY_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|@[A-Za-z_][A-Za-z0-9_]*|\d+|\S")
+_AGGREGATES = frozenset({"COUNT", "SUM", "AVG", "MIN", "MAX"})
 
 # Bounds on a single call. The SDK defaults (65 s read timeout, up to 9
 # throttle retries) are far too generous for a call the model is waiting on.
@@ -122,20 +117,18 @@ MAX_OMITTED_IDS = 50
 # Output budget. The platform cuts any longer tool result blindly (and appends a
 # marker), which would leave malformed JSON and no cursor, so no return of this
 # module may exceed ``get_tool_max_output_length()``. That budget can be set as
-# low as MIN_OUTPUT_BUDGET (4 KiB); every size below is derived from it:
-#   * the outgoing continuation token is limited at the source to
-#     CONTINUATION_TOKEN_LIMIT_KB (``continuation_token_limit`` on
-#     ``query_items``, in KB, 1 is the smallest positive value) = 1,024 bytes;
+# low as 4096 characters; the sizes below are derived from it:
+#   * the outgoing continuation token is limited at the source to this many KB
+#     (``continuation_token_limit`` on ``query_items``; 1 is the smallest
+#     positive value, 0 means no limit) = 1,024 bytes;
 #   * as JSON text a token character costs at most 2 characters (a quote or
-#     backslash is escaped), so it takes at most WORST_CASE_TOKEN_CHARS;
+#     backslash is escaped), so a limited token takes at most 2,048;
 #   * the rest of an empty-items envelope is two names (255 characters, 2 each
 #     at worst) and about 300 characters of fixed keys, so
 #     2048 + 1020 + 300 < 4096 (asserted by a test with worst-case inputs).
-# Anything that still does not fit becomes the fixed ``response_too_large``
-# envelope below, itself well under 512 characters.
-MIN_OUTPUT_BUDGET = 4096
+# A result that still does not fit becomes the fixed ``response_too_large``
+# error, itself well under 512 characters.
 CONTINUATION_TOKEN_LIMIT_KB = 1
-WORST_CASE_TOKEN_CHARS = 2 * 1024 * CONTINUATION_TOKEN_LIMIT_KB
 MAX_RETRY_AFTER_CHARS = 20
 
 _REQUEST_CHARGE_HEADER = "x-ms-request-charge"
@@ -147,8 +140,24 @@ class CosmosConfigError(ValueError):
     """A problem with the connector's own input; the message is ours, safe to show."""
 
 
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_BLOCKED_MESSAGES = {
+    "host": "The request was refused because it targeted a host that is not an "
+    "Azure Cosmos DB account host.",
+    "non_public_address": "The endpoint resolves to a non-public network address, "
+    "which this service does not connect to.",
+    "redirect": "Cosmos DB answered with a redirect, and redirects are not followed.",
+    "policy": "The request was refused by the outbound network policy.",
+}
+
+
 class BlockedDestinationError(Exception):
-    """A request was refused because its host is not an allowed Cosmos DB host."""
+    """The outbound policy refused a request; ``reason`` is a key of
+    ``_BLOCKED_MESSAGES``."""
+
+    def __init__(self, reason: str = "host") -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _success(**payload: Any) -> str:
@@ -162,13 +171,28 @@ def _error(error_code: str, message: str, **extra: Any) -> str:
     )
 
 
-def _too_large() -> str:
-    """The fixed, bounded failure for a response that cannot fit the budget."""
-    return _error(
-        "response_too_large",
+_TOO_LARGE_MESSAGES = {
+    "cosmos_query_container": (
         "The result, with its paging cursor, does not fit the output size limit. "
         "Select fewer fields, add a filter or a partition_key, or lower "
-        "max_item_count; repeating the same call will not help.",
+        "max_item_count, and run it again; repeating the same call will not help."
+    ),
+    "cosmos_read_item": (
+        "The item does not fit the output size limit. Query only the fields you "
+        "need (SELECT c.field FROM c WHERE c.id = @id, with the partition_key); "
+        "repeating the same call will not help."
+    ),
+}
+_TOO_LARGE_DEFAULT = (
+    "The list does not fit the output size limit, which is too small for this "
+    "account; repeating the same call will not help."
+)
+
+
+def _too_large(tool_name: str = "") -> str:
+    """The fixed, bounded failure for a response that cannot fit the budget."""
+    return _error(
+        "response_too_large", _TOO_LARGE_MESSAGES.get(tool_name, _TOO_LARGE_DEFAULT)
     )
 
 
@@ -187,7 +211,7 @@ def _bounded_output(tool: Callable[..., str]) -> Callable[..., str]:
     @functools.wraps(tool)
     def wrapper(*args: Any, **kwargs: Any) -> str:
         response = tool(*args, **kwargs)
-        return response if len(response) <= _budget() else _too_large()
+        return response if len(response) <= _budget() else _too_large(tool.__name__)
 
     return wrapper
 
@@ -255,8 +279,37 @@ class _GuardedTransport(RequestsTransport):  # type: ignore[no-any-unimported]
                 "Refused a request to a host outside the Cosmos DB allowlist: %s",
                 parts.hostname,
             )
-            raise BlockedDestinationError from None
-        return super().send(request, **kwargs)
+            raise BlockedDestinationError("host") from None
+        try:
+            response = super().send(request, **kwargs)
+        except AzureError as exc:
+            # ``public_requests`` raises ``InvalidURL`` when the host resolves to
+            # a non-public address; azure-core wraps every ``RequestException``
+            # it does not know as ``ServiceResponseError(error=...)``.
+            inner = getattr(exc, "inner_exception", None)
+            if isinstance(
+                inner, (public_requests.exceptions.InvalidURL, PrivateNetworkHostError)
+            ):
+                logger.warning(
+                    "Refused a request to a non-public address for host: %s",
+                    parts.hostname,
+                )
+                raise BlockedDestinationError("non_public_address") from None
+            raise
+        except ValueError:
+            # ``public_requests`` refuses with plain ``ValueError`` before it
+            # sends (destination checks, tunnels, untrusted proxies).
+            logger.warning(
+                "The outbound policy refused a request to %s", parts.hostname
+            )
+            raise BlockedDestinationError("policy") from None
+        # Redirects are never followed (azure-core sends with
+        # ``allow_redirects=False``) and the SDK treats any status below 400 as
+        # a success, so a 3xx would be parsed as an account or result body.
+        if response.status_code in _REDIRECT_STATUSES:
+            logger.warning("Refused a redirect answered by %s", parts.hostname)
+            raise BlockedDestinationError("redirect")
+        return response
 
 
 def _client() -> CosmosClient:
@@ -367,11 +420,7 @@ def _map_error(exc: Exception, target: str, not_found: str) -> str:
     if isinstance(exc, CosmosConfigError):
         return _error("invalid_configuration", str(exc))
     if isinstance(exc, BlockedDestinationError):
-        return _error(
-            "blocked_destination",
-            "The request was refused because it targeted a host that is not an "
-            "Azure Cosmos DB account host.",
-        )
+        return _error("blocked_destination", _BLOCKED_MESSAGES[exc.reason])
     if isinstance(exc, CosmosHttpResponseError):
         status = exc.status_code
         text = f"{getattr(exc, 'message', '')} {exc}".lower()
@@ -405,7 +454,8 @@ def _map_error(exc: Exception, target: str, not_found: str) -> str:
             return _error(
                 "throttled",
                 "Cosmos DB throttled the request (429): the container's "
-                "throughput is exhausted. Retry later or lower the page size.",
+                "throughput is exhausted. Retry later (a query can also lower "
+                "max_item_count).",
                 http_status=429,
                 **(
                     {"retry_after_ms": str(retry_after)[:MAX_RETRY_AFTER_CHARS]}
@@ -458,7 +508,7 @@ def _map_error(exc: Exception, target: str, not_found: str) -> str:
 
 
 def _success_with_capped_list(
-    field: str, payload: dict[str, Any], hint: str | None = None
+    field: str, payload: dict[str, Any], hint: str | tuple[str, str]
 ) -> str:
     """A success payload, halving ``payload[field]`` until the *whole* response
     fits ``get_tool_max_output_length()``.
@@ -467,9 +517,11 @@ def _success_with_capped_list(
     would drop the paging fields that follow the list, so the cap covers the
     entire JSON. Halved entries belong to the page already fetched and are not
     on the next page: their ids are returned (``omitted_ids``, within a quarter
-    of the budget) so a caller can still fetch each one, even when one record
+    of the budget) so a caller can fetch them with a query, even when one record
     alone is larger than the limit. The token already points past the page, so
-    a retry makes progress. When even the empty-items envelope does not fit,
+    a retry makes progress. ``hint`` is the advice added when entries were cut:
+    one text, or a pair (with ids, without ids) so that only advice the caller
+    can act on is given. When even the empty-items envelope does not fit,
     the ids and the message are dropped; if it still does not fit,
     ``_bounded_output`` replaces it with the fixed ``response_too_large``
     envelope (never an oversized one).
@@ -495,18 +547,14 @@ def _success_with_capped_list(
         if len(kept) == len(items):
             return _success(**rest, truncated=already_truncated)
         omitted = items[len(kept) :]
+        ids = omitted_ids(omitted)
+        message = hint if isinstance(hint, str) else hint[0 if ids else 1]
         return _success(
             **{**rest, field: kept},
             truncated=True,
             omitted_count=len(omitted),
-            omitted_ids=omitted_ids(omitted),
-            message=hint
-            or (
-                f"Returned {len(kept)} of {len(items)} {field}; the rest did not "
-                "fit the output size limit and are not on the next page. Fetch "
-                "each omitted id with cosmos_read_item, select fewer fields, or "
-                "lower max_item_count."
-            ),
+            omitted_ids=ids,
+            message=message,
         )
 
     kept = items
@@ -520,6 +568,17 @@ def _success_with_capped_list(
             **{**rest, field: []}, truncated=True, omitted_count=len(items)
         )
     return response  # still over budget only for _bounded_output to replace
+
+
+_QUERY_CUT_HINTS = (
+    "Some items did not fit the output size limit and are not on the next page. "
+    "Re-run this call (same continuation_token) with fewer selected fields or a "
+    "smaller max_item_count, or fetch the omitted ids with a query such as "
+    "SELECT * FROM c WHERE c.id IN (@a, @b) and their ids as parameters.",
+    "Some items did not fit the output size limit and are not on the next page. "
+    "Re-run this call (same continuation_token) with fewer selected fields or a "
+    "smaller max_item_count.",
+)
 
 
 def _parameters(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -546,10 +605,42 @@ def _is_resumable_across_partitions(query: str) -> bool:
     Microsoft Learn: in the Python SDK aggregate cross-partition queries
     (sorting, counting, distinct) do not support continuation tokens, and
     GROUP BY / DISTINCT cannot use them at the service. TOP and OFFSET are
-    merged client-side the same way (read from the SDK source). A best-effort
-    check on the query text with string literals removed.
+    merged client-side the same way (read from the SDK source).
+
+    Keywords are recognised only in their grammatical position, on the query
+    text with string literals removed: ``ORDER``/``GROUP`` followed by ``BY``,
+    ``DISTINCT`` right after ``SELECT``, ``TOP`` right after ``SELECT`` or
+    ``SELECT DISTINCT``, ``OFFSET`` followed by a number or parameter, and an
+    aggregate name followed by ``(``. A token after ``.`` (a property such as
+    ``c.top``, ``c.order_by``, ``udf.count(``) or after ``AS`` (an alias) is an
+    identifier, and so are bracket accesses (``c["top"]``, a string literal).
+
+    Bias: a false positive costs paging on a valid query, and the result says
+    so (``resumable: false``, ``may_be_incomplete``); a false negative hands out
+    a cursor that resumes wrongly and silently. So whenever the text cannot be
+    read with certainty (an unterminated string literal, for example because a
+    comment holds an apostrophe) the query counts as not resumable, and so does
+    a keyword that only appears inside a comment.
     """
-    return not _NON_RESUMABLE.search(_STRING_LITERAL.sub("''", query))
+    text = _STRING_LITERAL.sub("''", query)
+    if "'" in text.replace("''", "") or '"' in text:
+        return False
+    tokens = _QUERY_TOKEN.findall(text)
+    for index, token in enumerate(tokens):
+        previous = tokens[index - 1].upper() if index else ""
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if previous in (".", "AS"):
+            continue
+        word = token.upper()
+        if (
+            (word in ("ORDER", "GROUP") and following.upper() == "BY")
+            or (word == "DISTINCT" and previous == "SELECT")
+            or (word == "TOP" and previous in ("SELECT", "DISTINCT"))
+            or (word == "OFFSET" and following[:1] in ("@", *"0123456789"))
+            or (word in _AGGREGATES and following == "(")
+        ):
+            return False
+    return True
 
 
 def _charge_recorder() -> tuple[list[float], Any]:
@@ -592,7 +683,7 @@ def cosmos_list_databases() -> str:
                 "configured_database": database_name,
                 "truncated": truncated,
             },
-            hint="The list did not fit the output size limit.",
+            hint="Some databases did not fit the output size limit and are not listed.",
         )
     except Exception as e:
         return _map_error(
@@ -637,7 +728,7 @@ def cosmos_list_containers() -> str:
                 ],
                 "truncated": truncated,
             },
-            hint="The list did not fit the output size limit.",
+            hint="Some containers did not fit the output size limit and are not listed.",
         )
     except Exception as e:
         return _map_error(
@@ -679,9 +770,10 @@ def cosmos_query_container(
     Returns items, request_charge (RU), continuation_token (null on the last
     page), has_more and truncated. When the response is larger than the output
     size limit, items are cut: truncated is true, omitted_count says how many
-    were dropped and omitted_ids lists their ids (fetch them with
-    cosmos_read_item, or select fewer fields); the continuation_token still
-    points past this page.
+    were dropped and omitted_ids lists their ids. Fetch them with a query such
+    as SELECT * FROM c WHERE c.id IN (@a, @b), or re-run the same call (same
+    continuation_token) with fewer selected fields or a smaller max_item_count;
+    the continuation_token returned still points past this page.
     A query across partitions (no partition_key) that uses ORDER BY, GROUP BY,
     DISTINCT, TOP, OFFSET or an aggregate (COUNT, SUM, AVG, MIN, MAX) cannot be
     resumed with a token: the result has no continuation_token, resumable is
@@ -759,7 +851,7 @@ def cosmos_query_container(
         if not resumable:
             payload["resumable"] = False
             payload["may_be_incomplete"] = len(page) >= page_size
-        return _success_with_capped_list("items", payload)
+        return _success_with_capped_list("items", payload, _QUERY_CUT_HINTS)
     except Exception as e:
         return _map_error(
             e,

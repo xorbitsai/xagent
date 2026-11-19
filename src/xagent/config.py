@@ -371,6 +371,8 @@ XROUTER_CALL_HISTORY_ENABLED = "XAGENT_XROUTER_CALL_HISTORY_ENABLED"
 FORM_ANSWER_CONTINUATION_ENABLED = "XAGENT_FORM_ANSWER_CONTINUATION_ENABLED"
 MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 MCP_OAUTH_PROXY_URL = "XAGENT_MCP_OAUTH_PROXY_URL"
+MCP_OAUTH_CLIENT_NAME = "XAGENT_MCP_OAUTH_CLIENT_NAME"
+DEFAULT_MCP_OAUTH_CLIENT_NAME = "Xagent"
 HUBSPOT_MCP_CLIENT_ID = "XAGENT_HUBSPOT_MCP_CLIENT_ID"
 HUBSPOT_MCP_CLIENT_SECRET = "XAGENT_HUBSPOT_MCP_CLIENT_SECRET"
 TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
@@ -1312,6 +1314,27 @@ def get_mcp_oauth_proxy_url() -> str | None:
         raise ValueError(
             f"Invalid {MCP_OAUTH_PROXY_URL} value: {value!r}. "
             "Expected an absolute HTTP(S) proxy URL."
+        )
+    return value
+
+
+def get_mcp_oauth_client_name() -> str:
+    """Return the ``client_name`` sent in MCP OAuth dynamic client registration.
+
+    Some authorization servers show it on their consent page. After it changes,
+    servers registered under an older name register again on their next connect,
+    and the old client rows stay for their existing grants to refresh with.
+    """
+    value = os.getenv(MCP_OAUTH_CLIENT_NAME)
+    if value is None:
+        return DEFAULT_MCP_OAUTH_CLIENT_NAME
+    value = value.strip()
+    if not value:
+        return DEFAULT_MCP_OAUTH_CLIENT_NAME
+    if len(value) > 255:
+        raise ValueError(
+            f"Invalid {MCP_OAUTH_CLIENT_NAME} value: {value!r}. "
+            "Expected at most 255 characters."
         )
     return value
 

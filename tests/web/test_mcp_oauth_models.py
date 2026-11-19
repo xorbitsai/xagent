@@ -98,6 +98,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     }
     assert "lookup_hash" in client_columns
     assert "registration_lookup_hash" in client_columns
+    assert "registration_client_name" in client_columns
     assert "metadata" in grant_columns
     assert "lookup_hash" in grant_columns
     grant_column_types = {
@@ -116,6 +117,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     assert client_column_types["token_endpoint_auth_method"].length == (
         MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH
     )
+    assert client_column_types["registration_client_name"].length == 255
     client_indexes = {
         index["name"]: index for index in inspector.get_indexes("mcp_oauth_clients")
     }
@@ -155,6 +157,7 @@ def test_mcp_oauth_registration_lookup_hash_identifies_public_client_profile():
         10,
         "https://auth.example.com",
         "https://xagent.example.com/api/mcp/oauth/callback",
+        client_name=None,
     )
 
     assert len(lookup_hash) == 64
@@ -162,12 +165,66 @@ def test_mcp_oauth_registration_lookup_hash_identifies_public_client_profile():
         10,
         "https://auth.example.com",
         "https://xagent.example.com/api/mcp/oauth/callback",
+        client_name=None,
     )
     assert lookup_hash != mcp_oauth_client_registration_lookup_hash(
         10,
         "https://auth.example.com",
         "https://other.example.com/api/mcp/oauth/callback",
+        client_name=None,
     )
+
+
+def test_mcp_oauth_registration_lookup_hash_keeps_the_legacy_default_name_hash():
+    # Computed by the three-argument helper before the client name was added.
+    legacy_hash = "b57212d3256813b295191a7558e5a38307db6a1e52024d67dd12ce11a2d10663"
+    args = (7, "https://issuer.example", "https://app.example/api/mcp/oauth/callback")
+
+    assert (
+        mcp_oauth_client_registration_lookup_hash(*args, client_name=None)
+        == legacy_hash
+    )
+    assert (
+        mcp_oauth_client_registration_lookup_hash(*args, client_name="Xagent")
+        == legacy_hash
+    )
+
+
+def test_mcp_oauth_registration_lookup_hash_includes_a_custom_client_name():
+    args = (7, "https://issuer.example", "https://app.example/api/mcp/oauth/callback")
+    lookup_hash = mcp_oauth_client_registration_lookup_hash(
+        *args, client_name="Tobybot"
+    )
+
+    # Pinned: rows registered under a custom name are found by this value.
+    assert (
+        lookup_hash
+        == "f91bf6dc1545f2ea88afe33fb81b4846c971758fcc6c3417ab13fab57d590995"
+    )
+    assert lookup_hash != mcp_oauth_client_registration_lookup_hash(
+        *args, client_name=None
+    )
+    assert lookup_hash != mcp_oauth_client_registration_lookup_hash(
+        *args, client_name="Xagent"
+    )
+    assert lookup_hash != mcp_oauth_client_registration_lookup_hash(
+        8,
+        "https://issuer.example",
+        "https://app.example/api/mcp/oauth/callback",
+        client_name="Tobybot",
+    )
+    assert lookup_hash == mcp_oauth_client_registration_lookup_hash(
+        *args, client_name="Tobybot"
+    )
+
+
+def test_mcp_oauth_registration_lookup_hash_requires_the_client_name():
+    with pytest.raises(TypeError):
+        mcp_oauth_client_registration_lookup_hash(
+            7,
+            "https://issuer.example",
+            "https://app.example/api/mcp/oauth/callback",
+        )
 
 
 def test_mcp_oauth_grant_lookup_uniqueness_includes_resource_owner_key(db_session):

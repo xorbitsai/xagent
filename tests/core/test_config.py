@@ -36,6 +36,7 @@ from xagent.config import (
     DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
     DEEPDOC_XINFERENCE_URL,
     DEEPDOC_XINFERENCE_USERNAME,
+    DEFAULT_MCP_OAUTH_CLIENT_NAME,
     EXTERNAL_MEDIA_URL_TTL_SECONDS,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
@@ -68,6 +69,7 @@ from xagent.config import (
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
     MCP_OAUTH_ALLOW_PRIVATE_HOSTS,
+    MCP_OAUTH_CLIENT_NAME,
     MCP_OAUTH_PROXY_URL,
     MCP_TOOL_INIT_TIMEOUT_SECONDS,
     NATIVE_BROWSER_APP_NAME,
@@ -190,6 +192,7 @@ from xagent.config import (
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
     get_mcp_oauth_allow_private_hosts,
+    get_mcp_oauth_client_name,
     get_mcp_oauth_proxy_url,
     get_mcp_tool_init_timeout_seconds,
     get_native_browser_app_name,
@@ -482,6 +485,12 @@ class TestEnvironmentVariableConstants:
 
     def test_mcp_oauth_proxy_url_constant(self):
         assert MCP_OAUTH_PROXY_URL == "XAGENT_MCP_OAUTH_PROXY_URL"
+
+    def test_mcp_oauth_client_name_constant(self):
+        assert MCP_OAUTH_CLIENT_NAME == "XAGENT_MCP_OAUTH_CLIENT_NAME"
+
+    def test_mcp_oauth_client_name_default_constant(self):
+        assert DEFAULT_MCP_OAUTH_CLIENT_NAME == "Xagent"
 
     def test_file_storage_uri_constant(self):
         assert FILE_STORAGE_URI == "XAGENT_FILE_STORAGE_URI"
@@ -815,6 +824,27 @@ class TestMCPOAuthConfig:
         monkeypatch.setenv(MCP_OAUTH_PROXY_URL, value)
         with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_PROXY_URL"):
             get_mcp_oauth_proxy_url()
+
+    def test_client_name_defaults_when_unset_or_blank(self, monkeypatch):
+        monkeypatch.delenv(MCP_OAUTH_CLIENT_NAME, raising=False)
+        assert get_mcp_oauth_client_name() == "Xagent"
+
+        monkeypatch.setenv(MCP_OAUTH_CLIENT_NAME, "   ")
+        assert get_mcp_oauth_client_name() == "Xagent"
+
+    def test_client_name_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(MCP_OAUTH_CLIENT_NAME, "  Tobybot  ")
+        assert get_mcp_oauth_client_name() == "Tobybot"
+
+    def test_client_name_accepts_255_characters(self, monkeypatch):
+        value = "a" * 255
+        monkeypatch.setenv(MCP_OAUTH_CLIENT_NAME, value)
+        assert get_mcp_oauth_client_name() == value
+
+    def test_client_name_rejects_values_over_255_characters(self, monkeypatch):
+        monkeypatch.setenv(MCP_OAUTH_CLIENT_NAME, "a" * 256)
+        with pytest.raises(ValueError, match="XAGENT_MCP_OAUTH_CLIENT_NAME"):
+            get_mcp_oauth_client_name()
 
     def test_hubspot_credentials_are_trimmed(self, monkeypatch):
         monkeypatch.setenv(config.HUBSPOT_MCP_CLIENT_ID, " client-id ")

@@ -447,7 +447,9 @@ async def test_v2_export_message_count_matches_the_listing(canonical):
     header, row = csv.reader(io.StringIO(body.decode("utf-8-sig"), newline=""))
     exported = dict(zip(header, row))
     assert exported["message_count"] == str(listed["logs"][0]["message_count"])
-    assert exported["last_activity_at"] == listed["logs"][0]["last_activity_at"]
+    assert exported["last_activity_at"] == datetime.fromisoformat(
+        listed["logs"][0]["last_activity_at"]
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 V2_WINDOW_START = datetime(2026, 3, 10, tzinfo=timezone.utc)
@@ -1020,3 +1022,79 @@ def test_message_empty_defaults_remain_supported(canonical, kind, payload):
             load_live_display_event(db, task_id, "empty-message")["data"]["content"]
             == expected
         )
+
+
+def test_export_transcripts_follow_the_event_display_rules(canonical):
+    from xagent.web.api.conversation_logs import _load_export_transcripts
+
+    factory, task_id = canonical
+    hidden = {"display": "none", "kind": "connector_settled"}
+    with factory() as db:
+        fact(
+            db,
+            task_id,
+            "input_accepted",
+            "u1",
+            {"content": "hello", "message_type": "user"},
+            flat=True,
+        )
+        fact(
+            db,
+            task_id,
+            "input_accepted",
+            "hidden",
+            {"content": "settled", "message_type": "user", "message_metadata": hidden},
+            flat=True,
+        )
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "audit-message",
+            {"message": "secret", "expect_response": True, "__audit_only__": True},
+        )
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "child",
+            {"message": "secret"},
+            scope_id="child",
+        )
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "question",
+            {"message": "Which?", "expect_response": True, "visible": True},
+        )
+        fact(
+            db,
+            task_id,
+            "assistant_message",
+            "answer",
+            {"content": "done", "message_type": "assistant_response"},
+            flat=True,
+        )
+        db.commit()
+        # A fact appended after the display horizon is not part of the conversation.
+        horizon = db.get(Task, task_id).conversation_event_sequence
+        fact(
+            db,
+            task_id,
+            "assistant_message",
+            "late",
+            {"content": "late", "message_type": "assistant_response"},
+            flat=True,
+        )
+        db.commit()
+        db.get(Task, task_id).conversation_event_sequence = horizon
+        db.commit()
+
+        assert _load_export_transcripts(db, [task_id]) == {
+            task_id: (
+                "[2026-09-30 00:00 UTC] User:\nhello\n\n"
+                "[2026-09-30 00:00 UTC] Assistant:\nWhich?\n\n"
+                "[2026-09-30 00:00 UTC] Assistant:\ndone"
+            )
+        }

@@ -994,6 +994,7 @@ EXPORT_HEADER = [
     "first_message",
     "latest_answer",
     "error_message",
+    "conversation",
 ]
 FORMULA_PREFIXES = ["=", "+", "-", "@", "\t", "\r"]
 
@@ -1090,13 +1091,16 @@ def test_export_columns_carry_the_listed_values() -> None:
         "channel": "Widget",
         "status": "completed",
         "title": "Export title",
-        "started_at": "2026-03-01T08:00:00+00:00",
-        "last_activity_at": "2026-03-10T12:00:00+00:00",
+        "started_at": "2026-03-01 08:00:00",
+        "last_activity_at": "2026-03-10 12:00:00",
         "message_count": str(listed["message_count"]),
         "total_tokens": "8",
         "first_message": "first words",
         "latest_answer": "latest reply",
         "error_message": "boom",
+        "conversation": (
+            "[2026-03-01 08:00 UTC] User:\nhi\n\n[2026-03-10 12:00 UTC] Assistant:\nhello"
+        ),
     }
 
 
@@ -1406,6 +1410,354 @@ def test_export_releases_the_connection_before_the_first_byte_is_read(
     first_chunk = next(i for i, name in enumerate(order) if "first-chunk" in name)
     assert "returned" in order[:first_chunk], order
     assert order[first_chunk] == "first-chunk(outstanding=0)", order
+
+
+def _add_messages(
+    task_id: int,
+    user_id: int,
+    messages: list[tuple[str, str, datetime | None]],
+    *,
+    message_type: str = "chat",
+    message_metadata: dict[str, Any] | None = None,
+    interactions: list[dict[str, Any]] | None = None,
+) -> None:
+    """Insert messages in order; a ``None`` time is stored as a NULL ``created_at``."""
+    db = _direct_db_session()
+    try:
+        for role, content, created_at in messages:
+            row = TaskChatMessage(
+                task_id=task_id,
+                user_id=user_id,
+                role=role,
+                content=content,
+                message_type=message_type,
+                message_metadata=message_metadata,
+                interactions=interactions,
+                created_at=created_at or datetime(2000, 1, 1, tzinfo=timezone.utc),
+            )
+            db.add(row)
+            db.flush()
+            if created_at is None:
+                db.execute(
+                    text(
+                        "UPDATE task_chat_messages SET created_at = NULL WHERE id = :i"
+                    ),
+                    {"i": row.id},
+                )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _sdk_task(user_id: int, title: str = "conv") -> int:
+    return _create_task_row(
+        user_id=user_id, title=title, source="sdk", is_visible=False
+    )
+
+
+def _conversation_cells(headers: dict[str, str]) -> dict[str, str]:
+    return {
+        row["conversation_id"]: row["conversation"]
+        for row in _exported_by_column(_export(headers))
+    }
+
+
+def _minute(hour: int, minute: int = 0) -> datetime:
+    return datetime(2026, 3, 1, hour, minute, tzinfo=timezone.utc)
+
+
+def test_export_conversation_follows_the_detail_transcript_order() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    task_id = _sdk_task(user_id)
+    _add_messages(
+        task_id,
+        user_id,
+        [
+            # Same instant, assistant stored first: the detail page lists the
+            # user message first.
+            ("assistant", "a-same", _minute(9, 5)),
+            ("user", "u-same", _minute(9, 5)),
+            ("user", "u-early", _minute(9, 0)),
+            ("assistant", "a-late", _minute(9, 30)),
+            ("user", "u-null", None),
+        ],
+    )
+
+    transcript = client.get(
+        f"/api/conversation-logs/{task_id}", headers=headers
+    ).json()["transcript"]
+    expected_blocks = []
+    for message in transcript:
+        if message["message_type"] == "compaction":
+            continue
+        created = message["created_at"]
+        when = (
+            f"[{datetime.fromisoformat(created):%Y-%m-%d %H:%M} UTC]"
+            if created
+            else "[time unknown]"
+        )
+        expected_blocks.append(
+            f"{when} {message['role'].capitalize()}:\n{message['content']}"
+        )
+
+    cell = _conversation_cells(headers)[str(task_id)]
+    assert [m["content"] for m in transcript] == [
+        "u-null",
+        "u-early",
+        "u-same",
+        "a-same",
+        "a-late",
+    ]
+    assert cell == "\n\n".join(expected_blocks)
+    assert cell.startswith("[time unknown] User:\nu-null\n\n")
+
+
+def test_export_conversation_leaves_out_hidden_messages_only() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    task_id = _sdk_task(user_id)
+    _add_messages(
+        task_id,
+        user_id,
+        [("user", "shown", _minute(9, 0))],
+    )
+    _add_messages(
+        task_id,
+        user_id,
+        [("user", "hidden", _minute(9, 1))],
+        message_metadata={"display": "none", "kind": "connector_settled"},
+    )
+    _add_messages(
+        task_id,
+        user_id,
+        [("assistant", "card", _minute(9, 2))],
+        message_metadata={"display": "result_card"},
+    )
+
+    assert _conversation_cells(headers)[str(task_id)] == (
+        "[2026-03-01 09:00 UTC] User:\nshown\n\n[2026-03-01 09:02 UTC] Assistant:\ncard"
+    )
+
+
+@pytest.mark.parametrize("message_type", ["question", "chat_response"])
+def test_export_conversation_writes_stored_assistant_text_verbatim(
+    message_type: str,
+) -> None:
+    from xagent.core.agent.transcript import build_assistant_transcript_content
+
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    task_id = _sdk_task(user_id)
+    interactions = [
+        {
+            "type": "select_one",
+            "label": "Pick",
+            "options": [{"value": "a", "label": "Option A"}],
+        }
+    ]
+    stored = "Which one?" + build_assistant_transcript_content("", interactions)
+    _add_messages(
+        task_id,
+        user_id,
+        [("assistant", stored, _minute(9, 0))],
+        message_type=message_type,
+        interactions=interactions,
+    )
+
+    assert _conversation_cells(headers)[str(task_id)] == (
+        f"[2026-03-01 09:00 UTC] Assistant:\n{stored}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "label"),
+    [("user", "User"), ("assistant", "Assistant"), ("system", "System")],
+)
+def test_export_conversation_labels_roles(role: str, label: str) -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    task_id = _sdk_task(user_id)
+    _add_messages(task_id, user_id, [(role, "text", _minute(9, 0))])
+
+    assert _conversation_cells(headers)[str(task_id)] == (
+        f"[2026-03-01 09:00 UTC] {label}:\ntext"
+    )
+
+
+def test_export_role_label_falls_back_to_unknown_and_empty_content_keeps_its_title():
+    assert conversation_logs._export_role_label("") == "Unknown"
+    assert conversation_logs._export_role_label(None) == "Unknown"
+    assert conversation_logs._export_message_block("user", None, _minute(9)) == (
+        "[2026-03-01 09:00 UTC] User:\n"
+    )
+
+
+def test_export_conversation_is_empty_without_messages() -> None:
+    headers = _admin_headers()
+    task_id = _sdk_task(_user_id("admin"))
+
+    assert _conversation_cells(headers)[str(task_id)] == ""
+
+
+@pytest.mark.parametrize(
+    ("text_value", "expected_tail", "dropped"),
+    [
+        ("a" * 32_000, "", 0),
+        ("a" * 32_001, "\n\n[truncated: 1 more characters]", 1),
+        ("a" * 31_999 + "\U0001f600" + "b", "\n\n[truncated: 3 more characters]", 3),
+        ("a" * 40_000, "\n\n[truncated: 8,000 more characters]", 8_000),
+    ],
+)
+def test_truncate_export_cell_counts_utf16_units_and_never_splits_a_pair(
+    text_value: str, expected_tail: str, dropped: int
+) -> None:
+    result = conversation_logs._truncate_export_cell(text_value)
+
+    assert result.endswith(expected_tail)
+    kept = result[: len(result) - len(expected_tail)]
+    assert text_value.startswith(kept)
+    assert (
+        len(text_value.encode("utf-16-le")) // 2 - (len(kept.encode("utf-16-le")) // 2)
+        == dropped
+    )
+    assert len(result.encode("utf-16-le")) // 2 <= 32_767
+    if dropped == 0:
+        assert result == text_value
+    if "\U0001f600" in text_value and dropped:
+        assert len(kept) == 31_999
+
+
+def test_export_conversation_cell_is_truncated_in_the_file() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    task_id = _sdk_task(user_id)
+    _add_messages(task_id, user_id, [("user", "x" * 40_000, _minute(9, 0))])
+
+    cell = _conversation_cells(headers)[str(task_id)]
+
+    assert cell.endswith("\n\n[truncated: 8,029 more characters]")
+    assert len(cell.encode("utf-16-le")) // 2 <= 32_767
+
+
+def test_export_time_columns_are_spreadsheet_datetimes_in_utc() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    created = datetime(2026, 3, 1, 8, 30, 45, 123456, tzinfo=timezone.utc)
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="t",
+        source="sdk",
+        is_visible=False,
+        created_at=created,
+        updated_at=created,
+    )
+    _add_messages(
+        task_id,
+        user_id,
+        [("user", "hi", datetime(2026, 3, 2, 3, 4, 5, tzinfo=timezone.utc))],
+    )
+
+    (row,) = _exported_by_column(_export(headers))
+
+    pattern = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"
+    assert re.fullmatch(pattern, row["started_at"])
+    assert re.fullmatch(pattern, row["last_activity_at"])
+    assert row["started_at"] == "2026-03-01 08:30:45"
+    assert row["last_activity_at"] == "2026-03-02 03:04:05"
+    assert row["conversation"].startswith("[2026-03-02 03:04 UTC] User:")
+
+
+def test_export_timestamp_converts_to_utc_and_keeps_none() -> None:
+    zone = timezone(timedelta(hours=8))
+    moment = datetime(2026, 3, 1, 16, 30, 45, tzinfo=zone)
+
+    assert conversation_logs._export_timestamp(moment) == "2026-03-01 08:30:45"
+    assert conversation_logs._export_timestamp(None) is None
+    assert conversation_logs._export_timestamp(moment.replace(tzinfo=None)) == (
+        "2026-03-01 16:30:45"
+    )
+
+
+def _v2_task(user_id: int, title: str = "v2") -> int:
+    task_id = _sdk_task(user_id, title)
+    _set_task_fields(task_id, conversation_storage_version=2, run_id="run-1")
+    return task_id
+
+
+def _add_v2_input(task_id: int, key: str, content: str, at: datetime) -> None:
+    from xagent.web.services.task_execution_event_writer import (
+        append_fact_no_commit,
+    )
+
+    with _direct_db_session() as db:
+        append_fact_no_commit(
+            db,
+            task_id=task_id,
+            kind="input_accepted",
+            key=key,
+            run_id="run-1",
+            turn_id=key,
+            payload={"content": content, "message_type": "user"},
+            occurred_at=at,
+        )
+        db.commit()
+
+
+def test_export_conversation_reads_each_row_from_its_own_task_across_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    expected: dict[str, str] = {}
+    for index in range(5):
+        if index % 2:
+            task_id = _v2_task(user_id, f"row {index}")
+            _add_v2_input(task_id, f"k{index}", f"text {index}", _minute(9, index))
+        else:
+            task_id = _sdk_task(user_id, f"row {index}")
+            _add_messages(
+                task_id, user_id, [("user", f"text {index}", _minute(9, index))]
+            )
+        expected[str(task_id)] = f"[2026-03-01 09:0{index} UTC] User:\ntext {index}"
+    monkeypatch.setattr(conversation_logs, "EXPORT_FETCH_BATCH", 2)
+
+    assert _conversation_cells(headers) == expected
+
+
+def test_export_conversation_marks_only_the_task_whose_events_cannot_be_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    broken = _v2_task(user_id, "broken")
+    _add_v2_input(broken, "b1", "readable before the bad event", _minute(9, 0))
+    _add_v2_input(broken, "b2", 5, _minute(9, 1))  # type: ignore[arg-type]
+    _add_v2_input(broken, "b3", "skipped after the bad event", _minute(9, 2))
+    healthy = _v2_task(user_id, "healthy")
+    _add_v2_input(healthy, "h1", "fine", _minute(9, 3))
+
+    with caplog.at_level(logging.WARNING):
+        cells = _conversation_cells(headers)
+
+    assert cells == {
+        str(broken): "[conversation unavailable]",
+        str(healthy): "[2026-03-01 09:03 UTC] User:\nfine",
+    }
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert [m for m in warnings if "could not project" in m] == [
+        f"Conversation export could not project the events of task {broken}"
+    ]
+
+
+def test_load_export_transcripts_without_ids_runs_no_query() -> None:
+    with _capture_sql_statements() as statements:
+        db = _direct_db_session()
+        try:
+            assert conversation_logs._load_export_transcripts(db, []) == {}
+        finally:
+            db.close()
+    assert statements == []
 
 
 def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:

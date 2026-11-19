@@ -7,6 +7,7 @@ import math
 import tempfile
 from contextlib import suppress
 from datetime import datetime, timezone
+from itertools import islice
 from typing import Annotated, Any, Iterable, Iterator, Sequence
 from typing import cast as typing_cast
 
@@ -64,8 +65,9 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..services.task_event_display import project_event_message
 from ..services.task_runtime import mcp_runtime_authorization_policy_required_clause
-from ..utils.db_timezone import format_datetime_for_api
+from ..utils.db_timezone import format_datetime_for_api, normalize_datetime_from_db
 from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,9 @@ EXPORT_BYTE_LIMIT = 50 * 1024 * 1024
 EXPORT_SPOOL_BYTES = 8 * 1024 * 1024
 EXPORT_READ_CHUNK_BYTES = 64 * 1024
 EXPORT_FETCH_BATCH = 500
+# Excel holds at most 32,767 UTF-16 code units in a cell; the conversation cell
+# is cut below that so the truncation marker still fits.
+EXPORT_CELL_CHAR_LIMIT = 32_000
 EXPORT_TOO_LARGE_CODE = "conversation_log_export_too_large"
 EXPORT_COLUMNS = (
     "conversation_id",
@@ -133,7 +138,14 @@ EXPORT_COLUMNS = (
     "first_message",
     "latest_answer",
     "error_message",
+    "conversation",
 )
+EXPORT_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+EXPORT_MESSAGE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
+EXPORT_TIME_UNKNOWN = "[time unknown]"
+EXPORT_CONVERSATION_UNAVAILABLE = "[conversation unavailable]"
+# Only these event kinds can project to a message; the others are skipped in SQL.
+_EXPORT_MESSAGE_EVENT_KINDS = ("input_accepted", "assistant_message", "agent_message")
 # A spreadsheet reads a cell starting with one of these as a formula.
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -1162,6 +1174,169 @@ def _csv_line(cells: Iterable[Any]) -> str:
     return buffer.getvalue()
 
 
+def _export_timestamp(
+    value: datetime | None, fmt: str = EXPORT_TIMESTAMP_FORMAT
+) -> str | None:
+    """A stored time as UTC text in ``fmt``, which a spreadsheet reads as a date.
+
+    ``None`` stays ``None``.
+    """
+    if value is None:
+        return None
+    return normalize_datetime_from_db(value).strftime(fmt)
+
+
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _truncate_export_cell(text: str) -> str:
+    """``text`` cut to ``EXPORT_CELL_CHAR_LIMIT`` UTF-16 units, with a marker.
+
+    Excel counts a cell in UTF-16 code units, so a character outside the BMP
+    counts twice and is never split. The marker states how many units were
+    dropped.
+    """
+    total = _utf16_units(text)
+    if total <= EXPORT_CELL_CHAR_LIMIT:
+        return text
+    kept_units = 0
+    kept_chars = 0
+    for char in text:
+        units = _utf16_units(char)
+        if kept_units + units > EXPORT_CELL_CHAR_LIMIT:
+            break
+        kept_units += units
+        kept_chars += 1
+    return f"{text[:kept_chars]}\n\n[truncated: {total - kept_units:,} more characters]"
+
+
+def _export_role_label(role: str | None) -> str:
+    return (role or "").capitalize() or "Unknown"
+
+
+def _export_message_block(role: str | None, content: str | None, at: Any) -> str:
+    stamp = _export_timestamp(at, EXPORT_MESSAGE_TIMESTAMP_FORMAT)
+    when = f"[{stamp} UTC]" if stamp is not None else EXPORT_TIME_UNKNOWN
+    return f"{when} {_export_role_label(role)}:\n{content or ''}"
+
+
+def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, str]:
+    """The conversation cell for each of ``task_ids`` that has displayed messages.
+
+    A message shows when the detail page shows it, in the detail page's order,
+    with its stored text. A task whose v2 events cannot be projected gets
+    ``EXPORT_CONVERSATION_UNAVAILABLE``. A task without messages has no key.
+    """
+    ids = list(task_ids)
+    if not ids:
+        return {}
+    blocks: dict[int, list[str]] = {}
+
+    v1_rows = db.execute(
+        select(
+            TaskChatMessage.task_id,
+            TaskChatMessage.role,
+            TaskChatMessage.content,
+            TaskChatMessage.created_at,
+        )
+        .join(Task, Task.id == TaskChatMessage.task_id)
+        .where(
+            Task.id.in_(ids),
+            Task.conversation_storage_version == 1,
+            displayed_message_clause(TaskChatMessage.message_metadata),
+        )
+        .order_by(
+            TaskChatMessage.task_id,
+            TaskChatMessage.created_at.isnot(None),
+            TaskChatMessage.created_at,
+            TaskChatMessage.role != "user",
+            TaskChatMessage.id,
+        )
+    )
+    for task_id, role, content, created_at in v1_rows:
+        blocks.setdefault(int(task_id), []).append(
+            _export_message_block(role, content, created_at)
+        )
+
+    unavailable: set[int] = set()
+    v2_events = db.scalars(
+        select(TaskExecutionEvent)
+        .join(Task, Task.id == TaskExecutionEvent.task_id)
+        .where(
+            Task.id.in_(ids),
+            Task.conversation_storage_version == 2,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.sequence <= Task.conversation_event_sequence,
+            TaskExecutionEvent.kind.in_(_EXPORT_MESSAGE_EVENT_KINDS),
+        )
+        .order_by(TaskExecutionEvent.task_id, TaskExecutionEvent.sequence)
+    )
+    for event in v2_events:
+        task_id = int(event.task_id)
+        if task_id in unavailable:
+            continue
+        try:
+            message = project_event_message(event)
+        except ValueError:
+            logger.warning(
+                "Conversation export could not project the events of task %s",
+                task_id,
+            )
+            unavailable.add(task_id)
+            continue
+        if message is None or is_display_none_metadata(message["message_metadata"]):
+            continue
+        blocks.setdefault(task_id, []).append(
+            _export_message_block(
+                message["role"], message["content"], message["created_at"]
+            )
+        )
+
+    transcripts = {
+        task_id: _truncate_export_cell("\n\n".join(parts))
+        for task_id, parts in blocks.items()
+    }
+    for task_id in unavailable:
+        transcripts[task_id] = EXPORT_CONVERSATION_UNAVAILABLE
+    return transcripts
+
+
+def _export_rows(db: Session, result_rows: Iterator[Any]) -> Iterator[tuple[Any, ...]]:
+    """Export cells for every main-query row; conversations load one batch at a time."""
+    while batch := list(islice(result_rows, EXPORT_FETCH_BATCH)):
+        transcripts = _load_export_transcripts(db, [int(row[0]) for row in batch])
+        for (
+            task_id,
+            agent_name,
+            row_ui_source,
+            status,
+            title,
+            created_at,
+            last_activity_at,
+            message_count,
+            total_tokens,
+            description,
+            output,
+            error_message,
+        ) in batch:
+            yield (
+                int(task_id),
+                agent_name,
+                _source_label(row_ui_source),
+                _status_text(status),
+                title,
+                _export_timestamp(created_at),
+                _export_timestamp(last_activity_at),
+                int(message_count or 0),
+                int(total_tokens or 0),
+                description,
+                output,
+                error_message,
+                transcripts.get(int(task_id), ""),
+            )
+
+
 def _export_too_large(reason: str, limit: int) -> HTTPException:
     return HTTPException(
         status_code=422,
@@ -1274,38 +1449,7 @@ def export_conversation_logs(
     # collection would close after the connection was back in the pool.
     result_rows = iter(rows)
     try:
-        raw = _write_export_file(
-            (
-                (
-                    int(task_id),
-                    agent_name,
-                    _source_label(row_ui_source),
-                    _status_text(status),
-                    title,
-                    format_datetime_for_api(created_at),
-                    format_datetime_for_api(last_activity_at),
-                    int(message_count or 0),
-                    int(total_tokens or 0),
-                    description,
-                    output,
-                    error_message,
-                )
-                for (
-                    task_id,
-                    agent_name,
-                    row_ui_source,
-                    status,
-                    title,
-                    created_at,
-                    last_activity_at,
-                    message_count,
-                    total_tokens,
-                    description,
-                    output,
-                    error_message,
-                ) in result_rows
-            )
-        )
+        raw = _write_export_file(_export_rows(db, result_rows))
     finally:
         result_rows.close()
     # Return the connection to the pool now; ``get_db`` would otherwise hold it

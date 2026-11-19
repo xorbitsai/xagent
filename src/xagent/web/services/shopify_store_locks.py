@@ -94,7 +94,7 @@ def shopify_store_held_by_another_owner(
     )
 
 
-def _past_refresh_window(expires_at: datetime | None, now: datetime) -> bool:
+def _past_refresh_window(expires_at: Any, now: datetime) -> bool:
     """Whether a grant's refresh token has certainly expired.
 
     The refresh token was issued with the access token, no later than its
@@ -104,7 +104,7 @@ def _past_refresh_window(expires_at: datetime | None, now: datetime) -> bool:
         return False
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
-    return expires_at + SHOPIFY_REFRESH_TOKEN_LIFETIME < now
+    return bool(expires_at + SHOPIFY_REFRESH_TOKEN_LIFETIME < now)
 
 
 def shopify_store_of(provider_name: object, instance_url: object) -> str | None:

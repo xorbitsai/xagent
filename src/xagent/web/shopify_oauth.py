@@ -20,8 +20,12 @@ three of the checks here, which are specific to Shopify:
 The fourth, ``verify_shopify_launch``, is for the request Shopify sends to
 the app URL after an install or when the merchant opens the app; Toby's
 Shopify install flow (xagent-saas) takes the store to authorize on from it.
+``verify_shopify_webhook`` checks the app webhooks (api/shopify_webhooks.py),
+which Shopify signs over the raw body instead of the query.
 """
 
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -146,6 +150,42 @@ def verify_shopify_callback(
         )
 
 
+def shopify_store_label(domain: object) -> str | None:
+    """The store label of ``<label>.myshopify.com``, or ``None``.
+
+    Only a single valid label directly under ``myshopify.com`` names a store.
+    """
+    if not isinstance(domain, str):
+        return None
+    label, _, suffix = domain.strip().lower().partition(".")
+    if suffix != SHOPIFY_HOST_SUFFIX:
+        return None
+    try:
+        return normalize_oauth_account(label)
+    except OAuthAccountError:
+        return None
+
+
+def verify_shopify_webhook(
+    body: bytes, received: str | None, *, client_secret: str
+) -> bool:
+    """Whether ``received`` (``X-Shopify-Hmac-Sha256``) signs ``body``.
+
+    Shopify signs a webhook as the base64 HMAC-SHA256 of the raw request body
+    under the app's client secret, so the body must be checked exactly as it
+    arrived, before it is parsed. Only the body is signed: the topic and shop
+    headers are not.
+    """
+    if not client_secret or not received:
+        return False
+    try:
+        signature = base64.b64decode(received.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    expected = hmac.new(client_secret.encode(), body, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, signature)
+
+
 def verify_shopify_launch(
     query_items: Iterable[tuple[str, str]],
     *,
@@ -195,12 +235,8 @@ def verify_shopify_launch(
             "timestamp_stale",
             "This link from Shopify has expired. Open the app from Shopify again.",
         )
-    label, _, suffix = params.get("shop", "").strip().lower().partition(".")
-    try:
-        account = normalize_oauth_account(label)
-    except OAuthAccountError:
-        account = None
-    if account is None or suffix != SHOPIFY_HOST_SUFFIX:
+    account = shopify_store_label(params.get("shop", ""))
+    if account is None:
         raise ShopifyOAuthError(
             "shop_invalid", "Shopify's request did not name a store."
         )

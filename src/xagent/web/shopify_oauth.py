@@ -20,8 +20,12 @@ three of the checks here, which are specific to Shopify:
 The fourth, ``verify_shopify_launch``, is for the request Shopify sends to
 the app URL after an install or when the merchant opens the app; Toby's
 Shopify install flow (xagent-saas) takes the store to authorize on from it.
+``verify_shopify_webhook`` checks the app webhooks (api/shopify_webhooks.py),
+which Shopify signs over the raw body instead of the query.
 """
 
+import base64
+import binascii
 import hashlib
 import hmac
 import logging
@@ -144,6 +148,26 @@ def verify_shopify_callback(
             "Shopify approved a different store than the one you entered. "
             "Connect again and approve access on that store.",
         )
+
+
+def verify_shopify_webhook(
+    body: bytes, received: str | None, *, client_secret: str
+) -> bool:
+    """Whether ``received`` (``X-Shopify-Hmac-Sha256``) signs ``body``.
+
+    Shopify signs a webhook as the base64 HMAC-SHA256 of the raw request body
+    under the app's client secret, so the body must be checked exactly as it
+    arrived, before it is parsed. Only the body is signed: the topic and shop
+    headers are not.
+    """
+    if not client_secret or not received:
+        return False
+    try:
+        signature = base64.b64decode(received.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    expected = hmac.new(client_secret.encode(), body, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, signature)
 
 
 def verify_shopify_launch(

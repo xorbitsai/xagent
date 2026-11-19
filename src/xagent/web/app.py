@@ -96,6 +96,7 @@ from .api.monitor import monitor_router
 from .api.personal_api_keys import router as personal_api_keys_router
 from .api.progress_ws import progress_ws_router
 from .api.share import share_router
+from .api.shopify_webhooks import router as shopify_webhooks_router
 from .api.skill_hub import router as skill_hub_router
 from .api.skills import router as skills_router
 from .api.speech import speech_router
@@ -2122,6 +2123,7 @@ app.include_router(workforces_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
 app.include_router(widget_router)
 app.include_router(share_router)
+app.include_router(shopify_webhooks_router)
 # Public SDK surface, mounted under /v1. Auth via xag_* API key,
 # error envelope {"error": {"code", "message"}}. See web/api/v1/.
 app.include_router(v1_router)

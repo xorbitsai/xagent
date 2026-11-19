@@ -1112,6 +1112,30 @@ def test_a_refresh_holds_the_store_lock(shopify_db, monkeypatch):
     assert lock_free_during_refresh == [False]
 
 
+def test_a_token_that_needs_no_refresh_does_not_wait_for_the_store(
+    shopify_db, monkeypatch
+):
+    """Only a refresh takes the store lock: a valid token is used while a
+    callback or refresh for the store holds it."""
+    from xagent.web.services import shopify_store_locks
+
+    db, user = shopify_db
+    _held_grant(db, user)
+    posted = _fake_refresh_client(monkeypatch)
+    locked: list = []
+    monkeypatch.setattr(
+        shopify_store_locks,
+        "lock_shopify_store",
+        lambda session, **kwargs: locked.append(kwargs),
+    )
+
+    resolution = _resolve_shopify(db, user.id)
+
+    assert resolution.access_token == "held-access"
+    assert locked == []
+    assert posted == []
+
+
 def test_a_refresh_that_waited_for_the_store_uses_the_newer_token(
     shopify_db, monkeypatch
 ):
@@ -1250,16 +1274,16 @@ def test_concurrent_refreshes_in_one_event_loop_take_turns(shopify_db, monkeypat
 
 
 @pytest.mark.parametrize(
-    ("store", "expected_token"),
+    ("store", "expected_token", "expected_refreshes"),
     [
-        pytest.param("acme", "reconnected-access", id="same-store"),
-        # The new grant is not under the lock this refresh holds; the next
-        # resolution locks its store instead.
-        pytest.param("beta", None, id="another-store"),
+        pytest.param("acme", "reconnected-access", 0, id="same-store"),
+        # The new grant is not under the lock this refresh holds: it releases
+        # the old store, locks the new one and refreshes that grant.
+        pytest.param("beta", "rotated-access", 1, id="another-store"),
     ],
 )
 def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
-    shopify_db, monkeypatch, store, expected_token
+    shopify_db, monkeypatch, store, expected_token, expected_refreshes
 ):
     """A reconnect replaces the grant row (delete, then insert under a new
     id) while a refresh waits for the store; the refresh then uses the new
@@ -1274,7 +1298,12 @@ def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
     posted = _fake_refresh_client(monkeypatch)
     real_lock = shopify_store_locks.lock_shopify_store
 
+    reconnected: list[bool] = []
+
     def lock_after_a_reconnect(session, **kwargs):
+        if reconnected:
+            return real_lock(session, **kwargs)
+        reconnected.append(True)
         with sessionmaker(bind=db.get_bind())() as other:
             other.delete(other.get(UserOAuth, grant_id))
             other.flush()
@@ -1298,11 +1327,19 @@ def test_a_refresh_that_waited_through_a_reconnect_uses_the_new_grant(
     monkeypatch.setattr(
         shopify_store_locks, "lock_shopify_store", lock_after_a_reconnect
     )
+    events, remove = _record_lock_order(db.get_bind())
+    try:
+        resolution = _resolve_shopify(db, user.id)
+    finally:
+        remove()
 
-    resolution = _resolve_shopify(db, user.id)
-
+    # One store lock at a time: the old store is released before the new one
+    # is locked, so two moving owners never wait on each other.
+    _assert_one_store_per_transaction(events)
     assert resolution.access_token == expected_token
-    assert posted == []
+    assert len(posted) == expected_refreshes
+    if expected_refreshes:
+        assert f"{store}.myshopify.com" in posted[0][0]
 
 
 @pytest.mark.parametrize(
@@ -1541,3 +1578,14 @@ def test_an_actor_refresh_gives_up_on_a_grant_that_keeps_changing_store(
 
     assert peeked_stores == ["acme", "beta", "acme"]
     assert posted == []
+
+
+def _assert_one_store_per_transaction(events) -> None:
+    held: dict = {}
+    for key, kind, store in events:
+        if kind == "end":
+            held.pop(key, None)
+        elif kind == "store":
+            assert held.setdefault(key, store) == store, (
+                f"{store} locked while {held[key]} is held"
+            )

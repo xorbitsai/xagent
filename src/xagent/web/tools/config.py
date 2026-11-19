@@ -1323,45 +1323,94 @@ def send_oauth_refresh_request(
     return client.post(request.url, timeout=10.0, **request.kwargs)
 
 
+def _oauth_token_refresh_due(oauth_account: Any) -> bool:
+    """Whether :func:`refresh_oauth_token_if_needed` would call the provider.
+
+    An undecryptable token needs a reconnect, not a refresh, and a token
+    without an expiry is never refreshed.
+    """
+    from ..models.user_oauth import is_undecryptable_oauth_token
+
+    if is_undecryptable_oauth_token(
+        getattr(oauth_account, "access_token", None)
+    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None)):
+        return False
+    expires_at = oauth_account.expires_at
+    if not expires_at:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return bool(expires_at <= datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW)
+
+
 def _lock_shopify_store_and_reread(
-    db: Any, oauth_account: Any, provider_name: object
+    db: Any,
+    oauth_account: Any,
+    provider_name: object,
+    *,
+    may_switch_store: bool,
 ) -> Any:
-    """Take the grant's Shopify store lock, then reread the grant.
+    """Take the grant's Shopify store lock before a refresh, then reread it.
 
     Shopify retires a token refreshed or granted alongside another one for
     the same store, so refreshes and callbacks for a store take turns under
-    the lock until this transaction ends. Whoever went first may have stored
-    a token that needs no refresh, so the grant is read again after the wait.
-    The reread goes through the owner's namespace, never the row id alone:
-    a reconnect replaces the row under a new id, and SQLite can hand a
-    deleted row's id to another owner's new grant. ``None`` means the owner
-    has no grant for the locked store any more.
+    the lock until this transaction ends. A grant that needs no refresh is
+    returned as it is, without waiting for the lock. Whoever held the lock
+    may have stored a token that needs no refresh, so the grant is read again
+    after the wait.
+
+    The reread goes through the owner's namespace, never the row id alone: a
+    reconnect replaces the row under a new id, and SQLite can hand a deleted
+    row's id to another owner's new grant. If the owner moved to another
+    store while this waited, ``may_switch_store`` (a transaction holding no
+    other lock) releases the old store and locks the new one, once. ``None``
+    means the owner has no grant for the locked store.
     """
     from ..models.user_oauth import UserOAuth
 
     store = shopify_store_of(provider_name, oauth_account.instance_url)
-    if store is None:
+    if store is None or not _oauth_token_refresh_due(oauth_account):
         return oauth_account
     user_id = int(oauth_account.user_id)
     resource_owner_key = oauth_account.resource_owner_key
     app_provider = str(oauth_account.provider)
     grant_id = oauth_account.id
-    shopify_store_locks.lock_shopify_store(db, provider=str(provider_name), store=store)
-    # Only a grant for the locked store: one for another store is not under
-    # this lock, and the next resolution locks that store instead. The same
-    # row is preferred when it is still there.
-    return (
-        scoped_user_oauth_query(
+
+    def owner_grants() -> Any:
+        return scoped_user_oauth_query(
             db, user_id=user_id, resource_owner_key=resource_owner_key
+        ).filter(UserOAuth.provider == app_provider)
+
+    for attempt in range(2):
+        shopify_store_locks.lock_shopify_store(
+            db, provider=str(provider_name), store=store
         )
-        .filter(
-            UserOAuth.provider == app_provider,
-            func.lower(UserOAuth.instance_url) == store.lower(),
+        # Only a grant for the locked store: one for another store is not
+        # under this lock. The same row is preferred when it is still there.
+        reread = (
+            owner_grants()
+            .filter(func.lower(UserOAuth.instance_url) == store.lower())
+            .order_by((UserOAuth.id == grant_id).desc(), UserOAuth.id.desc())
+            .populate_existing()
+            .first()
         )
-        .order_by((UserOAuth.id == grant_id).desc(), UserOAuth.id.desc())
-        .populate_existing()
-        .first()
-    )
+        if reread is not None or not may_switch_store or attempt:
+            return reread
+        moved = (
+            owner_grants()
+            .with_entities(UserOAuth.instance_url)
+            .order_by(UserOAuth.id.desc())
+            .first()
+        )
+        new_store = shopify_store_of(
+            provider_name, moved.instance_url if moved else None
+        )
+        if new_store is None or new_store.lower() == store.lower():
+            return None
+        # Hold one store lock at a time: release the old store first.
+        db.rollback()
+        store = new_store
+    return None
 
 
 async def refresh_oauth_token_if_needed(
@@ -4467,7 +4516,12 @@ class WebToolConfig(BaseToolConfig):
             )
         # A Shopify grant is reread under its store lock (see the helper).
         oauth_account = _lock_shopify_store_and_reread(
-            oauth_db, oauth_account, provider_name
+            oauth_db,
+            oauth_account,
+            provider_name,
+            # An actor resolution holds its grant row: it must not take
+            # another store's lock (see its resolver).
+            may_switch_store=actor_app_id is None,
         )
         if not oauth_account:
             return _LegacyOAuthTokenResolution(access_token=None)

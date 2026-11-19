@@ -7,6 +7,7 @@ import math
 import tempfile
 from contextlib import suppress
 from datetime import datetime, timezone
+from itertools import islice
 from typing import Annotated, Any, Iterable, Iterator, Sequence
 from typing import cast as typing_cast
 
@@ -33,6 +34,7 @@ from sqlalchemy.types import Boolean
 from starlette.background import BackgroundTask
 
 from ...core.agent.result_card import RESULT_CARD_DISPLAY, RESULT_CARD_MESSAGE_TYPE
+from ...core.agent.transcript import build_assistant_transcript_content
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
@@ -65,8 +67,9 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
+from ..services.task_event_display import MESSAGE_EVENT_KINDS, project_event_message
 from ..services.task_runtime import mcp_runtime_authorization_policy_required_clause
-from ..utils.db_timezone import format_datetime_for_api
+from ..utils.db_timezone import format_datetime_for_api, normalize_datetime_from_db
 from .expired_task_errors import task_expired_http_error
 
 logger = logging.getLogger(__name__)
@@ -120,6 +123,12 @@ EXPORT_BYTE_LIMIT = 50 * 1024 * 1024
 EXPORT_SPOOL_BYTES = 8 * 1024 * 1024
 EXPORT_READ_CHUNK_BYTES = 64 * 1024
 EXPORT_FETCH_BATCH = 500
+# Excel holds at most 32,767 UTF-16 code units in a cell; the conversation cell
+# is cut below that so the truncation marker still fits.
+EXPORT_CELL_CHAR_LIMIT = 32_000
+# Message rows fetched from the database at a time while a conversation cell is
+# built, so memory does not grow with the length of the history.
+EXPORT_MESSAGE_FETCH_ROWS = 20
 EXPORT_TOO_LARGE_CODE = "conversation_log_export_too_large"
 EXPORT_COLUMNS = (
     "conversation_id",
@@ -134,7 +143,12 @@ EXPORT_COLUMNS = (
     "first_message",
     "latest_answer",
     "error_message",
+    "conversation",
 )
+EXPORT_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+EXPORT_MESSAGE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
+EXPORT_TIME_UNKNOWN = "[time unknown]"
+EXPORT_CONVERSATION_UNAVAILABLE = "[conversation unavailable]"
 # A spreadsheet reads a cell starting with one of these as a formula.
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -1171,6 +1185,233 @@ def _csv_line(cells: Iterable[Any]) -> str:
     return buffer.getvalue()
 
 
+def _export_timestamp(
+    value: datetime | None, fmt: str = EXPORT_TIMESTAMP_FORMAT
+) -> str | None:
+    """A stored time as UTC text in ``fmt``, which a spreadsheet reads as a date.
+
+    ``None`` stays ``None``.
+    """
+    if value is None:
+        return None
+    return normalize_datetime_from_db(value).strftime(fmt)
+
+
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+class _ExportCellBuilder:
+    """One conversation cell, built block by block without holding the history.
+
+    Only a prefix of at most ``EXPORT_CELL_CHAR_LIMIT`` UTF-16 units is kept;
+    everything after it is only counted. Excel counts a cell in UTF-16 code
+    units, so a character outside the BMP counts twice and is never split. The
+    result is the blocks joined by a blank line and cut at the limit, with a
+    marker stating how many units were dropped.
+    """
+
+    __slots__ = ("_parts", "_kept", "_dropped", "_full", "_started")
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._kept = 0
+        self._dropped = 0
+        self._full = False
+        self._started = False
+
+    def _append(self, text: str) -> None:
+        units = _utf16_units(text)
+        if self._full:
+            self._dropped += units
+            return
+        if self._kept + units <= EXPORT_CELL_CHAR_LIMIT:
+            self._parts.append(text)
+            self._kept += units
+            return
+        kept_chars = 0
+        for char in text:
+            char_units = _utf16_units(char)
+            if self._kept + char_units > EXPORT_CELL_CHAR_LIMIT:
+                break
+            self._kept += char_units
+            kept_chars += 1
+        self._parts.append(text[:kept_chars])
+        self._dropped += units - _utf16_units(text[:kept_chars])
+        self._full = True
+
+    def add_block(self, block: str) -> None:
+        if self._started:
+            self._append("\n\n")
+        self._append(block)
+        self._started = True
+
+    def finish(self) -> str:
+        text = "".join(self._parts)
+        if self._dropped:
+            text += f"\n\n[truncated: {self._dropped:,} more characters]"
+        return text
+
+
+def _export_role_label(role: str | None) -> str:
+    return (role or "").capitalize() or "Unknown"
+
+
+def _export_message_block(role: str | None, content: str | None, at: Any) -> str:
+    stamp = _export_timestamp(at, EXPORT_MESSAGE_TIMESTAMP_FORMAT)
+    when = f"[{stamp} UTC]" if stamp is not None else EXPORT_TIME_UNKNOWN
+    return f"{when} {_export_role_label(role)}:\n{content or ''}"
+
+
+def _finish_export_cells(cells: dict[int, _ExportCellBuilder]) -> dict[int, str]:
+    """Join each cell and release it, so one cell's pieces are in memory at a time."""
+    finished: dict[int, str] = {}
+    for task_id in list(cells):
+        finished[task_id] = cells.pop(task_id).finish()
+    return finished
+
+
+def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, str]:
+    """The conversation cell for each of ``task_ids`` that has displayed messages.
+
+    A message shows when the detail page shows it, in the detail page's order.
+    A v1 message is written as stored; a v2 message is the text the detail
+    page's event projection produces, and a v2 question gets the same choice
+    text the v1 writer stores. A task whose v2 events cannot be projected gets
+    ``EXPORT_CONVERSATION_UNAVAILABLE``. A task without messages has no key.
+    Messages are read ``EXPORT_MESSAGE_FETCH_ROWS`` rows at a time and each cell
+    keeps only its truncated prefix, and a finished cell is released as soon as
+    it is joined, so memory per batch does not grow with the number of messages;
+    a single message is still read whole.
+    """
+    ids = list(task_ids)
+    cells: dict[int, _ExportCellBuilder] = {}
+
+    v1_rows = db.execute(
+        select(
+            TaskChatMessage.task_id,
+            TaskChatMessage.role,
+            TaskChatMessage.content,
+            TaskChatMessage.created_at,
+        )
+        .join(Task, Task.id == TaskChatMessage.task_id)
+        .where(
+            Task.id.in_(ids),
+            Task.conversation_storage_version == 1,
+            displayed_message_clause(TaskChatMessage.message_metadata),
+        )
+        .order_by(
+            TaskChatMessage.task_id,
+            TaskChatMessage.created_at.isnot(None),
+            TaskChatMessage.created_at,
+            TaskChatMessage.role != "user",
+            TaskChatMessage.id,
+        )
+        .execution_options(yield_per=EXPORT_MESSAGE_FETCH_ROWS)
+    )
+    try:
+        for task_id, role, content, created_at in v1_rows:
+            cells.setdefault(int(task_id), _ExportCellBuilder()).add_block(
+                _export_message_block(role, content, created_at)
+            )
+    finally:
+        v1_rows.close()
+
+    unavailable: set[int] = set()
+    v2_events = db.scalars(
+        select(TaskExecutionEvent)
+        .join(Task, Task.id == TaskExecutionEvent.task_id)
+        .where(
+            Task.id.in_(ids),
+            Task.conversation_storage_version == 2,
+            TaskExecutionEvent.scope_id == "root",
+            TaskExecutionEvent.sequence <= Task.conversation_event_sequence,
+            TaskExecutionEvent.kind.in_(MESSAGE_EVENT_KINDS),
+        )
+        .order_by(TaskExecutionEvent.task_id, TaskExecutionEvent.sequence)
+        .execution_options(yield_per=EXPORT_MESSAGE_FETCH_ROWS)
+    )
+    try:
+        for event in v2_events:
+            task_id = int(event.task_id)
+            if task_id in unavailable:
+                continue
+            try:
+                message = project_event_message(event)
+            except ValueError:
+                logger.warning(
+                    "Conversation export could not project the events of task %s",
+                    task_id,
+                    exc_info=True,
+                )
+                cells.pop(task_id, None)
+                unavailable.add(task_id)
+                continue
+            if message is None or is_display_none_metadata(message["message_metadata"]):
+                continue
+            content = message["content"]
+            if event.kind == "agent_message" and message["message_type"] == "question":
+                # The v1 writer stores a question with its choices as text; the
+                # projection keeps them as data for the page's buttons.
+                try:
+                    content = build_assistant_transcript_content(
+                        content, message["interactions"]
+                    ).strip()
+                except (TypeError, ValueError, AttributeError):
+                    logger.warning(
+                        "Conversation export could not write the choices of "
+                        "event %s (task %s)",
+                        event.event_id,
+                        task_id,
+                        exc_info=True,
+                    )
+            cells.setdefault(task_id, _ExportCellBuilder()).add_block(
+                _export_message_block(message["role"], content, message["created_at"])
+            )
+    finally:
+        v2_events.close()
+
+    transcripts = _finish_export_cells(cells)
+    for task_id in unavailable:
+        transcripts[task_id] = EXPORT_CONVERSATION_UNAVAILABLE
+    return transcripts
+
+
+def _export_rows(db: Session, result_rows: Iterator[Any]) -> Iterator[tuple[Any, ...]]:
+    """Export cells for every main-query row; conversations load one batch at a time."""
+    while batch := list(islice(result_rows, EXPORT_FETCH_BATCH)):
+        transcripts = _load_export_transcripts(db, [int(row[0]) for row in batch])
+        for (
+            task_id,
+            agent_name,
+            row_ui_source,
+            status,
+            title,
+            created_at,
+            last_activity_at,
+            message_count,
+            total_tokens,
+            description,
+            output,
+            error_message,
+        ) in batch:
+            yield (
+                int(task_id),
+                agent_name,
+                _source_label(row_ui_source),
+                _status_text(status),
+                title,
+                _export_timestamp(created_at),
+                _export_timestamp(last_activity_at),
+                int(message_count or 0),
+                int(total_tokens or 0),
+                description,
+                output,
+                error_message,
+                transcripts.get(int(task_id), ""),
+            )
+
+
 def _export_too_large(reason: str, limit: int) -> HTTPException:
     return HTTPException(
         status_code=422,
@@ -1283,38 +1524,7 @@ def export_conversation_logs(
     # collection would close after the connection was back in the pool.
     result_rows = iter(rows)
     try:
-        raw = _write_export_file(
-            (
-                (
-                    int(task_id),
-                    agent_name,
-                    _source_label(row_ui_source),
-                    _status_text(status),
-                    title,
-                    format_datetime_for_api(created_at),
-                    format_datetime_for_api(last_activity_at),
-                    int(message_count or 0),
-                    int(total_tokens or 0),
-                    description,
-                    output,
-                    error_message,
-                )
-                for (
-                    task_id,
-                    agent_name,
-                    row_ui_source,
-                    status,
-                    title,
-                    created_at,
-                    last_activity_at,
-                    message_count,
-                    total_tokens,
-                    description,
-                    output,
-                    error_message,
-                ) in result_rows
-            )
-        )
+        raw = _write_export_file(_export_rows(db, result_rows))
     finally:
         result_rows.close()
     # Return the connection to the pool now; ``get_db`` would otherwise hold it

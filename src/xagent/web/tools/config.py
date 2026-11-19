@@ -80,6 +80,7 @@ from ...core.tools.adapters.vibe.signed_upload import (
 )
 from ...core.tools.core.web_content import get_trusted_proxy_url
 from ...core.utils.public_http_transport import create_public_async_client
+from ..services import shopify_store_locks
 from ..services.actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
@@ -88,6 +89,7 @@ from ..services.mcp_runtime import (
     MCPActorExecutionIdentity,
     MCPBuiltinOAuthActorPolicy,
 )
+from ..services.shopify_store_locks import shopify_store_of
 from ..services.slack_actor_runtime import (
     SLACK_ACTOR_RUNTIME_REFRESH_KEY,
     SLACK_CHANNEL_ACCESS_POLICY_ENV,
@@ -105,8 +107,6 @@ from ..services.tool_credentials import (
     resolve_tool_credential,
     unresolved_tool_policy_allowlist,
 )
-from ..services import shopify_store_locks
-from ..services.shopify_store_locks import shopify_store_of
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 from ..shopify_oauth import is_shopify_provider
 

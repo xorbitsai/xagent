@@ -3469,8 +3469,10 @@ def _log_oauth_callback_rejection(
     )
 
 
-def _oauth_popup_feedback_response(title: str, *paragraphs: str) -> HTMLResponse:
-    """Render an actionable, uncacheable 400 page for the OAuth popup.
+def _oauth_popup_feedback_response(
+    title: str, *paragraphs: str, status_code: int = 400
+) -> HTMLResponse:
+    """Render an actionable, uncacheable error page for the OAuth popup.
 
     ``title`` and ``paragraphs`` are trusted HTML; callers escape every
     request-derived value they include.
@@ -3487,7 +3489,7 @@ def _oauth_popup_feedback_response(title: str, *paragraphs: str) -> HTMLResponse
             "<p>If this window doesn't close, close it from your browser.</p>"
             "</body></html>"
         ),
-        status_code=400,
+        status_code=status_code,
         headers={"Cache-Control": "no-store"},
     )
 
@@ -5187,6 +5189,23 @@ def generic_oauth_callback(
     db_provider: Optional[Any] = None,
 ) -> Any:
     """Handle generic OAuth callback"""
+    try:
+        return _generic_oauth_callback(provider, request, db, db_provider)
+    finally:
+        # A Shopify callback locks its store until its transaction ends. A
+        # stored grant was committed; any other way out ends the transaction
+        # here, so the store is free as soon as the callback returns rather
+        # than when the request's session closes.
+        if db is not None and is_shopify_provider(provider) and db.in_transaction():
+            db.rollback()
+
+
+def _generic_oauth_callback(
+    provider: str,
+    request: Request,
+    db: Optional[Session] = None,
+    db_provider: Optional[Any] = None,
+) -> Any:
     # Computed once and reused at every Deputy-specific branch below
     # (`provider` is this function's own parameter, never reassigned) --
     # matches tools/config.py's refresh_oauth_token_if_needed's
@@ -5692,14 +5711,36 @@ def generic_oauth_callback(
             # One live grant per store: a new grant would retire the current
             # owner's token. Locked until this callback commits, so a refresh
             # or another callback for the store waits for the stored grant.
-            lock_shopify_store(db, provider=provider, store=bound_account)
-            if shopify_store_held_by_another_owner(
-                db,
-                provider=provider,
-                store=bound_account,
-                user_id=user_id,
-                resource_owner_key=resource_owner_key,
-            ):
+            try:
+                lock_shopify_store(db, provider=provider, store=bound_account)
+                held_elsewhere = shopify_store_held_by_another_owner(
+                    db,
+                    provider=provider,
+                    store=bound_account,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                )
+            except SQLAlchemyError as exc:
+                # A lock or busy timeout while another callback or refresh
+                # for the store holds it: nothing was exchanged, so trying
+                # again is safe.
+                db.rollback()
+                logger.warning(
+                    "Shopify store lock unavailable (%s)", type(exc).__name__
+                )
+                _log_oauth_callback_rejection(
+                    provider,
+                    "store_lock_unavailable",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
+                return _oauth_popup_feedback_response(
+                    "Cannot connect Shopify",
+                    "Another connection to this Shopify store is in progress. "
+                    "Please try again in a moment.",
+                    status_code=503,
+                )
+            if held_elsewhere:
                 db.rollback()
                 _log_oauth_callback_rejection(
                     provider,
@@ -5707,13 +5748,12 @@ def generic_oauth_callback(
                     app_id=app_id,
                     actor_flow=is_actor_flow,
                 )
-                response = _oauth_popup_feedback_response(
+                return _oauth_popup_feedback_response(
                     "Cannot connect Shopify",
                     "This Shopify store is already connected by another user. "
                     "To connect it yourself, ask them to disconnect it first.",
+                    status_code=409,
                 )
-                response.status_code = 409
-                return response
 
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 

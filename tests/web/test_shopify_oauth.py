@@ -988,6 +988,112 @@ def test_an_expired_access_token_still_holds_the_store_within_the_refresh_window
     assert calls == []
 
 
+def _actor_login_state(db, user, owner: str = "toby:w1:u1"):
+    """Start the store's OAuth for an actor, as Toby does."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+    from xagent.web.mcp_apps import ensure_builtin_oauth_server_definition
+    from xagent.web.models.mcp import UserMCPServer
+
+    # An actor flow starts only from the registry's own catalog row.
+    registry_row = get_builtin_public_mcp_app(TEST_APP_ID)
+    assert registry_row is not None
+    app = db.query(PublicMCPApp).filter_by(app_id=TEST_APP_ID).one()
+    for field, value in registry_row.items():
+        setattr(app, field, value)
+    app.is_visible_in_connector = True
+    db.commit()
+    server = ensure_builtin_oauth_server_definition(db, app_id=TEST_APP_ID)
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+    response = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="shopify",
+        app_id=TEST_APP_ID,
+        user=user,
+        resource_owner_key=owner,
+        redirect="https://app.example/connectors",
+        db=db,
+        db_provider=_db_provider(db),
+        account="acme",
+    )
+    db.commit()
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    return (
+        parse_qs(urlparse(response.headers["location"]).query)["state"][0],
+        {name: morsel.value for name, morsel in cookie.items()},
+    )
+
+
+def test_an_actor_connecting_a_store_held_by_someone_else_is_refused(
+    shopify_db, monkeypatch
+):
+    db, user = shopify_db
+    _held_grant(db, _other_user(db))
+    calls = _mock_shopify_http(monkeypatch)
+
+    response = _callback(db, _actor_login_state(db, user))
+
+    assert response.status_code == 409
+    assert b"already connected by another user" in response.body
+    assert calls == []
+    assert (
+        db.query(UserOAuth).filter(UserOAuth.resource_owner_key == "toby:w1:u1").count()
+        == 0
+    )
+    assert _probe_store_lock(db) is True
+
+
+def test_a_store_lock_timeout_asks_to_try_again(shopify_db, monkeypatch):
+    """Another callback or refresh holds the store past the database's lock
+    or busy timeout: nothing was exchanged, so the merchant can retry."""
+    from sqlalchemy.exc import OperationalError
+
+    db, user = shopify_db
+    calls = _mock_shopify_http(monkeypatch)
+
+    def busy(session, **kwargs):
+        raise OperationalError("lock", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(auth_api, "lock_shopify_store", busy)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code == 503
+    assert b"try again" in response.body
+    assert response.headers["cache-control"] == "no-store"
+    assert calls == []
+    assert _grant(db, user) is None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param({"token": {"error": "invalid_request"}}, id="exchange-error"),
+        pytest.param(
+            {"token": _token_response(scope="write_products")}, id="missing-scope"
+        ),
+    ],
+)
+def test_a_callback_that_fails_after_locking_releases_the_store(
+    shopify_db, monkeypatch, failure
+):
+    db, user = shopify_db
+    _mock_shopify_http(monkeypatch, **failure)
+
+    response = _callback(db, _login_state(db, user))
+
+    assert response.status_code != 200
+    assert _grant(db, user) is None
+    assert _probe_store_lock(db) is True
+
+
 def test_another_owner_of_the_same_account_holds_the_store_too(shopify_db):
     """An actor (e.g. a Toby member) and the account's own connection are
     separate owners with separate tokens, so either one holds the store

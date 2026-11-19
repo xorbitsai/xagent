@@ -18,6 +18,7 @@ from ...core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
     COMPACT_WATERMARK_METADATA_KEY,
 )
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE
 from ...core.agent.transcript import (
     build_assistant_transcript_content,
     normalize_transcript_messages,
@@ -765,6 +766,7 @@ def persist_assistant_message_no_commit(
     content_is_reconciled: bool = False,
     source_event_id: Optional[str] = None,
     execution_event_id: Optional[str] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[TaskChatMessage]:
     """Stage an assistant transcript row for an atomic caller-owned commit."""
 
@@ -803,6 +805,7 @@ def persist_assistant_message_no_commit(
         set_committed_value(existing, "content", normalized_content)
         set_committed_value(existing, "interactions", interactions)
         set_committed_value(existing, "attachments", None)
+        set_committed_value(existing, "message_metadata", message_metadata or None)
         return existing
     if not normalized_content:
         return None
@@ -817,6 +820,7 @@ def persist_assistant_message_no_commit(
         attachments=None,
         source_event_id=source_event_id,
         execution_event_id=execution_event_id,
+        message_metadata=message_metadata or None,
     )
     if execution_event_id is not None:
         db.add(message)
@@ -1000,6 +1004,11 @@ def load_task_transcript_window(
     query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+        # A result card only displays data the run already holds in its tool
+        # results, and the agent still answers in its own words; replaying the
+        # card as a title-only assistant turn would mislead the model. The v2
+        # context skips it too.
+        TaskChatMessage.message_type.is_distinct_from(RESULT_CARD_MESSAGE_TYPE),
         or_(
             TaskChatMessage.role != "user",
             TaskChatMessage.delivery_status.is_distinct_from(DELIVERY_FAILED),

@@ -65,6 +65,7 @@ import json
 import logging
 import uuid
 from collections.abc import Iterable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -163,6 +164,12 @@ from ...result import (
     tool_result_requires_authentication,
     tool_result_succeeded,
     unwrap_final_answer_content,
+)
+from ...result_card import (
+    RESULT_CARD_TOOL_NAME,
+    ResultCardConnector,
+    RunDisplayContext,
+    bind_run_display_context,
 )
 from ...runtime import (
     DISCARDED_BUNDLED_FINAL_ANSWER_REASON,
@@ -345,6 +352,11 @@ class ToolCallRecord:
     # existed keep ``None``.
     tool_attempt_id: str | None = None
     assistant_message_id: str | None = None
+    # The connector (see ``ResultCardConnector``) whose tool this call ran,
+    # recorded when the call completed. Rows written before the fields
+    # existed, and calls of tools with no connector origin, keep ``None``.
+    source_server: str | None = None
+    source_kind: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -364,6 +376,8 @@ class ToolCallRecord:
             "issued_at": self.issued_at,
             "tool_attempt_id": self.tool_attempt_id,
             "assistant_message_id": self.assistant_message_id,
+            "source_server": self.source_server,
+            "source_kind": self.source_kind,
         }
 
     @classmethod
@@ -403,6 +417,10 @@ class ToolCallRecord:
                 if data.get("assistant_message_id")
                 else None
             ),
+            source_server=(
+                str(data["source_server"]) if data.get("source_server") else None
+            ),
+            source_kind=str(data["source_kind"]) if data.get("source_kind") else None,
         )
 
 
@@ -868,6 +886,12 @@ class ReActPattern(AgentPattern):
         # One row per concrete invocation, keyed by ``_ledger_key``: the
         # invocation id, or the provider tool-call id for a legacy row.
         self.tool_ledger: dict[str, ToolCallRecord] = {}
+        # Connectors one of whose tools completed successfully in this run.
+        # A plan's steps each run their own ``ReActPattern``, so ``DAGPattern``
+        # hands every step the one set it keeps for the whole run; a pattern
+        # run alone owns its own. Filled when a call completes and rebuilt from
+        # the ledger by ``load_state``.
+        self.run_connectors: set[ResultCardConnector] = set()
         # Provider tool-call id -> ledger key of the row that id currently
         # resolves to. Maintained with exactly the dict operations the
         # pre-identity ledger (keyed by provider id) used, so its order and
@@ -3154,6 +3178,18 @@ class ReActPattern(AgentPattern):
             self.tool_call_id_index = {}
             for key, record in self.tool_ledger.items():
                 self.tool_call_id_index[record.tool_call_id] = key
+        self._restore_run_connectors()
+
+    def _restore_run_connectors(self) -> None:
+        """Add the connectors the restored ledger recorded to the run's set.
+
+        Adds to the set in place: a ``DAGPattern`` shares it across steps.
+        """
+        for record in self.tool_ledger.values():
+            if record.status == "completed" and record.source_server:
+                self.run_connectors.add(
+                    ResultCardConnector(record.source_server, record.source_kind)
+                )
 
     async def _resume_waiting_for_user_if_needed(
         self,
@@ -6985,6 +7021,7 @@ class ReActPattern(AgentPattern):
         tool_call = self._with_runtime_step(tool_call, runtime)
         tool_call = self._with_runtime_turn_id(tool_call, runtime)
         is_control = tool_call["name"] in CONTROL_TOOL_NAMES
+        connector = None if is_control else self._tool_connector(tool_call, tools)
         if not is_control:
             tool_call = self._with_trace_safe_tool_args(tool_call, tools)
             committed = await runtime.load_committed_tool_outcome(tool_call)
@@ -7000,6 +7037,7 @@ class ReActPattern(AgentPattern):
                     ),
                     result=result,
                     error=committed["error"],
+                    connector=connector,
                 )
                 return result
             # The duplicate-write scan runs before this call writes any ledger
@@ -7027,7 +7065,7 @@ class ReActPattern(AgentPattern):
                 await runtime.on_tool_start(tool_call=tool_call)
                 await runtime.on_tool_end(tool_call=tool_call, result=suppressed)
                 return suppressed
-        self._record_tool_call(tool_call, status="running")
+        self._record_tool_call(tool_call, status="running", connector=connector)
         recorded_terminal = False
         try:
             if is_control:
@@ -7044,8 +7082,11 @@ class ReActPattern(AgentPattern):
                 return result
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                with bind_tool_call_execution_context(
-                    self._mcp_gate_execution_context(tool_call, context, runtime)
+                with (
+                    bind_tool_call_execution_context(
+                        self._mcp_gate_execution_context(tool_call, context, runtime)
+                    ),
+                    self._bind_result_card_context(tool_call, tools, runtime),
                 ):
                     result = await runtime.run_tool_call(
                         lambda: self._execute_tool(tool_call, tools, context=context)
@@ -7128,7 +7169,11 @@ class ReActPattern(AgentPattern):
                 recorded_terminal = True
                 return result
 
-            self._record_tool_call(tool_call, status="completed", result=result)
+            self._record_tool_call(
+                tool_call,
+                status="completed",
+                result=result,
+            )
             recorded_terminal = True
             await runtime.on_tool_end(tool_call=tool_call, result=result)
             return result
@@ -7227,6 +7272,52 @@ class ReActPattern(AgentPattern):
             dag_step_id=str(dag_step_id) if dag_step_id else None,
         )
 
+    def _tool_connector(
+        self, tool_call: dict[str, Any], tools: list[Any]
+    ) -> ResultCardConnector | None:
+        """The connector the called tool belongs to, or ``None``."""
+        metadata = getattr(
+            self._match_tool(str(tool_call["name"]), tools), "metadata", None
+        )
+        server = getattr(metadata, "source_server", None)
+        if not server:
+            return None
+        kind = getattr(metadata, "source_kind", None)
+        return ResultCardConnector(str(server), str(kind) if kind else None)
+
+    def _bind_result_card_context(
+        self, tool_call: dict[str, Any], tools: list[Any], runtime: PatternRuntime
+    ) -> AbstractContextManager[None]:
+        """Give ``show_result_card`` the connectors this run has used.
+
+        ``run_connectors`` is the run-level set: it spans every step of a plan
+        and is rebuilt from the checkpointed ledger on resume. Rows written
+        before the connector was recorded on the row are resolved against the
+        current tool list instead (the best that can be done for them).
+        """
+        if tool_call.get("name") != RESULT_CARD_TOOL_NAME:
+            return nullcontext()
+        invoked = set(self.run_connectors)
+        for record in self.tool_ledger.values():
+            if (
+                record.source_server
+                or record.status != "completed"
+                or not tool_result_succeeded(record.result)
+            ):
+                continue
+            connector = self._tool_connector({"name": record.tool_name}, tools)
+            if connector is not None:
+                invoked.add(connector)
+        return bind_run_display_context(
+            RunDisplayContext(
+                invoked_connectors=frozenset(invoked),
+                send_message=runtime.send_message,
+                delivers=runtime.delivers_messages,
+                issued_at=tool_call.get("issued_at"),
+                message_source=self._tool_message_source(tool_call),
+            )
+        )
+
     def _with_runtime_turn_id(
         self, tool_call: dict[str, Any], runtime: PatternRuntime
     ) -> dict[str, Any]:
@@ -7280,7 +7371,17 @@ class ReActPattern(AgentPattern):
         settlement_turn_id: str | None = None,
         settlement_trace_pending: bool = False,
         index_tool_call_id: bool = True,
+        connector: ResultCardConnector | None = None,
     ) -> None:
+        """Write one ledger row for ``tool_call``.
+
+        The connector the call's tool belongs to is stamped on the first row
+        written for the call (``_execute_tool_safely`` passes it) and carried
+        over from the call's existing row by every later write, so a call that
+        reaches ``completed`` through any route keeps it: a direct run, a
+        replayed committed outcome, or a settlement after an approval or a
+        user interaction. A completed call adds its connector to the run's set.
+        """
         tool_call_id = str(
             tool_call.get("id") or f"tool_call_{len(self.tool_call_id_index)}"
         )
@@ -7291,6 +7392,10 @@ class ReActPattern(AgentPattern):
             tool_call_id=tool_call_id,
             invocation_id=invocation_id,
         )
+        if connector is None and existing is not None and existing.source_server:
+            connector = ResultCardConnector(
+                existing.source_server, existing.source_kind
+            )
         raw_issued_at = tool_call.get("issued_at")
         issued_at = (
             existing.issued_at
@@ -7326,8 +7431,12 @@ class ReActPattern(AgentPattern):
                 if tool_call.get("assistant_message_id")
                 else None
             ),
+            source_server=connector.name if connector else None,
+            source_kind=connector.kind if connector else None,
         )
         self._store_tool_record(record, index_tool_call_id=index_tool_call_id)
+        if connector is not None and status == "completed":
+            self.run_connectors.add(connector)
 
     @staticmethod
     def _normalized_invocation_id(value: Any) -> str | None:

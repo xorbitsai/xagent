@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 
 from ...core.agent.attachments import build_image_context_references
 from ...core.agent.result import CONTROL_TOOL_NAMES
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
 from ..models.task import TraceEvent
@@ -255,7 +256,12 @@ def _load_transcript_rows(
         TaskChatMessage.content,
         TaskChatMessage.attachments,
         TaskChatMessage.turn_id,
-    ).filter(TaskChatMessage.task_id == task_id)
+    ).filter(
+        TaskChatMessage.task_id == task_id,
+        # Same as ``load_task_transcript``: a result card is not replayed to
+        # the model.
+        TaskChatMessage.message_type.is_distinct_from(RESULT_CARD_MESSAGE_TYPE),
+    )
     if before_message_id is not None:
         query = query.filter(TaskChatMessage.id < before_message_id)
     query = query.order_by(asc(TaskChatMessage.id))

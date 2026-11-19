@@ -32,6 +32,7 @@ from sqlalchemy.sql.elements import ColumnClause, TextClause
 from sqlalchemy.types import Boolean
 from starlette.background import BackgroundTask
 
+from ...core.agent.result_card import RESULT_CARD_DISPLAY, RESULT_CARD_MESSAGE_TYPE
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
@@ -986,10 +987,18 @@ def _event_log_message_predicate(db: Session) -> Any:
             TaskExecutionEvent.kind.in_(["input_accepted", "assistant_message"]),
             and_(
                 TaskExecutionEvent.kind == "agent_message",
-                expects_response,
                 hidden.is_not(True),
                 data["message"].as_string().isnot(None),
                 data["message"].as_string() != "",
+                or_(
+                    expects_response,
+                    # A result card is a displayed assistant message that asks
+                    # nothing (the detail view shows it, so the list counts it).
+                    and_(
+                        data["message_type"].as_string() == RESULT_CARD_MESSAGE_TYPE,
+                        data["metadata"]["display"].as_string() == RESULT_CARD_DISPLAY,
+                    ),
+                ),
             ),
         ),
     )

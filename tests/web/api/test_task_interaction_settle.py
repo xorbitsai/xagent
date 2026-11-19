@@ -312,6 +312,33 @@ async def test_only_the_latest_waiting_message_counts(dispatched) -> None:
     assert task_waits_on_interaction_sync(task_id, "new-question")
 
 
+async def test_a_waiting_question_behind_many_result_cards_is_still_found(
+    dispatched,
+) -> None:
+    """Cards are agent messages that ask nothing; they must not push the
+    waiting question out of the lookup (concurrent DAG steps can emit many)."""
+    task_id = _waiting("the-question")
+    with _direct_db_session() as db:
+        for n in range(25):
+            db.add(
+                TraceEvent(
+                    task_id=task_id,
+                    event_id=f"card-{n}",
+                    event_type="agent_message",
+                    timestamp=STAMP,
+                    data={
+                        "message": f"Card {n}",
+                        "message_type": "result_card",
+                        "expect_response": False,
+                        "metadata": {"display": "result_card"},
+                    },
+                )
+            )
+        db.commit()
+    assert task_waits_on_interaction_sync(task_id, "the-question")
+    assert not task_waits_on_interaction_sync(task_id, "another")
+
+
 async def test_only_the_owner_or_an_admin_may_settle(dispatched) -> None:
     task_id = _task(TaskStatus.WAITING_FOR_USER)
     stranger = SimpleNamespace(id=987654, is_admin=False)

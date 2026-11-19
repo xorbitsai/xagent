@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, inspect, text
 from xagent.db.config import create_alembic_config
 
 REVISION = "20261119_mcp_oauth_client_name"
-DOWN_REVISION = "20261117_chat_message_metadata"
+DOWN_REVISION = "20261119_shopify_oauth"
 
 
 def test_upgrade_adds_nullable_registration_client_name() -> None:

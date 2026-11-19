@@ -1,7 +1,7 @@
 """add the client_name sent in MCP OAuth dynamic client registration
 
 Revision ID: 20261119_mcp_oauth_client_name
-Revises: 20261117_chat_message_metadata
+Revises: 20261119_shopify_oauth
 Create Date: 2026-11-19
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261119_mcp_oauth_client_name"
-down_revision: Union[str, None] = "20261117_chat_message_metadata"
+down_revision: Union[str, None] = "20261119_shopify_oauth"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

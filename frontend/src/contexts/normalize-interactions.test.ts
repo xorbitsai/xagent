@@ -57,4 +57,13 @@ describe("normalizeInteractions", () => {
 
     expect(result).toEqual([])
   })
+
+  it("accepts connect_connector and keeps its display data", () => {
+    const connector = { interaction_id: "i1", app_id: "cosmos", name: "Azure Cosmos DB", route: "mcp", fields: [] }
+    expect(normalizeInteractions([
+      { type: "connect_connector", field: "connect_connector", label: "Connect Azure Cosmos DB", live_widget: true, interaction_id: "i1", connector },
+    ])).toEqual([
+      { type: "connect_connector", field: "connect_connector", label: "Connect Azure Cosmos DB", interaction_id: "i1", connector },
+    ])
+  })
 })

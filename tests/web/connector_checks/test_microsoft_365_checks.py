@@ -5,7 +5,7 @@ check calls the real tool function of ``web/tools/mcp/{onedrive,teams,word,
 excel,powerpoint}.py``. Only Microsoft Graph is replaced, by an in-memory
 tenant laid out like the test account's seed: a closed OneDrive folder
 holding a text note and the Word, Excel and PowerPoint seed files, and a team
-whose one channel lists the seeded message first. The family runs read
+whose one channel lists the seeded message first once system messages are skipped. The family runs read
 checks only, so no test here switches writes on.
 """
 
@@ -662,6 +662,38 @@ def _newer_message(tenant: Tenant) -> None:
     tenant.messages[CHANNEL_ID].insert(0, tenant.message("1731500000000", "hello"))
 
 
+def _membership_changes(tenant: Tenant) -> None:
+    # Disabling the test account and enabling it again posts these two (#3836).
+    # Graph v1.0 lists them with messageType unknownFutureValue, not
+    # systemEventMessage, and above the seeded message.
+    messages = tenant.messages[CHANNEL_ID]
+    seed = next(i for i, m in enumerate(messages) if m["id"] == MESSAGE_ID)
+    messages[seed:seed] = [
+        _system_message("1794660949705", "membersAddedEventMessageDetail"),
+        _system_message("1794658198232", "membersDeletedEventMessageDetail"),
+    ]
+
+
+def _system_message_above_a_newer_message(tenant: Tenant) -> None:
+    # The filter skips system messages only: a person's newer message under one
+    # is still what the check reads first.
+    tenant.messages[CHANNEL_ID][0:0] = [
+        _system_message("1794660949705", "membersAddedEventMessageDetail"),
+        tenant.message("1731500000000", "hello"),
+    ]
+
+
+def _system_message(message_id: str, detail: str) -> dict[str, Any]:
+    return {
+        "id": message_id,
+        "messageType": "unknownFutureValue",
+        "createdDateTime": "2026-11-14T12:09:58Z",
+        "from": None,
+        "body": {"contentType": "html", "content": "<systemEventMessage/>"},
+        "eventDetail": {"@odata.type": f"#microsoft.graph.{detail}"},
+    }
+
+
 def _edited_message(tenant: Tenant) -> None:
     # Still starts like the seed's text, so only the whole text tells them apart.
     tenant.messages[CHANNEL_ID][0]["body"]["content"] = "xagent smoke test message"
@@ -747,6 +779,8 @@ def _speaker_notes(tenant: Tenant) -> None:
         (_other_channel, {"teams.list_seed_channels"}),
         (_extra_channel, {"teams.list_seed_channels"}),
         (_newer_message, {"teams.read_seed_message"}),
+        (_membership_changes, set()),
+        (_system_message_above_a_newer_message, {"teams.read_seed_message"}),
         (_edited_message, {"teams.read_seed_message"}),
         (_html_message, set()),
         (_extra_paragraph, {"word.list_paragraphs"}),

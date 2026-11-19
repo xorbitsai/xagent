@@ -2971,6 +2971,41 @@ def test_create_issue_sends_expected_fields(monkeypatch):
     }
 
 
+def test_create_issue_sends_labels(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"key": "ENG-2", "id": "10002"}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_create_issue(
+            project_key="ENG", summary="New bug", labels=["MVP", "backend"]
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args_list[1].kwargs["json"]["fields"]["labels"] == [
+        "MVP",
+        "backend",
+    ]
+
+
+def test_create_issue_rejects_label_with_space(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_create_issue(project_key="ENG", summary="New bug", labels=["a b"])
+    )
+
+    assert result["status"] == "error"
+    assert "labels" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_update_issue_requires_at_least_one_field(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(jira.requests, "request", mock_request)
@@ -2993,6 +3028,78 @@ def test_update_issue_unassigns_on_explicit_empty_assignee_id(monkeypatch):
     assert result["status"] == "success"
     update_call = mock_request.call_args_list[1]
     assert update_call.kwargs["json"] == {"fields": {"assignee": None}}
+
+
+def test_update_issue_adds_and_removes_labels_incrementally(monkeypatch):
+    mock_request = Mock(
+        side_effect=[MockResponse(json_data=[_SITE_A]), MockResponse(json_data={})]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_update_issue(
+            "ENG-1", add_labels=["MVP", "backend"], remove_labels=["draft"]
+        )
+    )
+
+    assert result["status"] == "success"
+    update_call = mock_request.call_args_list[1]
+    assert update_call.kwargs["method"] == "PUT"
+    # Labels use Jira's add/remove verbs, never `fields`, so the issue's other
+    # labels are not overwritten; no empty `fields` key is sent either.
+    assert update_call.kwargs["json"] == {
+        "update": {"labels": [{"add": "MVP"}, {"add": "backend"}, {"remove": "draft"}]}
+    }
+
+
+def test_update_issue_combines_labels_with_fields(monkeypatch):
+    mock_request = Mock(
+        side_effect=[MockResponse(json_data=[_SITE_A]), MockResponse(json_data={})]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_update_issue("ENG-1", priority="High", add_labels=["MVP"])
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args_list[1].kwargs["json"] == {
+        "fields": {"priority": {"name": "High"}},
+        "update": {"labels": [{"add": "MVP"}]},
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field_name"),
+    [
+        ({"add_labels": ["needs review"]}, "add_labels"),
+        ({"remove_labels": ["tab\there"]}, "remove_labels"),
+        ({"add_labels": ["ok", ""]}, "add_labels"),
+    ],
+)
+def test_update_issue_rejects_invalid_labels(monkeypatch, kwargs, field_name):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_update_issue("ENG-1", **kwargs))
+
+    assert result["status"] == "error"
+    assert field_name in result["message"]
+    assert "single words" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_issue_empty_label_lists_count_as_nothing_provided(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_update_issue("ENG-1", add_labels=[], remove_labels=[])
+    )
+
+    assert result["status"] == "error"
+    assert "No fields" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_create_issue_rejects_empty_summary(monkeypatch):

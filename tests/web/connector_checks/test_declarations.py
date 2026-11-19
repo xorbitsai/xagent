@@ -16,6 +16,7 @@ from xagent.web.connector_checks.declarations import (
     EachHasKeys,
     Equals,
     ExpectedVerdict,
+    FirstWhere,
     HasKeys,
     IsType,
     ItemRef,
@@ -149,6 +150,36 @@ def _checks(**changes: Any) -> ConnectorChecks:
 
 def test_a_complete_declaration_is_valid() -> None:
     validate_connector_checks(_checks())
+
+
+def test_an_assertion_path_may_take_the_first_item_where_a_key_matches() -> None:
+    first = FirstWhere("messageType", "message")
+    validate_connector_checks(
+        _checks(
+            reads=(
+                _read(
+                    assertions=(
+                        Equals(("messages", first, "id"), "m-1"),
+                        Contains(("messages", first, "body"), "seed"),
+                    )
+                ),
+            )
+        )
+    )
+
+
+@pytest.mark.parametrize(("key", "value"), [("", "x"), (1, "x"), ("a", 1), ("a", None)])
+def test_first_where_takes_a_non_empty_key_and_a_string_value(
+    key: Any, value: Any
+) -> None:
+    with pytest.raises(ValueError, match="FirstWhere takes a non-empty key"):
+        FirstWhere(key, value)
+
+
+@pytest.mark.parametrize("kind", [CreatedRef, ItemRef])
+def test_a_reference_path_takes_no_first_where(kind: Any) -> None:
+    with pytest.raises(ValueError, match="path"):
+        kind(("items", FirstWhere("type", "issue"), "id"))
 
 
 def test_a_connector_with_only_exemptions_is_valid() -> None:
@@ -914,9 +945,22 @@ def _read(**changes: Any) -> ReadCheck:
         ),
         (_checks(sweep=_sweep(items=("issues", -1))), "invalid path segment"),
         (_checks(sweep=_sweep(items="issues")), "a path must be a tuple"),
+        (
+            _checks(sweep=_sweep(items=("issues", FirstWhere("type", "issue")))),
+            "only an assertion's path may hold FirstWhere",
+        ),
+        (
+            _checks(
+                writes=(
+                    _write(tenant_pin=_pin(path=("sites", FirstWhere("a", "b"), "id"))),
+                )
+            ),
+            "only an assertion's path may hold FirstWhere",
+        ),
         (_checks(sweep=_sweep(name=())), "name path"),
         (_checks(sweep=_sweep(name="summary")), "name path"),
         (_checks(sweep=_sweep(name=("summary", -1))), "name path"),
+        (_checks(sweep=_sweep(name=("fields", FirstWhere("a", "b")))), "name path"),
         (ConnectorChecks("custom-foo"), "result label"),
         (ConnectorChecks("a" * 65), "result label"),
     ],

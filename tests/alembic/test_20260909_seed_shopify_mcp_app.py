@@ -239,7 +239,7 @@ def test_seed_row_is_the_shape_the_oauth_switch_migrates_from():
     migration = _load_migration()
     switch_file = (
         Path(__file__).parent.parent.parent
-        / "src/xagent/migrations/versions/20261116_migrate_shopify_to_oauth.py"
+        / "src/xagent/migrations/versions/20261119_migrate_shopify_to_oauth.py"
     )
     spec = importlib.util.spec_from_file_location("shopify_oauth_switch", switch_file)
     switch = importlib.util.module_from_spec(spec)

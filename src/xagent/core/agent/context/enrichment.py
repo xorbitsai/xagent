@@ -10,6 +10,7 @@ from ...agent.trace import (
     trace_memory_retrieve_start,
 )
 from ...user_context import current_user_id
+from ..attachments import SERVER_METADATA_KEY
 from .memory_retrieval import (
     MEMORY_CONTEXT_METADATA_KEY,
     RETRIEVED_MEMORIES_METADATA_KEY,
@@ -107,6 +108,48 @@ def pending_user_responses(context: Any) -> list[PendingUserResponse]:
 def latest_pending_user_response(context: Any) -> PendingUserResponse | None:
     responses = pending_user_responses(context)
     return responses[-1] if responses else None
+
+
+def settled_interaction_id(message: Any) -> str | None:
+    """The ``interaction_id`` a host-settle message names, else ``None``.
+
+    A host settles a waiting interaction with a user message carrying
+    server-set metadata ``{"interaction_id": ...}``
+    (``task_interaction_settle``); an ordinary message carries none.
+    """
+    metadata = getattr(message, "metadata", None)
+    server = metadata.get(SERVER_METADATA_KEY) if isinstance(metadata, dict) else None
+    value = server.get("interaction_id") if isinstance(server, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def waiting_request_interaction_ids(waiting_request: Any) -> frozenset[str]:
+    """The tool ``interaction_id`` of every request in a waiting batch."""
+    requests = (
+        waiting_request.get("requests") if isinstance(waiting_request, dict) else None
+    )
+    if not isinstance(requests, list):
+        return frozenset()
+    return frozenset(
+        str(request.get("interaction_id") or "")
+        for request in requests
+        if isinstance(request, dict)
+    )
+
+
+def is_stale_settle_message(message: Any, waiting_request: Any) -> bool:
+    """Whether ``message`` settles an interaction ``waiting_request`` lacks.
+
+    A settle only answers a pending request of the waiting batch that carries
+    its id. Any other settle is a leftover of an earlier question: it must
+    neither resume the run nor be taken as the answer to this one. A plain
+    question (no tool requests) has no id to match, so every settle is stale
+    for it. A message that is not a settle is never stale.
+    """
+    settled_id = settled_interaction_id(message)
+    if settled_id is None:
+        return False
+    return settled_id not in waiting_request_interaction_ids(waiting_request)
 
 
 def pending_user_response_marker(waiting_request: Any) -> dict[str, Any] | None:
@@ -307,6 +350,10 @@ def top_level_user_request(
         ):
             continue
         if is_answer_or_dag_step_message(message):
+            continue
+        if settled_interaction_id(message) is not None:
+            # A host settle is plumbing, never an independent request, even
+            # when it is stale and was not marked as an answer.
             continue
         metadata = getattr(message, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}

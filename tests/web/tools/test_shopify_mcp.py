@@ -2044,6 +2044,22 @@ def test_graphql_401_asks_to_reconnect_without_retrying_or_leaking(
     assert post.call_count == 1
 
 
+def test_graphql_401_hint_survives_a_long_error_body(monkeypatch):
+    """A WAF or HTML 401 page can fill the error-length cap on its own; the
+    reconnect hint must still reach the tool result."""
+    page = "<html>" + "x" * 5000 + "</html>"
+    monkeypatch.setattr(
+        shopify.requests,
+        "post",
+        Mock(return_value=MockResponse(status_code=401, text=page, json_raises=True)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        shopify._graphql("query { shop { id } }")
+
+    assert "reconnect Shopify" in shopify._error(str(excinfo.value))
+
+
 def test_scope_check_401_asks_to_reconnect(monkeypatch):
     monkeypatch.setattr(
         shopify.requests,

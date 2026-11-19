@@ -20,7 +20,9 @@ export interface ObservedTaskState {
   status: TaskStatus | undefined
 }
 
-export type HeldReason = "turn_failed" | "turn_paused" | "send_failed"
+// "earlier_send_failed": a message sent past the queue failed after a message
+// queued behind it was submitted, so that message would have gone out first.
+export type HeldReason = "turn_failed" | "turn_paused" | "send_failed" | "earlier_send_failed"
 
 export type MessageQueuePhase =
   | { kind: "idle" }
@@ -74,6 +76,9 @@ export type MessageQueueEvent =
   // `snapshot`: the frame is a periodic reconciliation snapshot.
   | { type: "OBSERVE"; observed: ObservedTaskState; snapshot: boolean }
   | { type: "DELIVERY_ACCEPTED"; clientMessageId: string; sinceVersion: number | undefined }
+  // A send failed for a reason other than a busy turn. `queuedFrom`: the
+  // submission order the next queued message would get when that send started.
+  | { type: "DELIVERY_FAILED"; queuedFrom: number }
   | { type: "ENQUEUE"; item: QueuedMessage }
   | { type: "REQUEUE_REFUSED"; item: QueuedMessage; sinceVersion: number | undefined }
   | { type: "SEND_STARTED"; clientMessageId: string; sinceVersion: number | undefined }
@@ -163,6 +168,13 @@ export function transitionMessageQueue(
       }
       if (phase.kind === "sending" && phase.clientMessageId !== event.clientMessageId) return to(state)
       return to(enterWaiting(removed, event.sinceVersion))
+    }
+    case "DELIVERY_FAILED": {
+      // The queue's own head reports through SEND_FAILED, and a held queue
+      // already waits for the visitor.
+      if (phase.kind !== "ready" && phase.kind !== "waiting") return to(state)
+      const overtakes = items.some(item => item.seq >= event.queuedFrom)
+      return to(overtakes ? { ...state, phase: held("earlier_send_failed") } : state)
     }
     case "ENQUEUE":
       return to({ ...state, items: [...items, event.item], phase: phase.kind === "idle" ? READY : phase })

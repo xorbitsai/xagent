@@ -24,6 +24,8 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { toast } from "@/components/ui/sonner";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
+import { ConnectorResultCard } from "./connector/ConnectorResultCard";
+import type { ResultCardData } from "./connector/types";
 import type { ClarificationOnSend } from "./clarification-delivery";
 import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
 import {
@@ -103,6 +105,8 @@ export interface ChatMessageProps {
   interactions?: any[];
   interactionRequestId?: string;
   interactionsActive?: boolean;
+  // Persisted connector result card (metadata.result_card), shown under the content.
+  resultCard?: ResultCardData;
   showEmptyStatus?: boolean;
   onOpenExecutionPlan?: () => void;
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void;
@@ -359,6 +363,7 @@ export function ChatMessage({
   interactions,
   interactionRequestId,
   interactionsActive = true,
+  resultCard,
   showEmptyStatus = true,
   onOpenExecutionPlan,
   onAgentExecutionClick,
@@ -501,6 +506,7 @@ export function ChatMessage({
     hasTraceEvents &&
     !isUser &&
     !content &&
+    !resultCard &&
     (
       hasSilencedInterruption ||
       (
@@ -638,7 +644,7 @@ export function ChatMessage({
               ) : (
                 // A past paused/waiting turn has showEmptyStatus=false, but with
                 // the trace hidden its status line is all that marks the turn.
-                !isUser && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
+                !isUser && !resultCard && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
                   <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} connectionNotice={connectionNotice} agent={agent} />
                 )
               )}
@@ -672,8 +678,9 @@ export function ChatMessage({
                   {...taskRuntimeExtensionMetadata}
                 />
               )}
+              {!isUser && resultCard && <ConnectorResultCard card={resultCard} />}
               {!isUser && interactions && interactions.length > 0 && (
-                <div className="mt-4 border-t pt-4">
+                <div className={interactions.every((i) => i?.type === "connect_connector") ? "" : "mt-4 border-t pt-4"}>
                   <ClarificationForm
                     interactions={interactions}
                     requestId={interactionRequestId}

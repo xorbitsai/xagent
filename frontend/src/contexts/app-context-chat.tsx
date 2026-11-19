@@ -503,7 +503,7 @@ export const acceptTaskControlVersion = (
 }
 
 export interface Interaction {
-  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards" | "connect_apps" | "teammate_summary";
+  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards" | "connect_apps" | "connect_connector" | "teammate_summary";
   field: string;
   label: string;
   /** Read-only first-run overview seeded from the hired template. */
@@ -523,6 +523,10 @@ export interface Interaction {
   apps?: string[];
   /** First-run cards group builtin OAuth apps under their shared provider. */
   group_by_provider?: boolean;
+  /** For "connect_connector": display data of the app to connect (parsed by the card, never trusted). */
+  connector?: unknown;
+  /** For "connect_connector": the id the host's save/skip/state endpoints key on. */
+  interaction_id?: string;
 }
 import {
   useWebSocket,
@@ -546,6 +550,7 @@ import {
 } from "./session-message-queue"
 import { toast } from "@/components/ui/sonner"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
+import { parseResultCard, type ResultCardData } from "@/components/chat/connector/types"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, isInputReviewErrorCode, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
@@ -775,7 +780,7 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       const field = seenFields.has(baseField) ? `${baseField}_${index}` : baseField
       seenFields.add(field)
       if (
-        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards", "connect_apps", "teammate_summary"].includes(type) ||
+        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards", "connect_apps", "connect_connector", "teammate_summary"].includes(type) ||
         typeof field !== "string" ||
         !field.trim()
       ) {
@@ -819,6 +824,10 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
       if (typeof item.group_by_provider === "boolean") normalized.group_by_provider = item.group_by_provider
+      if (type === "connect_connector") {
+        if (item.connector && typeof item.connector === "object") normalized.connector = item.connector
+        if (typeof item.interaction_id === "string" && item.interaction_id) normalized.interaction_id = item.interaction_id
+      }
       if (Array.isArray(item.apps)) {
         normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
       }
@@ -859,6 +868,8 @@ interface Message {
   interactionRequestId?: string
   isSystemNotice?: boolean
   isOptimistic?: boolean
+  /** Persisted connector result card (metadata.display === "result_card"). */
+  resultCard?: ResultCardData
 }
 
 export type TaskRuntimeExtensions = Record<string, Record<string, unknown>>
@@ -2771,11 +2782,12 @@ export type SessionConversationAttachment = "pending" | "attached" | "unsupporte
 // Whether the Session server said, in the capabilities frame of the latest
 // connection that sent one, that it takes chat frames declared as new turns.
 // It is not reset when a connection drops: only the next capabilities frame
-// changes it, and "unknown" until one has arrived. It is exposed for display,
-// and the message queue reads it to decide whether to hold and send queued
-// messages. A send that carries a declaration additionally requires
-// that the connection which reported "supported" is the current one, so this
-// value alone does not authorize a send.
+// changes it, and "unknown" until one has arrived. The message queue reads it
+// to decide whether to hold and send queued messages, and the Session page
+// reads it to decide whether the queue's "continue" action is available.
+// A send that carries a declaration additionally requires that the connection
+// which reported "supported" is the current one, so this value alone does not
+// authorize a send.
 export type NewTurnDeliveryCapability = "unknown" | "supported" | "unsupported"
 
 export interface SessionMessageQueueControls {
@@ -4450,6 +4462,10 @@ export function AppProvider({
               return
             }
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+            // A turn the server marks metadata.display "none" (e.g. a host-side
+            // settle message) is in the transcript for the model only; live and
+            // on replay it never becomes a chat message.
+            if (eventData.metadata?.display === "none") return
             const messageContent = eventData.message || eventData.content || ""
             const userMessageId = stableUserMessageId(
               eventData,
@@ -4618,7 +4634,13 @@ export function AppProvider({
               typeof rawMessageContent === "string"
                 ? unwrapFinalAnswerContent(rawMessageContent)
                 : rawMessageContent
-            if (!messageContent) {
+            // The server sends display "chat" with the card kind in
+            // message_type / metadata.display.
+            const resultCard = eventData.message_type === "result_card"
+              || eventData.metadata?.display === "result_card"
+              ? parseResultCard(eventData.metadata?.result_card)
+              : null
+            if (!messageContent && !resultCard) {
               return
             }
             const interactions = normalizeInteractions(eventData.metadata?.interactions)
@@ -4690,7 +4712,8 @@ export function AppProvider({
             // message ID also pairs the live refusal with its history replay.
             const identifiedRefusal = eventData.message_type === "input_review_rejected"
               && agentMessageId !== null
-            if (!canonicalMessageId && !streamMessageId && !identifiedRefusal && isDuplicateMessageForViewedTask(
+            const identifiedCard = resultCard !== null && agentMessageId !== null
+            if (!canonicalMessageId && !streamMessageId && !identifiedRefusal && !identifiedCard && isDuplicateMessageForViewedTask(
               messageContent,
               'agent-message',
               isAgentMessage ? interactionRequestId : undefined,
@@ -4716,6 +4739,7 @@ export function AppProvider({
                 executionSequence: message.execution_sequence,
                 interactions: interactions.length > 0 ? interactions : undefined,
                 interactionRequestId,
+                ...(resultCard ? { resultCard } : {}),
               }
             })
             // The refusal bubble is settled. The task's terminal frame owns
@@ -7949,6 +7973,9 @@ export function AppProvider({
         : sourceTaskId === undefined
           ? [message, files, config?.force, clientMessageId, requestId]
           : [message, files, config?.force, clientMessageId, requestId, undefined, sourceTaskId]
+      // Where messages queued while this send is in flight start: one of them
+      // must not go out first if this send fails.
+      const queuedFrom = nextQueuedSeqRef.current
       beginSessionMessageDelivery()
       try {
         await sendChatWithResend(
@@ -7984,6 +8011,11 @@ export function AppProvider({
         }
         addOptimisticUserMessage(state.taskId)
       } catch (error) {
+        // A busy refusal is left to the caller, which may queue the message
+        // itself. The generation check is defensive, as above.
+        if (!isBusyRefusal(error) && sessionDeliveryOwner.deliveryGeneration === deliveryGenerationRef.current) {
+          applyMessageQueue({ type: "DELIVERY_FAILED", queuedFrom })
+        }
         if (startsReplacementConversation) {
           if (!replacementSendStillOwned()) {
             throw error

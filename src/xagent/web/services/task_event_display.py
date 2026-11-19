@@ -255,6 +255,11 @@ def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
         "attachments": attachments if isinstance(attachments, list) else [],
         "turn_id": event.turn_id,
         "created_at": event.occurred_at,
+        "message_metadata": (
+            data.get("message_metadata")
+            if isinstance(data.get("message_metadata"), dict)
+            else None
+        ),
     }
 
 
@@ -285,6 +290,8 @@ def convert_display_event(
             data = {"message": content, "content": content, "turn_id": turn_id}
             if message["attachments"]:
                 data["files"] = data["attachments"] = message["attachments"]
+            if message.get("message_metadata"):
+                data["metadata"] = message["message_metadata"]
         else:
             kind = "agent_message"
             data = {

@@ -3308,26 +3308,25 @@ def test_set_tool_selection_spec_swaps_only_a_different_selection():
     cfg = WebToolConfig(
         db=None, request=None, tool_selection_spec=spec, include_mcp_tools=True
     )
-    cfg._cached_mcp_configs = ["sentinel"]
+    _prime_scope_derived_caches(cfg)
 
     # An equal selection, however its categories were ordered: a no-op that
-    # keeps the cached MCP configs and the spec object.
+    # keeps the spec object and everything built for it.
     same = ToolSelectionSpec.from_raw(tool_categories=["mcp:store", "basic"])
     assert cfg.set_tool_selection_spec(same, include_mcp_tools=True) is False
     assert cfg.get_tool_selection_spec() is spec
-    assert cfg._cached_mcp_configs == ["sentinel"]
+    _assert_scope_derived_caches_primed(cfg)
 
-    # Another selection: swapped in, and the MCP configs built for the old
-    # one are dropped.
+    # Another selection: swapped in, and what was built for the old one is dropped.
     narrowed = ToolSelectionSpec.from_raw(tool_categories=["basic"])
     assert cfg.set_tool_selection_spec(narrowed, include_mcp_tools=False) is True
     assert cfg.get_tool_selection_spec() is narrowed
-    assert cfg._cached_mcp_configs is None
+    _assert_scope_derived_caches_dropped(cfg)
 
     # The MCP flag alone counts as a change (an actor-marked turn forces it).
-    cfg._cached_mcp_configs = ["sentinel"]
+    _prime_scope_derived_caches(cfg)
     assert cfg.set_tool_selection_spec(narrowed, include_mcp_tools=True) is True
-    assert cfg._cached_mcp_configs is None
+    _assert_scope_derived_caches_dropped(cfg)
 
 
 def test_set_execution_scope_swaps_the_scope_and_drops_scope_derived_caches():

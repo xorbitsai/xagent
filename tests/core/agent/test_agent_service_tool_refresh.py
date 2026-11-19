@@ -748,3 +748,95 @@ async def test_agent_service_preserves_required_mcp_initialization_errors(
         await service._ensure_tools_initialized()
 
     assert exc_info.value is required_error
+
+
+class SelectableToolConfig:
+    """A tool config whose tools follow a selection a lookup can swap."""
+
+    _workspace_config = None
+
+    def __init__(self) -> None:
+        self.selection = "old"
+
+    def get_user_tool_overrides(self) -> dict[str, dict[str, bool]]:
+        return {}
+
+    def get_allowed_tools(self) -> list[str] | None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_tools_invalidated_while_they_are_built_are_built_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A lookup for the same task swaps the selection and invalidates the tools
+    # while the turn's build is awaiting. The selection is no part of the policy
+    # signature, so without a second build the stale tools would be kept as
+    # current and no later turn would rebuild them.
+    tool_config = SelectableToolConfig()
+    builds: list[str] = []
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        read = config.selection
+        builds.append(read)
+        if len(builds) == 1:
+            config.selection = "new"
+            service.invalidate_tools()
+        return [NamedTool(read)]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="tool-refresh-test",
+        id="tool-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+
+    assert builds == ["old", "new"]
+    assert [tool.name for tool in service.tools] == ["new"]
+    assert [tool.name for tool in service.agent.tools] == ["new"]
+    assert service._tools_initialized
+
+    # Current now: the next turn builds nothing.
+    await service._ensure_tools_initialized()
+    assert builds == ["old", "new"]
+
+
+@pytest.mark.asyncio
+async def test_tools_invalidated_in_every_build_stay_marked_for_a_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_config = SelectableToolConfig()
+    builds: list[int] = []
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        builds.append(len(builds))
+        service.invalidate_tools()
+        return [NamedTool(f"pass-{len(builds)}")]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="tool-refresh-test",
+        id="tool-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+
+    # The call gives up after a few passes rather than spinning; the turn runs
+    # on the last build and the next one builds again.
+    assert len(builds) == 3
+    assert [tool.name for tool in service.tools] == ["pass-3"]
+    assert not service._tools_initialized
+
+    await service._ensure_tools_initialized()
+    assert len(builds) == 6

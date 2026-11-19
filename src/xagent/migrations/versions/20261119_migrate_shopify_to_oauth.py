@@ -245,7 +245,7 @@ def _referencing(
 ) -> list[tuple[str, str, str]]:
     """Every (table, column, ON DELETE rule) that points at ``parent.id``."""
     found = []
-    for table in sorted(tables - skip - {parent}):
+    for table in sorted(tables - skip):
         for referred_table, referred_column, column, rule in _foreign_keys(
             bind, inspector, table
         ):
@@ -261,10 +261,12 @@ def _release_references(
     parent: str,
     ids: list[int],
     skip: set[str],
+    seen: set[tuple[str, int]],
 ) -> None:
     """Do what each reference's ON DELETE rule would do to rows pointing at
     ``parent`` rows ``ids``, explicitly: a migration connection may not
-    enforce foreign keys (SQLite without the pragma)."""
+    enforce foreign keys (SQLite without the pragma). ``seen`` holds the rows
+    already being deleted, so cascading cycles end."""
     for table, column, rule in _referencing(bind, inspector, tables, parent, skip):
         child = sa.table(table, sa.column(column, sa.Integer), sa.column("id"))
         hit = child.c[column].in_(ids)
@@ -286,8 +288,13 @@ def _release_references(
                 child_ids = [
                     int(row[0])
                     for row in bind.execute(sa.select(child.c.id).where(hit))
+                    if (table, int(row[0])) not in seen
                 ]
-                _release_references(bind, inspector, tables, table, child_ids, set())
+                seen.update((table, child_id) for child_id in child_ids)
+                if child_ids:
+                    _release_references(
+                        bind, inspector, tables, table, child_ids, set(), seen
+                    )
             bind.execute(sa.delete(child).where(hit))
         else:
             raise RuntimeError(
@@ -318,17 +325,32 @@ def _delete_servers_and_dependents(
     if not server_ids:
         return kept
     # Explicit, because a migration connection may not enforce the
-    # foreign keys' ON DELETE CASCADE (SQLite without the pragma).
-    known = set()
-    for table_name, column in KNOWN_SERVER_CHILDREN:
-        known.add(table_name)
-        if column not in _columns(bind, table_name):
-            continue
-        child = sa.table(table_name, sa.column(column, sa.Integer))
-        bind.execute(sa.delete(child).where(child.c[column].in_(server_ids)))
+    # foreign keys' ON DELETE CASCADE (SQLite without the pragma). The known
+    # children are deleted by name, since an older database may lack their
+    # foreign keys; tables pointing at them follow their own rules first.
     inspector = sa.inspect(bind)
     tables = set(inspector.get_table_names())
-    _release_references(bind, inspector, tables, "mcp_servers", server_ids, known)
+    known = {table_name for table_name, _column in KNOWN_SERVER_CHILDREN}
+    seen: set[tuple[str, int]] = {
+        ("mcp_servers", server_id) for server_id in server_ids
+    }
+    for table_name, column in KNOWN_SERVER_CHILDREN:
+        columns = _columns(bind, table_name)
+        if column not in columns:
+            continue
+        child = sa.table(table_name, sa.column(column, sa.Integer), sa.column("id"))
+        hit = child.c[column].in_(server_ids)
+        if "id" in columns:
+            child_ids = [
+                int(row[0]) for row in bind.execute(sa.select(child.c.id).where(hit))
+            ]
+            seen.update((table_name, child_id) for child_id in child_ids)
+            if child_ids:
+                _release_references(
+                    bind, inspector, tables, table_name, child_ids, known, seen
+                )
+        bind.execute(sa.delete(child).where(hit))
+    _release_references(bind, inspector, tables, "mcp_servers", server_ids, known, seen)
     bind.execute(sa.delete(MCP_SERVERS).where(MCP_SERVERS.c.id.in_(server_ids)))
     return kept
 

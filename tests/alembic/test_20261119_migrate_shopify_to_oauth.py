@@ -750,6 +750,62 @@ def test_a_protecting_reference_without_rows_does_not_block(database):
     assert _ids(connection, tables["mcp_servers"]) == []
 
 
+def test_upgrade_follows_references_to_the_known_child_tables(database):
+    """The rule applies one level down too: a table pointing at
+    user_mcpservers is handled like one pointing at mcp_servers."""
+    connection, tables = database
+    _create(
+        connection,
+        "CREATE TABLE usage_by_link (id INTEGER PRIMARY KEY, link_id INTEGER "
+        "REFERENCES user_mcpservers(id) ON DELETE SET NULL)",
+    )
+    _seed_legacy(connection, tables)
+    connection.exec_driver_sql("INSERT INTO usage_by_link VALUES (8, 1)")
+
+    _run(connection, "upgrade")
+
+    rows = connection.exec_driver_sql("SELECT id, link_id FROM usage_by_link").all()
+    assert [tuple(row) for row in rows] == [(8, None)]
+
+
+def test_upgrade_refuses_a_protecting_reference_to_a_known_child(database):
+    connection, tables = database
+    _create(
+        connection,
+        "CREATE TABLE link_audit (id INTEGER PRIMARY KEY, link_id INTEGER "
+        "REFERENCES user_mcpservers(id) ON DELETE RESTRICT)",
+    )
+    _seed_legacy(connection, tables)
+    connection.exec_driver_sql("INSERT INTO link_audit VALUES (2, 1)")
+
+    with pytest.raises(RuntimeError, match="link_audit"):
+        _run(connection, "upgrade")
+
+
+def test_upgrade_survives_cascading_tables_that_reference_each_other(database):
+    connection, tables = database
+    _create(
+        connection,
+        "CREATE TABLE ring_a (id INTEGER PRIMARY KEY, server_id INTEGER "
+        "REFERENCES mcp_servers(id) ON DELETE CASCADE, b_id INTEGER "
+        "REFERENCES ring_b(id) ON DELETE CASCADE)",
+    )
+    _create(
+        connection,
+        "CREATE TABLE ring_b (id INTEGER PRIMARY KEY, a_id INTEGER "
+        "REFERENCES ring_a(id) ON DELETE CASCADE)",
+    )
+    _seed_legacy(connection, tables)
+    connection.exec_driver_sql("INSERT INTO ring_a VALUES (1, 1, NULL)")
+    connection.exec_driver_sql("INSERT INTO ring_b VALUES (1, 1)")
+    connection.exec_driver_sql("UPDATE ring_a SET b_id = 1 WHERE id = 1")
+
+    _run(connection, "upgrade")
+
+    assert connection.exec_driver_sql("SELECT id FROM ring_a").all() == []
+    assert connection.exec_driver_sql("SELECT id FROM ring_b").all() == []
+
+
 # ---------- kept servers that block the builtin OAuth connect ---------------
 
 

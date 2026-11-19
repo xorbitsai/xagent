@@ -18,14 +18,15 @@ compliance topics (``customers/data_request``, ``customers/redact`` and
   details. Customer data that connector tools returned into a conversation is
   the user's own task history and out of scope here.
 
-A grant that holds a token and was written after the uninstall is kept: the uninstall revoked the
-store's token, so only a new install writes one, and Shopify retries for hours
-without keeping order, so a late delivery must not delete the grant of a
-merchant who has since reconnected. The uninstall is taken to have happened
-at ``X-Shopify-Triggered-At`` for ``app/uninstalled``, and, going by
-Shopify's documented 48-hour delay, ``SHOP_REDACT_DELAY`` before it for
-``shop/redact``. Without a usable time
-every grant for the store is deleted.
+A grant that holds a token and was written after the uninstall is left alone:
+the uninstall revoked the store's token, so only a new install writes one,
+and Shopify retries for hours without keeping order, so a late delivery must
+not clear or delete the grant of a merchant who has since reconnected. The
+uninstall is taken to have happened at ``X-Shopify-Triggered-At`` for
+``app/uninstalled`` and, going by Shopify's documented 48-hour delay,
+``SHOP_REDACT_DELAY`` before it for ``shop/redact``. Without a usable time
+every grant for the store is cleared (``app/uninstalled``) or deleted
+(``shop/redact``).
 
 The store is matched by its label (``<label>.myshopify.com`` in the body) or
 by the shop's id, which the callback stores as the grant's identity
@@ -182,8 +183,9 @@ def read_shopify_webhook(
 ) -> ShopifyWebhook:
     """Verify a delivery and read the store it is about.
 
-    ``headers`` are matched case-insensitively. Raises :class:`ShopifyWebhookRefused`: 401 when the signature does not
-    verify (Shopify's own check expects 401), 400 when a signed body does not
+    ``headers`` are matched case-insensitively. Raises
+    :class:`ShopifyWebhookRefused`: 401 when the signature does not verify
+    (Shopify's own check expects 401), 400 when a signed body does not
     fit its topic.
     """
     headers = {name.lower(): value for name, value in headers.items()}

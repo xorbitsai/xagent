@@ -354,7 +354,7 @@ def _raise_response_shape(message: str, *, mutation: bool) -> NoReturn:
 
 
 def _granted_admin_scopes() -> set[str]:
-    """Read the scopes granted to the current OAuth access token."""
+    """Read the scopes granted to the current access token."""
     try:
         response = requests.get(
             _scopes_url(),

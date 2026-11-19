@@ -8,9 +8,9 @@ emitted as a persisted assistant message that does not pause the run.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional, Type
+from typing import Annotated, Any, Mapping, Optional, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, ValidationError
 
 from .....web.tools.config import WebToolConfig
 from ....agent.result_card import (
@@ -21,17 +21,23 @@ from ....agent.result_card import (
     RESULT_CARD_DISPLAY,
     RESULT_CARD_MESSAGE_TYPE,
     RESULT_CARD_TOOL_NAME,
+    ResultCardConnector,
     current_run_display_context,
     resolve_result_card_source,
     result_card_enabled,
+    result_card_metadata,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .factory import register_tool
 from .selection_spec import normalize_mcp_server_name
 
 
+def _text(max_chars: int) -> Any:
+    return StringConstraints(strip_whitespace=True, min_length=1, max_length=max_chars)
+
+
 class ShowResultCardArgs(BaseModel):
-    title: str = Field(
+    title: Annotated[str, _text(MAX_TITLE_CHARS)] = Field(
         description=f"Short card title, at most {MAX_TITLE_CHARS} characters."
     )
     source_connector: str = Field(
@@ -40,12 +46,18 @@ class ShowResultCardArgs(BaseModel):
             "a connector you already called successfully in this run."
         )
     )
-    items: list[str] = Field(
+    items: list[Annotated[str, _text(MAX_ITEM_CHARS)]] = Field(
+        min_length=1,
+        max_length=MAX_ITEMS,
         description=(
             f"1 to {MAX_ITEMS} result lines, each at most {MAX_ITEM_CHARS} characters."
-        )
+        ),
     )
-    footnote: Optional[str] = Field(
+    footnote: Optional[
+        Annotated[
+            str, StringConstraints(strip_whitespace=True, max_length=MAX_FOOTNOTE_CHARS)
+        ]
+    ] = Field(
         default=None,
         description=f"Optional one-line note, at most {MAX_FOOTNOTE_CHARS} characters.",
     )
@@ -55,19 +67,16 @@ def _error(message: str) -> dict[str, Any]:
     return {"success": False, "error": message}
 
 
-def _validated(args: ShowResultCardArgs) -> tuple[dict[str, Any] | None, str | None]:
-    title = args.title.strip()
-    items = [item.strip() for item in args.items]
-    footnote = (args.footnote or "").strip() or None
-    if not title or len(title) > MAX_TITLE_CHARS:
-        return None, f"title must be 1-{MAX_TITLE_CHARS} characters"
-    if not items or len(items) > MAX_ITEMS:
-        return None, f"items must hold 1-{MAX_ITEMS} entries"
-    if any(not item or len(item) > MAX_ITEM_CHARS for item in items):
-        return None, f"each item must be 1-{MAX_ITEM_CHARS} characters"
-    if footnote is not None and len(footnote) > MAX_FOOTNOTE_CHARS:
-        return None, f"footnote must be at most {MAX_FOOTNOTE_CHARS} characters"
-    return {"title": title, "items": items, "footnote": footnote}, None
+def _identity(connector: str, invoked: frozenset[ResultCardConnector]) -> Any:
+    """The invoked connector ``connector`` names, or ``None`` if none does.
+
+    Two connectors of different kinds can share a name; the card is then
+    attributed with an unknown kind so a host never brands it as either.
+    """
+    matches = [c for c in invoked if c.name == connector]
+    if not matches:
+        return None
+    return matches[0] if len(matches) == 1 else ResultCardConnector(connector, None)
 
 
 class ShowResultCardTool(AbstractBaseTool):
@@ -100,39 +109,51 @@ class ShowResultCardTool(AbstractBaseTool):
         raise NotImplementedError("show_result_card is async only")
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        parsed = ShowResultCardArgs.model_validate(args)
+        try:
+            parsed = ShowResultCardArgs.model_validate(args)
+        except ValidationError as exc:
+            problems = "; ".join(
+                f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}"
+                for e in exc.errors()
+            )
+            return _error(f"Invalid result card: {problems}.")
         context = current_run_display_context()
         if not result_card_enabled() or context is None:
             return _error("Result cards are not available here.")
-        connector = normalize_mcp_server_name(parsed.source_connector)
-        if not connector or connector not in context.invoked_connectors:
+        name = normalize_mcp_server_name(parsed.source_connector)
+        connector = _identity(name, context.invoked_connectors) if name else None
+        if connector is None:
             return _error(
                 f"source_connector {parsed.source_connector!r} was not invoked "
                 "in this run. Call a tool of that connector first, or name the "
                 "connector you actually used."
             )
-        body, problem = _validated(parsed)
-        if body is None:
-            return _error(f"Invalid result card: {problem}.")
         source = resolve_result_card_source(connector)
         card = {
-            "title": body["title"],
+            "title": parsed.title,
             "source": {
                 "name": source.name,
                 "app_id": source.app_id,
                 "logo": source.logo,
             },
-            "items": body["items"],
-            "footnote": body["footnote"],
+            "items": list(parsed.items),
+            "footnote": parsed.footnote or None,
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        await context.send_message(
-            message=body["title"],
+        sent = await context.send_message(
+            message=parsed.title,
             message_type=RESULT_CARD_MESSAGE_TYPE,
             expect_response=False,
             visible=True,
-            metadata={"display": RESULT_CARD_DISPLAY, "result_card": card},
+            metadata={
+                **context.message_source,
+                "display": RESULT_CARD_DISPLAY,
+                "result_card": card,
+            },
         )
+        if result_card_metadata(sent) is None:
+            # An output guardrail replaces a blocked card with a plain notice.
+            return {"success": True, "shown": False}
         return {"success": True, "shown": True}
 
 

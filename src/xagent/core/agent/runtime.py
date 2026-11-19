@@ -18,6 +18,7 @@ from ..agent.prompt_composition import (
     build_prompt_composition,
     call_kind_from_metadata,
 )
+from ..agent.result_card import RESULT_CARD_DISPLAY, RESULT_CARD_MESSAGE_TYPE
 from ..agent.trace import (
     TraceAction,
     TraceCategory,
@@ -1397,6 +1398,11 @@ class PatternRuntime:
         """Emit an agent-to-user message through the runtime boundary."""
 
         outbound_metadata = dict(metadata or {})
+        if message_type != RESULT_CARD_MESSAGE_TYPE:
+            # Only a message of the card type can carry card metadata.
+            if outbound_metadata.get("display") == RESULT_CARD_DISPLAY:
+                outbound_metadata.pop("display")
+            outbound_metadata.pop("result_card", None)
         if self.output_guardrail is not None and (visible or expect_response):
             # Check structured metadata as well as the display text. A
             # provider rewrite cannot safely preserve interaction identity.

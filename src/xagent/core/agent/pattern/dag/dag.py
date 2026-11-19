@@ -37,6 +37,7 @@ from ...language import (
 )
 from ...prompt_prefix import PROMPT_PREFIX_KEY
 from ...result import normalize_tool_failure_code, unwrap_final_answer_content
+from ...result_card import ResultCardConnector
 from ...runtime import (
     ExecutionInterrupted,
     LLMCallInterrupted,
@@ -466,6 +467,10 @@ class DAGPattern(AgentPattern):
         self.active_step_context: dict[str, Any] | None = None
         self.active_step_ids: list[str] = []
         self.active_step_pattern_states: dict[str, dict[str, Any]] = {}
+        # Connectors a tool of which completed in any step of this run. Shared
+        # (the same object) with every step's ``ReActPattern`` so a later or
+        # concurrent step sees what an earlier one used.
+        self.run_connectors: set[ResultCardConnector] = set()
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
         # Uncommitted writes from a step checkpoint that is still in flight.
         # Never serialized: a staged entry has, by definition, no durable
@@ -1127,6 +1132,7 @@ class DAGPattern(AgentPattern):
             user_interaction_enabled=self.user_interaction_enabled,
         )
         react_pattern.seed_memory_input(self._memory_text(root_context))
+        react_pattern.run_connectors = self.run_connectors
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:
             react_pattern.load_state(active_pattern_state)
@@ -1337,6 +1343,12 @@ class DAGPattern(AgentPattern):
             "completion_feedback": self.completion_feedback,
             "completion_replan_count": self.completion_replan_count,
             "max_completion_replans": self.max_completion_replans,
+            "run_connectors": [
+                {"name": c.name, "kind": c.kind}
+                for c in sorted(
+                    self.run_connectors, key=lambda c: (c.name, c.kind or "")
+                )
+            ],
         }
 
     def get_execution_snapshot(self, root_context: Any) -> dict[str, Any]:
@@ -1454,6 +1466,15 @@ class DAGPattern(AgentPattern):
                     self.memory_input_text = str(child_memory_input)
                     break
         self.max_concurrency = max(1, int(state.get("max_concurrency", 4)))
+        self.run_connectors.clear()  # in place: step patterns share this set
+        for stored in state.get("run_connectors") or []:
+            if isinstance(stored, dict) and isinstance(stored.get("name"), str):
+                kind = stored.get("kind")
+                self.run_connectors.add(
+                    ResultCardConnector(
+                        stored["name"], kind if isinstance(kind, str) else None
+                    )
+                )
         feedback = state.get("completion_feedback")
         self.completion_feedback = str(feedback) if feedback else None
         self.completion_replan_count = int(state.get("completion_replan_count", 0))

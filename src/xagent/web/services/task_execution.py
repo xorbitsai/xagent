@@ -74,8 +74,8 @@ from ...core.agent.checkpoint import (
 )
 from ...core.agent.interruption import InterruptionReason
 from ...core.agent.result_card import (
-    RESULT_CARD_DISPLAY,
     RESULT_CARD_MESSAGE_TYPE,
+    result_card_metadata,
 )
 from ...core.agent.runner import (
     InjectionDisposition,
@@ -1040,7 +1040,7 @@ def _persist_agent_outbound_event(
                     turn_id=turn_id,
                 )
 
-        elif _is_result_card_event_data(data):
+        elif (card_metadata := result_card_metadata(data)) is not None:
             task = db.query(DatabaseTask).filter(DatabaseTask.id == task_id).first()
             task_user_id = _task_user_id(task) if task else None
             message = str(data.get("message") or "")
@@ -1051,7 +1051,7 @@ def _persist_agent_outbound_event(
                     user_id=task_user_id,
                     content=message,
                     message_type=RESULT_CARD_MESSAGE_TYPE,
-                    message_metadata=_result_card_message_metadata(data),
+                    message_metadata=card_metadata,
                     source_event_id=str(trace_event.event_id),
                     execution_event_id=execution_event_id,
                     turn_id=turn_id,
@@ -1082,30 +1082,12 @@ def _persist_agent_outbound_event(
         db.close()
 
 
-def _is_result_card_event_data(data: Dict[str, Any]) -> bool:
-    metadata = data.get("metadata")
-    return (
-        isinstance(metadata, dict)
-        and metadata.get("display") == RESULT_CARD_DISPLAY
-        and isinstance(metadata.get("result_card"), dict)
-    )
-
-
-def _result_card_message_metadata(data: Dict[str, Any]) -> Dict[str, Any]:
-    """The part of an outbound card event kept on its transcript row."""
-    metadata = cast(Dict[str, Any], data["metadata"])
-    return {
-        "display": RESULT_CARD_DISPLAY,
-        "result_card": metadata["result_card"],
-    }
-
-
 def _agent_outbound_event_type(payload: Dict[str, Any]) -> str:
     message_type = str(payload.get("message_type") or "info")
     if (
         bool(payload.get("expect_response"))
         or message_type == "question"
-        or message_type == RESULT_CARD_MESSAGE_TYPE
+        or result_card_metadata(payload) is not None
     ):
         return "agent_message"
     return "agent_progress"

@@ -2400,6 +2400,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
         self.source_server = source_server
+        self.source_kind = "mcp"
         self._workspace = workspace
         self._durable_upload_fields = durable_upload_fields
         self._durable_upload_own_file_id = durable_upload_own_file_id
@@ -4870,6 +4871,7 @@ class UnavailableMCPTool(AbstractBaseTool):
         self._message = message
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
+        self.source_kind = "mcp"
         self.category = ToolCategory.MCP
 
     @property

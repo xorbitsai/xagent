@@ -181,6 +181,7 @@ class CustomApiTool(AbstractBaseTool):
         from .selection_spec import normalize_mcp_server_name
 
         self.source_server = normalize_mcp_server_name(name)
+        self.source_kind = "custom_api"
 
         default_info = ""
         if url:

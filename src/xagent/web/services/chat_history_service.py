@@ -18,6 +18,7 @@ from ...core.agent.context.execution import (
     COMPACT_SUMMARY_METADATA_KEY,
     COMPACT_WATERMARK_METADATA_KEY,
 )
+from ...core.agent.result_card import RESULT_CARD_MESSAGE_TYPE
 from ...core.agent.transcript import (
     build_assistant_transcript_content,
     normalize_transcript_messages,
@@ -1003,6 +1004,11 @@ def load_task_transcript_window(
     query = db.query(TaskChatMessage).filter(
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.message_type != INPUT_REVIEW_REJECTED_MESSAGE_TYPE,
+        # A result card only displays data the run already holds in its tool
+        # results, and the agent still answers in its own words; replaying the
+        # card as a title-only assistant turn would mislead the model. The v2
+        # context skips it too.
+        TaskChatMessage.message_type.is_distinct_from(RESULT_CARD_MESSAGE_TYPE),
         or_(
             TaskChatMessage.role != "user",
             TaskChatMessage.delivery_status.is_distinct_from(DELIVERY_FAILED),

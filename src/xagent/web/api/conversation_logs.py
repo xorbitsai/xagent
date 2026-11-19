@@ -124,6 +124,9 @@ EXPORT_FETCH_BATCH = 500
 # Excel holds at most 32,767 UTF-16 code units in a cell; the conversation cell
 # is cut below that so the truncation marker still fits.
 EXPORT_CELL_CHAR_LIMIT = 32_000
+# Message rows fetched from the database at a time while a conversation cell is
+# built, so memory does not grow with the length of the history.
+EXPORT_MESSAGE_FETCH_ROWS = 20
 EXPORT_TOO_LARGE_CODE = "conversation_log_export_too_large"
 EXPORT_COLUMNS = (
     "conversation_id",
@@ -1190,25 +1193,56 @@ def _utf16_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _truncate_export_cell(text: str) -> str:
-    """``text`` cut to ``EXPORT_CELL_CHAR_LIMIT`` UTF-16 units, with a marker.
+class _ExportCellBuilder:
+    """One conversation cell, built block by block without holding the history.
 
-    Excel counts a cell in UTF-16 code units, so a character outside the BMP
-    counts twice and is never split. The marker states how many units were
-    dropped.
+    Only a prefix of at most ``EXPORT_CELL_CHAR_LIMIT`` UTF-16 units is kept;
+    everything after it is only counted. Excel counts a cell in UTF-16 code
+    units, so a character outside the BMP counts twice and is never split. The
+    result is the blocks joined by a blank line and cut at the limit, with a
+    marker stating how many units were dropped.
     """
-    total = _utf16_units(text)
-    if total <= EXPORT_CELL_CHAR_LIMIT:
+
+    __slots__ = ("_parts", "_kept", "_dropped", "_full", "_started")
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._kept = 0
+        self._dropped = 0
+        self._full = False
+        self._started = False
+
+    def _append(self, text: str) -> None:
+        units = _utf16_units(text)
+        if self._full:
+            self._dropped += units
+            return
+        if self._kept + units <= EXPORT_CELL_CHAR_LIMIT:
+            self._parts.append(text)
+            self._kept += units
+            return
+        kept_chars = 0
+        for char in text:
+            char_units = _utf16_units(char)
+            if self._kept + char_units > EXPORT_CELL_CHAR_LIMIT:
+                break
+            self._kept += char_units
+            kept_chars += 1
+        self._parts.append(text[:kept_chars])
+        self._dropped += units - _utf16_units(text[:kept_chars])
+        self._full = True
+
+    def add_block(self, block: str) -> None:
+        if self._started:
+            self._append("\n\n")
+        self._append(block)
+        self._started = True
+
+    def finish(self) -> str:
+        text = "".join(self._parts)
+        if self._dropped:
+            text += f"\n\n[truncated: {self._dropped:,} more characters]"
         return text
-    kept_units = 0
-    kept_chars = 0
-    for char in text:
-        units = _utf16_units(char)
-        if kept_units + units > EXPORT_CELL_CHAR_LIMIT:
-            break
-        kept_units += units
-        kept_chars += 1
-    return f"{text[:kept_chars]}\n\n[truncated: {total - kept_units:,} more characters]"
 
 
 def _export_role_label(role: str | None) -> str:
@@ -1228,9 +1262,12 @@ def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, 
     A v1 message is written as stored; a v2 message is the text the detail
     page's event projection produces. A task whose v2 events cannot be projected gets
     ``EXPORT_CONVERSATION_UNAVAILABLE``. A task without messages has no key.
+    Messages are read ``EXPORT_MESSAGE_FETCH_ROWS`` rows at a time and each cell
+    keeps only its truncated prefix, so memory per batch does not grow with the
+    number of messages; a single message is still read whole.
     """
     ids = list(task_ids)
-    blocks: dict[int, list[str]] = {}
+    cells: dict[int, _ExportCellBuilder] = {}
 
     v1_rows = db.execute(
         select(
@@ -1252,11 +1289,15 @@ def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, 
             TaskChatMessage.role != "user",
             TaskChatMessage.id,
         )
+        .execution_options(yield_per=EXPORT_MESSAGE_FETCH_ROWS)
     )
-    for task_id, role, content, created_at in v1_rows:
-        blocks.setdefault(int(task_id), []).append(
-            _export_message_block(role, content, created_at)
-        )
+    try:
+        for task_id, role, content, created_at in v1_rows:
+            cells.setdefault(int(task_id), _ExportCellBuilder()).add_block(
+                _export_message_block(role, content, created_at)
+            )
+    finally:
+        v1_rows.close()
 
     unavailable: set[int] = set()
     v2_events = db.scalars(
@@ -1270,32 +1311,34 @@ def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, 
             TaskExecutionEvent.kind.in_(_EXPORT_MESSAGE_EVENT_KINDS),
         )
         .order_by(TaskExecutionEvent.task_id, TaskExecutionEvent.sequence)
+        .execution_options(yield_per=EXPORT_MESSAGE_FETCH_ROWS)
     )
-    for event in v2_events:
-        task_id = int(event.task_id)
-        if task_id in unavailable:
-            continue
-        try:
-            message = project_event_message(event)
-        except ValueError:
-            logger.warning(
-                "Conversation export could not project the events of task %s",
-                task_id,
+    try:
+        for event in v2_events:
+            task_id = int(event.task_id)
+            if task_id in unavailable:
+                continue
+            try:
+                message = project_event_message(event)
+            except ValueError:
+                logger.warning(
+                    "Conversation export could not project the events of task %s",
+                    task_id,
+                )
+                cells.pop(task_id, None)
+                unavailable.add(task_id)
+                continue
+            if message is None or is_display_none_metadata(message["message_metadata"]):
+                continue
+            cells.setdefault(task_id, _ExportCellBuilder()).add_block(
+                _export_message_block(
+                    message["role"], message["content"], message["created_at"]
+                )
             )
-            unavailable.add(task_id)
-            continue
-        if message is None or is_display_none_metadata(message["message_metadata"]):
-            continue
-        blocks.setdefault(task_id, []).append(
-            _export_message_block(
-                message["role"], message["content"], message["created_at"]
-            )
-        )
+    finally:
+        v2_events.close()
 
-    transcripts = {
-        task_id: _truncate_export_cell("\n\n".join(parts))
-        for task_id, parts in blocks.items()
-    }
+    transcripts = {task_id: cell.finish() for task_id, cell in cells.items()}
     for task_id in unavailable:
         transcripts[task_id] = EXPORT_CONVERSATION_UNAVAILABLE
     return transcripts

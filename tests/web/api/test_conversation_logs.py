@@ -4,9 +4,11 @@ import csv
 import gc
 import io
 import logging
+import random
 import re
 import secrets
 import tempfile
+import tracemalloc
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
@@ -1597,6 +1599,80 @@ def test_export_conversation_is_empty_without_messages() -> None:
     assert _conversation_cells(headers)[str(task_id)] == ""
 
 
+def _units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _reference_join_then_truncate(blocks: list[str]) -> str:
+    """The cell as one string: blocks joined by a blank line, then cut."""
+    text = "\n\n".join(blocks)
+    total = _units(text)
+    if total <= conversation_logs.EXPORT_CELL_CHAR_LIMIT:
+        return text
+    kept_units = 0
+    kept_chars = 0
+    for char in text:
+        units = _units(char)
+        if kept_units + units > conversation_logs.EXPORT_CELL_CHAR_LIMIT:
+            break
+        kept_units += units
+        kept_chars += 1
+    return f"{text[:kept_chars]}\n\n[truncated: {total - kept_units:,} more characters]"
+
+
+def _build_cell(blocks: list[str]) -> str:
+    cell = conversation_logs._ExportCellBuilder()
+    for block in blocks:
+        cell.add_block(block)
+    return cell.finish()
+
+
+def _random_blocks(seed: int) -> list[str]:
+    rng = random.Random(seed)
+    alphabet = "ab\n\U0001f600\u4e2d"
+
+    def block() -> str:
+        kind = rng.random()
+        if kind < 0.1:
+            return ""
+        if kind < 0.2:
+            return "\U0001f600" * rng.randint(1, 4_000)
+        return "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 9_000)))
+
+    blocks = [block() for _ in range(rng.randint(1, 6))]
+    if seed % 3 == 0:
+        # Aim the joined length at the limit, within a few units either side.
+        target = conversation_logs.EXPORT_CELL_CHAR_LIMIT + rng.randint(-3, 3)
+        head = blocks[:-1]
+        used = _units("\n\n".join(head)) + (2 if head else 0)
+        blocks = [*head, "a" * max(0, target - used)]
+    return blocks
+
+
+_HEADER = "[2026-03-01 09:00 UTC] User:\n"
+CELL_CASES = {
+    "cut_inside_body": ["a" * 20_000, _HEADER + "b" * 20_000],
+    "cut_inside_next_header": ["a" * 31_990, _HEADER + "b" * 50],
+    "cut_inside_separator": ["a" * 31_999, "next"],
+    "cut_on_emoji_then_short_block": ["a" * 31_999 + "\U0001f600", "xx"],
+    "exactly_at_limit": ["a" * 15_999, "b" * 16_000],
+    "one_unit_over": ["a" * 15_999, "b" * 16_001],
+}
+
+
+@pytest.mark.parametrize("blocks", CELL_CASES.values(), ids=list(CELL_CASES))
+def test_export_cell_builder_matches_join_then_truncate(blocks: list[str]) -> None:
+    assert _build_cell(blocks) == _reference_join_then_truncate(blocks)
+
+
+def test_export_cell_builder_matches_join_then_truncate_on_random_input() -> None:
+    for seed in range(400):
+        blocks = _random_blocks(seed)
+        got = _build_cell(blocks)
+        want = _reference_join_then_truncate(blocks)
+        assert got == want, f"seed={seed} lens={[len(b) for b in blocks]}"
+
+
 @pytest.mark.parametrize(
     ("text_value", "kept_chars", "dropped"),
     [
@@ -1605,14 +1681,14 @@ def test_export_conversation_is_empty_without_messages() -> None:
         ("a" * 31_999 + "\U0001f600" + "b", 31_999, 3),
     ],
 )
-def test_truncate_export_cell_counts_utf16_units_and_never_splits_a_pair(
+def test_export_cell_builder_counts_utf16_units_and_never_splits_a_pair(
     text_value: str, kept_chars: int, dropped: int
 ) -> None:
-    result = conversation_logs._truncate_export_cell(text_value)
+    result = _build_cell([text_value])
 
     tail = f"\n\n[truncated: {dropped} more characters]" if dropped else ""
     assert result == text_value[:kept_chars] + tail
-    assert len(result.encode("utf-16-le")) // 2 <= 32_767
+    assert _units(result) <= 32_767
 
 
 def test_export_conversation_cell_is_truncated_in_the_file() -> None:
@@ -1712,6 +1788,104 @@ def test_export_conversation_marks_only_the_task_whose_events_cannot_be_read(
     assert [m for m in warnings if "could not project" in m] == [
         f"Conversation export could not project the events of task {broken}"
     ]
+
+
+def test_load_export_transcripts_peak_memory_is_independent_of_history_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.task_execution_event_writer import append_fact_no_commit
+
+    _admin_headers()
+    user_id = _user_id("admin")
+    body = "x" * 50_000
+    count = 200
+    v1 = _sdk_task(user_id, "v1 long")
+    _add_messages(
+        task_id=v1,
+        user_id=user_id,
+        messages=[
+            ("user", body, _minute(9, 0) + timedelta(seconds=i)) for i in range(count)
+        ],
+    )
+    v2 = _v2_task(user_id, "v2 long")
+    with _direct_db_session() as db:
+        for i in range(count):
+            append_fact_no_commit(
+                db,
+                task_id=v2,
+                kind="input_accepted",
+                key=f"k{i}",
+                run_id="run-1",
+                turn_id=f"k{i}",
+                payload={"content": body, "message_type": "user"},
+                occurred_at=_minute(9, 0) + timedelta(seconds=i),
+            )
+        db.commit()
+    expected = {
+        v1: _reference_join_then_truncate(
+            [
+                conversation_logs._export_message_block(
+                    "user", body, _minute(9, 0) + timedelta(seconds=i)
+                )
+                for i in range(count)
+            ]
+        ),
+    }
+    expected[v2] = expected[v1]
+    monkeypatch.setattr(conversation_logs, "EXPORT_MESSAGE_FETCH_ROWS", 2)
+
+    def load() -> dict[int, str]:
+        with _direct_db_session() as db:
+            return conversation_logs._load_export_transcripts(db, [v1, v2])
+
+    load()  # warm caches so only the call's own allocations are measured
+    tracemalloc.start()
+    try:
+        result = load()
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert result == expected
+    assert peak < 2 * 1024 * 1024
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_export_closes_conversation_results_when_reading_fails(
+    version: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.engine import cursor, result
+
+    _admin_headers()
+    user_id = _user_id("admin")
+    if version == 1:
+        task_id = _sdk_task(user_id)
+        _add_messages(task_id, user_id, [("user", "hello", _minute(9, 0))])
+        monkeypatch.setattr(conversation_logs, "_export_message_block", _boom)
+    else:
+        task_id = _v2_task(user_id)
+        _add_v2_input(task_id, "k1", "hello", _minute(9, 0))
+        monkeypatch.setattr(conversation_logs, "project_event_message", _boom)
+    # The v1 query returns a row result, the v2 query a scalar result.
+    closed: list[str] = []
+    for owner in (result.Result, cursor.CursorResult, result.FilterResult):
+        original = owner.close
+
+        def spy(self: Any, _original: Any = original) -> None:
+            closed.append("scalar" if isinstance(self, result.FilterResult) else "row")
+            _original(self)
+
+        monkeypatch.setattr(owner, "close", spy)
+
+    with _direct_db_session() as db:
+        with pytest.raises(RuntimeError, match="reading failed"):
+            conversation_logs._load_export_transcripts(db, [task_id])
+
+    assert "row" in closed if version == 1 else "scalar" in closed
+
+
+def _boom(*args: Any, **kwargs: Any) -> Any:
+    raise RuntimeError("reading failed")
 
 
 def test_conversation_logs_list_does_not_preload_off_page_messages() -> None:

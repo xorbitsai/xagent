@@ -172,7 +172,7 @@ class KBToolCompatibilityFacade:
         *,
         user_id: int,
         is_admin: bool = False,
-        embedding_model_id: Optional[str] = None,
+        embedding_model_id: Optional[str],
     ) -> Any:
         from ....adapters.vibe import file_ingestion_tool
 
@@ -190,7 +190,7 @@ class KBToolCompatibilityFacade:
         *,
         user_id: int,
         is_admin: bool = False,
-        embedding_model_id: Optional[str] = None,
+        embedding_model_id: Optional[str],
     ) -> Any:
         from ....adapters.vibe import web_ingestion_tool
 

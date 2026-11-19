@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -11,6 +12,8 @@ from ..models.uploaded_file import UploadedFile
 from .db_runtime import run_db_io_cancellation_safe
 from .llm_utils import UserAwareModelStorage
 from .model_service import get_default_embedding_model
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -84,13 +87,21 @@ def _load_builder_chat_runtime_inputs_sync(
             if compact_llm is None:
                 compact_llm = default_compact_llm
 
+        try:
+            embedding_model_id = get_default_embedding_model(user_id, db=db)
+        except Exception:
+            logger.warning(
+                "Default embedding lookup failed for user %s", user_id, exc_info=True
+            )
+            embedding_model_id = None
+
         return BuilderChatRuntimeInputs(
             authorized_file_ids=tuple(
                 file_id for file_id in ordered_file_ids if file_id in authorized_ids
             ),
             llm=llm,
             compact_llm=compact_llm,
-            embedding_model_id=get_default_embedding_model(user_id, db=db),
+            embedding_model_id=embedding_model_id,
         )
 
 

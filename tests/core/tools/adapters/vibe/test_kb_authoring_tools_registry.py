@@ -55,7 +55,7 @@ def test_kb_search_creator_stays_registered() -> None:
 def test_authoring_tool_classes_keep_their_names_and_sync_contract(tool_cls) -> None:
     # The builder-chat mounting itself is pinned by
     # tests/web/api/test_websocket_builder_chat.py.
-    tool = tool_cls(user_id=1)
+    tool = tool_cls(user_id=1, embedding_model_id=None)
     assert tool.name in KB_AUTHORING_TOOL_NAMES
     with pytest.raises(NotImplementedError, match="Only supports async execution."):
         tool.run_json_sync({})

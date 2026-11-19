@@ -62,7 +62,8 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
         self,
         user_id: int,
         is_admin: bool = False,
-        embedding_model_id: Optional[str] = None,
+        *,
+        embedding_model_id: Optional[str],
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.user_id = user_id
@@ -136,7 +137,7 @@ async def _create_knowledge_base_from_file_impl(
     *,
     user_id: int,
     is_admin: bool = False,
-    embedding_model_id: Optional[str] = None,
+    embedding_model_id: Optional[str],
 ) -> Any:
     from ...core.RAG_tools.core.exceptions import CollectionMigratingError
     from ...core.RAG_tools.management.migration_state import (

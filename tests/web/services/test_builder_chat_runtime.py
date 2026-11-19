@@ -112,6 +112,65 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
 
 
 @pytest.mark.asyncio
+async def test_load_builder_chat_runtime_inputs_survives_embedding_lookup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    selected_llm = object()
+    compact_llm = object()
+
+    class FakeQuery:
+        def filter(self, *_conditions: object) -> FakeQuery:
+            return self
+
+        def all(self) -> list[object]:
+            return []
+
+    class FakeSession:
+        def __enter__(self) -> FakeSession:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def query(self, _model: object) -> FakeQuery:
+            return FakeQuery()
+
+    class FakeStorage:
+        def __init__(self, _session: FakeSession) -> None:
+            pass
+
+        def get_llm_by_name_with_access(
+            self, model_name: object, user_id: int | None = None
+        ) -> object:
+            return selected_llm if model_name == "selected" else compact_llm
+
+    def failing_default_embedding(_user_id: int, *, db: object) -> str:
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(builder_chat_runtime, "get_session_local", lambda: FakeSession)
+    monkeypatch.setattr(builder_chat_runtime, "UserAwareModelStorage", FakeStorage)
+    monkeypatch.setattr(
+        builder_chat_runtime, "get_default_embedding_model", failing_default_embedding
+    )
+
+    result = await load_builder_chat_runtime_inputs(
+        user_id=42,
+        requested_file_ids=(),
+        model_name="selected",
+        compact_model_name="compact",
+    )
+
+    assert result == BuilderChatRuntimeInputs(
+        authorized_file_ids=(),
+        llm=selected_llm,
+        compact_llm=compact_llm,
+        embedding_model_id=None,
+    )
+    assert "Default embedding lookup failed" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_load_builder_chat_runtime_inputs_keeps_event_loop_responsive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -636,6 +636,60 @@ describe("Sidebar teammate conversations", () => {
     expect(row?.querySelector("img")).toHaveAttribute("src", "/marketplace/avatars/maya.png")
   })
 
+  it("keeps teammate avatars in the collapsed rail and opens their latest chat", async () => {
+    render(<Sidebar />)
+    await screen.findByText("Maya")
+    fireEvent.click(screen.getByRole("button", { name: resolveTranslation("en", "workspace.closeNavigation") }))
+
+    const rail = screen.getByRole("navigation", { name: resolveTranslation("en", "workspace.yourTeam") })
+    const maya = await within(rail).findByRole("link", { name: "Maya" })
+    expect(maya).toHaveAttribute("title", "Maya — Latest chat")
+    expect(within(rail).getByRole("link", { name: "Custom Bot" })).toBeInTheDocument()
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument()
+
+    fireEvent.click(maya)
+    // The first-conversation lookup resolves server-side (the mock returns task 101 first).
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/task/101"))
+  })
+
+  it("renders the phone home variant as a teammate list with a bottom menu", async () => {
+    render(<Sidebar variant="mobile-home" />)
+
+    const maya = await screen.findByRole("link", { name: /Maya/ })
+    expect(screen.getByRole("link", { name: /Custom Bot/ })).toBeInTheDocument()
+    expect(screen.getByRole("searchbox")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: resolveTranslation("en", "workspace.startNew") })).toBeInTheDocument()
+    // The desktop chrome (Recent toggle, footer links, drawer) is not part of the phone home.
+    expect(screen.queryByRole("button", { name: resolveTranslation("en", "workspace.showRecent") })).not.toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: resolveTranslation("en", "workspace.files") })).not.toBeInTheDocument()
+    expect(screen.queryByTestId("workspace-menu")).not.toBeInTheDocument()
+
+    fireEvent.click(maya)
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/task/101"))
+  })
+
+  it("opens the account menu from the phone home's bottom icon, and closes it again", async () => {
+    render(<Sidebar variant="mobile-home" />)
+    await screen.findByRole("link", { name: /Maya/ })
+
+    const trigger = screen.getByRole("button", { name: resolveTranslation("en", "workspace.openNavigation") })
+    fireEvent.click(trigger)
+    const menu = screen.getByTestId("workspace-menu")
+    expect(within(menu).getByRole("button", { name: "sidebar.user.logoutTitle" })).toBeInTheDocument()
+
+    fireEvent.click(trigger)
+    expect(screen.queryByTestId("workspace-menu")).not.toBeInTheDocument()
+  })
+
+  it("opens Tools and apps from the collapsed rail and links Files", async () => {
+    routeState.pathname = "/agent"
+    render(<Sidebar />)
+
+    fireEvent.click(screen.getByRole("button", { name: "nav.toolsAndApps" }))
+    expect(screen.getByRole("dialog", { name: "Connectors" })).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: resolveTranslation("en", "workspace.files") })).toHaveAttribute("href", "/files")
+  })
+
   it("searches the server after a debounce and loads older matching conversations", async () => {
     const baseFetch = globalThis.fetch
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

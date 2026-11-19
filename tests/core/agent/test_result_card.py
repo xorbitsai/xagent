@@ -611,8 +611,9 @@ def _cards(runtime: PatternRuntime) -> list[dict[str, Any]]:
 async def test_card_in_a_later_dag_step_accepts_a_connector_used_in_an_earlier_one() -> (
     None
 ):
-    from .test_dag import build_plan
     from xagent.core.agent import DAGPattern, PlanStep
+
+    from .test_dag import build_plan
 
     _enable()
     plan = build_plan(
@@ -655,8 +656,9 @@ async def test_card_in_a_later_dag_step_accepts_a_connector_used_in_an_earlier_o
 async def test_a_failed_connector_call_in_one_dag_step_does_not_count_for_the_next() -> (
     None
 ):
-    from .test_dag import build_plan
     from xagent.core.agent import DAGPattern, PlanStep
+
+    from .test_dag import build_plan
 
     _enable()
     cosmos = _CosmosQuery()
@@ -693,8 +695,9 @@ async def test_a_failed_connector_call_in_one_dag_step_does_not_count_for_the_ne
 
 @pytest.mark.asyncio
 async def test_concurrent_dag_steps_share_the_run_level_connector_set() -> None:
-    from .test_dag import build_plan
     from xagent.core.agent import DAGPattern, PlanStep
+
+    from .test_dag import build_plan
 
     _enable()
     plan = build_plan(

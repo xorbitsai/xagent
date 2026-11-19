@@ -220,7 +220,12 @@ def load_event_chat_message(
         )
     )
     if message is not None:
-        for field in ("content", "attachments", "interactions"):
+        for field in (
+            "content",
+            "attachments",
+            "interactions",
+            "message_metadata",
+        ):
             # Supply the existing return shape without fetching or rewriting
             # the legacy content columns, even in an already populated session.
             set_committed_value(message, field, event.payload.get(field))
@@ -260,6 +265,9 @@ def stage_chat_message_no_commit(
         "delivery_status": message.delivery_status,
         "source_event_id": message.source_event_id,
     }
+    if message.message_metadata:
+        # Only present when set, so facts without metadata keep their shape.
+        payload["message_metadata"] = message.message_metadata
     # A fresh input can be withdrawn before injection and handed to a new run.
     # Acceptance is still the same occurrence; retain its original provenance.
     run_id = cast(str | None, task.run_id)

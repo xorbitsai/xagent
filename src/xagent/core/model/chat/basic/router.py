@@ -469,21 +469,26 @@ class RouterLLM(BaseLLM):
 
     @property
     def accepts_image_input(self) -> bool:
-        """Whether every candidate of a configured Auto reads images.
+        """Whether a call with an image can be served by a configured Auto.
 
         ``abilities`` never lists ``vision`` for a router, because which model
-        answers is decided per call. A configured Auto whose candidates all
-        accept images can nevertheless take an image whichever one is chosen,
-        so an image-only tool may use it. One text-only candidate, or an Auto
-        without configured candidates, makes this False.
+        answers is decided per call. A call with an image only reaches
+        candidates that read images (the others are skipped), so one such
+        candidate is enough for an image-only tool to use the Auto. The check
+        runs over the candidates a call can actually reach: those left after
+        ``XAGENT_XROUTER_EXCLUDED_MODELS``, plus a fallback that reads images.
+        An Auto without configured candidates, or whose reachable models are
+        all text-only (or unchecked), makes this False.
         """
 
         if not self._candidate_models:
             return False
-        return all(
-            "image" in self._input_modalities(candidate)
-            for candidate in self._candidate_models
-        )
+        reachable = self._eligible_candidates()
+        if reachable is None:
+            reachable = self._candidate_models
+        if any("image" in self._input_modalities(model) for model in reachable):
+            return True
+        return self._usable_fallback(("image",)) is not None
 
     @property
     def uses_sequential_failover(self) -> bool:

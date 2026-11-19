@@ -205,6 +205,18 @@ describe("WidgetHistoryView", () => {
       expect(screen.getByTestId("composer")).toBeInTheDocument()
     })
 
+    it("offers load-more, not the empty view, when a page has no messages but a cursor", async () => {
+      history.read
+        .mockResolvedValueOnce(messagePage([], "cursor-2"))
+        .mockResolvedValueOnce(messagePage([message(1, "user", "older")]))
+      renderView()
+
+      const loadMore = await screen.findByRole("button", { name: "widgetSession.history.loadMore" })
+      expect(screen.queryByText("widgetSession.history.viewEmpty")).not.toBeInTheDocument()
+      fireEvent.click(loadMore)
+      expect(await screen.findByText("older")).toBeInTheDocument()
+    })
+
     it("shows that the conversation can no longer be viewed and takes the composer away", async () => {
       history.read.mockRejectedValue(new WidgetSessionHistoryError("not_found"))
       renderView()

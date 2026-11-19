@@ -15,6 +15,9 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
 import { TeammateSummary } from "./teammate-summary"
+import { ConnectorInteraction } from "./connector/ConnectorInteraction"
+import { ConnectorUnusableNotice } from "./connector/ConnectorUnusableNotice"
+import { parseConnectorInfo, type ConnectorInfo } from "./connector/types"
 import { canDeferClarification, CLARIFICATION_PAGE_SIZE, suggestedClarificationValue } from "./clarification-guidance"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import { clientErrorTranslationKey, type ClientErrorCode } from "@/lib/client-errors"
@@ -75,10 +78,32 @@ const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
 export function ClarificationForm(props: ClarificationFormProps) {
   const summaries = props.interactions.filter((interaction) => interaction.type === "teammate_summary")
-  const fields = props.interactions.filter((interaction) => interaction.type !== "teammate_summary")
+  // Each connect_connector entry is its own card, with its own settle state;
+  // every other entry goes to the normal form, with its own fields, Submit and
+  // text box. The host continues the whole waiting batch on the first reply it
+  // gets (a settled card or the form's answer), so the other entries may stop
+  // being needed; their cards then say so. A connect_connector entry is never
+  // shown as an input.
+  const connectors: ConnectorInfo[] = []
+  const fields: Interaction[] = []
+  let hasUnusable = false
+  for (const interaction of props.interactions) {
+    if (interaction.type === "teammate_summary") continue
+    if (interaction.type !== "connect_connector") {
+      fields.push(interaction)
+      continue
+    }
+    const connector = parseConnectorInfo(interaction.connector, interaction.interaction_id)
+    if (connector) connectors.push(connector)
+    else hasUnusable = true
+  }
   return (
     <div className="space-y-4">
       {summaries.map((interaction, index) => <TeammateSummary key={`${interaction.field}-${index}`} interaction={interaction} />)}
+      {connectors.map((connector) => (
+        <ConnectorInteraction key={connector.interaction_id} connector={connector} active={props.active ?? true} />
+      ))}
+      {hasUnusable && <ConnectorUnusableNotice />}
       {fields.length > 0 && <ClarificationFields {...props} interactions={fields} />}
     </div>
   )

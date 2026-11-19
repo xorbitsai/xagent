@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest"
 import {
   AgentChannelHeaderAction,
   AgentChannelOption,
+  AgentChannelProfileSection,
   AgentChannelView,
 } from "./agent-channel-extension"
 
@@ -17,6 +18,7 @@ describe("agent channel extension default", () => {
       <>
         <AgentChannelHeaderAction agent={agent} onOpen={vi.fn()} />
         <AgentChannelOption agent={agent} onOpen={vi.fn()} />
+        <AgentChannelProfileSection agent={agent} onOpenDeploy={vi.fn()} />
         <AgentChannelView agent={agent} onBack={vi.fn()} onClose={vi.fn()} />
       </>,
     )

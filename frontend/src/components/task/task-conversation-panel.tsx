@@ -1,9 +1,11 @@
 "use client"
 
+import type { ResultCardData } from "@/components/chat/connector/types"
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput"
+import { QueuedMessageList } from "@/components/chat/queued-message-list"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import { VoiceConversation } from "@/components/chat/voice-conversation"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
@@ -98,6 +100,7 @@ type CombinedItem = {
   traceEvents?: any[]
   interactions?: any[]
   interactionRequestId?: string
+  resultCard?: ResultCardData
   showEmptyStatus?: boolean
   processStatus?: string
   showInterruptedStatus?: boolean
@@ -337,6 +340,8 @@ export function TaskConversationPanel({
     connectionNotice,
     isConnected,
     messageQueue,
+    newTurnDelivery,
+    sessionConversationState,
   } = useApp()
   const accentAttributes = useAgentAccentAttributes(agent)
   const fileAccess = useFileAccess()
@@ -461,6 +466,7 @@ export function TaskConversationPanel({
           ),
           interactions: message.interactions,
           interactionRequestId: message.interactionRequestId,
+          resultCard: message.resultCard,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -1111,6 +1117,7 @@ export function TaskConversationPanel({
                         timestamp={item.timestamp}
                         interactions={item.interactions}
                         interactionRequestId={item.interactionRequestId}
+                        resultCard={item.resultCard}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
@@ -1235,6 +1242,12 @@ export function TaskConversationPanel({
               <div className="pointer-events-none absolute bottom-full left-1/2 mb-3 -translate-x-1/2">
                 <VoiceOrb call={voiceOrbCall} className="h-[88px] w-[88px]" />
               </div>
+            )}
+            {messageQueue && (
+              <QueuedMessageList
+                queue={messageQueue}
+                canContinue={newTurnDelivery === "supported" && sessionConversationState === "bound"}
+              />
             )}
             <ChatInput
               onSend={handleSend}

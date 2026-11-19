@@ -1,6 +1,7 @@
 import type {
   AgentChannelHeaderActionComponent,
   AgentChannelOptionComponent,
+  AgentChannelProfileSectionComponent,
   AgentChannelViewComponent,
 } from "@/lib/page-extension-contracts"
 
@@ -11,3 +12,5 @@ export const AgentChannelHeaderAction: AgentChannelHeaderActionComponent = () =>
 export const AgentChannelOption: AgentChannelOptionComponent = () => null
 
 export const AgentChannelView: AgentChannelViewComponent = () => null
+
+export const AgentChannelProfileSection: AgentChannelProfileSectionComponent = () => null

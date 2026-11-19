@@ -230,6 +230,7 @@ def claim_user_message_delivery_no_commit(
     *,
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: str,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> UserMessageDeliveryClaim:
     """Stage a delivery claim without committing the caller's transaction.
 
@@ -266,6 +267,7 @@ def claim_user_message_delivery_no_commit(
         turn_id=turn_id,
         delivery_status=DELIVERY_PENDING,
         attachments=attachments,
+        message_metadata=message_metadata or None,
     )
     message = stage_chat_message_no_commit(db, message)
     # Before the insert, not after it: this is the one staging path that
@@ -651,6 +653,7 @@ def persist_user_message(
     *,
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[TaskChatMessage]:
     return _persist_message(
         db=db,
@@ -661,6 +664,7 @@ def persist_user_message(
         message_type="user_message",
         attachments=attachments,
         turn_id=turn_id,
+        message_metadata=message_metadata,
     )
 
 
@@ -673,6 +677,7 @@ def persist_user_message_no_commit(
     attachments: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     delivery_status: Optional[str] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[TaskChatMessage]:
     """``persist_user_message`` variant that stages the row but does NOT commit.
 
@@ -703,6 +708,7 @@ def persist_user_message_no_commit(
         # callers may want to distinguish "no attachments specified" from
         # "attachments key was set, just empty".
         attachments=attachments,
+        message_metadata=message_metadata or None,
     )
     message = stage_chat_message_no_commit(db, message)
     touch_task_last_activity(db, task_id)
@@ -1152,6 +1158,7 @@ def _persist_message(
     turn_id: Optional[str] = None,
     delivery_status: Optional[str] = None,
     source_event_id: Optional[str] = None,
+    message_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
     if not normalized_content and not attachments:
@@ -1170,6 +1177,7 @@ def _persist_message(
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,
+        message_metadata=message_metadata or None,
     )
     message = stage_chat_message_no_commit(db, message)
     touch_task_last_activity(db, task_id)

@@ -148,6 +148,49 @@ describe("ChatMessage Session file capability", () => {
     expect(appContextMock.openFilePreview).not.toHaveBeenCalled()
   })
 
+  it("renders a persisted connector result card under an assistant message", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Cosmos is connected. Picking up your request now."
+        resultCard={{
+          title: "Query · top customers by revenue",
+          source: { name: "Azure Cosmos DB", logo: { mark: "◎", bg: "#0078D4", fg: "#fff" } },
+          items: ["Contoso Ltd · $182,400"],
+          footnote: "1 of 1,284 customers · read-only query",
+        }}
+      />,
+    )
+    expect(screen.getByTestId("connector-result-card")).toBeInTheDocument()
+    expect(screen.getByText("Query · top customers by revenue")).toBeInTheDocument()
+    expect(screen.getByText("1 of 1,284 customers · read-only query")).toBeInTheDocument()
+  })
+
+  it("shows no generating indicator beside a result card whose message text is empty", () => {
+    const card = {
+      title: "Query · top customers",
+      source: { name: "Azure Cosmos DB", logo: { mark: "◎", bg: "#0078D4", fg: "#fff" } },
+      items: ["Contoso Ltd · $182,400"],
+    }
+    const indicator = /^common\.(planning|thinking)$/
+    // Control: the same empty message without a card does show the indicator.
+    const { unmount } = render(<ChatMessage role="assistant" content="" showEmptyStatus taskStatus="running" />)
+    expect(screen.getByText(indicator)).toBeInTheDocument()
+    unmount()
+    render(<ChatMessage role="assistant" content="" showEmptyStatus taskStatus="running" resultCard={card} />)
+    expect(screen.getByTestId("connector-result-card")).toBeInTheDocument()
+    expect(screen.queryByText(indicator)).toBeNull()
+  })
+
+  it.each([
+    ["only connector entries", [{ type: "connect_connector", field: "a", label: "A" }], false],
+    ["a connector entry beside another type", [{ type: "connect_connector", field: "a", label: "A" }, { type: "text_input", field: "b", label: "B" }], true],
+    ["no connector entry", [{ type: "text_input", field: "b", label: "B" }], true],
+  ])("keeps the separator above the form only when something other than cards renders: %s", (_label, interactions, separator) => {
+    const { container } = render(<ChatMessage role="assistant" content="Q" interactions={interactions} />)
+    expect(container.querySelector(".border-t.pt-4") !== null).toBe(separator)
+  })
+
   it("passes the resolved file capability to clarification interactions", () => {
     appContextMock.filesDisabled = true
 

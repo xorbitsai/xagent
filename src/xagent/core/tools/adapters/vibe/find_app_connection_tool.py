@@ -10,7 +10,8 @@ The host must ship a renderer for ``connect_connector``: it draws a card from
 the opaque ``connector`` payload and collects the credential out of band. The
 stock front end does not know the type. Without a renderer the user sees only
 the message text and, because ``live_widget`` suppresses the default text box,
-no field to answer in.
+no field to answer in. The renderer reads the interaction id from the item
+(see :class:`ConnectorResolution`).
 
 The tool is registered only while a resolver is set, is refused for the public
 ``widget`` and ``shared_link`` task sources, and is not offered to delegated
@@ -175,6 +176,9 @@ class FindAppConnectionTool(AbstractBaseTool):
                             "field": CONNECT_CONNECTOR_INTERACTION_TYPE,
                             "label": message,
                             LIVE_WIDGET_KEY: True,
+                            # The card calls the host's endpoints with this id;
+                            # it is the same value as the top-level one.
+                            "interaction_id": interaction_id,
                             "connector": dict(resolution.connector),
                         }
                     ],

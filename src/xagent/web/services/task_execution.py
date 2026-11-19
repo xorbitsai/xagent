@@ -4431,6 +4431,9 @@ async def execute_resume_background(
                                     "display_message"
                                 ),
                                 files=pending_user_message.get("files"),
+                                message_metadata=pending_user_message.get(
+                                    "message_metadata"
+                                ),
                                 turn_id=pending_user_message.get("turn_id"),
                                 request_interrupt=False,
                                 reason="deferred websocket user message",

@@ -154,3 +154,73 @@ export interface AgentChannelViewProps extends AgentChannelExtensionProps {
   onClose: () => void
 }
 export type AgentChannelViewComponent = ComponentType<AgentChannelViewProps>
+
+// Deploy dialog views a section outside the dialog can open directly.
+// `webhook` has no view of its own: the host opens its routines dialog.
+export type AgentDeployView = "options" | "channel" | "embed" | "api" | "share" | "webhook"
+
+// Section rendered inside the agent profile dialog (the phone-sized entry to
+// deployment options). `onOpenDeploy` closes the profile and opens `view`.
+export interface AgentChannelProfileSectionProps extends AgentChannelExtensionProps {
+  onOpenDeploy: (view: AgentDeployView) => void
+}
+export type AgentChannelProfileSectionComponent =
+  ComponentType<AgentChannelProfileSectionProps>
+
+// ---------------------------------------------------------------------------
+// Connecting an app from chat (`connect_connector` cards)
+//
+// The `connector` payload of the interaction and the types below are a
+// contract between a host and this frontend; the backend forwards the payload
+// as-is and defines no type for it.
+//
+// The module `lib/connector-connect.ts` is the extension point. It must export
+// the four functions of `ConnectorConnectExtension` as named exports. The OSS
+// default has no host service behind it and answers every call with
+// `state: "unavailable"` without calling any endpoint; a distribution that
+// provides the service replaces the module. `parseConnectorConnectResult`
+// (lib/connector-connect-response.ts) is available to a replacement for
+// turning a response body into a `ConnectorConnectResult`.
+//
+// Saving or skipping makes the host settle the interaction, which continues the
+// task through the normal event stream; the card never sends a chat message.
+// `taskResumed` says whether the host already queued the task to continue.
+// `resumeConnector` queues it again and must be idempotent on the host.
+// ---------------------------------------------------------------------------
+
+export type ConnectorConnectState = "pending" | "connected" | "failed" | "skipped" | "unavailable"
+
+export type ConnectorErrorCode =
+  | "auth_failed"
+  | "unreachable"
+  | "timeout"
+  | "no_tools"
+  | "invalid_field"
+
+export interface ConnectorToolSummary {
+  name: string
+  label: string
+}
+
+export interface ConnectorConnectResult {
+  state: ConnectorConnectState
+  errorCode: ConnectorErrorCode | null
+  /** Key of the field the error is about; the card ignores one that matches no field. */
+  errorField: string | null
+  /** Masked tail of the saved secret, e.g. "•••• •••• fdsf". Never a field value. */
+  secretMasked: string | null
+  scope: string | null
+  agentName: string | null
+  tools: ConnectorToolSummary[]
+  /** Whether the host has queued the task to continue; null when it does not say. */
+  taskResumed: boolean | null
+}
+
+export interface ConnectorConnectExtension {
+  /** Field values go only in the request body, and are never echoed back. */
+  saveConnector(interactionId: string, appId: string, values: Record<string, string>): Promise<ConnectorConnectResult>
+  skipConnector(interactionId: string): Promise<ConnectorConnectResult>
+  /** The stored state of the interaction, to restore a card after a reload. */
+  getConnectorState(interactionId: string): Promise<ConnectorConnectResult>
+  resumeConnector(interactionId: string): Promise<ConnectorConnectResult>
+}

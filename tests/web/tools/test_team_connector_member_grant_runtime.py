@@ -178,7 +178,9 @@ async def test_grant_from_member_login_is_used_by_web_chat_but_not_widget_task(
     async def fake_discover(*_args: Any, **_kwargs: Any) -> Any:
         return _discovery(_MCP_URL)
 
-    async def fake_register(_server: Any, *, redirect_uri: str) -> Any:
+    async def fake_register(
+        _server: Any, *, redirect_uri: str, client_name: str
+    ) -> Any:
         return SimpleNamespace(
             client_id="member-login-client", token_endpoint_auth_method="none"
         )

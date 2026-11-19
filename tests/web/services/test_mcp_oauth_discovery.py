@@ -1,4 +1,5 @@
 import gzip
+import json
 import ssl
 from pathlib import Path
 
@@ -792,10 +793,66 @@ async def test_dynamic_registration_rejects_confidential_client_response(monkeyp
         await register_mcp_oauth_public_client(
             metadata,
             redirect_uri="https://api.xagent.test/api/mcp/oauth/callback",
+            client_name="Xagent",
         )
 
     assert exc.value.code == "client_registration_failed"
     assert "public client" in exc.value.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client_name",
+    ["Xagent", "Tobybot"],
+    ids=("default-name", "configured-name"),
+)
+async def test_dynamic_registration_sends_the_requested_client_name(
+    monkeypatch, client_name
+):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: client,
+    )
+    metadata = OAuthAuthorizationServerMetadata(
+        url="https://auth.example.com/.well-known/oauth-authorization-server",
+        issuer="https://auth.example.com",
+        authorization_endpoint="https://auth.example.com/authorize",
+        token_endpoint="https://auth.example.com/token",
+        registration_endpoint="https://auth.example.com/register",
+        client_id_metadata_document_supported=True,
+        raw={},
+    )
+
+    registration = await register_mcp_oauth_public_client(
+        metadata,
+        redirect_uri="https://api.xagent.test/api/mcp/oauth/callback",
+        client_name=client_name,
+    )
+
+    assert registration.client_id == "dynamic-client"
+    assert len(requests) == 1
+    assert json.loads(requests[0].content) == {
+        "application_type": "web",
+        "client_name": client_name,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "redirect_uris": ["https://api.xagent.test/api/mcp/oauth/callback"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
 
 
 def test_owned_oauth_paths_use_shared_helpers_without_redirect_following():

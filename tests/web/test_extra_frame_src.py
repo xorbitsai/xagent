@@ -57,6 +57,7 @@ INVALID = [
     "https://widget.example.com;script-src",
     "https://widget.example.com,https://evil.example.com",
     "https://a.example.com\u00a0https://b.example.com",
+    "\u00a0https://widget.example.com\u00a0",
     "'self'",
     "'unsafe-inline'",
     "data:",
@@ -93,12 +94,30 @@ def test_unset_extra_frame_src_leaves_the_policy_unchanged(monkeypatch, embeddab
         assert page_security_headers(embeddable=embeddable) == baseline
 
 
+MIXED_EXPECTED = [
+    "https://widget.example.com",
+    "https://*.widget.example.com",
+    "https://intranet",
+    "https://xn--bcher-kva.example",
+    "https://a.example.com",
+    "https://*.b.example.com",
+]
+
+
 @pytest.mark.parametrize("embeddable", [False, True])
-def test_packaged_and_next_policies_agree_on_extra_frame_src(monkeypatch, embeddable):
+@pytest.mark.parametrize(
+    "configured, expected",
+    [
+        (" ".join([*INVALID, *(value for value, _ in VALID)]), MIXED_EXPECTED),
+        ("\u00a0https://widget.example.com\u00a0", []),
+    ],
+)
+def test_packaged_and_next_policies_agree_on_extra_frame_src(
+    monkeypatch, embeddable, configured, expected
+):
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node is required for cross-runtime policy parity")
-    configured = " ".join([*INVALID, *(value for value, _ in VALID)])
     monkeypatch.delenv(config.HTML_PREVIEW_ORIGIN, raising=False)
     monkeypatch.setenv(config.CSP_EXTRA_FRAME_SRC, configured)
     result = subprocess.run(
@@ -117,13 +136,5 @@ def test_packaged_and_next_policies_agree_on_extra_frame_src(monkeypatch, embedd
     headers = page_security_headers(embeddable=embeddable)
     assert json.loads(result.stdout) == headers
     assert _frame_src(headers["Content-Security-Policy"]) == " ".join(
-        [
-            BASE_FRAME_SRC,
-            "https://widget.example.com",
-            "https://*.widget.example.com",
-            "https://intranet",
-            "https://xn--bcher-kva.example",
-            "https://a.example.com",
-            "https://*.b.example.com",
-        ]
+        [BASE_FRAME_SRC, *expected]
     )

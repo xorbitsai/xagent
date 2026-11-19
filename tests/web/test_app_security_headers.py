@@ -196,6 +196,7 @@ def test_production_middleware_and_frontend_mount_share_one_page_policy(
 def test_configured_runner_csp_is_a_narrow_origin_allowlist(
     monkeypatch, configured, expected
 ):
+    monkeypatch.delenv("XAGENT_CSP_EXTRA_FRAME_SRC", raising=False)
     monkeypatch.setenv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", configured)
     for embeddable in [False, True]:
         policy = page_security_headers(embeddable=embeddable)["Content-Security-Policy"]

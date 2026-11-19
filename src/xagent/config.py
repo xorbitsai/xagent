@@ -3358,9 +3358,11 @@ def get_html_preview_origin() -> str:
 def get_csp_extra_frame_src() -> str:
     """Extra frame-src origins for the packaged SPA CSP, read at runtime.
 
-    A standalone Next build reads the same variable at build time instead.
+    A standalone Next build reads the same variable at build time instead. The
+    raw value is returned because the validator splits on ASCII whitespace only,
+    matching the Next builder.
     """
-    return os.getenv(CSP_EXTRA_FRAME_SRC, "").strip()
+    return os.getenv(CSP_EXTRA_FRAME_SRC, "")
 
 
 def get_frontend_dist_dir() -> Path:

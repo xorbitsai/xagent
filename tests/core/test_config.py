@@ -1466,7 +1466,7 @@ def test_get_html_preview_origin(monkeypatch, value, expected):
         ("", ""),
         (
             " https://widget.example.com https://*.chat.example.com ",
-            "https://widget.example.com https://*.chat.example.com",
+            " https://widget.example.com https://*.chat.example.com ",
         ),
     ],
 )

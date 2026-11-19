@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process"
 import { readFileSync } from "node:fs"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import YAML from "yaml"
 import { browserSecurityHeaders } from "../../browser-security.mjs"
 import { createRequire } from "node:module"
@@ -10,6 +10,10 @@ const { pathToRegexp } = createRequire(import.meta.url)("next/dist/compiled/path
 }
 
 describe("standalone browser security policy", () => {
+  beforeEach(() => {
+    vi.stubEnv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", "")
+    vi.stubEnv("XAGENT_CSP_EXTRA_FRAME_SRC", "")
+  })
   afterEach(() => vi.unstubAllEnvs())
 
   it.each<[string, string[]]>([
@@ -85,6 +89,7 @@ describe("standalone browser security policy", () => {
     "https://widget.example.com;script-src",
     "https://widget.example.com,https://evil.example.com",
     "https://a.example.com\u00a0https://b.example.com",
+    "\u00a0https://widget.example.com\u00a0",
     "'self'",
     "'unsafe-inline'",
     "data:",

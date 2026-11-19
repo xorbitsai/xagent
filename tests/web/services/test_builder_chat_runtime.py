@@ -76,6 +76,18 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
         FakeStorage,
     )
 
+    def fake_default_embedding(user_id: int, *, db: object) -> str:
+        assert user_id == 42
+        assert isinstance(db, FakeSession)
+        session_events.append(("embedding", threading.get_ident()))
+        return "user-default-embedding"
+
+    monkeypatch.setattr(
+        builder_chat_runtime,
+        "get_default_embedding_model",
+        fake_default_embedding,
+    )
+
     result = await load_builder_chat_runtime_inputs(
         user_id=42,
         requested_file_ids=("owned-file", "missing-file", "owned-file"),
@@ -87,11 +99,13 @@ async def test_load_builder_chat_runtime_inputs_uses_worker_owned_session(
         authorized_file_ids=("owned-file", "owned-file"),
         llm=selected_llm,
         compact_llm=default_compact_llm,
+        embedding_model_id="user-default-embedding",
     )
     assert [event for event, _thread_id in session_events] == [
         "enter",
         "query",
         "storage",
+        "embedding",
         "exit",
     ]
     assert all(thread_id != event_loop_thread for _event, thread_id in session_events)

@@ -38,10 +38,12 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
         self,
         user_id: int,
         is_admin: bool = False,
+        embedding_model_id: Optional[str] = None,
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.user_id = user_id
         self.is_admin = is_admin
+        self.embedding_model_id = embedding_model_id
 
     @property
     def name(self) -> str:
@@ -70,6 +72,7 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
             args,
             user_id=self.user_id,
             is_admin=self.is_admin,
+            embedding_model_id=self.embedding_model_id,
         )
 
 
@@ -85,6 +88,7 @@ async def _create_knowledge_base_from_url_impl(
     *,
     user_id: int,
     is_admin: bool = False,
+    embedding_model_id: Optional[str] = None,
 ) -> Any:
     from ...core.RAG_tools.core.exceptions import CollectionMigratingError
 
@@ -94,15 +98,12 @@ async def _create_knowledge_base_from_url_impl(
         import re
         import time
 
-        from ...core.RAG_tools.core.schemas import (
-            DEFAULT_EMBEDDING_MODEL_ID,
-            IngestionConfig,
-            WebCrawlConfig,
-        )
+        from ...core.RAG_tools.core.schemas import IngestionConfig, WebCrawlConfig
         from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
         from .agent_kb_service import (
             AgentKnowledgeBaseError,
             AgentKnowledgeBaseService,
+            requested_embedding_model_id,
         )
 
         tool_args = CreateKnowledgeBaseFromUrlArgs.model_validate(args)
@@ -123,12 +124,16 @@ async def _create_knowledge_base_from_url_impl(
             max_depth=2,
         )
 
-        ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
         kb_service = AgentKnowledgeBaseService(user_id=user_id)
         collection_name = await kb_service.prepare_collection(collection_name)
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if the import produces nothing.
         collection_existed_before = await kb_service.collection_exists(collection_name)
+        ingest_config = IngestionConfig(
+            embedding_model_id=requested_embedding_model_id(
+                embedding_model_id, collection_existed_before
+            )
+        )
 
         logger.info(
             "Starting background web ingestion for %s into %s",

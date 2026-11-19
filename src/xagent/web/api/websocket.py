@@ -4635,10 +4635,14 @@ clarification questions as plain assistant text.
             list_tool_categories_tool = ListToolCategoriesTool()
             list_kbs_tool = ListKnowledgeBasesTool(user_id=user_id, is_admin=is_admin)
             create_kb_url_tool = CreateKnowledgeBaseFromUrlTool(
-                user_id=user_id, is_admin=is_admin
+                user_id=user_id,
+                is_admin=is_admin,
+                embedding_model_id=runtime_inputs.embedding_model_id,
             )
             create_kb_file_tool = CreateKnowledgeBaseFromFileTool(
-                user_id=user_id, is_admin=is_admin
+                user_id=user_id,
+                is_admin=is_admin,
+                embedding_model_id=runtime_inputs.embedding_model_id,
             )
 
             # Build allowed external directories

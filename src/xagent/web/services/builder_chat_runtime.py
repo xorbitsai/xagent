@@ -10,6 +10,7 @@ from ..models.database import get_session_local
 from ..models.uploaded_file import UploadedFile
 from .db_runtime import run_db_io_cancellation_safe
 from .llm_utils import UserAwareModelStorage
+from .model_service import get_default_embedding_model
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class BuilderChatRuntimeInputs:
     authorized_file_ids: tuple[str, ...]
     llm: BaseLLM | None
     compact_llm: BaseLLM | None
+    embedding_model_id: str | None = None
 
 
 def _load_builder_chat_runtime_inputs_sync(
@@ -88,6 +90,7 @@ def _load_builder_chat_runtime_inputs_sync(
             ),
             llm=llm,
             compact_llm=compact_llm,
+            embedding_model_id=get_default_embedding_model(user_id, db=db),
         )
 
 

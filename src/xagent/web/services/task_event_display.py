@@ -52,6 +52,9 @@ _STREAM_KINDS = frozenset(
 # ``publish_task_result``; a cancellation settlement publishes none. Both
 # reach the client through the next replay.
 _CONDITIONAL_LIVE_KINDS = frozenset({"input_accepted", "assistant_message"})
+# Every kind ``project_event_message`` can turn into a message; a reader that
+# only needs messages can filter on these in SQL.
+MESSAGE_EVENT_KINDS = ("input_accepted", "assistant_message", "agent_message")
 
 
 @dataclass(frozen=True)

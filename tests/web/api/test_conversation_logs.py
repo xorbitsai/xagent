@@ -1723,23 +1723,33 @@ def _v2_task(user_id: int, title: str = "v2") -> int:
     return task_id
 
 
-def _add_v2_input(task_id: int, key: str, content: str, at: datetime) -> None:
+def _add_v2_event(
+    task_id: int, key: str, kind: str, payload: dict[str, Any], at: datetime
+) -> str:
     from xagent.web.services.task_execution_event_writer import (
         append_fact_no_commit,
     )
 
     with _direct_db_session() as db:
-        append_fact_no_commit(
+        row = append_fact_no_commit(
             db,
             task_id=task_id,
-            kind="input_accepted",
+            kind=kind,
             key=key,
             run_id="run-1",
             turn_id=key,
-            payload={"content": content, "message_type": "user"},
+            payload=payload,
             occurred_at=at,
         )
+        event_id = str(row.event_id)
         db.commit()
+    return event_id
+
+
+def _add_v2_input(task_id: int, key: str, content: str, at: datetime) -> None:
+    _add_v2_event(
+        task_id, key, "input_accepted", {"content": content, "message_type": "user"}, at
+    )
 
 
 def test_export_conversation_reads_each_row_from_its_own_task_across_batches(
@@ -1788,6 +1798,124 @@ def test_export_conversation_marks_only_the_task_whose_events_cannot_be_read(
     assert [m for m in warnings if "could not project" in m] == [
         f"Conversation export could not project the events of task {broken}"
     ]
+    (record,) = [r for r in caplog.records if "could not project" in r.getMessage()]
+    assert record.exc_info is not None
+    assert "event_id=" in str(record.exc_info[1])
+
+
+CHOICES = [
+    {
+        "type": "select_one",
+        "label": "Pick",
+        "options": [{"value": "a", "label": "Option A"}],
+    }
+]
+
+
+def _v2_question(task_id: int, content: str, interactions: Any) -> str:
+    return _add_v2_event(
+        task_id,
+        "q1",
+        "agent_message",
+        {
+            "message": content,
+            "expect_response": True,
+            "visible": True,
+            "metadata": {"interactions": interactions},
+        },
+        _minute(9, 0),
+    )
+
+
+def _body(cell: str) -> str:
+    """The cell without its first header line."""
+    return cell.split(":\n", 1)[1]
+
+
+def test_export_v2_question_keeps_its_choices_like_v1() -> None:
+    from xagent.web.services.chat_history_service import (
+        persist_assistant_message_no_commit,
+    )
+
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    v2 = _v2_task(user_id, "v2")
+    _v2_question(v2, "  Which one?", CHOICES)
+    v1 = _sdk_task(user_id, "v1")
+    with _direct_db_session() as db:
+        persist_assistant_message_no_commit(
+            db,
+            v1,
+            user_id,
+            "  Which one?",
+            message_type="question",
+            interactions=CHOICES,
+            content_is_reconciled=True,
+        )
+        db.commit()
+
+    cells = _conversation_cells(headers)
+
+    assert "- Pick: a: Option A" in cells[str(v2)]
+    assert _body(cells[str(v2)]) == _body(cells[str(v1)])
+
+
+def test_export_v2_assistant_message_with_choices_is_not_doubled() -> None:
+    from xagent.core.agent.transcript import build_assistant_transcript_content
+
+    headers = _admin_headers()
+    v2 = _v2_task(_user_id("admin"), "v2")
+    stored = build_assistant_transcript_content("Which one?", CHOICES)
+    _add_v2_event(
+        v2,
+        "a1",
+        "assistant_message",
+        {"content": stored, "message_type": "question", "interactions": CHOICES},
+        _minute(9, 0),
+    )
+
+    cell = _conversation_cells(headers)[str(v2)]
+
+    assert _body(cell) == stored
+    assert cell.count("Option A") == 1
+
+
+def test_export_v2_question_with_malformed_choices_falls_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    headers = _admin_headers()
+    v2 = _v2_task(_user_id("admin"), "v2")
+    event_id = _v2_question(
+        v2, "Which one?", [{"type": "select_one", "label": "Pick", "options": 5}]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        cell = _conversation_cells(headers)[str(v2)]
+
+    assert cell == "[2026-03-01 09:00 UTC] Assistant:\nWhich one?"
+    (record,) = [r for r in caplog.records if event_id in r.getMessage()]
+    assert record.exc_info is not None
+
+
+def test_finish_export_cells_releases_each_cell_before_joining_the_next() -> None:
+    cells: dict[int, conversation_logs._ExportCellBuilder] = {}
+    tracemalloc.start()
+    try:
+        for task_id in range(20):
+            cell = conversation_logs._ExportCellBuilder()
+            for part in range(30):
+                cell.add_block(f"{task_id:02}{part:02}" * 250)
+            cells[task_id] = cell
+        before = tracemalloc.get_traced_memory()[0]
+        tracemalloc.reset_peak()
+        finished = conversation_logs._finish_export_cells(cells)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert cells == {}
+    assert sorted(finished) == list(range(20))
+    assert peak < 1.5 * before
 
 
 def test_load_export_transcripts_peak_memory_is_independent_of_history_size(

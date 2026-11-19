@@ -1025,7 +1025,11 @@ def test_message_empty_defaults_remain_supported(canonical, kind, payload):
 
 
 def test_export_transcripts_follow_the_event_display_rules(canonical):
-    from xagent.web.api.conversation_logs import _load_export_transcripts
+    from xagent.web.api.conversation_logs import (
+        _export_message_block,
+        _load_export_transcripts,
+    )
+    from xagent.web.services.message_metadata import is_display_none_metadata
 
     factory, task_id = canonical
     hidden = {"display": "none", "kind": "connector_settled"}
@@ -1037,6 +1041,7 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
             "u1",
             {"content": "hello", "message_type": "user"},
             flat=True,
+            turn_id="t1",
         )
         fact(
             db,
@@ -1045,6 +1050,7 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
             "hidden",
             {"content": "settled", "message_type": "user", "message_metadata": hidden},
             flat=True,
+            turn_id="t1",
         )
         fact(
             db,
@@ -1067,6 +1073,26 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
             "agent_message",
             "question",
             {"message": "Which?", "expect_response": True, "visible": True},
+            turn_id="t1",
+        )
+        fact(
+            db,
+            task_id,
+            "agent_message",
+            "card",
+            {
+                "message": "Card",
+                "message_type": "result_card",
+                "metadata": {
+                    "display": "result_card",
+                    "result_card": {
+                        "title": "T",
+                        "items": ["a"],
+                        "source": {"name": "S"},
+                    },
+                },
+            },
+            turn_id="t1",
         )
         fact(
             db,
@@ -1075,6 +1101,7 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
             "answer",
             {"content": "done", "message_type": "assistant_response"},
             flat=True,
+            turn_id="t1",
         )
         db.commit()
         # A fact appended after the display horizon is not part of the conversation.
@@ -1086,18 +1113,24 @@ def test_export_transcripts_follow_the_event_display_rules(canonical):
             "late",
             {"content": "late", "message_type": "assistant_response"},
             flat=True,
+            turn_id="t1",
         )
         db.commit()
         db.get(Task, task_id).conversation_event_sequence = horizon
         db.commit()
 
-        assert _load_export_transcripts(db, [task_id]) == {
-            task_id: (
-                "[2026-09-30 00:00 UTC] User:\nhello\n\n"
-                "[2026-09-30 00:00 UTC] Assistant:\nWhich?\n\n"
-                "[2026-09-30 00:00 UTC] Assistant:\ndone"
-            )
-        }
+        # The conversation is exactly what the detail page's snapshot displays.
+        shown = [
+            message
+            for message in load_event_display_snapshot(db, task_id).messages
+            if not is_display_none_metadata(message["message_metadata"])
+        ]
+        assert [m["content"] for m in shown] == ["hello", "Which?", "Card", "done"]
+        expected = "\n\n".join(
+            _export_message_block(m["role"], m["content"], m["created_at"])
+            for m in shown
+        )
+        assert _load_export_transcripts(db, [task_id]) == {task_id: expected}
 
 
 def test_export_transcripts_put_a_null_created_at_before_timed_messages(canonical):
@@ -1135,3 +1168,86 @@ def test_export_transcripts_put_a_null_created_at_before_timed_messages(canonica
                 "[time unknown] User:\nuntimed\n\n[2026-09-30 08:00 UTC] User:\ntimed"
             )
         }
+
+
+@pytest.mark.asyncio
+async def test_v2_and_v1_export_conversation_across_batches_on_every_backend(
+    canonical, monkeypatch
+):
+    import csv
+    import io
+
+    from xagent.web.api import conversation_logs
+    from xagent.web.api.conversation_logs import export_conversation_logs
+    from xagent.web.models.task import TaskStatus
+    from xagent.web.models.user import User
+
+    monkeypatch.setattr(conversation_logs, "EXPORT_FETCH_BATCH", 1)
+    monkeypatch.setattr(conversation_logs, "EXPORT_MESSAGE_FETCH_ROWS", 1)
+    factory, v2_id = canonical
+    at = datetime(2026, 9, 30, tzinfo=timezone.utc)
+    with factory() as db:
+        v2 = db.get(Task, v2_id)
+        v2.source = "sdk"
+        v2.is_visible = False
+        user = db.get(User, v2.user_id)
+        expected = {}
+        for index, text in enumerate(("v2 first", "v2 second")):
+            fact(
+                db,
+                v2_id,
+                "input_accepted",
+                f"in{index}",
+                {"content": text, "message_type": "user"},
+                flat=True,
+                turn_id=f"in{index}",
+            )
+        expected[v2_id] = (
+            "[2026-09-30 00:00 UTC] User:\nv2 first\n\n"
+            "[2026-09-30 00:00 UTC] User:\nv2 second"
+        )
+        for name in ("one", "two"):
+            task = Task(
+                user_id=v2.user_id,
+                title=name,
+                description=name,
+                status=TaskStatus.COMPLETED,
+                source="sdk",
+                is_visible=False,
+            )
+            db.add(task)
+            db.flush()
+            for index, role in enumerate(("user", "assistant")):
+                db.add(
+                    TaskChatMessage(
+                        task_id=task.id,
+                        user_id=v2.user_id,
+                        role=role,
+                        content=f"{name} {role}",
+                        message_type="chat",
+                        created_at=at.replace(minute=index),
+                    )
+                )
+            expected[task.id] = (
+                f"[2026-09-30 00:00 UTC] User:\n{name} user\n\n"
+                f"[2026-09-30 00:01 UTC] Assistant:\n{name} assistant"
+            )
+        db.commit()
+        # The export releases the session, so it is the last use of ``db``.
+        response = export_conversation_logs(
+            source="all",
+            agent_id=None,
+            search=None,
+            active_from=None,
+            active_to=None,
+            db=db,
+            user=user,
+        )
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        await response.background()
+
+    header, *rows = csv.reader(io.StringIO(body.decode("utf-8-sig"), newline=""))
+    cells = {int(r[header.index("conversation_id")]): r[-1] for r in rows}
+    assert header[-1] == "conversation"
+    assert len(rows) == 3
+    assert cells == expected

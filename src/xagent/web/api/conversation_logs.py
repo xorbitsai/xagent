@@ -34,6 +34,7 @@ from sqlalchemy.types import Boolean
 from starlette.background import BackgroundTask
 
 from ...core.agent.result_card import RESULT_CARD_DISPLAY, RESULT_CARD_MESSAGE_TYPE
+from ...core.agent.transcript import build_assistant_transcript_content
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
 from ..models.chat_message import TaskChatMessage
@@ -66,7 +67,7 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
-from ..services.task_event_display import project_event_message
+from ..services.task_event_display import MESSAGE_EVENT_KINDS, project_event_message
 from ..services.task_runtime import mcp_runtime_authorization_policy_required_clause
 from ..utils.db_timezone import format_datetime_for_api, normalize_datetime_from_db
 from .expired_task_errors import task_expired_http_error
@@ -148,8 +149,6 @@ EXPORT_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 EXPORT_MESSAGE_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M"
 EXPORT_TIME_UNKNOWN = "[time unknown]"
 EXPORT_CONVERSATION_UNAVAILABLE = "[conversation unavailable]"
-# Only these event kinds can project to a message; the others are skipped in SQL.
-_EXPORT_MESSAGE_EVENT_KINDS = ("input_accepted", "assistant_message", "agent_message")
 # A spreadsheet reads a cell starting with one of these as a formula.
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -1264,16 +1263,26 @@ def _export_message_block(role: str | None, content: str | None, at: Any) -> str
     return f"{when} {_export_role_label(role)}:\n{content or ''}"
 
 
+def _finish_export_cells(cells: dict[int, _ExportCellBuilder]) -> dict[int, str]:
+    """Join each cell and release it, so one cell's pieces are in memory at a time."""
+    finished: dict[int, str] = {}
+    for task_id in list(cells):
+        finished[task_id] = cells.pop(task_id).finish()
+    return finished
+
+
 def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, str]:
     """The conversation cell for each of ``task_ids`` that has displayed messages.
 
     A message shows when the detail page shows it, in the detail page's order.
     A v1 message is written as stored; a v2 message is the text the detail
-    page's event projection produces. A task whose v2 events cannot be projected gets
+    page's event projection produces, and a v2 question gets the same choice
+    text the v1 writer stores. A task whose v2 events cannot be projected gets
     ``EXPORT_CONVERSATION_UNAVAILABLE``. A task without messages has no key.
     Messages are read ``EXPORT_MESSAGE_FETCH_ROWS`` rows at a time and each cell
-    keeps only its truncated prefix, so memory per batch does not grow with the
-    number of messages; a single message is still read whole.
+    keeps only its truncated prefix, and a finished cell is released as soon as
+    it is joined, so memory per batch does not grow with the number of messages;
+    a single message is still read whole.
     """
     ids = list(task_ids)
     cells: dict[int, _ExportCellBuilder] = {}
@@ -1317,7 +1326,7 @@ def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, 
             Task.conversation_storage_version == 2,
             TaskExecutionEvent.scope_id == "root",
             TaskExecutionEvent.sequence <= Task.conversation_event_sequence,
-            TaskExecutionEvent.kind.in_(_EXPORT_MESSAGE_EVENT_KINDS),
+            TaskExecutionEvent.kind.in_(MESSAGE_EVENT_KINDS),
         )
         .order_by(TaskExecutionEvent.task_id, TaskExecutionEvent.sequence)
         .execution_options(yield_per=EXPORT_MESSAGE_FETCH_ROWS)
@@ -1333,21 +1342,36 @@ def _load_export_transcripts(db: Session, task_ids: Sequence[int]) -> dict[int, 
                 logger.warning(
                     "Conversation export could not project the events of task %s",
                     task_id,
+                    exc_info=True,
                 )
                 cells.pop(task_id, None)
                 unavailable.add(task_id)
                 continue
             if message is None or is_display_none_metadata(message["message_metadata"]):
                 continue
+            content = message["content"]
+            if event.kind == "agent_message" and message["message_type"] == "question":
+                # The v1 writer stores a question with its choices as text; the
+                # projection keeps them as data for the page's buttons.
+                try:
+                    content = build_assistant_transcript_content(
+                        content, message["interactions"]
+                    ).strip()
+                except (TypeError, ValueError, AttributeError):
+                    logger.warning(
+                        "Conversation export could not write the choices of "
+                        "event %s (task %s)",
+                        event.event_id,
+                        task_id,
+                        exc_info=True,
+                    )
             cells.setdefault(task_id, _ExportCellBuilder()).add_block(
-                _export_message_block(
-                    message["role"], message["content"], message["created_at"]
-                )
+                _export_message_block(message["role"], content, message["created_at"])
             )
     finally:
         v2_events.close()
 
-    transcripts = {task_id: cell.finish() for task_id, cell in cells.items()}
+    transcripts = _finish_export_cells(cells)
     for task_id in unavailable:
         transcripts[task_id] = EXPORT_CONVERSATION_UNAVAILABLE
     return transcripts
